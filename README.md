@@ -10,3 +10,15 @@ p2p generative AI marketplace
 - [ ] client.py MVP: access host compute via the server (batch output)
 - [ ] client.py streaming output
 - [ ] image support
+
+## usage
+
+1. start the script
+
+```sh
+python server.python
+```
+
+2. navigate to http://localhost:3000/?message=YOUR_MESSAGE_HERE
+
+3. edit the message param and visit the page to see your message update

@@ -16,7 +16,7 @@ p2p generative AI marketplace
 1. start the script
 
 ```sh
-python server.python
+python server.py
 ```
 
 2. navigate to http://localhost:3000/?message=YOUR_MESSAGE_HERE

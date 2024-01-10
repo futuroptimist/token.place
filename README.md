@@ -1,15 +1,16 @@
 # token.place
 p2p generative AI marketplace
 
+# vision
+There are tons of personal computers and homelabs out there with lots of compute that remain idle. This project aims to create a marketplace of people with spare compute and people with needs for compute. Note that this is not a financial marketplace -- this is intended to be a public good. If it takes off is anyone's guess, but I'll donate whatever compute I can in the meantime once this is up and running.
+
 ## roadmap
 
 - [x] hello world: it literally just echoes your message param back to you
-- [ ] server.py MVP: set up CI/CD, domain name, etc.
-- [ ] host.py MVP: sign up as a host and manage your account
-- [ ] host.py model management: browse available models, download, and manage downloads
-- [ ] client.py MVP: access host compute via the server (batch output)
-- [ ] client.py streaming output
-- [ ] image support
+- [ ] find an initial model to support (might keep it simple and just say Llama-2-7B quantized, as this isn't a commercial project)
+- [ ] download model programmatically on device
+- [ ] load the model and successfully run it
+- [ ] do inference over HTTP (including creation of a client.py)
 
 ## usage
 

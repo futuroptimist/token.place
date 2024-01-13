@@ -7,7 +7,7 @@ There are tons of personal computers and homelabs out there with lots of compute
 ## roadmap
 
 - [x] hello world: it literally just echoes your message param back to you
-- [ ] find an initial model to support (might keep it simple and just say Llama-2-7B quantized, as this isn't a commercial project)
+- [x] find an initial model to support (llama 2 7b chat gguf)
 - [ ] download model programmatically on device
 - [ ] load the model and successfully run it
 - [ ] do inference over HTTP (including creation of a client.py)

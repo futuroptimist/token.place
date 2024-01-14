@@ -88,7 +88,7 @@ def llama_cpp_get_response(message):
     model_path = f"models/{file_name}"
     if not os.path.exists(model_path):
         print(f"Error: Model file {model_path} does not exist.")
-        return
+        return "Model file not found."
 
     try:
         llm = Llama(model_path=model_path, chat_format="llama-2")
@@ -98,20 +98,21 @@ def llama_cpp_get_response(message):
                 {"role": "user", "content": message}
             ]
         )
-        print("Model Response:", response)  # Print the response from the model
+        return response  # Return the response from the model
     except Exception as e:
         print(f"Error during model initialization or chat completion: {e}")
+        return "Error during model initialization or chat completion."
 
 @app.route('/', methods=['GET'])
 def echo_message():
     if request.method == 'GET' and 'message' in request.args:
         message = request.args.get('message')
-        return message
+        response = llama_cpp_get_response(message)
+        return response  # Return the response from the Llama model
     else:
         return 'Invalid request'
 
 if __name__ == '__main__':
     models_dir = create_models_directory()
     download_file_if_not_exists(models_dir, URL)
-    llama_cpp_get_response("Can you name the planets in the solar system from the sun?")
     app.run(port=3000)

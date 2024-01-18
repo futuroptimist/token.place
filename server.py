@@ -138,4 +138,4 @@ def process_message():
 if __name__ == '__main__':
     models_dir = create_models_directory()
     download_file_if_not_exists(models_dir, URL)
-    app.run(port=3000)
+    app.run(host='0.0.0.0', port=3000) # Flask app runs on port 3000 internally

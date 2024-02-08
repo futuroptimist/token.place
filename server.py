@@ -1,7 +1,6 @@
 import os
 import requests
 import time
-import json
 from flask import Flask, request, jsonify
 
 # Import Llama
@@ -20,7 +19,12 @@ if not os.path.exists(model_path):
     print(f"Error: Model file {model_path} does not exist.")
 else:
     # Initialize Llama model if it's available
-    llm = Llama(model_path=model_path, chat_format="llama-2")
+    llm = Llama(
+        model_path=model_path,
+        n_gpu_layers=-1,
+        n_ctx=2048,
+        chat_format="llama-2"
+    )
 
 def create_models_directory():
     models_dir = 'models/'
@@ -97,7 +101,6 @@ def download_file_if_not_exists(models_dir, url):
         print(f"File {file_name} already exists.")
 
 def llama_cpp_get_response(chat_history, message):
-    global llm  # Use the global llm variable
     try:
         # Append the new user message to the received chat history
         chat_history.append({"role": "user", "content": message})

@@ -3,7 +3,7 @@ import json
 import re
 
 # URL of the server running locally
-server_url = 'http://localhost/'
+server_url = 'http://localhost:3000'
 
 # Initialize an empty chat history
 chat_history = []

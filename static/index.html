@@ -20,8 +20,8 @@
             margin-left: auto; /* Center the container horizontally */
             margin-right: auto; /* Center the container horizontally */
         }
-        h1 {
-            text-align: center;
+        h1, h2, h3, p {
+            margin: 10px 0;
         }
         /* Chat styles */
         .chat-container {
@@ -32,11 +32,13 @@
         }
         .message-input {
             width: 100%;
+            padding: 10px;
+            box-sizing: border-box; /* Ensures padding doesn't increase total width */
             margin-top: 10px;
         }
         .message {
-            padding: 5px 10px;
-            margin: 5px;
+            padding: 10px;
+            margin: 5px 0; /* Spacing between messages */
             border-radius: 10px;
             background-color: #f9f9f9;
         }
@@ -47,9 +49,20 @@
             text-align: left;
         }
         /* Responsive styles */
-        @media (max-width: 768px) { /* Adjust this value as needed for your breakpoint */
+        @media (max-width: 768px) {
             .container {
-                width: 80%;
+                width: 90%;
+            }
+            h1, h2, h3, p {
+                padding: 0 10px; /* Slight padding to prevent text from hitting the edges */
+            }
+            .message-input {
+                padding: 15px; /* Larger touch target */
+                font-size: 16px; /* Legibility */
+            }
+            .message {
+                padding: 15px; /* More visual space */
+                font-size: 14px; /* Adjust text size for readability */
             }
         }
     </style>

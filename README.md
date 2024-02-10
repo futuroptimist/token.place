@@ -12,9 +12,12 @@ There are tons of personal computers and homelabs out there with lots of compute
 - [x] load the model and successfully run it
 - [x] do inference over HTTP
 - [x] multi-step dialogue
+- [ ] set up production server (raspberry pi cluster lol)
 - [ ] relay.py, which passes plaintext requests from client to a server (relay chooses one) and the response back to the client.
 - [ ] end-to-end encrypt communication between server and client with public key cryptography (server generates public/private key pair on init and gives public key to relay, which passes it on to the server [but does not reveal server's IP address])
-
+- [ ] bandwidth improvements
+- [ ] allow participation from other server.pys
+- [ ] allow users to specify which model they want from a growing list
 
 ## usage
 

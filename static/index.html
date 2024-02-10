@@ -23,6 +23,29 @@
         h1 {
             text-align: center;
         }
+        /* Chat styles */
+        .chat-container {
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin-top: 20px;
+            border-radius: 5px;
+        }
+        .message-input {
+            width: 100%;
+            margin-top: 10px;
+        }
+        .message {
+            padding: 5px 10px;
+            margin: 5px;
+            border-radius: 10px;
+            background-color: #f9f9f9;
+        }
+        .user-message {
+            text-align: right;
+        }
+        .assistant-message {
+            text-align: left;
+        }
         /* Responsive styles */
         @media (max-width: 768px) { /* Adjust this value as needed for your breakpoint */
             .container {
@@ -32,12 +55,76 @@
     </style>
 </head>
 <body>
-    <div class="container">
+    <div id="app" class="container">
         <h1>Welcome to tokenplace!</h1>
+
+        <h3><strong>WARNING! Your conversation is not yet private while I debug things. Don't put anything sensitive in here. I'll remove this message once it is</strong></h3>
         <p>tokenplace is a peer-to-peer generative AI platform that pairs those in need of LLM compute with individuals donating spare resources.</p>
         <p>Heavily inspired by projects like Folding@Home, token.place aims to truly democratized AI by providing a completely free chat client and API. No strings attached, forever. Made possible by generous compute donors like you.</p>
         <p>Access to and governance over these highly capable and sophisticated language models should be universal. It shouldn't belong to an elite few at the governmental, corporate, or individual level.</p>
         <p>This project is completely open source (<a href="https://github.com/futuroptimist/token.place">Github repository</a>) and MIT licensed.</p>
+        <hr>
+        <div class="chat-container">
+            <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
+                {{ message.content }}
+            </div>
+            <input type="text" v-model="newMessage" @keyup.enter="sendMessage" class="message-input">
+        </div>
+        <hr>
+        <h2>API</h2>
+        <p>Coming soon!</p>
     </div>
+
+    <!-- Vue.js -->
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
+    <script>
+        new Vue({
+            el: '#app',
+            data: {
+                newMessage: '',
+                chatHistory: []
+            },
+            methods: {
+                sendMessage() {
+                    const messageContent = this.newMessage.trim();
+                    if (messageContent) {
+                        // Clear the input field
+                        this.newMessage = '';
+
+                        // Add the user message to the chat history
+                        this.chatHistory.push({ role: 'user', content: messageContent });
+
+                        // Send just the new message to the server
+                        fetch('/inference', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ chat_history: this.chatHistory })
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data && Array.isArray(data)) {
+                                console.log('Response:', JSON.stringify(data, null, 2));
+                                this.chatHistory = data;
+                            } else {
+                                console.error('Unexpected response format:', data);
+                            }
+                        })
+                        .catch((error) => {
+                            console.error('Error:', error);
+                        });
+                    }
+                }
+            },
+            updated() {
+                // Scroll to the bottom of the chat container every time the chatHistory updates
+                this.$nextTick(() => {
+                    const container = this.$el.querySelector(".chat-container");
+                    container.scrollTop = container.scrollHeight;
+                });
+            }
+        });
+    </script>
 </body>
 </html>

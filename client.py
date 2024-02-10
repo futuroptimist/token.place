@@ -1,9 +1,8 @@
 import requests
 import json
-import re
 
-# URL of the server running locally
-server_url = 'http://localhost:3000'
+# URL of the relay server running locally
+relay_url = 'http://localhost:5000/inference'
 
 # Initialize an empty chat history
 chat_history = []
@@ -25,11 +24,12 @@ while True:
     }
 
     try:
-        response = requests.post(server_url, json=data)
+        # Send a POST request to the relay server instead of the server directly
+        response = requests.post(relay_url, json=data)
 
         if response.status_code == 200:
             response_data = response.json()
-            # Extracting the message content from the response
+            # Assuming the response format is the same as before, modify as needed
             print("AI:", response_data[-1]["content"]["choices"][0]["message"]["content"])
         else:
             # Handle non-200 responses

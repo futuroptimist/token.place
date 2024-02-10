@@ -1,10 +1,11 @@
 import os
 import requests
 import time
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 
 # Import Llama
 from llama_cpp import Llama
+import json
 
 app = Flask(__name__)
 
@@ -100,43 +101,51 @@ def download_file_if_not_exists(models_dir, url):
     else:
         print(f"File {file_name} already exists.")
 
-def llama_cpp_get_response(chat_history, message):
-    try:
-        # Append the new user message to the received chat history
-        chat_history.append({"role": "user", "content": message})
+def llama_cpp_get_response(chat_history):
+    """Get a response from the Llama model using the C++ API.
 
+    Args:
+        chat_history (list):    List of chat messages, consisting of at least 1 system message and one user message.
+
+    Returns:
+        list:   Updated chat history with the model's response appended.
+    """
+
+    # TODO: error handling for invalid chat_history
+
+    try:
         response = llm.create_chat_completion(messages=chat_history)
 
-        # Append the model's response to the chat history
-        chat_history.append({"role": "assistant", "content": response})
+        # Check if the response is None or doesn't have the expected keys
+        if response is None or 'choices' not in response or not response['choices']:
+            raise ValueError("Received an invalid response from the Llama model.")
 
-        return chat_history  # Return the updated chat history
+        # The 'message' key is already a dictionary with 'role' and 'content'
+        assistant_message = response['choices'][0]['message']
+        
+        # Append the assistant's message to the chat history
+        chat_history.append(assistant_message)
+
     except Exception as e:
         print(f"Error during chat completion: {e}")
-        return [{"role": "user", "content": message}, {"role": "assistant", "content": "Error during chat completion."}]
+        chat_history.append({"role": "system", "content": f"Error during chat completion: {e}"})
+    
+    return chat_history
 
-# Handle POST requests
 @app.route('/', methods=['POST'])
 def process_message():
     if request.method == 'POST':
-        # Parse the JSON data from the request body
         data = request.json
-        message = data.get('message')
         chat_history = data.get('chat_history', [])
 
-        # Log the chat history and message for debugging
-        print(f"Received message: {message}")
-        print(f"Received chat history: {chat_history}")
+        updated_chat_history = llama_cpp_get_response(chat_history)
 
-        updated_chat_history = llama_cpp_get_response(chat_history, message)
+        print(f"Updated chat history: {json.dumps(updated_chat_history, indent=4)}")
 
-        # Log the updated chat history for debugging
-        print(f"Updated chat history: {updated_chat_history}")
-
-        # Return the updated chat history as JSON
         return jsonify(updated_chat_history)
     else:
         return 'Invalid request'
+     
 
 if __name__ == '__main__':
     models_dir = create_models_directory()

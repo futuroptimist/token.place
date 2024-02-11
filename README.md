@@ -93,6 +93,27 @@ $env:FORCE_CMAKE=1
 pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose
 ```
 
+when you run `server.py` next, you'll see `BLAS = 1` in a collection of lines that looks like this:
+
+```
+AVX = 1 | AVX_VNNI = 0 | AVX2 = 1 | AVX512 = 0 | AVX512_VBMI = 0 | AVX512_VNNI = 0 | FMA = 1 | NEON = 0 | ARM_FMA = 0 | F16C = 1 | FP16_VA = 0 | WASM_SIMD = 0 | BLAS = 1 | SSE3 = 1 | SSSE3 = 0 | VSX = 0 |
+```
+
+This indicates that `server.py` can correctly access your GPU resources.
+
+llama_cpp_python is initialized like this:
+
+```py
+llm = Llama(
+        model_path=model_path,
+        n_gpu_layers=-1,
+        n_ctx=2048,
+        chat_format="llama-2"
+    )
+```
+
+`n_gpu_layers` instructs llama to use as much of your GPU resources as possible.
+
 #### macos
 
 TODO

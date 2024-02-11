@@ -1,7 +1,7 @@
 import os
 import requests
 import time
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 
 # Import Llama
 from llama_cpp import Llama
@@ -128,7 +128,6 @@ def llama_cpp_get_response(chat_history):
 
     except Exception as e:
         print(f"Error during chat completion: {e}")
-        chat_history.append({"role": "system", "content": f"Error during chat completion: {e}"})
     
     return chat_history
 

@@ -64,6 +64,9 @@
                 padding: 15px; /* More visual space */
                 font-size: 14px; /* Adjust text size for readability */
             }
+            [v-cloak] {
+                display: none; /* Hide Vue.js elements until they are ready */
+            }
         }
     </style>
 </head>
@@ -77,7 +80,8 @@
         <p>Access to and governance over these highly capable and sophisticated language models should be universal. It shouldn't belong to an elite few at the governmental, corporate, or individual level.</p>
         <p>This project is completely open source (<a href="https://github.com/futuroptimist/token.place">Github repository</a>) and MIT licensed.</p>
         <hr>
-        <div class="chat-container">
+        <h2>Chat Demo</h2>
+        <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 {{ message.content }}
             </div>
@@ -90,54 +94,6 @@
 
     <!-- Vue.js -->
     <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
-    <script>
-        new Vue({
-            el: '#app',
-            data: {
-                newMessage: '',
-                chatHistory: []
-            },
-            methods: {
-                sendMessage() {
-                    const messageContent = this.newMessage.trim();
-                    if (messageContent) {
-                        // Clear the input field
-                        this.newMessage = '';
-
-                        // Add the user message to the chat history
-                        this.chatHistory.push({ role: 'user', content: messageContent });
-
-                        // Send just the new message to the server
-                        fetch('/inference', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({ chat_history: this.chatHistory })
-                        })
-                        .then(response => response.json())
-                        .then(data => {
-                            if (data && Array.isArray(data)) {
-                                console.log('Response:', JSON.stringify(data, null, 2));
-                                this.chatHistory = data;
-                            } else {
-                                console.error('Unexpected response format:', data);
-                            }
-                        })
-                        .catch((error) => {
-                            console.error('Error:', error);
-                        });
-                    }
-                }
-            },
-            updated() {
-                // Scroll to the bottom of the chat container every time the chatHistory updates
-                this.$nextTick(() => {
-                    const container = this.$el.querySelector(".chat-container");
-                    container.scrollTop = container.scrollHeight;
-                });
-            }
-        });
-    </script>
+    <script src="/static/chat.js"></script>
 </body>
 </html>

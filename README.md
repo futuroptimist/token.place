@@ -61,6 +61,38 @@ If you want to also utilize your GPU (instead of just your CPU), follow these pl
 
 #### windows
 
+This is the resource I used to get things finally working: https://medium.com/@piyushbatra1999/installing-llama-cpp-python-with-nvidia-gpu-acceleration-on-windows-a-short-guide-0dfac475002d
+
+Summarizing:
+
+**Prerequisites**
+
+- Visual Studio with
+  - C++ CMake tools for windows
+  - C++ core features
+  - Windows 10/11 SDK
+- [CUDA Toolkit](https://developer.nvidia.com/cuda-12-2-0-download-archive?target_os=Windows)
+
+The next steps need to be executed in the same virtual environment you set up above. You'll see something like (env) on the bottom left in your terminal (may not be true on all platforms in all terminals).
+
+This will replace the llama-cpp-python you installed via `pip install -r requirements.txt` and will instruct it to use [cuBLAS](https://docs.nvidia.com/cuda/cublas/index.html).
+
+**if you're using Command Prompt**
+
+```
+set CMAKE_ARGS=-DLLAMA_CUBLAS=on
+set FORCE_CMAKE=1
+pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose
+```
+
+**if you're using Powershell**
+
+```
+$env:CMAKE_ARGS = "-DLLAMA_CUBLAS=on"
+$env:FORCE_CMAKE=1
+pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose
+```
+
 #### macos
 
 TODO

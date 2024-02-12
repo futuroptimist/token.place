@@ -27,6 +27,9 @@ else:
         chat_format="llama-2"
     )
 
+    if llm is None:
+        print("Error: Failed to initialize Llama model.")
+
 def create_models_directory():
     models_dir = 'models/'
     if not os.path.exists(models_dir):

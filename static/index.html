@@ -81,6 +81,7 @@
         <p>This project is completely open source (<a href="https://github.com/futuroptimist/token.place">Github repository</a>) and MIT licensed.</p>
         <hr>
         <h2>Chat Demo</h2>
+        <p>The following chat UI uses token.place. <strong>TRY IT OUT!!</strong> When API v1 is generally available, you can use it for your own Chat UIs, workflows, or projects, free of charge!</p>
         <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 {{ message.content }}

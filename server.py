@@ -1,11 +1,12 @@
+from encrypt import generate_keys, decrypt_message
+from flask import Flask, request, jsonify
+import json
+from llama_cpp import Llama
 import os
 import requests
+import rsa
 import time
-from flask import Flask, request, jsonify
 
-# Import Llama
-from llama_cpp import Llama
-import json
 
 app = Flask(__name__)
 
@@ -29,6 +30,11 @@ else:
 
     if llm is None:
         print("Error: Failed to initialize Llama model.")
+
+keys = {
+    'public_key': None,
+    'private_key': None
+}
 
 def create_models_directory():
     models_dir = 'models/'
@@ -152,4 +158,5 @@ def process_message():
 if __name__ == '__main__':
     models_dir = create_models_directory()
     download_file_if_not_exists(models_dir, URL)
+
     app.run(host='0.0.0.0', port=3000) # Flask app runs on port 3000 internally

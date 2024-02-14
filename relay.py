@@ -8,17 +8,15 @@ app = Flask(__name__)
 def index():
     return send_from_directory('static', 'index.html')
 
-@app.route('/favicon.ico')
-def favicon():
-    return send_from_directory(os.path.join(app.root_path, 'static'),
-                               'icon.ico', mimetype='image/vnd.microsoft.icon')  
+# Generic route for serving static files
+@app.route('/static/<path:path>')
+def serve_static(path):
+    return send_from_directory('static', path)
 
 @app.route('/inference', methods=['POST'])
 def inference():
     # Get JSON data from the incoming request
     data = request.get_json()
-
-    print(f"Received message: {data}")
 
     # Define the URL to which we will forward the request
     url = 'http://localhost:3000/'

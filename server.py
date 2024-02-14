@@ -148,8 +148,6 @@ def process_message():
 
         updated_chat_history = llama_cpp_get_response(chat_history)
 
-        print(f"Updated chat history: {json.dumps(updated_chat_history, indent=4)}")
-
         return jsonify(updated_chat_history)
     else:
         return 'Invalid request'

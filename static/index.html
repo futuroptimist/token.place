@@ -48,6 +48,7 @@
         }
         .assistant-message {
             text-align: left;
+            background-color: #e0e0e0; /* Slightly darker than user message */
         }
         /* Responsive styles */
         @media (max-width: 768px) {
@@ -69,6 +70,51 @@
                 display: none; /* Hide Vue.js elements until they are ready */
             }
         }
+
+        .input-container {
+            display: flex; /* This will align the input and button in a row */
+        }
+
+        .message-input {
+            flex-grow: 1; /* This will make the input field grow to fill the container */
+            padding: 10px;
+            margin-top: 10px;
+            border-top-left-radius: 4px; /* Rounded corners for the left side of the input field */
+            border-bottom-left-radius: 4px; /* Same as above */
+            border-right: none; /* Removes the right border to merge input and button visually */
+        }
+
+        .send-button {
+            padding: 10px;
+            margin-top: 10px;
+            border-top-right-radius: 4px; /* Rounded corners for the right side of the button */
+            border-bottom-right-radius: 4px; /* Same as above */
+            background-color: #e0e0e0; /* Bootstrap primary button color for example */
+            color: black;
+            border: 1px solid #000000; /* Same color as background for a solid look */
+            cursor: pointer; /* Changes the cursor to indicate the button is clickable */
+        }
+
+        .send-button:hover {
+            background-color: #0056b3; /* Darker shade for hover effect */
+        }
+
+        /* Responsive styles */
+        @media (max-width: 768px) {
+            .input-container {
+                flex-direction: column; /* Stack input and button on top of each other */
+            }
+
+            .message-input,
+            .send-button {
+                width: 100%; /* Full width in a stacked layout */
+                border-radius: 4px; /* Restore all-round rounded corners */
+            }
+
+            .send-button {
+                border-top: 1px solid #b9b9b9; /* Add top border to button when stacked */
+            }
+        }
     </style>
 </head>
 <body>
@@ -82,12 +128,15 @@
         <p>This project is completely open source (<a href="https://github.com/futuroptimist/token.place">Github repository</a>) and MIT licensed.</p>
         <hr>
         <h2>Chat Demo</h2>
-        <p>The following chat UI uses token.place. <strong>TRY IT OUT!!</strong> When API v1 is generally available, you can use it for your own Chat UIs, workflows, or projects, free of charge!</p>
+        <p>The following chat UI uses token.place. When API v1 is generally available, you can use it for your own Chat UIs, workflows, or projects, free of charge!</p>
         <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 {{ message.content }}
             </div>
-            <input type="text" v-model="newMessage" @keyup.enter="sendMessage" class="message-input">
+            <div class="input-container">
+                <input type="text" v-model="newMessage" @keyup.enter="sendMessage" class="message-input" placeholder="Type your message here...">
+                <button @click="sendMessage" class="send-button">Send</button>
+            </div>
         </div>
         <hr>
         <h2>API</h2>

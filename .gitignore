@@ -1,3 +1,4 @@
 env
 models
 models.bak
+__pycache__

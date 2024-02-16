@@ -143,7 +143,7 @@ def sink():
         known_servers[public_key] = {
             'public_key': public_key,
             'last_ping': datetime.now(),
-            'last_ping_duration': 10  # Example: Set initial backoff to 10 seconds
+            'last_ping_duration': 1  # Example: Set initial backoff to 10 seconds
         }
 
     response_data = {

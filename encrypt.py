@@ -36,11 +36,14 @@ def load_public_key(filename):
     with open(filename, 'rb') as f:
         return rsa.PublicKey.load_pkcs1(f.read())
 
-def encrypt_message(message, public_key):
+def encrypt_message(message_bytes, public_key):
     """
-    Encrypt a message with the public key
+    Encrypt a message with the public key.
+    :param message_bytes: Message in bytes to be encrypted.
+    :param public_key: The RSA public key object for encryption.
+    :return: Encrypted message as bytes.
     """
-    return rsa.encrypt(message.encode('utf8'), public_key)
+    return rsa.encrypt(message_bytes, public_key)
 
 def decrypt_message(encrypted_message, private_key):
     """
@@ -51,3 +54,11 @@ def decrypt_message(encrypted_message, private_key):
     except rsa.DecryptionError as e:
         print("Decryption failed:", e)
         return None
+    
+def public_key_from_pem(pem_str):
+    """
+    Load an RSA public key from a PEM string.
+    :param pem_str: The PEM string of the public key.
+    :return: The RSA public key object.
+    """
+    return rsa.PublicKey.load_pkcs1(pem_str.encode('utf-8'))

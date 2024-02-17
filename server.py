@@ -1,10 +1,12 @@
+import base64
 from flask import Flask, request, jsonify
 import json
 import os
 import requests
 import time
-from encrypt import generate_keys, encrypt_message, decrypt_message
+from encrypt import generate_keys, encrypt_message, decrypt_message, load_private_key, public_key_from_pem
 from llama_cpp import Llama
+from threading import Thread
 
 
 app = Flask(__name__)
@@ -30,8 +32,7 @@ else:
     if llm is None:
         print("Error: Failed to initialize Llama model.")
 
-_private_key, public_key = generate_keys()
-public_key = public_key.save_pkcs1().decode('utf-8')
+_private_key, _public_key = generate_keys()
 
 def create_models_directory():
     models_dir = 'models/'
@@ -108,31 +109,40 @@ def download_file_if_not_exists(models_dir, url):
         print(f"File {file_name} already exists.")
 
 def poll_relay():
+    """
+    Continuously polls the relay for incoming client requests, decrypts the chat history,
+    generates a response using the Llama model, encrypts the response, and sends it back.
+    """
     while True:
         try:
             response = requests.post('http://localhost:5000/sink', json={
-                'server_public_key': public_key,
+                'server_public_key': _public_key.save_pkcs1().decode('utf-8'),
             })
             if response.status_code == 200:
                 data = response.json()
                 if 'client_public_key' in data and 'chat_history' in data:
-                    print("Received chat history from client:", data['chat_history'][:50], "...")
-                    # Decrypt, process, and re-encrypt the chat history here
-                    decrypted_chat_history = decrypt_message(data['chat_history'], public_key)
-                    # Process the decrypted chat history with your model
-                    response_history = llama_cpp_get_response(json.loads(decrypted_chat_history))
-                    encrypted_response = encrypt_message(json.dumps(response_history), data['client_public_key'])
-                    response = requests.post('http://localhost:5000/source', json={
-                        'client_public_key': data['client_public_key'],
-                        'chat_history': encrypted_response,
-                    })
-                    if response.status_code != 200:
-                        print("Error from client:", response.status_code, response.text)
+                    print("Received request from /faucet.")
+                    encrypted_chat_history = base64.b64decode(data['chat_history'])
+                    decrypted_chat_history = decrypt_message(encrypted_chat_history, _private_key)
+                    
+                    if decrypted_chat_history:
+                        print("Successfully decrypted chat history from /faucet.")
+                        chat_history_obj = json.loads(decrypted_chat_history)
+                        response_history = llama_cpp_get_response(chat_history_obj)
+                        print(f"Generated response for /faucet: {response_history}")
+                        client_pub_key = public_key_from_pem(data['client_public_key'])
+                        encrypted_response = encrypt_message(json.dumps(response_history).encode('utf-8'), client_pub_key)
+                        encoded_encrypted_response = base64.b64encode(encrypted_response).decode('utf-8')
+                        requests.post('http://localhost:5000/source', json={
+                            'client_public_key': data['client_public_key'],
+                            'chat_history': encoded_encrypted_response,
+                        })
+                        print("Response sent to /faucet.")
+                    else:
+                        print("Decryption failed or chat history is invalid.")
                 else:
-                    print("no client request found in response:", data)
-
-                # Send the encrypted response back to the relay or directly to the client as needed
-                time.sleep(data.get('next_ping_in_x_seconds', 1))
+                    print("No client request found in response:", data)
+                time.sleep(data.get('next_ping_in_x_seconds', 10))
             else:
                 print("Error from relay:", response.status_code, response.text)
                 time.sleep(10)  # Back off on error
@@ -141,54 +151,31 @@ def poll_relay():
             time.sleep(10)  # Back off on exception
 
 def llama_cpp_get_response(chat_history):
-    """Get a response from the Llama model using the C++ API.
-
-    Args:
-        chat_history (list):    List of chat messages, consisting of at least 1 system message and one user message.
-
-    Returns:
-        list:   Updated chat history with the model's response appended.
-    """
-
-    # TODO: error handling for invalid chat_history
-
+    """Process chat history with the Llama model and generate a response."""
+    # This is a placeholder for your actual Llama model integration
+    # Replace with your actual model invocation logic
     try:
         response = llm.create_chat_completion(messages=chat_history)
-
-        # Check if the response is None or doesn't have the expected keys
-        if response is None or 'choices' not in response or not response['choices']:
-            raise ValueError("Received an invalid response from the Llama model.")
-
-        # The 'message' key is already a dictionary with 'role' and 'content'
-        assistant_message = response['choices'][0]['message']
-        
-        # Append the assistant's message to the chat history
-        chat_history.append(assistant_message)
-
+        if response and 'choices' in response and response['choices']:
+            assistant_message = response['choices'][0]['message']
+            chat_history.append(assistant_message)
     except Exception as e:
         print(f"Error during chat completion: {e}")
-    
     return chat_history
 
 @app.route('/', methods=['POST'])
 def process_message():
+    """Process incoming chat messages and return model responses."""
     if request.method == 'POST':
-        data = request.json
+        data = request.get_json()
         chat_history = data.get('chat_history', [])
-
         updated_chat_history = llama_cpp_get_response(chat_history)
-
         return jsonify(updated_chat_history)
     else:
         return 'Invalid request', 400
-     
 
 if __name__ == '__main__':
     models_dir = create_models_directory()
     download_file_if_not_exists(models_dir, URL)
-
-    # Start the relay polling in a separate thread or asynchronous task
-    from threading import Thread
     Thread(target=poll_relay, daemon=True).start()
-
-    app.run(host='0.0.0.0', port=3000) # Flask app runs on port 3000 internally
+    app.run(host='0.0.0.0', port=3000)

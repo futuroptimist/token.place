@@ -58,7 +58,8 @@ def decrypt_message(encrypted_message, private_key):
 def public_key_from_pem(pem_str):
     """
     Load an RSA public key from a PEM string.
-    :param pem_str: The PEM string of the public key.
+    :param pem_str: The PEM string of the public key, expected to be in bytes format.
     :return: The RSA public key object.
     """
-    return rsa.PublicKey.load_pkcs1(pem_str.encode('utf-8'))
+    # Directly pass the pem_str without encoding it
+    return rsa.PublicKey.load_pkcs1(pem_str)

@@ -9,6 +9,7 @@ known_servers = {}
 client_queue = []
 next_server_index = 0  # This will no longer be needed but kept for reference
 client_inference_requests = {}
+client_responses = {}
 
 @app.route('/')
 def index():
@@ -159,6 +160,40 @@ def sink():
         })
 
     return jsonify(response_data)
+
+@app.route('/source', methods=['POST'])
+def source():
+    """
+    Receives encrypted responses from the server and queues them for the client to retrieve.
+    """
+    data = request.get_json()
+    if not data or 'client_public_key' not in data or 'chat_history' not in data:
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    client_public_key = data['client_public_key']
+    encrypted_chat_history = data['chat_history']
+
+    # Store the response in the client_responses dictionary
+    client_responses[client_public_key] = encrypted_chat_history
+    return jsonify({'message': 'Response received and queued for client'}), 200
+
+@app.route('/retrieve', methods=['POST'])
+def retrieve():
+    """
+    Endpoint for clients to retrieve responses queued by the /source endpoint.
+    """
+    data = request.get_json()
+    if not data or 'client_public_key' not in data:
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    client_public_key = data['client_public_key']
+
+    # Check if there's a response for the given client public key
+    if client_public_key in client_responses:
+        encrypted_chat_history = client_responses.pop(client_public_key)
+        return jsonify({'chat_history': encrypted_chat_history}), 200
+    else:
+        return jsonify({'error': 'No response available for the given public key'}), 404
  
 if __name__ == '__main__':
     app.run(port=5000)  # Flask app runs on port 5000 internally

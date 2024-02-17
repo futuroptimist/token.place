@@ -1,6 +1,7 @@
 import requests
 import json
 import base64
+import time
 from encrypt import generate_keys, encrypt_message, decrypt_message, public_key_from_pem
 
 # Generate client RSA keys
@@ -46,6 +47,20 @@ def send_request_to_faucet(encrypted_chat_history, server_public_key):
     response = requests.post('http://localhost:5000/faucet', json=data)
     return response
 
+def retrieve_response():
+    """Poll the relay for a response until it's available."""
+    while True:
+        response = requests.post('http://localhost:5000/retrieve', json={"client_public_key": client_public_key_pem})
+        if response.status_code == 200:
+            data = response.json()
+            encrypted_chat_history = base64.b64decode(data['chat_history'])
+            decrypted_chat_history = decrypt_message(encrypted_chat_history, _private_key)
+            print("Response from AI:", decrypted_chat_history)
+            break
+        else:
+            print("Waiting for response...")
+            time.sleep(2)  # Wait a bit before trying again
+
 relay_url = 'http://localhost:5000/inference'
 chat_history = []
 
@@ -65,31 +80,12 @@ while True:
         # Encrypt chat history with server's public key
         encrypted_chat_history = encrypt_chat_history(chat_history, server_public_key)
         
-        # Send encrypted chat history to the faucet endpoint
+        # Send encrypted chat history to the faucet endpoint and wait for a response
         response_faucet = send_request_to_faucet(encrypted_chat_history, server_public_key)
-        if response_faucet.status_code != 200:
+        if response_faucet.status_code == 200:
+            print("Request sent successfully, waiting for response...")
+            retrieve_response()
+        else:
             print("Failed to send encrypted chat to faucet.")
 
-    # Continue to use the /inference endpoint as before
-    data = {
-        "message": user_message,
-        "chat_history": chat_history
-    }
-
-    # Send request to the /inference endpoint
-    try:
-        response = requests.post(relay_url, json=data)
-        if response.status_code == 200:
-            response_data = response.json()
-            
-            # Iterate through each message in the response
-            for message in response_data:
-                if message["role"] == "assistant":
-                    print("AI:", message["content"])
-                    break 
-
-        else:
-            print(f"Error {response.status_code}: The server encountered an issue.")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
 print("Goodbye!")

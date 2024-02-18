@@ -115,6 +115,64 @@
                 border-top: 1px solid #b9b9b9; /* Add top border to button when stacked */
             }
         }
+
+        body.light-mode {
+            background-color: #ffffff; /* Light background */
+            color: #000000; /* Dark text */
+        }
+
+        body.dark-mode {
+                background-color: #222222;
+                color: #ffffff; /* Light text */
+
+            .message {
+                background-color: #777777;
+                color: #CCCCCC;
+            }
+
+            .assistant-message {
+                background-color: #333333; /* Dark background */
+            }
+
+            a:link {
+                color: #00a0e4; /* Light blue for links */
+            }
+
+            a:visited {
+                color: #83a2af; /* Light blue for visited links */
+            }
+
+        }
+
+        .chat-container, .message {
+            transition: background-color 0.3s ease; /* Smooth transition for backgrounds */
+        }
+
+        /* Mode Toggle Button */
+        .mode-toggle-container {
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        #toggleMode {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            background-color: #009688; /* Teal background */
+            color: white; /* White text */
+        }
+
+        #toggleMode:hover {
+            background-color: #00796b; /* Darker teal on hover */
+        }
+
+        /* Responsive styles */
+        @media (max-width: 768px) {
+            /* Existing responsive styles */
+        }
     </style>
 </head>
 <body>
@@ -153,10 +211,48 @@
 
         <h3>Privacy Notice</h3>
         <p><strong>WARNING! Your converstation is reasonably private at this moment, and base privacy will become incrementally better over time. For enhanced privacy, consider self hosting by following the README on the Github repository.</strong></p>
+
+        
+        <div class="mode-toggle-container">
+            <button id="toggleMode">☀️🌙</button>
+        </div>
     </div>
 
     <!-- Vue.js -->
     <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
     <script src="/static/chat.js"></script>
+
+    <script>
+        // Wait for the DOM to load
+        document.addEventListener('DOMContentLoaded', function() {
+            const toggleModeButton = document.getElementById('toggleMode');
+            // Initial setting
+            let isDarkMode = false;
+            document.body.classList.add('light-mode');
+      
+            // Function to switch the theme
+            const switchTheme = () => {
+                if (isDarkMode) {
+                    document.body.classList.remove('dark-mode');
+                    document.body.classList.add('light-mode');
+                    toggleModeButton.textContent = '🌙 Toggle Light/Dark Mode'; // Moon emoji for dark mode
+                } else {
+                    document.body.classList.remove('light-mode');
+                    document.body.classList.add('dark-mode');
+                    toggleModeButton.textContent = '☀️ Toggle Light/Dark Mode'; // Sun emoji for light mode
+                }
+            };
+      
+            // Click event listener for the button
+            toggleModeButton.addEventListener('click', function() {
+                isDarkMode = !isDarkMode; // Toggle the state
+                switchTheme(); // Call the function to switch themes
+            });
+      
+            // Initialize the theme
+            switchTheme();
+        });
+      </script>
+
 </body>
 </html>

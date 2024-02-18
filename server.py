@@ -25,7 +25,7 @@ else:
     llm = Llama(
         model_path=model_path,
         n_gpu_layers=-1,
-        n_ctx=2048,
+        n_ctx=32000,
         chat_format="llama-2"
     )
 

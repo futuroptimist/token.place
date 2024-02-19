@@ -1,6 +1,7 @@
 from flask import Flask, send_from_directory, request, jsonify
 import requests
 from datetime import datetime
+import random
 
 app = Flask(__name__)
 
@@ -24,13 +25,12 @@ def serve_static(path):
 def next_server():
     """
     Endpoint for clients to get the next server to send a request to.
-    This allows the relay to load-balance requests across heterogeneous servers and clients.
+    This allows the relay to load-balance requests across heterogeneous servers and clients in a random manner.
 
     Returns: a json response with the following keys:
-        - server_public_key: the RSA-2048 public key of the next server to send a request to
+        - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
-    global next_server_index
     if not known_servers:
         return jsonify({
             'error': {
@@ -39,10 +39,8 @@ def next_server():
             }
         })
 
-    server_keys = list(known_servers.keys())
-    return_index = next_server_index
-    next_server_index = (next_server_index + 1) % len(server_keys)
-    server_public_key = server_keys[return_index]
+    # Select a server randomly
+    server_public_key = random.choice(list(known_servers.keys()))
     return jsonify({
         'server_public_key': known_servers[server_public_key]['public_key']
     })

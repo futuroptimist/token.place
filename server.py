@@ -4,7 +4,7 @@ import json
 import os
 import requests
 import time
-from encrypt import generate_keys, encrypt_message, decrypt_message, load_private_key, public_key_from_pem
+from encrypt import generate_keys, encrypt_message, decrypt_message, public_key_from_pem
 from llama_cpp import Llama
 from threading import Thread
 

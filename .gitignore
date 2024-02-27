@@ -2,3 +2,4 @@ env
 models
 models.bak
 __pycache__
+.env

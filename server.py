@@ -8,6 +8,11 @@ from encrypt import generate_keys, encrypt_message, decrypt_message, public_key_
 from llama_cpp import Llama
 from threading import Thread
 
+# Load the ENVIRONMENT variable from .env or set a default value
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
+
+# Set the base URL based on the ENVIRONMENT
+BASE_URL = 'https://token.place' if ENVIRONMENT == 'prod' else 'http://localhost:5000'
 
 app = Flask(__name__)
 

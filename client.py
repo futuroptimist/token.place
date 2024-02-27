@@ -2,6 +2,7 @@ import requests
 import json
 import base64
 import time
+import os
 from encrypt import generate_keys, encrypt_message, decrypt_message, public_key_from_pem
 
 # Generate client RSA keys
@@ -9,6 +10,12 @@ _private_key, _public_key = generate_keys()
 
 # Convert client's public key to PEM format for transmission
 client_public_key_pem = _public_key.save_pkcs1().decode('utf-8')
+
+# Use an environment variable to determine the environment
+environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
+
+# Choose the base URL based on the environment
+base_url = 'http://token.place' if environment == 'prod' else 'http://localhost:5000'
 
 def get_server_public_key():
     """Fetch the server's public key from the relay."""

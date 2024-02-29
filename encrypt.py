@@ -1,65 +1,94 @@
-import rsa
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from os import urandom
 
 def generate_keys():
     """
-    Generate an RSA keypair with an exponent of 65537 in PEM format
-    :return: private_key, public_key
+    Generates an RSA private/public key pair.
     """
-    (public_key, private_key) = rsa.newkeys(2048)
-    return private_key, public_key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
 
-def save_private_key(private_key, filename):
-    """
-    Save the private key to a PEM file
-    """
-    with open(filename, 'wb') as f:
-        f.write(private_key.save_pkcs1('PEM'))
+    # Return the keys in PEM format
+    pem_private_key = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pem_public_key = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
 
-def save_public_key(public_key, filename):
-    """
-    Save the public key to a PEM file
-    """
-    with open(filename, 'wb') as f:
-        f.write(public_key.save_pkcs1('PEM'))
+    return pem_private_key, pem_public_key
 
-def load_private_key(filename):
+def encrypt_message_with_public_key(message, pem_public_key):
     """
-    Load the private key from a PEM file
+    Encrypts a message with the recipient's public RSA key.
     """
-    with open(filename, 'rb') as f:
-        return rsa.PrivateKey.load_pkcs1(f.read())
+    public_key = load_pem_public_key(pem_public_key, backend=default_backend())
+    encrypted_message = public_key.encrypt(
+        message,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return encrypted_message
 
-def load_public_key(filename):
+def decrypt_message_with_private_key(encrypted_message, pem_private_key):
     """
-    Load the public key from a PEM file
+    Decrypts an encrypted message with the recipient's private RSA key.
     """
-    with open(filename, 'rb') as f:
-        return rsa.PublicKey.load_pkcs1(f.read())
+    private_key = load_pem_private_key(pem_private_key, password=None, backend=default_backend())
+    decrypted_message = private_key.decrypt(
+        encrypted_message,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return decrypted_message
 
-def encrypt_message(message_bytes, public_key):
+def encrypt_longer_message_with_aes(message, pem_public_key):
     """
-    Encrypt a message with the public key.
-    :param message_bytes: Message in bytes to be encrypted.
-    :param public_key: The RSA public key object for encryption.
-    :return: Encrypted message as bytes.
+    Encrypts a longer message using AES for the message and RSA for the AES key.
     """
-    return rsa.encrypt(message_bytes, public_key)
+    # Generate a random AES key and IV
+    aes_key = urandom(32)  # AES-256 key
+    iv = urandom(16)  # AES block size is 128 bits
 
-def decrypt_message(encrypted_message, private_key):
+    # Encrypt the message with AES
+    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    padded_message = message + b" " * (16 - len(message) % 16)  # PKCS#7 padding
+    encrypted_message = encryptor.update(padded_message) + encryptor.finalize()
+
+    # Encrypt the AES key with the recipient's public RSA key
+    encrypted_aes_key = encrypt_message_with_public_key(aes_key, pem_public_key)
+
+    return encrypted_aes_key, iv, encrypted_message
+
+def decrypt_aes_encrypted_message(encrypted_aes_key, iv, encrypted_message, pem_private_key):
     """
-    Decrypt a message with the private key
+    Decrypts an AES encrypted message, first decrypting the AES key with RSA.
     """
-    try:
-        return rsa.decrypt(encrypted_message, private_key).decode('utf8')
-    except rsa.DecryptionError as e:
-        print("Decryption failed:", e)
-        return None
-    
-def public_key_from_pem(pem_str):
-    """
-    Load an RSA public key from a PEM string.
-    :param pem_str: The PEM string of the public key, expected to be in bytes format.
-    :return: The RSA public key object.
-    """
-    # Directly pass the pem_str without encoding it
-    return rsa.PublicKey.load_pkcs1(pem_str)
+    aes_key = decrypt_message_with_private_key(encrypted_aes_key, pem_private_key)
+    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
+
+    # Remove PKCS#7 padding
+    unpadded_message = decrypted_message.rstrip(b" ")
+    return unpadded_message

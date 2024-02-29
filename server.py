@@ -4,7 +4,7 @@ import json
 import os
 import requests
 import time
-from encrypt import generate_keys, encrypt_message, decrypt_message, public_key_from_pem
+from encrypt import generate_keys, encrypt_message_with_public_key, decrypt_message_with_private_key, encrypt_longer_message_with_aes, decrypt_aes_encrypted_message
 from llama_cpp import Llama
 from threading import Thread
 
@@ -38,6 +38,8 @@ else:
         print("Error: Failed to initialize Llama model.")
 
 _private_key, _public_key = generate_keys()
+
+_public_key_b64 = base64.b64encode(_public_key).decode('utf-8')
 
 def create_models_directory():
     models_dir = 'models/'
@@ -114,46 +116,56 @@ def download_file_if_not_exists(models_dir, url):
         print(f"File {file_name} already exists.")
 
 def poll_relay():
-    """
-    Continuously polls the relay for incoming client requests, decrypts the chat history,
-    generates a response using the Llama model, encrypts the response, and sends it back.
-    """
     while True:
         try:
-            response = requests.post('http://localhost:5000/sink', json={
-                'server_public_key': _public_key.save_pkcs1().decode('utf-8'),
+            response = requests.post(f'{BASE_URL}/sink', json={
+                'server_public_key': _public_key_b64,
             })
             if response.status_code == 200:
                 data = response.json()
                 if 'client_public_key' in data and 'chat_history' in data:
-                    print("Received request from /faucet.")
-                    encrypted_chat_history = base64.b64decode(data['chat_history'])
-                    decrypted_chat_history = decrypt_message(encrypted_chat_history, _private_key)
-                    
-                    if decrypted_chat_history:
-                        print("Successfully decrypted chat history from /faucet.")
-                        chat_history_obj = json.loads(decrypted_chat_history)
-                        response_history = llama_cpp_get_response(chat_history_obj)
-                        print(f"Generated response for /faucet: {response_history}")
-                        client_pub_key = public_key_from_pem(data['client_public_key'])
-                        encrypted_response = encrypt_message(json.dumps(response_history).encode('utf-8'), client_pub_key)
-                        encoded_encrypted_response = base64.b64encode(encrypted_response).decode('utf-8')
-                        requests.post('http://localhost:5000/source', json={
-                            'client_public_key': data['client_public_key'],
-                            'chat_history': encoded_encrypted_response,
-                        })
-                        print("Response sent to /faucet.")
-                    else:
-                        print("Decryption failed or chat history is invalid.")
-                else:
-                    print("No client request found in response:", data)
+                    encrypted_chat_history_b64 = data['chat_history']
+
+                    print("Encoded chat history length:", len(encrypted_chat_history_b64))
+                    # Adjust the padding if necessary
+                    if len(encrypted_chat_history_b64) % 4 != 0:
+                        encrypted_chat_history_b64 += '=' * (4 - len(encrypted_chat_history_b64) % 4)
+
+                    try:
+                        encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
+                    except Exception as e:
+                        print(f"Exception decoding base64 data: {e}")
+                        continue
+
+                    try:
+                        encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
+                    except Exception as e:
+                        print(f"Exception decoding base64 data: {e}")
+                        continue
+
+                    decrypted_chat_history = decrypt_message_with_private_key(encrypted_chat_history, _private_key)
+                    chat_history_obj = json.loads(decrypted_chat_history)
+                    response_history = llama_cpp_get_response(chat_history_obj)
+                    client_pub_key_b64 = data['client_public_key']
+                    encrypted_aes_key, iv, encrypted_response = encrypt_longer_message_with_aes(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
+                    encrypted_response_b64 = base64.b64encode(encrypted_response).decode('utf-8')
+                    encrypted_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
+                    iv_b64 = base64.b64encode(iv).decode('utf-8')
+
+                    requests.post(f'{BASE_URL}/source', json={
+                        'client_public_key': client_pub_key_b64,
+                        'encrypted_aes_key': encrypted_aes_key_b64,
+                        'iv': iv_b64,
+                        'chat_history': encrypted_response_b64,
+                    })
+                    print("Response sent.")
                 time.sleep(data.get('next_ping_in_x_seconds', 10))
             else:
                 print("Error from relay:", response.status_code, response.text)
-                time.sleep(10)  # Back off on error
+                time.sleep(10)
         except Exception as e:
-            print("Exception during polling:", e)
-            time.sleep(10)  # Back off on exception
+            print(f"Exception during polling: {e}")
+            time.sleep(10)
 
 def llama_cpp_get_response(chat_history):
     """Process chat history with the Llama model and generate a response."""
@@ -173,11 +185,19 @@ def process_message():
     """Process incoming chat messages and return model responses."""
     if request.method == 'POST':
         data = request.get_json()
+        # Validate if 'chat_history' key exists in the request data
+        if 'chat_history' not in data:
+            return jsonify({'error': 'Invalid request format'}), 400
         chat_history = data.get('chat_history', [])
         updated_chat_history = llama_cpp_get_response(chat_history)
         return jsonify(updated_chat_history)
     else:
-        return 'Invalid request', 400
+        return jsonify({'error': 'Method not allowed'}), 405
+    
+@app.errorhandler(405)
+def method_not_allowed(error):
+    """Custom error handler for Method Not Allowed (405) errors."""
+    return jsonify({'error': 'Method not allowed'}), 405
 
 if __name__ == '__main__':
     models_dir = create_models_directory()

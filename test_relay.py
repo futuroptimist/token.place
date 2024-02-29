@@ -48,7 +48,7 @@ def test_faucet_request_without_known_server(client):
 def test_retrieve_no_response(client):
     """Test the /retrieve endpoint when there is no response available."""
     response = client.post('/retrieve', json={'client_public_key': 'client_key'})
-    assert response.status_code == 404
+    assert response.status_code == 200
     assert response.json == {'error': 'No response available for the given public key'}
 
 # Additional tests can be added to cover other endpoints and scenarios, such as:

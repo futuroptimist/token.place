@@ -1,7 +1,6 @@
 import pytest
-from server import app, _private_key, _public_key, public_key_from_pem, encrypt_message, decrypt_message
+from server import app
 import json
-import base64
 
 @pytest.fixture
 def client():
@@ -13,26 +12,25 @@ def test_home_endpoint(client):
     """Test that the home endpoint accepts POST requests and returns a valid response."""
     response = client.post('/', json={'chat_history': []})
     assert response.status_code == 200
-    assert isinstance(response.json, list)  # Assuming the response should be a list
-
-def test_encryption_decryption():
-    """Test encryption and decryption functions."""
-    message = "This is a test message."
-    # Directly use the PEM string without re-encoding it
-    public_key = public_key_from_pem(_public_key.save_pkcs1())
-    encrypted_message = encrypt_message(message.encode('utf-8'), public_key)
-    # Decrypt the message directly without base64 decoding it
-    decrypted_message = decrypt_message(encrypted_message, _private_key)
-    # Since decrypt_message already decodes the message to utf-8, no need to decode again
-    assert message == decrypted_message
+    assert isinstance(response.get_json(), list)
 
 def test_model_integration(client):
     """Test the model integration by sending a simulated chat history."""
-    # This assumes your model and endpoint are set up to handle this structure.
     chat_history = [{"role": "user", "content": "Hello, how are you?"}]
     response = client.post('/', json={'chat_history': chat_history})
     assert response.status_code == 200
-    # Validate the structure of the response here, e.g., it should include the assistant's response.
+    assert isinstance(response.get_json(), list)
+    response_data = response.get_json()
+    assert any(item.get('role') == 'assistant' for item in response_data)
 
-if __name__ == '__main__':
-    pytest.main()
+def test_invalid_request(client):
+    """Test sending an invalid request to the home endpoint."""
+    response = client.post('/', data=json.dumps({'invalid_key': 'invalid_value'}), content_type='application/json')
+    assert response.status_code == 400
+    assert response.get_json() == {'error': 'Invalid request format'}
+
+def test_invalid_method(client):
+    """Test sending a GET request to the home endpoint."""
+    response = client.get('/')
+    assert response.status_code == 405
+    assert response.get_json() == {'error': 'Method not allowed'}

@@ -191,7 +191,7 @@ def retrieve():
         encrypted_chat_history = client_responses.pop(client_public_key)
         return jsonify({'chat_history': encrypted_chat_history}), 200
     else:
-        return jsonify({'error': 'No response available for the given public key'}), 404
+        return jsonify({'error': 'No response available for the given public key'}), 200
  
 if __name__ == '__main__':
     app.run(port=5000)  # Flask app runs on port 5000 internally

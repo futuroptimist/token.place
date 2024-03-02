@@ -195,7 +195,7 @@ def process_message():
         return jsonify({'error': 'Method not allowed'}), 405
     
 @app.errorhandler(405)
-def method_not_allowed(error):
+def method_not_allowed(_):
     """Custom error handler for Method Not Allowed (405) errors."""
     return jsonify({'error': 'Method not allowed'}), 405
 

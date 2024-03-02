@@ -74,24 +74,29 @@ def retrieve_response():
 relay_url = 'http://localhost:5000/inference'
 chat_history = []
 
-print("Welcome to the Chat Client!")
-print("Type your messages and press Enter to send. Type 'exit' to quit.")
+def main():
+    print("Welcome to the Chat Client!")
+    print("Type your messages and press Enter to send. Type 'exit' to quit.")
+    chat_history = []
 
-while True:
-    user_message = input("You: ")
-    if user_message.lower() == 'exit':
-        break
+    while True:
+        user_message = input("You: ")
+        if user_message.lower() == 'exit':
+            break
 
-    chat_history.append({"role": "user", "content": user_message})
+        chat_history.append({"role": "user", "content": user_message})
 
-    server_public_key = get_server_public_key()
-    if server_public_key:
-        encrypted_aes_key, iv, encrypted_chat_history = encrypt_chat_history(chat_history, server_public_key)
-        response_faucet = send_request_to_faucet(encrypted_aes_key, iv, encrypted_chat_history, base64.b64encode(server_public_key).decode('utf-8'))
-        if response_faucet.status_code == 200:
-            print("Request sent successfully, waiting for response...")
-            retrieve_response()
-        else:
-            print("Failed to send encrypted chat to faucet.")
+        server_public_key = get_server_public_key()
+        if server_public_key:
+            encrypted_aes_key, iv, encrypted_chat_history = encrypt_chat_history(chat_history, server_public_key)
+            response_faucet = send_request_to_faucet(encrypted_aes_key, iv, encrypted_chat_history, base64.b64encode(server_public_key).decode('utf-8'))
+            if response_faucet.status_code == 200:
+                print("Request sent successfully, waiting for response...")
+                retrieve_response()
+            else:
+                print("Failed to send encrypted chat to faucet.")
 
-print("Goodbye!")
+    print("Goodbye!")
+
+if __name__ == "__main__":
+    main()

@@ -45,7 +45,7 @@ def next_server():
         'server_public_key': known_servers[server_public_key]['public_key']
     })
 
-# deprecated; use request_inference instead
+# deprecated; use /faucet instead
 @app.route('/inference', methods=['POST'])
 def inference():
     # Get JSON data from the incoming request

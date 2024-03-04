@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from os import urandom
+import base64
 
 def generate_keys():
     """
@@ -92,3 +93,35 @@ def decrypt_aes_encrypted_message(encrypted_aes_key, iv, encrypted_message, pem_
     # Remove PKCS#7 padding
     unpadded_message = decrypted_message.rstrip(b" ")
     return unpadded_message
+
+def safe_base64_encode(data):
+    """Encode data in base64, ensuring padding is correct."""
+    return base64.b64encode(data).decode('utf-8')
+
+def safe_base64_decode(data_b64):
+    """Decode base64 data, correctly handling padding."""
+    padded_data_b64 = data_b64 + '=' * (-len(data_b64) % 4)
+    return base64.b64decode(padded_data_b64)
+
+def encrypt_and_encode_message_with_public_key(message, pem_public_key):
+    """Encrypt a message with public key and encode the result in base64."""
+    encrypted_message = encrypt_message_with_public_key(message, pem_public_key)
+    return safe_base64_encode(encrypted_message)
+
+def decode_and_decrypt_message_with_private_key(encrypted_message_b64, pem_private_key):
+    """Decode a base64 encrypted message and decrypt it with a private key."""
+    encrypted_message = safe_base64_decode(encrypted_message_b64)
+    return decrypt_message_with_private_key(encrypted_message, pem_private_key)
+
+def encrypt_and_encode_longer_message_with_aes(message, pem_public_key):
+    """Encrypt a longer message with AES, encrypt the AES key with RSA, and encode all parts in base64."""
+    encrypted_aes_key, iv, encrypted_message = encrypt_longer_message_with_aes(message, pem_public_key)
+    return (safe_base64_encode(encrypted_aes_key), safe_base64_encode(iv), safe_base64_encode(encrypted_message))
+
+def decode_and_decrypt_aes_encrypted_message(encrypted_aes_key_b64, iv_b64, encrypted_message_b64, pem_private_key):
+    """Decode the base64 encoded parts of an AES encrypted message and decrypt."""
+    encrypted_aes_key = safe_base64_decode(encrypted_aes_key_b64)
+    iv = safe_base64_decode(iv_b64)
+    encrypted_message = safe_base64_decode(encrypted_message_b64)
+    decrypted_message = decrypt_aes_encrypted_message(encrypted_aes_key, iv, encrypted_message, pem_private_key)
+    return decrypted_message

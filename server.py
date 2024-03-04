@@ -4,7 +4,12 @@ import json
 import os
 import requests
 import time
-from encrypt import generate_keys, encrypt_message_with_public_key, decrypt_message_with_private_key, encrypt_longer_message_with_aes, decrypt_aes_encrypted_message
+from encrypt import (
+    generate_keys, 
+    encrypt_and_encode_longer_message_with_aes, 
+    decode_and_decrypt_message_with_private_key, 
+    decode_and_decrypt_aes_encrypted_message
+)
 from llama_cpp import Llama
 from threading import Thread
 
@@ -118,47 +123,29 @@ def download_file_if_not_exists(models_dir, url):
 def poll_relay():
     while True:
         try:
-            response = requests.post(f'{BASE_URL}/sink', json={
-                'server_public_key': _public_key_b64,
-            })
+            response = requests.post(f'{BASE_URL}/sink', json={'server_public_key': _public_key_b64})
             if response.status_code == 200:
                 data = response.json()
                 if 'client_public_key' in data and 'chat_history' in data:
                     encrypted_chat_history_b64 = data['chat_history']
 
-                    print("Encoded chat history length:", len(encrypted_chat_history_b64))
-                    # Adjust the padding if necessary
-                    if len(encrypted_chat_history_b64) % 4 != 0:
-                        encrypted_chat_history_b64 += '=' * (4 - len(encrypted_chat_history_b64) % 4)
-
                     try:
-                        encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
+                        decrypted_chat_history = decode_and_decrypt_message_with_private_key(encrypted_chat_history_b64, _private_key)
+                        chat_history_obj = json.loads(decrypted_chat_history)
+                        response_history = llama_cpp_get_response(chat_history_obj)
+                        client_pub_key_b64 = data['client_public_key']
+                        encrypted_aes_key_b64, iv_b64, encrypted_response_b64 = encrypt_and_encode_longer_message_with_aes(
+                            json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
+                        
+                        requests.post(f'{BASE_URL}/source', json={
+                            'client_public_key': client_pub_key_b64,
+                            'encrypted_aes_key': encrypted_aes_key_b64,
+                            'iv': iv_b64,
+                            'chat_history': encrypted_response_b64,
+                        })
+                        print("Response sent.")
                     except Exception as e:
-                        print(f"Exception decoding base64 data: {e}")
-                        continue
-
-                    try:
-                        encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
-                    except Exception as e:
-                        print(f"Exception decoding base64 data: {e}")
-                        continue
-
-                    decrypted_chat_history = decrypt_message_with_private_key(encrypted_chat_history, _private_key)
-                    chat_history_obj = json.loads(decrypted_chat_history)
-                    response_history = llama_cpp_get_response(chat_history_obj)
-                    client_pub_key_b64 = data['client_public_key']
-                    encrypted_aes_key, iv, encrypted_response = encrypt_longer_message_with_aes(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
-                    encrypted_response_b64 = base64.b64encode(encrypted_response).decode('utf-8')
-                    encrypted_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
-                    iv_b64 = base64.b64encode(iv).decode('utf-8')
-
-                    requests.post(f'{BASE_URL}/source', json={
-                        'client_public_key': client_pub_key_b64,
-                        'encrypted_aes_key': encrypted_aes_key_b64,
-                        'iv': iv_b64,
-                        'chat_history': encrypted_response_b64,
-                    })
-                    print("Response sent.")
+                        print(f"Exception handling message: {e}")
                 time.sleep(data.get('next_ping_in_x_seconds', 10))
             else:
                 print("Error from relay:", response.status_code, response.text)

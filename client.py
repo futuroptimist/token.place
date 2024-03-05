@@ -45,7 +45,7 @@ def send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64):
     response = requests.post(f'{base_url}/faucet', json=data)
     return response
 
-def retrieve_response():
+def retrieve_response(encrypted_cipherkey_b64):
     while True:
         response = requests.post(f'{base_url}/retrieve', json={"client_public_key": _public_key_b64})
         if response.status_code == 200:
@@ -53,7 +53,8 @@ def retrieve_response():
             if 'chat_history' in data:
                 encrypted_chat_history_b64 = data['chat_history']
                 encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
-                decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history}, None, _private_key)
+                cipherkey = base64.b64decode(encrypted_cipherkey_b64)
+                decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history}, cipherkey, _private_key)
                 print("Response from AI:", decrypted_chat_history.decode('utf-8'))
                 break
             else:
@@ -80,12 +81,13 @@ def main():
 
         server_public_key = get_server_public_key()
         if server_public_key:
-            ciphertext, _ = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+            ciphertext, cipherkey = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
             encrypted_chat_history_b64 = base64.b64encode(ciphertext['ciphertext']).decode('utf-8')
-            response_faucet = send_request_to_faucet(encrypted_chat_history_b64, base64.b64encode(server_public_key).decode('utf-8'))
+            encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
+            response_faucet = send_request_to_faucet(encrypted_chat_history_b64, base64.b64encode(server_public_key).decode('utf-8'), encrypted_cipherkey_b64)
             if response_faucet.status_code == 200:
                 print("Request sent successfully, waiting for response...")
-                retrieve_response()
+                retrieve_response(encrypted_cipherkey_b64)
             else:
                 print("Failed to send encrypted chat to faucet.")
 

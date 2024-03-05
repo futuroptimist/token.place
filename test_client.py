@@ -2,7 +2,8 @@ import unittest
 from unittest.mock import patch, MagicMock
 import base64
 import json
-from client import get_server_public_key, encrypt_chat_history, send_request_to_faucet, retrieve_response
+from client import get_server_public_key, send_request_to_faucet, retrieve_response, encrypt
+from encrypt import generate_keys
 
 class TestClient(unittest.TestCase):
 
@@ -29,18 +30,31 @@ class TestClient(unittest.TestCase):
         server_public_key = get_server_public_key()
         self.assertIsNone(server_public_key)
 
-    @patch('client.encrypt_longer_message_with_aes')
-    def test_encrypt_chat_history(self, mock_encrypt):
-        mock_encrypt.return_value = (b'encrypted_aes_key', b'iv', b'encrypted_message')
-        chat_history = [{'role': 'user', 'content': 'Hello'}]
-        server_public_key = b'MockServerPublicKey'
+    @patch('client.requests.post')
+    def test_send_request_to_faucet(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
 
-        encrypted_aes_key, iv, encrypted_chat_history = encrypt_chat_history(chat_history, server_public_key)
-        self.assertEqual(encrypted_aes_key, b'encrypted_aes_key')
-        self.assertEqual(iv, b'iv')
-        self.assertEqual(encrypted_chat_history, b'encrypted_message')
+        encrypted_chat_history_b64 = base64.b64encode(b'encrypted_chat_history').decode('utf-8')
+        server_public_key_b64 = base64.b64encode(b'MockServerPublicKey').decode('utf-8')
+        response = send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64)
+        self.assertEqual(response.status_code, 200)
 
-    # Additional tests for send_request_to_faucet and retrieve_response would follow a similar pattern
+    def test_encrypt_with_server_public_key_bytes(self):
+        # Generate a valid public key in PEM format
+        _, server_public_key = generate_keys()
+
+        # Mock the chat history
+        chat_history = [{"role": "user", "content": "Hello"}]
+
+        # Call the encrypt function with the generated server's public key and chat history
+        ciphertext, _ = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+
+        # Assert that the ciphertext is not None
+        self.assertIsNotNone(ciphertext)
+
+    # Additional tests for retrieve_response would follow a similar pattern
 
 if __name__ == '__main__':
     unittest.main()

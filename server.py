@@ -4,12 +4,7 @@ import json
 import os
 import requests
 import time
-from encrypt import (
-    generate_keys, 
-    encrypt_and_encode_longer_message_with_aes, 
-    decode_and_decrypt_message_with_private_key, 
-    decode_and_decrypt_aes_encrypted_message
-)
+from encrypt import encrypt, decrypt, generate_keys
 from llama_cpp import Llama
 from threading import Thread
 
@@ -128,19 +123,26 @@ def poll_relay():
                 data = response.json()
                 if 'client_public_key' in data and 'chat_history' in data:
                     encrypted_chat_history_b64 = data['chat_history']
+                    print("Received chat history from client.")
 
                     try:
-                        decrypted_chat_history = decode_and_decrypt_message_with_private_key(encrypted_chat_history_b64, _private_key)
+                        encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64)}
+                        decrypted_chat_history = decrypt(encrypted_chat_history_dict, None, _private_key)
+                        
+                        if decrypted_chat_history is None:
+                            print("Decryption failed. Skipping this message.")
+                            continue
+
                         chat_history_obj = json.loads(decrypted_chat_history)
                         response_history = llama_cpp_get_response(chat_history_obj)
                         client_pub_key_b64 = data['client_public_key']
-                        encrypted_aes_key_b64, iv_b64, encrypted_response_b64 = encrypt_and_encode_longer_message_with_aes(
-                            json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
+                        encrypted_response, _ = encrypt(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
+                        encrypted_response_b64 = base64.b64encode(encrypted_response['ciphertext']).decode('utf-8')
+
+                        print("Sending response...")
                         
                         requests.post(f'{BASE_URL}/source', json={
                             'client_public_key': client_pub_key_b64,
-                            'encrypted_aes_key': encrypted_aes_key_b64,
-                            'iv': iv_b64,
                             'chat_history': encrypted_response_b64,
                         })
                         print("Response sent.")

@@ -1,12 +1,19 @@
 import pytest
 from server import app
 import json
+from encrypt import generate_keys
 
 @pytest.fixture
 def client():
     app.config['TESTING'] = True
     with app.test_client() as client:
         yield client
+
+@pytest.fixture(autouse=True)
+def mock_keys(monkeypatch):
+    def mock_generate_keys():
+        return b'mock_private_key', b'mock_public_key'
+    monkeypatch.setattr('server.generate_keys', mock_generate_keys)
 
 def test_home_endpoint(client):
     """Test that the home endpoint accepts POST requests and returns a valid response."""

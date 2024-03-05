@@ -1,22 +1,32 @@
+# Made with help from https://www.youtube.com/watch?v=pOx2TYwR590
+# Github: https://github.com/cgossi/fundamental_cryptography_with_python
+
+import os
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from os import urandom
-import base64
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asymmetric_padding
+from cryptography.hazmat.primitives.serialization import load_pem_public_key, load_pem_private_key
+from cryptography.hazmat.primitives.ciphers import Cipher
+from cryptography.hazmat.primitives.ciphers.algorithms import AES
+from cryptography.hazmat.primitives.ciphers.modes import CBC
+from cryptography.hazmat.primitives.hashes import SHA256
 
 def generate_keys():
     """
     Generates an RSA private/public key pair.
+
+    Returns:
+        pem_private_key (bytes): The private key in PEM format.
+        pem_public_key (bytes): The public key in PEM format.
     """
+
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
         backend=default_backend()
     )
+
     public_key = private_key.public_key()
 
     # Return the keys in PEM format
@@ -25,6 +35,7 @@ def generate_keys():
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
+
     pem_public_key = public_key.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -32,96 +43,74 @@ def generate_keys():
 
     return pem_private_key, pem_public_key
 
-def encrypt_message_with_public_key(message, pem_public_key):
+def encrypt(plaintext, public_key_bytes):
     """
-    Encrypts a message with the recipient's public RSA key.
+    Encrypt the plaintext using the provided public key. RSA encryption is used to share the
+    AES key and IV, and AES encryption is used to encrypt the plaintext.
+
+    Args:
+        plaintext (bytes): The plaintext to encrypt.
+        public_key_bytes (bytes): The public key in PEM format.
+
+    Returns:
+        ciphertext (Dict): A dictionary containing the IV, and ciphertext.
+        cipherkey (bytes): The AES key encrypted with the public key.
     """
-    public_key = load_pem_public_key(pem_public_key, backend=default_backend())
-    encrypted_message = public_key.encrypt(
-        message,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-    return encrypted_message
 
-def decrypt_message_with_private_key(encrypted_message, pem_private_key):
+    public_key = load_pem_public_key(public_key_bytes)
+
+    pkcs7_padder = padding.PKCS7(AES.block_size).padder()
+    padded_plaintext = pkcs7_padder.update(plaintext) + pkcs7_padder.finalize()
+
+    # Generate new random AES-256 key
+    key = os.urandom(256 // 8)
+
+    # Generate new random 128 IV required for CBC mode
+    iv = os.urandom(128 // 8)
+
+    # AES CBC Cipher
+    aes_cbc_cipher = Cipher(AES(key), CBC(iv))
+
+    # Encrypt padded plaintext
+    ciphertext = aes_cbc_cipher.encryptor().update(padded_plaintext)
+
+    # Encrypt AES key
+    oaep_padding = asymmetric_padding.OAEP(mgf=asymmetric_padding.MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None)
+    cipherkey = public_key.encrypt(key, oaep_padding)
+
+    return {'iv': iv, 'ciphertext': ciphertext}, cipherkey
+
+def decrypt(ciphertext, cipherkey, private_key_bytes):
     """
-    Decrypts an encrypted message with the recipient's private RSA key.
+    Decrypt the ciphertext using the provided cipherkey and private key.
+
+    Args:
+        ciphertext (Dict): A dictionary containing the IV, and ciphertext.
+        cipherkey (bytes): The AES key encrypted with the public key.
+        private_key_bytes (bytes): The private key in PEM format.
+
+    Returns:
+        plaintext (bytes): The decrypted plaintext.
     """
-    private_key = load_pem_private_key(pem_private_key, password=None, backend=default_backend())
-    decrypted_message = private_key.decrypt(
-        encrypted_message,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-    return decrypted_message
 
-def encrypt_longer_message_with_aes(message, pem_public_key):
-    """
-    Encrypts a longer message using AES for the message and RSA for the AES key.
-    """
-    # Generate a random AES key and IV
-    aes_key = urandom(32)  # AES-256 key
-    iv = urandom(16)  # AES block size is 128 bits
+    try:
+        private_key = load_pem_private_key(private_key_bytes, password=None)
 
-    # Encrypt the message with AES
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    padded_message = message + b" " * (16 - len(message) % 16)  # PKCS#7 padding
-    encrypted_message = encryptor.update(padded_message) + encryptor.finalize()
+        # Decrypt AES key
+        oaep_padding = asymmetric_padding.OAEP(mgf=asymmetric_padding.MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None)
+        key = private_key.decrypt(cipherkey, oaep_padding)
 
-    # Encrypt the AES key with the recipient's public RSA key
-    encrypted_aes_key = encrypt_message_with_public_key(aes_key, pem_public_key)
+        # AES CBC Cipher
+        aes_cbc_cipher = Cipher(AES(key), CBC(ciphertext['iv']))
 
-    return encrypted_aes_key, iv, encrypted_message
+        # Decrypt ciphertext
+        padded_plaintext = aes_cbc_cipher.decryptor().update(ciphertext['ciphertext'])
 
-def decrypt_aes_encrypted_message(encrypted_aes_key, iv, encrypted_message, pem_private_key):
-    """
-    Decrypts an AES encrypted message, first decrypting the AES key with RSA.
-    """
-    aes_key = decrypt_message_with_private_key(encrypted_aes_key, pem_private_key)
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
+        # Remove padding
+        pkcs7_unpadder = padding.PKCS7(AES.block_size).unpadder()
+        plaintext = pkcs7_unpadder.update(padded_plaintext) + pkcs7_unpadder.finalize()
 
-    # Remove PKCS#7 padding
-    unpadded_message = decrypted_message.rstrip(b" ")
-    return unpadded_message
-
-def safe_base64_encode(data):
-    """Encode data in base64, ensuring padding is correct."""
-    return base64.b64encode(data).decode('utf-8')
-
-def safe_base64_decode(data_b64):
-    """Decode base64 data, correctly handling padding."""
-    padded_data_b64 = data_b64 + '=' * (-len(data_b64) % 4)
-    return base64.b64decode(padded_data_b64)
-
-def encrypt_and_encode_message_with_public_key(message, pem_public_key):
-    """Encrypt a message with public key and encode the result in base64."""
-    encrypted_message = encrypt_message_with_public_key(message, pem_public_key)
-    return safe_base64_encode(encrypted_message)
-
-def decode_and_decrypt_message_with_private_key(encrypted_message_b64, pem_private_key):
-    """Decode a base64 encrypted message and decrypt it with a private key."""
-    encrypted_message = safe_base64_decode(encrypted_message_b64)
-    return decrypt_message_with_private_key(encrypted_message, pem_private_key)
-
-def encrypt_and_encode_longer_message_with_aes(message, pem_public_key):
-    """Encrypt a longer message with AES, encrypt the AES key with RSA, and encode all parts in base64."""
-    encrypted_aes_key, iv, encrypted_message = encrypt_longer_message_with_aes(message, pem_public_key)
-    return (safe_base64_encode(encrypted_aes_key), safe_base64_encode(iv), safe_base64_encode(encrypted_message))
-
-def decode_and_decrypt_aes_encrypted_message(encrypted_aes_key_b64, iv_b64, encrypted_message_b64, pem_private_key):
-    """Decode the base64 encoded parts of an AES encrypted message and decrypt."""
-    encrypted_aes_key = safe_base64_decode(encrypted_aes_key_b64)
-    iv = safe_base64_decode(iv_b64)
-    encrypted_message = safe_base64_decode(encrypted_message_b64)
-    decrypted_message = decrypt_aes_encrypted_message(encrypted_aes_key, iv, encrypted_message, pem_private_key)
-    return decrypted_message
+        return plaintext
+    except Exception as e:
+        print(f"Exception during decryption: {e}")
+        return None

@@ -1,6 +1,5 @@
 import pytest
-from encrypt import generate_keys, encrypt_message_with_public_key, decrypt_message_with_private_key
-import os
+from encrypt import generate_keys, encrypt, decrypt
 
 def test_generate_keys():
     private_key, public_key = generate_keys()
@@ -10,8 +9,8 @@ def test_generate_keys():
 def test_encrypt_decrypt():
     private_key, public_key = generate_keys()
     message = "This is a test message."
-    encrypted_message = encrypt_message_with_public_key(message.encode('utf-8'), public_key)
-    decrypted_message = decrypt_message_with_private_key(encrypted_message, private_key)
+    ciphertext, cipherkey = encrypt(message.encode('utf-8'), public_key)
+    decrypted_message = decrypt(ciphertext, cipherkey, private_key)
     
     # Ensure the decrypted message matches the original message
     assert message == decrypted_message.decode('utf-8')
@@ -24,8 +23,8 @@ def test_encrypt_decrypt():
 ])
 def test_encrypt_decrypt_various_messages(message):
     private_key, public_key = generate_keys()
-    encrypted_message = encrypt_message_with_public_key(message.encode('utf-8'), public_key)
-    decrypted_message = decrypt_message_with_private_key(encrypted_message, private_key)
+    ciphertext, cipherkey = encrypt(message.encode('utf-8'), public_key)
+    decrypted_message = decrypt(ciphertext, cipherkey, private_key)
     
     # Ensure the decrypted message matches the original message
     assert message == decrypted_message.decode('utf-8')

@@ -3,7 +3,7 @@ import json
 import base64
 import time
 import os
-from encrypt import generate_keys, encrypt_longer_message_with_aes, decrypt_aes_encrypted_message
+from encrypt import generate_keys, encrypt, decrypt
 
 
 # Generate client RSA keys
@@ -35,17 +35,11 @@ def encrypt_chat_history(chat_history, server_public_key):
     encrypted_aes_key, iv, encrypted_message = encrypt_longer_message_with_aes(message_bytes, server_public_key)
     return encrypted_aes_key, iv, encrypted_message
 
-def send_request_to_faucet(encrypted_aes_key, iv, encrypted_chat_history, server_public_key_b64):
+def send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64):
     """Send the encrypted chat history to the faucet endpoint."""
-    encrypted_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
-    iv_b64 = base64.b64encode(iv).decode('utf-8')
-    encrypted_chat_history_b64 = base64.b64encode(encrypted_chat_history).decode('utf-8')
-
     data = {
         "client_public_key": _public_key_b64,
         "server_public_key": server_public_key_b64,
-        "encrypted_aes_key": encrypted_aes_key_b64,
-        "iv": iv_b64,
         "chat_history": encrypted_chat_history_b64
     }
     response = requests.post(f'{base_url}/faucet', json=data)
@@ -56,12 +50,10 @@ def retrieve_response():
         response = requests.post(f'{base_url}/retrieve', json={"client_public_key": _public_key_b64})
         if response.status_code == 200:
             data = response.json()
-            if 'encrypted_aes_key' in data and 'iv' in data and 'chat_history' in data:
-                encrypted_aes_key_b64 = data['encrypted_aes_key']
-                iv_b64 = data['iv']
+            if 'chat_history' in data:
                 encrypted_chat_history_b64 = data['chat_history']
-                # Decryption logic...
-                decrypted_chat_history = decrypt_aes_encrypted_message(encrypted_chat_history_b64, encrypted_aes_key_b64, iv_b64)
+                encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
+                decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history}, None, _private_key)
                 print("Response from AI:", decrypted_chat_history.decode('utf-8'))
                 break
             else:
@@ -88,8 +80,9 @@ def main():
 
         server_public_key = get_server_public_key()
         if server_public_key:
-            encrypted_aes_key, iv, encrypted_chat_history = encrypt_chat_history(chat_history, server_public_key)
-            response_faucet = send_request_to_faucet(encrypted_aes_key, iv, encrypted_chat_history, base64.b64encode(server_public_key).decode('utf-8'))
+            ciphertext, _ = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+            encrypted_chat_history_b64 = base64.b64encode(ciphertext['ciphertext']).decode('utf-8')
+            response_faucet = send_request_to_faucet(encrypted_chat_history_b64, base64.b64encode(server_public_key).decode('utf-8'))
             if response_faucet.status_code == 200:
                 print("Request sent successfully, waiting for response...")
                 retrieve_response()

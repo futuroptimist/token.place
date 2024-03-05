@@ -5,10 +5,8 @@ import random
 
 app = Flask(__name__)
 
-# Changing known_servers to a dict to uniquely identify servers by their public keys
 known_servers = {}
 client_queue = []
-next_server_index = 0  # This will no longer be needed but kept for reference
 client_inference_requests = {}
 client_responses = {}
 

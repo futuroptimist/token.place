@@ -38,7 +38,8 @@ class TestClient(unittest.TestCase):
 
         encrypted_chat_history_b64 = base64.b64encode(b'encrypted_chat_history').decode('utf-8')
         server_public_key_b64 = base64.b64encode(b'MockServerPublicKey').decode('utf-8')
-        response = send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64)
+        encrypted_cipherkey_b64 = base64.b64encode(b'encrypted_cipherkey').decode('utf-8')
+        response = send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64, encrypted_cipherkey_b64)
         self.assertEqual(response.status_code, 200)
 
     def test_encrypt_with_server_public_key_bytes(self):
@@ -53,8 +54,6 @@ class TestClient(unittest.TestCase):
 
         # Assert that the ciphertext is not None
         self.assertIsNotNone(ciphertext)
-
-    # Additional tests for retrieve_response would follow a similar pattern
 
 if __name__ == '__main__':
     unittest.main()

@@ -121,13 +121,15 @@ def poll_relay():
             response = requests.post(f'{BASE_URL}/sink', json={'server_public_key': _public_key_b64})
             if response.status_code == 200:
                 data = response.json()
-                if 'client_public_key' in data and 'chat_history' in data:
+                if 'client_public_key' in data and 'chat_history' in data and 'cipherkey' in data:
                     encrypted_chat_history_b64 = data['chat_history']
+                    encrypted_cipherkey_b64 = data['cipherkey']
                     print("Received chat history from client.")
 
                     try:
                         encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64)}
-                        decrypted_chat_history = decrypt(encrypted_chat_history_dict, None, _private_key)
+                        cipherkey = base64.b64decode(encrypted_cipherkey_b64)
+                        decrypted_chat_history = decrypt(encrypted_chat_history_dict, cipherkey, _private_key)
                         
                         if decrypted_chat_history is None:
                             print("Decryption failed. Skipping this message.")
@@ -136,14 +138,16 @@ def poll_relay():
                         chat_history_obj = json.loads(decrypted_chat_history)
                         response_history = llama_cpp_get_response(chat_history_obj)
                         client_pub_key_b64 = data['client_public_key']
-                        encrypted_response, _ = encrypt(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
+                        encrypted_response, encrypted_cipherkey = encrypt(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
                         encrypted_response_b64 = base64.b64encode(encrypted_response['ciphertext']).decode('utf-8')
+                        encrypted_cipherkey_b64 = base64.b64encode(encrypted_cipherkey).decode('utf-8')
 
                         print("Sending response...")
                         
                         requests.post(f'{BASE_URL}/source', json={
                             'client_public_key': client_pub_key_b64,
                             'chat_history': encrypted_response_b64,
+                            'cipherkey': encrypted_cipherkey_b64
                         })
                         print("Response sent.")
                     except Exception as e:

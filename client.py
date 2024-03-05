@@ -35,12 +35,13 @@ def encrypt_chat_history(chat_history, server_public_key):
     encrypted_aes_key, iv, encrypted_message = encrypt_longer_message_with_aes(message_bytes, server_public_key)
     return encrypted_aes_key, iv, encrypted_message
 
-def send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64):
+def send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64, encrypted_cipherkey_b64):
     """Send the encrypted chat history to the faucet endpoint."""
     data = {
         "client_public_key": _public_key_b64,
         "server_public_key": server_public_key_b64,
-        "chat_history": encrypted_chat_history_b64
+        "chat_history": encrypted_chat_history_b64,
+        "cipherkey": encrypted_cipherkey_b64
     }
     response = requests.post(f'{base_url}/faucet', json=data)
     return response

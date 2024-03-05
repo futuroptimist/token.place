@@ -51,10 +51,10 @@ def retrieve_response(encrypted_cipherkey_b64):
         response = requests.post(f'{base_url}/retrieve', json={"client_public_key": _public_key_b64})
         if response.status_code == 200:
             data = response.json()
-            if 'chat_history' in data:
+            if 'chat_history' in data and 'cipherkey' in data:
                 encrypted_chat_history_b64 = data['chat_history']
                 encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
-                cipherkey = base64.b64decode(encrypted_cipherkey_b64)
+                cipherkey = base64.b64decode(data['cipherkey'])
                 decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history}, cipherkey, _private_key)
                 print("Response from AI:", decrypted_chat_history.decode('utf-8'))
                 break

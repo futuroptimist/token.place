@@ -163,14 +163,18 @@ def source():
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
     data = request.get_json()
-    if not data or 'client_public_key' not in data or 'chat_history' not in data:
+    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data:
         return jsonify({'error': 'Invalid request data'}), 400
 
     client_public_key = data['client_public_key']
     encrypted_chat_history = data['chat_history']
+    encrypted_cipherkey = data['cipherkey']
 
     # Store the response in the client_responses dictionary
-    client_responses[client_public_key] = encrypted_chat_history
+    client_responses[client_public_key] = {
+        'chat_history': encrypted_chat_history,
+        'cipherkey': encrypted_cipherkey
+    }
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 @app.route('/retrieve', methods=['POST'])
@@ -186,8 +190,8 @@ def retrieve():
 
     # Check if there's a response for the given client public key
     if client_public_key in client_responses:
-        encrypted_chat_history = client_responses.pop(client_public_key)
-        return jsonify({'chat_history': encrypted_chat_history}), 200
+        response_data = client_responses.pop(client_public_key)
+        return jsonify(response_data), 200
     else:
         return jsonify({'error': 'No response available for the given public key'}), 200
  

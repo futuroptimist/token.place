@@ -164,17 +164,19 @@ def source():
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
     data = request.get_json()
-    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data:
+    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({'error': 'Invalid request data'}), 400
 
     client_public_key = data['client_public_key']
     encrypted_chat_history = data['chat_history']
     encrypted_cipherkey = data['cipherkey']
+    iv = data['iv']
 
     # Store the response in the client_responses dictionary
     client_responses[client_public_key] = {
         'chat_history': encrypted_chat_history,
-        'cipherkey': encrypted_cipherkey
+        'cipherkey': encrypted_cipherkey,
+        'iv': iv
     }
     return jsonify({'message': 'Response received and queued for client'}), 200
 

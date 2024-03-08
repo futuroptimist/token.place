@@ -127,7 +127,7 @@ def poll_relay(base_url, relay_port):
             if response.status_code == 200:
                 data = response.json()
                 if 'client_public_key' in data and 'chat_history' in data:
-                    encrypted_chat_history_b64 = data['chat_history']  # Corrected key name
+                    encrypted_chat_history_b64 = data['chat_history']
                     print("Received chat history from client.")
 
                     try:
@@ -145,6 +145,7 @@ def poll_relay(base_url, relay_port):
                         encrypted_response, encrypted_cipherkey = encrypt(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
                         encrypted_response_b64 = base64.b64encode(encrypted_response['ciphertext']).decode('utf-8')
                         encrypted_cipherkey_b64 = base64.b64encode(encrypted_cipherkey).decode('utf-8')
+                        iv_b64 = base64.b64encode(encrypted_response['iv']).decode('utf-8')
 
                         print("Sending response...")
                         
@@ -152,7 +153,7 @@ def poll_relay(base_url, relay_port):
                             'client_public_key': client_pub_key_b64,
                             'chat_history': encrypted_response_b64,
                             'cipherkey': encrypted_cipherkey_b64,
-                            'iv': base64.b64encode(encrypted_response['iv']).decode('utf-8')
+                            'iv': iv_b64
                         })
                         print("Response sent.")
                     except Exception as e:

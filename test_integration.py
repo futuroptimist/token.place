@@ -13,11 +13,11 @@ def setup_servers():
 
     # Start the relay server
     relay_process = subprocess.Popen(["python", "relay.py", "--port", str(relay_port)])
-    time.sleep(2)  # Give the relay server some time to start
+    time.sleep(5)  # Give the relay server some time to start
 
     # Start the server
     server_process = subprocess.Popen(["python", "server.py", "--server_port", str(server_port), "--relay_port", str(relay_port)])
-    time.sleep(5)  # Give the server some time to start and download the model (if needed)
+    time.sleep(10)  # Give the server some time to start and download the model (if needed)
 
     yield relay_port, server_port
 
@@ -79,8 +79,6 @@ def test_end_to_end(setup_servers):
         
         elapsed_time = time.time() - start_time
         assert elapsed_time < 60, "Timeout while waiting for response"
-        
-        time.sleep(2)  # Wait for a short interval before trying again
         
         time.sleep(2)  # Wait for a short interval before trying again
 

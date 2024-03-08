@@ -142,10 +142,10 @@ def poll_relay(base_url, relay_port):
                         chat_history_obj = json.loads(decrypted_chat_history)
                         response_history = llama_cpp_get_response(chat_history_obj)
                         client_pub_key_b64 = data['client_public_key']
-                        encrypted_response, encrypted_cipherkey = encrypt(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
+                        encrypted_response, encrypted_cipherkey = encrypt(response_history.encode('utf-8'), client_pub_key_b64)
                         encrypted_response_b64 = base64.b64encode(encrypted_response['ciphertext']).decode('utf-8')
-                        encrypted_cipherkey_b64 = base64.b64encode(encrypted_cipherkey).decode('utf-8')
                         iv_b64 = base64.b64encode(encrypted_response['iv']).decode('utf-8')
+                        encrypted_cipherkey_b64 = base64.b64encode(encrypted_cipherkey).decode('utf-8')
 
                         print("Sending response...")
                         

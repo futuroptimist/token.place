@@ -39,7 +39,8 @@ class TestClient(unittest.TestCase):
         encrypted_chat_history_b64 = base64.b64encode(b'encrypted_chat_history').decode('utf-8')
         server_public_key_b64 = base64.b64encode(b'MockServerPublicKey').decode('utf-8')
         encrypted_cipherkey_b64 = base64.b64encode(b'encrypted_cipherkey').decode('utf-8')
-        response = send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64, encrypted_cipherkey_b64)
+        iv_b64 = base64.b64encode(b'MockIV').decode('utf-8')  # Mock IV for the test.
+        response = send_request_to_faucet(encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64)  # Include iv_b64 here.
         self.assertEqual(response.status_code, 200)
 
     def test_encrypt_with_server_public_key_bytes(self):

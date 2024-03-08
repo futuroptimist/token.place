@@ -102,15 +102,17 @@ def faucet():
 
     server_public_key = data['server_public_key']
     chat_history_ciphertext = data['chat_history']
+    cipherkey = data['cipherkey']
 
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
         return jsonify({'error': 'Server with the specified public key not found'}), 404
     
-    # Save the client's requests to client_inference_requests
+    # Save the client's requests including the cipherkey
     client_inference_requests[server_public_key] = {
         'chat_history': chat_history_ciphertext,
-        'client_public_key': data.get('client_public_key', None)
+        'client_public_key': data.get('client_public_key', None),
+        'cipherkey': cipherkey
     }
     return jsonify({'message': 'Request received'}), 200
 
@@ -153,7 +155,9 @@ def sink():
         request_data = client_inference_requests.pop(public_key)
         response_data.update({
             'client_public_key': request_data['client_public_key'],
-            'chat_history': request_data['chat_history']
+            'chat_history': request_data['chat_history'],
+            'cipherkey': request_data['cipherkey'],
+            'iv': request_data['iv'],
         })
 
     return jsonify(response_data)

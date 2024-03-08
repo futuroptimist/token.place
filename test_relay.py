@@ -40,10 +40,13 @@ def test_faucet_request_without_known_server(client):
     response = client.post('/faucet', json={
         'client_public_key': 'client_key',
         'server_public_key': 'unknown_server_key',
-        'chat_history': 'encrypted_chat_history'
+        'chat_history': 'encrypted_chat_history',
+        'cipherkey': 'mock_cipherkey',  # Mock cipherkey for the test.
+        'iv': 'mock_iv'  # Mock IV for the test.
     })
     assert response.status_code == 404
     assert response.json == {'error': 'Server with the specified public key not found'}
+
 
 def test_retrieve_no_response(client):
     """Test the /retrieve endpoint when there is no response available."""

@@ -32,14 +32,15 @@ def get_server_public_key():
         print(f"Error while fetching server's public key: {str(e)}")
         return None
 
-def send_request_to_faucet(encrypted_chat_history_b64, server_public_key_b64, encrypted_cipherkey_b64):
-    """Send the encrypted chat history to the faucet endpoint."""
+def send_request_to_faucet(encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64):
+    """Send the encrypted chat history and IV to the faucet endpoint."""
     try:
         data = {
             "client_public_key": _public_key_b64,
             "server_public_key": server_public_key_b64,
             "chat_history": encrypted_chat_history_b64,
-            "cipherkey": encrypted_cipherkey_b64
+            "cipherkey": encrypted_cipherkey_b64,
+            "iv": iv_b64,
         }
         response = requests.post(f'{base_url}/faucet', json=data)
         return response
@@ -93,10 +94,13 @@ def main():
 
         server_public_key = get_server_public_key()
         if server_public_key:
-            ciphertext, cipherkey = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
-            encrypted_chat_history_b64 = base64.b64encode(ciphertext['ciphertext']).decode('utf-8')
+            ciphertext_dict, cipherkey = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+            encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
+            iv_b64 = base64.b64encode(ciphertext_dict['iv']).decode('utf-8')
             encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
-            response_faucet = send_request_to_faucet(encrypted_chat_history_b64, base64.b64encode(server_public_key).decode('utf-8'), encrypted_cipherkey_b64)
+
+            # Then, you correctly include iv_b64 in the data sent to the faucet
+            response_faucet = send_request_to_faucet(encrypted_chat_history_b64, iv_b64, base64.b64encode(server_public_key).decode('utf-8'), encrypted_cipherkey_b64)
             if response_faucet and response_faucet.status_code == 200:
                 print("Request sent successfully, waiting for response...")
                 response = retrieve_response(encrypted_cipherkey_b64)

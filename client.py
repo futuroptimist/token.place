@@ -100,7 +100,12 @@ def main():
             encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
 
             # Then, you correctly include iv_b64 in the data sent to the faucet
-            response_faucet = send_request_to_faucet(encrypted_chat_history_b64, iv_b64, base64.b64encode(server_public_key).decode('utf-8'), encrypted_cipherkey_b64)
+            response_faucet = send_request_to_faucet(
+                encrypted_chat_history_b64,
+                iv_b64,  # Add this argument
+                base64.b64encode(server_public_key).decode('utf-8'),
+                encrypted_cipherkey_b64
+            )
             if response_faucet and response_faucet.status_code == 200:
                 print("Request sent successfully, waiting for response...")
                 response = retrieve_response(encrypted_cipherkey_b64)

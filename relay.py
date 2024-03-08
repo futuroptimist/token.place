@@ -2,6 +2,7 @@ from flask import Flask, send_from_directory, request, jsonify
 import requests
 from datetime import datetime
 import random
+import argparse
 
 app = Flask(__name__)
 
@@ -196,4 +197,8 @@ def retrieve():
         return jsonify({'error': 'No response available for the given public key'}), 200
  
 if __name__ == '__main__':
-    app.run(port=5000)  # Flask app runs on port 5000 internally
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=5000, help='Port number for the Flask app')
+    args = parser.parse_args()
+
+    app.run(port=args.port)

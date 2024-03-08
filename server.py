@@ -7,12 +7,17 @@ import time
 from encrypt import encrypt, decrypt, generate_keys
 from llama_cpp import Llama
 from threading import Thread
+import argparse
 
 # Load the ENVIRONMENT variable from .env or set a default value
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
 
 # Set the base URL based on the ENVIRONMENT
-BASE_URL = 'https://token.place' if ENVIRONMENT == 'prod' else 'http://localhost:5000'
+BASE_URL = 'https://token.place' if ENVIRONMENT == 'prod' else 'http://localhost'
+
+# Set the default relay and server ports
+RELAY_PORT = 5000
+SERVER_PORT = 3000
 
 app = Flask(__name__)
 
@@ -115,20 +120,19 @@ def download_file_if_not_exists(models_dir, url):
     else:
         print(f"File {file_name} already exists.")
 
-def poll_relay():
+def poll_relay(base_url, relay_port):
     while True:
         try:
-            response = requests.post(f'{BASE_URL}/sink', json={'server_public_key': _public_key_b64})
+            response = requests.post(f'{base_url}:{relay_port}/sink', json={'server_public_key': _public_key_b64})
             if response.status_code == 200:
                 data = response.json()
-                if 'client_public_key' in data and 'chat_history' in data and 'cipherkey' in data:
-                    encrypted_chat_history_b64 = data['chat_history']
-                    encrypted_cipherkey_b64 = data['cipherkey']
+                if 'client_public_key' in data and 'chat_history' in data:
+                    encrypted_chat_history_b64 = data['chat_history']  # Corrected key name
                     print("Received chat history from client.")
 
                     try:
                         encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64)}
-                        cipherkey = base64.b64decode(encrypted_cipherkey_b64)
+                        cipherkey = base64.b64decode(data['cipherkey'])
                         decrypted_chat_history = decrypt(encrypted_chat_history_dict, cipherkey, _private_key)
                         
                         if decrypted_chat_history is None:
@@ -144,10 +148,11 @@ def poll_relay():
 
                         print("Sending response...")
                         
-                        requests.post(f'{BASE_URL}/source', json={
+                        requests.post(f'{base_url}:{relay_port}/source', json={
                             'client_public_key': client_pub_key_b64,
                             'chat_history': encrypted_response_b64,
-                            'cipherkey': encrypted_cipherkey_b64
+                            'cipherkey': encrypted_cipherkey_b64,
+                            'iv': base64.b64encode(encrypted_response['iv']).decode('utf-8')
                         })
                         print("Response sent.")
                     except Exception as e:
@@ -193,7 +198,12 @@ def method_not_allowed(_):
     return jsonify({'error': 'Method not allowed'}), 405
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--server_port', type=int, default=SERVER_PORT, help='Port number for the Flask app')
+    parser.add_argument('--relay_port', type=int, default=RELAY_PORT, help='Port number for the relay')
+    args = parser.parse_args()
+
     models_dir = create_models_directory()
     download_file_if_not_exists(models_dir, URL)
-    Thread(target=poll_relay, daemon=True).start()
-    app.run(host='0.0.0.0', port=3000)
+    Thread(target=poll_relay, args=(BASE_URL, args.relay_port), daemon=True).start()
+    app.run(host='0.0.0.0', port=args.server_port)

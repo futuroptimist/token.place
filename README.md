@@ -16,7 +16,7 @@ There are tons of personal computers and homelabs out there with lots of compute
 - [ ] end-to-end encrypt communication between server and client with public key cryptography (server generates public/private key pair on init and gives public key to relay, which passes it on to the server [but does not reveal server's IP address])
   - [x] IP obfuscation
   - [x] end-to-end encryption (short responses, under 256 bytes of utf-8 encoded text) for client.py
-  - [ ] end-to-end encryption for longer responses for client.py
+  - [x] end-to-end encryption for longer responses for client.py
   - [ ] end-to-end encryption on landing page (relay.py / GET)
   - [ ] delete old /inference endpoint and everything upstream and downstream that's now unused
 - [ ] set up production server (raspberry pi cluster lol)

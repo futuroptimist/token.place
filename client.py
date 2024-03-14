@@ -17,6 +17,38 @@ environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
 # Choose the base URL based on the environment
 base_url = 'http://token.place' if environment == 'prod' else 'http://localhost:5000'
 
+class ChatClient:
+    def __init__(self, base_url, relay_port):
+        self.base_url = base_url
+        self.relay_port = relay_port
+        self.private_key, self.public_key = generate_keys()
+        self.public_key_b64 = base64.b64encode(self.public_key).decode('utf-8')
+        self.chat_history = []
+
+    def send_message(self, message):
+        self.chat_history.append({"role": "user", "content": message})
+        server_public_key = self.get_server_public_key()
+        
+        if server_public_key:
+            ciphertext_dict, cipherkey = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)
+            encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
+            iv_b64 = base64.b64encode(ciphertext_dict['iv']).decode('utf-8')
+            encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
+
+            response_faucet = self.send_request_to_faucet(
+                encrypted_chat_history_b64,
+                iv_b64,
+                base64.b64encode(server_public_key).decode('utf-8'),
+                encrypted_cipherkey_b64
+            )
+            if response_faucet and response_faucet.status_code == 200:
+                response = self.retrieve_response(encrypted_cipherkey_b64)
+                if response:
+                    self.chat_history = response
+                    return response
+
+        return None
+
 def get_server_public_key():
     """Fetch the server's public key from the relay."""
     try:

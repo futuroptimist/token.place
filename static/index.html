@@ -14,170 +14,214 @@
             justify-content: center;
             margin: 0;
             padding: 0;
-            font-family: Arial, sans-serif;
-            background-color: #222222; /* Default to dark mode background */
-            color: #ffffff; /* Default to dark mode text color */
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            background-color: #111111;
+            color: #ffffff;
         }
         .container {
             width: 50%;
-            margin-left: auto; /* Center the container horizontally */
-            margin-right: auto; /* Center the container horizontally */
+            margin-left: auto;
+            margin-right: auto;
         }
         h1, h2, h3, p {
-            margin: 10px 0;
+            margin: 20px 0;
         }
-        /* Chat styles */
+        h1 {
+            font-size: 48px;
+            font-weight: 100;
+            text-align: center;
+            text-transform: uppercase;
+            letter-spacing: 5px;
+        }
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 36px;
+            }
+        }
+        h2 {
+            font-size: 24px;
+            font-weight: 300;
+            color: #00ffff;
+        }
+        p {
+            font-size: 18px;
+            line-height: 1.6;
+            color: #cccccc;
+        }
+        a {
+            color: #00ffff;
+            text-decoration: none;
+            border-bottom: 1px solid #00ffff;
+            transition: border-bottom 0.3s ease;
+        }
+        a:hover {
+            border-bottom: 1px solid #ffffff;
+        }
         .chat-container {
-            border: 1px solid #ddd;
-            padding: 10px;
-            margin-top: 20px;
-            border-radius: 5px;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 30px;
         }
         .message-input {
             width: 100%;
-            padding: 10px;
-            box-sizing: border-box; /* Ensures padding doesn't increase total width */
-            margin-top: 10px;
+            padding: 15px;
+            box-sizing: border-box;
+            margin-top: 15px;
+            background-color: rgba(255, 255, 255, 0.2);
+            border: none;
+            border-radius: 5px;
+            color: #ffffff;
+            font-size: 16px;
         }
         .message {
-            padding: 10px;
-            margin: 5px 0; /* Spacing between messages */
+            padding: 15px;
+            margin: 10px 0;
             border-radius: 10px;
-            background-color: #f9f9f9;
         }
         .user-message {
             text-align: right;
+            background-color: rgba(0, 255, 255, 0.2);
         }
         .assistant-message {
             text-align: left;
-            background-color: #e0e0e0; /* Slightly darker than user message */
+            background-color: rgba(255, 255, 255, 0.1);
         }
-        /* Responsive styles */
-        @media (max-width: 768px) {
-            .container {
-                width: 90%;
-            }
-            h1, h2, h3, p {
-                padding: 0 10px; /* Slight padding to prevent text from hitting the edges */
-            }
-            .message-input {
-                padding: 15px; /* Larger touch target */
-                font-size: 16px; /* Legibility */
-            }
-            .message {
-                padding: 15px; /* More visual space */
-                font-size: 14px; /* Adjust text size for readability */
-            }
-            [v-cloak] {
-                display: none; /* Hide Vue.js elements until they are ready */
-            }
-        }
-
         .input-container {
-            display: flex; /* This will align the input and button in a row */
+            display: flex;
         }
-
-        .message-input {
-            flex-grow: 1; /* This will make the input field grow to fill the container */
-            padding: 10px;
-            margin-top: 10px;
-            border-top-left-radius: 4px; /* Rounded corners for the left side of the input field */
-            border-bottom-left-radius: 4px; /* Same as above */
-            border-right: none; /* Removes the right border to merge input and button visually */
-        }
-
         .send-button {
-            padding: 10px;
-            margin-top: 10px;
-            border-top-right-radius: 4px; /* Rounded corners for the right side of the button */
-            border-bottom-right-radius: 4px; /* Same as above */
-            background-color: #e0e0e0; /* Bootstrap primary button color for example */
-            color: black;
-            border: 1px solid #000000; /* Same color as background for a solid look */
-            cursor: pointer; /* Changes the cursor to indicate the button is clickable */
+            padding: 15px 20px;
+            margin-top: 15px;
+            border-radius: 5px;
+            background-color: #00ffff;
+            color: #111111;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
         }
-
         .send-button:hover {
-            background-color: #0056b3; /* Darker shade for hover effect */
+            background-color: #ffffff;
         }
-
-        /* Responsive styles */
-        @media (max-width: 768px) {
-            .input-container {
-                flex-direction: column; /* Stack input and button on top of each other */
-            }
-
-            .message-input,
-            .send-button {
-                width: 100%; /* Full width in a stacked layout */
-                border-radius: 4px; /* Restore all-round rounded corners */
-            }
-
-            .send-button {
-                border-top: 1px solid #b9b9b9; /* Add top border to button when stacked */
-            }
-        }
-
-        body.light-mode {
-            background-color: #ffffff; /* Light background */
-            color: #000000; /* Dark text */
-        }
-
-        body.dark-mode {
-                background-color: #222222;
-                color: #ffffff; /* Light text */
-
-            .message {
-                background-color: #777777;
-                color: #CCCCCC;
-            }
-
-            .assistant-message {
-                background-color: #333333; /* Dark background */
-            }
-
-            a:link {
-                color: #00a0e4; /* Light blue for links */
-            }
-
-            a:visited {
-                color: #83a2af; /* Light blue for visited links */
-            }
-
-        }
-
-        .chat-container, .message {
-            transition: background-color 0.3s ease; /* Smooth transition for backgrounds */
-        }
-
-        /* Mode Toggle Button */
         .mode-toggle-container {
             display: flex;
             justify-content: center;
-            padding: 20px;
+            padding: 30px;
         }
-
         #toggleMode {
             padding: 10px 20px;
             font-size: 16px;
             cursor: pointer;
             border: none;
             border-radius: 5px;
-            background-color: #009688; /* Teal background */
-            color: white; /* White text */
+            background-color: rgba(255, 255, 255, 0.2);
+            color: #ffffff;
+            transition: background-color 0.3s ease;
         }
-
         #toggleMode:hover {
-            background-color: #00796b; /* Darker teal on hover */
+            background-color: rgba(255, 255, 255, 0.4);
+        }
+        @media (max-width: 768px) {
+            .container {
+                width: 90%;
+            }
+            h1, h2, h3, p {
+                padding: 0 20px;
+            }
+            .message-input {
+                padding: 20px;
+                font-size: 18px;
+            }
+            .message {
+                padding: 20px;
+                font-size: 16px;
+            }
+            [v-cloak] {
+                display: none;
+            }
+            .input-container {
+                flex-direction: column;
+            }
+            .message-input,
+            .send-button {
+                width: 100%;
+                border-radius: 5px;
+            }
+            .send-button {
+                border-top: 1px solid rgba(255, 255, 255, 0.2);
+            }
         }
 
-        /* Responsive styles */
-        @media (max-width: 768px) {
-            /* Existing responsive styles */
+        body.light-mode {
+            background-color: #f5f5f5;
+            color: #333333;
+        }
+
+        body.light-mode h2 {
+            color: #007bff;
+        }
+
+        body.light-mode p {
+            color: #555555;
+        }
+
+        body.light-mode .chat-container {
+            background-color: #ffffff;
+        }
+
+        body.light-mode .message {
+            background-color: #eeeeee;
+            color: #333333;
+        }
+
+        body.light-mode .user-message {
+            background-color: #007bff;
+            color: #ffffff;
+        }
+
+        body.light-mode .assistant-message {
+            background-color: #f0f0f0;
+            color: #333333;
+        }
+
+        body.light-mode .message-input {
+            background-color: #ffffff;
+            color: #333333;
+        }
+
+        body.light-mode .send-button {
+            background-color: #007bff;
+            color: #ffffff;
+        }
+
+        body.light-mode .send-button:hover {
+            background-color: #0056b3;
+        }
+
+        body.light-mode a {
+            color: #007bff;
+            border-bottom: 1px solid #007bff;
+        }
+
+        body.light-mode a:hover {
+            border-bottom: 1px solid #0056b3;
+        }
+
+        body.light-mode .mode-toggle-container {
+            background-color: #f5f5f5;
+        }
+
+        body.light-mode #toggleMode {
+            background-color: #007bff;
+            color: #ffffff;
+        }
+
+        body.light-mode #toggleMode:hover {
+            background-color: #0056b3;
         }
     </style>
 </head>
-<body>
+<body class="dark-mode">
     <div id="app" class="container">
         <h1>Welcome to token.place!</h1>
         <p>tokenplace is a peer-to-peer generative AI platform that pairs those in need of LLM compute with individuals donating spare resources, aiming to democratize AI access.</p>
@@ -202,6 +246,9 @@
 
         <hr>
 
+        <h2>Roadmap</h2>
+        <p>Check out the <a href="https://github.com/futuroptimist/token.place#roadmap">roadmap</a> section of the README.</p>
+
         <h2>FAQ</h2>
         <h3>Why token.place?</h3>
         <p>We believe in the democratization of AI. Projects like Folding@Home inspired us to leverage peer-to-peer technology for generative AI, making sophisticated language models accessible to everyone.</p>
@@ -212,9 +259,8 @@
         <p>Learn more about our goals and how you can be a part of this initiative on our <a href="https://github.com/futuroptimist/token.place">GitHub repository</a>.</p>
 
         <h3>Privacy Notice</h3>
-        <p><strong>WARNING! Your converstation is reasonably private at this moment, and base privacy will become incrementally better over time. For enhanced privacy, consider self hosting by following the README on the Github repository.</strong></p>
+        <p><strong>WARNING! Your conversation is reasonably private at this moment, and base privacy will become incrementally better over time. For enhanced privacy, consider self hosting by following the README on the GitHub repository.</strong></p>
 
-        
         <div class="mode-toggle-container">
             <button id="toggleMode"></button>
         </div>
@@ -228,33 +274,25 @@
         // Wait for the DOM to load
         document.addEventListener('DOMContentLoaded', function() {
             const toggleModeButton = document.getElementById('toggleMode');
-            // Initial setting
-            let isDarkMode = false;
-            document.body.classList.add('light-mode');
+            const body = document.body;
       
-            // Function to switch the theme
             const switchTheme = () => {
-                if (isDarkMode) {
-                    document.body.classList.remove('dark-mode');
-                    document.body.classList.add('light-mode');
-                    toggleModeButton.textContent = '🌙 switch to dark mode'; // Moon emoji for dark mode
+                if (body.classList.contains('dark-mode')) {
+                    body.classList.remove('dark-mode');
+                    body.classList.add('light-mode');
+                    toggleModeButton.textContent = '🌙 switch to dark mode';
                 } else {
-                    document.body.classList.remove('light-mode');
-                    document.body.classList.add('dark-mode');
-                    toggleModeButton.textContent = '☀️ switch to light mode'; // Sun emoji for light mode
+                    body.classList.remove('light-mode');
+                    body.classList.add('dark-mode');
+                    toggleModeButton.textContent = '☀️ switch to light mode';
                 }
             };
       
-            // Click event listener for the button
-            toggleModeButton.addEventListener('click', function() {
-                isDarkMode = !isDarkMode; // Toggle the state
-                switchTheme(); // Call the function to switch themes
-            });
+            toggleModeButton.addEventListener('click', switchTheme);
       
-            // Initialize the theme
-            switchTheme();
+            // Set initial button text
+            toggleModeButton.textContent = '☀️ switch to light mode';
         });
-      </script>
-
+    </script>
 </body>
 </html>

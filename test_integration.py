@@ -10,13 +10,13 @@ from relay import app as relay_app
 from server import app as server_app
 from flask import g
 
-
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def setup_servers():
+    # use new port numbers to avoid conflicts with running servers/relays locally (which use 5000 and 3000, respectively)
     relay_port = 5001
     server_port = 3001
 
-    # Create a ChatClient instance
+    # Create a ChatClient instance with the test relay port
     client = ChatClient('http://localhost', relay_port)
 
     # Start the relay server
@@ -29,15 +29,22 @@ def setup_servers():
     print("Launched server. Waiting for 10 seconds...")
     time.sleep(10)  # Give the server some time to start and download the model (if needed)
 
-    yield client, relay_port, server_port
+    yield client, relay_port, server_port, relay_process, server_process
 
-    # Stop the servers after the test is done
+@pytest.fixture(scope="function")
+def client(setup_servers):
+    client, _, _, _, _ = setup_servers
+    return client
+
+@pytest.fixture(scope="session", autouse=True)
+def teardown_servers(setup_servers):
+    yield
+    _, _, _, relay_process, server_process = setup_servers
+    # Stop the servers after all tests are done
     relay_process.terminate()
     server_process.terminate()
 
-def test_end_to_end(setup_servers):
-    client, relay_port, server_port = setup_servers
-
+def test_send_message(client):
     # Send a message and check the response
     response = client.send_message("Hello, how are you?")
     assert response is not None
@@ -46,6 +53,7 @@ def test_end_to_end(setup_servers):
     assert response[0]['content'] == 'Hello, how are you?'
     assert response[1]['role'] == 'assistant'
 
+def test_send_another_message(client):
     # Send another message and check the response
     response = client.send_message("What is the capital of France?")
     assert response is not None

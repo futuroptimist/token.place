@@ -157,7 +157,7 @@ def sink():
             'client_public_key': request_data['client_public_key'],
             'chat_history': request_data['chat_history'],
             'cipherkey': request_data['cipherkey'],
-            'iv': request_data['iv'],
+            'iv': request_data.get('iv', ''),  # Include the 'iv' key, default to an empty string if not present
         })
 
     return jsonify(response_data)

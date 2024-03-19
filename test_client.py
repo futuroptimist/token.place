@@ -2,13 +2,16 @@ import unittest
 from unittest.mock import patch, MagicMock
 import base64
 import json
-from client import get_server_public_key, send_request_to_faucet, retrieve_response, encrypt
+from client import ChatClient, encrypt
 from encrypt import generate_keys
 
-class TestClient(unittest.TestCase):
+class TestChatClient(unittest.TestCase):
 
     def setUp(self):
         self.mock_server_public_key = base64.b64encode(b'MockServerPublicKey').decode('utf-8')
+        self.base_url = 'http://localhost'
+        self.relay_port = 5000
+        self.chat_client = ChatClient(self.base_url, self.relay_port)
 
     @patch('client.requests.get')
     def test_get_server_public_key_success(self, mock_get):
@@ -17,7 +20,7 @@ class TestClient(unittest.TestCase):
         mock_response.json.return_value = {'server_public_key': self.mock_server_public_key}
         mock_get.return_value = mock_response
 
-        server_public_key = get_server_public_key()
+        server_public_key = self.chat_client.get_server_public_key()
         self.assertIsNotNone(server_public_key)
         self.assertEqual(server_public_key, base64.b64decode(self.mock_server_public_key))
 
@@ -27,7 +30,7 @@ class TestClient(unittest.TestCase):
         mock_response.status_code = 404
         mock_get.return_value = mock_response
 
-        server_public_key = get_server_public_key()
+        server_public_key = self.chat_client.get_server_public_key()
         self.assertIsNone(server_public_key)
 
     @patch('client.requests.post')
@@ -40,7 +43,7 @@ class TestClient(unittest.TestCase):
         server_public_key_b64 = base64.b64encode(b'MockServerPublicKey').decode('utf-8')
         encrypted_cipherkey_b64 = base64.b64encode(b'encrypted_cipherkey').decode('utf-8')
         iv_b64 = base64.b64encode(b'MockIV').decode('utf-8')  # Mock IV for the test.
-        response = send_request_to_faucet(encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64)  # Include iv_b64 here.
+        response = self.chat_client.send_request_to_faucet(encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64)
         self.assertEqual(response.status_code, 200)
 
     def test_encrypt_with_server_public_key_bytes(self):

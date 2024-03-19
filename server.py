@@ -126,12 +126,12 @@ def poll_relay(base_url, relay_port):
             response = requests.post(f'{base_url}:{relay_port}/sink', json={'server_public_key': _public_key_b64})
             if response.status_code == 200:
                 data = response.json()
-                if 'client_public_key' in data and 'chat_history' in data:
+                if 'client_public_key' in data and 'chat_history' in data and 'cipherkey' in data and 'iv' in data:
                     encrypted_chat_history_b64 = data['chat_history']
                     print("Received chat history from client.")
 
                     try:
-                        encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64)}
+                        encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64), 'iv': base64.b64decode(data['iv'])}
                         cipherkey = base64.b64decode(data['cipherkey'])
                         decrypted_chat_history = decrypt(encrypted_chat_history_dict, cipherkey, _private_key)
                         
@@ -142,7 +142,7 @@ def poll_relay(base_url, relay_port):
                         chat_history_obj = json.loads(decrypted_chat_history)
                         response_history = llama_cpp_get_response(chat_history_obj)
                         client_pub_key_b64 = data['client_public_key']
-                        encrypted_response, encrypted_cipherkey, iv = encrypt(response_history.encode('utf-8'), client_pub_key_b64)
+                        encrypted_response, encrypted_cipherkey, iv = encrypt(json.dumps(response_history).encode('utf-8'), base64.b64decode(client_pub_key_b64))
                         encrypted_response_b64 = base64.b64encode(encrypted_response['ciphertext']).decode('utf-8')
                         iv_b64 = base64.b64encode(iv).decode('utf-8')
                         encrypted_cipherkey_b64 = base64.b64encode(encrypted_cipherkey).decode('utf-8')
@@ -168,13 +168,12 @@ def poll_relay(base_url, relay_port):
 
 def llama_cpp_get_response(chat_history):
     """Process chat history with the Llama model and generate a response."""
-    # This is a placeholder for your actual Llama model integration
-    # Replace with your actual model invocation logic
     try:
         response = llm.create_chat_completion(messages=chat_history)
         if response and 'choices' in response and response['choices']:
             assistant_message = response['choices'][0]['message']
             chat_history.append(assistant_message)
+            return chat_history  # Return the modified chat_history
     except Exception as e:
         print(f"Error during chat completion: {e}")
     return chat_history

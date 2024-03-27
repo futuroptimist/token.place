@@ -57,14 +57,14 @@ class ChatClient:
         start_time = time.time()
         while True:
             try:
-                response = requests.post(f'{self.base_url}:{self.relay_port}/retrieve', json={"client_public_key": self.public_key_b64, "cipherkey": encrypted_cipherkey_b64})
+                response = requests.post(f'{self.base_url}:{self.relay_port}/retrieve', json={"client_public_key": self.public_key_b64})
                 if response.status_code == 200:
                     data = response.json()
-                    if 'chat_history' in data and 'iv' in data:
+                    if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:
                         encrypted_chat_history_b64 = data['chat_history']
                         encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
                         iv = base64.b64decode(data['iv'])
-                        cipherkey = base64.b64decode(encrypted_cipherkey_b64)
+                        cipherkey = base64.b64decode(data['cipherkey'])
                         print(f"Received cipherkey: {cipherkey}")
                         print(f"Received IV: {iv}")
                         decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, self.private_key)

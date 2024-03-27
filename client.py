@@ -65,9 +65,15 @@ class ChatClient:
                         encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
                         iv = base64.b64decode(data['iv'])
                         cipherkey = base64.b64decode(encrypted_cipherkey_b64)
+                        print(f"Received cipherkey: {cipherkey}")
+                        print(f"Received IV: {iv}")
                         decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, self.private_key)
-                        print(f"Response from AI: {decrypted_chat_history.decode('utf-8')}")
-                        return json.loads(decrypted_chat_history.decode('utf-8'))
+                        
+                        if decrypted_chat_history is not None:
+                            print(f"Response from AI: {decrypted_chat_history.decode('utf-8')}")
+                            return json.loads(decrypted_chat_history.decode('utf-8'))
+                        else:
+                            print("Decryption failed. Skipping this response.")
                     else:
                         print("Response data is incomplete, waiting for complete response...")
                 else:
@@ -87,9 +93,9 @@ class ChatClient:
         server_public_key = self.get_server_public_key()
         
         if server_public_key:
-            ciphertext_dict, cipherkey = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)
+            ciphertext_dict, cipherkey, iv = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)
             encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
-            iv_b64 = base64.b64encode(ciphertext_dict['iv']).decode('utf-8')
+            iv_b64 = base64.b64encode(iv).decode('utf-8')
             encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
 
             response_faucet = self.send_request_to_faucet(

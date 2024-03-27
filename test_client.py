@@ -54,10 +54,12 @@ class TestChatClient(unittest.TestCase):
         chat_history = [{"role": "user", "content": "Hello"}]
 
         # Call the encrypt function with the generated server's public key and chat history
-        ciphertext, _ = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+        ciphertext_dict, cipherkey, iv = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
 
-        # Assert that the ciphertext is not None
-        self.assertIsNotNone(ciphertext)
+        # Assert that the ciphertext_dict, cipherkey, and iv are not None
+        self.assertIsNotNone(ciphertext_dict)
+        self.assertIsNotNone(cipherkey)
+        self.assertIsNotNone(iv)
 
 if __name__ == '__main__':
     unittest.main()

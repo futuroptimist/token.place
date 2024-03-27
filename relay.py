@@ -75,6 +75,8 @@ def faucet():
             conforms to a list of objects with the the following JSON format:
             - role: the role of the message sender (either 'user' or 'assistant')
             - content: the message content
+        - cipherkey: the AES key used to encrypt the chat_history, encrypted with the server_public_key
+        - iv: the initialization vector used in the AES encryption of the chat_history
 
     Returns: a json response with the following keys:
         - chat_history: a string of ciphertext encrypted with the client_public_key, which when decrypted,
@@ -92,7 +94,7 @@ def faucet():
     """
     # Parse the request data
     data = request.get_json()
-    if not data or 'server_public_key' not in data or 'chat_history' not in data:
+    if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({
             'error': {
                 'message': 'Invalid request data',
@@ -103,16 +105,18 @@ def faucet():
     server_public_key = data['server_public_key']
     chat_history_ciphertext = data['chat_history']
     cipherkey = data['cipherkey']
+    iv = data['iv']  # Extract the IV from the request data
 
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
         return jsonify({'error': 'Server with the specified public key not found'}), 404
     
-    # Save the client's requests including the cipherkey
+    # Save the client's requests including the cipherkey and IV
     client_inference_requests[server_public_key] = {
         'chat_history': chat_history_ciphertext,
         'client_public_key': data.get('client_public_key', None),
-        'cipherkey': cipherkey
+        'cipherkey': cipherkey,
+        'iv': iv  # Include the IV in the saved client's request
     }
     return jsonify({'message': 'Request received'}), 200
 

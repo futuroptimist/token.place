@@ -53,8 +53,9 @@ def encrypt(plaintext, public_key_bytes):
         public_key_bytes (bytes): The public key in PEM format.
 
     Returns:
-        ciphertext (Dict): A dictionary containing the IV, and ciphertext.
+        ciphertext (Dict): A dictionary containing the IV and ciphertext.
         cipherkey (bytes): The AES key encrypted with the public key.
+        iv (bytes): The initialization vector used in the AES encryption.
     """
 
     public_key = load_pem_public_key(public_key_bytes)
@@ -78,21 +79,20 @@ def encrypt(plaintext, public_key_bytes):
     oaep_padding = asymmetric_padding.OAEP(mgf=asymmetric_padding.MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None)
     cipherkey = public_key.encrypt(key, oaep_padding)
 
-    return {'iv': iv, 'ciphertext': ciphertext}, cipherkey
+    return {'iv': iv, 'ciphertext': ciphertext}, cipherkey, iv
 
 def decrypt(ciphertext, cipherkey, private_key_bytes):
     """
     Decrypt the ciphertext using the provided cipherkey and private key.
 
     Args:
-        ciphertext (Dict): A dictionary containing the IV, and ciphertext.
+        ciphertext (Dict): A dictionary containing the IV and ciphertext.
         cipherkey (bytes): The AES key encrypted with the public key.
         private_key_bytes (bytes): The private key in PEM format.
 
     Returns:
         plaintext (bytes): The decrypted plaintext.
     """
-
     try:
         private_key = load_pem_private_key(private_key_bytes, password=None)
 
@@ -113,4 +113,6 @@ def decrypt(ciphertext, cipherkey, private_key_bytes):
         return plaintext
     except Exception as e:
         print(f"Exception during decryption: {e}")
+        import traceback
+        traceback.print_exc()  # Print the full traceback for debugging
         return None

@@ -121,17 +121,28 @@ def download_file_if_not_exists(models_dir, url):
         print(f"File {file_name} already exists.")
 
 def poll_relay(base_url, relay_port):
+    """
+    Continuously poll the relay for new chat messages and process them.
+
+    Args:
+        base_url (str): The base URL of the relay server.
+        relay_port (int): The port number of the relay server.
+    """
     while True:
         try:
             response = requests.post(f'{base_url}:{relay_port}/sink', json={'server_public_key': _public_key_b64})
             if response.status_code == 200:
                 data = response.json()
-                if 'client_public_key' in data and 'chat_history' in data and 'cipherkey' in data and 'iv' in data:
+                print(f"Received data from relay: {data}")  # Log the received data
+                if 'client_public_key' in data and 'chat_history' in data and 'cipherkey' in data and 'iv' in data and data['iv']:
                     encrypted_chat_history_b64 = data['chat_history']
                     print("Received chat history from client.")
 
                     try:
-                        encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64), 'iv': base64.b64decode(data['iv'])}
+                        print(f"Received IV (base64 encoded): {data['iv']}")  # Log the received IV
+                        iv = base64.b64decode(data['iv'])
+                        print(f"Decoded IV: {iv}")  # Log the decoded IV
+                        encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64), 'iv': iv}
                         cipherkey = base64.b64decode(data['cipherkey'])
                         decrypted_chat_history = decrypt(encrypted_chat_history_dict, cipherkey, _private_key)
                         
@@ -157,7 +168,11 @@ def poll_relay(base_url, relay_port):
                         })
                         print("Response sent.")
                     except Exception as e:
-                        print(f"Exception handling message: {e}")
+                        print(f"Exception during decryption or encryption: {e}")
+                        continue
+                else:
+                    print("Incomplete or invalid data received from the relay. Skipping this message.")
+                
                 time.sleep(data.get('next_ping_in_x_seconds', 10))
             else:
                 print("Error from relay:", response.status_code, response.text)

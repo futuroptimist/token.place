@@ -3,12 +3,20 @@ new Vue({
     data: {
         newMessage: '',
         chatHistory: [],
-        serverPublicKey: null // Store the server public key
+        serverPublicKey: null,
+        privateKey: null,
+        publicKey: null
     },
-    mounted() {
+    async mounted() {
+        await this.generateKeys();
         this.getServerPublicKey();
     },
     methods: {
+        async generateKeys() {
+            const { pemPrivateKey, pemPublicKey } = await generateKeys();
+            this.privateKey = pemPrivateKey;
+            this.publicKey = pemPublicKey;
+        },
         getServerPublicKey() {
             fetch('/next_server')
             .then(response => response.json())
@@ -23,19 +31,23 @@ new Vue({
                 console.error('Error fetching server public key:', error);
             });
         },
-        sendMessage() {
+        async sendMessage() {
             const messageContent = this.newMessage.trim();
             if (messageContent && this.serverPublicKey) {
-                this.chatHistory.push({ role: 'user', content: messageContent }); // Display user's message immediately
-                this.newMessage = ''; // Clear the input field after sending
-                
-                // Payload for the /faucet endpoint
+                this.chatHistory.push({ role: 'user', content: messageContent });
+                this.newMessage = '';
+
+                const plaintextBytes = new TextEncoder().encode(JSON.stringify([{ role: 'user', content: messageContent }]));
+                const { iv, ciphertext, encryptedKey } = await encrypt(plaintextBytes, this.serverPublicKey);
+
                 const faucetPayload = {
+                    client_public_key: this.publicKey,
                     server_public_key: this.serverPublicKey,
-                    chat_history: JSON.stringify([{ role: 'user', content: messageContent }])
+                    chat_history: btoa(String.fromCharCode.apply(null, new Uint8Array(ciphertext))),
+                    cipherkey: btoa(String.fromCharCode.apply(null, new Uint8Array(encryptedKey))),
+                    iv: btoa(String.fromCharCode.apply(null, new Uint8Array(iv)))
                 };
-                
-                // Send the message to the /faucet endpoint
+
                 fetch('/faucet', {
                     method: 'POST',
                     headers: {
@@ -46,32 +58,47 @@ new Vue({
                 .then(response => response.json())
                 .then(data => {
                     console.log('Response from /faucet:', data);
-                    // Process and log the /faucet response. Do not update the UI with this response.
                 })
                 .catch((error) => {
                     console.error('Error sending message to /faucet:', error);
                 });
 
-                // Original message sending logic to the /inference (or another) endpoint
-                fetch('/inference', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ chat_history: this.chatHistory })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data && Array.isArray(data)) {
-                        this.chatHistory = data; // Update UI with the response from the original endpoint
-                    } else {
-                        console.error('Unexpected response format from /inference:', data);
-                    }
-                })
-                .catch((error) => {
-                    console.error('Error sending message to /inference:', error);
-                });
+                // Poll for the response
+                const decryptedResponse = await this.pollForResponse(encryptedKey);
+                if (decryptedResponse) {
+                    this.chatHistory = decryptedResponse;
+                }
             }
+        },
+        async pollForResponse(encryptedKey) {
+            const maxAttempts = 30;
+            const delay = 2000;
+
+            for (let i = 0; i < maxAttempts; i++) {
+                const response = await fetch('/retrieve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ client_public_key: this.publicKey }),
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.chat_history && data.iv && data.cipherkey) {
+                        const decryptedResponse = await decrypt(
+                            data.chat_history,
+                            data.cipherkey,
+                            data.iv,
+                            this.privateKey
+                        );
+                        return JSON.parse(decryptedResponse);
+                    }
+                }
+
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+
+            console.error('Timeout while waiting for response');
+            return null;
         }
     },
     updated() {

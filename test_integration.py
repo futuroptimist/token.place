@@ -2,8 +2,6 @@ import pytest
 import subprocess
 import time
 import requests
-import json
-import base64
 from encrypt import generate_keys, encrypt, decrypt
 from client import ChatClient
 from relay import app as relay_app
@@ -62,3 +60,14 @@ def test_send_another_message(client):
     assert response[2]['content'] == 'What is the capital of France?'
     assert response[3]['role'] == 'assistant'
     assert 'Paris' in response[3]['content']
+
+def test_root_endpoint_returns_html(setup_servers):
+    # Assuming your relay server is running on port 5001 as set up in your fixture
+    base_url = 'http://localhost:5001/'
+    response = requests.get(base_url)
+
+    # Check if the response status code is 200
+    assert response.status_code == 200, "Expected a 200 OK response."
+
+    # Check if the 'Content-Type' header is 'text/html'
+    assert 'text/html' in response.headers['Content-Type'], "Expected HTML content to be returned."

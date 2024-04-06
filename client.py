@@ -53,7 +53,7 @@ class ChatClient:
             print(f"Error while sending request to faucet: {str(e)}")
             return None
 
-    def retrieve_response(self, encrypted_cipherkey_b64, timeout=60):
+    def retrieve_response(self, timeout=60):
         start_time = time.time()
         while True:
             try:
@@ -108,7 +108,7 @@ class ChatClient:
                 start_time = time.time()
                 timeout = 60  # Adjust the timeout as needed
                 while True:
-                    response = self.retrieve_response(encrypted_cipherkey_b64)
+                    response = self.retrieve_response()
                     if response:
                         self.chat_history = response
                         return response

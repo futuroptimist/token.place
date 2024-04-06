@@ -2,11 +2,10 @@ import pytest
 import subprocess
 import time
 import requests
-from encrypt import generate_keys, encrypt, decrypt
 from client import ChatClient
-from relay import app as relay_app
-from server import app as server_app
-from flask import g
+import base64
+import json
+from encrypt import encrypt, decrypt, generate_keys
 
 @pytest.fixture(scope="session")
 def setup_servers():
@@ -71,3 +70,72 @@ def test_root_endpoint_returns_html(setup_servers):
 
     # Check if the 'Content-Type' header is 'text/html'
     assert 'text/html' in response.headers['Content-Type'], "Expected HTML content to be returned."
+
+def test_faucet_endpoint(setup_servers):
+    _, relay_port, _, _, _ = setup_servers
+
+    # Generate a new key pair for the test
+    private_key, public_key = generate_keys()
+    public_key_b64 = base64.b64encode(public_key).decode('utf-8')
+
+    # Fetch the server's public key from the /next_server endpoint
+    base_url = f'http://localhost:{relay_port}'
+    response = requests.get(f'{base_url}/next_server')
+    assert response.status_code == 200, "Expected a 200 OK response from /next_server endpoint."
+    server_public_key_b64 = response.json()['server_public_key']
+    server_public_key = base64.b64decode(server_public_key_b64)
+
+    # Prepare the chat history with the "hello" message
+    chat_history = [{"role": "user", "content": "hello"}]
+
+    # Encrypt the chat history
+    ciphertext_dict, cipherkey, iv = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+    encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
+    iv_b64 = base64.b64encode(iv).decode('utf-8')
+    encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
+
+    # Prepare the request payload
+    payload = {
+        "client_public_key": public_key_b64,
+        "server_public_key": server_public_key_b64,
+        "chat_history": encrypted_chat_history_b64,
+        "cipherkey": encrypted_cipherkey_b64,
+        "iv": iv_b64,
+    }
+
+    # Send the request to the /faucet endpoint
+    response = requests.post(f'{base_url}/faucet', json=payload)
+
+    # Check if the response status code is 200
+    assert response.status_code == 200, "Expected a 200 OK response from /faucet endpoint."
+
+    # Check if the response contains the expected message
+    assert response.json() == {'message': 'Request received'}, "Expected 'Request received' message."
+
+    # Poll the /retrieve endpoint for a response
+    start_time = time.time()
+    timeout = 60  # Timeout in seconds
+    while True:
+        response = requests.post(f'{base_url}/retrieve', json={"client_public_key": public_key_b64})
+        if response.status_code == 200:
+            data = response.json()
+            if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:
+                encrypted_chat_history_b64 = data['chat_history']
+                encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
+                iv = base64.b64decode(data['iv'])
+                cipherkey = base64.b64decode(data['cipherkey'])
+                decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, private_key)
+                
+                if decrypted_chat_history is not None:
+                    decrypted_response = json.loads(decrypted_chat_history.decode('utf-8'))
+                    assert len(decrypted_response) == 2
+                    assert decrypted_response[0]['role'] == 'user'
+                    assert decrypted_response[0]['content'] == 'hello'
+                    assert decrypted_response[1]['role'] == 'assistant'
+                    return  # Exit the loop if the response is successfully decrypted
+        
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout:
+            raise AssertionError("Timeout while waiting for response.")
+        
+        time.sleep(2)  # Wait for 2 seconds before the next attempt

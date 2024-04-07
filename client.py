@@ -90,7 +90,10 @@ class ChatClient:
 
     def send_message(self, message):
         self.chat_history.append({"role": "user", "content": message})
+
         server_public_key = self.get_server_public_key()
+
+        print(f"Server public key: {server_public_key}")
         
         if server_public_key:
             ciphertext_dict, cipherkey, iv = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)

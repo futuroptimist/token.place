@@ -66,63 +66,57 @@ new Vue({
         async encrypt(plaintext, publicKey) {
             const encoder = new TextEncoder();
             const plainTextBytes = encoder.encode(plaintext);
-
+        
             const key = await crypto.subtle.generateKey({ name: 'AES-CBC', length: 256 }, true, ['encrypt', 'decrypt']);
             const iv = crypto.getRandomValues(new Uint8Array(16));
-
+        
+            const publicKeyBuffer = this.base64ToArrayBuffer(publicKey);
             const publicKeyImported = await crypto.subtle.importKey(
                 'spki',
-                this.str2ab(atob(publicKey)),
+                publicKeyBuffer,
                 { name: 'RSA-OAEP', hash: 'SHA-256' },
                 false,
                 ['encrypt']
             );
-
+        
             const encryptedKey = await crypto.subtle.encrypt(
                 { name: 'RSA-OAEP' },
                 publicKeyImported,
                 await crypto.subtle.exportKey('raw', key)
             );
-
+        
             const cipherText = await crypto.subtle.encrypt(
                 { name: 'AES-CBC', iv },
                 key,
                 plainTextBytes
             );
-
+        
             return {
-                cipherText: this.ab2str(cipherText),
-                cipherKey: this.ab2str(encryptedKey),
-                iv: this.ab2str(iv)
+                cipherText: this.arrayBufferToBase64(cipherText),
+                cipherKey: this.arrayBufferToBase64(encryptedKey),
+                iv: btoa(String.fromCharCode.apply(null, new Uint8Array(iv)))
             };
         },
-        ab2str(buffer) {
-            return btoa(String.fromCharCode.apply(null, new Uint8Array(buffer)));
-        },
-
-        str2ab(str) {
-            const buf = new ArrayBuffer(str.length);
-            const bufView = new Uint8Array(buf);
-            for (let i = 0, strLen = str.length; i < strLen; i++) {
-                bufView[i] = str.charCodeAt(i);
-            }
-            return buf;
-        },
         async decrypt(cipherText, cipherKey, iv, privateKey) {
+            const cipherTextBuffer = this.base64ToArrayBuffer(cipherText);
+            const cipherKeyBuffer = this.base64ToArrayBuffer(cipherKey);
+            const ivBuffer = this.base64ToArrayBuffer(atob(iv));
+        
+            const privateKeyBuffer = this.base64ToArrayBuffer(privateKey);
             const privateKeyImported = await crypto.subtle.importKey(
                 'pkcs8',
-                this.str2ab(atob(privateKey)),
+                privateKeyBuffer,
                 { name: 'RSA-OAEP', hash: 'SHA-256' },
                 false,
                 ['decrypt']
             );
-
+        
             const decryptedKey = await crypto.subtle.decrypt(
                 { name: 'RSA-OAEP' },
                 privateKeyImported,
-                this.str2ab(cipherKey)
+                cipherKeyBuffer
             );
-
+        
             const key = await crypto.subtle.importKey(
                 'raw',
                 decryptedKey,
@@ -130,29 +124,70 @@ new Vue({
                 false,
                 ['decrypt']
             );
-
+        
             const decryptedBytes = await crypto.subtle.decrypt(
-                { name: 'AES-CBC', iv: this.str2ab(iv) },
+                { name: 'AES-CBC', iv: ivBuffer },
                 key,
-                this.str2ab(cipherText)
+                cipherTextBuffer
             );
-
+        
             const decoder = new TextDecoder();
             return decoder.decode(decryptedBytes);
         },
-        sendMessage() {
+        base64ToArrayBuffer(base64) {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        },
+        arrayBufferToBase64(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+        },
+        async sendMessage() {
             const messageContent = this.newMessage.trim();
             if (messageContent && this.serverPublicKey) {
-                this.chatHistory.push({ role: 'user', content: messageContent }); // Display user's message immediately
-                this.newMessage = ''; // Clear the input field after sending
-                
-                // Payload for the /faucet endpoint
+                this.chatHistory.push({ role: 'user', content: messageContent });
+                this.newMessage = '';
+        
+                // Send the message to the /inference endpoint
+                fetch('/inference', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ chat_history: this.chatHistory })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data && Array.isArray(data)) {
+                        this.chatHistory = data; // Update UI with the response from the /inference endpoint
+                    } else {
+                        console.error('Unexpected response format from /inference:', data);
+                    }
+                })
+                .catch((error) => {
+                    console.error('Error sending message to /inference:', error);
+                });
+        
+                // Send the message to the /faucet endpoint
+                const encryptedData = await this.encrypt(JSON.stringify([{ role: 'user', content: messageContent }]), this.serverPublicKey);
+
                 const faucetPayload = {
                     server_public_key: this.serverPublicKey,
-                    chat_history: JSON.stringify([{ role: 'user', content: messageContent }])
+                    client_public_key: this.clientPublicKey,
+                    chat_history: encryptedData.cipherText,
+                    cipherkey: encryptedData.cipherKey,
+                    iv: encryptedData.iv
                 };
-                
-                // Send the message to the /faucet endpoint
+        
                 fetch('/faucet', {
                     method: 'POST',
                     headers: {
@@ -164,29 +199,41 @@ new Vue({
                 .then(data => {
                     console.log('Response from /faucet:', data);
                     // Process and log the /faucet response. Do not update the UI with this response.
+        
+                    // Start polling the /retrieve endpoint
+                    const startTime = Date.now();
+                    const pollInterval = setInterval(async () => {
+                        const retrieveResponse = await fetch('/retrieve', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ client_public_key: this.clientPublicKey })
+                        });
+        
+                        if (retrieveResponse.ok) {
+                            const responseData = await retrieveResponse.json();
+                            const decryptedChatHistory = await this.decrypt(
+                                responseData.chat_history,
+                                responseData.cipherkey,
+                                responseData.iv,
+                                this.clientPrivateKey
+                            );
+                            console.log('Decrypted chat history from /retrieve:', JSON.parse(decryptedChatHistory));
+                            clearInterval(pollInterval);
+                        } else {
+                            console.error('Error retrieving response:', retrieveResponse.status);
+                        }
+        
+                        // Check for timeout
+                        if (Date.now() - startTime > 60000) {
+                            clearInterval(pollInterval);
+                            console.log('Timeout reached while polling /retrieve endpoint');
+                        }
+                    }, 2000);
                 })
                 .catch((error) => {
                     console.error('Error sending message to /faucet:', error);
-                });
-
-                // Original message sending logic to the /inference (or another) endpoint
-                fetch('/inference', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ chat_history: this.chatHistory })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data && Array.isArray(data)) {
-                        this.chatHistory = data; // Update UI with the response from the original endpoint
-                    } else {
-                        console.error('Unexpected response format from /inference:', data);
-                    }
-                })
-                .catch((error) => {
-                    console.error('Error sending message to /inference:', error);
                 });
             }
         }

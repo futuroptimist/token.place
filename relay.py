@@ -121,13 +121,15 @@ def faucet():
     if server_public_key not in known_servers:
         return jsonify({'error': 'Server with the specified public key not found'}), 404
     
-    # Save the client's requests including the cipherkey and IV
-    client_inference_requests[server_public_key] = {
+    # Append the client's request to the list of requests for the server
+    if server_public_key not in client_inference_requests:
+        client_inference_requests[server_public_key] = []
+    client_inference_requests[server_public_key].append({
         'chat_history': chat_history_ciphertext,
         'client_public_key': data.get('client_public_key', None),
         'cipherkey': cipherkey,
         'iv': iv  # Include the IV in the saved client's request
-    }
+    })
     return jsonify({'message': 'Request received'}), 200
 
 @app.route('/sink', methods=['POST'])
@@ -165,13 +167,13 @@ def sink():
     }
 
     # Check if there are any client requests for this server
-    if public_key in client_inference_requests:
-        request_data = client_inference_requests.pop(public_key)
+    if public_key in client_inference_requests and client_inference_requests[public_key]:
+        request_data = client_inference_requests[public_key].pop(0)
         response_data.update({
             'client_public_key': request_data['client_public_key'],
             'chat_history': request_data['chat_history'],
             'cipherkey': request_data['cipherkey'],
-            'iv': request_data.get('iv', ''),  # Include the 'iv' key, default to an empty string if not present
+            'iv': request_data.get('iv', ''),
         })
 
     return jsonify(response_data)

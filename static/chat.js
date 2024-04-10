@@ -8,23 +8,26 @@ new Vue({
         clientPublicKey: null
     },
     mounted() {
-        this.getServerPublicKey();
-        this.generateClientKeys();
+        this.getServerPublicKey().then(() => {
+            console.log("Final serverPublicKey before encoding:", this.serverPublicKey);
+            this.generateClientKeys();
+        });
     },
     methods: {
         getServerPublicKey() {
-            fetch('/next_server')
-            .then(response => response.json())
-            .then(data => {
-                if (data && data.server_public_key) {
-                    this.serverPublicKey = data.server_public_key;
-                } else {
-                    console.error('Failed to retrieve server public key:', data);
-                }
-            })
-            .catch((error) => {
-                console.error('Error fetching server public key:', error);
-            });
+            return fetch('/next_server')
+                .then(response => response.json())
+                .then(data => {
+                    if (data && data.server_public_key) {
+                        this.serverPublicKey = data.server_public_key;
+                        console.log("Server public key set:", this.serverPublicKey);
+                    } else {
+                        console.error('Failed to retrieve server public key:', data);
+                    }
+                })
+                .catch((error) => {
+                    console.error('Error fetching server public key:', error);
+                });
         },
         async generateClientKeys() {
             // Generate client's RSA key pair
@@ -65,37 +68,54 @@ new Vue({
         },
         async encrypt(plaintext, publicKey) {
             const encoder = new TextEncoder();
-            const plainTextBytes = encoder.encode(plaintext);
+            const plainTextBytes = encoder.encode(JSON.stringify(plaintext));
+            console.log('Plain text bytes:', plainTextBytes);
         
             const key = await crypto.subtle.generateKey({ name: 'AES-CBC', length: 256 }, true, ['encrypt', 'decrypt']);
+            console.log('AES key generated:', key);
+        
             const iv = crypto.getRandomValues(new Uint8Array(16));
+            console.log('IV generated:', iv);
         
-            const publicKeyBuffer = this.base64ToArrayBuffer(publicKey);
-            const publicKeyImported = await crypto.subtle.importKey(
-                'spki',
-                publicKeyBuffer,
-                { name: 'RSA-OAEP', hash: 'SHA-256' },
-                false,
-                ['encrypt']
-            );
+            try {
+                const publicKeyBytes = this.base64ToArrayBuffer(publicKey);
+                console.log('Public key bytes:', publicKeyBytes);
         
-            const encryptedKey = await crypto.subtle.encrypt(
-                { name: 'RSA-OAEP' },
-                publicKeyImported,
-                await crypto.subtle.exportKey('raw', key)
-            );
+                const publicKeyImported = await crypto.subtle.importKey(
+                    "spki",
+                    publicKeyBytes,
+                    { name: "RSA-OAEP", hash: "SHA-256" },
+                    false,
+                    ["encrypt"]
+                );
+                console.log('Public key imported:', publicKeyImported);
         
-            const cipherText = await crypto.subtle.encrypt(
-                { name: 'AES-CBC', iv },
-                key,
-                plainTextBytes
-            );
+                const exportedKey = await crypto.subtle.exportKey('raw', key);
+                console.log('Exported AES key:', exportedKey);
         
-            return {
-                cipherText: this.arrayBufferToBase64(cipherText),
-                cipherKey: this.arrayBufferToBase64(encryptedKey),
-                iv: btoa(String.fromCharCode.apply(null, new Uint8Array(iv)))
-            };
+                const encryptedKey = await crypto.subtle.encrypt(
+                    { name: 'RSA-OAEP' },
+                    publicKeyImported,
+                    exportedKey
+                );
+                console.log('Encrypted key:', encryptedKey);
+        
+                const cipherText = await crypto.subtle.encrypt(
+                    { name: 'AES-CBC', iv },
+                    key,
+                    plainTextBytes
+                );
+                console.log('Cipher text:', cipherText);
+        
+                return {
+                    cipherText: this.arrayBufferToBase64(cipherText),
+                    cipherKey: this.arrayBufferToBase64(encryptedKey),
+                    iv: this.arrayBufferToBase64(iv)
+                };
+            } catch (error) {
+                console.error("Error during encryption process:", error);
+                console.error("Stack trace:", error.stack);
+            }
         },
         async decrypt(cipherText, cipherKey, iv, privateKey) {
             const cipherTextBuffer = this.base64ToArrayBuffer(cipherText);
@@ -153,8 +173,10 @@ new Vue({
         },
         async sendMessage() {
             const messageContent = this.newMessage.trim();
+            console.log('Message content:', messageContent);
             if (messageContent && this.serverPublicKey) {
                 this.chatHistory.push({ role: 'user', content: messageContent });
+                console.log('Chat history:', this.chatHistory);
                 this.newMessage = '';
         
                 // Send the message to the /inference endpoint
@@ -176,9 +198,11 @@ new Vue({
                 .catch((error) => {
                     console.error('Error sending message to /inference:', error);
                 });
+
+                console.log("Sending encrypted message to /faucet");
         
                 // Send the message to the /faucet endpoint
-                const encryptedData = await this.encrypt(JSON.stringify([{ role: 'user', content: messageContent }]), this.serverPublicKey);
+                const encryptedData = await this.encrypt(this.chatHistory, this.serverPublicKey);
 
                 const faucetPayload = {
                     server_public_key: this.serverPublicKey,

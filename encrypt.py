@@ -58,9 +58,13 @@ def encrypt(plaintext, public_key_bytes):
         iv (bytes): The initialization vector used in the AES encryption.
     """
 
+    # Load the public key
     public_key = load_pem_public_key(public_key_bytes)
 
+    # PKCS7 padding
     pkcs7_padder = padding.PKCS7(AES.block_size).padder()
+
+    # Pad the plaintext to be a multiple of the block size
     padded_plaintext = pkcs7_padder.update(plaintext) + pkcs7_padder.finalize()
 
     # Generate new random AES-256 key
@@ -77,8 +81,13 @@ def encrypt(plaintext, public_key_bytes):
 
     # Encrypt AES key
     oaep_padding = asymmetric_padding.OAEP(mgf=asymmetric_padding.MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None)
+
+    # Encrypt the AES key with the public key
     cipherkey = public_key.encrypt(key, oaep_padding)
 
+    # TODO: refactor the return values to be a tuple
+
+    # Return the ciphertext, encrypted AES key, and IV
     return {'iv': iv, 'ciphertext': ciphertext}, cipherkey, iv
 
 def decrypt(ciphertext, cipherkey, private_key_bytes):

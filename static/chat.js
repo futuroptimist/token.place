@@ -66,56 +66,101 @@ new Vue({
             this.clientPrivateKey = privateKeyPem;
             this.clientPublicKey = publicKeyPem;
         },
-        async encrypt(plaintext, publicKey) {
-            const encoder = new TextEncoder();
-            const plainTextBytes = encoder.encode(JSON.stringify(plaintext));
-            console.log('Plain text bytes:', plainTextBytes);
-        
-            const key = await crypto.subtle.generateKey({ name: 'AES-CBC', length: 256 }, true, ['encrypt', 'decrypt']);
-            console.log('AES key generated:', key);
-        
-            const iv = crypto.getRandomValues(new Uint8Array(16));
-            console.log('IV generated:', iv);
-        
+        async convertPemToBinary(pem) {
+            const pemHeader = "-----BEGIN PUBLIC KEY-----";
+            const pemFooter = "-----END PUBLIC KEY-----";
+            const pemContents = pem.substring(pemHeader.length, pem.length - pemFooter.length);
+            const binaryDerString = window.atob(pemContents);
+            const binaryDer = new Uint8Array(Array.from(binaryDerString, (c) => c.charCodeAt(0)));
+            return binaryDer.buffer;
+        },
+        async encryptWithRSA(publicKeyPem, data) {
             try {
-                const publicKeyBytes = this.base64ToArrayBuffer(publicKey);
-                console.log('Public key bytes:', publicKeyBytes);
+                const encoder = new TextEncoder();
+                const encodedData = encoder.encode(data);
         
-                const publicKeyImported = await crypto.subtle.importKey(
-                    "spki",
-                    publicKeyBytes,
-                    { name: "RSA-OAEP", hash: "SHA-256" },
-                    false,
-                    ["encrypt"]
-                );
-                console.log('Public key imported:', publicKeyImported);
+                try {
+                    const binaryDer = await this.convertPemToBinary(publicKeyPem);
+                    console.log("Binary DER:", binaryDer);
         
-                const exportedKey = await crypto.subtle.exportKey('raw', key);
-                console.log('Exported AES key:', exportedKey);
+                    const publicKey = await window.crypto.subtle.importKey(
+                        "spki",
+                        binaryDer,
+                        {
+                            name: "RSA-OAEP",
+                            hash: "SHA-256"
+                        },
+                        true,
+                        ["encrypt"]
+                    );
+                    console.log("Public key imported successfully");
         
-                const encryptedKey = await crypto.subtle.encrypt(
-                    { name: 'RSA-OAEP' },
-                    publicKeyImported,
-                    exportedKey
-                );
-                console.log('Encrypted key:', encryptedKey);
+                    const encryptedData = await window.crypto.subtle.encrypt(
+                        {
+                            name: "RSA-OAEP"
+                        },
+                        publicKey,
+                        encodedData
+                    );
+                    console.log("Data encrypted successfully");
         
-                const cipherText = await crypto.subtle.encrypt(
-                    { name: 'AES-CBC', iv },
-                    key,
-                    plainTextBytes
-                );
-                console.log('Cipher text:', cipherText);
-        
-                return {
-                    cipherText: this.arrayBufferToBase64(cipherText),
-                    cipherKey: this.arrayBufferToBase64(encryptedKey),
-                    iv: this.arrayBufferToBase64(iv)
-                };
+                    return encryptedData;
+                } catch (error) {
+                    console.error("Error in encryptWithRSA inner try-catch:", error);
+                    throw error;
+                }
             } catch (error) {
-                console.error("Error during encryption process:", error);
-                console.error("Stack trace:", error.stack);
+                console.error("Error in encryptWithRSA outer try-catch:", error);
+                throw error;
             }
+        },
+        async encrypt(plaintext, publicKey) {
+            console.log("CryptoJS:", CryptoJS);
+            console.log("CryptoJS.AES:", CryptoJS.AES);
+            // Convert the public key from PEM to WordArray
+            const pemHeader = "-----BEGIN PUBLIC KEY-----";
+            const pemFooter = "-----END PUBLIC KEY-----";
+            const pemContents = publicKey.substring(pemHeader.length, publicKey.length - pemFooter.length);
+            const binaryDerString = window.atob(pemContents);
+            const publicKeyWordArray = CryptoJS.enc.Hex.parse(binaryDerString);
+        
+            // Convert plaintext to WordArray
+            const plaintextWordArray = CryptoJS.enc.Utf8.parse(plaintext);
+        
+            // PKCS7 padding
+            const paddedPlaintext = CryptoJS.pad.Pkcs7.pad(plaintextWordArray);
+        
+            // Generate new random AES-256 key
+            const key = CryptoJS.lib.WordArray.random(256 / 8);
+        
+            // Generate new random 128-bit IV
+            const iv = CryptoJS.lib.WordArray.random(128 / 8);
+
+            console.log("Final serverPublicKey before encoding:", publicKeyWordArray);
+        
+            // AES CBC Cipher
+            const encrypted = CryptoJS.AES.encrypt(paddedPlaintext, key, {
+                iv: iv,
+                mode: CryptoJS.mode.CBC,
+                padding: CryptoJS.pad.Pkcs7
+            });
+
+            console.log("Encrypted:", encrypted);
+        
+            // Encrypt the AES key with the public RSA key for transmission over the network
+            const encryptedKey = await this.encryptWithRSA(publicKey, key.toString()).catch(error => {
+                console.error("Error encrypting key:", error);
+                throw error;
+            });
+
+            console.log("Encrypted key:", encryptedKey);
+        
+            // Return the ciphertext, encrypted AES key, and IV
+            return {
+                ciphertext: CryptoJS.enc.Base64.stringify(encrypted.ciphertext),
+                encryptedKey: encryptedKey.toString(),
+                iv: CryptoJS.enc.Base64.stringify(iv)
+            };
         },
         async decrypt(cipherText, cipherKey, iv, privateKey) {
             const cipherTextBuffer = this.base64ToArrayBuffer(cipherText);

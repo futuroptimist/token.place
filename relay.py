@@ -104,6 +104,8 @@ def faucet():
     """
     # Parse the request data
     data = request.get_json()
+    print("Received data in /faucet:", data)  # Add this line to log the received data
+    
     if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({
             'error': {

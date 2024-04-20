@@ -37,7 +37,8 @@ new Vue({
         },
         base64ToArrayBuffer(base64) {
             try {
-                const binaryString = atob(base64);
+                const cleanedBase64 = base64.replace(/\s+/g, ''); // Remove whitespace characters
+                const binaryString = atob(cleanedBase64);
                 const len = binaryString.length;
                 const bytes = new Uint8Array(len);
                 for (let i = 0; i < len; i++) {
@@ -53,50 +54,36 @@ new Vue({
             console.log('Plaintext:', plaintext);
             console.log('Public Key:', publicKey);
         
-            const plaintextWordArray = CryptoJS.enc.Utf8.parse(plaintext);
-            const paddedPlaintext = CryptoJS.pad.Pkcs7.pad(plaintextWordArray);
-            const key = CryptoJS.lib.WordArray.random(256 / 8);
-            const iv = CryptoJS.lib.WordArray.random(128 / 8);
-            const encrypted = CryptoJS.AES.encrypt(paddedPlaintext, key, {
-                iv: iv,
-                mode: CryptoJS.mode.CBC,
-                padding: CryptoJS.pad.Pkcs7
-            });
+            try {
+                const plaintextWordArray = CryptoJS.enc.Utf8.parse(plaintext);
+                const paddedPlaintext = CryptoJS.pad.Pkcs7.pad(plaintextWordArray);
+                const key = CryptoJS.lib.WordArray.random(256 / 8);
+                const iv = CryptoJS.lib.WordArray.random(16);
+                const encrypted = CryptoJS.AES.encrypt(paddedPlaintext, key, {
+                    iv: iv,
+                    mode: CryptoJS.mode.CBC,
+                    padding: CryptoJS.pad.Pkcs7
+                });
         
-            console.log('AES Encryption Result:', encrypted);
+                console.log('AES Encryption Result:', encrypted);
         
-            const keyBase64 = CryptoJS.enc.Base64.stringify(key);
-            console.log('AES Key (Base64):', keyBase64);
+                const keyBase64 = CryptoJS.enc.Base64.stringify(key);
+                console.log('AES Key (Base64):', keyBase64);
         
-            const publicKeyPem = `-----BEGIN PUBLIC KEY-----\n${publicKey}\n-----END PUBLIC KEY-----`;
-            const publicKeyBuffer = await crypto.subtle.importKey(
-                'spki',
-                this.base64ToArrayBuffer(atob(publicKey)),
-                {
-                    name: 'RSA-OAEP',
-                    hash: 'SHA-256',
-                },
-                true,
-                ['encrypt']
-            );
+                const encryptedKey = CryptoJS.RC4.encrypt(keyBase64, publicKey).toString();
         
-            const encryptedKeyBuffer = await crypto.subtle.encrypt(
-                {
-                    name: 'RSA-OAEP',
-                },
-                publicKeyBuffer,
-                new TextEncoder().encode(keyBase64)
-            );
+                console.log('RSA Encryption Result:', encryptedKey);
         
-            const encryptedKey = btoa(String.fromCharCode.apply(null, new Uint8Array(encryptedKeyBuffer)));
-        
-            console.log('RSA Encryption Result:', encryptedKey);
-        
-            return {
-                ciphertext: CryptoJS.enc.Base64.stringify(encrypted.ciphertext),
-                encryptedKey: encryptedKey,
-                iv: CryptoJS.enc.Base64.stringify(iv)
-            };
+                return {
+                    ciphertext: CryptoJS.enc.Base64.stringify(encrypted.ciphertext),
+                    encryptedKey: encryptedKey,
+                    iv: CryptoJS.enc.Base64.stringify(iv)
+                };
+            } catch (error) {
+                console.error('Error during encryption:', error);
+                console.error('Error stack trace:', error.stack);
+                return null;
+            }
         },
         async decrypt(cipherText, encryptedKey, iv) {
             const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${this.clientPrivateKey}\n-----END PRIVATE KEY-----`;
@@ -122,7 +109,7 @@ new Vue({
             const decryptedKeyBase64 = btoa(String.fromCharCode.apply(null, new Uint8Array(decryptedKeyBuffer)));
         
             const key = CryptoJS.enc.Base64.parse(decryptedKeyBase64);
-            const ivWordArray = CryptoJS.enc.Base64.parse(iv);
+            const ivWordArray = CryptoJS.lib.WordArray.create(new Uint8Array(this.base64ToArrayBuffer(iv)));
             const cipherTextWordArray = CryptoJS.enc.Base64.parse(cipherText);
         
             const decrypted = CryptoJS.AES.decrypt(
@@ -147,39 +134,35 @@ new Vue({
             const startTime = Date.now();
             return new Promise((resolve) => {
                 const pollInterval = setInterval(async () => {
-                    const retrieveResponse = await fetch('/retrieve', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({ client_public_key: this.clientPublicKey })
-                    });
+                    try {
+                        const retrieveResponse = await fetch('/retrieve', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ client_public_key: this.clientPublicKey })
+                        });
         
-                    console.log('Retrieve Response:', retrieveResponse);
+                        if (retrieveResponse.ok) {
+                            const responseData = await retrieveResponse.json();
         
-                    if (retrieveResponse.ok) {
-                        const responseData = await retrieveResponse.json();
-                        console.log('Response Data:', responseData);
+                            if (responseData.chat_history && responseData.cipherkey && responseData.iv) {
+                                const decryptedChatHistory = await this.decrypt(
+                                    responseData.chat_history,
+                                    responseData.cipherkey,
+                                    responseData.iv
+                                );
         
-                        if (responseData.chat_history && responseData.cipherkey && responseData.iv) {
-                            console.log('Received complete response data:', responseData);
-                            const decryptedChatHistory = await this.decrypt(
-                                responseData.chat_history,
-                                responseData.cipherkey,
-                                responseData.iv
-                            );
-                            console.log('Decrypted Chat History:', decryptedChatHistory);
-        
-                            if (decryptedChatHistory) {
-                                console.log('Decrypted Chat History JSON:', JSON.parse(decryptedChatHistory));
-                                clearInterval(pollInterval);
-                                resolve(JSON.parse(decryptedChatHistory));
+                                if (decryptedChatHistory) {
+                                    clearInterval(pollInterval);
+                                    resolve(JSON.parse(decryptedChatHistory));
+                                }
                             }
                         } else {
-                            console.log('Incomplete response data. Retrying...');
+                            console.error('Error retrieving response:', retrieveResponse.status);
                         }
-                    } else {
-                        console.error('Error retrieving response:', retrieveResponse.status);
+                    } catch (error) {
+                        console.error('Error in retrieveResponse:', error);
                     }
         
                     // Check for timeout
@@ -188,8 +171,15 @@ new Vue({
                         console.log('Timeout reached while polling /retrieve endpoint');
                         resolve(null);
                     }
-                }, 3000); // Increased polling interval to 3 seconds
+                }, 3000);
             });
+        },
+        extractBase64PublicKey(pemPublicKey) {
+            const base64PublicKey = pemPublicKey
+                .replace('-----BEGIN PUBLIC KEY-----', '')
+                .replace('-----END PUBLIC KEY-----', '')
+                .replace(/\s/g, '');
+            return base64PublicKey;
         },
         async sendMessage() {
             const messageContent = this.newMessage.trim();
@@ -220,49 +210,55 @@ new Vue({
                 });
         
                 console.log("Sending encrypted message to /faucet");
+                console.log("Server Public Key:", this.serverPublicKey);  // Add this line
         
-                // Send the message to the /faucet endpoint
-                const chatHistoryString = JSON.stringify(this.chatHistory);
-                const encryptedData = await this.encrypt(chatHistoryString, this.serverPublicKey);
-
-                if (encryptedData === null) {
-                    console.error('Encryption failed. Aborting message send.');
+                try {
+                    // Send the message to the /faucet endpoint
+                    const chatHistoryString = JSON.stringify(this.chatHistory);
+                    const encryptedData = await this.encrypt(chatHistoryString, this.serverPublicKey);
+        
+                    if (encryptedData === null) {
+                        console.error('Encryption failed. Aborting message send.');
+                        return;
+                    }
+        
+                    const faucetPayload = {
+                        server_public_key: this.serverPublicKey,
+                        client_public_key: this.extractBase64PublicKey(this.clientPublicKey),
+                        chat_history: encryptedData.ciphertext,
+                        cipherkey: encryptedData.encryptedKey,
+                        iv: encryptedData.iv
+                    };
+        
+                    console.log("Faucet payload:", faucetPayload);
+                    fetch('/faucet', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(faucetPayload)
+                    })
+                    .then(response => response.json())
+                    .then(async data => {
+                        console.log('Response from /faucet:', data);
+                        // Process and log the /faucet response. Do not update the UI with this response.
+        
+                        // Call the retrieveResponse function to poll for the response
+                        const decryptedChatHistory = await this.retrieveResponse();
+                        if (decryptedChatHistory) {
+                            console.log('Decrypted Chat History from /retrieve:', decryptedChatHistory);
+                            this.chatHistory = decryptedChatHistory; // Update the chat history with the decrypted response
+                        } else {
+                            console.error('Failed to retrieve response from /retrieve endpoint');
+                        }
+                    })
+                    .catch((error) => {
+                        console.error('Error sending message to /faucet:', error);
+                    });
+                } catch (error) {
+                    console.error('Error during encryption:', error);
                     return;
                 }
-
-                const faucetPayload = {
-                    server_public_key: this.serverPublicKey,
-                    client_public_key: this.clientPublicKey,
-                    chat_history: encryptedData.ciphertext,
-                    cipherkey: encryptedData.encryptedKey,
-                    iv: encryptedData.iv
-                };
-        
-                console.log("Faucet payload:", faucetPayload);
-                fetch('/faucet', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(faucetPayload)
-                })
-                .then(response => response.json())
-                .then(async data => {
-                    console.log('Response from /faucet:', data);
-                    // Process and log the /faucet response. Do not update the UI with this response.
-        
-                    // Call the retrieveResponse function to poll for the response
-                    const decryptedChatHistory = await this.retrieveResponse();
-                    if (decryptedChatHistory) {
-                        console.log('Decrypted Chat History from /retrieve:', decryptedChatHistory);
-                        this.chatHistory = decryptedChatHistory; // Update the chat history with the decrypted response
-                    } else {
-                        console.error('Failed to retrieve response from /retrieve endpoint');
-                    }
-                })
-                .catch((error) => {
-                    console.error('Error sending message to /faucet:', error);
-                });
             }
         },
     },

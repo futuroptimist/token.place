@@ -4,3 +4,4 @@ models.bak
 __pycache__
 .pytest_cache
 .env
+f2clipboard.py

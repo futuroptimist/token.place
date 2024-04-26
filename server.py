@@ -21,7 +21,8 @@ SERVER_PORT = 3000
 
 app = Flask(__name__)
 
-URL = 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf'
+# URL = 'https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf'
+URL = 'https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf'
 file_name = os.path.basename(URL)
 CHUNK_SIZE_MB = 16  # Chunk size in MB
 
@@ -35,8 +36,8 @@ else:
     llm = Llama(
         model_path=model_path,
         n_gpu_layers=-1,
-        n_ctx=4096,
-        chat_format="llama-2"
+        n_ctx=8192,
+        chat_format="llama-3"
     )
 
     if llm is None:

@@ -18,6 +18,7 @@ There are tons of personal computers and homelabs out there with lots of compute
   - [x] end-to-end encryption (short responses, under 256 bytes of utf-8 encoded text) for client.py
   - [x] end-to-end encryption for longer responses for client.py
   - [x] integration test demonstrating the above
+  - [x] Llama 2 -> 3 (7B -> 8B)
   - [ ] end-to-end encryption on landing page (relay.py / GET)
   - [ ] automated browser testing of landing page, preventing regressions of the chat ui
   - [ ] delete old /inference endpoint and everything upstream and downstream that's now unused

@@ -202,7 +202,16 @@ def process_message():
         # Validate if 'chat_history' key exists in the request data
         if 'chat_history' not in data:
             return jsonify({'error': 'Invalid request format'}), 400
-        chat_history = data.get('chat_history', [])
+        chat_history = data.get('chat_history', [
+            {
+                "role": "system",
+                "content": "You are Llama 3 8B, a helpful assistant created by"
+                "Meta. If anyone asks you what your name is, just say Llama!🦙 "
+                "Make sure you use whitespace appropriately so that your "
+                "responses aren't just a big blob of text, especially on smaller"
+                "device widths."
+            }
+        ])
         updated_chat_history = llama_cpp_get_response(chat_history)
         return jsonify(updated_chat_history)
     else:

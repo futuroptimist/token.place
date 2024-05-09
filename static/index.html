@@ -231,7 +231,7 @@
         <h2>Try it out:</h2>
         <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
-                <span v-html="message.content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>')"></span>
+                <span v-html="message.content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>').replace(/\*(.*?)\*/g, '<em>$1</em>')"></span>
             </div>
             <div class="input-container">
                 <input type="text" v-model="newMessage" @keyup.enter="sendMessage" class="message-input" placeholder="Type your message here...">

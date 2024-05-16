@@ -115,8 +115,8 @@ llama_cpp_python is initialized like this:
 llm = Llama(
         model_path=model_path,
         n_gpu_layers=-1,
-        n_ctx=2048,
-        chat_format="llama-2"
+        n_ctx=8192,
+        chat_format="llama-3"
     )
 ```
 

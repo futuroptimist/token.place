@@ -22,10 +22,14 @@ There are tons of personal computers and homelabs out there with lots of compute
   - [ ] end-to-end encryption on landing page (relay.py / GET)
   - [ ] automated browser testing of landing page, preventing regressions of the chat ui
   - [ ] delete old /inference endpoint and everything upstream and downstream that's now unused
+- [x] distribute relay.py across 2 or more machines
+  - [x] personal gaming PC
+  - [x] basic DigitalOcean droplet
+- [ ] API v1 with at least 10 models supported and available
+- [ ] landing page chat UI integrated with API v1
+- [ ] [https://github.com/democratizedspace/dspace](DSPACE) (first 1st party integration) uses API v1 for dChat
 - [ ] set up production server (raspberry pi cluster lol)
-- [ ] bandwidth improvements
 - [ ] allow participation from other server.pys
-- [ ] allow users to specify which model they want from a growing list
 
 ## installation
 

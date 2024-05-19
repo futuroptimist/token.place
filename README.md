@@ -41,6 +41,14 @@ create a virtual environment:
 $ python -m venv env
 ```
 
+Depending on your environment, you may need to replace `python` in the above command with `python3`.
+
+On Debian-based distributions, you may additionally need to install venv first, if it's not already installed:
+
+```sh
+apt install python3.12-venv
+```
+
 activate the virtual environment:
 
 #### unix/linux/macos
@@ -62,6 +70,18 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
 ### install dependencies
+
+You may be missing some CMAKE dependencies
+
+on Debian, you can run the following
+
+```sh
+sudo apt-get install build-essential cmake
+```
+
+TODO: instructions for other common OSes
+
+then, run:
 
 ```
 pip install -r requirements.txt

@@ -1,5 +1,5 @@
 import pytest
-from server import app
+from server.server_app import ServerApp
 import json
 from encrypt import generate_keys
 from unittest.mock import MagicMock, patch
@@ -9,53 +9,48 @@ from config import get_config, Config
 config = get_config()
 
 @pytest.fixture
-def client():
-    app.config['TESTING'] = True
-    with app.test_client() as client:
+def server_app():
+    """Create a ServerApp instance for testing."""
+    with patch('server.server_app.model_manager') as mock_model_manager, \
+         patch('server.server_app.crypto_manager') as mock_crypto_manager, \
+         patch('server.server_app.RelayClient') as mock_relay_client_class:
+        
+        # Set up return values for mocks
+        mock_model_manager.use_mock_llm = True
+        
+        # Create a test relay client
+        mock_relay_client = MagicMock()
+        mock_relay_client_class.return_value = mock_relay_client
+        
+        # Create the server app
+        server = ServerApp(
+            server_port=9000,  # Use a different port for testing
+            relay_port=9001,
+            relay_url="http://localhost"
+        )
+        
+        # Patch the start_relay_polling method to avoid starting threads
+        server.start_relay_polling = MagicMock()
+        
+        yield server
+
+@pytest.fixture
+def client(server_app):
+    """Create a test client for the Flask app."""
+    server_app.app.config['TESTING'] = True
+    with server_app.app.test_client() as client:
         yield client
 
-@pytest.fixture(autouse=True)
-def mock_keys(monkeypatch):
-    def mock_generate_keys():
-        return b'mock_private_key', b'mock_public_key'
-    monkeypatch.setattr('server.generate_keys', mock_generate_keys)
-
-@pytest.fixture(autouse=True)
-def mock_llm(monkeypatch):
-    """Mocks the get_llm_instance function to return a mock Llama object."""
-    # Create a mock Llama instance
-    mock_llama_instance = MagicMock()
-    
-    # Configure the mock create_chat_completion to return a sample response
-    mock_response = {
-        'choices': [
-            {
-                'message': {
-                    'role': 'assistant',
-                    'content': 'This is a mock response from the Llama model.'
-                }
-            }
-        ]
-        # Add other fields if your code uses them
-    }
-    mock_llama_instance.create_chat_completion.return_value = mock_response
-
-    # Mock the get_llm_instance function in the server module
-    monkeypatch.setattr('server.get_llm_instance', lambda: mock_llama_instance)
-
-# Mock config for testing
 @pytest.fixture(autouse=True)
 def mock_config(monkeypatch):
     """Ensure we're using testing configuration."""
     # Force testing environment for all server tests
-    # Instead of setting is_testing directly, set the env property
     monkeypatch.setattr('config.config.env', 'testing')
     # Create a new test Config instance with testing env
     test_config = Config(env="testing")
     # Replace the global config with our test config
     monkeypatch.setattr('config.config', test_config)
-    monkeypatch.setattr('server.config', test_config)
-    monkeypatch.setattr('server.USE_MOCK_LLM', True)
+    monkeypatch.setattr('server.server_app.config', test_config)
     
     # Ensure the models directory exists
     import os
@@ -70,28 +65,50 @@ def mock_config(monkeypatch):
             f.write(b'dummy model data for testing')
 
 def test_home_endpoint(client):
-    """Test that the home endpoint accepts POST requests and returns a valid response."""
-    response = client.post('/', json={'chat_history': []})
-    assert response.status_code == 200
-    assert isinstance(response.get_json(), list)
-
-def test_model_integration(client):
-    """Test the model integration by sending a simulated chat history."""
-    chat_history = [{"role": "user", "content": "Hello, how are you?"}]
-    response = client.post('/', json={'chat_history': chat_history})
-    assert response.status_code == 200
-    assert isinstance(response.get_json(), list)
-    response_data = response.get_json()
-    assert any(item.get('role') == 'assistant' for item in response_data)
-
-def test_invalid_request(client):
-    """Test sending an invalid request to the home endpoint."""
-    response = client.post('/', data=json.dumps({'invalid_key': 'invalid_value'}), content_type='application/json')
-    assert response.status_code == 400
-    assert response.get_json() == {'error': 'Invalid request format'}
-
-def test_invalid_method(client):
-    """Test sending a GET request to the home endpoint."""
+    """Test that the home endpoint returns a valid response."""
     response = client.get('/')
-    assert response.status_code == 405
-    assert response.get_json() == {'error': 'Method not allowed'}
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['status'] == 'ok'
+    assert 'message' in data
+
+def test_health_endpoint(client):
+    """Test the health endpoint."""
+    response = client.get('/health')
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['status'] == 'ok'
+    assert 'version' in data
+    assert 'mock_mode' in data
+
+def test_server_initialization(server_app):
+    """Test that the server initializes correctly."""
+    # Check that the server object has the expected attributes
+    assert server_app.server_port == 9000
+    assert server_app.relay_port == 9001
+    assert server_app.relay_url == "http://localhost"
+    assert server_app.app is not None
+
+def test_setup_routes(server_app):
+    """Test that the routes are set up correctly."""
+    # Check that the expected routes are registered
+    routes = [rule.rule for rule in server_app.app.url_map.iter_rules()]
+    assert '/' in routes
+    assert '/health' in routes
+
+def test_initialize_llm_mock_mode(server_app):
+    """Test the initialize_llm method in mock mode."""
+    with patch('server.server_app.model_manager') as mock_model_manager:
+        mock_model_manager.use_mock_llm = True
+        server_app.initialize_llm()
+        # Verify that download_model_if_needed was not called
+        mock_model_manager.download_model_if_needed.assert_not_called()
+
+def test_initialize_llm_real_mode(server_app):
+    """Test the initialize_llm method in real mode."""
+    with patch('server.server_app.model_manager') as mock_model_manager:
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.download_model_if_needed.return_value = True
+        server_app.initialize_llm()
+        # Verify that download_model_if_needed was called
+        mock_model_manager.download_model_if_needed.assert_called_once()

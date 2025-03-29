@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""
+token.place LLM server.
+This is the main entry point that uses the refactored modular architecture.
+"""
+import os
+import sys
+
+# Import from the refactored server package
+from server.server_app import main
+
+if __name__ == "__main__":
+    # Pass control to the main function in server_app.py
+    main() 

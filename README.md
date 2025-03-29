@@ -151,7 +151,7 @@ This will replace the llama-cpp-python you installed via `pip install -r require
 **if you're using Command Prompt**
 
 ```
-set CMAKE_ARGS=-DLLAMA_CUBLAS=on
+set CMAKE_ARGS=-DGGML_CUDA=on
 set FORCE_CMAKE=1
 pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose
 ```
@@ -159,10 +159,12 @@ pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbos
 **if you're using Powershell**
 
 ```
-$env:CMAKE_ARGS = "-DLLAMA_CUBLAS=on"
+$env:CMAKE_ARGS = "-DGGML_CUDA=on"
 $env:FORCE_CMAKE=1
 pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose
 ```
+
+> **Note:** The compilation process can take 5-20 minutes depending on your system. The `--verbose` flag shows build progress, but there may still be periods with no visible output. This is normal - the compiler is working in the background. As long as your system shows CPU activity, the process is still running.
 
 when you run `server.py` next, you'll see `BLAS = 1` in a collection of lines that looks like this:
 

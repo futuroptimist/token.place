@@ -11,10 +11,10 @@ import logging
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-# Import our path handling utilities
-from utils.path_handling import (
-    get_config_dir, ensure_dir_exists, IS_WINDOWS, IS_MACOS, IS_LINUX
-)
+# Global constants for platform detection
+IS_WINDOWS = platform.system().lower() == "windows"
+IS_MACOS = platform.system().lower() == "darwin"
+IS_LINUX = platform.system().lower() == "linux"
 
 # Set up logging
 logging.basicConfig(
@@ -162,15 +162,16 @@ class Config:
     
     def _configure_platform_paths(self):
         """Configure paths based on the detected platform"""
+        # Import path handling here to avoid circular imports
+        from utils.path_handling import (
+            get_config_dir, ensure_dir_exists, get_app_data_dir, 
+            get_models_dir, get_logs_dir, get_cache_dir
+        )
+        
         config_dir = get_config_dir()
         
         # Ensure the config directory exists
         ensure_dir_exists(config_dir)
-        
-        # Set all the path configurations
-        from utils.path_handling import (
-            get_app_data_dir, get_models_dir, get_logs_dir, get_cache_dir
-        )
         
         app_data_dir = get_app_data_dir()
         models_dir = get_models_dir()

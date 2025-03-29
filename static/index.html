@@ -63,6 +63,13 @@
             overflow-x: auto;
             white-space: pre;
         }
+        code {
+            font-family: 'Courier New', Courier, monospace;
+            background-color: rgba(0, 0, 0, 0.2);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
         a:hover {
             border-bottom: 1px solid #ffffff;
         }
@@ -129,6 +136,43 @@
         }
         #toggleMode:hover {
             background-color: rgba(255, 255, 255, 0.4);
+        }
+        .api-endpoint {
+            margin-bottom: 30px;
+            border-left: 3px solid #00ffff;
+            padding-left: 15px;
+        }
+        .api-method {
+            display: inline-block;
+            padding: 3px 8px;
+            margin-right: 10px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+        .method-get {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .method-post {
+            background-color: #2196F3;
+            color: white;
+        }
+        .api-path {
+            font-family: 'Courier New', Courier, monospace;
+            color: #ffffff;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        th {
+            background-color: rgba(0, 255, 255, 0.1);
         }
         @media (max-width: 768px) {
             .container {
@@ -228,6 +272,19 @@
         body.light-mode #toggleMode:hover {
             background-color: #0056b3;
         }
+        
+        body.light-mode pre {
+            background-color: #f0f0f0;
+            color: #333;
+        }
+        
+        body.light-mode code {
+            background-color: #e8e8e8;
+        }
+        
+        body.light-mode .api-endpoint {
+            border-left-color: #007bff;
+        }
     </style>
 </head>
 <body class="dark-mode">
@@ -251,7 +308,120 @@
         <hr>
 
         <h2>API</h2>
-        <p>Coming soon!</p>
+        <p>The token.place API is designed to be compatible with the OpenAI API format, making it easy to integrate with existing applications that use OpenAI's services.</p>
+        
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models</span></h3>
+            <p>Lists the available models.</p>
+            <p><strong>Example Response:</strong></p>
+            <pre>{
+  "object": "list",
+  "data": [
+    {
+      "id": "llama-3-8b-instruct",
+      "object": "model",
+      "created": 1679351277,
+      "owned_by": "token.place",
+      "permission": [...],
+      "root": "llama-3-8b-instruct",
+      "parent": null
+    }
+  ]
+}</pre>
+        </div>
+        
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models/{model_id}</span></h3>
+            <p>Retrieves information about a specific model.</p>
+            <p><strong>Example Response:</strong></p>
+            <pre>{
+  "id": "llama-3-8b-instruct",
+  "object": "model",
+  "created": 1679351277,
+  "owned_by": "token.place",
+  "permission": [...],
+  "root": "llama-3-8b-instruct",
+  "parent": null
+}</pre>
+        </div>
+        
+        <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/chat/completions</span></h3>
+            <p>Creates a completion for the chat message.</p>
+            <p><strong>Request Body:</strong></p>
+            <pre>{
+  "model": "llama-3-8b-instruct",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ]
+}</pre>
+            <p><strong>Example Response:</strong></p>
+            <pre>{
+  "id": "chatcmpl-123abc456def",
+  "object": "chat.completion",
+  "created": 1677858242,
+  "model": "llama-3-8b-instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I assist you today?"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  }
+}</pre>
+        </div>
+        
+        <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/completions</span></h3>
+            <p>Creates a completion for the prompt (traditional completion API).</p>
+            <p><strong>Request Body:</strong></p>
+            <pre>{
+  "model": "llama-3-8b-instruct",
+  "prompt": "Write a poem about AI",
+  "max_tokens": 256
+}</pre>
+            <p><strong>Example Response:</strong> (Same format as chat/completions)</p>
+        </div>
+        
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/public-key</span></h3>
+            <p>Retrieves the server's public key for end-to-end encryption.</p>
+            <p><strong>Example Response:</strong></p>
+            <pre>{
+  "public_key": "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUl..."
+}</pre>
+        </div>
+        
+        <h3>Encrypted API Usage</h3>
+        <p>For enhanced privacy, you can use end-to-end encryption with the API:</p>
+        <ol>
+            <li>Get the server's public key from <code>/api/v1/public-key</code></li>
+            <li>Generate your own RSA key pair on the client</li>
+            <li>Encrypt your messages with the server's public key</li>
+            <li>Send the encrypted request with <code>"encrypted": true</code> flag</li>
+            <li>The server will encrypt its response with your public key</li>
+        </ol>
+        
+        <p><strong>Example Encrypted Request:</strong></p>
+        <pre>{
+  "model": "llama-3-8b-instruct",
+  "encrypted": true,
+  "client_public_key": "YOUR_PUBLIC_KEY_HERE",
+  "messages": {
+    "ciphertext": "ENCRYPTED_DATA_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
+  }
+}</pre>
 
         <hr>
 
@@ -268,7 +438,7 @@
         <p>Learn more about our goals and how you can be a part of this initiative on our <a href="https://github.com/futuroptimist/token.place">GitHub repository</a>.</p>
 
         <h3>Privacy Notice</h3>
-        <p><strong>WARNING! Your conversation is reasonably private at this moment, and base privacy will become incrementally better over time. For enhanced privacy, consider self hosting by following the README on the GitHub repository.</strong></p>
+        <p><strong>All communications are now end-to-end encrypted for enhanced privacy. For maximum security, consider self-hosting by following the README on the GitHub repository.</strong></p>
 
         <div class="mode-toggle-container">
             <button id="toggleMode"></button>
@@ -277,8 +447,20 @@
 
     <!-- Vue.js -->
     <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsencrypt/3.2.1/jsencrypt.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.0.0/crypto-js.min.js"></script>
+    <!-- Use JSEncrypt 3.3.2 from jsDelivr, matching the test runner -->
+    <script 
+        src="https://cdn.jsdelivr.net/npm/jsencrypt@3.3.2/bin/jsencrypt.min.js" 
+        integrity="sha512-94ncgEEqkuZ4yNTFmu2dSn1TJ6Ij+ANQqpR7eLVU99kzvYzu6UjBxuVoNHtnd29R+T6nvK+ugCVI698pbyEkvQ=="
+        crossorigin="anonymous" 
+        referrerpolicy="no-referrer"
+    ></script>
+    <!-- Use CryptoJS 4.2.0 from cdnjs, matching the test runner -->
+    <script 
+        src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js" 
+        integrity="sha512-a+SUDuwNzXDvz4XrIcXHuCf089/iJAoN4lmrXJg18XnduKK6YlDHNRalv4yd1N40OKI80tFidF+rqTFKGPoWFQ=="
+        crossorigin="anonymous" 
+        referrerpolicy="no-referrer"
+    ></script>
     <script src="/static/chat.js"></script>
 
     <script>

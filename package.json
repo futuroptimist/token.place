@@ -1,0 +1,37 @@
+{
+  "name": "token-place",
+  "version": "1.0.0",
+  "description": "p2p generative AI platform",
+  "main": "index.js",
+  "scripts": {
+    "test": "pytest tests/",
+    "test:js": "node tests/test_js_crypto.js",
+    "test:crypto-compat": "python tests/test_crypto_compatibility.py",
+    "test:e2e": "pytest tests/test_e2e_chat.py",
+    "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/futuroptimist/token.place.git"
+  },
+  "keywords": [
+    "AI",
+    "encryption",
+    "LLM",
+    "generative",
+    "P2P"
+  ],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/futuroptimist/token.place/issues"
+  },
+  "homepage": "https://github.com/futuroptimist/token.place#readme",
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "jsencrypt": "^3.3.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.36.0"
+  }
+}

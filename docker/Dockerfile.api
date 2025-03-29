@@ -1,0 +1,38 @@
+FROM python:3.10-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc python3-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Final stage
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH
+
+# Copy application code
+COPY . .
+
+# Run with a non-root user
+RUN useradd -m appuser
+USER appuser
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+
+# Expose the port the API runs on
+EXPOSE 3000
+
+# Command to run the API
+CMD ["python", "-m", "api.main"] 

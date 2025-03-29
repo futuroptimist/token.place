@@ -6,6 +6,7 @@ from client import ChatClient
 import base64
 import json
 from encrypt import encrypt, decrypt, generate_keys
+import os # Import os
 
 @pytest.fixture(scope="session")
 def setup_servers():
@@ -21,10 +22,44 @@ def setup_servers():
     print("Launched relay server. Waiting for 5 seconds...")
     time.sleep(5)  # Give the relay server some time to start
 
-    # Start the server
-    server_process = subprocess.Popen(["python", "server.py", "--server_port", str(server_port), "--relay_port", str(relay_port)])
-    print("Launched server. Waiting for 10 seconds...")
-    time.sleep(10)  # Give the server some time to start and download the model (if needed)
+    # Start the server with the mock LLM environment variable
+    server_env = os.environ.copy() # Get a copy of the current environment
+    server_env["USE_MOCK_LLM"] = "1" # Set the variable
+    server_process = subprocess.Popen(
+        ["python", "server.py", "--server_port", str(server_port), "--relay_port", str(relay_port)],
+        env=server_env # Pass the modified environment
+    )
+    print("Launched server with USE_MOCK_LLM=1. Waiting for 5 seconds...") # Reduced wait time as no model download needed
+    time.sleep(5)  # Reduced wait time
+
+    # --- Wait for server to register with relay --- 
+    print("Waiting for server to register with relay...")
+    base_relay_url = f'http://localhost:{relay_port}'
+    max_wait_time = 30 # seconds
+    start_wait_time = time.time()
+    server_registered = False
+    while time.time() - start_wait_time < max_wait_time:
+        try:
+            response = requests.get(f'{base_relay_url}/next_server')
+            if response.status_code == 200 and 'server_public_key' in response.json():
+                print("Server registered successfully.")
+                server_registered = True
+                break
+            else:
+                print(f"Waiting... (Status: {response.status_code}, JSON: {response.text})")
+        except requests.exceptions.ConnectionError:
+            print("Waiting... (Relay not responding yet)")
+        except Exception as e:
+            print(f"Waiting... (Error checking registration: {e})")
+        time.sleep(1) # Wait 1 second before retrying
+
+    if not server_registered:
+        # If the server doesn't register, terminate processes and raise error
+        print("Error: Server failed to register with relay within timeout.")
+        relay_process.terminate()
+        server_process.terminate()
+        raise TimeoutError("Server did not register with relay.")
+    # --- End wait for server --- 
 
     yield client, relay_port, server_port, relay_process, server_process
 

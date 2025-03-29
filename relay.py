@@ -3,8 +3,41 @@ import requests
 from datetime import datetime
 import random
 import argparse
+import os
+from api import init_app
+import sys
+import threading
+import time
+
+# Import configuration
+try:
+    from config import RELAY_PORT
+except ImportError:
+    RELAY_PORT = 5010
+
+# Parse command line arguments only when run as script, not when imported
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="token.place relay server")
+    parser.add_argument("--port", type=int, default=RELAY_PORT, help="Port to run the relay server on")
+    parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
+    args = parser.parse_args()
+else:
+    # Default values when imported
+    class Args:
+        def __init__(self):
+            self.port = RELAY_PORT
+            self.use_mock_llm = False
+    args = Args()
+
+# Set environment variable based on the command line argument
+if args.use_mock_llm:
+    os.environ['USE_MOCK_LLM'] = '1'
+    print(f"Running with USE_MOCK_LLM=1 (mock mode enabled)")
 
 app = Flask(__name__)
+
+# Initialize the API
+init_app(app)
 
 known_servers = {}
 client_queue = []
@@ -221,8 +254,4 @@ def retrieve():
         return jsonify({'error': 'No response available for the given public key'}), 200
  
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=5000, help='Port number for the Flask app')
-    args = parser.parse_args()
-
-    app.run(port=args.port)
+    app.run(host='0.0.0.0', port=args.port)

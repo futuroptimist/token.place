@@ -5,6 +5,9 @@ import time
 import os
 import argparse
 from encrypt import generate_keys, encrypt, decrypt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
 
 # Use an environment variable to determine the environment
 environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -13,6 +16,148 @@ environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
 base_url = 'http://token.place' if environment == 'prod' else 'http://localhost'
 
 # TODO: handle prod case, where the port shouldn't be hardcoded (as we can't determine in advance if it's 80 or 443)
+
+# --- Configuration ---
+# Use the correct base URL for your running relay/API
+# If running locally with default port 5070:
+API_BASE_URL = "http://localhost:5070/api/v1" 
+# Or use "http://localhost:5070" if targeting relay endpoints directly
+
+CLIENT_KEYS_DIR = "client_keys"
+CLIENT_PRIVATE_KEY_FILE = os.path.join(CLIENT_KEYS_DIR, "client_private.pem")
+CLIENT_PUBLIC_KEY_FILE = os.path.join(CLIENT_KEYS_DIR, "client_public.pem")
+
+# --- Key Management ---
+
+def load_or_generate_client_keys():
+    """Loads client keys if they exist, otherwise generates and saves them."""
+    os.makedirs(CLIENT_KEYS_DIR, exist_ok=True)
+    if os.path.exists(CLIENT_PRIVATE_KEY_FILE) and os.path.exists(CLIENT_PUBLIC_KEY_FILE):
+        print("Loading existing client keys...")
+        with open(CLIENT_PRIVATE_KEY_FILE, "rb") as f:
+            private_key = serialization.load_pem_private_key(
+                f.read(),
+                password=None, # Assuming no password for simplicity
+                backend=default_backend()
+            )
+        with open(CLIENT_PUBLIC_KEY_FILE, "rb") as f:
+            public_key_pem = f.read()
+    else:
+        print("Generating new client keys...")
+        private_key, public_key_pem = generate_keys()
+        # Save keys
+        with open(CLIENT_PRIVATE_KEY_FILE, "wb") as f:
+            f.write(
+                private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption() # No password
+                )
+            )
+        with open(CLIENT_PUBLIC_KEY_FILE, "wb") as f:
+            f.write(public_key_pem)
+        print(f"New keys saved in {CLIENT_KEYS_DIR}/")
+        
+    return private_key, public_key_pem
+
+# --- API Interaction ---
+
+def get_server_public_key():
+    """Gets the public key from the API server."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/public-key")
+        response.raise_for_status() # Raise an exception for bad status codes
+        data = response.json()
+        return data.get('public_key')
+    except requests.exceptions.RequestException as e:
+        print(f"Error getting server public key: {e}")
+        return None
+
+def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_pub_key_pem):
+    """Calls the encrypted chat completions endpoint."""
+    
+    # 1. Prepare message data
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the capital of France? Write a short poem about it."}
+    ]
+    
+    # 2. Decode server public key
+    try:
+        server_public_key_bytes = base64.b64decode(server_pub_key_b64)
+    except Exception as e:
+        print(f"Error decoding server public key: {e}")
+        return None
+
+    # 3. Encrypt message using encrypt.py functions
+    print("Encrypting request...")
+    try:
+        # Ensure message is JSON bytes
+        message_bytes = json.dumps(messages).encode('utf-8')
+        # Encrypt using server's public key
+        ciphertext_dict, cipherkey, iv = encrypt(message_bytes, server_public_key_bytes)
+    except Exception as e:
+        print(f"Error during request encryption: {e}")
+        return None
+        
+    # 4. Prepare payload
+    client_pub_key_b64 = base64.b64encode(client_pub_key_pem).decode('utf-8')
+    payload = {
+        "model": "llama-3-8b-instruct", # Use a model the server knows
+        "encrypted": True,
+        "client_public_key": client_pub_key_b64,
+        "messages": {
+            "ciphertext": base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8'),
+            "cipherkey": base64.b64encode(cipherkey).decode('utf-8'),
+            "iv": base64.b64encode(iv).decode('utf-8')
+        }
+    }
+    
+    # 5. Send request
+    print("Sending request to API...")
+    try:
+        response = requests.post(f"{API_BASE_URL}/chat/completions", json=payload)
+        response.raise_for_status()
+        encrypted_response_data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+             try:
+                 print(f"Error details: {e.response.json()}")
+             except json.JSONDecodeError:
+                 print(f"Error details: {e.response.text}")
+        return None
+
+    # 6. Decrypt response
+    print("Decrypting response...")
+    try:
+        if not encrypted_response_data.get('encrypted'):
+            print("Error: Response was not encrypted as expected.")
+            print("Response data:", encrypted_response_data)
+            return None
+            
+        enc_data = encrypted_response_data['data']
+        ciphertext_resp = base64.b64decode(enc_data['ciphertext'])
+        cipherkey_resp = base64.b64decode(enc_data['cipherkey'])
+        iv_resp = base64.b64decode(enc_data['iv'])
+        
+        # Prepare dict for decrypt function
+        ciphertext_resp_dict = {'ciphertext': ciphertext_resp, 'iv': iv_resp}
+        
+        # Decrypt using client's private key
+        decrypted_bytes = decrypt(ciphertext_resp_dict, cipherkey_resp, client_priv_key)
+        
+        if decrypted_bytes is None:
+            print("Failed to decrypt response.")
+            return None
+            
+        # Decode and parse JSON
+        decrypted_response = json.loads(decrypted_bytes.decode('utf-8'))
+        return decrypted_response
+        
+    except Exception as e:
+        print(f"Error during response decryption or parsing: {e}")
+        return None
 
 class ChatClient:
     def __init__(self, base_url, relay_port=5000):

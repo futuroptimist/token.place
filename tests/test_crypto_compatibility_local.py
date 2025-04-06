@@ -60,13 +60,16 @@ def test_python_encrypt_js_decrypt():
     
     # Create temporary JavaScript file to test decryption
     with tempfile.NamedTemporaryFile(suffix='.js', mode='w', delete=False) as temp_js:
+        # Replace Windows backslashes with forward slashes for JavaScript paths
+        project_root_js = project_root.replace('\\', '/')
+        
         js_script = f"""
 // Load the shim first to create browser environment objects
 require('{shim_path_js}');
 
 // Import JSEncrypt correctly for Node.js - use local node_modules
-const JSEncrypt = require('{project_root.replace('\\', '/')}/node_modules/jsencrypt');
-const cryptoJs = require('{project_root.replace('\\', '/')}/node_modules/crypto-js');
+const JSEncrypt = require('{project_root_js}/node_modules/jsencrypt');
+const cryptoJs = require('{project_root_js}/node_modules/crypto-js');
 
 // Get encrypted data from Python
 const encryptedData = {{
@@ -168,13 +171,16 @@ def test_js_encrypt_python_decrypt():
     
     # Create temporary JavaScript file to test encryption
     with tempfile.NamedTemporaryFile(suffix='.js', mode='w', delete=False) as temp_js:
+        # Replace Windows backslashes with forward slashes for JavaScript paths
+        project_root_js = project_root.replace('\\', '/')
+        
         js_script = f"""
 // Load the shim first to create browser environment objects
 require('{shim_path_js}');
 
 // Import JSEncrypt correctly for Node.js - use local node_modules
-const JSEncrypt = require('{project_root.replace('\\', '/')}/node_modules/jsencrypt');
-const cryptoJs = require('{project_root.replace('\\', '/')}/node_modules/crypto-js');
+const JSEncrypt = require('{project_root_js}/node_modules/jsencrypt');
+const cryptoJs = require('{project_root_js}/node_modules/crypto-js');
 
 // Test data
 const testData = {test_data_json};
@@ -195,7 +201,7 @@ async function encryptData() {{
         
         // Encrypt the plaintext with AES in CBC mode with PKCS7 padding
         const encrypted = cryptoJs.AES.encrypt(
-            testData, 
+            JSON.stringify(testData), 
             aesKey, 
             {{
                 iv: iv,

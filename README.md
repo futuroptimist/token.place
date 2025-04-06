@@ -502,74 +502,60 @@ docker-compose up -d
 - [x] No token leakage to proxy servers
 - [x] Cross-platform support (Windows, macOS, Linux)
 
-## Getting Started
+## Quick Start
 
-Follow the detailed instructions in the [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) file.
-
-## Testing
-
-token.place has a comprehensive test suite to ensure everything works correctly.
-
-### Running All Tests
-
-Use the provided scripts to run all tests:
-
-```powershell
-# Windows
-.\run_all_tests.ps1
-
-# Linux/macOS
-./run_all_tests.sh
-```
-
-These scripts run the following test types:
-- Unit tests (Python component tests)
-- Integration tests (Component interaction tests)
-- API tests (HTTP API functionality)
-- Playwright tests (Browser-based compatibility tests)
-- Crypto compatibility tests (Cross-language crypto testing)
-- JavaScript tests (JS functionality verification)
-- End-to-End tests (Complete workflow testing) 
-- Failure recovery tests (Error handling)
-- DSPACE integration tests (3rd party application integration)
-
-### Running Specific Tests
-
-You can also run specific test types:
-
-```bash
-# Run Python unit tests
-python -m pytest tests/unit/
-
-# Run JavaScript tests
-npm run test:js
-
-# Run Playwright compatibility tests
-python -m pytest tests/test_crypto_compatibility_playwright.py
-
-# Run simple compatibility tests
-python tests/test_crypto_compatibility_simple.py
-
-# Run DSPACE integration tests
-cd integration_tests
-.\run_integration_test.ps1  # Windows
-./run_integration_test.sh   # Linux/macOS
-```
-
-For more detailed testing instructions, see [tests/README.md](tests/README.md).
-
-## Integration with Other Applications
-
-### DSPACE Integration
-
-token.place has been successfully integrated with DSPACE as a drop-in replacement for OpenAI. This integration demonstrates how to use the token.place API in a real-world application.
-
-For detailed instructions on setting up and testing the DSPACE integration, see [integration_tests/dspace_setup_instructions.md](integration_tests/dspace_setup_instructions.md).
+1. Clone the repository
+2. Install dependencies with `pip install -r requirements.txt`
+3. Run the server with `python server.py`
+4. Connect to the server at `http://localhost:5000`
 
 ## Development
 
-For contributing to the project, see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+### Testing
+
+We have comprehensive testing to ensure quality:
+
+```bash
+# Run all Python tests
+python -m pytest
+
+# Run JS unit tests
+npm run test:js
+
+# Run crypto compatibility tests
+python tests/test_crypto_compatibility_simple.py
+```
+
+### Windows PowerShell Tips
+
+In PowerShell, use semicolons (`;`) for command chaining instead of ampersands (`&&`):
+
+```powershell
+# Correct:
+cd folder_path; python script.py
+
+# Incorrect (will cause errors):
+cd folder_path && python script.py
+```
+
+Always use explicit IPv4 addresses for reliable network testing:
+
+```powershell
+# Preferred:
+curl http://127.0.0.1:5000/test
+
+# May cause issues:
+curl http://localhost:5000/test
+```
+
+## Contributing
+
+We welcome contributions! See our [Contributing Guide](docs/CONTRIBUTING.md) for details.
+
+## Security
+
+Security is our top priority. Please report any vulnerabilities responsibly. See [SECURITY.md](docs/SECURITY.md) for details.
 
 ## License
 
-This project is licensed under the [ISC License](LICENSE).
+This project is licensed under the terms in [LICENSE](LICENSE).

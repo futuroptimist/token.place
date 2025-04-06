@@ -69,6 +69,42 @@ npm run test:js
 python tests/test_crypto_compatibility_simple.py
 ```
 
+## Windows and PowerShell Compatibility
+
+When developing on Windows, be aware of these important compatibility considerations:
+
+1. **Command Chaining**: Use semicolons (`;`) instead of ampersands (`&&`) for command chaining in PowerShell:
+   ```powershell
+   # CORRECT
+   cd scripts; python example.py
+   
+   # INCORRECT (will cause errors)
+   cd scripts && python example.py
+   ```
+
+2. **IPv4/IPv6 Compatibility**: Always use explicit IPv4 addresses (`127.0.0.1`) instead of `localhost` for network services to avoid IPv6 resolution issues:
+   ```powershell
+   # PREFERRED
+   curl http://127.0.0.1:5000/test
+   
+   # MAY CAUSE ISSUES
+   curl http://localhost:5000/test
+   ```
+
+3. **Path Separators**: Use backslashes (`\`) for Windows paths:
+   ```powershell
+   cd tests\unit
+   ```
+
+4. **Port Management**: Check for and clean up conflicting processes:
+   ```powershell
+   # List processes using a port
+   netstat -ano | findstr :5000
+   
+   # Kill a process by PID
+   taskkill /F /PID <pid>
+   ```
+
 ## Understanding the Encryption System
 
 token.place employs a hybrid encryption approach that combines the security of RSA with the performance of AES:
@@ -138,6 +174,22 @@ When adding new features or fixing bugs, please include appropriate tests:
 - For new features, add tests that verify the feature works as expected
 - Always run the full test suite before submitting a PR
 
+### Testing Best Practices
+
+1. **Network Testing**: 
+   - Always use explicit IPv4 addresses (`127.0.0.1`) instead of `localhost`
+   - Allow sufficient time for servers to start before testing
+   - Check for port conflicts before starting services
+
+2. **Cross-Platform Testing**:
+   - Test on both Windows and Linux when possible
+   - Be aware of path separator differences (`\` vs `/`)
+   - Use platform-specific commands in the appropriate scripts
+
+3. **Cleanup**:
+   - Always clean up processes after testing
+   - Check for and terminate orphaned processes that might interfere with future tests
+
 ## Coding Standards
 
 ### Python
@@ -196,6 +248,9 @@ When adding new features or fixing bugs, please include appropriate tests:
 - **Performance**: Be mindful of encryption performance, especially for large payloads
 - **Dependencies**: Keep external dependencies to a minimum to reduce security risks
 - **Stylization**: Remember to use `token.place` (lowercase) in documentation and communication
+- **PowerShell**: On Windows, use `;` for command chaining, not `&&`
+- **Network Services**: Use explicit IPv4 (`127.0.0.1`) for reliable connection testing
+- **Port Management**: Be vigilant about checking for and clearing orphaned processes
 
 ## License
 

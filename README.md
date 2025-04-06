@@ -248,83 +248,6 @@ To exit, press Ctrl+C/Cmd+C.
 
 Alternatively, you can visit http://localhost:5000 in your browser to use the web interface.
 
-## API (OpenAI-compatible)
-
-The token.place API is designed to be compatible with the OpenAI API format, making it easy to integrate with existing applications that use OpenAI's services.
-
-### API Endpoints
-
-#### List Models
-```
-GET /api/v1/models
-```
-Returns a list of available models.
-
-#### Get Model
-```
-GET /api/v1/models/{model_id}
-```
-Returns information about a specific model.
-
-#### Chat Completions
-```
-POST /api/v1/chat/completions
-```
-Creates a completion for chat messages.
-
-Request body:
-```json
-{
-  "model": "llama-3-8b-instruct",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-  ]
-}
-```
-
-#### Text Completions
-```
-POST /api/v1/completions
-```
-Traditional completions API (redirects to chat).
-
-Request body:
-```json
-{
-  "model": "llama-3-8b-instruct",
-  "prompt": "Write a poem about AI",
-  "max_tokens": 256
-}
-```
-
-### End-to-End Encryption
-
-For enhanced privacy, you can use end-to-end encryption with the API:
-
-1. Get the server's public key:
-```
-GET /api/v1/public-key
-```
-
-2. Encrypt your request with the server's public key
-
-3. Send your encrypted request:
-```json
-{
-  "model": "llama-3-8b-instruct",
-  "encrypted": true,
-  "client_public_key": "YOUR_PUBLIC_KEY_HERE",
-  "messages": {
-    "ciphertext": "ENCRYPTED_DATA_HERE",
-    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
-    "iv": "INITIALIZATION_VECTOR_HERE"
-  }
-}
-```
-
-The server will encrypt its response with your public key, ensuring end-to-end encryption.
-
 ## Testing
 
 The project includes a comprehensive test suite to ensure functionality and prevent regressions.
@@ -416,9 +339,99 @@ If you want to disable the test to avoid downloading, edit `tests/test_real_llm.
 RUN_REAL_LLM_TEST = False
 ```
 
-### Production-like environment
+## Project Documentation for LLMs
 
-TODO
+This project includes an `llms.txt` file in the root directory that provides structured information for Large Language Models (LLMs) about the project. Following the [llms.txt specification](https://llmstxt.org/), this file helps LLMs understand the codebase structure, available components, and key documentation links.
+
+The `llms.txt` file includes:
+- Project overview and description
+- Links to setup and installation instructions
+- Core component descriptions
+- Testing documentation links
+- Development guidelines
+
+When working with LLMs to understand or develop this codebase, reference the `llms.txt` file for comprehensive context.
+
+## Naming Conventions
+
+Always stylize the project name as lowercase `token.place` (not Title case "Token.place") to emphasize that it is a URL. For complete stylization guidelines, see [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md).
+
+## API (OpenAI-compatible)
+
+The token.place API is designed to be compatible with the OpenAI API format, making it easy to integrate with existing applications that use OpenAI's services.
+
+### API Endpoints
+
+#### List Models
+```
+GET /api/v1/models
+```
+Returns a list of available models.
+
+#### Get Model
+```
+GET /api/v1/models/{model_id}
+```
+Returns information about a specific model.
+
+#### Chat Completions
+```
+POST /api/v1/chat/completions
+```
+Creates a completion for chat messages.
+
+Request body:
+```json
+{
+  "model": "llama-3-8b-instruct",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ]
+}
+```
+
+#### Text Completions
+```
+POST /api/v1/completions
+```
+Traditional completions API (redirects to chat).
+
+Request body:
+```json
+{
+  "model": "llama-3-8b-instruct",
+  "prompt": "Write a poem about AI",
+  "max_tokens": 256
+}
+```
+
+### End-to-End Encryption
+
+For enhanced privacy, you can use end-to-end encryption with the API:
+
+1. Get the server's public key:
+```
+GET /api/v1/public-key
+```
+
+2. Encrypt your request with the server's public key
+
+3. Send your encrypted request:
+```json
+{
+  "model": "llama-3-8b-instruct",
+  "encrypted": true,
+  "client_public_key": "YOUR_PUBLIC_KEY_HERE",
+  "messages": {
+    "ciphertext": "ENCRYPTED_DATA_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
+  }
+}
+```
+
+The server will encrypt its response with your public key, ensuring end-to-end encryption.
 
 ## System Architecture
 
@@ -480,3 +493,72 @@ scripts\start.bat
 ```bash
 docker-compose up -d
 ```
+
+## Features
+
+- [x] OpenAI-compatible API with end-to-end encryption
+- [x] Local and remote running modes
+- [x] Compatibility with standard OpenAI client libraries
+- [x] No token leakage to proxy servers
+- [x] Cross-platform support (Windows, macOS, Linux)
+
+## Getting Started
+
+Follow the detailed instructions in the [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) file.
+
+## Testing
+
+token.place has a comprehensive test suite to ensure everything works correctly.
+
+### Running All Tests
+
+Use the provided PowerShell script to run all tests:
+
+```powershell
+.\run_all_tests.ps1
+```
+
+This script runs:
+- Unit tests
+- Integration tests
+- API tests
+- Crypto compatibility tests
+- JavaScript tests
+- End-to-End tests 
+- Failure recovery tests
+- DSPACE integration tests
+
+### Running Specific Tests
+
+You can also run specific test types:
+
+```bash
+# Run Python tests
+python -m pytest
+
+# Run JavaScript tests
+npm run test:js
+
+# Run compatibility tests
+python tests/test_crypto_compatibility_simple.py
+
+# Run DSPACE integration tests
+cd integration_tests
+.\run_integration_test.ps1
+```
+
+## Integration with Other Applications
+
+### DSPACE Integration
+
+token.place has been successfully integrated with DSPACE as a drop-in replacement for OpenAI. This integration demonstrates how to use the token.place API in a real-world application.
+
+For detailed instructions on setting up and testing the DSPACE integration, see [integration_tests/dspace_setup_instructions.md](integration_tests/dspace_setup_instructions.md).
+
+## Development
+
+For contributing to the project, see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+
+## License
+
+This project is licensed under the [ISC License](LICENSE).

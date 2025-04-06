@@ -1,0 +1,103 @@
+# token.place
+
+> token.place is a secure proxy service for AI models that implements end-to-end encryption between clients and AI services. It provides transparent API compatibility with original services while ensuring that message content is encrypted on the client before being sent to the server, preventing the service from accessing the plaintext content of user prompts or AI responses.
+
+token.place uses a hybrid encryption approach combining RSA and AES for secure communication. The Python backend serves as a proxy between clients and AI model providers, while the JavaScript client library handles encryption and decryption in the browser. The project aims to maintain compatibility with existing AI service APIs while adding an encryption layer.
+
+Key components:
+- Python backend with Flask/FastAPI APIs
+- JavaScript client library for browser-based encryption/decryption
+- Hybrid RSA/AES encryption system ensuring secure message exchange
+- Cross-language compatibility between Python and JavaScript implementations
+- OpenAI-compatible API with end-to-end encryption options
+
+Important: Always stylize the project name as lowercase `token.place` (not Title case "Token.place") to emphasize that it's a URL.
+
+## Setup and Installation
+
+- [README.md](README.md): Project overview and getting started instructions
+- [requirements.txt](requirements.txt): Python dependencies for the project
+- [package.json](package.json): Node.js dependencies for JavaScript components
+
+## Core Components
+
+- [encrypt.py](encrypt.py): The core encryption/decryption implementation in Python
+- [static/chat.js](static/chat.js): JavaScript client library for encryption/decryption in browsers
+- [utils/crypto/crypto_manager.py](utils/crypto/crypto_manager.py): Python class managing key generation and encryption/decryption operations
+- [server.py](server.py): Main server implementation for the proxy service
+- [relay.py](relay.py): Middleware server that forwards encrypted messages between clients and servers
+
+## Encryption System
+
+The encryption system employs a hybrid approach:
+- **RSA**: Used for secure key exchange (2048-bit keys by default)
+- **AES-CBC**: Used for bulk data encryption (256-bit keys)
+- **PKCS#7 Padding**: Applied to ensure data compatibility with block cipher requirements
+
+The flow works as follows:
+1. Server generates RSA key pair on initialization
+2. Client requests server's public key
+3. Client generates random AES key and encrypts message content
+4. Client encrypts AES key with server's RSA public key
+5. Server decrypts AES key with its private RSA key
+6. Server decrypts message content with the AES key
+7. Server processes the request and encrypts the response using the client's public key
+
+This approach provides strong end-to-end encryption while maintaining performance for large payloads.
+
+## API Structure
+
+The API is designed to be compatible with OpenAI's API format:
+
+- `/api/v1/models`: List available models
+- `/api/v1/models/{model_id}`: Get information about a specific model
+- `/api/v1/chat/completions`: Create chat completions
+- `/api/v1/completions`: Create completions (legacy)
+- `/api/v1/public-key`: Retrieve server's public key for encryption
+
+All API endpoints support both encrypted and unencrypted modes for maximum flexibility.
+
+## Testing
+
+- [tests/README.md](tests/README.md): Comprehensive guide to running all tests
+- [tests/test_js_crypto.js](tests/test_js_crypto.js): JavaScript crypto implementation tests
+- [tests/unit/test_crypto_manager.py](tests/unit/test_crypto_manager.py): Python crypto implementation tests
+- [tests/test_crypto_compatibility_simple.py](tests/test_crypto_compatibility_simple.py): Tests for crypto compatibility between Python and JavaScript
+- [tests/test_api.py](tests/test_api.py): API endpoint tests ensuring functionality
+- [tests/test_failure_recovery.py](tests/test_failure_recovery.py): Tests for system resilience and error recovery
+- [docs/TESTING_IMPROVEMENTS.md](docs/TESTING_IMPROVEMENTS.md): Planned testing improvements and ideas
+
+The testing infrastructure includes:
+- **Unit Tests**: Test individual components in isolation
+- **Integration Tests**: Test interactions between components
+- **End-to-End Tests**: Test complete workflows
+- **API Tests**: Verify API functionality and compatibility
+- **Compatibility Tests**: Ensure cross-language functionality
+- **Failure Recovery Tests**: Ensure system robustness
+
+## Development
+
+- [config.py](config.py): Configuration management for different environments
+- [utils/logging/logger.py](utils/logging/logger.py): Logging infrastructure for the application
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): Contribution guidelines for developers
+- [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md): Style and branding guidelines, including proper name stylization
+
+## Architecture
+
+The architecture follows a distributed pattern with:
+1. **Client Layer**: Web browsers or CLI tools that encrypt/decrypt locally
+2. **Relay Layer**: Lightweight servers that forward encrypted traffic
+3. **Server Layer**: LLM inference servers running on contributed hardware
+
+This design ensures:
+- IP addresses of clients and servers are mutually hidden
+- Message content is only readable by legitimate endpoints
+- Multiple relay servers can be used for redundancy and load balancing
+- Server operators never see plaintext user prompts or AI responses
+
+## Optional
+
+- [tests/test_crypto_compatibility_playwright.py](tests/test_crypto_compatibility_playwright.py): Advanced browser-based crypto compatibility tests
+- [tests/js_test_shim.js](tests/js_test_shim.js): Support code for running JavaScript tests in Node.js
+- [pytest.ini](pytest.ini): Configuration for Python test suite
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Detailed architectural overview of the system 

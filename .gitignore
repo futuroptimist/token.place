@@ -46,3 +46,6 @@ ui_test_screenshot_*.png
 *.swp
 *.swo
 .DS_Store
+
+# Integration tests
+integration_tests/

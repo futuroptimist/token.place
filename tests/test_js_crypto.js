@@ -3,13 +3,17 @@
  * Run with: node tests/test_js_crypto.js
  */
 
-const jsencrypt = require('jsencrypt');
+// Load the shim first to create browser environment objects
+require('./js_test_shim.js');
+
+// Import JSEncrypt correctly for Node.js
+const JSEncrypt = require('jsencrypt');
 const cryptoJs = require('crypto-js');
 
 // Mock Vue component for testing
 const crypto = {
     generateClientKeys() {
-        const crypt = new jsencrypt.JSEncrypt({ default_key_size: 2048 });
+        const crypt = new JSEncrypt({ default_key_size: 2048 });
         crypt.getKey();
         this.clientPrivateKey = crypt.getPrivateKey();
         this.clientPublicKey = crypt.getPublicKey();
@@ -34,19 +38,22 @@ const crypto = {
             // Generate random IV (16 bytes)
             const iv = cryptoJs.lib.WordArray.random(16);
             
-            // Pad and encrypt the plaintext with AES in CBC mode
-            const paddedData = cryptoJs.pad.Pkcs7.pad(cryptoJs.enc.Utf8.parse(plaintext), 16);
-            const encrypted = cryptoJs.AES.encrypt(paddedData, aesKey, {
-                iv: iv,
-                mode: cryptoJs.mode.CBC,
-                padding: cryptoJs.pad.NoPadding // Already padded above
-            });
+            // Encrypt the plaintext with AES in CBC mode with PKCS7 padding
+            const encrypted = cryptoJs.AES.encrypt(
+                plaintext, 
+                aesKey, 
+                {
+                    iv: iv,
+                    mode: cryptoJs.mode.CBC,
+                    padding: cryptoJs.pad.Pkcs7
+                }
+            );
             
             // Prepare the RSA encryption
-            const jsEncrypt = new jsencrypt.JSEncrypt();
+            const jsEncrypt = new JSEncrypt();
             jsEncrypt.setPublicKey(publicKeyPem);
             
-            // Encrypt the AES key with RSA-OAEP
+            // Encrypt the AES key with RSA
             const aesKeyBase64 = cryptoJs.enc.Base64.stringify(aesKey);
             const encryptedKey = jsEncrypt.encrypt(aesKeyBase64);
             
@@ -55,7 +62,7 @@ const crypto = {
             }
             
             return {
-                ciphertext: cryptoJs.enc.Base64.stringify(encrypted.ciphertext),
+                ciphertext: encrypted.toString(), // Use toString() to get the Base64 representation
                 cipherkey: encryptedKey,
                 iv: cryptoJs.enc.Base64.stringify(iv)
             };
@@ -68,7 +75,7 @@ const crypto = {
     async decrypt(ciphertext, encryptedKey, ivBase64) {
         try {
             // Prepare for RSA decryption
-            const jsEncrypt = new jsencrypt.JSEncrypt();
+            const jsEncrypt = new JSEncrypt();
             jsEncrypt.setPrivateKey(this.clientPrivateKey);
             
             // Decrypt the AES key with RSA
@@ -83,12 +90,10 @@ const crypto = {
             // Convert the Base64 IV to a WordArray
             const iv = cryptoJs.enc.Base64.parse(ivBase64);
             
-            // Convert the Base64 ciphertext to a WordArray
-            const ciphertextWordArray = cryptoJs.enc.Base64.parse(ciphertext);
-            
             // Decrypt the ciphertext with AES
+            // Note: ciphertext from encrypt() is already a Base64 string
             const decrypted = cryptoJs.AES.decrypt(
-                { ciphertext: ciphertextWordArray },
+                ciphertext,
                 aesKey,
                 {
                     iv: iv,

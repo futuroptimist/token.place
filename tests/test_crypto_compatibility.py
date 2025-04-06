@@ -1,6 +1,13 @@
 import pytest
 import base64
 import json
+import sys
+import os
+from pathlib import Path
+
+# Add the project root to the path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from encrypt import generate_keys, encrypt, decrypt
 from playwright.sync_api import Page
 import pathlib

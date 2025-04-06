@@ -29,7 +29,9 @@
   "homepage": "https://github.com/futuroptimist/token.place#readme",
   "dependencies": {
     "crypto-js": "^4.2.0",
-    "jsencrypt": "^3.3.2"
+    "jsencrypt": "^3.3.2",
+    "mocha": "^11.1.0",
+    "selenium-webdriver": "^4.30.0"
   },
   "devDependencies": {
     "playwright": "^1.36.0"

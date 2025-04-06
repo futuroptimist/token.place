@@ -66,6 +66,7 @@ class TestRelayClient:
         assert relay_client.crypto_manager == mock_crypto_manager
         assert relay_client.model_manager == mock_model_manager
         assert relay_client.relay_url == "http://localhost:5000"
+        assert relay_client.stop_polling is False
     
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):
@@ -272,7 +273,7 @@ class TestRelayClient:
     @patch('utils.networking.relay_client.time.sleep')
     def test_poll_relay_continuously_with_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
         """Test the continuous polling with a client request."""
-        # Setup mock ping to return one response with client request, then an error to exit the loop
+        # Setup to return a client request on first call
         mock_ping.side_effect = [
             {
                 'client_public_key': 'client_key',
@@ -280,21 +281,23 @@ class TestRelayClient:
                 'cipherkey': 'key',
                 'iv': 'iv',
                 'next_ping_in_x_seconds': 5
-            },
-            Exception("Stop the test")  # To break out of the infinite loop
+            }
         ]
         
         # Mock sleep to avoid actually sleeping
         mock_sleep.return_value = None
         
+        # Set stop_polling to True after one iteration
+        def stop_after_first_call(*args, **kwargs):
+            relay_client.stop_polling = True
+            
+        mock_process.side_effect = stop_after_first_call
+        
         # Call the method - this would normally run forever
-        try:
-            relay_client.poll_relay_continuously()
-        except Exception as e:
-            assert str(e) == "Stop the test"
+        relay_client.poll_relay_continuously()
         
         # Verify mock calls
-        assert mock_ping.call_count == 2
+        assert mock_ping.call_count == 1
         mock_process.assert_called_once_with({
             'client_public_key': 'client_key',
             'chat_history': 'encrypted_data',
@@ -309,25 +312,24 @@ class TestRelayClient:
     @patch('utils.networking.relay_client.time.sleep')
     def test_poll_relay_continuously_no_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
         """Test the continuous polling without a client request."""
-        # Setup mock ping to return one response without client request, then an error to exit the loop
+        # Setup mock ping to return one response without client request
         mock_ping.side_effect = [
             {
                 'next_ping_in_x_seconds': 5
-            },
-            Exception("Stop the test")  # To break out of the infinite loop
+            }
         ]
         
-        # Mock sleep to avoid actually sleeping
-        mock_sleep.return_value = None
+        # Mock sleep to avoid actually sleeping and stop polling after first sleep
+        def stop_after_sleep(seconds):
+            relay_client.stop_polling = True
+            
+        mock_sleep.side_effect = stop_after_sleep
         
         # Call the method - this would normally run forever
-        try:
-            relay_client.poll_relay_continuously()
-        except Exception as e:
-            assert str(e) == "Stop the test"
+        relay_client.poll_relay_continuously()
         
         # Verify mock calls
-        assert mock_ping.call_count == 2
+        assert mock_ping.call_count == 1
         mock_process.assert_not_called()
         mock_sleep.assert_called_once_with(5)
     
@@ -335,24 +337,23 @@ class TestRelayClient:
     @patch('utils.networking.relay_client.time.sleep')
     def test_poll_relay_continuously_with_error(self, mock_sleep, mock_ping, relay_client):
         """Test the continuous polling with an error in the response."""
-        # Setup mock ping to return an error, then an exception to exit the loop
+        # Setup mock ping to return an error response
         mock_ping.side_effect = [
             {
                 'error': 'Connection refused',
                 'next_ping_in_x_seconds': 10
-            },
-            Exception("Stop the test")  # To break out of the infinite loop
+            }
         ]
         
-        # Mock sleep to avoid actually sleeping
-        mock_sleep.return_value = None
+        # Mock sleep to avoid actually sleeping and stop polling after first sleep
+        def stop_after_sleep(seconds):
+            relay_client.stop_polling = True
+            
+        mock_sleep.side_effect = stop_after_sleep
         
         # Call the method - this would normally run forever
-        try:
-            relay_client.poll_relay_continuously()
-        except Exception as e:
-            assert str(e) == "Stop the test"
+        relay_client.poll_relay_continuously()
         
         # Verify mock calls
-        assert mock_ping.call_count == 2
+        assert mock_ping.call_count == 1
         mock_sleep.assert_called_once_with(10) 

@@ -47,6 +47,7 @@ class RelayClient:
         self.crypto_manager = crypto_manager
         self.model_manager = model_manager
         self.relay_url = f"{base_url}:{port}"
+        self.stop_polling = False  # Flag to control polling loop for testing
         
     def ping_relay(self) -> Dict[str, Any]:
         """
@@ -146,8 +147,10 @@ class RelayClient:
         """
         Continuously poll the relay for new chat messages and process them.
         This method runs in an infinite loop and should be called in a separate thread.
+        
+        In test environments, you can set self.stop_polling = True to exit the loop.
         """
-        while True:
+        while not self.stop_polling:
             try:
                 # Ping the relay and check for client requests
                 relay_response = self.ping_relay()

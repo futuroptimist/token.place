@@ -53,19 +53,25 @@ fi
 # 3. Run API tests
 run_test "API Tests" "python -m pytest tests/test_api.py -v" "Testing API functionality and compatibility"
 
-# 4. Run crypto compatibility tests
-run_test "Crypto Compatibility Tests" "python tests/test_crypto_compatibility_local.py" "Testing cross-language compatibility for encryption"
+# 4. Run crypto compatibility tests - simple
+run_test "Crypto Compatibility Tests (Simple)" "python tests/test_crypto_compatibility_simple.py" "Testing cross-language compatibility for encryption (simple tests)"
 
-# 5. Run JavaScript tests
+# 5. Run crypto compatibility tests - local
+run_test "Crypto Compatibility Tests (Local)" "python tests/test_crypto_compatibility_local.py" "Testing cross-language compatibility for encryption (local tests)"
+
+# 6. Run crypto compatibility tests - Playwright
+run_test "Crypto Compatibility Tests (Playwright)" "python -m pytest tests/test_crypto_compatibility_playwright.py -v" "Testing cross-language compatibility in browsers with Playwright"
+
+# 7. Run JavaScript tests
 run_test "JavaScript Tests" "npm run test:js" "Testing JavaScript functionality"
 
-# 6. Run E2E tests
+# 8. Run E2E tests
 run_test "End-to-End Tests" "python -m pytest tests/test_e2e_*.py -v" "Testing complete workflows"
 
-# 7. Run failure recovery tests
+# 9. Run failure recovery tests
 run_test "Failure Recovery Tests" "python -m pytest tests/test_failure_recovery.py -v" "Testing system resilience against errors"
 
-# 8. Run DSPACE integration tests
+# 10. Run DSPACE integration tests
 if [ -d "integration_tests/" ]; then
     echo ""
     echo "======================================================"

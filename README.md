@@ -512,40 +512,51 @@ token.place has a comprehensive test suite to ensure everything works correctly.
 
 ### Running All Tests
 
-Use the provided PowerShell script to run all tests:
+Use the provided scripts to run all tests:
 
 ```powershell
+# Windows
 .\run_all_tests.ps1
+
+# Linux/macOS
+./run_all_tests.sh
 ```
 
-This script runs:
-- Unit tests
-- Integration tests
-- API tests
-- Crypto compatibility tests
-- JavaScript tests
-- End-to-End tests 
-- Failure recovery tests
-- DSPACE integration tests
+These scripts run the following test types:
+- Unit tests (Python component tests)
+- Integration tests (Component interaction tests)
+- API tests (HTTP API functionality)
+- Playwright tests (Browser-based compatibility tests)
+- Crypto compatibility tests (Cross-language crypto testing)
+- JavaScript tests (JS functionality verification)
+- End-to-End tests (Complete workflow testing) 
+- Failure recovery tests (Error handling)
+- DSPACE integration tests (3rd party application integration)
 
 ### Running Specific Tests
 
 You can also run specific test types:
 
 ```bash
-# Run Python tests
-python -m pytest
+# Run Python unit tests
+python -m pytest tests/unit/
 
 # Run JavaScript tests
 npm run test:js
 
-# Run compatibility tests
+# Run Playwright compatibility tests
+python -m pytest tests/test_crypto_compatibility_playwright.py
+
+# Run simple compatibility tests
 python tests/test_crypto_compatibility_simple.py
 
 # Run DSPACE integration tests
 cd integration_tests
-.\run_integration_test.ps1
+.\run_integration_test.ps1  # Windows
+./run_integration_test.sh   # Linux/macOS
 ```
+
+For more detailed testing instructions, see [tests/README.md](tests/README.md).
 
 ## Integration with Other Applications
 

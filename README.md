@@ -4,6 +4,8 @@ p2p generative AI platform
 # vision
 There are tons of personal computers and homelabs out there with lots of compute that remain idle. This project aims to create a marketplace of people with spare compute and people with needs for compute. Note that this is not a financial marketplace -- this is intended to be a public good. If it takes off is anyone's guess, but I'll donate whatever compute I can in the meantime once this is up and running.
 
+For a quick orientation to the repository layout and key docs, see [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
 ## roadmap
 
 - [x] hello world: it literally just echoes your message param back to you

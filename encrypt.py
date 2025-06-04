@@ -89,10 +89,14 @@ def encrypt(plaintext: bytes, public_key_pem: bytes) -> Tuple[Dict[str, bytes], 
     # For compatibility with JSEncrypt, convert the AES key to Base64 first
     aes_key_b64 = base64.b64encode(aes_key)
     
-    # Then encrypt the Base64 representation of the key using PKCS1v15 padding
+    # Encrypt the Base64 representation of the key using OAEP padding
     encrypted_key = public_key.encrypt(
         aes_key_b64,
-        asymmetric_padding.PKCS1v15()
+        asymmetric_padding.OAEP(
+            mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None,
+        )
     )
     
     return {'ciphertext': ciphertext, 'iv': iv}, encrypted_key, iv
@@ -117,10 +121,14 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
             backend=default_backend()
         )
         
-        # Decrypt the encrypted AES key with PKCS1v15 padding
+        # Decrypt the encrypted AES key with OAEP padding
         aes_key_b64 = private_key.decrypt(
             encrypted_key,
-            asymmetric_padding.PKCS1v15()
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
+                algorithm=SHA256(),
+                label=None,
+            )
         )
         
         # Decode the Base64 to get the actual AES key

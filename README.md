@@ -570,7 +570,7 @@ We welcome contributions! See our [Contributing Guide](docs/CONTRIBUTING.md) for
 
 ## Security
 
-Security is our top priority. Please report any vulnerabilities responsibly. See [SECURITY.md](docs/SECURITY.md) for details.
+Security is our top priority. Please report any vulnerabilities responsibly. See [Security and Privacy Audit](SECURITY_PRIVACY_AUDIT.md) for details.
 
 ## License
 

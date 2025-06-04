@@ -364,21 +364,31 @@ The token.place API is designed to be compatible with the OpenAI API format, mak
 
 ### API Endpoints
 
+All routes are available under `/api/v1` as well as `/v1` so that the standard
+OpenAI Python client can interact with `token.place` by simply changing the
+base URL to `https://token.place/v1`.
+
 #### List Models
 ```
 GET /api/v1/models
+# or
+GET /v1/models
 ```
 Returns a list of available models.
 
 #### Get Model
 ```
 GET /api/v1/models/{model_id}
+# or
+GET /v1/models/{model_id}
 ```
 Returns information about a specific model.
 
 #### Chat Completions
 ```
 POST /api/v1/chat/completions
+# or
+POST /v1/chat/completions
 ```
 Creates a completion for chat messages.
 
@@ -396,8 +406,10 @@ Request body:
 #### Text Completions
 ```
 POST /api/v1/completions
+# or
+POST /v1/completions
 ```
-Traditional completions API (redirects to chat).
+Traditional completions API returning text completion data.
 
 Request body:
 ```json
@@ -415,6 +427,8 @@ For enhanced privacy, you can use end-to-end encryption with the API:
 1. Get the server's public key:
 ```
 GET /api/v1/public-key
+# or
+GET /v1/public-key
 ```
 
 2. Encrypt your request with the server's public key

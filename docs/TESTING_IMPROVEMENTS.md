@@ -148,7 +148,8 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    
    class TokenPlaceClient {
      constructor(config = {}) {
-       this.baseUrl = config.baseUrl || 'http://localhost:5000/api/v1';
+      // token.place exposes both `/api/v1` and `/v1` for OpenAI compatibility
+      this.baseUrl = config.baseUrl || 'http://localhost:5000/v1';
        this.clientKeys = null;
        this.serverPublicKey = null;
      }
@@ -232,10 +233,11 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
      const tokenPlaceCode = `
        import TokenPlaceClient from '../../../token.place-client';
        
-       const client = new TokenPlaceClient({
-         baseUrl: 'http://localhost:${TOKEN_PLACE_PORT}/api/v1',
-         // Add any other configuration options
-       });
+      const client = new TokenPlaceClient({
+        // use /v1 so the OpenAI client works with token.place directly
+        baseUrl: 'http://localhost:${TOKEN_PLACE_PORT}/v1',
+        // Add any other configuration options
+      });
        
        // Initialize the client
        await client.initialize();

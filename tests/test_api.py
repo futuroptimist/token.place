@@ -204,15 +204,14 @@ def test_completions_endpoint(client, mock_llama):
     assert response.status_code == 200
     data = response.get_json()
     
-    # Verify the response is in the chat completion format
+    # Verify the response is in text completion format
     assert 'id' in data
-    assert data['object'] == 'chat.completion'
+    assert data['object'] == 'text_completion'
     assert 'choices' in data
     assert len(data['choices']) > 0
-    assert 'message' in data['choices'][0]
-    assert data['choices'][0]['message']['role'] == 'assistant'
-    assert 'Mock response' in data['choices'][0]['message']['content']
-    print(f"Completions Endpoint Response: {data['choices'][0]['message']['content']}")
+    assert 'text' in data['choices'][0]
+    assert 'Mock response' in data['choices'][0]['text']
+    print(f"Completions Endpoint Response: {data['choices'][0]['text']}")
 
 def test_error_handling(client, mock_llama):
     """Test API error handling"""

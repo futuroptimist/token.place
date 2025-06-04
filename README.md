@@ -176,7 +176,7 @@ AVX = 1 | AVX_VNNI = 0 | AVX2 = 1 | AVX512 = 0 | AVX512_VBMI = 0 | AVX512_VNNI =
 
 This indicates that `server.py` can correctly access your GPU resources.
 
-llama_cpp_python is initialized like this:
+llama-cpp-python is initialized like this:
 
 ```py
 llm = Llama(
@@ -244,7 +244,7 @@ You can test things out using the simple command-line client, `client.py`:
 python client.py
 ```
 
-Type your message when prompted and press Enter. All of this is now happening on your local hardware, thanks to `llama_cpp_python`, a binding for llama.cpp.
+Type your message when prompted and press Enter. All of this is now happening on your local hardware, thanks to `llama-cpp-python`, a binding for llama.cpp.
 
 To exit, press Ctrl+C/Cmd+C.
 

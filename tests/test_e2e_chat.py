@@ -44,6 +44,7 @@ def test_chat_encryption_e2e(page, base_url, setup_servers):
     screenshot_path = os.path.join(os.path.dirname(__file__), "encryption_test_screenshot.png")
     page.screenshot(path=screenshot_path)
     print(f"Screenshot saved to {screenshot_path}")
+    assert os.path.exists(screenshot_path)
     
     # Test direct API connection with CryptoClient
     crypto_client = CryptoClient(base_url, debug=True)

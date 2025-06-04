@@ -30,7 +30,6 @@ Thank you for your interest in contributing to token.place! This document provid
 3. Install Python dependencies:
    ```bash
    pip install -r requirements.txt
-   pip install -r requirements-dev.txt  # Development dependencies
    ```
 
 4. Install Node.js dependencies:

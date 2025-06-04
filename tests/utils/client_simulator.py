@@ -34,8 +34,13 @@ class ClientSimulator:
         """
         response = self.session.get(f"{self.base_url}/api/v1/public-key")
         response.raise_for_status()
-        
-        self.server_public_key = response.content
+
+        data = response.json()
+        key_b64 = data.get("server_public_key") or data.get("public_key")
+        if key_b64 is None:
+            raise ValueError("Public key not found in response")
+
+        self.server_public_key = base64.b64decode(key_b64)
         return self.server_public_key
         
     def encrypt_message(self, message: Union[str, Dict], server_key: Optional[bytes] = None) -> Dict:

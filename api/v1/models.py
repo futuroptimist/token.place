@@ -118,10 +118,22 @@ def get_model_instance(model_id):
         logger.info(f"Using cached model instance for {model_id}")
         return _loaded_models[model_id]
     
-    # For testing purposes in this version, always return mock
-    # In production, this would attempt to load the actual model
-    logger.info(f"Using mock LLM for model_id: {model_id} (forced for testing)")
-    return "MOCK_MODEL"
+    # Load the model from disk if not already loaded
+    try:
+        model_path = model_meta["file_name"]
+        if not os.path.isabs(model_path):
+            model_path = os.path.join("models", model_meta["file_name"])
+        logger.info(f"Loading model from {model_path}")
+        llama = Llama(model_path=model_path)
+        _loaded_models[model_id] = llama
+        return llama
+    except Exception as e:
+        logger.exception(f"Failed to load model {model_id}: {e}")
+        raise ModelError(
+            f"Failed to load model '{model_id}': {str(e)}",
+            status_code=500,
+            error_type="model_load_error",
+        )
 
 def generate_response(model_id, messages):
     """

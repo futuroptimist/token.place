@@ -18,6 +18,10 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('crypto_tests')
 
+jsencrypt_path = Path(project_root) / 'node_modules' / 'jsencrypt'
+if not jsencrypt_path.exists():
+    pytest.skip("jsencrypt module not available", allow_module_level=True)
+
 def test_python_encrypt_js_decrypt():
     """
     Test that data encrypted in Python can be decrypted in Node.js JavaScript

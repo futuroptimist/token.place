@@ -372,9 +372,10 @@ def create_chat_completion():
 @v1_bp.route('/completions', methods=['POST'])
 def create_completion():
     """
-    Text completion API (OpenAI-compatible) that redirects to chat completion
-    
-    This converts traditional completion requests to chat format
+    Text completion API (OpenAI-compatible).
+
+    The request is converted to chat format internally and the response is
+    returned in the legacy text completion schema.
     """
     try:
         log_info("API request: POST /completions")
@@ -419,37 +420,39 @@ def create_completion():
             )
     
         # Prepare messages for chat format
-        messages = [{
-            "role": "user",
-            "content": prompt
-        }]
-    
+        messages = [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ]
+
         # Generate response
         try:
             log_info(f"Generating response using model {model_id}")
             updated_messages = generate_response(model_id, messages)
-            
+
             assistant_message = updated_messages[-1]
             log_info("Response generated successfully")
-    
-            # Create response in OpenAI CHAT format (as this endpoint mimics it)
+
+            # Create response in OpenAI text completion format
             response_data = {
-                "id": f"cmpl-{uuid.uuid4().hex[:12]}", # Use cmpl- prefix maybe?
-                "object": "chat.completion", # Keep chat.completion as per tests
+                "id": f"cmpl-{uuid.uuid4().hex[:12]}",
+                "object": "text_completion",
                 "created": int(time.time()),
                 "model": model_id,
                 "choices": [
                     {
                         "index": 0,
-                        "message": assistant_message, 
-                        "finish_reason": "stop"
+                        "text": assistant_message.get("content", ""),
+                        "finish_reason": "stop",
                     }
                 ],
-                "usage": { # Placeholder usage
+                "usage": {
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
-                    "total_tokens": 0
-                }
+                    "total_tokens": 0,
+                },
             }
             
             # Encrypt response if client_public_key was provided
@@ -500,4 +503,35 @@ def health_check():
         })
     except Exception as e:
         log_error("Error in health_check endpoint")
-        return format_error_response(f"Health check failed: {str(e)}") 
+        return format_error_response(f"Health check failed: {str(e)}")
+
+# --- OpenAI-compatible alias routes ---
+
+# Create a second blueprint that mirrors the /api/v1 endpoints at /v1 so
+# the OpenAI Python client can talk to token.place by simply changing the
+# base URL.
+openai_v1_bp = Blueprint('openai_v1', __name__, url_prefix='/v1')
+
+@openai_v1_bp.route('/models', methods=['GET'])
+def list_models_openai():
+    return list_models()
+
+@openai_v1_bp.route('/models/<model_id>', methods=['GET'])
+def get_model_openai(model_id):
+    return get_model(model_id)
+
+@openai_v1_bp.route('/public-key', methods=['GET'])
+def get_public_key_openai():
+    return get_public_key()
+
+@openai_v1_bp.route('/chat/completions', methods=['POST'])
+def create_chat_completion_openai():
+    return create_chat_completion()
+
+@openai_v1_bp.route('/completions', methods=['POST'])
+def create_completion_openai():
+    return create_completion()
+
+@openai_v1_bp.route('/health', methods=['GET'])
+def health_check_openai():
+    return health_check()

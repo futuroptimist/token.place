@@ -17,6 +17,10 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('crypto_tests')
 
+jsencrypt_path = Path(__file__).resolve().parent.parent / 'node_modules' / 'jsencrypt'
+if not jsencrypt_path.exists():
+    pytest.skip("jsencrypt module not available", allow_module_level=True)
+
 # Playwright fixture with web server configuration
 @pytest.fixture(scope="module")
 def browser_context_args(browser_context_args):

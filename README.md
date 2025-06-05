@@ -39,13 +39,13 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] API integration tests
   - [x] End-to-end tests with mock LLM
   - [x] Support for testing with real LLM models
-- [ ] API v1 with at least 1 model supported and available
+  - [x] API v1 with at least 1 model supported and available
 - [ ] landing page chat UI integrated with API v1
 - [ ] use best available llama family model that can run on an RTX 4090
 - [ ] [https://github.com/democratizedspace/dspace](DSPACE) (first 1st party integration) uses API v1 for dChat
 - [ ] set up production server (raspberry pi cluster lol)
 - [ ] allow participation from other server.pys
-- [ ] split relay/server python dependencies to reduce installation toil for relay-only nodes
+  - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
 - [ ] API v2 with at least 10 models supported and available
   - [ ] Streaming response support for faster UI feedback
   - [ ] Function/tool calling support via Machine Conversation Protocol (MCP)
@@ -119,7 +119,8 @@ TODO: instructions for other common OSes
 then, run:
 
 ```
-pip install -r requirements.txt
+pip install -r requirements_server.txt  # server/API dependencies
+pip install -r requirements_relay.txt   # relay-only dependencies
 ```
 
 For JavaScript dependencies, run:
@@ -521,7 +522,8 @@ docker-compose up -d
 ## Quick Start
 
 1. Clone the repository
-2. Install dependencies with `pip install -r requirements.txt`
+2. Install server dependencies with `pip install -r requirements_server.txt`
+   (for relay-only nodes, use `pip install -r requirements_relay.txt`)
 3. Run the server with `python server.py`
 4. Connect to the server at `http://localhost:5000`
 

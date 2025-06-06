@@ -16,29 +16,23 @@ new Vue({
     },
     methods: {
         getServerPublicKey() {
-            // Try the new API endpoint first
+            // Fetch the server's public key from the API
             return fetch('/api/v1/public-key')
                 .then(response => {
                     if (response.ok) {
                         return response.json();
-                    } else {
-                        // Fall back to the old endpoint
-                        return fetch('/next_server').then(response => response.json());
                     }
+                    throw new Error('Failed to fetch server public key');
                 })
                 .then(data => {
                     if (data && data.public_key) {
                         this.serverPublicKey = data.public_key;
-                        console.log("Server public key received successfully");
-                    } else if (data && data.server_public_key) {
-                        // Handle old format
-                        this.serverPublicKey = data.server_public_key;
-                        console.log("Server public key received successfully (legacy format)");
+                        console.log('Server public key received successfully');
                     } else {
-                        console.error('Failed to retrieve server public key:', data);
+                        console.error('Unexpected server public key format:', data);
                     }
                 })
-                .catch((error) => {
+                .catch(error => {
                     console.error('Error fetching server public key:', error);
                 });
         },
@@ -243,106 +237,7 @@ new Vue({
             }
         },
         
-        // Poll for response from the server (legacy method)
-        async retrieveResponse(timeout = 60000) {
-            console.log('Polling for response...');
-            const startTime = Date.now();
-            return new Promise((resolve) => {
-                const pollInterval = setInterval(async () => {
-                    try {
-                        const response = await fetch('/retrieve', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({ 
-                                client_public_key: this.extractBase64(this.clientPublicKey)
-                            })
-                        });
-        
-                        if (response.ok) {
-                            const data = await response.json();
-        
-                            if (data.chat_history && data.cipherkey && data.iv) {
-                                clearInterval(pollInterval);
-                                
-                                try {
-                                    const decryptedText = await this.decrypt(
-                                        data.chat_history,
-                                        data.cipherkey,
-                                        data.iv
-                                    );
-                                    
-                                    if (decryptedText) {
-                                        resolve(JSON.parse(decryptedText));
-                                    } else {
-                                        console.error('Decryption failed');
-                                        resolve(null);
-                                    }
-                                } catch (err) {
-                                    console.error('Error processing response:', err);
-                                    resolve(null);
-                                }
-                            }
-                        } else {
-                            console.error('Error retrieving response:', response.status);
-                        }
-                    } catch (error) {
-                        console.error('Error polling for response:', error);
-                    }
-        
-                    // Check for timeout
-                    if (Date.now() - startTime > timeout) {
-                        clearInterval(pollInterval);
-                        console.log('Timeout reached while polling for response');
-                        resolve(null);
-                    }
-                }, 2000);
-            });
-        },
-        
-        // Legacy method to send messages through the faucet endpoint
-        async sendMessageLegacy() {
-            try {
-                console.log('Sending message via legacy method...');
-                
-                // Encrypt the chat history
-                const chatHistoryString = JSON.stringify(this.chatHistory);
-                const encryptedData = await this.encrypt(chatHistoryString, this.serverPublicKey);
-                
-                if (!encryptedData) {
-                    throw new Error('Failed to encrypt message');
-                }
-                
-                // Prepare the payload for the faucet endpoint
-                const payload = {
-                    server_public_key: this.serverPublicKey,
-                    client_public_key: this.extractBase64(this.clientPublicKey),
-                    chat_history: encryptedData.ciphertext,
-                    cipherkey: encryptedData.cipherkey,
-                    iv: encryptedData.iv
-                };
-                
-                // Send the encrypted message to the faucet endpoint
-                const response = await fetch('/faucet', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(payload)
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`Failed to send message: ${response.status}`);
-                }
-                
-                // Poll for the response
-                return await this.retrieveResponse();
-            } catch (error) {
-                console.error('Error sending message via legacy method:', error);
-                return null;
-            }
-        },
+
         
         // Send a message to the server
         async sendMessage() {
@@ -356,14 +251,8 @@ new Vue({
             this.newMessage = '';
             
             try {
-                // Try the new API first
+                // Send the message via the API
                 let response = await this.sendMessageApi();
-                
-                // If API request fails, fall back to legacy method -- Temporarily disable for debugging
-                // if (!response) {
-                //     console.log('API request failed, falling back to legacy method');
-                //     response = await this.sendMessageLegacy();
-                // }
                 
                 // Process the response
                 if (response) {

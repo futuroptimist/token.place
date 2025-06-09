@@ -210,30 +210,8 @@ Launch the relay, which runs on http://localhost:5000:
 python relay.py
 ```
 
-Then, in a separate terminal tab, launch the server, which runs on http://localhost:3000:
-
-```sh
-python server.py
-```
-
-NOTE: When first launched, or if the model file isn't present (currently only [Llama 3 8B Instruct GGUF](https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF)), the script will download the model (approximately 4GB) and will save it in the `models/` directory in your project directory under the same filename. This will be gated by user interaction in the future to prevent large file downloads without the user's consent. Eventually you'll basically browse models and choose one from a list.
-
-#### Mock LLM Mode for Testing
-
-For faster testing without downloading the full model, you can use mock mode:
-
-```sh
-python server.py --use_mock_llm
-```
-
-Or set the environment variable:
-
-```sh
-export USE_MOCK_LLM=1
-python server.py
-```
-
-This mode provides mock responses for all queries, making it ideal for development and testing.
+The relay listens on port 5000. It expects a running server specified by the
+`SERVER_URL` environment variable.
 
 ### Using the Application
 
@@ -512,7 +490,7 @@ scripts\start.bat
 
 **Docker:**
 ```bash
-docker-compose up -d
+docker-compose up -d  # starts the relay service
 ```
 
 ## Features
@@ -526,10 +504,9 @@ docker-compose up -d
 ## Quick Start
 
 1. Clone the repository
-2. Install server dependencies with `pip install -r requirements_server.txt`
-   (for relay-only nodes, use `pip install -r requirements_relay.txt`)
-3. Run the server with `python server.py`
-4. Connect to the server at `http://localhost:5000`
+2. Install relay dependencies with `pip install -r requirements_relay.txt`
+3. Run the relay with `python relay.py`
+4. Ensure the `SERVER_URL` environment variable points at your server
 
 ## Development
 

@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
     # Server settings
     'server': {
         'host': '0.0.0.0',
-        'port': 8000,
+        'port': 5000,
         'debug': False,
         'workers': 4,
         'timeout': 30,
@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     'relay': {
         'host': '0.0.0.0',
         'port': 5000,
-        'server_url': 'http://localhost:8000',
+        'server_url': 'http://localhost:5000',
         'workers': 2,
     },
     

@@ -23,7 +23,7 @@ Log out and back in if needed so Docker commands work without `sudo`.
 ## 2. Clone the repository
 
 ```bash
-git clone https://github.com/democratizedspace/token.place.git
+git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 ```
 

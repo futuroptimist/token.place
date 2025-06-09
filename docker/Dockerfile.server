@@ -32,7 +32,7 @@ USER appuser
 ENV PYTHONUNBUFFERED=1
 
 # Expose the port the server runs on
-EXPOSE 8000
+EXPOSE 5000
 
 # Command to run the server
 CMD ["python", "-m", "server.main"] 

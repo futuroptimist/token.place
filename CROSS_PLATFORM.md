@@ -15,26 +15,21 @@ This document explains the improvements made to make token.place work seamlessly
 
 ## Docker Containerization
 
-We've implemented Docker support for easy deployment of all components:
+We've implemented Docker support for easy deployment:
 
-- `docker/Dockerfile.server` - Server component container
 - `docker/Dockerfile.relay` - Relay component container
-- `docker/Dockerfile.api` - API component container
-- `docker-compose.yml` - Orchestrates all services together
+- `docker-compose.yml` - Launches the relay service
 
 ### Building and Running with Docker
 
 ```bash
-# Build and start all services
+# Build and start the relay service
 docker-compose up -d
-
-# Build and start a specific service
-docker-compose up -d server
 
 # View logs
 docker-compose logs -f
 
-# Stop all services
+# Stop the service
 docker-compose down
 ```
 

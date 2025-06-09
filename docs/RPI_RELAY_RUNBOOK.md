@@ -27,6 +27,9 @@ git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 ```
 
+ 
+The relay listens on port 5000. Set the `SERVER_URL` environment variable to point at your server.
+
 ## 3. Configure relay
 
 The relay container needs to know where your server instance is running.
@@ -41,14 +44,14 @@ The relay container needs to know where your server instance is running.
    - **Temporary for the current shell:**
 
      ```bash
-     export SERVER_URL="http://192.168.1.100:8000"
+    export SERVER_URL="http://192.168.1.100:5000"
      ```
 
    - **Persistent with a `.env` file** (create this file next to
      `docker-compose.yml`):
 
      ```
-     SERVER_URL=http://192.168.1.100:8000
+    SERVER_URL=http://192.168.1.100:5000
      ```
 
 Docker Compose automatically loads variables from `.env` when you run the
@@ -56,10 +59,10 @@ Docker Compose automatically loads variables from `.env` when you run the
 
 ## 4. Start relay with Docker Compose
 
-Launch only the relay service (skip the bundled server and API containers):
+The compose file now only defines the relay service, so simply run:
 
 ```bash
-docker compose up -d --no-deps relay
+docker compose up -d
 ```
 
 The relay listens on port 5000 by default.

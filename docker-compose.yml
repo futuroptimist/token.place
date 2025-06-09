@@ -1,57 +1,14 @@
 version: '3.8'
 
 services:
-  server:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.server
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - PLATFORM=${PLATFORM:-linux}
-      - ENV=${ENV:-development}
-    restart: unless-stopped
-    networks:
-      - token-network
-
   relay:
     build:
       context: .
       dockerfile: docker/Dockerfile.relay
     ports:
       - "5000:5000"
-    depends_on:
-      - server
     environment:
       - PLATFORM=${PLATFORM:-linux}
       - ENV=${ENV:-development}
-      - SERVER_URL=http://server:8000
+      - SERVER_URL=${SERVER_URL:-http://localhost:5000}
     restart: unless-stopped
-    networks:
-      - token-network
-
-  api:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api
-    ports:
-      - "3000:3000"
-    depends_on:
-      - relay
-    environment:
-      - PLATFORM=${PLATFORM:-linux}
-      - ENV=${ENV:-development}
-      - RELAY_URL=http://relay:5000
-    restart: unless-stopped
-    networks:
-      - token-network
-
-networks:
-  token-network:
-    driver: bridge
-
-volumes:
-  data:
-    driver: local

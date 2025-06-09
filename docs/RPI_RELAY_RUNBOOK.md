@@ -29,13 +29,30 @@ cd token.place
 
 ## 3. Configure relay
 
-The relay container needs to know where your `server.py` instance is running. Set the `SERVER_URL` environment variable to point to your server machine:
+The relay container needs to know where your server instance is running.
 
-```bash
-export SERVER_URL="http://YOUR_SERVER_IP:8000"
-```
+1. **Find the server's IP address.** On the machine running server, run
+   `hostname -I` or `ip addr show` and note the IP address. If the server runs
+   on the same Raspberry Pi, use `127.0.0.1`.
 
-You can place this variable in a `.env` file so Compose loads it automatically.
+2. **Set the `SERVER_URL` variable.** Replace `192.168.1.100` with the address
+   from the previous step.
+
+   - **Temporary for the current shell:**
+
+     ```bash
+     export SERVER_URL="http://192.168.1.100:8000"
+     ```
+
+   - **Persistent with a `.env` file** (create this file next to
+     `docker-compose.yml`):
+
+     ```
+     SERVER_URL=http://192.168.1.100:8000
+     ```
+
+Docker Compose automatically loads variables from `.env` when you run the
+`docker compose` command.
 
 ## 4. Start relay with Docker Compose
 
@@ -78,6 +95,6 @@ Once the tunnel is active, requests to `relay.your-domain.com` will reach `relay
 
 ## 6. Verify connectivity
 
-Open a browser and navigate to your Cloudflare hostname. The token.place landing page should load, and chatting in the UI will send requests to your existing `server.py` instance.
+Open a browser and navigate to your Cloudflare hostname. The token.place landing page should load, and chatting in the UI will send requests to your existing server instance.
 
 That's it! You now have a repeatable way to run `relay.py` on a Raspberry Pi 5 and expose it securely through Cloudflare.

@@ -28,38 +28,11 @@ cd token.place
 ```
 
  
-The relay listens on port 5000. Set the `SERVER_URL` environment variable to point at your server.
+The relay listens on port 5000 and is already configured to connect to the
+default server container, so no manual setup is required.
+## 3. Start relay with Docker Compose
 
-## 3. Configure relay
-
-The relay container needs to know where your server instance is running.
-
-1. **Find the server's IP address.** On the machine running server, run
-   `hostname -I` or `ip addr show` and note the IP address. If the server runs
-   on the same Raspberry Pi, use `127.0.0.1`.
-
-2. **Set the `SERVER_URL` variable.** Replace `192.168.1.100` with the address
-   from the previous step.
-
-   - **Temporary for the current shell:**
-
-     ```bash
-    export SERVER_URL="http://192.168.1.100:5000"
-     ```
-
-   - **Persistent with a `.env` file** (create this file next to
-     `docker-compose.yml`):
-
-     ```
-    SERVER_URL=http://192.168.1.100:5000
-     ```
-
-Docker Compose automatically loads variables from `.env` when you run the
-`docker compose` command.
-
-## 4. Start relay with Docker Compose
-
-The compose file now only defines the relay service, so simply run:
+The compose file defines the relay service. Start it with:
 
 ```bash
 docker compose up -d
@@ -67,7 +40,7 @@ docker compose up -d
 
 The relay listens on port 5000 by default.
 
-## 5. Set up Cloudflare Tunnel
+## 4. Set up Cloudflare Tunnel
 
 1. Install cloudflared on the Pi:
    ```bash
@@ -96,7 +69,7 @@ ingress:
 
 Once the tunnel is active, requests to `relay.your-domain.com` will reach `relay.py` running in Docker on the Pi.
 
-## 6. Verify connectivity
+## 5. Verify connectivity
 
 Open a browser and navigate to your Cloudflare hostname. The token.place landing page should load, and chatting in the UI will send requests to your existing server instance.
 

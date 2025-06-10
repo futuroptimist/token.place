@@ -17,6 +17,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [README.md](README.md): Project overview and getting started instructions
 - [requirements.txt](requirements.txt): Python dependencies for the project
 - [package.json](package.json): Node.js dependencies for JavaScript components
+- `docker-compose up` starts the relay container for quick local testing
 
 ## Core Components
 

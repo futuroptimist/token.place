@@ -210,8 +210,8 @@ Launch the relay, which runs on http://localhost:5000:
 python relay.py
 ```
 
-The relay listens on port 5000. It expects a running server specified by the
-`SERVER_URL` environment variable.
+The relay listens on port 5000. It automatically connects to the default server
+address baked into the project, so no environment variables are required.
 
 ### Using the Application
 
@@ -504,9 +504,8 @@ docker-compose up -d  # starts the relay service
 ## Quick Start
 
 1. Clone the repository
-2. Install relay dependencies with `pip install -r requirements_relay.txt`
-3. Run the relay with `python relay.py`
-4. Ensure the `SERVER_URL` environment variable points at your server
+2. Run `docker-compose up` to build and start the relay container
+3. Open `http://localhost:5000` in your browser to begin chatting
 
 ## Development
 

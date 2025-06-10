@@ -10,5 +10,4 @@ services:
     environment:
       - PLATFORM=${PLATFORM:-linux}
       - ENV=${ENV:-development}
-      - SERVER_URL=${SERVER_URL:-http://localhost:5000}
     restart: unless-stopped

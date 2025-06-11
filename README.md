@@ -108,13 +108,24 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 You may be missing some CMAKE dependencies
 
-on Debian, you can run the following
+on Debian/Ubuntu you can run the following
 
 ```sh
 sudo apt-get install build-essential cmake
 ```
 
-TODO: instructions for other common OSes
+on macOS, install the Xcode command line tools and CMake via Homebrew:
+
+```sh
+xcode-select --install  # if not already installed
+brew install cmake
+```
+
+On other Linux distributions, use your package manager to install the equivalents of `build-essential` and `cmake`. For example on Fedora:
+
+```sh
+sudo dnf install gcc-c++ make cmake
+```
 
 then, run:
 
@@ -191,12 +202,21 @@ llm = Llama(
 `n_gpu_layers` instructs llama to use as much of your GPU resources as possible.
 
 #### macos
+Install the [Homebrew](https://brew.sh) package manager if you haven't already,
+then reinstall `llama-cpp-python` with Metal support:
 
-TODO
+```sh
+brew install cmake
+CMAKE_ARGS="-DLLAMA_METAL=on" FORCE_CMAKE=1 pip install llama-cpp-python --force-reinstall --upgrade
+```
 
 #### unix/linux
+Most distributions can compile `llama-cpp-python` with OpenBLAS:
 
-TODO
+```sh
+sudo apt-get install build-essential cmake libopenblas-dev
+CMAKE_ARGS="-DLLAMA_OPENBLAS=on" FORCE_CMAKE=1 pip install llama-cpp-python --force-reinstall --upgrade
+```
 
 ## Running the servers
 
@@ -243,6 +263,17 @@ Run all tests:
 
 ```sh
 python -m pytest
+```
+
+To execute all available test suites (including JavaScript and end‑to‑end tests), use:
+
+```bash
+./run_all_tests.sh
+```
+or on Windows:
+
+```powershell
+./run_all_tests.ps1
 ```
 
 Run specific test files:
@@ -523,6 +554,8 @@ npm run test:js
 # Run crypto compatibility tests
 python tests/test_crypto_compatibility_simple.py
 ```
+
+To run every test category in one command (including Playwright and JS tests) execute `./run_all_tests.sh` (or `./run_all_tests.ps1` on Windows).
 
 ### Windows PowerShell Tips
 

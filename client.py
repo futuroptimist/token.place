@@ -12,15 +12,14 @@ from cryptography.hazmat.backends import default_backend
 # Use an environment variable to determine the environment
 environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
 
-# Choose the base URL based on the environment
-base_url = 'http://token.place' if environment == 'prod' else 'http://localhost'
-
-# TODO: handle prod case, where the port shouldn't be hardcoded (as we can't determine in advance if it's 80 or 443)
+# Choose the base domain based on the environment
+base_url = "http://token.place" if environment == "prod" else "http://localhost"
 
 # --- Configuration ---
 # Use the correct base URL for your running relay/API
+# You can override this with the API_BASE_URL environment variable.
 # If running locally with default port 5070:
-API_BASE_URL = "http://localhost:5070/api/v1" 
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:5070/api/v1")
 # Or use "http://localhost:5070" if targeting relay endpoints directly
 
 CLIENT_KEYS_DIR = "client_keys"

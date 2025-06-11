@@ -107,6 +107,8 @@ Run tests with a specific marker using:
 python -m pytest -m marker_name
 ```
 
+For convenience, you can execute all available test suites with `./run_all_tests.sh` (or `./run_all_tests.ps1` on Windows).
+
 ## Configuration
 
 - [config.py](config.py): Configuration management for different environments

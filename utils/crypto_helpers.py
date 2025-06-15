@@ -99,7 +99,6 @@ class CryptoClient:
                 return False
                 
             data = response.json()
-            logger.debug(f"Server response data: {data}")
             
             # Check if there's an error in the response
             if 'error' in data:
@@ -140,7 +139,7 @@ class CryptoClient:
         else:
             plaintext = str(message).encode('utf-8')
             
-        logger.debug(f"Encrypting message: {plaintext[:100]}...")
+        logger.debug("Encrypting message of length %d bytes", len(plaintext))
             
         # Encrypt the message
         encrypted_dict, cipherkey, iv = encrypt(plaintext, self.server_public_key)
@@ -242,7 +241,7 @@ class CryptoClient:
         else:
             chat_history = message
             
-        logger.debug(f"Sending chat message: {chat_history}")
+        logger.debug("Sending chat message with %d entries", len(chat_history))
             
         # Encrypt the chat history
         try:

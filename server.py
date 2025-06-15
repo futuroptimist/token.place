@@ -148,7 +148,7 @@ def poll_relay(base_url, relay_port):
             
             if response.status_code == 200:
                 data = response.json()
-                log_info(f"[Server Poll] Received data from relay: {data}")
+                log_info("[Server Poll] Received data from relay")
                 
                 if 'client_public_key' in data and 'chat_history' in data and 'cipherkey' in data and 'iv' in data and data['iv']:
                     log_info("[Server Poll] Processing client request...")
@@ -167,12 +167,12 @@ def poll_relay(base_url, relay_port):
                             log_info("[Server Poll] Decryption failed. Skipping.")
                             continue
                             
-                        log_info(f"[Server Poll] Decrypted request: {decrypted_chat_history.decode('utf-8')}")
+                        log_info("[Server Poll] Decrypted request received")
                         chat_history_obj = json.loads(decrypted_chat_history)
                         
                         log_info("[Server Poll] Getting response from LLM...")
                         response_history = llama_cpp_get_response(chat_history_obj) # This uses get_llm_instance()
-                        log_info(f"[Server Poll] LLM response history: {response_history}")
+                        log_info("[Server Poll] LLM response generated")
 
                         log_info("[Server Poll] Encrypting response for client...")
                         client_pub_key = base64.b64decode(client_pub_key_b64)
@@ -263,13 +263,13 @@ def llama_cpp_get_response(chat_history):
         return chat_history
 
     try:
-        log_info(f"[LLM] Calling create_chat_completion with history: {chat_history}")
+        log_info("[LLM] Calling create_chat_completion")
         # Use the obtained model_instance
         response = model_instance.create_chat_completion(messages=chat_history)
-        log_info(f"[LLM] Raw response from model: {response}")
+        log_info("[LLM] Received response from model")
         if response and 'choices' in response and response['choices']:
             assistant_message = response['choices'][0]['message']
-            log_info(f"[LLM] Assistant message generated: {assistant_message}")
+            log_info("[LLM] Assistant message generated")
             chat_history.append(assistant_message)
             # Return the modified chat_history (already done by append)
         else:

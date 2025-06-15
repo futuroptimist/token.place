@@ -31,6 +31,8 @@ This document provides an overview of the testing approach for token.place and i
 - Location: `tests/test_e2e_*.py`
 - Purpose: Test complete workflows
 - Command: `python -m pytest tests/test_e2e_*.py`
+- Additional Playwright test `tests/e2e/test_installation_docs.py` verifies that
+  installation instructions exist in the README.
 
 ### 6. Failure Recovery Tests
 - Location: `tests/test_failure_recovery.py`

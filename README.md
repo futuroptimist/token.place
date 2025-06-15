@@ -237,6 +237,8 @@ address baked into the project, so no environment variables are required.
 
 `relay.py` acts as a proxy between the client (including, but not limited to, this repo's `client.py`) and `server.py`, obfuscating each other's public IP from each other, solving one of the big limitations of P2P networks (e.g. for .torrents). The relay.py provides end-to-end encryption for communication between server and client, ensuring that your messages are private even from the relay itself.
 
+`server.py` runs on volunteers' machines and hosts the LLM model. It serves inference requests forwarded by the relay while keeping the server's network details private.
+
 You can test things out using the simple command-line client, `client.py`:
 
 ```sh
@@ -586,6 +588,7 @@ We welcome contributions! See our [Contributing Guide](docs/CONTRIBUTING.md) for
 ## Security
 
 Security is our top priority. Please report any vulnerabilities responsibly. See [Security and Privacy Audit](SECURITY_PRIVACY_AUDIT.md) for details.
+token.place intentionally avoids storing user prompts or LLM responses in logs to protect user privacy.
 
 ## License
 

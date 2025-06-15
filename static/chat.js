@@ -10,7 +10,6 @@ new Vue({
     },
     mounted() {
         this.getServerPublicKey().then(() => {
-            console.log("Server public key received");
             this.generateClientKeys();
         });
     },
@@ -27,7 +26,6 @@ new Vue({
                 .then(data => {
                     if (data && data.public_key) {
                         this.serverPublicKey = data.public_key;
-                        console.log('Server public key received successfully');
                     } else {
                         console.error('Unexpected server public key format:', data);
                     }
@@ -41,7 +39,6 @@ new Vue({
             crypt.getKey();
             this.clientPrivateKey = crypt.getPrivateKey();
             this.clientPublicKey = crypt.getPublicKey();
-            console.log("Client keys generated successfully");
         },
         
         // Convert Base64 string to ArrayBuffer
@@ -85,7 +82,6 @@ new Vue({
          */
         async encrypt(plaintext, publicKeyPem) {
             try {
-                console.log('Encrypting message...');
                 
                 // Generate random AES key (256 bits)
                 const aesKey = CryptoJS.lib.WordArray.random(32); // 32 bytes = 256 bits
@@ -132,7 +128,6 @@ new Vue({
          */
         async decrypt(ciphertext, encryptedKey, ivBase64) {
             try {
-                console.log('Decrypting response...');
                 
                 // Prepare for RSA decryption
                 const jsEncrypt = new JSEncrypt();

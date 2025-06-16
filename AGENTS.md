@@ -122,3 +122,4 @@ For convenience, you can execute all available test suites with `./run_all_tests
 
 - Run `./run_all_tests.sh` to verify changes before committing.
 - Keep the roadmap in [README.md](README.md) updated as features progress.
+- Use `npm ci` for faster, reproducible Node.js installs (mirrors the CI pipeline's behavior).

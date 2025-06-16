@@ -42,6 +42,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] End-to-end tests with mock LLM
   - [x] Support for testing with real LLM models
   - [x] GitHub Actions CI for automated tests
+  - [x] CI caching for faster dependency installs
 - [x] API v1 with at least 1 model supported and available
 - [x] landing page chat UI integrated with API v1
 - [ ] use best available llama family model that can run on an RTX 4090

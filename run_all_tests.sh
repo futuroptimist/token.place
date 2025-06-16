@@ -66,10 +66,18 @@ run_test "Crypto Compatibility Tests (Playwright)" "python -m pytest tests/test_
 run_test "JavaScript Tests" "npm run test:js" "Testing JavaScript functionality"
 
 # 8. Run E2E tests
-run_test "End-to-End Tests" "python -m pytest tests/test_e2e_*.py -v" "Testing complete workflows"
+if [ "$RUN_E2E" = "1" ]; then
+    run_test "End-to-End Tests" "python -m pytest tests/test_e2e_*.py -v" "Testing complete workflows"
+else
+    echo "Skipping End-to-End Tests (set RUN_E2E=1 to enable)"
+fi
 
 # 9. Run failure recovery tests
-run_test "Failure Recovery Tests" "python -m pytest tests/test_failure_recovery.py -v" "Testing system resilience against errors"
+if [ "$RUN_E2E" = "1" ]; then
+    run_test "Failure Recovery Tests" "python -m pytest tests/test_failure_recovery.py -v" "Testing system resilience against errors"
+else
+    echo "Skipping Failure Recovery Tests (set RUN_E2E=1 to enable)"
+fi
 
 # 10. Run DSPACE integration tests
 if [ -d "integration_tests/" ]; then

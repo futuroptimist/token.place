@@ -6,9 +6,13 @@ This is the main entry point that uses the refactored modular architecture.
 import os
 import sys
 
+# Enable mock LLM mode early if flag is present
+if "--use_mock_llm" in sys.argv:
+    os.environ["USE_MOCK_LLM"] = "1"
+
 # Import from the refactored server package
 from server.server_app import main
 
 if __name__ == "__main__":
     # Pass control to the main function in server_app.py
-    main() 
+    main()

@@ -52,7 +52,7 @@ def generate_keys() -> Tuple[bytes, bytes]:
     
     return private_key_pem, public_key_pem
 
-def encrypt(plaintext: bytes, public_key_pem: bytes) -> Tuple[Dict[str, bytes], bytes, bytes]:
+def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False) -> Tuple[Dict[str, bytes], bytes, bytes]:
     """
     Encrypt plaintext using AES-CBC with a random key, then encrypt that key with RSA.
     
@@ -89,15 +89,21 @@ def encrypt(plaintext: bytes, public_key_pem: bytes) -> Tuple[Dict[str, bytes], 
     # For compatibility with JSEncrypt, convert the AES key to Base64 first
     aes_key_b64 = base64.b64encode(aes_key)
     
-    # Encrypt the Base64 representation of the key using OAEP padding
-    encrypted_key = public_key.encrypt(
-        aes_key_b64,
-        asymmetric_padding.OAEP(
-            mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
-            algorithm=SHA256(),
-            label=None,
+    # Encrypt the Base64 representation of the key
+    if use_pkcs1v15:
+        encrypted_key = public_key.encrypt(
+            aes_key_b64,
+            asymmetric_padding.PKCS1v15()
         )
-    )
+    else:
+        encrypted_key = public_key.encrypt(
+            aes_key_b64,
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
+                algorithm=SHA256(),
+                label=None,
+            )
+        )
     
     return {'ciphertext': ciphertext, 'iv': iv}, encrypted_key, iv
 
@@ -121,15 +127,21 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
             backend=default_backend()
         )
         
-        # Decrypt the encrypted AES key with OAEP padding
-        aes_key_b64 = private_key.decrypt(
-            encrypted_key,
-            asymmetric_padding.OAEP(
-                mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
-                algorithm=SHA256(),
-                label=None,
+        # Decrypt the encrypted AES key. Try OAEP first, then fall back to PKCS1v15 for JS compatibility
+        try:
+            aes_key_b64 = private_key.decrypt(
+                encrypted_key,
+                asymmetric_padding.OAEP(
+                    mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
+                    algorithm=SHA256(),
+                    label=None,
+                )
             )
-        )
+        except Exception:
+            aes_key_b64 = private_key.decrypt(
+                encrypted_key,
+                asymmetric_padding.PKCS1v15()
+            )
         
         # Decode the Base64 to get the actual AES key
         aes_key = base64.b64decode(aes_key_b64)

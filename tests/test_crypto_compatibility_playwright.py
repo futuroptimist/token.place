@@ -100,7 +100,7 @@ def test_python_encrypt_js_decrypt(page, web_server):
     
     # Encrypt with Python
     plaintext = json.dumps(test_data).encode('utf-8')
-    ciphertext_dict, cipherkey, iv = encrypt(plaintext, public_key)
+    ciphertext_dict, cipherkey, iv = encrypt(plaintext, public_key, use_pkcs1v15=True)
     logger.info(f"Encrypted data in Python, ciphertext size: {len(ciphertext_dict['ciphertext'])} bytes")
     
     # Convert encrypted data to Base64 strings for JS

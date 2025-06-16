@@ -2,14 +2,9 @@
 <html>
 <head>
     <title>Crypto Test Runner</title>
-    <!-- Include Crypto-JS (Bundled) -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <!-- Include JSEncrypt (Using jsDelivr CDN) -->
-    <script 
-        src="https://cdn.jsdelivr.net/npm/jsencrypt@3.3.2/bin/jsencrypt.min.js" 
-        crossorigin="anonymous" 
-        referrerpolicy="no-referrer"
-    ></script>
+    <!-- Include Crypto-JS and JSEncrypt from local node_modules for offline testing -->
+    <script src="../node_modules/crypto-js/crypto-js.js"></script>
+    <script src="../node_modules/jsencrypt/bin/jsencrypt.min.js"></script>
     <script>
         console.log(`JSEncrypt type immediately after script tag: ${typeof window.JSEncrypt}`);
         if (typeof window.JSEncrypt !== 'function') {

@@ -4,35 +4,32 @@ from datetime import datetime
 import random
 import argparse
 import os
-from api import init_app
 import sys
 import threading
 import time
+
+# Parse command line arguments early to set environment variables before imports
+parser = argparse.ArgumentParser(description="token.place relay server")
+parser.add_argument("--port", type=int, default=5010, help="Port to run the relay server on")
+parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+else:
+    args = parser.parse_args([])
+
+# Set environment variable based on the command line argument or existing env
+if args.use_mock_llm or os.environ.get("USE_MOCK_LLM") == "1":
+    os.environ["USE_MOCK_LLM"] = "1"
+    print("Running with USE_MOCK_LLM=1 (mock mode enabled)")
+
+from api import init_app
 
 # Import configuration
 try:
     from config import RELAY_PORT
 except ImportError:
     RELAY_PORT = 5010
-
-# Parse command line arguments only when run as script, not when imported
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="token.place relay server")
-    parser.add_argument("--port", type=int, default=RELAY_PORT, help="Port to run the relay server on")
-    parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
-    args = parser.parse_args()
-else:
-    # Default values when imported
-    class Args:
-        def __init__(self):
-            self.port = RELAY_PORT
-            self.use_mock_llm = False
-    args = Args()
-
-# Set environment variable based on the command line argument
-if args.use_mock_llm:
-    os.environ['USE_MOCK_LLM'] = '1'
-    print(f"Running with USE_MOCK_LLM=1 (mock mode enabled)")
 
 app = Flask(__name__)
 

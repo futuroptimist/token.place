@@ -62,11 +62,11 @@ class ClientSimulator:
                 self.fetch_server_public_key()
             server_key = self.server_public_key
         
-        # Convert message to JSON string if it's a dict
-        if isinstance(message, dict):
+        # Convert message to JSON string if it's a dict or list
+        if isinstance(message, (dict, list)):
             message_str = json.dumps(message)
         else:
-            message_str = message
+            message_str = str(message)
             
         # Encrypt the message
         ciphertext_dict, cipherkey, iv = encrypt(message_str.encode('utf-8'), server_key)
@@ -120,7 +120,7 @@ class ClientSimulator:
         payload = {
             "model": model,
             "encrypted": True,
-            "client_public_key": self.public_key.decode('utf-8'),
+            "client_public_key": base64.b64encode(self.public_key).decode('utf-8'),
             "messages": encrypted_data
         }
         
@@ -130,8 +130,8 @@ class ClientSimulator:
             json=payload
         )
         response.raise_for_status()
-        
-        # Return the encrypted response
+
+        # Return parsed JSON
         return response.json()
     
     def send_message(self, message: Union[str, Dict, List[Dict]], model: str = "llama-3-8b-instruct") -> str:
@@ -160,10 +160,16 @@ class ClientSimulator:
             self.fetch_server_public_key()
         
         # Encrypt the message
-        encrypted_data = self.encrypt_message({"messages": formatted_message})
+        encrypted_data = self.encrypt_message(formatted_message)
         
         # Send the request
         response_data = self.send_request(encrypted_data, model)
-        
-        # Decrypt and return the response
-        return self.decrypt_response(response_data["choices"][0]["message"]) 
+
+        # Handle different response formats
+        if isinstance(response_data, dict):
+            if "data" in response_data:
+                return self.decrypt_response(response_data["data"])
+            elif "choices" in response_data and response_data["choices"]:
+                return self.decrypt_response(response_data["choices"][0]["message"])
+
+        raise ValueError("Unexpected response format")

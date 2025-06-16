@@ -24,21 +24,19 @@ run_test() {
     TEST_NAME=$1
     COMMAND=$2
     DESCRIPTION=$3
-    
+
     echo ""
     echo "======================================================"
     echo " Running $TEST_NAME"
     echo "======================================================"
     echo "$DESCRIPTION"
     echo ""
-    
-    eval $COMMAND
-    
-    if [ $? -ne 0 ]; then
+
+    if eval $COMMAND; then
+        echo -e "\e[32m✅ $TEST_NAME passed\e[0m"
+    else
         echo -e "\e[31m❌ $TEST_NAME failed\e[0m"
         FAILED_TESTS+=("$TEST_NAME")
-    else
-        echo -e "\e[32m✅ $TEST_NAME passed\e[0m"
     fi
 }
 
@@ -87,19 +85,18 @@ if [ -d "integration_tests/" ]; then
     echo "======================================================"
     echo "Testing token.place as a drop-in replacement for OpenAI in DSPACE"
     echo ""
-    
+
     cd integration_tests
     ./run_integration_test.sh
     DSPACE_STATUS=$?
-    
+    cd ..
+
     if [ $DSPACE_STATUS -ne 0 ]; then
         echo -e "\e[31m❌ DSPACE Integration Tests failed with exit code: $DSPACE_STATUS\e[0m"
         FAILED_TESTS+=("DSPACE Integration Tests")
     else
         echo -e "\e[32m✅ DSPACE Integration Tests passed\e[0m"
     fi
-    
-    cd ..
 fi
 
 # Summary
@@ -119,4 +116,5 @@ else
     echo ""
     echo -e "\e[31m${#FAILED_TESTS[@]} test(s) failed\e[0m"
     exit 1
-fi 
+fi
+

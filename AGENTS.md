@@ -115,3 +115,8 @@ For convenience, you can execute all available test suites with `./run_all_tests
 - [utils/logging/logger.py](utils/logging/logger.py): Logging infrastructure for the application
 - [pytest.ini](pytest.ini): Configuration for Python test suite
 - **Privacy**: Do not log plaintext or ciphertext of user messages. Remove debugging statements that could leak sensitive data.
+
+## Development Tips
+
+- Run `./run_all_tests.sh` to verify changes before committing.
+- Keep the roadmap in [README.md](README.md) updated as features progress.

@@ -25,9 +25,11 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] automated browser testing of landing page, preventing regressions of the chat ui
   - [x] delete old /inference endpoint and everything upstream and downstream that's now unused
   - [x] simplified crypto utility (CryptoClient) for easy encrypted communication
-- [x] distribute relay.py across 2 or more machines
+- [ ] distribute relay.py across multiple machines
   - [x] personal gaming PC
-  - [x] basic DigitalOcean droplet
+  - [ ] raspi k3s pod
+  - [ ] once k3s pod is stable, run relay.py only on the cluster
+  - [ ] optional cloud fallback via Cloudflare
 - [x] OpenAI-compatible API with end-to-end encryption
   - [x] Models listing endpoint
   - [x] Chat completions endpoint
@@ -43,7 +45,9 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [x] landing page chat UI integrated with API v1
 - [ ] use best available llama family model that can run on an RTX 4090
 - [ ] [https://github.com/democratizedspace/dspace](DSPACE) (first 1st party integration) uses API v1 for dChat
-- [ ] set up production server (raspberry pi cluster lol)
+- [ ] set up production k3s raspberry pi pod running relay.py
+  - [ ] server.py stays on personal gaming PC
+  - [ ] potential cloud fallback node via Cloudflare
 - [ ] allow participation from other server.pys
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
 - [ ] API v2 with at least 10 models supported and available

@@ -336,7 +336,10 @@ def main():
     
     # Create models directory and download model if needed
     models_dir = create_models_directory()
-    download_file_if_not_exists(models_dir, URL)
+    if not USE_MOCK_LLM:
+        download_file_if_not_exists(models_dir, URL)
+    else:
+        log_info("Mock LLM mode enabled - skipping model download")
     
     # Start the polling thread to interact with the relay
     log_info(f"Starting polling thread for relay at {BASE_URL}:{RELAY_PORT}...")

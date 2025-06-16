@@ -18,9 +18,6 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('crypto_tests')
 
-jsencrypt_path = Path(project_root) / 'node_modules' / 'jsencrypt'
-if not jsencrypt_path.exists():
-    pytest.skip("jsencrypt module not available", allow_module_level=True)
 
 def test_python_encrypt_js_decrypt():
     """
@@ -71,8 +68,7 @@ def test_python_encrypt_js_decrypt():
 // Load the shim first to create browser environment objects
 require('{shim_path_js}');
 
-// Import JSEncrypt correctly for Node.js - use local node_modules
-const JSEncrypt = require('{project_root_js}/node_modules/jsencrypt');
+const crypto = require('crypto');
 const cryptoJs = require('{project_root_js}/node_modules/crypto-js');
 
 // Get encrypted data from Python
@@ -87,17 +83,14 @@ const privateKeyPem = `{private_key_pem}`;
 
 async function decryptData() {{
     try {{
-        // Create JSEncrypt instance
-        const jsEncrypt = new JSEncrypt();
-        jsEncrypt.setPrivateKey(privateKeyPem);
-        
-        // Decrypt the AES key with RSA
-        const decryptedKeyBase64 = jsEncrypt.decrypt(encryptedData.cipherkey);
-        if (!decryptedKeyBase64) {{
-            throw new Error('RSA decryption of AES key failed');
-        }}
-        
-        // Convert the Base64 key to a WordArray
+        const decryptedKeyBuffer = crypto.privateDecrypt({{
+            key: privateKeyPem,
+            padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+            oaepHash: "sha256"
+        }},
+            Buffer.from(encryptedData.cipherkey, "base64")
+        );
+        const decryptedKeyBase64 = decryptedKeyBuffer.toString("utf8");
         const aesKey = cryptoJs.enc.Base64.parse(decryptedKeyBase64);
         
         // Convert the Base64 IV to a WordArray
@@ -182,8 +175,7 @@ def test_js_encrypt_python_decrypt():
 // Load the shim first to create browser environment objects
 require('{shim_path_js}');
 
-// Import JSEncrypt correctly for Node.js - use local node_modules
-const JSEncrypt = require('{project_root_js}/node_modules/jsencrypt');
+const crypto = require('crypto');
 const cryptoJs = require('{project_root_js}/node_modules/crypto-js');
 
 // Test data
@@ -191,46 +183,41 @@ const testData = {test_data_json};
 
 async function encryptData() {{
     try {{
-        // Generate RSA keys
-        const crypt = new JSEncrypt({{ default_key_size: 2048 }});
-        crypt.getKey();
-        const privateKey = crypt.getPrivateKey();
-        const publicKey = crypt.getPublicKey();
-        
-        // Generate random AES key (256 bits)
-        const aesKey = cryptoJs.lib.WordArray.random(32);
-        
-        // Generate random IV (16 bytes)
-        const iv = cryptoJs.lib.WordArray.random(16);
-        
-        // Encrypt the plaintext with AES in CBC mode with PKCS7 padding
+        const {{ publicKey, privateKey }} = crypto.generateKeyPairSync('rsa', {{ modulusLength: 2048 }});
+        const publicKeyPem = publicKey.export({{ type: 'pkcs1', format: 'pem' }});
+        const privateKeyPem = privateKey.export({{ type: 'pkcs1', format: 'pem' }});
+
+        const aesKeyBuf = crypto.randomBytes(32);
+        const ivBuf = crypto.randomBytes(16);
+        const aesKey = cryptoJs.lib.WordArray.create(aesKeyBuf);
+        const iv = cryptoJs.lib.WordArray.create(ivBuf);
+
         const encrypted = cryptoJs.AES.encrypt(
-            JSON.stringify(testData), 
-            aesKey, 
+            JSON.stringify(testData),
+            aesKey,
             {{
                 iv: iv,
                 mode: cryptoJs.mode.CBC,
                 padding: cryptoJs.pad.Pkcs7
             }}
         );
-        
-        // Encrypt the AES key with RSA
-        const jsEncrypt = new JSEncrypt();
-        jsEncrypt.setPublicKey(publicKey);
-        const aesKeyBase64 = cryptoJs.enc.Base64.stringify(aesKey);
-        const encryptedKey = jsEncrypt.encrypt(aesKeyBase64);
-        
-        if (!encryptedKey) {{
-            throw new Error('RSA encryption of AES key failed');
-        }}
-        
-        // Output encrypted data and keys
+
+        const aesKeyBase64 = aesKeyBuf.toString('base64');
+        const encryptedKeyBuffer = crypto.publicEncrypt(
+            {{
+                key: publicKeyPem,
+                padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+                oaepHash: 'sha256'
+            }},
+            Buffer.from(aesKeyBase64)
+        );
+
         const result = {{
             ciphertext: encrypted.toString(),
-            cipherkey: encryptedKey,
+            cipherkey: encryptedKeyBuffer.toString('base64'),
             iv: cryptoJs.enc.Base64.stringify(iv),
-            publicKey: publicKey,
-            privateKey: privateKey
+            publicKey: publicKeyPem,
+            privateKey: privateKeyPem
         }};
         
         console.log(JSON.stringify(result));

@@ -316,10 +316,15 @@ def main():
     parser = argparse.ArgumentParser(description='Start the server with specific ports')
     parser.add_argument('--server_port', type=int, default=config.get('server.port'), help='Port for the server')
     parser.add_argument('--relay_port', type=int, default=config.get('relay.port'), help='Port for the relay')
+    parser.add_argument('--use_mock_llm', action='store_true', help='Use mock LLM implementation')
     args = parser.parse_args()
-    
+
     SERVER_PORT = args.server_port
     RELAY_PORT = args.relay_port
+    if args.use_mock_llm:
+        os.environ['USE_MOCK_LLM'] = '1'
+        global USE_MOCK_LLM
+        USE_MOCK_LLM = True
     BASE_URL = config.get('server.base_url', 'http://localhost')
     SERVER_HOST = config.get('server.host', '0.0.0.0')
     

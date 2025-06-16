@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tokenplace-relay
+  labels:
+    app: tokenplace-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tokenplace-relay
+  template:
+    metadata:
+      labels:
+        app: tokenplace-relay
+    spec:
+      containers:
+      - name: relay
+        image: tokenplace-relay:latest
+        ports:
+        - containerPort: 5000
+        env:
+        - name: PLATFORM
+          value: "linux"
+        - name: ENV
+          value: "production"

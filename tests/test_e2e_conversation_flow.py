@@ -31,7 +31,7 @@ def start_server(use_mock_llm: bool = True) -> Generator[None, None, None]:
         env['USE_MOCK_LLM'] = '1'
     
     # Start the server process
-    server_cmd = ["python", "server.py.new", "--server_port", "8010", "--relay_port", "5010"]
+    server_cmd = ["python", "server.py", "--server_port", "3000", "--relay_port", "5000"]
     if use_mock_llm:
         server_cmd.append("--use_mock_llm")
     
@@ -48,7 +48,7 @@ def start_server(use_mock_llm: bool = True) -> Generator[None, None, None]:
         time.sleep(2)  # Allow server time to initialize
         
         # Check if server is running
-        health_check_url = "http://localhost:8010/health"
+        health_check_url = "http://localhost:3000/health"
         retries = 5
         while retries > 0:
             try:
@@ -83,7 +83,7 @@ def start_relay() -> Generator[None, None, None]:
         None
     """
     # Start the relay process
-    relay_cmd = ["python", "relay.py", "--port", "5010"]
+    relay_cmd = ["python", "relay.py", "--port", "5000"]
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
     process = subprocess.Popen(
@@ -99,7 +99,7 @@ def start_relay() -> Generator[None, None, None]:
         time.sleep(2)  # Allow relay time to initialize
         
         # Check if relay is running
-        health_check_url = "http://localhost:5010/"
+        health_check_url = "http://localhost:5000/"
         retries = 5
         while retries > 0:
             try:
@@ -131,7 +131,7 @@ def test_complete_encrypted_conversation_flow():
     # Start the server and relay
     with start_relay(), start_server(use_mock_llm=USE_MOCK_LLM):
         # Initialize client simulator
-        client = ClientSimulator(base_url="http://localhost:5010")
+        client = ClientSimulator(base_url="http://localhost:5000")
         
         # Get server public key
         server_key = client.fetch_server_public_key()
@@ -164,7 +164,7 @@ def test_conversation_context_maintenance():
     # Start the server and relay
     with start_relay(), start_server(use_mock_llm=USE_MOCK_LLM):
         # Initialize client simulator
-        client = ClientSimulator(base_url="http://localhost:5010")
+        client = ClientSimulator(base_url="http://localhost:5000")
         
         # Initial conversation
         conversation = [
@@ -190,7 +190,7 @@ def test_encryption_decryption_integrity():
     # Start the server and relay
     with start_relay(), start_server(use_mock_llm=USE_MOCK_LLM):
         # Initialize client simulator
-        client = ClientSimulator(base_url="http://localhost:5010")
+        client = ClientSimulator(base_url="http://localhost:5000")
         
         # Create a complex message with special characters
         complex_message = {

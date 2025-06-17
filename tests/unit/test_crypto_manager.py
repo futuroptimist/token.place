@@ -20,7 +20,7 @@ class TestCryptoManager:
     @pytest.fixture
     def crypto_manager(self):
         """Fixture that returns a crypto manager instance with mocked dependencies."""
-        with patch('utils.crypto.crypto_manager.get_config') as mock_get_config:
+        with patch('utils.crypto.crypto_manager.get_config_lazy') as mock_get_config:
             mock_config = MagicMock()
             mock_config.is_production = False
             mock_get_config.return_value = mock_config

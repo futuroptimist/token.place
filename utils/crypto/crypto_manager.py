@@ -9,23 +9,32 @@ from typing import Dict, Tuple, Any, Optional, Union, List
 # Import from the existing encrypt.py
 from encrypt import encrypt, decrypt, generate_keys
 
-# Import config
-from config import get_config
-
-# Get configuration instance
-config = get_config()
-
 # Configure logging
 logger = logging.getLogger('crypto_manager')
 
+def get_config_lazy():
+    """Lazy import of config to avoid circular imports"""
+    from config import get_config
+    return get_config()
+
 def log_info(message):
     """Log info only in non-production environments"""
-    if not config.is_production:
+    try:
+        config = get_config_lazy()
+        if not config.is_production:
+            logger.info(message)
+    except:
+        # Fallback to always log if config is not available
         logger.info(message)
 
 def log_error(message, exc_info=False):
     """Log errors only in non-production environments"""
-    if not config.is_production:
+    try:
+        config = get_config_lazy()
+        if not config.is_production:
+            logger.error(message, exc_info=exc_info)
+    except:
+        # Fallback to always log if config is not available
         logger.error(message, exc_info=exc_info)
 
 class CryptoManager:
@@ -142,5 +151,12 @@ class CryptoManager:
             log_error(f"Error decrypting message: {e}", exc_info=True)
             return None
 
-# Create a singleton instance
-crypto_manager = CryptoManager() 
+# Delay instantiation to avoid circular imports
+crypto_manager = None
+
+def get_crypto_manager():
+    """Get the global crypto manager instance, creating it if necessary."""
+    global crypto_manager
+    if crypto_manager is None:
+        crypto_manager = CryptoManager()
+    return crypto_manager 

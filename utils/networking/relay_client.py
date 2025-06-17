@@ -9,14 +9,13 @@ import base64
 import jsonschema
 from typing import Dict, Optional, Any, List, Union, Tuple
 
-# Import config
-from config import get_config
-
-# Get configuration instance
-config = get_config()
-
 # Configure logging
 logger = logging.getLogger('relay_client')
+
+def get_config_lazy():
+    """Lazy import of config to avoid circular imports"""
+    from config import get_config
+    return get_config()
 
 # Define JSON schema for messages
 MESSAGE_SCHEMA = {
@@ -46,7 +45,15 @@ RELAY_RESPONSE_SCHEMA = {
 
 def log_info(message, *args):
     """Log info only in non-production environments using consistent formatting"""
-    if not config.is_production:
+    try:
+        config = get_config_lazy()
+        if not config.is_production:
+            if args:
+                logger.info(message.format(*args))
+            else:
+                logger.info(message)
+    except:
+        # Fallback to always log if config is not available
         if args:
             logger.info(message.format(*args))
         else:
@@ -54,7 +61,15 @@ def log_info(message, *args):
 
 def log_error(message, *args, exc_info=False):
     """Log errors only in non-production environments using consistent formatting"""
-    if not config.is_production:
+    try:
+        config = get_config_lazy()
+        if not config.is_production:
+            if args:
+                logger.error(message.format(*args), exc_info=exc_info)
+            else:
+                logger.error(message, exc_info=exc_info)
+    except:
+        # Fallback to always log if config is not available
         if args:
             logger.error(message.format(*args), exc_info=exc_info)
         else:
@@ -102,7 +117,11 @@ class RelayClient:
         self.model_manager = model_manager
         self.relay_url = f"{base_url}:{port}"
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
-        self._request_timeout = config.get('relay.request_timeout', 10)  # Get timeout from config or use default
+        try:
+            config = get_config_lazy()
+            self._request_timeout = config.get('relay.request_timeout', 10)  # Get timeout from config or use default
+        except:
+            self._request_timeout = 10  # Fallback default
         
     def start(self):
         """Start the polling loop by setting stop_polling to False"""

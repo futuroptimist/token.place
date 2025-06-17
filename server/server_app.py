@@ -9,8 +9,8 @@ from flask import Flask, request, jsonify
 from typing import Dict, Any, List, Optional
 
 # Import our refactored modules
-from utils.llm.model_manager import model_manager
-from utils.crypto.crypto_manager import crypto_manager
+from utils.llm.model_manager import get_model_manager
+from utils.crypto.crypto_manager import get_crypto_manager
 from utils.networking.relay_client import RelayClient
 
 # Import config
@@ -61,8 +61,8 @@ class ServerApp:
         self.relay_client = RelayClient(
             base_url=relay_url,
             port=relay_port,
-            crypto_manager=crypto_manager,
-            model_manager=model_manager
+            crypto_manager=get_crypto_manager(),
+            model_manager=get_model_manager()
         )
         
         # Initialize LLM by downloading model if needed
@@ -71,11 +71,12 @@ class ServerApp:
     def initialize_llm(self):
         """Initialize the LLM by downloading the model if needed."""
         log_info("Initializing LLM...")
-        if model_manager.use_mock_llm:
+        model_mgr = get_model_manager()
+        if model_mgr.use_mock_llm:
             log_info("Using mock LLM based on configuration")
         else:
             # Download model if needed
-            if model_manager.download_model_if_needed():
+            if model_mgr.download_model_if_needed():
                 log_info("Model ready for inference")
             else:
                 log_error("Failed to download or verify model")
@@ -96,7 +97,7 @@ class ServerApp:
             return jsonify({
                 'status': 'ok',
                 'version': config.get('version', 'dev'),
-                'mock_mode': model_manager.use_mock_llm
+                'mock_mode': get_model_manager().use_mock_llm
             })
             
         # Endpoints for direct API access (if needed)

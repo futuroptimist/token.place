@@ -261,4 +261,12 @@ class ModelManager:
             return chat_history
 
 # Create a singleton instance
-model_manager = ModelManager() 
+# Delay instantiation to avoid circular imports
+model_manager = None
+
+def get_model_manager():
+    """Get the global model manager instance, creating it if necessary."""
+    global model_manager
+    if model_manager is None:
+        model_manager = ModelManager()
+    return model_manager 

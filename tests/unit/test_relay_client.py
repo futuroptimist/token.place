@@ -103,7 +103,7 @@ class TestRelayClient:
     @pytest.fixture
     def relay_client(self, mock_crypto_manager, mock_model_manager, config_values):
         """Fixture that returns a relay client instance with mocked dependencies."""
-        with patch('utils.networking.relay_client.get_config') as mock_get_config:
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
             # Create a MagicMock that also implements get method
             mock_config = MagicMock()
             mock_config.is_production = False
@@ -134,7 +134,7 @@ class TestRelayClient:
         assert relay_client.model_manager == mock_model_manager
         assert relay_client.relay_url == "http://localhost:5000"
         assert relay_client.stop_polling is True  # Now initialized to True
-        assert relay_client._request_timeout == 10  # Default value from RelayClient
+        assert relay_client._request_timeout == 15  # Value from config fixture
     
     def test_start_stop_methods(self, relay_client):
         """Test start and stop methods."""

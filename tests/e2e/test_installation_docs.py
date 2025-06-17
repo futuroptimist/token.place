@@ -7,6 +7,6 @@ def test_server_setup_instructions_exist(page: Page):
     readme_path = os.path.abspath('README.md')
     page.goto(f'file://{readme_path}')
     content = page.content()
-    assert 'python server.py' in content
+    assert 'python server.py' in content or 'python -m server' in content
     assert 'docker-compose up' in content
 

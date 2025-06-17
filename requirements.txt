@@ -23,12 +23,15 @@ httpx==0.27.0
 jsonschema==4.23.0
 
 # Testing dependencies
+# IMPORTANT: Keep these versions compatible!
+# pytest-benchmark 5.1.0+ requires pytest>=8.1
+# pytest-playwright 0.7.0+ supports pytest 8.x
 pytest>=8.1
-pytest-playwright==0.7.0
-playwright>=1.40.0
-pytest-cov
-pytest-mock
-pytest-benchmark==5.1.0
+pytest-playwright==0.7.0  # Supports pytest 8.x, provides browser automation
+playwright>=1.40.0        # Required by pytest-playwright 0.7.0+
+pytest-cov                # Code coverage
+pytest-mock               # Mocking utilities
+pytest-benchmark==5.1.0   # Performance benchmarking, requires pytest>=8.1
 
 # JavaScript test dependencies
 # Note: Install these with npm install

@@ -28,6 +28,7 @@ pytest-playwright==0.4.0
 playwright==1.36.0
 pytest-cov
 pytest-mock
+pytest-benchmark==5.1.0
 
 # JavaScript test dependencies
 # Note: Install these with npm install

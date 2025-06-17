@@ -11,12 +11,18 @@ config = get_config()
 @pytest.fixture
 def server_app():
     """Create a ServerApp instance for testing."""
-    with patch('server.server_app.model_manager') as mock_model_manager, \
-         patch('server.server_app.crypto_manager') as mock_crypto_manager, \
+    with patch('server.server_app.get_model_manager') as mock_get_model_manager, \
+         patch('server.server_app.get_crypto_manager') as mock_get_crypto_manager, \
          patch('server.server_app.RelayClient') as mock_relay_client_class:
         
-        # Set up return values for mocks
+        # Set up mock managers
+        mock_model_manager = MagicMock()
         mock_model_manager.use_mock_llm = True
+        mock_model_manager.download_model_if_needed.return_value = True
+        mock_get_model_manager.return_value = mock_model_manager
+        
+        mock_crypto_manager = MagicMock()
+        mock_get_crypto_manager.return_value = mock_crypto_manager
         
         # Create a test relay client
         mock_relay_client = MagicMock()
@@ -98,17 +104,21 @@ def test_setup_routes(server_app):
 
 def test_initialize_llm_mock_mode(server_app):
     """Test the initialize_llm method in mock mode."""
-    with patch('server.server_app.model_manager') as mock_model_manager:
+    with patch('server.server_app.get_model_manager') as mock_get_model_manager:
+        mock_model_manager = MagicMock()
         mock_model_manager.use_mock_llm = True
+        mock_get_model_manager.return_value = mock_model_manager
         server_app.initialize_llm()
         # Verify that download_model_if_needed was not called
         mock_model_manager.download_model_if_needed.assert_not_called()
 
 def test_initialize_llm_real_mode(server_app):
     """Test the initialize_llm method in real mode."""
-    with patch('server.server_app.model_manager') as mock_model_manager:
+    with patch('server.server_app.get_model_manager') as mock_get_model_manager:
+        mock_model_manager = MagicMock()
         mock_model_manager.use_mock_llm = False
         mock_model_manager.download_model_if_needed.return_value = True
+        mock_get_model_manager.return_value = mock_model_manager
         server_app.initialize_llm()
         # Verify that download_model_if_needed was called
         mock_model_manager.download_model_if_needed.assert_called_once()

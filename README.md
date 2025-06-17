@@ -136,8 +136,8 @@ sudo dnf install gcc-c++ make cmake
 then, run:
 
 ```
-pip install -r requirements_server.txt  # server/API dependencies
-pip install -r requirements_relay.txt   # relay-only dependencies
+pip install -r config/requirements_server.txt  # server/API dependencies
+pip install -r config/requirements_relay.txt   # relay-only dependencies
 ```
 
 For JavaScript dependencies, run:

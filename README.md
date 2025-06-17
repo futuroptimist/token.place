@@ -1,4 +1,8 @@
 # token.place
+
+[![CI](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml/badge.svg)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
+
 p2p generative AI platform
 
 # vision

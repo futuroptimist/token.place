@@ -34,4 +34,10 @@ jobs:
         run: npm ci
       - name: Run tests
         run: ./run_all_tests.sh
+        env:
+          TEST_COVERAGE: '1'
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: coverage.xml
 

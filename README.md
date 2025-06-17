@@ -1,4 +1,8 @@
 # token.place
+
+[![CI](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml/badge.svg)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
+
 p2p generative AI platform
 
 # vision
@@ -307,7 +311,8 @@ python -m pytest tests/test_e2e_network.py
 Run tests with coverage report:
 
 ```sh
-python -m pytest --cov=.
+TEST_COVERAGE=1 ./run_all_tests.sh
+# Coverage results are uploaded to Codecov on CI
 ```
 
 ### Test Categories
@@ -576,7 +581,7 @@ npm run test:js
 python tests/test_crypto_compatibility_simple.py
 ```
 
-To run every test category in one command (including Playwright and JS tests) execute `./run_all_tests.sh` (or `./run_all_tests.ps1` on Windows).
+To run every test category in one command (including Playwright and JS tests) execute `TEST_COVERAGE=1 ./run_all_tests.sh` (or `./run_all_tests.ps1` on Windows).
 
 ### Windows PowerShell Tips
 

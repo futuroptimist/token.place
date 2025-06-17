@@ -239,6 +239,18 @@ python relay.py
 The relay listens on port 5000. It automatically connects to the default server
 address baked into the project, so no environment variables are required.
 
+In a separate terminal, launch the server, which runs on http://localhost:3000:
+
+```sh
+python server.py
+```
+
+For testing with mock LLM (faster startup):
+
+```sh
+python server.py --use_mock_llm
+```
+
 ### Using the Application
 
 `relay.py` acts as a proxy between the client (including, but not limited to, this repo's `client.py`) and `server.py`, obfuscating each other's public IP from each other, solving one of the big limitations of P2P networks (e.g. for .torrents). The relay.py provides end-to-end encryption for communication between server and client, ensuring that your messages are private even from the relay itself.

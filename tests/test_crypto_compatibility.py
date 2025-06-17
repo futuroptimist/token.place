@@ -46,7 +46,8 @@ def test_python_encrypt_js_decrypt(page: Page):
     # Encrypt with Python
     plaintext = json.dumps(test_data).encode('utf-8')
     # In Python, we encrypt the *raw* AES key bytes with RSA
-    ciphertext_dict, cipherkey, iv = encrypt(plaintext, public_key)
+    # Use PKCS1v15 padding for compatibility with JSEncrypt
+    ciphertext_dict, cipherkey, iv = encrypt(plaintext, public_key, use_pkcs1v15=True)
     logger.info(f"Encrypted data in Python, ciphertext size: {len(ciphertext_dict['ciphertext'])} bytes")
     
     # Convert encrypted data to Base64 strings for JS

@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger('visual_verification.chat_ui')
 
 # Constants
-HOME_URL = "http://localhost:3000"  # Server UI (updated port)
+HOME_URL = "http://localhost:5010"  # Relay UI (serves the web interface)
 
 @pytest.mark.visual
 def test_chat_ui_initial_state(page: Page, visual_test_context, create_baseline_mode, setup_servers):

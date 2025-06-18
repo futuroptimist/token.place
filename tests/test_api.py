@@ -246,3 +246,57 @@ def test_error_handling(client, mock_llama):
 # Add more tests as needed
 # Consider adding tests for different error conditions, edge cases, etc.
 # Example: test invalid encryption data, test max_tokens, etc. 
+
+
+def test_get_model_not_found(client):
+    resp = client.get('/api/v1/models/does-not-exist')
+    assert resp.status_code == 404
+    data = resp.get_json()
+    assert 'error' in data
+    assert data['error']['type'] == 'invalid_request_error'
+
+
+def test_completions_encryption_error(client, monkeypatch, mock_llama):
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'prompt': 'hi',
+        'encrypted': True,
+        'client_public_key': 'bogus'
+    }
+    monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda *a, **k: None)
+    response = client.post('/api/v1/completions', json=payload)
+    assert response.status_code == 500
+    data = response.get_json()
+    assert 'error' in data
+    assert 'Failed to encrypt response' in data['error']['message']
+
+
+def test_create_completion_encrypted_success(client, monkeypatch, mock_llama):
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
+    monkeypatch.setattr('api.v1.routes.generate_response', lambda m, msgs: msgs + [{'role':'assistant','content':'ok'}])
+    monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda data, key: {'ciphertext':'a','cipherkey':'b','iv':'c'})
+    payload = {'model':'llama-3-8b-instruct','prompt':'hi','encrypted':True,'client_public_key':'x'}
+    res = client.post('/api/v1/completions', json=payload)
+    assert res.status_code == 200
+    d = res.get_json()
+    assert d['encrypted'] is True
+
+
+def test_create_chat_completion_model_error(client, monkeypatch, mock_llama):
+    class DummyErr(Exception):
+        pass
+    from api.v1.models import ModelError
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
+    monkeypatch.setattr('api.v1.routes.generate_response', lambda m, msgs: (_ for _ in ()).throw(ModelError('boom')))
+    payload = {'model':'llama-3-8b-instruct','messages':[{'role':'user','content':'hi'}]}
+    res = client.post('/api/v1/chat/completions', json=payload)
+    assert res.status_code == 400
+    assert 'error' in res.get_json()
+
+
+def test_create_completion_exception(client, monkeypatch, mock_llama):
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: (_ for _ in ()).throw(RuntimeError('oops')))
+    payload = {'model':'llama-3-8b-instruct','prompt':'hi'}
+    res = client.post('/api/v1/completions', json=payload)
+    assert res.status_code == 400
+    assert 'error' in res.get_json()

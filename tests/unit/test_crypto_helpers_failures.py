@@ -74,3 +74,23 @@ def test_send_chat_message_unexpected_faucet(monkeypatch):
     client = _prep_client()
     monkeypatch.setattr(client, 'send_encrypted_message', MagicMock(return_value={'success': False}))
     assert client.send_chat_message('hi') is None
+
+def test_send_chat_message_fetch_key_fail(monkeypatch):
+    client = _prep_client()
+    monkeypatch.setattr(client, 'fetch_server_public_key', lambda: False)
+    assert client.send_chat_message('hi') is None
+
+
+def test_retrieve_chat_response_server_error(monkeypatch):
+    client = _prep_client()
+    # First call to send_encrypted_message returns {'error': 'fail'} so it exits
+    monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'error': 'fail'})
+    result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
+    assert result is None
+
+
+def test_send_api_request_invalid_format(monkeypatch):
+    client = _prep_client()
+    monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'unexpected': True})
+    res = client.send_api_request([{'role': 'user', 'content': 'hi'}])
+    assert res is None

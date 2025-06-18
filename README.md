@@ -314,6 +314,7 @@ Run tests with coverage report:
 TEST_COVERAGE=1 ./run_all_tests.sh
 # Coverage results are uploaded to Codecov on CI
 ```
+Every pull request automatically runs this test suite in GitHub Actions, so you can rely on the status checks for pass/fail information.
 
 ### Test Categories
 

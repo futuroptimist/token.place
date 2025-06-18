@@ -125,3 +125,4 @@ For convenience, you can execute all available test suites with `./run_all_tests
 - Use `npm ci` for faster, reproducible Node.js installs (mirrors the CI pipeline's behavior).
 - Install Python dependencies with `pip install -r config/requirements_server.txt` and `pip install -r config/requirements_relay.txt` before running tests. If Playwright tests complain about missing browsers, run `playwright install chromium`.
 - For development and unit testing, also run `pip install -r requirements.txt` to install extra tooling like pytest-playwright, then run `playwright install`.
+- Every pull request triggers the GitHub Actions workflow in `.github/workflows/ci.yml` which runs `./run_all_tests.sh` with coverage enabled and uploads results to Codecov.

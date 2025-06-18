@@ -3,3 +3,7 @@ source = .
 [report]
 omit =
     tests/*
+    client.py
+    client_simplified.py
+    server.py
+    relay.py

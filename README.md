@@ -50,7 +50,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [x] API v1 with at least 1 model supported and available
 - [x] landing page chat UI integrated with API v1
 - [ ] use best available llama family model that can run on an RTX 4090
-- [ ] [https://github.com/democratizedspace/dspace](DSPACE) (first 1st party integration) uses API v1 for dChat
+- [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
 - [ ] set up production k3s raspberry pi pod running relay.py
   - [ ] server.py stays on personal gaming PC
   - [ ] potential cloud fallback node via Cloudflare

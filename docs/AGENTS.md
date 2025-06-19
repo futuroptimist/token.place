@@ -37,6 +37,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [docs/LLM_ASSISTANT_GUIDE.md](docs/LLM_ASSISTANT_GUIDE.md): Guide for AI assistants working with this codebase
 - [docs/RPI_RELAY_RUNBOOK.md](docs/RPI_RELAY_RUNBOOK.md): Running `relay.py` on a Raspberry Pi
 - [docs/RPI_K3S_CLUSTER.md](docs/RPI_K3S_CLUSTER.md): Deploying the relay on a Raspberry Pi k3s cluster
+- [../llms.txt](../llms.txt): Machine-readable project summary for LLM assistants
 
 ## User Journeys
 
@@ -126,3 +127,4 @@ For convenience, you can execute all available test suites with `./run_all_tests
 - Install Python dependencies with `pip install -r config/requirements_server.txt` and `pip install -r config/requirements_relay.txt` before running tests. If Playwright tests complain about missing browsers, run `playwright install chromium`.
 - For development and unit testing, also run `pip install -r requirements.txt` to install extra tooling like pytest-playwright, then run `playwright install`.
 - Every pull request triggers the GitHub Actions workflow in `.github/workflows/ci.yml` which runs `./run_all_tests.sh` with coverage enabled and uploads results to Codecov.
+- Real-world integration tests live in the [DSPACE project](https://github.com/democratizedspace/dspace); token.place acts as its OpenAI-compatible backend.

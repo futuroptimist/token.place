@@ -37,6 +37,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [docs/LLM_ASSISTANT_GUIDE.md](docs/LLM_ASSISTANT_GUIDE.md): Guide for AI assistants working with this codebase
 - [docs/RPI_RELAY_RUNBOOK.md](docs/RPI_RELAY_RUNBOOK.md): Running `relay.py` on a Raspberry Pi
 - [docs/RPI_K3S_CLUSTER.md](docs/RPI_K3S_CLUSTER.md): Deploying the relay on a Raspberry Pi k3s cluster
+- [docs/RPI_BILL_OF_MATERIALS.md](docs/RPI_BILL_OF_MATERIALS.md): Suggested hardware for Raspberry Pi deployments
 - [../llms.txt](../llms.txt): Machine-readable project summary for LLM assistants
 
 ## User Journeys

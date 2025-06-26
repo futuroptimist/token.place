@@ -2,6 +2,8 @@
 
 This guide explains how to run the `relay.py` service on a Raspberry Pi k3s cluster. It assumes you have multiple Raspberry Pi boards and want to manage them with k3s (a lightweight Kubernetes distribution).
 
+For recommended hardware, see [Raspberry Pi Deployment Bill of Materials](RPI_BILL_OF_MATERIALS.md).
+
 ## 1. Prepare the Hardware
 
 - Use Raspberry Pi 5 boards for best performance (Pi 4 also works).

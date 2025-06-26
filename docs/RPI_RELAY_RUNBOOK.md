@@ -2,6 +2,8 @@
 
 This runbook explains how to deploy `relay.py` on a Raspberry Pi 5 using Docker Compose and expose it through a Cloudflare Tunnel. The goal is to keep the workflow simple so a single `docker compose up` command can start everything.
 
+For an overview of the recommended hardware, see [Raspberry Pi Deployment Bill of Materials](RPI_BILL_OF_MATERIALS.md).
+
 ## Prerequisites
 
 - Raspberry Pi OS 64‑bit (tested on Raspberry Pi 5)

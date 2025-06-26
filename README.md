@@ -277,6 +277,7 @@ Alternatively, you can visit http://localhost:5000 in your browser to use the we
 
 For a guide on running `relay.py` on a Raspberry Pi 5 and exposing it through Cloudflare, see [docs/RPI_RELAY_RUNBOOK.md](docs/RPI_RELAY_RUNBOOK.md).
 If you want to deploy the relay on a Raspberry Pi k3s cluster, follow [docs/RPI_K3S_CLUSTER.md](docs/RPI_K3S_CLUSTER.md).
+Hardware suggestions are listed in [docs/RPI_BILL_OF_MATERIALS.md](docs/RPI_BILL_OF_MATERIALS.md).
 
 ## Testing
 

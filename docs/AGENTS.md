@@ -15,6 +15,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 ## Setup and Installation
 
 - [README.md](README.md): Project overview and getting started instructions
+- [docs/ONBOARDING.md](docs/ONBOARDING.md): Quick orientation to the repository structure
 - [requirements.txt](requirements.txt): Python dependencies for the project
 - [package.json](package.json): Node.js dependencies for JavaScript components
 - `docker-compose up` starts the relay container for quick local testing

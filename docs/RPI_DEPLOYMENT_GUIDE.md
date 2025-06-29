@@ -42,6 +42,13 @@ This list reflects our setup. Other hardware choices will also work. Contributio
    sudo raspi-config  # Advanced Options -> Boot Order -> USB Boot
    sudo poweroff                                             # shut down to switch boot devices
    ```
+The `rpi-clone` command will ask four questions:
+1. When asked to *Initialize and clone to the destination disk*, type `yes`.
+2. At the optional rootfs label prompt, press Enter (or provide a custom label).
+3. When prompted to *Run setup script (no)*, just press Enter.
+4. For *Verbose mode (no)*, press Enter.
+You can skip these questions on later runs with `sudo rpi-clone -u /dev/sda`.
+
 6. Remove the SD card and power on. The Pi should boot from the SSD. Repeat for the remaining nodes using the same SD card.
 
 ### Moving the SSD to the M.2 slot

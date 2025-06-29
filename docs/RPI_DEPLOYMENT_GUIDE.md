@@ -51,9 +51,37 @@ You can skip these questions on later runs with `sudo rpi-clone -u /dev/sda`.
 
 6. Remove the SD card and power on. The Pi should boot from the SSD. Repeat for the remaining nodes using the same SD card.
 
+### First boot from the SSD
+
+On the initial boot you may see a scrolling list of `Trying partition`
+messages while the bootloader searches the FAT partition and the filesystem
+grows to fill the new drive. This **usually finishes within 2–5 minutes** on a
+USB‑attached SSD but can take slightly longer on slower media. Subsequent boots
+drop back down to around **15–20&nbsp;seconds**.
+
+If you are still staring at `Trying partition` after about **10&nbsp;minutes**,
+something likely went wrong:
+
+- Reseat the USB or M.2 cable and make sure the drive has power.
+- Boot from the SD card again and run `lsblk` to confirm that `/dev/sda1` and
+  `/dev/sda2` exist.
+- Run `sudo fsck -fy /dev/sda2` to repair the filesystem if needed.
+- As a last resort, re-run `rpi-clone /dev/sda` and verify the clone completed
+  without errors.
+
+Once the boot messages stop, you should get a normal login prompt on the
+console.
+
 ### Moving the SSD to the M.2 slot
 
 USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**. The PoE+ HAT connects over a PCIe ×1 lane and can run in Gen3 mode, reaching roughly **900 MB/s** with a capable NVMe drive—more than twice the throughput of USB.
+
+| Storage option                | Interface     | Typical throughput |
+| ----------------------------- | ------------- | ------------------ |
+| Fast microSD (UHS‑I)          | SD card       | ~45&nbsp;MB/s       |
+| M.2 drive over USB 3.0        | USB           | 350–400&nbsp;MB/s   |
+| M.2 drive via PCIe Gen2 ×1    | PCIe Gen2 ×1  | ~500&nbsp;MB/s      |
+| M.2 drive via PCIe Gen3 ×1    | PCIe Gen3 ×1  | ~900&nbsp;MB/s      |
 
 1. Boot from the SSD over USB as described above.
 2. Mount the boot partition and add the following to `/boot/config.txt`:

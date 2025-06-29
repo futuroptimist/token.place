@@ -2,6 +2,20 @@
 
 This guide provides an overview of the token.place testing approach, including test types, user journeys, and how to run various test suites.
 
+## Prerequisites
+
+Before running the tests, install the required Python and Node.js dependencies and download the Playwright browsers. The [docs/AGENTS.md](AGENTS.md) file lists the exact commands, summarized here:
+
+```bash
+pip install -r config/requirements_server.txt
+pip install -r config/requirements_relay.txt
+pip install -r requirements.txt
+npm install
+playwright install
+```
+
+The final step fetches browser binaries so that the Playwright-based tests can run successfully.
+
 ## Test Types
 
 token.place uses several types of tests to ensure functionality, security, and performance:

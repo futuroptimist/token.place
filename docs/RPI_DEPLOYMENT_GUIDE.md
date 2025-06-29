@@ -5,8 +5,8 @@ This guide combines the runbook, k3s cluster instructions and bill of materials 
 ## Bill of Materials
 
 - **Raspberry Pi 5** boards (4GB or 8GB RAM)
-- **PoE+ HAT with M.2 SATA slot** (2230/2242) for each Pi. Most PoE+ HATs include an M.2 connector, which we prefer for SSD boot.
-- **256GB M.2 SATA SSD** (TS256GMTS430S) per Pi
+- **PoE+ HAT with M.2 slot** (2230/2242) for each Pi. Use an NVMe-capable HAT if you want PCIe speeds for the SSD.
+- **256GB M.2 SATA or NVMe SSD** (TS256GMTS430S or similar) per Pi
 - **64GB microSD card** (one card can be reused for all nodes)
 - **PoE+ network switch** and **Ethernet cables**
 - **Cooling solution** such as a fan case or heatsink
@@ -42,6 +42,22 @@ This list reflects our setup. Other hardware choices will also work. Contributio
    sudo poweroff
    ```
 6. Remove the SD card and power on. The Pi should boot from the SSD. Repeat for the remaining nodes using the same SD card.
+
+### Moving the SSD to the M.2 slot
+
+USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**. The PoE+ HAT connects over a PCIe ×1 lane and can run in Gen3 mode, reaching roughly **900 MB/s** with a capable NVMe drive—more than twice the throughput of USB.
+
+1. Boot from the SSD over USB as described above.
+2. Mount the boot partition and add the following to `/boot/config.txt`:
+   ```ini
+   dtparam=nvme
+   # Optional: force PCIe Gen3 speeds
+   dtparam=pciex1_gen=3
+   ```
+   Optionally run `sudo rpi-eeprom-config --edit` and ensure `PCIE_PROBE=1` is present.
+3. Power down, move the SSD into the PoE HAT’s M.2 slot and boot again.
+
+Because the EEPROM’s “USB boot” setting also covers NVMe devices, the Pi will continue to boot from this drive without further changes.
 
 ## Running the Relay with Docker Compose
 

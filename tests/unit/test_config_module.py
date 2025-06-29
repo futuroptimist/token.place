@@ -54,3 +54,35 @@ def test_config_overrides_and_save(patched_paths, tmp_path):
     # ensure directories were created
     assert (patched_paths / "data").exists()
     assert (patched_paths / "models").exists()
+
+
+def test_load_user_config_success(patched_paths, tmp_path):
+    config_path = tmp_path / "my.json"
+    config_path.write_text(json.dumps({"server": {"port": 12345}}))
+    cfg = Config(config_path=str(config_path))
+    assert cfg.get("server.port") == 12345
+
+
+def test_load_user_config_json_error(patched_paths, tmp_path, caplog):
+    config_path = tmp_path / "bad.json"
+    config_path.write_text("{bad}")
+    with caplog.at_level("ERROR"):
+        Config(config_path=str(config_path))
+    assert any("Error decoding JSON" in r.message for r in caplog.records)
+
+
+def test_platform_properties(patched_paths):
+    cfg = Config()
+    assert cfg.is_linux
+    assert not cfg.is_windows
+    assert not cfg.is_macos
+
+
+def test_merge_get_set_methods(patched_paths):
+    cfg = Config()
+    base = {"a": {"b": 1}, "c": 2}
+    cfg._merge_configs(base, {"a": {"d": 3}, "e": 4})
+    assert base == {"a": {"b": 1, "d": 3}, "c": 2, "e": 4}
+    assert cfg.get("nonexistent.key", "default") == "default"
+    cfg.set("nested.value", 5)
+    assert cfg.get("nested.value") == 5

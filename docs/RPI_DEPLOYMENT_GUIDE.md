@@ -21,25 +21,26 @@ This list reflects our setup. Other hardware choices will also work. Contributio
 2. Boot the first Pi with the SD card inserted and login via console or SSH.
 3. Update firmware:
    ```bash
-   sudo apt update && sudo apt full-upgrade
-   sudo rpi-eeprom-update -a
+   sudo apt update && sudo apt full-upgrade  # refresh package list and upgrade the OS
+   sudo rpi-eeprom-update -a                 # install the latest firmware
    ```
 4. Clone the repository and install Docker:
    ```bash
-   git clone https://github.com/futuroptimist/token.place.git
-   cd token.place
-   sudo apt install -y docker.io docker-compose
-   sudo usermod -aG docker $USER
-   newgrp docker
+   git clone https://github.com/futuroptimist/token.place.git  # download the project
+   cd token.place                                             # enter the project folder
+   sudo apt install -y docker.io docker-compose               # install Docker runtime
+   sudo usermod -aG docker $USER                              # allow the current user to run Docker
+   newgrp docker                                              # apply the new group membership
    ```
 5. Copy the OS to the SSD and enable USB/M.2 boot:
    ```bash
    lsblk  # identify your SSD (e.g. /dev/sda)
-   git clone https://github.com/billw2/rpi-clone.git
-   sudo cp rpi-clone/rpi-clone /usr/local/sbin/
-   sudo rpi-clone /dev/sda
+   cd ..  # leave the token.place directory so rpi-clone isn't cloned inside it
+   git clone https://github.com/billw2/rpi-clone.git            # fetch the cloning utility
+   sudo cp rpi-clone/rpi-clone /usr/local/sbin/                 # install rpi-clone
+   sudo rpi-clone /dev/sda                                      # copy the running OS to the SSD
    sudo raspi-config  # Advanced Options -> Boot Order -> USB Boot
-   sudo poweroff
+   sudo poweroff                                             # shut down to switch boot devices
    ```
 6. Remove the SD card and power on. The Pi should boot from the SSD. Repeat for the remaining nodes using the same SD card.
 
@@ -64,15 +65,15 @@ Because the EEPROM’s “USB boot” setting also covers NVMe devices, the Pi w
 On any single Pi you can run the relay directly:
 
 ```bash
-docker compose up -d
+docker compose up -d  # start the relay container in the background
 ```
 
 The relay listens on port 5000. To expose it publicly, create a Cloudflare Tunnel:
 
 ```bash
-sudo apt install -y cloudflared
-cloudflared tunnel login
-cloudflared tunnel create tokenplace-relay
+sudo apt install -y cloudflared               # install Cloudflare Tunnel client
+cloudflared tunnel login                      # authenticate your account
+cloudflared tunnel create tokenplace-relay    # create a tunnel named tokenplace-relay
 ```
 
 Create `~/.cloudflared/config.yml`:
@@ -90,7 +91,7 @@ ingress:
 Run the tunnel:
 
 ```bash
-cloudflared tunnel run tokenplace-relay
+cloudflared tunnel run tokenplace-relay  # run the tunnel using the above config
 ```
 
 ## Deploying on a k3s Cluster
@@ -98,32 +99,32 @@ cloudflared tunnel run tokenplace-relay
 With each Pi booting from its SSD, you can stitch them together into a lightweight Kubernetes cluster using [k3s](https://k3s.io). Pick one Pi to be the control plane ("server") and run:
 
 ```bash
-curl -sfL https://get.k3s.io | sh -
+curl -sfL https://get.k3s.io | sh -  # install k3s on the control-plane node
 ```
 
 This installs the `k3s` service and starts the Kubernetes API. Grab the join token:
 
 ```bash
-sudo cat /var/lib/rancher/k3s/server/node-token
+sudo cat /var/lib/rancher/k3s/server/node-token  # display the join token
 ```
 
 On each remaining Pi (the "agents"), join the cluster by pointing the install script at the control plane's IP address and providing the token:
 
 ```bash
-curl -sfL https://get.k3s.io | K3S_URL=https://<CONTROL_PLANE_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -
+curl -sfL https://get.k3s.io | K3S_URL=https://<CONTROL_PLANE_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -  # join an agent to the cluster
 ```
 
 Once all nodes show up in `kubectl get nodes`, build the relay container image and load it into k3s' internal container registry:
 
 ```bash
-docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-k3s ctr images import tokenplace-relay:latest
+docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .  # build relay image
+k3s ctr images import tokenplace-relay:latest                          # load image into k3s
 ```
 
 Apply the Kubernetes manifests to deploy the relay and any supporting services:
 
 ```bash
-kubectl apply -f k8s/
+kubectl apply -f k8s/  # deploy Kubernetes manifests
 ```
 
 ## Troubleshooting
@@ -134,11 +135,11 @@ kubectl apply -f k8s/
 - Check for a SATA controller with `lspci -nn`. You should see a JMicron/ASM chip.
 - Trigger a PCIe rescan:
   ```bash
-  echo 1 | sudo tee /sys/bus/pci/rescan
+  echo 1 | sudo tee /sys/bus/pci/rescan  # force the kernel to rescan PCIe
   ```
 - Examine logs:
   ```bash
-  dmesg | grep -i sata
+  dmesg | grep -i sata  # look for SATA-related errors
   ```
 - Test the SSD with a USB-to-SATA adapter to rule out drive failure.
 - Update the Pi firmware with `sudo rpi-eeprom-update -a`.

@@ -10,6 +10,7 @@ import os
 # Add project root to the Python path to import relay
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from relay import app
+from api.v1.routes import format_error_response
 
 # API base URL for testing - No longer needed with test client
 # API_BASE_URL = "http://localhost:5000/api/v1"
@@ -300,3 +301,25 @@ def test_create_completion_exception(client, monkeypatch, mock_llama):
     res = client.post('/api/v1/completions', json=payload)
     assert res.status_code == 400
     assert 'error' in res.get_json()
+
+
+def test_format_error_response_function():
+    with app.app_context():
+        resp = format_error_response("bad request", code="oops", status_code=418)
+        data = resp.get_json()
+        assert resp.status_code == 418
+        assert data["error"]["message"] == "bad request"
+        assert data["error"]["code"] == "oops"
+
+
+def test_openai_alias_routes(client):
+    alias_resp = client.get("/v1/models")
+    api_resp = client.get("/api/v1/models")
+    assert alias_resp.status_code == 200
+    assert alias_resp.get_json() == api_resp.get_json()
+
+def test_chat_completion_invalid_body(client):
+    res = client.post('/api/v1/chat/completions', json={})
+    assert res.status_code == 400
+    data = res.get_json()
+    assert data['error']['message'].startswith('Invalid request body')

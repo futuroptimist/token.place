@@ -122,6 +122,7 @@ For convenience, you can execute all available test suites with `./run_all_tests
 ## Development Tips
 
 - Run `./run_all_tests.sh` to verify changes before committing. Set `TEST_COVERAGE=1` to collect coverage data when running this script. Coverage is uploaded to Codecov automatically via the GitHub Actions workflow.
+- Install `pre-commit` and run `pre-commit run --all-files` before pushing changes.
 - Keep the roadmap in [README.md](README.md) updated as features progress.
 - Use `npm ci` for faster, reproducible Node.js installs (mirrors the CI pipeline's behavior).
 - Install Python dependencies with `pip install -r config/requirements_server.txt` and `pip install -r config/requirements_relay.txt` before running tests. If Playwright tests complain about missing browsers, run `playwright install chromium`.

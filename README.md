@@ -608,6 +608,12 @@ curl http://localhost:5000/test
 ## Contributing
 
 We welcome contributions! See our [Contributing Guide](docs/CONTRIBUTING.md) for details.
+Before submitting commits, install the pre-commit hooks and run them locally:
+```bash
+pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
 
 ## Security
 

@@ -5,6 +5,27 @@
 
 p2p generative AI platform
 
+# Quickstart
+
+```bash
+git clone https://github.com/futuroptimist/token.place.git
+cd token.place
+pip install -r config/requirements_server.txt
+pip install -r config/requirements_relay.txt
+npm install
+```
+
+Run the relay and server in separate terminals:
+
+```bash
+python relay.py
+python server.py
+```
+
+Open `http://localhost:5000` or run `python client.py`.
+Set `API_RATE_LIMIT` (default `60/hour`) to control per-IP limits. Metrics are
+exposed at `/metrics`.
+
 # vision
 There are tons of personal computers and homelabs out there with lots of compute that remain idle. This project aims to create a marketplace of people with spare compute and people with needs for compute. Note that this is not a financial marketplace -- this is intended to be a public good. If it takes off is anyone's guess, but I'll donate whatever compute I can in the meantime once this is up and running.
 
@@ -491,7 +512,8 @@ The server will encrypt its response with your public key, ensuring end-to-end e
 
 ## System Architecture
 
-The project follows a distributed architecture with end-to-end encryption:
+The project follows a distributed architecture with end-to-end encryption
+(see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
 ```
                                         

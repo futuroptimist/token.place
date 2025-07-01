@@ -9,6 +9,6 @@ repos:
     hooks:
       - id: run-checks
         name: run project checks
-        entry: bash scripts/checks.sh
+        entry: scripts/checks.sh
         language: script
         pass_filenames: false

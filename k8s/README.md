@@ -13,3 +13,6 @@ These manifests run `relay.py` as a Deployment and expose it via a Service.
    ```
 
 Edit `relay-deployment.yaml` to point `image:` at your registry if needed.
+
+The deployment manifest includes resource requests/limits and basic health
+probes. Adjust these values according to your cluster capacity.

@@ -171,6 +171,17 @@ For JavaScript dependencies, run:
 npm install
 ```
 
+#### troubleshooting `llama_cpp_python` builds
+
+If `pip install` fails while building `llama_cpp_python` with an error such as
+`CMAKE_CXX_COMPILER not set` or `Could not find compiler set in environment
+variable CXX`, it usually means a C++ compiler is missing from your system.
+Install `g++` (e.g. via `build-essential` on Debian/Ubuntu) and ensure it is on
+your `PATH` or set `CXX=g++` before running `pip install`. The
+[`hardware acceleration`](#hardware-acceleration) section below describes how to
+reinstall `llama_cpp_python` with GPU support once your build environment is set
+up correctly.
+
 ### hardware acceleration
 
 If you want to also utilize your GPU (instead of just your CPU), follow these platform-specific instructions.
@@ -342,17 +353,17 @@ Every pull request automatically runs this test suite in GitHub Actions, so you 
   - Core crypto functionality (RSA/AES encryption)
   - Client message handling
   - Server request processing
-  
+
 - **Integration Tests**: Test component interactions
   - Client-server communication
   - Relay server message passing
   - Multi-step conversation handling
-  
+
 - **End-to-End Tests**: Test complete workflows from client to server
   - Chat functionality through the relay
   - Browser-based UI testing with Playwright
   - API endpoints with encrypted communication
-  
+
 - **API Tests**: Test the OpenAI-compatible API endpoints
   - Models listing
   - Chat completions
@@ -364,7 +375,7 @@ Every pull request automatically runs this test suite in GitHub Actions, so you 
   - Single-turn inference
   - Multi-turn conversations
   - Error handling and recovery
-  
+
 - **Mock Testing**: Mock mode for faster development and testing
   - Models can be swapped with mock implementations
   - Test complex scenarios without real inference
@@ -516,7 +527,7 @@ The project follows a distributed architecture with end-to-end encryption
 (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
 ```
-                                        
+
 ┌───────────────┐    Encrypted     ┌─────────────────┐    Encrypted     ┌─────────────────┐
 │               │    Requests      │                 │    Requests      │                 │
 │  Web Browser  │ ───────────────► │  Relay Server   │ ───────────────► │  Server (LLM)   │ ◄─── LLM Model File (~4GB)

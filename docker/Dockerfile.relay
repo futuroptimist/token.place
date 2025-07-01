@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install build dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc python3-dev && \
+    apt-get install -y --no-install-recommends gcc g++ python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -34,4 +34,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 5000
 
 # Command to run the relay
-CMD ["python", "-m", "relay.main"] 
+CMD ["python", "-m", "relay.main"]

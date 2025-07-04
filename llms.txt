@@ -111,4 +111,6 @@ python -m pytest -m marker_name
 
 - [config.py](config.py): Configuration management for different environments
 - [utils/logging/logger.py](utils/logging/logger.py): Logging infrastructure for the application
-- [pytest.ini](pytest.ini): Configuration for Python test suite 
+- [pytest.ini](pytest.ini): Configuration for Python test suite
+
+For LLM usage guidelines, see AGENTS.md and CLAUDE.md.

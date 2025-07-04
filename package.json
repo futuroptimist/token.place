@@ -8,7 +8,10 @@
     "test:js": "node tests/test_js_crypto.js",
     "test:crypto-compat": "python tests/test_crypto_compatibility.py",
     "test:e2e": "pytest tests/test_e2e_chat.py",
-    "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e"
+    "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "repository": {
     "type": "git",
@@ -34,6 +37,8 @@
     "selenium-webdriver": "^4.30.0"
   },
   "devDependencies": {
-    "playwright": "^1.36.0"
+    "playwright": "^1.36.0",
+    "eslint": "^8.56.0",
+    "prettier": "^3.2.5"
   }
 }

@@ -1,0 +1,39 @@
+name: Lint & Format
+on: [push, pull_request]
+jobs:
+  lint-format:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        language: [python, javascript]
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      - name: Install Py Lint Tools
+        if: matrix.language == 'python'
+        run: pip install flake8 black isort
+      - name: Run Python Linters
+        if: matrix.language == 'python'
+        run: |
+          flake8 .
+          isort --check-only .
+          black --check .
+
+      - name: Setup Node
+        if: matrix.language == 'javascript'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - name: Install JS Lint Tools
+        if: matrix.language == 'javascript' && hashFiles('package.json') != ''
+        run: npm install --no-audit --no-fund
+      - name: Run JS Linters
+        if: matrix.language == 'javascript' && hashFiles('package.json') != ''
+        run: |
+          npm run lint
+          npm run format:check

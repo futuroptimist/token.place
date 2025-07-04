@@ -9,6 +9,12 @@ repos:
     hooks:
       - id: run-checks
         name: run project checks
-        entry: scripts/checks.sh
-        language: script
+        entry: bash scripts/checks.sh
+        language: python
+        additional_dependencies:
+          - flake8
+          - isort
+          - black
+          - pytest
+          - linkchecker
         pass_filenames: false

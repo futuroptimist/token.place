@@ -2,10 +2,15 @@
 
 [![CI](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml/badge.svg)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
+[![Lint & Format](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/01-lint-format.yml?label=lint%20%26%20format)](https://github.com/futuroptimist/token.place/actions/workflows/01-lint-format.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/02-tests.yml?label=tests)](https://github.com/futuroptimist/token.place/actions/workflows/02-tests.yml)
+[![Docs](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/03-docs.yml?label=docs)](https://github.com/futuroptimist/token.place/actions/workflows/03-docs.yml)
 
 p2p generative AI platform
 
 # Quickstart
+
+See [docs/AGENTS.md](docs/AGENTS.md) for repository workflow tips.
 
 ```bash
 git clone https://github.com/futuroptimist/token.place.git

@@ -1,0 +1,26 @@
+name: Test Suite
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install dependencies
+        run: |
+          pip install -r config/requirements_server.txt
+          pip install -r config/requirements_relay.txt
+          pip install -r requirements.txt
+          npm ci
+          playwright install
+      - name: Run tests
+        run: ./run_all_tests.sh
+        env:
+          TEST_COVERAGE: '1'

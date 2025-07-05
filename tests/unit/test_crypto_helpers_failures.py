@@ -112,3 +112,25 @@ def test_send_api_request_invalid_format(monkeypatch):
     monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'unexpected': True})
     res = client.send_api_request([{'role': 'user', 'content': 'hi'}])
     assert res is None
+
+def test_fetch_server_public_key_missing_key(monkeypatch):
+    client = CryptoClient('https://example.com')
+    resp = MagicMock(status_code=200, json=lambda: {'unexpected': 'x'})
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **k: resp)
+    assert not client.fetch_server_public_key()
+
+
+def test_send_chat_message_encrypt_exception(monkeypatch):
+    client = _prep_client()
+    monkeypatch.setattr(client, 'encrypt_message', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    assert client.send_chat_message('hi') is None
+
+
+def test_send_api_request_decrypt_failure(monkeypatch):
+    client = _prep_client()
+    enc_payload = {'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'}
+    monkeypatch.setattr(client, 'encrypt_message', lambda msgs: enc_payload)
+    monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'data': {'encrypted': True, **enc_payload}})
+    monkeypatch.setattr(client, 'decrypt_message', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('fail')))
+    res = client.send_api_request([{'role': 'user', 'content': 'hi'}])
+    assert res is None

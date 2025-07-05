@@ -345,6 +345,7 @@ Run tests with coverage report:
 TEST_COVERAGE=1 ./run_all_tests.sh
 # Coverage results are uploaded to Codecov on CI
 ```
+If you don't see coverage comments on your pull requests, install the [Codecov GitHub App](https://github.com/marketplace/codecov) on your fork.
 Every pull request automatically runs this test suite in GitHub Actions, so you can rely on the status checks for pass/fail information.
 
 ### Test Categories

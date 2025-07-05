@@ -55,11 +55,29 @@ def test_fetch_server_public_key_error_field(monkeypatch):
     assert not client.fetch_server_public_key()
 
 
+def test_fetch_server_public_key_exception(monkeypatch):
+    """Handle exception when fetching the server key"""
+    client = CryptoClient('https://example.com')
+    def boom(*a, **k):
+        raise RuntimeError('fail')
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', boom)
+    assert not client.fetch_server_public_key()
+
+
 def test_decrypt_message_requires_private_key(monkeypatch):
     client = _prep_client()
     client.client_private_key = None
     with pytest.raises(ValueError):
         client.decrypt_message({'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'})
+
+
+def test_decrypt_message_failure(monkeypatch):
+    """Decrypt returns None when underlying decrypt fails"""
+    client = _prep_client()
+    enc = client.encrypt_message({'msg': 'hi'})
+    monkeypatch.setattr('utils.crypto_helpers.decrypt', lambda *a, **k: None)
+    res = client.decrypt_message(enc)
+    assert res is None
 
 
 def test_send_encrypted_message_exception(monkeypatch):

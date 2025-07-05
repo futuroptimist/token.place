@@ -68,7 +68,7 @@ def test_list_models(client):
     assert data['object'] == 'list'
     assert isinstance(data['data'], list)
     assert len(data['data']) > 0
-    
+
     # Verify model format
     model = data['data'][0]
     assert 'id' in model
@@ -83,15 +83,15 @@ def test_get_model(client, mock_llama):
     response = client.get("/api/v1/models")
     assert response.status_code == 200
     models = response.get_json()['data']
-    
+
     # Get the first model's ID
     model_id = models[0]['id']
-    
+
     # Retrieve the specific model
     response = client.get(f"/api/v1/models/{model_id}")
     assert response.status_code == 200
     model = response.get_json()
-    
+
     # Verify it's the same model
     assert model['id'] == model_id
     assert model['object'] == 'model'
@@ -113,11 +113,11 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
             {"role": "user", "content": "What is the capital of France?"}
         ]
     }
-    
+
     response = client.post("/api/v1/chat/completions", json=payload)
     assert response.status_code == 200
     data = response.get_json()
-    
+
     # Verify response format
     assert 'id' in data
     assert data['object'] == 'chat.completion'
@@ -135,17 +135,17 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     response = client.get("/api/v1/public-key")
     assert response.status_code == 200
     server_public_key = response.get_json()['public_key']
-    
+
     # Prepare the message data
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What is the capital of France?"}
     ]
-    
+
     # Encrypt the messages
     server_public_key_bytes = base64.b64decode(server_public_key)
     ciphertext_dict, cipherkey, iv = encrypt(json.dumps(messages).encode('utf-8'), server_public_key_bytes)
-    
+
     # Create the encrypted request payload
     payload = {
         "model": "llama-3-8b-instruct",
@@ -157,12 +157,12 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
             "iv": base64.b64encode(iv).decode('utf-8')
         }
     }
-    
+
     # Send the request
     response = client.post("/api/v1/chat/completions", json=payload)
     assert response.status_code == 200
     data = response.get_json()
-    
+
     # Verify response format for encrypted response
     assert 'encrypted' in data
     assert data['encrypted'] == True
@@ -170,18 +170,18 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert 'ciphertext' in data['data']
     assert 'cipherkey' in data['data']
     assert 'iv' in data['data']
-    
+
     # Decrypt the response
     ciphertext = base64.b64decode(data['data']['ciphertext'])
     cipherkey = base64.b64decode(data['data']['cipherkey'])
     iv = base64.b64decode(data['data']['iv'])
-    
+
     decrypted_bytes = decrypt({'ciphertext': ciphertext, 'iv': iv}, cipherkey, client_keys['private_key'])
     assert decrypted_bytes is not None
-    
+
     # Parse the decrypted data
     decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
-    
+
     # Verify the decrypted response format
     assert 'id' in decrypted_data
     assert decrypted_data['object'] == 'chat.completion'
@@ -200,11 +200,11 @@ def test_completions_endpoint(client, mock_llama):
         "prompt": "What is the capital of France?",
         "max_tokens": 100
     }
-    
+
     response = client.post("/api/v1/completions", json=payload)
     assert response.status_code == 200
     data = response.get_json()
-    
+
     # Verify the response is in text completion format
     assert 'id' in data
     assert data['object'] == 'text_completion'
@@ -222,7 +222,7 @@ def test_error_handling(client, mock_llama):
             {"role": "user", "content": "What is the capital of France?"}
         ]
     }
-    
+
     response = client.post("/api/v1/chat/completions", json=payload)
     assert response.status_code == 400
     data = response.get_json()
@@ -237,7 +237,7 @@ def test_error_handling(client, mock_llama):
             {"role": "user", "content": "What is the capital of France?"}
         ]
     }
-    
+
     response = client.post("/api/v1/chat/completions", json=payload)
     assert response.status_code == 400
     data = response.get_json()
@@ -246,7 +246,7 @@ def test_error_handling(client, mock_llama):
 
 # Add more tests as needed
 # Consider adding tests for different error conditions, edge cases, etc.
-# Example: test invalid encryption data, test max_tokens, etc. 
+# Example: test invalid encryption data, test max_tokens, etc.
 
 
 def test_get_model_not_found(client):
@@ -349,3 +349,71 @@ def test_chat_completion_json_error(client, monkeypatch):
     res = client.post('/api/v1/chat/completions', json=payload)
     assert res.status_code == 400
     assert 'Failed to parse JSON' in res.get_json()['error']['message']
+
+def test_chat_completion_missing_messages(client):
+    payload = {"model": "llama-3-8b-instruct"}
+    res = client.post("/api/v1/chat/completions", json=payload)
+    assert res.status_code == 400
+    data = res.get_json()
+    assert 'messages' in data['error']['message']
+
+
+def test_chat_completion_messages_wrong_type(client):
+    payload = {"model": "llama-3-8b-instruct", "messages": "not-a-list"}
+    res = client.post("/api/v1/chat/completions", json=payload)
+    assert res.status_code == 400
+    assert 'Invalid type for messages' in res.get_json()['error']['message']
+
+
+def test_chat_completion_invalid_role(client):
+    payload = {"model": "llama-3-8b-instruct", "messages": [{"role": "bad", "content": "hi"}]}
+    res = client.post("/api/v1/chat/completions", json=payload)
+    assert res.status_code == 400
+    assert 'Invalid role' in res.get_json()['error']['message']
+
+
+def test_chat_completion_encrypt_failure_on_response(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
+    monkeypatch.setattr('api.v1.routes.generate_response', lambda m, msgs: msgs + [{'role': 'assistant', 'content': 'ok'}])
+    monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda *a, **k: None)
+    monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: b'[{"role":"user","content":"hi"}]')
+    monkeypatch.setattr('api.v1.validation.validate_encrypted_request', lambda data: None)
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'encrypted': True,
+        'client_public_key': base64.b64encode(b'x').decode(),
+        'messages': {
+            'ciphertext': base64.b64encode(b'c').decode(),
+            'cipherkey': base64.b64encode(b'k').decode(),
+            'iv': base64.b64encode(b'i').decode()
+        }
+    }
+    res = client.post('/api/v1/chat/completions', json=payload)
+    assert res.status_code == 500
+    assert 'Failed to encrypt response' in res.get_json()['error']['message']
+
+
+def test_openai_alias_routes_extended(client):
+    endpoints = [
+        ('/v1/public-key', '/api/v1/public-key'),
+        ('/v1/health', '/api/v1/health'),
+        ('/v1/completions', '/api/v1/completions'),
+        ('/v1/chat/completions', '/api/v1/chat/completions')
+    ]
+    for alias, api in endpoints:
+        if 'completions' in alias:
+            if alias.endswith('/completions'):
+                payload = {'model': 'llama-3-8b-instruct', 'prompt': 'hi'}
+            else:
+                payload = {'model': 'llama-3-8b-instruct', 'messages': [{'role': 'user', 'content': 'hi'}]}
+            res_alias = client.post(alias, json=payload)
+            res_api = client.post(api, json=payload)
+        else:
+            res_alias = client.get(alias)
+            res_api = client.get(api)
+        assert res_alias.status_code == res_api.status_code
+        data_alias = res_alias.get_json()
+        data_api = res_api.get_json()
+        if isinstance(data_alias, dict) and 'id' in data_alias:
+            data_alias['id'] = data_api.get('id')
+        assert data_alias == data_api

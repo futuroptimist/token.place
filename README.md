@@ -415,6 +415,7 @@ RUN_REAL_LLM_TEST = False
 
 ## Project Documentation for LLMs
 
+See [AGENTS.md](AGENTS.md) for a list of repo helpers. For LLMs, `llms.txt` contains the same helper summary in plain text.
 This project includes an `llms.txt` file in the root directory that provides structured information for Large Language Models (LLMs) about the project. Following the [llms.txt specification](https://llmstxt.org/), this file helps LLMs understand the codebase structure, available components, and key documentation links.
 
 The `llms.txt` file includes:

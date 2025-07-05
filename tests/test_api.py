@@ -323,3 +323,29 @@ def test_chat_completion_invalid_body(client):
     assert res.status_code == 400
     data = res.get_json()
     assert data['error']['message'].startswith('Invalid request body')
+
+
+def test_chat_completion_decrypt_failure(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: None)
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'encrypted': True,
+        'client_public_key': base64.b64encode(b'x').decode(),
+        'messages': {'ciphertext': base64.b64encode(b'c').decode(), 'cipherkey': base64.b64encode(b'k').decode(), 'iv': base64.b64encode(b'i').decode()}
+    }
+    res = client.post('/api/v1/chat/completions', json=payload)
+    assert res.status_code == 400
+    assert 'Failed to decrypt messages' in res.get_json()['error']['message']
+
+
+def test_chat_completion_json_error(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: b'not-json')
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'encrypted': True,
+        'client_public_key': base64.b64encode(b'x').decode(),
+        'messages': {'ciphertext': base64.b64encode(b'c').decode(), 'cipherkey': base64.b64encode(b'k').decode(), 'iv': base64.b64encode(b'i').decode()}
+    }
+    res = client.post('/api/v1/chat/completions', json=payload)
+    assert res.status_code == 400
+    assert 'Failed to parse JSON' in res.get_json()['error']['message']

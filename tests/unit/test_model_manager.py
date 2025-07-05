@@ -18,30 +18,30 @@ from utils.llm.model_manager import ModelManager
 
 class TestModelManager:
     """Test class for ModelManager."""
-    
+
     @pytest.fixture
     def model_manager(self):
         """Fixture that returns a model manager instance with mocked config."""
         mock_config = MagicMock()
         mock_config.is_production = False
         mock_config.get.side_effect = self._mock_config_get
-        
+
         with tempfile.TemporaryDirectory() as temp_dir:
             # Override the models_dir config
             self._temp_dir = temp_dir
-            
+
             # Create a models path with a temp file
             self.create_fake_model_file(temp_dir)
-            
+
             manager = ModelManager(mock_config)
             yield manager
-                
+
     def create_fake_model_file(self, directory):
         """Create a fake model file for testing."""
         model_path = os.path.join(directory, 'test_model.gguf')
         with open(model_path, 'wb') as f:
             f.write(b'fake model data')
-    
+
     def _mock_config_get(self, key, default=None):
         """Mock implementation of config.get()."""
         config_values = {
@@ -58,7 +58,7 @@ class TestModelManager:
             'model.stop_tokens': [],
         }
         return config_values.get(key, default)
-    
+
     def test_init(self, model_manager):
         """Test ModelManager initialization."""
         assert model_manager.file_name == 'test_model.gguf'
@@ -68,28 +68,28 @@ class TestModelManager:
         assert model_manager.model_path == os.path.join(self._temp_dir, 'test_model.gguf')
         assert model_manager.llm is None
         assert model_manager.use_mock_llm is False
-    
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist
         new_temp_dir = os.path.join(self._temp_dir, 'new_models')
-        
+
         # Make the model manager use this new directory
         model_manager.models_dir = new_temp_dir
-        
+
         # Verify it doesn't exist yet
         assert not os.path.exists(new_temp_dir)
-        
+
         # Call the method
         models_dir = model_manager.create_models_directory()
-        
+
         # Check the result
         assert models_dir == new_temp_dir
         assert os.path.exists(new_temp_dir)
-        
+
         # Clean up
         shutil.rmtree(new_temp_dir)
-    
+
     @patch('utils.llm.model_manager.requests.get')
     def test_download_file_in_chunks_success(self, mock_get, model_manager):
         """Test successful file download."""
@@ -99,22 +99,22 @@ class TestModelManager:
         mock_response.headers.get.return_value = '1048576'  # 1MB
         mock_response.iter_content.return_value = [b'x' * 1024 * 512] * 2  # Two chunks of 512KB
         mock_get.return_value = mock_response
-        
+
         # Create a temporary file path
         file_path = os.path.join(self._temp_dir, 'test_download.gguf')
-        
+
         # Call the method
         result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
-        
+
         # Check the result
         assert result is True
         assert os.path.exists(file_path)
         assert os.path.getsize(file_path) == 1048576  # 1MB
-        
+
         # Verify mock calls
         mock_get.assert_called_once_with('https://example.com/model.gguf', stream=True)
         mock_response.iter_content.assert_called_once_with(chunk_size=1048576)
-    
+
     @patch('utils.llm.model_manager.requests.get')
     def test_download_file_in_chunks_http_error(self, mock_get, model_manager):
         """Test file download with HTTP error."""
@@ -122,36 +122,36 @@ class TestModelManager:
         mock_response = MagicMock()
         mock_response.status_code = 404
         mock_get.return_value = mock_response
-        
+
         # Create a temporary file path
         file_path = os.path.join(self._temp_dir, 'test_download.gguf')
-        
+
         # Call the method
         result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
-        
+
         # Check the result
         assert result is False
         assert not os.path.exists(file_path)
-        
+
         # Verify mock calls
         mock_get.assert_called_once_with('https://example.com/model.gguf', stream=True)
-    
+
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.download_file_in_chunks')
     def test_download_model_if_needed_existing(self, mock_download, mock_exists, model_manager):
         """Test download_model_if_needed when model already exists."""
         # Setup mocks
         mock_exists.return_value = True  # Model already exists
-        
+
         # Call the method
         result = model_manager.download_model_if_needed()
-        
+
         # Check the result
         assert result is True
-        
+
         # Verify mock calls
         mock_download.assert_not_called()
-    
+
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.create_models_directory')
     @patch('utils.llm.model_manager.ModelManager.download_file_in_chunks')
@@ -160,21 +160,21 @@ class TestModelManager:
         # Setup mocks
         mock_exists.return_value = False  # Model doesn't exist
         mock_download.return_value = True  # Download succeeds
-        
+
         # Call the method
         result = model_manager.download_model_if_needed()
-        
+
         # Check the result
         assert result is True
-        
+
         # Verify mock calls
         mock_create_dir.assert_called_once()
         mock_download.assert_called_once_with(
-            model_manager.model_path, 
-            'https://example.com/model.gguf', 
+            model_manager.model_path,
+            'https://example.com/model.gguf',
             1
         )
-    
+
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.create_models_directory')
     @patch('utils.llm.model_manager.ModelManager.download_file_in_chunks')
@@ -183,75 +183,75 @@ class TestModelManager:
         # Setup mocks
         mock_exists.return_value = False  # Model doesn't exist
         mock_download.return_value = False  # Download fails
-        
+
         # Call the method
         result = model_manager.download_model_if_needed()
-        
+
         # Check the result
         assert result is False
-        
+
         # Verify mock calls
         mock_create_dir.assert_called_once()
         mock_download.assert_called_once_with(
-            model_manager.model_path, 
-            'https://example.com/model.gguf', 
+            model_manager.model_path,
+            'https://example.com/model.gguf',
             1
         )
-    
+
     def test_get_llm_instance_mock_mode(self, model_manager):
         """Test get_llm_instance in mock mode."""
         # Enable mock mode
         model_manager.use_mock_llm = True
-        
+
         # Call the method
         llm = model_manager.get_llm_instance()
-        
+
         # Check the result
         assert llm is not None
         assert isinstance(llm, MagicMock)
-        
+
         # Check that the mock is properly configured
         completion = llm.create_chat_completion()
         assert 'choices' in completion
         assert 'message' in completion['choices'][0]
         assert 'content' in completion['choices'][0]['message']
         assert 'Mock Response' in completion['choices'][0]['message']['content']
-    
+
     def test_get_llm_instance_real_mode(self, model_manager):
         """Test get_llm_instance in real mode when the model file exists."""
         # Create a mock for Llama
         mock_llama = MagicMock()
-        
+
         # Patch everything needed
         with patch('os.path.exists', return_value=True), \
              patch('llama_cpp.Llama', return_value=mock_llama, create=True):
-            
+
             # Call the method
             llm = model_manager.get_llm_instance()
-            
+
             # Check the result
             assert llm is not None
             assert llm == mock_llama
-    
+
     @patch('os.path.exists')
     def test_get_llm_instance_real_mode_no_model(self, mock_exists, model_manager):
         """Test get_llm_instance in real mode when the model file doesn't exist."""
         # Setup mocks
         mock_exists.return_value = False  # Model doesn't exist
-        
+
         # Call the method
         llm = model_manager.get_llm_instance()
-        
+
         # Check the result
         assert llm is None
-    
+
     def test_llama_cpp_get_response_mock_instance(self, model_manager):
         """Test llama_cpp_get_response with a mock LLM instance."""
         # Setup
         chat_history = [
             {"role": "user", "content": "What is the capital of France?"}
         ]
-        
+
         # Mock get_llm_instance to return a mock
         mock_llm = MagicMock()
         mock_completion = {
@@ -266,16 +266,16 @@ class TestModelManager:
         }
         mock_llm.create_chat_completion.return_value = mock_completion
         model_manager.get_llm_instance = MagicMock(return_value=mock_llm)
-        
+
         # Call the method
         result = model_manager.llama_cpp_get_response(chat_history)
-        
+
         # Check the result
         assert len(result) == 2
         assert result[0] == chat_history[0]
         assert result[1]['role'] == 'assistant'
         assert result[1]['content'] == 'The capital of France is Paris.'
-        
+
         # Verify mock calls - check the structure but not exact values which may change
         mock_llm.create_chat_completion.assert_called_once()
         call_args = mock_llm.create_chat_completion.call_args[1]
@@ -285,43 +285,86 @@ class TestModelManager:
         assert 'temperature' in call_args
         assert 'top_p' in call_args
         assert 'stop' in call_args
-    
+
     def test_llama_cpp_get_response_no_llm(self, model_manager):
         """Test llama_cpp_get_response when LLM initialization fails."""
         # Setup
         chat_history = [
             {"role": "user", "content": "What is the capital of France?"}
         ]
-        
+
         # Mock get_llm_instance to return None
         model_manager.get_llm_instance = MagicMock(return_value=None)
-        
+
         # Call the method
         result = model_manager.llama_cpp_get_response(chat_history)
-        
+
         # Check the result
         assert len(result) == 2
         assert result[0] == chat_history[0]
         assert result[1]['role'] == 'assistant'
         assert "trouble" in result[1]['content'].lower()
-    
+
     def test_llama_cpp_get_response_exception(self, model_manager):
         """Test llama_cpp_get_response when an exception occurs during inference."""
         # Setup
         chat_history = [
             {"role": "user", "content": "What is the capital of France?"}
         ]
-        
+
         # Mock get_llm_instance to return a mock that raises an exception
         mock_llm = MagicMock()
         mock_llm.create_chat_completion.side_effect = Exception("Test error")
         model_manager.get_llm_instance = MagicMock(return_value=mock_llm)
-        
+
         # Call the method
         result = model_manager.llama_cpp_get_response(chat_history)
-        
+
         # Check the result
         assert len(result) == 2
         assert result[0] == chat_history[0]
         assert result[1]['role'] == 'assistant'
-        assert "sorry" in result[1]['content'].lower() 
+        assert "sorry" in result[1]['content'].lower()
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_file_in_chunks_no_header(self, mock_get, model_manager):
+        """Return False if Content-Length header missing or zero."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '0'
+        mock_get.return_value = mock_response
+
+        file_path = os.path.join(self._temp_dir, 'no_header.gguf')
+        result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
+        assert result is False
+        assert not os.path.exists(file_path)
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_file_in_chunks_size_mismatch(self, mock_get, model_manager):
+        """Return False if downloaded size doesn't match header."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '1048576'  # 1MB
+        # Only half the data so size check fails
+        mock_response.iter_content.return_value = [b'x' * 1024 * 256] * 2
+        mock_get.return_value = mock_response
+
+        file_path = os.path.join(self._temp_dir, 'bad_size.gguf')
+        result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
+        assert result is False
+        assert os.path.exists(file_path)
+        assert os.path.getsize(file_path) != 1048576
+
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_file_in_chunks_empty_chunk(self, mock_get, model_manager):
+        """Handle empty data chunk but still succeed."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '1'
+        mock_response.iter_content.return_value = [b'', b'a']
+        mock_get.return_value = mock_response
+
+        file_path = os.path.join(self._temp_dir, 'empty_chunk.gguf')
+        result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
+        assert result is True
+        assert os.path.getsize(file_path) == 1

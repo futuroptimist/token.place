@@ -38,16 +38,16 @@ def display_conversation(messages: List[Dict]):
 def chat_loop(client: CryptoClient):
     """Main chat loop for interactive conversation"""
     conversation = []
-    
+
     # Fetch server public key
     print("Connecting to server...")
     if not client.fetch_server_public_key():
         print("Failed to connect to server. Make sure the relay is running.")
         sys.exit(1)
-    
+
     print("Connected! Starting chat session.\n")
     display_conversation(conversation)
-    
+
     try:
         while True:
             # Get user input
@@ -55,28 +55,28 @@ def chat_loop(client: CryptoClient):
             if user_message.lower() in ['exit', 'quit', 'bye']:
                 print("Ending chat session.")
                 break
-                
+
             # Add to local conversation
             conversation.append({"role": "user", "content": user_message})
             display_conversation(conversation)
-            
+
             # Send message and get response
             print("Assistant is thinking...")
             response = client.send_chat_message(conversation)
-            
+
             if response is None:
                 print("Error: Failed to get response from server.")
                 continue
-                
+
             # Update conversation with the full response from server
             conversation = response
-            
+
             # Display updated conversation
             display_conversation(conversation)
-            
+
     except KeyboardInterrupt:
         print("\nChat session ended by user.")
-    
+
     print("Thank you for using token.place!")
 
 def main():
@@ -86,13 +86,13 @@ def main():
     parser.add_argument("--port", type=int, default=5010, help="Relay port")
     parser.add_argument("--message", help="Single message mode: send a message and exit")
     args = parser.parse_args()
-    
+
     # Create the API URL
     base_url = f"{args.host}:{args.port}"
-    
+
     # Create a crypto client
     client = CryptoClient(base_url)
-    
+
     if args.message:
         # Single message mode
         print(f"Sending message: {args.message}")
@@ -112,5 +112,5 @@ def main():
         # Interactive chat mode
         chat_loop(client)
 
-if __name__ == "__main__":
-    main() 
+if __name__ == "__main__":  # pragma: no cover
+    main()

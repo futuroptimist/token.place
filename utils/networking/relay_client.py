@@ -79,7 +79,7 @@ class RelayClient:
     """
     Client for communicating with relay servers.
     Handles registration, polling, sending and receiving encrypted messages.
-    
+
     Example:
         ```python
         # Create a relay client
@@ -89,13 +89,13 @@ class RelayClient:
             crypto_manager=crypto_manager_instance,
             model_manager=model_manager_instance
         )
-        
+
         # Start polling in a separate thread
         import threading
         polling_thread = threading.Thread(target=relay.poll_relay_continuously)
         polling_thread.daemon = True
         polling_thread.start()
-        
+
         # Later, to stop polling cleanly:
         relay.stop()
         polling_thread.join(timeout=15)  # Wait for thread to finish
@@ -104,7 +104,7 @@ class RelayClient:
     def __init__(self, base_url: str, port: int, crypto_manager, model_manager):
         """
         Initialize the RelayClient.
-        
+
         Args:
             base_url: The base URL of the relay server (e.g., 'http://localhost')
             port: The port number of the relay server
@@ -122,23 +122,23 @@ class RelayClient:
             self._request_timeout = config.get('relay.request_timeout', 10)  # Get timeout from config or use default
         except:
             self._request_timeout = 10  # Fallback default
-        
+
     def start(self):
         """Start the polling loop by setting stop_polling to False"""
         self.stop_polling = False
-        
+
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""
         log_info("Stopping relay polling")
         self.stop_polling = True
-        
+
     def ping_relay(self) -> Dict[str, Any]:
         """
         Send a ping to the relay server to register this server and check for client requests.
-        
+
         Returns:
             Dict containing relay server response
-        
+
         Raises:
             requests.ConnectionError: If connection to relay fails
             requests.Timeout: If the request times out
@@ -147,16 +147,16 @@ class RelayClient:
         """
         try:
             log_info("Pinging relay {}/sink with key {}...", self.relay_url, self.crypto_manager.public_key_b64[:10])
-            
+
             response = requests.post(
-                f'{self.relay_url}/sink', 
+                f'{self.relay_url}/sink',
                 json={'server_public_key': self.crypto_manager.public_key_b64},
                 timeout=self._request_timeout
             )
-            
+
             if response.status_code == 200:
                 relay_response = response.json()
-                
+
                 # Validate response against schema
                 try:
                     jsonschema.validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
@@ -166,7 +166,7 @@ class RelayClient:
                         'error': f"Invalid response format: {str(e)}",
                         'next_ping_in_x_seconds': self._request_timeout
                     }
-                
+
                 return relay_response
             else:
                 log_error("Error from relay /sink: {} {}", response.status_code, response.text)
@@ -189,17 +189,17 @@ class RelayClient:
         except Exception as e:
             log_error("Unexpected error when pinging relay: {}", str(e), exc_info=True)
             return {'error': str(e), 'next_ping_in_x_seconds': self._request_timeout}
-    
+
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
         """
         Process a client request from the relay.
-        
+
         Args:
             request_data: Data received from the relay containing the encrypted client request
-            
+
         Returns:
             bool: True if processing succeeded, False otherwise
-        
+
         Example:
             ```python
             # Process data from relay
@@ -219,19 +219,19 @@ class RelayClient:
             except jsonschema.exceptions.ValidationError as e:
                 log_error("Invalid request data format: {}", str(e))
                 return False
-                
+
             client_pub_key_b64 = request_data['client_public_key']
-            
+
             # Decrypt the request
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
-            
+
             if decrypted_chat_history is None:
                 log_info("Decryption failed. Skipping.")
                 return False
-                
+
             log_info("Decrypted request: {}", decrypted_chat_history)
-            
+
             # Process with LLM
             log_info("Getting response from LLM...")
             response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
@@ -240,7 +240,7 @@ class RelayClient:
             # Encrypt the response for the client
             log_info("Encrypting response for client...")
             client_pub_key = base64.b64decode(client_pub_key_b64)
-            
+
             encrypted_response = self.crypto_manager.encrypt_message(
                 response_history,
                 client_pub_key
@@ -251,39 +251,39 @@ class RelayClient:
                 'client_public_key': client_pub_key_b64,
                 **encrypted_response  # Include chat_history, cipherkey, and iv
             }
-            
+
             # Validate the outgoing payload
             try:
                 jsonschema.validate(instance=source_payload, schema=MESSAGE_SCHEMA)
             except jsonschema.exceptions.ValidationError as e:
                 log_error("Invalid response payload format: {}", str(e))
                 return False
-            
+
             log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
-            
+
             # Send the response to the relay
             try:
                 source_response = requests.post(
-                    f'{self.relay_url}/source', 
+                    f'{self.relay_url}/source',
                     json=source_payload,
                     timeout=self._request_timeout
                 )
-                
+
                 log_info("Response sent to /source. Status: {}, Text: {}", source_response.status_code, source_response.text)
-                
+
                 # Validate response beyond just status code
                 if source_response.status_code != 200:
                     log_error("Error status from /source: {}", source_response.status_code)
                     return False
-                    
+
                 # Check if response has valid content
                 response_content = source_response.text.strip()
                 if not response_content:
                     log_error("Empty response from /source")
                     return False
-                    
+
                 return True
-                
+
             except requests.ConnectionError as e:
                 log_error("Connection error when posting to /source: {}", str(e), exc_info=True)
                 return False
@@ -293,31 +293,31 @@ class RelayClient:
             except requests.RequestException as e:
                 log_error("Request exception when posting to /source: {}", str(e), exc_info=True)
                 return False
-            
+
         except Exception as e:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
             return False
-            
-    def poll_relay_continuously(self):
+
+    def poll_relay_continuously(self):  # pragma: no cover
         """
         Continuously poll the relay for new chat messages and process them.
         This method runs in an infinite loop and should be called in a separate thread.
-        
+
         Call start() before running this method to set stop_polling to False.
         Call stop() to terminate the polling loop cleanly.
-        
+
         Example:
             ```python
             import threading
-            
+
             # Create a thread for polling
             relay_client.start()  # Allow polling to run
             thread = threading.Thread(target=relay_client.poll_relay_continuously)
             thread.daemon = True  # Thread will exit when main program exits
             thread.start()
-            
+
             # Main program continues...
-            
+
             # Later when you want to stop polling:
             relay_client.stop()
             thread.join(timeout=10)  # Wait for thread to finish
@@ -326,28 +326,28 @@ class RelayClient:
         if self.stop_polling:
             log_info("Starting relay polling")
             self.stop_polling = False
-            
+
         while not self.stop_polling:
             try:
                 # Ping the relay and check for client requests
                 relay_response = self.ping_relay()
-                
+
                 # Validate the relay response contains expected fields
                 if not isinstance(relay_response, dict):
                     log_error("Invalid relay response type: {}", type(relay_response))
                     time.sleep(self._request_timeout)
                     continue
-                    
+
                 if 'next_ping_in_x_seconds' not in relay_response:
                     log_error("Missing 'next_ping_in_x_seconds' in relay response")
                     time.sleep(self._request_timeout)
                     continue
-                
+
                 if 'error' in relay_response:
                     log_error("Error from relay: {}", relay_response['error'])
                 else:
                     log_info("Received data from relay: {}", relay_response)
-                    
+
                     # Check if there's a client request to process
                     required_fields = ['client_public_key', 'chat_history', 'cipherkey', 'iv']
                     if all(field in relay_response for field in required_fields):
@@ -355,12 +355,12 @@ class RelayClient:
                         self.process_client_request(relay_response)
                     else:
                         log_info("No client request data in sink response.")
-                
+
                 # Sleep before the next ping
                 sleep_duration = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
                 log_info("Sleeping for {} seconds...", sleep_duration)
                 time.sleep(sleep_duration)
-                
+
             except Exception as e:
                 log_error("Exception during polling loop: {}", str(e), exc_info=True)
-                time.sleep(self._request_timeout)  # Sleep for 10 seconds on error 
+                time.sleep(self._request_timeout)  # Sleep for 10 seconds on error

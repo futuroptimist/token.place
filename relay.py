@@ -13,7 +13,7 @@ parser = argparse.ArgumentParser(description="token.place relay server")
 parser.add_argument("--port", type=int, default=5010, help="Port to run the relay server on")
 parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     args = parser.parse_args()
 else:
     args = parser.parse_args([])
@@ -134,7 +134,7 @@ def faucet():
     """
     # Parse the request data
     data = request.get_json()
-    
+
     if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({
             'error': {
@@ -151,7 +151,7 @@ def faucet():
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
         return jsonify({'error': 'Server with the specified public key not found'}), 404
-    
+
     # Append the client's request to the list of requests for the server
     if server_public_key not in client_inference_requests:
         client_inference_requests[server_public_key] = []
@@ -182,7 +182,7 @@ def sink():
 
     if public_key is None:
         return jsonify({'error': 'Invalid public key'}), 400
-    
+
     # Update or add the server to known_servers
     if public_key in known_servers:
         known_servers[public_key]['last_ping'] = datetime.now()
@@ -248,6 +248,6 @@ def retrieve():
         return jsonify(response_data), 200
     else:
         return jsonify({'error': 'No response available for the given public key'}), 200
- 
-if __name__ == '__main__':
+
+if __name__ == '__main__':  # pragma: no cover
     app.run(host='0.0.0.0', port=args.port)

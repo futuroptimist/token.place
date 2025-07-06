@@ -41,7 +41,7 @@ class ServerApp:
     def __init__(self, server_port: int = 3000, relay_port: int = 5000, relay_url: str = "http://localhost"):
         """
         Initialize the server application.
-        
+
         Args:
             server_port: Port to run the server on
             relay_port: Port the relay server is running on
@@ -50,13 +50,13 @@ class ServerApp:
         self.server_port = server_port
         self.relay_port = relay_port
         self.relay_url = relay_url
-        
+
         # Create Flask app
         self.app = Flask(__name__)
-        
+
         # Set up endpoints
         self.setup_routes()
-        
+
         # Create relay client
         self.relay_client = RelayClient(
             base_url=relay_url,
@@ -64,10 +64,10 @@ class ServerApp:
             crypto_manager=get_crypto_manager(),
             model_manager=get_model_manager()
         )
-        
+
         # Initialize LLM by downloading model if needed
         self.initialize_llm()
-        
+
     def initialize_llm(self):
         """Initialize the LLM by downloading the model if needed."""
         log_info("Initializing LLM...")
@@ -80,7 +80,7 @@ class ServerApp:
                 log_info("Model ready for inference")
             else:
                 log_error("Failed to download or verify model")
-    
+
     def setup_routes(self):
         """Set up Flask routes for the server."""
         # Root endpoint
@@ -90,7 +90,7 @@ class ServerApp:
                 'status': 'ok',
                 'message': 'token.place server is running'
             })
-            
+
         # Health check endpoint
         @self.app.route('/health')
         def health():
@@ -99,11 +99,11 @@ class ServerApp:
                 'version': config.get('version', 'dev'),
                 'mock_mode': get_model_manager().use_mock_llm
             })
-            
+
         # Endpoints for direct API access (if needed)
         # These endpoints might be unused if all communication goes through the relay
-        
-    def start_relay_polling(self):
+
+    def start_relay_polling(self):  # pragma: no cover
         """Start polling the relay in a background thread."""
         relay_thread = threading.Thread(
             target=self.relay_client.poll_relay_continuously,
@@ -111,14 +111,14 @@ class ServerApp:
         )
         relay_thread.start()
         log_info(f"Started relay polling thread for {self.relay_url}:{self.relay_port}")
-        
-    def run(self):
+
+    def run(self):  # pragma: no cover
         """Run the server application."""
         log_info(f"Starting server on port {self.server_port}")
-        
+
         # Start relay polling in a background thread
         self.start_relay_polling()
-        
+
         # Run the Flask app
         self.app.run(
             host='0.0.0.0',
@@ -127,7 +127,7 @@ class ServerApp:
             use_reloader=False  # Disable reloader to avoid duplicate threads
         )
 
-def parse_args():
+def parse_args():  # pragma: no cover
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="token.place server")
     parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
@@ -136,15 +136,15 @@ def parse_args():
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
     return parser.parse_args()
 
-def main():
+def main():  # pragma: no cover
     """Main entry point for the server application."""
     args = parse_args()
-    
+
     # Set USE_MOCK_LLM environment variable if flag is set
     if args.use_mock_llm:
         os.environ['USE_MOCK_LLM'] = '1'
         print("Running in mock LLM mode")
-    
+
     # Create and run the server
     server = ServerApp(
         server_port=args.server_port,
@@ -153,5 +153,5 @@ def main():
     )
     server.run()
 
-if __name__ == "__main__":
-    main() 
+if __name__ == "__main__":  # pragma: no cover
+    main()

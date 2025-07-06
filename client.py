@@ -56,7 +56,7 @@ def load_or_generate_client_keys():
         with open(CLIENT_PUBLIC_KEY_FILE, "wb") as f:
             f.write(public_key_pem)
         print(f"New keys saved in {CLIENT_KEYS_DIR}/")
-        
+
     return private_key, public_key_pem
 
 # --- API Interaction ---
@@ -74,13 +74,13 @@ def get_server_public_key():
 
 def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_pub_key_pem):
     """Calls the encrypted chat completions endpoint."""
-    
+
     # 1. Prepare message data
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What is the capital of France? Write a short poem about it."}
     ]
-    
+
     # 2. Decode server public key
     try:
         server_public_key_bytes = base64.b64decode(server_pub_key_b64)
@@ -98,7 +98,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     except Exception as e:
         print(f"Error during request encryption: {e}")
         return None
-        
+
     # 4. Prepare payload
     client_pub_key_b64 = base64.b64encode(client_pub_key_pem).decode('utf-8')
     payload = {
@@ -111,7 +111,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
             "iv": base64.b64encode(iv).decode('utf-8')
         }
     }
-    
+
     # 5. Send request
     print("Sending request to API...")
     try:
@@ -134,26 +134,26 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
             print("Error: Response was not encrypted as expected.")
             print("Response data:", encrypted_response_data)
             return None
-            
+
         enc_data = encrypted_response_data['data']
         ciphertext_resp = base64.b64decode(enc_data['ciphertext'])
         cipherkey_resp = base64.b64decode(enc_data['cipherkey'])
         iv_resp = base64.b64decode(enc_data['iv'])
-        
+
         # Prepare dict for decrypt function
         ciphertext_resp_dict = {'ciphertext': ciphertext_resp, 'iv': iv_resp}
-        
+
         # Decrypt using client's private key
         decrypted_bytes = decrypt(ciphertext_resp_dict, cipherkey_resp, client_priv_key)
-        
+
         if decrypted_bytes is None:
             print("Failed to decrypt response.")
             return None
-            
+
         # Decode and parse JSON
         decrypted_response = json.loads(decrypted_bytes.decode('utf-8'))
         return decrypted_response
-        
+
     except Exception as e:
         print(f"Error during response decryption or parsing: {e}")
         return None
@@ -212,7 +212,7 @@ class ChatClient:
                         print(f"Received cipherkey: {cipherkey}")
                         print(f"Received IV: {iv}")
                         decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, self.private_key)
-                        
+
                         if decrypted_chat_history is not None:
                             print(f"Response from AI: {decrypted_chat_history.decode('utf-8')}")
                             return json.loads(decrypted_chat_history.decode('utf-8'))
@@ -238,7 +238,7 @@ class ChatClient:
         server_public_key = self.get_server_public_key()
 
         print(f"Server public key: {server_public_key}")
-        
+
         if server_public_key:
             ciphertext_dict, cipherkey, iv = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)
             encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
@@ -259,14 +259,14 @@ class ChatClient:
                     if response:
                         self.chat_history = response
                         return response
-                    
+
                     elapsed_time = time.time() - start_time
                     if elapsed_time > timeout:
                         print("Timeout while waiting for response.")
                         break
-                    
+
                     time.sleep(2)  # Adjust the polling interval as needed
-        
+
         return None
 
 def main():
@@ -292,5 +292,5 @@ def main():
 
     print("Goodbye!")
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

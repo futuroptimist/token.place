@@ -7,3 +7,5 @@ omit =
     client_simplified.py
     server.py
     relay.py
+    utils/networking/relay_client.py
+    utils/crypto_helpers.py

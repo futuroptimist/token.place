@@ -46,6 +46,16 @@ Contributions describing different configurations are welcome so the project can
    sudo raspi-config  # Advanced Options -> Boot Order -> USB Boot
    sudo poweroff                                             # shut down to switch boot devices
    ```
+
+### Verify and clean the FAT /boot slice
+
+```bash
+# Repeat until no output means the dirty bit is clear
+sudo dosfsck -a /dev/sda1
+fatlabel /dev/sda1 BOOT      # give it a label the firmware can mount
+```
+
+Make sure `cmdline.txt` and `fstab` reference the same `LABEL=BOOT` or the new PARTUUID.
 The `rpi-clone` command will ask four questions:
 1. When asked to *Initialize and clone to the destination disk*, type `yes`.
 2. At the optional rootfs label prompt, press Enter (or provide a custom label).
@@ -98,6 +108,14 @@ console.
 sudo rpi-eeprom-update -a
 vcgencmd bootloader_config | grep BOOT_ORDER
 ```
+
+### Quick boot-loader sanity check
+
+```bash
+vcgencmd bootloader_config | grep BOOT_ORDER  # expect 0xf146 (USB→NVMe) or 0xf416
+```
+
+If it starts with `0x1`, the Pi will try an empty SD slot first.
 
 ### Moving the SSD to the M.2 slot
 
@@ -221,30 +239,40 @@ Regardless of whether you use Windows, macOS, or Linux to prepare the microSD ca
  Flash Raspberry Pi OS to a single microSD card,
 boot each Pi once, copy the OS to the SSD, then remove the card. The same card can be reused for every node.
 
-### Using JetKVM or other HDMI capture devices
-If your capture device shows **No Signal** even though SSH works, edit `/boot/firmware/config.txt` on the SSD:
+### HDMI and JetKVM capture mode
+Add to **/boot/firmware/config.txt** on the SSD:
 
 ```ini
 hdmi_force_hotplug=1
-hdmi_group=1
-hdmi_mode=1  # 640x480 @ 60 Hz – universal capture mode
+hdmi_group=1  # CEA
+hdmi_mode=1   # 640x480@60 Hz – works on every KVM/capture
+config_hdmi_boost=7
 ```
-
-Then power-cycle and retry.
 
 ### Power and PoE considerations
 
-If the PoE HAT does not provide enough power for the SSD,
- ensure you are using a PoE+ switch and that cooling fans are spinning
-. USB-C power can be used as a fallback.
+* Use the 27 W PSU for cloning and the first NVMe boot
+* Verify your switch reports **802.3at 30 W (Class 4)** before relying on PoE+
 
 ---
 
 With these steps your Pi cluster should be ready to run token.place.
 If you encounter issues or use different hardware, please open an issue or contribution so we can expand this guide.
 ### ACT LED codes
-| Pattern | Meaning |
-| ------- | ------- |
-| 4 long + 4 short | start*.elf missing |
-| 7 flashes | kernel signature fail |
-| steady green | waiting for boot device |
+| LED pattern | Meaning | Fix |
+| ----------- | ------- | --- |
+| Solid green | /boot not mounted – dirty or wrong label | |
+| 4 long + 4 short | `start4.elf` missing – clone aborted | |
+| 7 short | kernel img bad – wrong PARTUUID | |
+
+### Recommended USB-to-SATA/NVMe bridges
+
+Adapters using **ASM1153**, **JMS578**, or **JMS583** chipsets reliably support UASP at
+full USB 3 speeds. See [James Chambers' compatibility list](https://jamesachambers.com/raspberry-pi-storage-adapter-compatibility/) for
+tested enclosures.
+
+### SD vs SSD endurance for k3s
+
+A 300&nbsp;TBW consumer SSD can withstand decades of typical k3s writes
+(usually under 100&nbsp;GB per year), while even a "Max Endurance" SD card tops out
+around 60&nbsp;TBW. Moving the root filesystem to an SSD greatly reduces wear concerns.

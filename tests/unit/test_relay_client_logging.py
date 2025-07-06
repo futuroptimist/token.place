@@ -1,48 +1,48 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import utils.networking.relay_client as rc
 
 
-def test_log_info_respects_config(monkeypatch):
+def test_log_info_non_production():
     logger = MagicMock()
-    monkeypatch.setattr(rc, 'logger', logger)
-    config = MagicMock(is_production=False)
-    monkeypatch.setattr(rc, 'get_config_lazy', lambda: config)
-    rc.log_info('Hi {}', 'there')
-    logger.info.assert_called_with('Hi there')
-    logger.info.reset_mock()
-    config.is_production = True
-    rc.log_info('No log')
+    cfg = MagicMock(is_production=False)
+    with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', return_value=cfg):
+        rc.log_info("hello {}", "world")
+    logger.info.assert_called_with("hello world")
+
+
+def test_log_info_production():
+    logger = MagicMock()
+    cfg = MagicMock(is_production=True)
+    with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', return_value=cfg):
+        rc.log_info("ignored")
     logger.info.assert_not_called()
 
 
-def test_log_info_fallback(monkeypatch):
+def test_log_info_fallback():
     logger = MagicMock()
-    monkeypatch.setattr(rc, 'logger', logger)
-    def boom():
-        raise Exception('fail')
-    monkeypatch.setattr(rc, 'get_config_lazy', boom)
-    rc.log_info('Hello {}', 'world')
-    logger.info.assert_called_with('Hello world')
+    with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', side_effect=RuntimeError()):
+        rc.log_info("hi {}", "there")
+    logger.info.assert_called_with("hi there")
 
 
-def test_log_error_respects_config(monkeypatch):
+def test_log_error_non_production():
     logger = MagicMock()
-    monkeypatch.setattr(rc, 'logger', logger)
-    config = MagicMock(is_production=False)
-    monkeypatch.setattr(rc, 'get_config_lazy', lambda: config)
-    rc.log_error('Err {}', 'oops')
-    logger.error.assert_called_with('Err oops', exc_info=False)
-    logger.error.reset_mock()
-    config.is_production = True
-    rc.log_error('Silence')
+    cfg = MagicMock(is_production=False)
+    with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', return_value=cfg):
+        rc.log_error("err {}", "msg", exc_info=True)
+    logger.error.assert_called_with("err msg", exc_info=True)
+
+
+def test_log_error_production():
+    logger = MagicMock()
+    cfg = MagicMock(is_production=True)
+    with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', return_value=cfg):
+        rc.log_error("ignored")
     logger.error.assert_not_called()
 
 
-def test_log_error_fallback(monkeypatch):
+def test_log_error_fallback():
     logger = MagicMock()
-    monkeypatch.setattr(rc, 'logger', logger)
-    def boom():
-        raise Exception('fail')
-    monkeypatch.setattr(rc, 'get_config_lazy', boom)
-    rc.log_error('Bad {}', 'news', exc_info=True)
-    logger.error.assert_called_with('Bad news', exc_info=True)
+    with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', side_effect=RuntimeError()):
+        rc.log_error("oops {}", "fail")
+    logger.error.assert_called_with("oops fail", exc_info=False)

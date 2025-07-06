@@ -119,7 +119,11 @@ class ModelManager:
                     downloaded_mb = progress / (1024 * 1024)
                     done = int(50 * progress / total_size_in_bytes)
                     if not self.config.is_production:
-                        print(f'\r[{"=" * done}{" " * (50-done)}] {progress * 100 / total_size_in_bytes:.2f}% ({downloaded_mb:.2f}/{total_size_in_mb:.2f} MB) ETA: {eta:.2f}s', end='\r')
+                        # Progress output is cosmetic and difficult to test
+                        print(
+                            f'\r[{"=" * done}{" " * (50-done)}] {progress * 100 / total_size_in_bytes:.2f}% ({downloaded_mb:.2f}/{total_size_in_mb:.2f} MB) ETA: {eta:.2f}s',
+                            end='\r',
+                        )  # pragma: no cover
         except Exception as e:
             self.log_error(f"Error during file download: {e}")
             return False

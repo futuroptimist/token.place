@@ -58,3 +58,10 @@ def test_send_chat_message():
         resp = client.send_chat_message('hi')
         assert isinstance(resp, list) and resp[1]['role'] == 'assistant'
         assert mock_requests.post.call_count == 2
+
+
+def test_debug_logging(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr('utils.crypto_helpers.logger', logger)
+    CryptoClient('https://example.com', debug=True)
+    assert logger.setLevel.called

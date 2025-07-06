@@ -134,3 +134,9 @@ def test_send_api_request_decrypt_failure(monkeypatch):
     monkeypatch.setattr(client, 'decrypt_message', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('fail')))
     res = client.send_api_request([{'role': 'user', 'content': 'hi'}])
     assert res is None
+
+def test_send_chat_message_fetch_key_fail_missing_key(monkeypatch):
+    client = CryptoClient('https://example.com')
+    client.server_public_key = None
+    monkeypatch.setattr(client, 'fetch_server_public_key', lambda: False)
+    assert client.send_chat_message('hi') is None

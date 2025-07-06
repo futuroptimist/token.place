@@ -513,3 +513,36 @@ class TestRelayClient:
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_ping_relay_timeout(self, mock_post, relay_client):
+        """Handle timeout errors when pinging the relay."""
+        mock_post.side_effect = requests.Timeout("boom")
+        result = relay_client.ping_relay()
+        assert result['error'] == 'boom'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_ping_relay_request_exception_generic(self, mock_post, relay_client):
+        """Handle generic RequestException when pinging the relay."""
+        mock_post.side_effect = requests.RequestException("bad")
+        result = relay_client.ping_relay()
+        assert result['error'] == 'bad'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+
+    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_relay_continuously_invalid_type(self, mock_sleep, mock_ping, relay_client):
+        """Handle non-dict responses from relay."""
+        mock_ping.side_effect = ['oops']
+        relay_client.start()
+
+        def stop_after_sleep(seconds):
+            relay_client.stop()
+            return None
+
+        mock_sleep.side_effect = stop_after_sleep
+        relay_client.poll_relay_continuously()
+        mock_ping.assert_called_once()
+        mock_sleep.assert_called_once_with(relay_client._request_timeout)
+        assert relay_client.stop_polling is True

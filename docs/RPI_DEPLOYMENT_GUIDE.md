@@ -268,8 +268,8 @@ If you encounter issues or use different hardware, please open an issue or contr
 ### Recommended USB-to-SATA/NVMe bridges
 
 Adapters using **ASM1153**, **JMS578**, or **JMS583** chipsets reliably support UASP at
-full USB 3 speeds. See [James Chambers' compatibility list](https://jamesachambers.com/raspberry-pi-storage-adapter-compatibility/) for
-tested enclosures.
+full USB 3 speeds. See [Jeff Geerling’s Raspberry Pi 5 NVMe-SSD boot guide](https://www.jeffgeerling.com/blog/2023/nvme-ssd-boot-raspberry-pi-5) for
+recommended M.2/NVMe adapters, compatible drives, and the required Pi 5 boot-configuration steps.
 
 ### SD vs SSD endurance for k3s
 

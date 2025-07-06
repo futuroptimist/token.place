@@ -1,6 +1,8 @@
 # Raspberry Pi Deployment Guide
 
-This guide combines the runbook, k3s cluster instructions and bill of materials into a single place. It documents how we built a three-node Raspberry Pi 5 cluster for token.place and captures some lessons learned along the way.
+This guide combines the runbook, k3s cluster instructions and bill of materials into a single place.
+It documents how we built a three-node Raspberry Pi 5 cluster for token.place
+ and captures some lessons learned along the way.
 
 ## Bill of Materials
 
@@ -13,7 +15,8 @@ This guide combines the runbook, k3s cluster instructions and bill of materials 
 - **Optional: USB-C power supply** if you are not using PoE
 - **Cloudflare account** with a registered domain for tunneling
 
-This list reflects our setup. Other hardware choices will also work. Contributions describing different configurations are welcome so the project can support a wide variety of hardware.
+This list reflects our setup. Other hardware choices will also work.
+Contributions describing different configurations are welcome so the project can support a wide variety of hardware.
 
 ## Preparing the Hardware
 
@@ -39,6 +42,7 @@ This list reflects our setup. Other hardware choices will also work. Contributio
    git clone https://github.com/billw2/rpi-clone.git            # fetch the cloning utility
    sudo cp rpi-clone/rpi-clone /usr/local/sbin/                 # install rpi-clone
    sudo rpi-clone /dev/sda                                      # copy the running OS to the SSD
+   # rsync warnings about chown on vfat are normal
    sudo raspi-config  # Advanced Options -> Boot Order -> USB Boot
    sudo poweroff                                             # shut down to switch boot devices
    ```
@@ -49,7 +53,14 @@ The `rpi-clone` command will ask four questions:
 4. For *Verbose mode (no)*, press Enter.
 You can skip these questions on later runs with `sudo rpi-clone -u /dev/sda`.
 
-6. Remove the SD card and power on. The Pi should boot from the SSD. Repeat for the remaining nodes using the same SD card.
+### Verify the clone _before_ removing the SD
+1. `ls /mnt/clone/boot/firmware | head` – ensure you see `config.txt` and `start4.elf`.
+2. `blkid /dev/sda2` → compare PARTUUID with `/mnt/clone/boot/firmware/cmdline.txt`.
+3. (Optional) `fatlabel /dev/sda1 BOOT` if you use `LABEL=BOOT` mounts.
+4. `sudo umount /mnt/clone/boot/firmware /mnt/clone && sync`.
+
+6. Remove the SD card and power on. The Pi should boot from the SSD.
+Repeat for the remaining nodes using the same SD card.
 
 ### First boot from the SSD
 
@@ -69,12 +80,30 @@ something likely went wrong:
 - As a last resort, re-run `rpi-clone /dev/sda` and verify the clone completed
   without errors.
 
+<details>
+<summary>Diagnosing endless <code>mkfs.fat</code> loops</summary>
+
+* `dosfsck -a /dev/sda1` – clears a dirty FAT flag.
+* Solid green LED + 4-long/4-short blinks → `/boot` missing, reclone.
+* Solid green, no blinks, but SSD LED blinking → check BOOT_ORDER (`0xf416`) and `dtparam=nvme`.
+
+</details>
+
 Once the boot messages stop, you should get a normal login prompt on the
 console.
 
+### EEPROM & boot-order quick-check
+
+```bash
+sudo rpi-eeprom-update -a
+vcgencmd bootloader_config | grep BOOT_ORDER
+```
+
 ### Moving the SSD to the M.2 slot
 
-USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**. The PoE+ HAT connects over a PCIe ×1 lane and can run in Gen3 mode, reaching roughly **900 MB/s** with a capable NVMe drive—more than twice the throughput of USB.
+USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**.
+. The PoE+ HAT connects over a PCIe ×1 lane and can run in Gen3 mode,
+ reaching roughly **900 MB/s** with a capable NVMe drive—more than twice the throughput of USB.
 
 | Storage option                | Interface     | Typical throughput |
 | ----------------------------- | ------------- | ------------------ |
@@ -91,9 +120,11 @@ USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**. The PoE+ HAT c
    dtparam=pciex1_gen=3
    ```
    Optionally run `sudo rpi-eeprom-config --edit` and ensure `PCIE_PROBE=1` is present.
-3. Power down, move the SSD into the PoE HAT’s M.2 slot and boot again.
+   Forcing Gen3 avoids link-down errors on cold boot with some HAT cables.
+   3. Power down, move the SSD into the PoE HAT’s M.2 slot and boot again.
 
-Because the EEPROM’s “USB boot” setting also covers NVMe devices, the Pi will continue to boot from this drive without further changes.
+Because the EEPROM’s “USB boot” setting also covers NVMe devices,
+ the Pi will continue to boot from this drive without further changes.
 
 ## Running the Relay with Docker Compose
 
@@ -131,7 +162,8 @@ cloudflared tunnel run tokenplace-relay  # run the tunnel using the above config
 
 ## Deploying on a k3s Cluster
 
-With each Pi booting from its SSD, you can stitch them together into a lightweight Kubernetes cluster using [k3s](https://k3s.io). Pick one Pi to be the control plane ("server") and run:
+With each Pi booting from its SSD, you can stitch them together into a lightweight Kubernetes cluster
+ using [k3s](https://k3s.io). Pick one Pi to be the control plane ("server") and run:
 
 ```bash
 curl -sfL https://get.k3s.io | sh -  # install k3s on the control-plane node
@@ -143,13 +175,16 @@ This installs the `k3s` service and starts the Kubernetes API. Grab the join tok
 sudo cat /var/lib/rancher/k3s/server/node-token  # display the join token
 ```
 
-On each remaining Pi (the "agents"), join the cluster by pointing the install script at the control plane's IP address and providing the token:
+On each remaining Pi (the "agents"), join the cluster by pointing the install script
+ at the control plane's IP address and providing the token:
 
 ```bash
-curl -sfL https://get.k3s.io | K3S_URL=https://<CONTROL_PLANE_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -  # join an agent to the cluster
+curl -sfL https://get.k3s.io |
+ K3S_URL=https://<CONTROL_PLANE_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -  # join an agent to the cluster
 ```
 
-Once all nodes show up in `kubectl get nodes`, build the relay container image and load it into k3s' internal container registry:
+Once all nodes show up in `kubectl get nodes`, build the relay container image
+ and load it into k3s' internal container registry:
 
 ```bash
 docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .  # build relay image
@@ -181,13 +216,35 @@ kubectl apply -f k8s/  # deploy Kubernetes manifests
 
 ### Booting from SSD without an SD card
 
-Regardless of whether you use Windows, macOS, or Linux to prepare the microSD card, the Raspberry Pi 5 currently requires an SD-based install before it can boot from USB or M.2. Flash Raspberry Pi OS to a single microSD card, boot each Pi once, copy the OS to the SSD, then remove the card. The same card can be reused for every node.
+Regardless of whether you use Windows, macOS, or Linux to prepare the microSD card,
+ the Raspberry Pi 5 currently requires an SD-based install before it can boot from USB or M.2.
+ Flash Raspberry Pi OS to a single microSD card,
+boot each Pi once, copy the OS to the SSD, then remove the card. The same card can be reused for every node.
+
+### Using JetKVM or other HDMI capture devices
+If your capture device shows **No Signal** even though SSH works, edit `/boot/firmware/config.txt` on the SSD:
+
+```ini
+hdmi_force_hotplug=1
+hdmi_group=1
+hdmi_mode=1  # 640x480 @ 60 Hz – universal capture mode
+```
+
+Then power-cycle and retry.
 
 ### Power and PoE considerations
 
-If the PoE HAT does not provide enough power for the SSD, ensure you are using a PoE+ switch and that cooling fans are spinning. USB-C power can be used as a fallback.
+If the PoE HAT does not provide enough power for the SSD,
+ ensure you are using a PoE+ switch and that cooling fans are spinning
+. USB-C power can be used as a fallback.
 
 ---
 
-With these steps your Pi cluster should be ready to run token.place. If you encounter issues or use different hardware, please open an issue or contribution so we can expand this guide.
-
+With these steps your Pi cluster should be ready to run token.place.
+If you encounter issues or use different hardware, please open an issue or contribution so we can expand this guide.
+### ACT LED codes
+| Pattern | Meaning |
+| ------- | ------- |
+| 4 long + 4 short | start*.elf missing |
+| 7 flashes | kernel signature fail |
+| steady green | waiting for boot device |

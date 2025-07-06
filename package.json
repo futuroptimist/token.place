@@ -31,7 +31,7 @@
     "crypto-js": "^4.2.0",
     "jsencrypt": "^3.3.2",
     "mocha": "^11.7.1",
-    "selenium-webdriver": "^4.30.0"
+    "selenium-webdriver": "^4.34.0"
   },
   "devDependencies": {
     "playwright": "^1.53.2"

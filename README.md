@@ -91,7 +91,11 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Advanced security features
   - [ ] Client authentication for relay servers
   - [ ] Rate limiting and quota enforcement
-  - [ ] Enhanced encryption options for model weights and inference data
+- [ ] Enhanced encryption options for model weights and inference data
+  - [ ] Key rotation for relay and server certificates
+  - [ ] Signed relay binaries for client verification
+  - [ ] Optional content moderation hooks
+  - [ ] External security review of protocol and code
 - [ ] Community features
   - [ ] Server provider directory/registry
   - [ ] Model leaderboard based on community feedback

@@ -50,12 +50,13 @@ Contributions describing different configurations are welcome so the project can
    ```bash
    lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINTS
    ```
-   If `/mnt/clone` is missing from the `MOUNTPOINTS` column, mount it manually:
+   If `/mnt/clone` is missing from the `MOUNTPOINTS` column, the mount points may not exist yet. Create them and mount the partitions manually:
    ```bash
-   sudo mkdir -p /mnt/clone/boot/firmware
-   sudo mount /dev/nvme0n1p2 /mnt/clone
-   sudo mount /dev/nvme0n1p1 /mnt/clone/boot/firmware
+   sudo mkdir -p /mnt/clone/boot/firmware  # creates /mnt/clone and the boot subdir
+   sudo mount /dev/nvme0n1p2 /mnt/clone          # root filesystem
+   sudo mount /dev/nvme0n1p1 /mnt/clone/boot/firmware   # FAT /boot
    ```
+   Failing to create the directories first results in a “mount point does not exist” error.
    NVMe drives label partitions as `nvme0n1p1`, `nvme0n1p2`, and so on.
 
 ### Verify and clean the FAT /boot slice

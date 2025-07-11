@@ -192,40 +192,92 @@ cloudflared tunnel run tokenplace-relay  # run the tunnel using the above config
 
 ## Deploying on a k3s Cluster
 
-With each Pi booting from its SSD, you can stitch them together into a lightweight Kubernetes cluster
- using [k3s](https://k3s.io). Pick one Pi to be the control plane ("server") and run:
+The steps below create a tiny Kubernetes cluster across several Pi boards and expose the relay via a
+Cloudflare Tunnel.
 
-```bash
-curl -sfL https://get.k3s.io | sh -  # install k3s on the control-plane node
-```
+1. **Install k3s on the control-plane node**
 
-This installs the `k3s` service and starts the Kubernetes API. Grab the join token:
+   ```bash
+   curl -sfL https://get.k3s.io | sh -
+   ```
 
-```bash
-sudo cat /var/lib/rancher/k3s/server/node-token  # display the join token
-```
+   The command installs the `k3s` service and starts the API server on port 6443. After it finishes,
+   retrieve the join token:
 
-On each remaining Pi (the "agents"), join the cluster by pointing the install script
- at the control plane's IP address and providing the token:
+   ```bash
+   sudo cat /var/lib/rancher/k3s/server/node-token
+   ```
 
-```bash
-curl -sfL https://get.k3s.io |
- K3S_URL=https://<CONTROL_PLANE_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -  # join an agent to the cluster
-```
+2. **Join additional Pi nodes as agents**
 
-Once all nodes show up in `kubectl get nodes`, build the relay container image
- and load it into k3s' internal container registry:
+   Run the installer on each extra Pi, pointing it at the control plane:
 
-```bash
-docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .  # build relay image
-k3s ctr images import tokenplace-relay:latest                          # load image into k3s
-```
+   ```bash
+   curl -sfL https://get.k3s.io | \
+     K3S_URL=https://<CONTROL_PLANE_IP>:6443 \
+     K3S_TOKEN=<NODE_TOKEN> sh -
+   ```
 
-Apply the Kubernetes manifests to deploy the relay and any supporting services:
+   Confirm all nodes appear:
 
-```bash
-kubectl apply -f k8s/  # deploy Kubernetes manifests
-```
+   ```bash
+   sudo kubectl get nodes -o wide
+   ```
+
+3. **Build the relay container and load it into the cluster**
+
+   ```bash
+   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
+   sudo k3s ctr images import tokenplace-relay:latest
+   ```
+
+4. **Deploy the Kubernetes manifests**
+
+   ```bash
+   kubectl create namespace tokenplace
+   kubectl -n tokenplace apply -f k8s/
+   ```
+
+5. **Expose the relay service**
+
+   Patch the service to type `NodePort` so `cloudflared` can reach it:
+
+   ```bash
+   kubectl -n tokenplace patch svc tokenplace-relay \
+     -p '{"spec": {"type": "NodePort", "ports": [{"port": 5000, "nodePort": 30500}]}}'
+   kubectl -n tokenplace get svc tokenplace-relay
+   ```
+
+6. **Create a Cloudflare Tunnel to the NodePort**
+
+   On the control-plane node:
+
+   ```bash
+   sudo apt install -y cloudflared
+   cloudflared tunnel login
+   cloudflared tunnel create tokenplace-prod
+   ```
+
+   Write `~/.cloudflared/config.yml`:
+
+   ```yaml
+   tunnel: TUNNEL_ID
+   credentials-file: /home/pi/.cloudflared/TUNNEL_ID.json
+
+   ingress:
+     - hostname: relay.your-domain.com
+       service: http://localhost:30500
+     - service: http_status:404
+   ```
+
+   Start the tunnel and keep it running:
+
+   ```bash
+   cloudflared tunnel run tokenplace-prod
+   ```
+
+After the tunnel is active, your relay is reachable at `https://relay.your-domain.com` and traffic is
+forwarded into the k3s cluster.
 
 ## Troubleshooting
 

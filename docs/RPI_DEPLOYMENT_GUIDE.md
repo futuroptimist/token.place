@@ -270,13 +270,26 @@ Cloudflare Tunnel.
      - service: http_status:404
    ```
 
+   > **Tip:** The `hostname` value can also be the zone's apex domain. Replace
+   > `relay.your-domain.com` with your root domain to expose the relay at the
+   > base URL:
+   >
+   > ```yaml
+   > ingress:
+   >   - hostname: your-domain.com
+   >     service: http://localhost:30500
+   >   - service: http_status:404
+   > ```
+   >
+   > Cloudflare handles the DNS record via CNAME flattening.
+
    Start the tunnel and keep it running:
 
    ```bash
    cloudflared tunnel run tokenplace-prod
    ```
 
-After the tunnel is active, your relay is reachable at `https://relay.your-domain.com` and traffic is
+After the tunnel is active, your relay is reachable at `https://relay.your-domain.com` (or `https://your-domain.com` if you used the apex domain) and traffic is
 forwarded into the k3s cluster.
 
 ## Troubleshooting

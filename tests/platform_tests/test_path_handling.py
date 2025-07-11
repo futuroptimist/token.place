@@ -126,4 +126,27 @@ class TestPathHandling:
         other_dir = ensure_dir_exists(temp_dir.parent / "other")
         rel_path_2 = get_relative_path(other_dir, base_dir)
         assert rel_path_2.is_absolute()
-        assert rel_path_2 == other_dir 
+        assert rel_path_2 == other_dir
+
+    def test_get_relative_path_default_base(self, tmp_path, monkeypatch):
+        """Path is made relative to CWD when base_path is None"""
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            sub = tmp_path / "subdir"
+            ensure_dir_exists(sub)
+            result = get_relative_path(sub)
+            assert result == Path("subdir")
+        finally:
+            os.chdir(original_cwd)
+
+    def test_get_executable_extension(self, monkeypatch):
+        """Ensure executable extension varies by platform"""
+        monkeypatch.setattr('utils.path_handling.IS_WINDOWS', True)
+        monkeypatch.setattr('utils.path_handling.IS_MACOS', False)
+        monkeypatch.setattr('utils.path_handling.IS_LINUX', False)
+        from utils import path_handling as ph
+        assert ph.get_executable_extension() == '.exe'
+
+        monkeypatch.setattr(ph, 'IS_WINDOWS', False)
+        assert ph.get_executable_extension() == ''

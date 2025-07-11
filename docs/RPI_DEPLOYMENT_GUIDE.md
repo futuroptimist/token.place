@@ -37,22 +37,33 @@ Contributions describing different configurations are welcome so the project can
    ```
 5. Copy the OS to the SSD and enable USB/M.2 boot:
    ```bash
-   lsblk  # identify your SSD (e.g. /dev/sda)
+   lsblk  # identify your SSD (e.g. /dev/nvme0n1 or /dev/sda)
    cd ..  # leave the token.place directory so rpi-clone isn't cloned inside it
-   git clone https://github.com/billw2/rpi-clone.git            # fetch the cloning utility
-   sudo cp rpi-clone/rpi-clone /usr/local/sbin/                 # install rpi-clone
-   sudo rpi-clone /dev/sda                                      # copy the running OS to the SSD
+   git clone https://github.com/geerlingguy/rpi-clone.git        # fetch the NVMe-aware cloning utility
+   sudo cp rpi-clone/rpi-clone /usr/local/sbin/                  # install rpi-clone
+   sudo rpi-clone nvme0n1                                        # copy the running OS to the SSD
    # rsync warnings about chown on vfat are normal
-   sudo raspi-config  # Advanced Options -> Boot Order -> USB Boot
-   sudo poweroff                                             # shut down to switch boot devices
+   sudo raspi-config  # Advanced Options -> Boot Order -> B1 (SD -> NVMe -> USB)
+   sudo reboot                                               # restart to verify the clone
    ```
+   After logging back in, confirm the SSD is mounted:
+   ```bash
+   lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINTS
+   ```
+   If `/mnt/clone` is missing from the `MOUNTPOINTS` column, mount it manually:
+   ```bash
+   sudo mkdir -p /mnt/clone/boot/firmware
+   sudo mount /dev/nvme0n1p2 /mnt/clone
+   sudo mount /dev/nvme0n1p1 /mnt/clone/boot/firmware
+   ```
+   NVMe drives label partitions as `nvme0n1p1`, `nvme0n1p2`, and so on.
 
 ### Verify and clean the FAT /boot slice
 
 ```bash
 # Repeat until no output means the dirty bit is clear
-sudo dosfsck -a /dev/sda1
-fatlabel /dev/sda1 BOOT      # give it a label the firmware can mount
+sudo dosfsck -a /dev/nvme0n1p1
+sudo fatlabel /dev/nvme0n1p1 BOOT      # give it a label the firmware can mount
 ```
 
 Make sure `cmdline.txt` and `fstab` reference the same `LABEL=BOOT` or the new PARTUUID.
@@ -61,12 +72,12 @@ The `rpi-clone` command will ask four questions:
 2. At the optional rootfs label prompt, press Enter (or provide a custom label).
 3. When prompted to *Run setup script (no)*, just press Enter.
 4. For *Verbose mode (no)*, press Enter.
-You can skip these questions on later runs with `sudo rpi-clone -u /dev/sda`.
+You can skip these questions on later runs with `sudo rpi-clone -u nvme0n1`.
 
 ### Verify the clone _before_ removing the SD
 1. `ls /mnt/clone/boot/firmware | head` – ensure you see `config.txt` and `start4.elf`.
-2. `blkid /dev/sda2` → compare PARTUUID with `/mnt/clone/boot/firmware/cmdline.txt`.
-3. (Optional) `fatlabel /dev/sda1 BOOT` if you use `LABEL=BOOT` mounts.
+2. `blkid /dev/nvme0n1p2` → compare PARTUUID with `/mnt/clone/boot/firmware/cmdline.txt`.
+3. (Optional) `sudo fatlabel /dev/nvme0n1p1 BOOT` if you use `LABEL=BOOT` mounts.
 4. `sudo umount /mnt/clone/boot/firmware /mnt/clone && sync`.
 
 6. Remove the SD card and power on. The Pi should boot from the SSD.
@@ -84,16 +95,16 @@ If you are still staring at `Trying partition` after about **10&nbsp;minutes**,
 something likely went wrong:
 
 - Reseat the USB or M.2 cable and make sure the drive has power.
-- Boot from the SD card again and run `lsblk` to confirm that `/dev/sda1` and
-  `/dev/sda2` exist.
-- Run `sudo fsck -fy /dev/sda2` to repair the filesystem if needed.
-- As a last resort, re-run `rpi-clone /dev/sda` and verify the clone completed
+- Boot from the SD card again and run `lsblk` to confirm that `/dev/nvme0n1p1` and
+  `/dev/nvme0n1p2` exist.
+- Run `sudo fsck -fy /dev/nvme0n1p2` to repair the filesystem if needed.
+- As a last resort, re-run `rpi-clone nvme0n1` and verify the clone completed
   without errors.
 
 <details>
 <summary>Diagnosing endless <code>mkfs.fat</code> loops</summary>
 
-* `dosfsck -a /dev/sda1` – clears a dirty FAT flag.
+* `dosfsck -a /dev/nvme0n1p1` – clears a dirty FAT flag.
 * Solid green LED + 4-long/4-short blinks → `/boot` missing, reclone.
 * Solid green, no blinks, but SSD LED blinking → check BOOT_ORDER (`0xf416`) and `dtparam=nvme`.
 

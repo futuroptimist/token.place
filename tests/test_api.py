@@ -305,11 +305,14 @@ def test_create_completion_exception(client, monkeypatch, mock_llama):
 
 def test_format_error_response_function():
     with app.app_context():
-        resp = format_error_response("bad request", code="oops", status_code=418)
+        resp = format_error_response(
+            "bad request", code="oops", param="field", status_code=418
+        )
         data = resp.get_json()
         assert resp.status_code == 418
         assert data["error"]["message"] == "bad request"
         assert data["error"]["code"] == "oops"
+        assert data["error"]["param"] == "field"
 
 
 def test_openai_alias_routes(client):

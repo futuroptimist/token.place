@@ -14,30 +14,30 @@ def server_app():
     with patch('server.server_app.get_model_manager') as mock_get_model_manager, \
          patch('server.server_app.get_crypto_manager') as mock_get_crypto_manager, \
          patch('server.server_app.RelayClient') as mock_relay_client_class:
-        
+
         # Set up mock managers
         mock_model_manager = MagicMock()
         mock_model_manager.use_mock_llm = True
         mock_model_manager.download_model_if_needed.return_value = True
         mock_get_model_manager.return_value = mock_model_manager
-        
+
         mock_crypto_manager = MagicMock()
         mock_get_crypto_manager.return_value = mock_crypto_manager
-        
+
         # Create a test relay client
         mock_relay_client = MagicMock()
         mock_relay_client_class.return_value = mock_relay_client
-        
+
         # Create the server app
         server = ServerApp(
             server_port=9000,  # Use a different port for testing
             relay_port=9001,
             relay_url="http://localhost"
         )
-        
+
         # Patch the start_relay_polling method to avoid starting threads
         server.start_relay_polling = MagicMock()
-        
+
         yield server
 
 @pytest.fixture
@@ -57,13 +57,13 @@ def mock_config(monkeypatch):
     # Replace the global config with our test config
     monkeypatch.setattr('config.config', test_config)
     monkeypatch.setattr('server.server_app.config', test_config)
-    
+
     # Ensure the models directory exists
     import os
     from utils.path_handling import ensure_dir_exists
     models_dir = config.get('paths.models_dir')
     ensure_dir_exists(models_dir)
-    
+
     # Create a dummy model file if needed for tests
     dummy_model_path = os.path.join(models_dir, config.get('model.filename'))
     if not os.path.exists(dummy_model_path):
@@ -122,3 +122,18 @@ def test_initialize_llm_real_mode(server_app):
         server_app.initialize_llm()
         # Verify that download_model_if_needed was called
         mock_model_manager.download_model_if_needed.assert_called_once()
+
+
+def test_initialize_llm_real_mode_failure(server_app):
+    """Log an error when model download fails."""
+    with patch('server.server_app.get_model_manager') as mock_get_model_manager, \
+         patch('server.server_app.log_error') as mock_log_error:
+        mock_model_manager = MagicMock()
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.download_model_if_needed.return_value = False
+        mock_get_model_manager.return_value = mock_model_manager
+
+        server_app.initialize_llm()
+
+        mock_model_manager.download_model_if_needed.assert_called_once()
+        mock_log_error.assert_called_once_with("Failed to download or verify model")

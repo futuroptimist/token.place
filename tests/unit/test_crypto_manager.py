@@ -249,3 +249,16 @@ class TestCryptoManager:
         # Check for exception when initializing CryptoManager
         with pytest.raises(RuntimeError):
             CryptoManager() 
+
+    def test_log_functions_fallback(self, monkeypatch):
+        """Ensure log helpers log when config retrieval fails."""
+        from utils.crypto import crypto_manager as cm
+        logger = MagicMock()
+        monkeypatch.setattr(cm, 'logger', logger)
+        monkeypatch.setattr(cm, 'get_config_lazy', MagicMock(side_effect=RuntimeError()))
+
+        cm.log_info('hi')
+        logger.info.assert_called_with('hi')
+
+        cm.log_error('bye')
+        logger.error.assert_called_with('bye', exc_info=False)

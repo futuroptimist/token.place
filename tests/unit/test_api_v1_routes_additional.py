@@ -68,4 +68,3 @@ def test_openai_alias_get_model(client):
     api_resp = client.get(f'/api/v1/models/{model_id}').get_json()
     alias_resp = client.get(f'/v1/models/{model_id}').get_json()
     assert api_resp == alias_resp
-

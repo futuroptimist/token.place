@@ -368,3 +368,77 @@ class TestModelManager:
         result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
         assert result is True
         assert os.path.getsize(file_path) == 1
+
+    @patch('builtins.open', side_effect=IOError('disk error'))
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_file_in_chunks_exception(self, mock_get, mock_open, model_manager):
+        """Return False if an exception occurs during download."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '1'
+        mock_response.iter_content.return_value = [b'a']
+        mock_get.return_value = mock_response
+
+        file_path = os.path.join(self._temp_dir, 'error.gguf')
+        result = model_manager.download_file_in_chunks(file_path, 'https://example.com/model.gguf', 1)
+        assert result is False
+        mock_open.assert_called()
+
+    @patch('config.get_config')
+    def test_init_default_config(self, mock_get_config):
+        """Initialization without passing a config calls get_config."""
+        mock_cfg = MagicMock()
+        mock_cfg.is_production = False
+
+        def cfg_get(key, default=None):
+            values = {
+                'model.filename': 'test_model.gguf',
+                'model.url': 'https://example.com/model.gguf',
+                'model.download_chunk_size_mb': 1,
+                'paths.models_dir': self._temp_dir,
+                'model.use_mock': False,
+                'model.context_size': 2048,
+                'model.chat_format': 'llama-3',
+                'model.max_tokens': 1000,
+                'model.temperature': 0.7,
+                'model.top_p': 0.9,
+                'model.stop_tokens': [],
+            }
+            return values.get(key, default)
+
+        mock_cfg.get.side_effect = cfg_get
+        mock_get_config.return_value = mock_cfg
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._temp_dir = temp_dir
+            self.create_fake_model_file(temp_dir)
+            manager = ModelManager()
+            assert isinstance(manager, ModelManager)
+            assert mock_get_config.called
+
+    @patch('llama_cpp.Llama', side_effect=Exception('fail'), create=True)
+    @patch('os.path.exists', return_value=True)
+    def test_get_llm_instance_init_failure(self, mock_exists, mock_llama, model_manager):
+        """Return None if Llama initialization raises an exception."""
+        llm = model_manager.get_llm_instance()
+        assert llm is None
+
+    def test_get_model_manager_singleton(self):
+        """get_model_manager should return a singleton instance."""
+        from utils.llm import model_manager as mm
+
+        with patch('config.get_config') as mock_get:
+            mock_cfg = MagicMock()
+            mock_cfg.is_production = False
+            mock_cfg.get.return_value = ''
+            mock_get.return_value = mock_cfg
+
+            original = mm.model_manager
+            try:
+                mm.model_manager = None
+                inst1 = mm.get_model_manager()
+                inst2 = mm.get_model_manager()
+
+                assert inst1 is inst2
+            finally:
+                mm.model_manager = original

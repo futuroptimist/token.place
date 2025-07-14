@@ -82,7 +82,20 @@ You can skip these questions on later runs with `sudo rpi-clone -u nvme0n1`.
 4. `sudo umount /mnt/clone/boot/firmware /mnt/clone && sync`.
 
 6. Remove the SD card and power on. The Pi should boot from the SSD.
-Repeat for the remaining nodes using the same SD card.
+
+### Setting up additional nodes
+
+Use the very same microSD card for each of the remaining Pis. Because the OS is
+mutable, any changes you made while configuring the first node (package installs,
+Docker group membership, etc.) will still be present when you insert the card
+into another board.
+
+1. Boot the next Pi from the shared SD card and log in.
+2. Update its EEPROM with `sudo rpi-eeprom-update -a` – this must be run on each
+   board individually.
+3. Clone the running system to that Pi's SSD with `sudo rpi-clone nvme0n1` and
+   reboot without the SD card.
+4. Repeat for the third node to end up with a three-Pi k3s cluster.
 
 ### First boot from the SSD
 

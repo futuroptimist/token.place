@@ -3,6 +3,7 @@ import pytest
 import json
 import base64
 import time
+import logging
 from encrypt import encrypt, decrypt, generate_keys
 import sys
 import os
@@ -420,3 +421,113 @@ def test_openai_alias_routes_extended(client):
         if isinstance(data_alias, dict) and 'id' in data_alias:
             data_alias['id'] = data_api.get('id')
         assert data_alias == data_api
+
+
+def test_logging_prod_environment(monkeypatch):
+    monkeypatch.setenv('ENVIRONMENT', 'prod')
+    import importlib
+    import api.v1.routes as routes
+    importlib.reload(routes)
+    assert routes.ENVIRONMENT == 'prod'
+    assert routes.logger.handlers == []
+    monkeypatch.setenv('ENVIRONMENT', 'dev')
+    importlib.reload(routes)
+
+
+def test_list_models_exception(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: (_ for _ in ()).throw(RuntimeError('boom')))
+    resp = client.get('/api/v1/models')
+    assert resp.status_code == 400
+    assert 'error' in resp.get_json()
+
+
+def test_get_model_exception(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: (_ for _ in ()).throw(RuntimeError('boom')))
+    resp = client.get('/api/v1/models/foo')
+    assert resp.status_code == 400
+    assert 'error' in resp.get_json()
+
+
+def test_get_public_key_exception(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.encryption_manager', None)
+    resp = client.get('/api/v1/public-key')
+    assert resp.status_code == 400
+    assert 'error' in resp.get_json()
+
+
+def test_chat_completion_validation_error(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.validate_model_name', lambda *a, **k: None)
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda *a, **k: object())
+    from api.v1.validation import ValidationError
+    monkeypatch.setattr('api.v1.routes.validate_encrypted_request', lambda d: (_ for _ in ()).throw(ValidationError('bad', field='f', code='c')))
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'encrypted': True,
+        'client_public_key': base64.b64encode(b'x').decode(),
+        'messages': {
+            'ciphertext': base64.b64encode(b'c').decode(),
+            'cipherkey': base64.b64encode(b'k').decode(),
+            'iv': base64.b64encode(b'i').decode()
+        }
+    }
+    resp = client.post('/api/v1/chat/completions', json=payload)
+    assert resp.status_code == 400
+    assert 'bad' in resp.get_json()['error']['message']
+
+
+def test_chat_completion_unexpected_exception(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'x'}])
+    monkeypatch.setattr('api.v1.routes.validate_model_name', lambda *a, **k: None)
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda *a, **k: object())
+    monkeypatch.setattr('api.v1.routes.validate_chat_messages', lambda m: None)
+    monkeypatch.setattr('api.v1.routes.generate_response', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('fail')))
+    payload = {'model': 'x', 'messages': [{'role': 'user', 'content': 'hi'}]}
+    resp = client.post('/api/v1/chat/completions', json=payload)
+    assert resp.status_code == 500
+    assert 'Internal server error' in resp.get_json()['error']['message']
+
+
+def test_completions_invalid_body(client):
+    resp = client.post('/api/v1/completions', json={})
+    assert resp.status_code == 400
+    assert 'Invalid request body' in resp.get_json()['error']['message']
+
+
+def test_completions_missing_model(client):
+    resp = client.post('/api/v1/completions', json={'prompt': 'hi'})
+    assert resp.status_code == 400
+    assert 'Missing required parameter' in resp.get_json()['error']['message']
+
+
+def test_completions_model_error(client, monkeypatch):
+    from api.v1.models import ModelError
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: (_ for _ in ()).throw(ModelError('no', status_code=404, error_type='model_not_found')))
+    resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
+    assert resp.status_code == 404
+    assert 'model_not_found' in resp.get_json()['error']['type']
+
+
+def test_completions_generate_model_error(client, monkeypatch):
+    from api.v1.models import ModelError
+    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
+    monkeypatch.setattr('api.v1.routes.generate_response', lambda *a, **k: (_ for _ in ()).throw(ModelError('bad', status_code=402)))
+    resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
+    assert resp.status_code == 402
+    assert 'bad' in resp.get_json()['error']['message']
+
+
+def test_health_check_exception(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.time', None)
+    resp = client.get('/api/v1/health')
+    assert resp.status_code == 400
+    assert 'error' in resp.get_json()
+
+
+def test_alias_get_model(client):
+    resp = client.get('/api/v1/models')
+    model_id = resp.get_json()['data'][0]['id']
+    resp_alias = client.get(f'/v1/models/{model_id}')
+    resp_api = client.get(f'/api/v1/models/{model_id}')
+    assert resp_alias.status_code == resp_api.status_code
+    assert resp_alias.get_json() == resp_api.get_json()

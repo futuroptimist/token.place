@@ -93,6 +93,13 @@ into another board.
 1. Boot the next Pi from the shared SD card and log in.
 2. Update its EEPROM with `sudo rpi-eeprom-update -a` – this must be run on each
    board individually.
+   If your other Pis or PoE HATs haven't arrived yet, you can still prepare
+   their drives by temporarily swapping each SSD into the first board's
+   M.2 (or USB) slot.  Power the Pi off, insert a blank SSD, boot from the
+   shared SD card and run `sudo rpi-clone nvme0n1`.  Repeat this process for
+   the remaining drives so that every SSD is ready before you assemble the
+   additional nodes. This saves a lot of teardown and reassembly time and lets
+   you continue even if some hardware hasn't arrived yet.
 3. Clone the running system to that Pi's SSD with `sudo rpi-clone nvme0n1` and
    reboot without the SD card.
 4. Repeat for the third node to end up with a three-Pi k3s cluster.

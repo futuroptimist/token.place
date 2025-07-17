@@ -215,6 +215,17 @@ cloudflared tunnel run tokenplace-relay  # run the tunnel using the above config
 The steps below create a tiny Kubernetes cluster across several Pi boards and expose the relay via a
 Cloudflare Tunnel.
 
+### Prerequisites
+
+k3s will not start without memory cgroups enabled. Raspberry Pi OS disables them by default, so update
+`/boot/cmdline.txt` to enable the necessary controllers before installing k3s:
+
+```bash
+sudo sed -i 's/$/ cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
+```
+
+Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/installation/requirements#control-plane-nodes), [GitHub issue #2067](https://github.com/k3s-io/k3s/issues/2067) and [StackOverflow question 74294548](https://stackoverflow.com/questions/74294548) for background.
+
 1. **Set a unique hostname for each node**
 
    The k3s installer uses the current hostname as the node name. Pick names ahead of time so you can

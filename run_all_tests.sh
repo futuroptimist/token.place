@@ -73,6 +73,9 @@ run_test "Crypto Compatibility Tests (Playwright)" "python -m pytest tests/test_
 # 7. Run JavaScript tests
 run_test "JavaScript Tests" "npm run test:js" "Testing JavaScript functionality"
 
+# 7b. Test Raspberry Pi cgroup setup script
+run_test "Cgroup Setup Script Tests" "bash tests/test_cgroup.sh" "Validating prepare-pi-cgroups.sh logic"
+
 # 8. Run E2E tests
 if [ "$RUN_E2E" = "1" ]; then
     run_test "End-to-End Tests" "python -m pytest tests/test_e2e_*.py -v $COVERAGE_ARGS" "Testing complete workflows"

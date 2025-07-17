@@ -226,7 +226,29 @@ sudo sed -i 's/$/ cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory/' /b
 
 Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/installation/requirements#control-plane-nodes), [GitHub issue #2067](https://github.com/k3s-io/k3s/issues/2067) and [StackOverflow question 74294548](https://stackoverflow.com/questions/74294548) for background.
 
-1. **Install k3s on the control-plane node**
+1. **Set a unique hostname for each node**
+
+   The k3s installer uses the current hostname as the node name. Pick names ahead of time so you can
+   easily identify the control plane and workers. For example:
+
+   ```bash
+   sudo hostnamectl set-hostname controlplane0  # on the first Pi
+   sudo reboot
+   ```
+
+   On the remaining Pis:
+
+   ```bash
+   sudo hostnamectl set-hostname workernode0    # second Pi
+   sudo reboot
+
+   sudo hostnamectl set-hostname workernode1    # third Pi
+   sudo reboot
+   ```
+
+   Rebooting ensures the new hostname propagates everywhere before installing k3s.
+
+2. **Install k3s on the control-plane node**
 
    ```bash
    curl -sfL https://get.k3s.io | sh -
@@ -239,7 +261,7 @@ Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/in
    sudo cat /var/lib/rancher/k3s/server/node-token
    ```
 
-2. **Join additional Pi nodes as agents**
+3. **Join additional Pi nodes as agents**
 
    Run the installer on each extra Pi, pointing it at the control plane:
 
@@ -255,21 +277,21 @@ Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/in
    sudo kubectl get nodes -o wide
    ```
 
-3. **Build the relay container and load it into the cluster**
+4. **Build the relay container and load it into the cluster**
 
    ```bash
    docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
    sudo k3s ctr images import tokenplace-relay:latest
    ```
 
-4. **Deploy the Kubernetes manifests**
+5. **Deploy the Kubernetes manifests**
 
    ```bash
    kubectl create namespace tokenplace
    kubectl -n tokenplace apply -f k8s/
    ```
 
-5. **Expose the relay service**
+6. **Expose the relay service**
 
    Patch the service to type `NodePort` so `cloudflared` can reach it:
 
@@ -279,7 +301,7 @@ Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/in
    kubectl -n tokenplace get svc tokenplace-relay
    ```
 
-6. **Create a Cloudflare Tunnel to the NodePort**
+7. **Create a Cloudflare Tunnel to the NodePort**
 
    On the control-plane node:
 
@@ -366,6 +388,16 @@ config_hdmi_boost=7
 
 With these steps your Pi cluster should be ready to run token.place.
 If you encounter issues or use different hardware, please open an issue or contribution so we can expand this guide.
+
+### Reinstalling k3s
+
+If the install fails or you need to start over, remove all k3s components with:
+
+```bash
+sudo /usr/local/bin/k3s-uninstall.sh
+```
+
+After the uninstall completes, you can run the installation commands again for a clean deployment.
 ### ACT LED codes
 | LED pattern | Meaning | Fix |
 | ----------- | ------- | --- |

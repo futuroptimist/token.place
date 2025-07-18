@@ -1,9 +1,12 @@
 # token.place
 
-[![CI](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml/badge.svg)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
+[![Lint & Format](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=lint%20%26%20format)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=tests)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
+[![Docs](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=docs)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/futuroptimist/token.place)](LICENSE)
 
-p2p generative AI platform
+Secure peer-to-peer generative AI platform
 
 # Quickstart
 
@@ -13,6 +16,9 @@ cd token.place
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
 npm install
+pip install pre-commit
+pre-commit install
+pre-commit run --all-files
 ```
 
 Run the relay and server in separate terminals:
@@ -30,6 +36,14 @@ exposed at `/metrics`.
 There are tons of personal computers and homelabs out there with lots of compute that remain idle. This project aims to create a marketplace of people with spare compute and people with needs for compute. Note that this is not a financial marketplace -- this is intended to be a public good. If it takes off is anyone's guess, but I'll donate whatever compute I can in the meantime once this is up and running.
 
 For a quick orientation to the repository layout and key docs, see [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
+## Contents
+
+- End-to-end encryption powered by RSA and AES
+- Cross-platform Python server and JavaScript client
+- Comprehensive tests and CI via GitHub Actions
+- [AGENTS.md](AGENTS.md) lists repo helpers for LLMs
+- [llms.txt](llms.txt) provides machine-readable context
 
 ## roadmap
 

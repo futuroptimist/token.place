@@ -18,10 +18,10 @@ fi
 
 # Determine cmdline file
 if [ -z "$CMDLINE_FILE" ]; then
-    if [ -f /boot/cmdline.txt ]; then
-        CMDLINE_FILE=/boot/cmdline.txt
-    elif [ -f /boot/firmware/cmdline.txt ]; then
+    if [ -f /boot/firmware/cmdline.txt ]; then
         CMDLINE_FILE=/boot/firmware/cmdline.txt
+    elif [ -f /boot/cmdline.txt ]; then
+        CMDLINE_FILE=/boot/cmdline.txt
     else
         echo "cmdline.txt not found" >&2
         exit 1
@@ -30,8 +30,20 @@ fi
 
 PARAMS="cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory"
 
-if ! grep -q "cgroup_memory=1" "$CMDLINE_FILE"; then
-    sed -i "s/\$/ $PARAMS/" "$CMDLINE_FILE"
+# Remove conflicting or duplicate parameters
+sed -i -e 's/\<cgroup_disable=memory\>//g' \
+       -e 's/\<cgroup_enable=cpuset\>//g' \
+       -e 's/\<cgroup_memory=1\>//g' \
+       -e 's/\<cgroup_enable=memory\>//g' "$CMDLINE_FILE"
+# Collapse multiple spaces and trim trailing whitespace
+sed -i -e 's/  */ /g' -e 's/[[:space:]]*$//' "$CMDLINE_FILE"
+
+# Append the required parameters exactly once
+sed -i "s/\$/ $PARAMS/" "$CMDLINE_FILE"
+
+# Check if the memory controller is enabled
+if grep -qE '^memory\s+.*\s1$' "$CGROUPS_PATH"; then
+    exit 0
 fi
 
 echo "Reboot required"

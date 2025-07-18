@@ -218,10 +218,18 @@ Cloudflare Tunnel.
 ### Prerequisites
 
 k3s will not start without memory cgroups enabled. Raspberry Pi OS disables them by default, so update
-`/boot/cmdline.txt` to enable the necessary controllers before installing k3s:
+`cmdline.txt` to enable the necessary controllers before installing k3s. *Bookworm moved
+cmdline.txt; edit `/boot/firmware/cmdline.txt` instead of `/boot/cmdline.txt`.*
+
+Use this one-liner:
 
 ```bash
-sudo sed -i 's/$/ cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory/' /boot/cmdline.txt
+FILE=$(test -f /boot/firmware/cmdline.txt && echo /boot/firmware/cmdline.txt || echo /boot/cmdline.txt)
+sudo sed -i -e 's/\<cgroup_disable=memory\>//g' \
+            -e 's/\<cgroup_enable=cpuset\>//g' \
+            -e 's/\<cgroup_memory=1\>//g' \
+            -e 's/\<cgroup_enable=memory\>//g' \
+            -e 's/$/ cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory/' "$FILE"
 ```
 
 Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/installation/requirements#control-plane-nodes), [GitHub issue #2067](https://github.com/k3s-io/k3s/issues/2067) and [StackOverflow question 74294548](https://stackoverflow.com/questions/74294548) for background.

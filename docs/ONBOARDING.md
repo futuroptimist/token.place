@@ -29,7 +29,7 @@ The project runs on Windows, macOS and Linux. Path handling, configuration locat
 
 - **Architecture** – [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 - **Testing** – [docs/TESTING.md](TESTING.md) and [tests/README.md](../tests/README.md)
-- **Contribution guidelines** – [docs/CONTRIBUTING.md](CONTRIBUTING.md)
+- **Contribution guidelines** – [CONTRIBUTING.md](../CONTRIBUTING.md)
 - **Style guide** – [docs/STYLE_GUIDE.md](STYLE_GUIDE.md)
 - **LLM assistant tips** – [docs/LLM_ASSISTANT_GUIDE.md](LLM_ASSISTANT_GUIDE.md)
 

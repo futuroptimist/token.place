@@ -30,7 +30,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 
 ## Documentation
 
-- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): Contribution guidelines for developers
+- [CONTRIBUTING.md](../CONTRIBUTING.md): Contribution guidelines for developers
 - [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md): Style and branding guidelines, including proper name stylization
 - [docs/TESTING.md](docs/TESTING.md): Comprehensive guide to the testing approach
 - [docs/TESTING_IMPROVEMENTS.md](docs/TESTING_IMPROVEMENTS.md): Ideas for further testing improvements

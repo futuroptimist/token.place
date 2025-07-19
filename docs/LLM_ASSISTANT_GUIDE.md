@@ -111,7 +111,7 @@ If a user reports connection issues:
 
 When assisting users, refer them to these key documents:
 
-- [CONTRIBUTING.md](./CONTRIBUTING.md): General contribution guidelines
+- [CONTRIBUTING.md](../CONTRIBUTING.md): General contribution guidelines
 - [tests/README.md](../tests/README.md): General testing guide
 
 ---

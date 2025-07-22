@@ -252,6 +252,7 @@ To further enhance cross-platform support, future work includes:
    - Windows installer (.msi)
    - macOS package (.pkg)
    - Linux package (.deb, .rpm)
+   - Windows `.exe` and macOS `.dmg` builds are generated automatically via GitHub Actions
 
 2. **Platform-Specific UI Optimizations**:
    - Native UI integrations 

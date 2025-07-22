@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, Event } from 'electron';
 import Store from 'electron-store';
 import path from 'path';
 import { AppTray } from './Tray';
@@ -29,7 +29,7 @@ function createWindow(): void {
 
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
 
-  mainWindow.on('close', (e) => {
+  mainWindow.on('close', (e: Event) => {
     e.preventDefault();
     mainWindow?.hide();
   });
@@ -59,6 +59,6 @@ ipcMain.handle('set-settings', (_, data: UserSettings) => {
   scheduler.removeAllListeners();
 });
 
-app.on('window-all-closed', (e) => {
+app.on('window-all-closed', (e: Event) => {
   e.preventDefault();
 });

@@ -1,0 +1,16 @@
+{
+  "appId": "com.tokenplace.desktop",
+  "productName": "token.place Desktop",
+  "files": ["dist/**/*"],
+  "directories": {
+    "buildResources": "assets"
+  },
+  "mac": {
+    "target": "dmg",
+    "icon": "assets/icon.icns"
+  },
+  "win": {
+    "target": "nsis",
+    "icon": "assets/icon.ico"
+  }
+}

@@ -15,12 +15,12 @@
     "package:win": "electron-builder --config electron-builder.json --win"
   },
   "dependencies": {
-    "electron": "^30.0.0",
     "electron-store": "^8.1.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
+    "electron": "^30.0.0",
     "@types/node": "^20.9.0",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",

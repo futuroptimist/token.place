@@ -1,0 +1,45 @@
+name: Build Desktop App
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            build_script: package:win
+            artifact_name: token-place-desktop-win
+          - os: macos-latest
+            build_script: package:mac
+            artifact_name: token-place-desktop-mac
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build sources
+        run: npm run build
+      - name: Package application
+        run: npm run ${{ matrix.build_script }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            desktop/dist/**/*.exe
+            desktop/dist/**/*.dmg
+            desktop/dist/**/*.zip
+            desktop/dist/**/*.pkg

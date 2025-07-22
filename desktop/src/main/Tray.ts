@@ -2,12 +2,13 @@ import { Menu, Tray, nativeImage } from 'electron';
 import Store from 'electron-store';
 import path from 'path';
 import { IdleScheduler } from './IdleScheduler';
+import { UserSettings } from '../common/types';
 
 export class AppTray {
   private tray: Tray | null = null;
   constructor(
     private scheduler: IdleScheduler,
-    private store: Store,
+    private store: Store<UserSettings>,
   ) {}
 
   init(): void {

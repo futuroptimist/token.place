@@ -35,7 +35,7 @@ jobs:
       - name: Package application
         run: npm run ${{ matrix.build_script }}
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: |

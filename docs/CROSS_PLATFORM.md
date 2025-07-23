@@ -95,42 +95,11 @@ if config.is_development and config.is_windows:
 
 ## Platform-Specific Launchers
 
-We've created cross-platform launcher scripts:
+The repository now uses a `Makefile` for common tasks.
 
-- `scripts/launcher.py` - Core Python launcher that works on all platforms
-- `scripts/start.bat` - Windows batch file wrapper
-- `scripts/start.sh` - Unix shell script wrapper for macOS and Linux
-
-### Using the Launchers
-
-**Windows:**
-```batch
-# Start all components
-scripts\start.bat
-
-# Start a specific component
-scripts\start.bat --component server
-
-# Specify environment
-scripts\start.bat --env production
-
-# Stop all components
-scripts\start.bat stop
-```
-
-**macOS/Linux:**
 ```bash
-# Start all components
-./scripts/start.sh
-
-# Start a specific component
-./scripts/start.sh --component server
-
-# Specify environment
-./scripts/start.sh --env production
-
-# Stop all components
-./scripts/start.sh stop
+make docker-build  # build container images
+make k8s-deploy    # deploy manifests to your cluster
 ```
 
 ## Cross-Platform Testing
@@ -184,7 +153,7 @@ When contributing to the codebase, please follow these guidelines:
 
 5. **Docker**:
    - Update Docker files when adding new dependencies
-   - Test Docker builds on your platform before submitting changes 
+   - Test Docker builds on your platform before submitting changes
 
 ## Compatibility Status
 
@@ -201,7 +170,7 @@ We've successfully implemented and tested cross-platform compatibility for token
 | API | ✅ | ✅ | ✅ | ✅ |
 | Crypto Utilities | ✅ | ✅ | ✅ | ✅ |
 
-All unit tests pass successfully on all platforms. 
+All unit tests pass successfully on all platforms.
 
 **Notes**:
 - UI tests require a running server on localhost:5010
@@ -255,7 +224,7 @@ To further enhance cross-platform support, future work includes:
    - Windows `.exe` and macOS `.dmg` builds are generated automatically via GitHub Actions
 
 2. **Platform-Specific UI Optimizations**:
-   - Native UI integrations 
+   - Native UI integrations
    - Platform-specific UX enhancements
    - Touch support for mobile devices
 
@@ -267,4 +236,4 @@ To further enhance cross-platform support, future work includes:
 4. **CI/CD Pipeline**:
    - Matrix testing across all supported platforms
    - Automated builds for all platforms
-   - Containerized testing environments 
+   - Containerized testing environments

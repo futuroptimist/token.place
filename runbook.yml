@@ -1,0 +1,18 @@
+version: 1
+workflow:
+  - stage: bootstrap
+    tasks:
+      - id: clone
+        description: "Use the GitHub template and run ./scripts/setup.sh"
+      - id: install
+        description: "Install pre-commit and hooks"
+  - stage: development
+    tasks:
+      - id: lint
+        description: "Run pre-commit run --all-files"
+      - id: test
+        description: "Run pytest"
+  - stage: release
+    tasks:
+      - id: merge
+        description: "Merge to main and let Release Drafter generate notes"

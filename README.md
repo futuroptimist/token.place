@@ -591,12 +591,13 @@ For detailed information on cross-platform features and containerization, see [C
 
 **Windows:**
 ```batch
-scripts\start.bat
+docker compose up -d
 ```
 
 **macOS/Linux:**
 ```bash
-./scripts/start.sh
+make docker-build
+docker compose up -d
 ```
 
 **Docker:**

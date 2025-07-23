@@ -42,6 +42,18 @@ Thank you for your interest in contributing to token.place! This document provid
    pre-commit install
    ```
 
+### Unified Workflow
+
+Use the Makefile for common tasks:
+
+```bash
+make lint        # run linters and pre-commit checks
+make format      # apply formatting
+make test        # run all tests
+make docker-build  # build Docker images
+make k8s-deploy    # deploy manifests
+```
+
 ## Development Workflow
 
 ### Running the server
@@ -76,7 +88,7 @@ When developing on Windows, be aware of these important compatibility considerat
    ```powershell
    # CORRECT
    cd scripts; python example.py
-   
+
    # INCORRECT (will cause errors)
    cd scripts && python example.py
    ```
@@ -85,7 +97,7 @@ When developing on Windows, be aware of these important compatibility considerat
    ```powershell
    # PREFERRED
    curl http://127.0.0.1:5000/test
-   
+
    # MAY CAUSE ISSUES
    curl http://localhost:5000/test
    ```
@@ -99,7 +111,7 @@ When developing on Windows, be aware of these important compatibility considerat
    ```powershell
    # List processes using a port
    netstat -ano | findstr :5000
-   
+
    # Kill a process by PID
    taskkill /F /PID <pid>
    ```
@@ -175,7 +187,7 @@ When adding new features or fixing bugs, please include appropriate tests:
 
 ### Testing Best Practices
 
-1. **Network Testing**: 
+1. **Network Testing**:
    - Always use explicit IPv4 addresses (`127.0.0.1`) instead of `localhost`
    - Allow sufficient time for servers to start before testing
    - Check for port conflicts before starting services
@@ -257,4 +269,4 @@ By contributing to token.place, you agree that your contributions will be licens
 
 ## Contact
 
-If you have questions or need assistance, please open an issue or contact the maintainers. 
+If you have questions or need assistance, please open an issue or contact the maintainers.

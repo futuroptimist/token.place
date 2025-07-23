@@ -1,0 +1,143 @@
+# .typos.toml ── flywheel spell‑check configuration
+# -------------------------------------------------
+# This version:
+#   • Skips minified JS and other generated artefacts
+#   • Treats commit SHAs and short project tokens as valid
+#   • Keeps your previous word allow‑list untouched
+#
+# Notes on structure:
+#   * Keys under [default] configure *behaviour*.
+#   * The [default.extend-words] table enumerates additional valid words.
+#   * The [files] table extends the file‑selection globs.
+
+[default]
+# Ignore any 7‑ to 40‑char hexadecimal sequence (Git commit hashes, object IDs, etc.)
+extend-ignore-re = [
+  "\\b[0-9a-f]{7,40}\\b",
+]
+
+[default.extend-words]
+# ─── New very short tokens triggered by SHA‑splitting or abbreviations ───
+ba = "ba"
+ot = "ot"
+ue = "ue"
+Ot = "Ot"
+Ue = "Ue"
+# ───‑‑‑ Everything you already had follows unchanged ‑‑‑───────────────────
+AES               = "AES"
+CLI               = "CLI"
+CodeQL            = "CodeQL"
+DEPENDABOT        = "DEPENDABOT"
+Dependabot        = "Dependabot"
+DoS               = "DoS"
+ESLint            = "ESLint"
+JS                = "JS"
+LLM               = "LLM"
+NEWREPO           = "NEWREPO"
+OpenAI            = "OpenAI"
+PRD               = "PRD"
+Prettier          = "Prettier"
+PyPI              = "PyPI"
+README            = "README"
+RSA               = "RSA"
+YOURNAME          = "YOURNAME"
+auth              = "auth"
+axel              = "axel"
+"axel's"          = "axel's"
+backend           = "backend"
+cd                = "cd"
+cli               = "cli"
+configs           = "configs"
+dev               = "dev"
+dspace            = "dspace"
+eslint            = "eslint"
+eslintrc          = "eslintrc"
+frictionless      = "frictionless"
+futuroptimist     = "futuroptimist"
+Gabriel           = "Gabriel"
+github            = "github"
+https             = "https"
+idempotency       = "idempotency"
+img               = "img"
+init              = "init"
+io                = "io"
+isort             = "isort"
+json              = "json"
+js                = "js"
+macOS             = "macOS"
+md                = "md"
+npm               = "npm"
+pipx              = "pipx"
+pre               = "pre"
+prettierrc        = "prettierrc"
+"release-drafter" = "release-drafter"
+repo              = "repo"
+repo_manager      = "repo_manager"
+repos             = "repos"
+roadmap           = "roadmap"
+subcommands       = "subcommands"
+subprocess        = "subprocess"
+"token.place"     = "token.place"
+tokenplace        = "tokenplace"
+txt               = "txt"
+wasm              = "wasm"
+yml               = "yml"
+yourorg           = "yourorg"
+YOURREPO          = "YOURREPO"
+styleguides       = "styleguides"
+customizations    = "customizations"
+gabriel           = "gabriel"
+heatmap           = "heatmap"
+llms              = "llms"
+onboarding        = "onboarding"
+runbook           = "runbook"
+Runbook           = "Runbook"
+subcommand        = "subcommand"
+virtualenvs       = "virtualenvs"
+Makefile          = "Makefile"
+YAML              = "YAML"
+solarpunk         = "solarpunk"
+"Futuroptimist's" = "Futuroptimist's"
+LLMs              = "LLMs"
+Anthropic         = "Anthropic"
+democratizedspace = "democratizedspace"
+CLIs              = "CLIs"
+dir               = "dir"
+pio               = "pio"
+testbed           = "testbed"
+uv                = "uv"
+venv              = "venv"
+brightgreen       = "brightgreen"
+SHA               = "SHA"
+YOURTOKEN         = "YOURTOKEN"
+htmlcontent       = "htmlcontent"
+installable       = "installable"
+OpenSCAD          = "OpenSCAD"
+LaTeX             = "LaTeX"
+tfrac             = "tfrac"
+frac              = "frac"
+PETG              = "PETG"
+explainer         = "explainer"
+PLA               = "PLA"
+STL               = "STL"
+retightened       = "retightened"
+http              = "http"
+localhost         = "localhost"
+dropdown          = "dropdown"
+IRL               = "IRL"
+repurpose         = "repurpose"
+config            = "config"
+PRs               = "PRs"
+changelogs        = "changelogs"
+STLs              = "STLs"
+sugarkube         = "sugarkube"
+
+[files]
+# Existing exclusions plus new ones for generated assets
+extend-exclude = [
+  "*.lock",
+  "*.svg",
+  # Ignore all minified or vendor JS – reduces noise massively
+  "**/*.min.js",
+  "webapp/static/js/**",
+]

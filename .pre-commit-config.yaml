@@ -5,6 +5,21 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.0
+    hooks:
+      - id: codespell
+        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,*.svg,webapp/static/js/*"]
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        args: ["--ignore-missing-imports"]
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.7
+    hooks:
+      - id: vulture
+        args: ["token.place", "--min-confidence", "80"]
   - repo: local
     hooks:
       - id: run-checks

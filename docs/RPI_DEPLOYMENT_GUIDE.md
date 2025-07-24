@@ -4,6 +4,24 @@ This guide combines the runbook, k3s cluster instructions and bill of materials 
 It documents how we built a three-node Raspberry Pi 5 cluster for token.place
  and captures some lessons learned along the way.
 
+## ⚡ Quick-Start (Zero-touch Image)
+
+Download `token-place-lite.img.xz` from the [latest GitHub Release](https://github.com/futuroptimist/token.place/releases/latest) and flash it with Raspberry Pi Imager:
+
+```bash
+rpi-imager --config ./imager-config.json token-place-lite.img.xz
+```
+
+<details>
+<summary>What’s inside the image?</summary>
+
+- created user `token`
+- authorised SSH keys (see [`../keys/`](../keys/))
+- pre-installed packages: k3s, cloudflared, docker, python3
+- systemd services: k3s, cloudflared, relay.service
+
+</details>
+
 ## Bill of Materials
 
 - **Raspberry Pi 5** boards (4GB or 8GB RAM)
@@ -103,6 +121,18 @@ into another board.
 3. Clone the running system to that Pi's SSD with `sudo rpi-clone nvme0n1` and
    reboot without the SD card.
 4. Repeat for the third node to end up with a three-Pi k3s cluster.
+
+## Clone SD to SSD in one shot
+
+Run the helper script to flash Raspberry Pi OS and clone it directly to the SSD:
+
+```bash
+scripts/flash_and_clone.sh
+```
+
+The script wraps `rpi-clone` with `-f`, `-U` and `-q` so no prompts appear. A
+fresh clone to a USB SSD usually finishes in **3–4 minutes** while an NVMe drive
+over PCIe completes in **under 2 minutes**.
 
 ### First boot from the SSD
 
@@ -256,50 +286,34 @@ Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/in
 
    Rebooting ensures the new hostname propagates everywhere before installing k3s.
 
-2. **Install k3s on the control-plane node**
+2. **Install k3s with k3sup**
 
-   ```bash
-   curl -sfL https://get.k3s.io | sh -
-   ```
+   Run these commands from your workstation to bootstrap the cluster:
 
-   The command installs the `k3s` service and starts the API server on port 6443. After it finishes,
-   retrieve the join token:
+```bash
+k3sup install --cluster --user token --host pi-1.local
+k3sup join   --server-host pi-1.local --user token --host pi-2.local
+k3sup join   --server-host pi-1.local --user token --host pi-3.local
+```
 
-   ```bash
-   sudo cat /var/lib/rancher/k3s/server/node-token
-   ```
+   The [`../playbooks/site.yml`](../playbooks/site.yml) playbook provides an
+   Ansible equivalent if you prefer automation.
 
-3. **Join additional Pi nodes as agents**
-
-   Run the installer on each extra Pi, pointing it at the control plane:
-
-   ```bash
-   curl -sfL https://get.k3s.io | \
-     K3S_URL=https://<CONTROL_PLANE_IP>:6443 \
-     K3S_TOKEN=<NODE_TOKEN> sh -
-   ```
-
-   Confirm all nodes appear:
-
-   ```bash
-   sudo kubectl get nodes -o wide
-   ```
-
-4. **Build the relay container and load it into the cluster**
+3. **Build the relay container and load it into the cluster**
 
    ```bash
    docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
    sudo k3s ctr images import tokenplace-relay:latest
    ```
 
-5. **Deploy the Kubernetes manifests**
+4. **Deploy the Kubernetes manifests**
 
    ```bash
    kubectl create namespace tokenplace
    kubectl -n tokenplace apply -f k8s/
    ```
 
-6. **Expose the relay service**
+5. **Expose the relay service**
 
    Patch the service to type `NodePort` so `cloudflared` can reach it:
 
@@ -309,7 +323,7 @@ Reboot after editing the file. See the [k3s requirements](https://docs.k3s.io/in
    kubectl -n tokenplace get svc tokenplace-relay
    ```
 
-7. **Create a Cloudflare Tunnel to the NodePort**
+6. **Create a Cloudflare Tunnel to the NodePort**
 
    On the control-plane node:
 
@@ -424,3 +438,16 @@ recommended M.2/NVMe adapters, compatible drives, and the required Pi 5 boot-con
 A 300&nbsp;TBW consumer SSD can withstand decades of typical k3s writes
 (usually under 100&nbsp;GB per year), while even a "Max Endurance" SD card tops out
 around 60&nbsp;TBW. Moving the root filesystem to an SSD greatly reduces wear concerns.
+
+## Non-interactive tweaks
+
+Enable common hardware options from scripts when building your own image:
+
+```bash
+raspi-config nonint do_i2c 0
+raspi-config nonint do_camera 0
+raspi-config nonint do_gpu_mem 256
+```
+
+These commands are already applied in the zero-touch image but remain handy for
+custom pi-gen builds.

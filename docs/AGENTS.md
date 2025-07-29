@@ -128,5 +128,6 @@ For convenience, you can execute all available test suites with `./run_all_tests
 - Install Python dependencies with `pip install -r config/requirements_server.txt` and `pip install -r config/requirements_relay.txt` before running tests. If Playwright tests complain about missing browsers, run `playwright install chromium`.
 - For development and unit testing, also run `pip install -r requirements.txt` to install extra tooling like pytest-playwright, then run `playwright install`.
 - Every pull request triggers the GitHub Actions workflow in `.github/workflows/ci.yml` which runs `./run_all_tests.sh` with coverage enabled and uploads results to Codecov.
+- Tag **@claude** in a pull request or issue to invoke the Claude PR Assistant defined in `.github/workflows/claude.yml`.
 - Ensure the [Codecov GitHub App](https://github.com/marketplace/codecov) is installed on your fork so coverage badges and PR comments work reliably.
 - Real-world integration tests live in the [DSPACE project](https://github.com/democratizedspace/dspace); token.place acts as its OpenAI-compatible backend.

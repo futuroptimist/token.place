@@ -44,6 +44,10 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - **When:** pushes or PRs
 - **Does:** run tests via GitHub Actions
 
+### Claude PR Assistant
+- **When:** you mention `@claude` in a PR or issue
+- **Does:** analyzes your code changes and proposes patches
+
 ### Security Bot
 - **When:** dependency or vulnerability alerts appear
 - **Does:** open PRs to patch them
@@ -51,4 +55,3 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 ### Prompt Agent
 - **When:** you run `flywheel prompt`
 - **Does:** generate context-aware prompts for Codex or other LLM assistants
-

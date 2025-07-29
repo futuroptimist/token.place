@@ -18,6 +18,7 @@ Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python
 - Synergy Bot: spot shared utilities across repos
 - Release Drafter Bot: draft notes on pushes to main
 - CI Bot: run tests on GitHub Actions
+- Claude PR Assistant: tag @claude in PRs or issues for automated help
 - Security Bot: patch dependency alerts
 - Prompt Agent: generate flywheel prompts
 
@@ -26,4 +27,3 @@ Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python
 - Tests live in `tests/` and cover Python, JS, and Playwright
 - Docs in `docs/` with onboarding and style guides
 - See AGENTS.md for the Markdown version of this file
-

@@ -44,6 +44,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - Comprehensive tests and CI via GitHub Actions
 - [AGENTS.md](AGENTS.md) lists repo helpers for LLMs
 - [llms.txt](llms.txt) provides machine-readable context
+- [CLAUDE.md](CLAUDE.md) summarizes Claude integration tips
 
 ## roadmap
 
@@ -365,6 +366,8 @@ TEST_COVERAGE=1 ./run_all_tests.sh
 ```
 If you don't see coverage comments on your pull requests, install the [Codecov GitHub App](https://github.com/marketplace/codecov) on your fork.
 Every pull request automatically runs this test suite in GitHub Actions, so you can rely on the status checks for pass/fail information.
+
+Tag **@claude** in any pull request or issue to invoke the automated Claude PR Assistant for implementation help.
 
 ### Test Categories
 

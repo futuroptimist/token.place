@@ -26,6 +26,15 @@ jobs:
       issues: read
       id-token: write
     steps:
+      - name: Verify API key
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error ::ANTHROPIC_API_KEY not set"
+            exit 1
+          fi
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -34,6 +43,8 @@ jobs:
       - name: Run Claude PR Action
         uses: anthropics/claude-code-action@beta
         with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           timeout_minutes: "60"
           # mode: tag  # Default: responds to @claude mentions
           # Optional: Restrict network access to specific domains only

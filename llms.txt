@@ -1,35 +1,29 @@
 # token.place llms.txt
 
-Secure proxy providing OpenAI-compatible APIs with end-to-end encryption.
-Python servers host local LLMs; a relay obfuscates IPs.
-JavaScript clients handle browser-side crypto.
+Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python servers host local LLMs; a relay obfuscates IPs. JavaScript clients handle browser-side crypto.
 
-## Repo Helpers
-This repo follows the lightweight assistant workflow from flywheel.
-Use these helpers to keep `token.place` healthy.
+## Setup
+- Run `./scripts/setup.sh YOURNAME YOURREPO` after cloning.
 
-### Code Linter Agent
-- **When:** every pull request
-- **Does:** run Python and JavaScript linters and suggest patches
+## Checks
+- `pre-commit run --all-files` before pushing (runs `./run_all_tests.sh`).
 
-### Docs Agent
-- **When:** docs or README change
-- **Does:** spell-check and link-check
+## Coding
+- New JS should use TypeScript, React hooks, and Tailwind CSS.
 
-### Release Drafter
-- **When:** commits land on `main`
-- **Does:** update release notes automatically
-
-### Prompt Agent
-- **When:** you run `flywheel prompt`
-- **Does:** generate context-aware prompts for Codex or other LLMs
-
-Run `pre-commit run --all-files` before pushing. This executes `./run_all_tests.sh` and mirrors CI.
+## Agents
+- Code Linter Agent: PR linting via ESLint/Flake8
+- Docs Agent: spell- and link-check docs updates
+- Quest Generator Agent: scaffold quests on demand
+- Synergy Bot: spot shared utilities across repos
+- Release Drafter Bot: draft notes on pushes to main
+- CI Bot: run tests on GitHub Actions
+- Security Bot: patch dependency alerts
+- Prompt Agent: generate flywheel prompts
 
 ## Development
-- Python 3.12; formatting via pre-commit.
-- Run `pre-commit run --all-files` to execute `./run_all_tests.sh` before pushing.
-- Tests live in `tests/` and cover Python, JS and Playwright flows.
+- Python 3.12 with pre-commit formatting
+- Tests live in `tests/` and cover Python, JS, and Playwright
+- Docs in `docs/` with onboarding and style guides
+- See AGENTS.md for the Markdown version of this file
 
-Docs live in `docs/` with onboarding, style, and architecture guides.
-See [AGENTS.md](AGENTS.md) for a richer Markdown explanation of these helpers.

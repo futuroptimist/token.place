@@ -12,7 +12,7 @@ llama_cpp_python==0.3.14
 MarkupSafe==3.0.2
 numpy==2.0.2
 requests==2.32.4
-tqdm==4.66.1
+tqdm==4.67.1
 typing_extensions==4.14.1
 urllib3==2.1.0
 Werkzeug==3.0.1

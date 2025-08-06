@@ -5,6 +5,9 @@
 [![Coverage](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
 [![Docs](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=docs)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/futuroptimist/token.place)](LICENSE)
+[![Dependabot](https://img.shields.io/badge/dependabot-enabled-brightgreen?logo=dependabot)](https://github.com/futuroptimist/token.place/network/updates)
+[![CodeQL](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml/badge.svg)](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml)
+[![Secret Scanning](https://img.shields.io/badge/secret%20scanning-enabled-brightgreen)](https://docs.github.com/en/code-security/secret-scanning)
 
 Secure peer-to-peer generative AI platform
 
@@ -31,6 +34,15 @@ python server.py
 Open `http://localhost:5000` or run `python client.py`.
 Set `API_RATE_LIMIT` (default `60/hour`) to control per-IP limits. Metrics are
 exposed at `/metrics`.
+
+## CI pass criteria
+
+All pull requests must:
+
+- run `pre-commit run --all-files`
+- pass `pytest -q tests/test_security.py`
+- pass `bandit -r tokenplace -lll` with no medium or high findings
+- keep Dependabot, CodeQL, and secret-scanning badges in this README
 
 # vision
 There are tons of personal computers and homelabs out there with lots of compute that remain idle. This project aims to create a marketplace of people with spare compute and people with needs for compute. Note that this is not a financial marketplace -- this is intended to be a public good. If it takes off is anyone's guess, but I'll donate whatever compute I can in the meantime once this is up and running.

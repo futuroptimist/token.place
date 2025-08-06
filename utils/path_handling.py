@@ -22,7 +22,11 @@ def get_app_data_dir() -> pathlib.Path:
     - Linux: ~/.local/share/token.place
     """
     if IS_WINDOWS:
-        base_dir = pathlib.Path(os.environ.get('APPDATA', ''))
+        appdata = os.environ.get('APPDATA')
+        if appdata:
+            base_dir = pathlib.Path(appdata)
+        else:
+            base_dir = get_user_home_dir() / 'AppData' / 'Roaming'
     elif IS_MACOS:
         base_dir = get_user_home_dir() / 'Library' / 'Application Support'
     else:  # Linux and other Unix-like
@@ -50,7 +54,11 @@ def get_cache_dir() -> pathlib.Path:
     - Linux: ~/.cache/token.place
     """
     if IS_WINDOWS:
-        base_dir = pathlib.Path(os.environ.get('LOCALAPPDATA', ''))
+        local_appdata = os.environ.get('LOCALAPPDATA')
+        if local_appdata:
+            base_dir = pathlib.Path(local_appdata)
+        else:
+            base_dir = get_user_home_dir() / 'AppData' / 'Local'
         return base_dir / 'token.place' / 'cache'
     elif IS_MACOS:
         return get_user_home_dir() / 'Library' / 'Caches' / 'token.place'

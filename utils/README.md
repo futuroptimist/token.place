@@ -7,6 +7,7 @@ This directory contains utility modules for token.place that provide reusable fu
 ### Path Handling (`path_handling.py`)
 
 Cross-platform path handling utilities that ensure consistent behavior across Windows, macOS, and Linux.
+These helpers now fall back to standard `AppData` locations when Windows environment variables are missing.
 
 ### Crypto Helpers (`crypto_helpers.py`)
 

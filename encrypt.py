@@ -174,11 +174,11 @@ def pkcs7_unpad(padded_data: bytes, block_size: int) -> bytes:
     """
     Remove PKCS#7 padding
     """
-    padding_length = padded_data[-1]
-    if padding_length > block_size:
+    if not padded_data:
         raise ValueError("Invalid padding")
-    # Verify padding
-    for i in range(1, padding_length + 1):
-        if padded_data[-i] != padding_length:
-            raise ValueError("Invalid padding")
+    padding_length = padded_data[-1]
+    if padding_length == 0 or padding_length > block_size:
+        raise ValueError("Invalid padding")
+    if padded_data[-padding_length:] != bytes([padding_length]) * padding_length:
+        raise ValueError("Invalid padding")
     return padded_data[:-padding_length]

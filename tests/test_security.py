@@ -5,23 +5,22 @@ These tests verify the security properties of the encryption implementation
 by testing for common vulnerabilities and ensuring proper cryptographic practices.
 """
 
-import pytest
 import base64
 import os
 import sys
-import hashlib
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Tuple
+
+import pytest
 
 # Add the project root to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import the modules to test
-from encrypt import generate_keys, encrypt, decrypt
+from encrypt import decrypt, encrypt, generate_keys
 from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
 class TestEncryptionSecurity:
@@ -237,4 +236,12 @@ class TestEncryptionSecurity:
         result = decrypt(modified_dict, cipherkey, private_key)
         
         # Either decryption should fail (result is None) or the result should be different from the original
-        assert result is None or result != plaintext, "Modified ciphertext should not decrypt to original plaintext" 
+        assert result is None or result != plaintext, "Modified ciphertext should not decrypt to original plaintext"
+
+    def test_readme_has_security_badges(self):
+        """Ensure README lists security-related badges."""
+        readme_path = Path(__file__).resolve().parent.parent / "README.md"
+        content = readme_path.read_text().lower()
+        assert "dependabot" in content
+        assert "codeql" in content
+        assert "secret%20scanning" in content

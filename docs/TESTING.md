@@ -28,6 +28,9 @@ Unit tests verify individual components in isolation. Run with:
 python -m pytest tests/unit/
 ```
 
+These tests cover numerous edge cases, including rejection of invalid PKCS#7 padding
+such as zero-length padding, ensuring token.place's cryptography remains robust.
+
 ### Integration Tests
 
 Integration tests verify that components work together correctly:

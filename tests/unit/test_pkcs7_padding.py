@@ -21,3 +21,10 @@ def test_unpad_padding_too_long():
     padded = b"abc" + b"\x11" * 17  # block size 16, padding byte 17 (>16)
     with pytest.raises(ValueError):
         pkcs7_unpad(padded, 16)
+
+
+def test_unpad_zero_padding():
+    """Zero-length padding should be rejected."""
+    padded = b"data" + b"\x00"
+    with pytest.raises(ValueError):
+        pkcs7_unpad(padded, 16)

@@ -42,6 +42,17 @@ def test_paths_windows(tmp_path):
             assert ph.get_executable_extension() == '.exe'
 
 
+def test_paths_windows_missing_env():
+    with mock.patch('platform.system', return_value='Windows'):
+        with mock.patch.dict(os.environ, {'APPDATA': '', 'LOCALAPPDATA': ''}, clear=False):
+            import utils.path_handling as ph
+            importlib.reload(ph)
+            home = Path.home()
+            assert ph.get_app_data_dir() == home / 'AppData' / 'Roaming' / 'token.place'
+            assert ph.get_config_dir() == home / 'AppData' / 'Roaming' / 'token.place' / 'config'
+            assert ph.get_cache_dir() == home / 'AppData' / 'Local' / 'token.place' / 'cache'
+
+
 def test_paths_macos(tmp_path):
     with mock.patch('platform.system', return_value='Darwin'):
         import utils.path_handling as ph

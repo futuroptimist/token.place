@@ -14,3 +14,7 @@ This document captures incremental improvements to `token.place` over time. Add 
 - `api/__init__.py` now initializes rate limiting and metrics.
 - README expanded with quickstart instructions, architecture link, and environment variable notes.
 - Kubernetes documentation mentions production-ready probes and resources.
+
+## [2025-08-06]
+### Changed
+- Windows path helpers now default to `AppData` directories when environment variables are missing.

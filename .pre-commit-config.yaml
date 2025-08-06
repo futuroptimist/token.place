@@ -9,7 +9,7 @@ repos:
     rev: v2.4.0
     hooks:
       - id: codespell
-        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,*.svg,webapp/static/js/*"]
+        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,package-lock.json,*.svg,webapp/static/js/*"]
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.10.0
     hooks:
@@ -19,7 +19,7 @@ repos:
     rev: v2.7
     hooks:
       - id: vulture
-        args: ["token.place", "--min-confidence", "80"]
+        args: [".", "--min-confidence", "80"]
   - repo: local
     hooks:
       - id: run-checks

@@ -27,7 +27,7 @@ def get_app_data_dir() -> pathlib.Path:
         base_dir = get_user_home_dir() / 'Library' / 'Application Support'
     else:  # Linux and other Unix-like
         base_dir = get_user_home_dir() / '.local' / 'share'
-    
+
     return base_dir / 'token.place'
 
 def get_config_dir() -> pathlib.Path:
@@ -73,9 +73,12 @@ def get_logs_dir() -> pathlib.Path:
 def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
     """
     Ensure a directory exists, creating it if necessary.
+    Raises NotADirectoryError if the path points to an existing file.
     Returns the path as a pathlib.Path object.
     """
     path = pathlib.Path(dir_path)
+    if path.exists() and not path.is_dir():
+        raise NotADirectoryError(f"{path} exists and is not a directory")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -97,9 +100,9 @@ def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[
         base_path = pathlib.Path.cwd()
     else:
         base_path = normalize_path(base_path)
-    
+
     try:
         return path.relative_to(base_path)
     except ValueError:
         # If path is not relative to base_path, return the absolute path
-        return path 
+        return path

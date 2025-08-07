@@ -90,7 +90,7 @@ Some tests (particularly Playwright tests) require additional setup or running s
    ```
 5. All Node.js dependencies installed:
    ```bash
-   npm install
+    npm ci
    ```
 
 ## Test Configuration
@@ -166,4 +166,4 @@ To generate a test coverage report:
 python -m pytest --cov=. --cov-report=html
 ```
 
-The HTML report will be available in the `htmlcov` directory. 
+The HTML report will be available in the `htmlcov` directory.

@@ -116,6 +116,7 @@ during tests or `https://token.place/v1` in production.
 **User Journey**: Users run token.place on different operating systems.
 
 **Test Files**:
+- `tests/unit/test_path_handling.py` - Quick checks for path utilities on each OS
 - `tests/platform_tests/test_path_handling.py` - Tests path handling across platforms
 - `tests/platform_tests/test_config.py` - Tests configuration loading on different platforms
 
@@ -158,7 +159,7 @@ The Visual Verification framework captures and compares screenshots of the UI to
 ### How Visual Verification Works
 
 1. The framework captures screenshots of key UI states
-2. These screenshots are compared with baseline images 
+2. These screenshots are compared with baseline images
 3. Differences are highlighted and quantified
 4. A visual report is generated
 
@@ -265,4 +266,4 @@ python -m pytest tests/test_security.py
 ## Additional Resources
 
 - [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md) - Detailed ideas for test improvements
-- [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation 
+- [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation

@@ -9,7 +9,8 @@ This directory contains utility modules for token.place that provide reusable fu
 Cross-platform path handling utilities that ensure consistent behavior across Windows, macOS, and Linux.
 These helpers now fall back to standard `AppData` locations when Windows environment variables are missing.
 
-- `ensure_dir_exists(path)`: Creates the directory if missing and raises `NotADirectoryError` when the path points to an existing file.
+- `ensure_dir_exists(path)`: Creates the directory if missing (expands `~` to the user's home) and raises
+  `NotADirectoryError` when the path points to an existing file.
 
 ### Crypto Helpers (`crypto_helpers.py`)
 

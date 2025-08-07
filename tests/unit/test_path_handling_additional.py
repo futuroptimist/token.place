@@ -1,4 +1,6 @@
+import importlib
 import pathlib
+import platform
 import pytest
 from utils import path_handling as ph
 
@@ -41,3 +43,14 @@ def test_get_relative_path_default_base(tmp_path, monkeypatch):
     sub.mkdir()
     result = ph.get_relative_path(sub)
     assert result == pathlib.Path("sub")
+
+
+def test_get_app_data_dir_creates_directory(tmp_path, monkeypatch):
+    """get_app_data_dir should ensure the directory exists"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    importlib.reload(ph)
+    app_dir = ph.get_app_data_dir()
+    expected = tmp_path / ".local" / "share" / "token.place"
+    assert app_dir == expected
+    assert app_dir.exists()

@@ -13,7 +13,7 @@ def test_fetch_server_public_key():
         mock_requests.get.return_value = resp
         client = CryptoClient('https://example.com')
         assert client.fetch_server_public_key()
-        mock_requests.get.assert_called_with('https://example.com/next_server')
+        mock_requests.get.assert_called_with('https://example.com/next_server', timeout=10)
         assert client.server_public_key is not None
 
 

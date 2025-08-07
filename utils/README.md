@@ -15,6 +15,10 @@ These helpers now fall back to standard `AppData` locations when Windows environ
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
 
+Network requests in this module now use a default 10 second timeout to prevent
+hanging connections. You can override this by passing a `timeout` argument to
+`CryptoClient.fetch_server_public_key` or `CryptoClient.send_encrypted_message`.
+
 ## Crypto Helpers
 
 The `CryptoClient` class provides a high-level abstraction over the encryption/decryption process, making it easy to:

@@ -34,7 +34,7 @@ Thank you for your interest in contributing to token.place! This document provid
 
 4. Install Node.js dependencies:
    ```bash
-   npm install
+    npm ci
    ```
 
 5. Set up pre-commit hooks:

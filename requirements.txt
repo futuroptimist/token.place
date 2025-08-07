@@ -36,4 +36,4 @@ pytest-mock               # Mocking utilities
 pytest-benchmark==5.1.0   # Performance benchmarking, requires pytest>=8.1
 
 # JavaScript test dependencies
-# Note: Install these with npm install
+# Note: Install these with npm ci

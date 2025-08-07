@@ -10,7 +10,7 @@ Before running the tests, install the required Python and Node.js dependencies a
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
 pip install -r requirements.txt
-npm install
+ npm ci
 playwright install
 ```
 
@@ -158,7 +158,7 @@ The Visual Verification framework captures and compares screenshots of the UI to
 ### How Visual Verification Works
 
 1. The framework captures screenshots of key UI states
-2. These screenshots are compared with baseline images 
+2. These screenshots are compared with baseline images
 3. Differences are highlighted and quantified
 4. A visual report is generated
 
@@ -265,4 +265,4 @@ python -m pytest tests/test_security.py
 ## Additional Resources
 
 - [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md) - Detailed ideas for test improvements
-- [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation 
+- [tests/visual_verification/README.md](../tests/visual_verification/README.md) - Visual verification framework documentation

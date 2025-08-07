@@ -145,7 +145,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 1. **Create NPM Client Package**:
    ```javascript
    // token.place-client/index.js
-   
+
    class TokenPlaceClient {
      constructor(config = {}) {
       // token.place exposes both `/api/v1` and `/v1` for OpenAI compatibility
@@ -153,7 +153,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
        this.clientKeys = null;
        this.serverPublicKey = null;
      }
-     
+
      async initialize() {
        // Generate client keys
        this.clientKeys = await window.crypto.subtle.generateKey(
@@ -161,104 +161,104 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
          true,
          ['encrypt', 'decrypt']
        );
-       
+
        // Fetch server public key
        const response = await fetch(`${this.baseUrl}/public-key`);
        const data = await response.json();
        this.serverPublicKey = data.public_key;
-       
+
        return true;
      }
-     
+
      // Implement OpenAI-compatible methods
      async createChatCompletion(params) {
        // Encrypt messages if encryption is enabled
        const encryptedParams = await this.encryptParams(params);
-       
+
        // Send to token.place server
        const response = await fetch(`${this.baseUrl}/chat/completions`, {
          method: 'POST',
          headers: { 'Content-Type': 'application/json' },
          body: JSON.stringify(encryptedParams)
        });
-       
+
        // Handle response (decrypt if necessary)
        const data = await response.json();
        return this.encrypted ? await this.decryptResponse(data) : data;
      }
-     
+
      // Additional methods as needed
    }
-   
+
    module.exports = TokenPlaceClient;
    ```
 
 2. **Create Test Configuration Script**:
    ```javascript
    // integration_tests/setup.js
-   
+
    const { spawn } = require('child_process');
    const path = require('path');
    const fs = require('fs');
-   
+
    // Custom ports to avoid conflicts
    const TOKEN_PLACE_PORT = 5555;
    const DSPACE_PORT = 4444;
-   
+
    async function startTokenPlace() {
      console.log('Starting token.place server...');
      const tokenPlaceServer = spawn('python', ['server.py', `--port=${TOKEN_PLACE_PORT}`], {
        cwd: path.join(__dirname, 'token.place'),
        env: { ...process.env, USE_MOCK_LLM: '1' },
      });
-     
+
      // Log output
      tokenPlaceServer.stdout.on('data', (data) => console.log(`token.place: ${data}`));
      tokenPlaceServer.stderr.on('data', (data) => console.error(`token.place error: ${data}`));
-     
+
      return tokenPlaceServer;
    }
-   
+
    async function startDspace() {
      console.log('Starting DSPACE app...');
-     
+
      // Replace OpenAI client with token.place client
      const openaiPath = path.join(__dirname, 'dspace/src/lib/openai.js');
      const openaiContent = fs.readFileSync(openaiPath, 'utf8');
-     
+
      // Backup original file
      fs.writeFileSync(`${openaiPath}.bak`, openaiContent);
-     
+
      // Replace with token.place client
      const tokenPlaceCode = `
        import TokenPlaceClient from '../../../token.place-client';
-       
+
       const client = new TokenPlaceClient({
         // use /v1 so the OpenAI client works with token.place directly
         baseUrl: 'http://localhost:${TOKEN_PLACE_PORT}/v1',
         // Add any other configuration options
       });
-       
+
        // Initialize the client
        await client.initialize();
-       
+
        export default client;
      `;
-     
+
      fs.writeFileSync(openaiPath, tokenPlaceCode);
-     
+
      // Start DSPACE
      const dspaceServer = spawn('npm', ['run', 'dev', '--', `--port=${DSPACE_PORT}`], {
        cwd: path.join(__dirname, 'dspace'),
      });
-     
+
      // Log output
      dspaceServer.stdout.on('data', (data) => console.log(`DSPACE: ${data}`));
      dspaceServer.stderr.on('data', (data) => console.error(`DSPACE error: ${data}`));
-     
+
      return dspaceServer;
    }
-   
+
    // Cleanup function
    function cleanup(servers) {
      servers.forEach(server => {
@@ -266,7 +266,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
          process.kill(server.pid);
        }
      });
-     
+
      // Restore original OpenAI file
      const openaiPath = path.join(__dirname, 'dspace/src/lib/openai.js');
      if (fs.existsSync(`${openaiPath}.bak`)) {
@@ -274,7 +274,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
        fs.unlinkSync(`${openaiPath}.bak`);
      }
    }
-   
+
    // Export setup and teardown functions
    module.exports = {
      startTokenPlace,
@@ -288,59 +288,59 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 3. **Create Integration Test**:
    ```javascript
    // integration_tests/test_dspace_integration.js
-   
+
    const { startTokenPlace, startDspace, cleanup, DSPACE_PORT } = require('./setup');
    const { Builder, By } = require('selenium-webdriver');
    const assert = require('assert');
-   
+
    describe('DSPACE Integration Test', function() {
      this.timeout(60000); // Set longer timeout
-     
+
      let tokenPlaceServer;
      let dspaceServer;
      let driver;
-     
+
      before(async function() {
        // Start both servers
        tokenPlaceServer = await startTokenPlace();
        dspaceServer = await startDspace();
-       
+
        // Wait for servers to initialize
        await new Promise(resolve => setTimeout(resolve, 10000));
-       
+
        // Initialize Selenium WebDriver
        driver = await new Builder().forBrowser('chrome').build();
      });
-     
+
      after(async function() {
        // Clean up
        if (driver) await driver.quit();
        cleanup([tokenPlaceServer, dspaceServer]);
      });
-     
+
      it('should load DSPACE and send chat messages through token.place', async function() {
        // Navigate to DSPACE
        await driver.get(`http://localhost:${DSPACE_PORT}`);
-       
+
        // Wait for page to load
        await driver.sleep(2000);
-       
+
        // Find chat input and send a message
        const chatInput = await driver.findElement(By.id('chat-input'));
        await chatInput.sendKeys('Tell me about space exploration');
        await chatInput.submit();
-       
+
        // Wait for response
        await driver.sleep(5000);
-       
+
        // Verify response exists
        const chatMessages = await driver.findElements(By.className('chat-message'));
        assert(chatMessages.length >= 2, 'Expected at least a request and response message');
-       
+
        // Verify response content
        const responseText = await chatMessages[chatMessages.length - 1].getText();
        assert(responseText.length > 0, 'Expected non-empty response');
-       assert(responseText.toLowerCase().includes('space') || 
+       assert(responseText.toLowerCase().includes('space') ||
               responseText.toLowerCase().includes('exploration'),
               'Expected response to be relevant to the prompt');
      });
@@ -351,21 +351,21 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    ```bash
    #!/bin/bash
    # integration_tests/run_dspace_integration.sh
-   
+
    # Current directory
    DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-   
+
    # Check if directories exist, clone if not
    if [ ! -d "$DIR/token.place" ]; then
      echo "Cloning token.place repository..."
      git clone https://github.com/futuroptimist/token.place.git "$DIR/token.place"
    fi
-   
+
    if [ ! -d "$DIR/dspace" ]; then
      echo "Cloning DSPACE repository..."
      git clone https://github.com/democratizedspace/dspace.git -b v3 "$DIR/dspace"
    fi
-   
+
    # Setup Python environment for token.place
    cd "$DIR/token.place"
    if [ ! -d "env" ]; then
@@ -377,14 +377,14 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    else
      source env/bin/activate
    fi
-   
+
    # Setup Node environment for DSPACE
    cd "$DIR/dspace"
    if [ ! -d "node_modules" ]; then
      echo "Installing DSPACE dependencies..."
-     npm install
+      npm ci
    fi
-   
+
    # Setup token.place client package
    cd "$DIR"
    if [ ! -d "token.place-client" ]; then
@@ -399,23 +399,23 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
          "node-fetch": "^2.6.7"
        }
      }' > token.place-client/package.json
-     
+
      # Install dependencies
      cd token.place-client
-     npm install
-     
+      npm ci
+
      # Create the client library (implementation details in the JavaScript example above)
      echo "// token.place client implementation..." > index.js
    fi
-   
+
    # Run the integration tests
    cd "$DIR"
    echo "Running integration tests..."
    mocha test_dspace_integration.js
-   
+
    # Deactivate virtual environment
    deactivate
-   
+
    echo "Integration tests completed."
    ```
 
@@ -447,4 +447,4 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 - Integrate with CI/CD to run tests automatically
 - Consider using docker containers for browser and integration tests
 - Implement stress tests for production readiness
-- Add documentation for each test type 
+- Add documentation for each test type

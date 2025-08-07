@@ -84,7 +84,8 @@ def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
     Raises NotADirectoryError if the path points to an existing file.
     Returns the path as a pathlib.Path object.
     """
-    path = pathlib.Path(dir_path)
+    # Expand user home (~) and normalize to an absolute path
+    path = pathlib.Path(dir_path).expanduser().resolve()
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
     path.mkdir(parents=True, exist_ok=True)

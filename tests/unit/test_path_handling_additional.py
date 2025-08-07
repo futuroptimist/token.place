@@ -17,6 +17,15 @@ def test_ensure_dir_exists_file(tmp_path):
         ph.ensure_dir_exists(file_path)
 
 
+def test_ensure_dir_exists_expands_user(tmp_path, monkeypatch):
+    """ensure_dir_exists should expand '~' to the user's home directory"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path_with_tilde = "~/nested"
+    result = ph.ensure_dir_exists(path_with_tilde)
+    assert result == tmp_path / "nested"
+    assert result.exists()
+
+
 def test_get_relative_path_not_relative(tmp_path):
     a = tmp_path / "a"
     b = tmp_path / "b"

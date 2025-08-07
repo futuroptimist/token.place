@@ -31,8 +31,7 @@ def get_app_data_dir() -> pathlib.Path:
         base_dir = get_user_home_dir() / 'Library' / 'Application Support'
     else:  # Linux and other Unix-like
         base_dir = get_user_home_dir() / '.local' / 'share'
-
-    return base_dir / 'token.place'
+    return ensure_dir_exists(base_dir / 'token.place')
 
 def get_config_dir() -> pathlib.Path:
     """
@@ -42,9 +41,9 @@ def get_config_dir() -> pathlib.Path:
     - Linux: ~/.config/token.place
     """
     if IS_WINDOWS or IS_MACOS:
-        return get_app_data_dir() / 'config'
+        return ensure_dir_exists(get_app_data_dir() / 'config')
     else:  # Linux and other Unix-like
-        return get_user_home_dir() / '.config' / 'token.place'
+        return ensure_dir_exists(get_user_home_dir() / '.config' / 'token.place')
 
 def get_cache_dir() -> pathlib.Path:
     """
@@ -59,24 +58,24 @@ def get_cache_dir() -> pathlib.Path:
             base_dir = pathlib.Path(local_appdata)
         else:
             base_dir = get_user_home_dir() / 'AppData' / 'Local'
-        return base_dir / 'token.place' / 'cache'
+        return ensure_dir_exists(base_dir / 'token.place' / 'cache')
     elif IS_MACOS:
-        return get_user_home_dir() / 'Library' / 'Caches' / 'token.place'
+        return ensure_dir_exists(get_user_home_dir() / 'Library' / 'Caches' / 'token.place')
     else:  # Linux and other Unix-like
-        return get_user_home_dir() / '.cache' / 'token.place'
+        return ensure_dir_exists(get_user_home_dir() / '.cache' / 'token.place')
 
 def get_models_dir() -> pathlib.Path:
     """Get the directory for storing downloaded models."""
-    return get_app_data_dir() / 'models'
+    return ensure_dir_exists(get_app_data_dir() / 'models')
 
 def get_logs_dir() -> pathlib.Path:
     """Get the directory for storing log files."""
     if IS_WINDOWS:
-        return get_app_data_dir() / 'logs'
+        return ensure_dir_exists(get_app_data_dir() / 'logs')
     elif IS_MACOS:
-        return get_user_home_dir() / 'Library' / 'Logs' / 'token.place'
+        return ensure_dir_exists(get_user_home_dir() / 'Library' / 'Logs' / 'token.place')
     else:  # Linux and other Unix-like
-        return get_user_home_dir() / '.local' / 'state' / 'token.place' / 'logs'
+        return ensure_dir_exists(get_user_home_dir() / '.local' / 'state' / 'token.place' / 'logs')
 
 def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
     """

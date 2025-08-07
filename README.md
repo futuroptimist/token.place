@@ -31,9 +31,15 @@ python relay.py
 python server.py
 ```
 
-Open `http://localhost:5000` or run `python client.py`.
-Set `API_RATE_LIMIT` (default `60/hour`) to control per-IP limits. Metrics are
-exposed at `/metrics`.
+Open `http://localhost:5000` or run `python client.py`. Metrics are exposed at `/metrics`.
+
+### Key environment variables
+
+| Variable        | Default     | Description                        |
+|-----------------|-------------|------------------------------------|
+| API_RATE_LIMIT  | 60/hour     | Per-IP request limit               |
+| USE_MOCK_LLM    | 0           | Use mock LLM instead of real model |
+| TOKEN_PLACE_ENV | development | Runtime environment name           |
 
 | Variable        | Default     | Description                                                   |
 |-----------------|-------------|---------------------------------------------------------------|

@@ -3,10 +3,11 @@ import os
 from pathlib import Path
 from unittest import mock
 
+import utils.path_handling as ph
+
 
 def test_paths_linux(tmp_path):
     with mock.patch('platform.system', return_value='Linux'):
-        import utils.path_handling as ph
         importlib.reload(ph)
         home = Path.home()
         assert ph.get_app_data_dir() == home / '.local' / 'share' / 'token.place'
@@ -32,7 +33,6 @@ def test_paths_windows(tmp_path):
     }
     with mock.patch('platform.system', return_value='Windows'):
         with mock.patch.dict(os.environ, env, clear=False):
-            import utils.path_handling as ph
             importlib.reload(ph)
             base = Path(env['APPDATA'])
             assert ph.get_app_data_dir() == base / 'token.place'
@@ -45,7 +45,6 @@ def test_paths_windows(tmp_path):
 def test_paths_windows_missing_env():
     with mock.patch('platform.system', return_value='Windows'):
         with mock.patch.dict(os.environ, {'APPDATA': '', 'LOCALAPPDATA': ''}, clear=False):
-            import utils.path_handling as ph
             importlib.reload(ph)
             home = Path.home()
             assert ph.get_app_data_dir() == home / 'AppData' / 'Roaming' / 'token.place'
@@ -55,7 +54,6 @@ def test_paths_windows_missing_env():
 
 def test_paths_macos(tmp_path):
     with mock.patch('platform.system', return_value='Darwin'):
-        import utils.path_handling as ph
         importlib.reload(ph)
         home = Path.home()
         assert ph.get_app_data_dir() == home / 'Library' / 'Application Support' / 'token.place'

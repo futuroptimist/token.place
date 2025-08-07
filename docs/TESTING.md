@@ -116,6 +116,7 @@ during tests or `https://token.place/v1` in production.
 **User Journey**: Users run token.place on different operating systems.
 
 **Test Files**:
+- `tests/unit/test_path_handling.py` - Quick checks for path utilities on each OS
 - `tests/platform_tests/test_path_handling.py` - Tests path handling across platforms
 - `tests/platform_tests/test_config.py` - Tests configuration loading on different platforms
 

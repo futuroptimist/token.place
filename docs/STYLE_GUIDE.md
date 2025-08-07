@@ -33,6 +33,7 @@ Examples:
 - In variable names, use `tokenPlace` (camelCase) or `token_place` (snake_case) depending on the language conventions.
 - In class names, use `TokenPlace` (PascalCase).
 - For file names, use `token_place` (snake_case) for Python files and `tokenPlace` (camelCase) for JavaScript files.
+- In comments and docstrings, refer to the project as `token.place`.
 
 Examples:
 ```python
@@ -84,4 +85,4 @@ When referring to versions of `token.place`:
 - Use semantic versioning (MAJOR.MINOR.PATCH)
 - Reference versions as `token.place v1.0.0` not `Token.place Version 1.0.0`
 
-By following these guidelines, we ensure consistent presentation of the `token.place` brand across all platforms and materials. 
+By following these guidelines, we ensure consistent presentation of the `token.place` brand across all platforms and materials.

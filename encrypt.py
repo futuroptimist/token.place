@@ -36,30 +36,30 @@ def generate_keys() -> Tuple[bytes, bytes]:
         key_size=RSA_KEY_SIZE,
         backend=default_backend()
     )
-    
+
     # Get private key in PEM format
     private_key_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
-    
+
     # Get public key in PEM format
     public_key_pem = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo
     )
-    
+
     return private_key_pem, public_key_pem
 
 def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False) -> Tuple[Dict[str, bytes], bytes, bytes]:
     """
     Encrypt plaintext using AES-CBC with a random key, then encrypt that key with RSA.
-    
+
     Args:
         plaintext: The data to encrypt
         public_key_pem: RSA public key in PEM format
-        
+
     Returns:
         Tuple (ciphertext_dict, encrypted_key, iv)
         - ciphertext_dict: Dictionary with 'ciphertext' and 'iv' keys
@@ -68,27 +68,27 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
     """
     # Generate a random AES key
     aes_key = secrets.token_bytes(AES_KEY_SIZE)  # 256-bit key
-    
+
     # Generate a random IV
     iv = secrets.token_bytes(IV_SIZE)  # 128-bit IV for AES
-    
+
     # Encrypt the plaintext with AES-CBC
     cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
-    
+
     # We need to pad the plaintext to a multiple of 16 bytes
     padded_data = pkcs7_pad(plaintext, 16)
     ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-    
+
     # Now encrypt the AES key with RSA
     public_key = serialization.load_pem_public_key(
         public_key_pem,
         backend=default_backend()
     )
-    
+
     # For compatibility with JSEncrypt, convert the AES key to Base64 first
     aes_key_b64 = base64.b64encode(aes_key)
-    
+
     # Encrypt the Base64 representation of the key
     if use_pkcs1v15:
         encrypted_key = public_key.encrypt(
@@ -104,18 +104,18 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
                 label=None,
             )
         )
-    
+
     return {'ciphertext': ciphertext, 'iv': iv}, encrypted_key, iv
 
 def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key_pem: bytes) -> Optional[bytes]:
     """
     Decrypt ciphertext that was encrypted with the encrypt function.
-    
+
     Args:
         ciphertext_dict: Dictionary with 'ciphertext' and 'iv'
         encrypted_key: The AES key encrypted with RSA
         private_key_pem: RSA private key in PEM format
-        
+
     Returns:
         Decrypted plaintext or None if decryption fails
     """
@@ -126,7 +126,7 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
             password=None,
             backend=default_backend()
         )
-        
+
         # Decrypt the encrypted AES key. Try OAEP first, then fall back to PKCS1v15 for JS compatibility
         try:
             aes_key_b64 = private_key.decrypt(
@@ -142,19 +142,19 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
                 encrypted_key,
                 asymmetric_padding.PKCS1v15()
             )
-        
+
         # Decode the Base64 to get the actual AES key
         aes_key = base64.b64decode(aes_key_b64)
-        
+
         # Get the ciphertext and IV
         ciphertext = ciphertext_dict['ciphertext']
         iv = ciphertext_dict['iv']
-        
+
         # Decrypt the ciphertext using AES-CBC
         cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
         decryptor = cipher.decryptor()
         padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-        
+
         # Remove padding
         plaintext = pkcs7_unpad(padded_plaintext, 16)
         return plaintext
@@ -176,6 +176,8 @@ def pkcs7_unpad(padded_data: bytes, block_size: int) -> bytes:
     """
     if not padded_data:
         raise ValueError("Invalid padding")
+    if len(padded_data) % block_size != 0:
+        raise ValueError("Invalid padding length")
     padding_length = padded_data[-1]
     if padding_length == 0 or padding_length > block_size:
         raise ValueError("Invalid padding")

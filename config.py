@@ -27,7 +27,7 @@ logger = logging.getLogger('config')
 DEFAULT_CONFIG = {
     # Server settings
     'server': {
-        'host': '0.0.0.0',
+        'host': '127.0.0.1',
         'port': 5000,
         'debug': False,
         'workers': 4,
@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     
     # Relay settings
     'relay': {
-        'host': '0.0.0.0',
+        'host': '127.0.0.1',
         'port': 5000,
         'server_url': 'http://localhost:5000',
         'workers': 2,
@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
     
     # API settings
     'api': {
-        'host': '0.0.0.0',
+        'host': '127.0.0.1',
         'port': 3000,
         'relay_url': 'http://localhost:5000',
         'cors_origins': ['*'],
@@ -121,6 +121,13 @@ ENV_OVERRIDES = {
         'server': {
             'debug': False,
             'workers': 8,
+            'host': os.environ.get('PROD_SERVER_HOST', '127.0.0.1'),
+        },
+        'relay': {
+            'host': os.environ.get('PROD_RELAY_HOST', '127.0.0.1'),
+        },
+        'api': {
+            'host': os.environ.get('PROD_API_HOST', '127.0.0.1'),
         },
         'security': {
             'encryption_enabled': True,

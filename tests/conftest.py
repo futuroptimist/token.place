@@ -176,7 +176,7 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
     relay_ready = False
     for _ in range(15):  # Try for 15 seconds
         try:
-            response = requests.get(f"{E2E_BASE_URL}/")
+            response = requests.get(f"{E2E_BASE_URL}/", timeout=10)
             if response.status_code == 200:
                 relay_ready = True
                 print("✓ Relay server is running")
@@ -211,7 +211,7 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
     server_registered = False
     for _ in range(30):  # 30 seconds timeout
         try:
-            response = requests.get(f"{E2E_BASE_URL}/next_server")
+            response = requests.get(f"{E2E_BASE_URL}/next_server", timeout=10)
             if response.status_code == 200 and response.json().get('server_public_key'):
                 server_registered = True
                 print("✓ Server registered with relay")

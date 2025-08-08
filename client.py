@@ -221,8 +221,6 @@ class ChatClient:
                         encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
                         iv = base64.b64decode(data['iv'])
                         cipherkey = base64.b64decode(data['cipherkey'])
-                        print(f"Received cipherkey: {cipherkey}")
-                        print(f"Received IV: {iv}")
                         decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, self.private_key)
 
                         if decrypted_chat_history is not None:

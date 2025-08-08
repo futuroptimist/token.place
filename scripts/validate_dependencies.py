@@ -15,14 +15,17 @@ from pathlib import Path
 
 def run_command(cmd, cwd=None):
     """Run a command and return success status and output."""
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
     try:
         result = subprocess.run(
+=======
             cmd if isinstance(cmd, list) else shlex.split(cmd),
             shell=False,
             capture_output=True,
             text=True,
             cwd=cwd,
-            check=False
+            check=False,
         )
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:

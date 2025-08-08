@@ -11,6 +11,7 @@ import time
 # Parse command line arguments early to set environment variables before imports
 parser = argparse.ArgumentParser(description="token.place relay server")
 parser.add_argument("--port", type=int, default=5010, help="Port to run the relay server on")
+parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind the relay server")
 parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
 
 if __name__ == "__main__":  # pragma: no cover
@@ -84,7 +85,7 @@ def inference():
     url = 'http://localhost:3000/'
 
     # Forward the POST request to the other service and get the response
-    response = requests.post(url, json=data)
+    response = requests.post(url, json=data, timeout=10)
 
     # Return the response received from the other service to the client
     return jsonify(response.json()), response.status_code
@@ -250,4 +251,4 @@ def retrieve():
         return jsonify({'error': 'No response available for the given public key'}), 200
 
 if __name__ == '__main__':  # pragma: no cover
-    app.run(host='0.0.0.0', port=args.port)
+    app.run(host=args.host, port=args.port)

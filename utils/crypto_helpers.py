@@ -213,7 +213,7 @@ class CryptoClient:
 
             if response.status_code != 200:
                 logger.error(f"Server returned error status: {response.status_code}")
-                logger.debug(f"Response content: {response.text[:200]}")
+                logger.debug("Response content length: %d", len(response.text))
                 return None
 
             return response.json()

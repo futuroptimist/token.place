@@ -4,7 +4,6 @@ Uses the CryptoClient helper to handle encryption and API communication
 """
 
 import argparse
-import os
 import sys
 import time
 from typing import List, Dict, Optional
@@ -13,8 +12,9 @@ from typing import List, Dict, Optional
 from utils.crypto_helpers import CryptoClient
 
 def clear_screen():
-    """Clear the terminal screen"""
-    os.system('cls' if os.name == 'nt' else 'clear')
+    """Clear the terminal screen without spawning a shell"""
+    # Use ANSI escape codes to avoid shell injection via os.system
+    print("\033[2J\033[H", end="")
 
 def format_message(message: Dict) -> str:
     """Format a message for display"""

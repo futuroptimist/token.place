@@ -19,7 +19,7 @@ def get_app_data_dir() -> pathlib.Path:
     Get the appropriate application data directory based on platform:
     - Windows: %APPDATA%/token.place
     - macOS: ~/Library/Application Support/token.place
-    - Linux: ~/.local/share/token.place
+    - Linux: $XDG_DATA_HOME/token.place or ~/.local/share/token.place
     """
     if IS_WINDOWS:
         appdata = os.environ.get('APPDATA')
@@ -30,7 +30,11 @@ def get_app_data_dir() -> pathlib.Path:
     elif IS_MACOS:
         base_dir = get_user_home_dir() / 'Library' / 'Application Support'
     else:  # Linux and other Unix-like
-        base_dir = get_user_home_dir() / '.local' / 'share'
+        xdg_data_home = os.environ.get('XDG_DATA_HOME')
+        if xdg_data_home:
+            base_dir = pathlib.Path(xdg_data_home)
+        else:
+            base_dir = get_user_home_dir() / '.local' / 'share'
     return ensure_dir_exists(base_dir / 'token.place')
 
 def get_config_dir() -> pathlib.Path:
@@ -38,19 +42,24 @@ def get_config_dir() -> pathlib.Path:
     Get the appropriate configuration directory based on platform:
     - Windows: %APPDATA%/token.place/config
     - macOS: ~/Library/Application Support/token.place/config
-    - Linux: ~/.config/token.place
+    - Linux: $XDG_CONFIG_HOME/token.place or ~/.config/token.place
     """
     if IS_WINDOWS or IS_MACOS:
         return ensure_dir_exists(get_app_data_dir() / 'config')
     else:  # Linux and other Unix-like
-        return ensure_dir_exists(get_user_home_dir() / '.config' / 'token.place')
+        xdg_config_home = os.environ.get('XDG_CONFIG_HOME')
+        if xdg_config_home:
+            base_dir = pathlib.Path(xdg_config_home)
+        else:
+            base_dir = get_user_home_dir() / '.config'
+        return ensure_dir_exists(base_dir / 'token.place')
 
 def get_cache_dir() -> pathlib.Path:
     """
     Get the appropriate cache directory based on platform:
     - Windows: %LOCALAPPDATA%/token.place/cache
     - macOS: ~/Library/Caches/token.place
-    - Linux: ~/.cache/token.place
+    - Linux: $XDG_CACHE_HOME/token.place or ~/.cache/token.place
     """
     if IS_WINDOWS:
         local_appdata = os.environ.get('LOCALAPPDATA')
@@ -62,7 +71,12 @@ def get_cache_dir() -> pathlib.Path:
     elif IS_MACOS:
         return ensure_dir_exists(get_user_home_dir() / 'Library' / 'Caches' / 'token.place')
     else:  # Linux and other Unix-like
-        return ensure_dir_exists(get_user_home_dir() / '.cache' / 'token.place')
+        xdg_cache_home = os.environ.get('XDG_CACHE_HOME')
+        if xdg_cache_home:
+            base_dir = pathlib.Path(xdg_cache_home)
+        else:
+            base_dir = get_user_home_dir() / '.cache'
+        return ensure_dir_exists(base_dir / 'token.place')
 
 def get_models_dir() -> pathlib.Path:
     """Get the directory for storing downloaded models."""

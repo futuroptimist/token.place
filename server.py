@@ -45,7 +45,13 @@ class ServerApp:
     """
     Main server application that integrates all components.
     """
-    def __init__(self, server_port: int = 3000, relay_port: int = 5000, relay_url: str = "http://localhost"):
+    def __init__(
+        self,
+        server_port: int = 3000,
+        relay_port: int = 5000,
+        relay_url: str = "http://localhost",
+        server_host: str = "127.0.0.1",
+    ):
         """
         Initialize the server application.
 
@@ -55,6 +61,7 @@ class ServerApp:
             relay_url: URL of the relay server
         """
         self.server_port = server_port
+        self.server_host = server_host
         self.relay_port = relay_port
         self.relay_url = relay_url
 
@@ -128,7 +135,7 @@ class ServerApp:
 
         # Run the Flask app
         self.app.run(
-            host='0.0.0.0',
+            host=self.server_host,
             port=self.server_port,
             debug=not config.is_production,
             use_reloader=False  # Disable reloader to avoid duplicate threads
@@ -138,6 +145,7 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="token.place server")
     parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
+    parser.add_argument("--server_host", default="127.0.0.1", help="Host interface to bind the server")
     parser.add_argument("--relay_port", type=int, default=5000, help="Port the relay server is running on")
     parser.add_argument("--relay_url", type=str, default="http://localhost", help="URL of the relay server")
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
@@ -155,6 +163,7 @@ def main():
     # Create and run the server
     server = ServerApp(
         server_port=args.server_port,
+        server_host=args.server_host,
         relay_port=args.relay_port,
         relay_url=args.relay_url
     )

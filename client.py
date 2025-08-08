@@ -64,7 +64,7 @@ def load_or_generate_client_keys():
 def get_server_public_key():
     """Gets the public key from the API server."""
     try:
-        response = requests.get(f"{API_BASE_URL}/public-key")
+        response = requests.get(f"{API_BASE_URL}/public-key", timeout=10)
         response.raise_for_status() # Raise an exception for bad status codes
         data = response.json()
         return data.get('public_key')
@@ -115,7 +115,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     # 5. Send request
     print("Sending request to API...")
     try:
-        response = requests.post(f"{API_BASE_URL}/chat/completions", json=payload)
+        response = requests.post(f"{API_BASE_URL}/chat/completions", json=payload, timeout=10)
         response.raise_for_status()
         encrypted_response_data = response.json()
     except requests.exceptions.RequestException as e:
@@ -169,7 +169,7 @@ class ChatClient:
     def get_server_public_key(self):
         """Fetch the server's public key from the relay."""
         try:
-            response = requests.get(f'{self.base_url}:{self.relay_port}/next_server')
+            response = requests.get(f'{self.base_url}:{self.relay_port}/next_server', timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 server_public_key_b64 = data['server_public_key']
@@ -191,7 +191,7 @@ class ChatClient:
                 "cipherkey": encrypted_cipherkey_b64,
                 "iv": iv_b64,
             }
-            response = requests.post(f'{self.base_url}:{self.relay_port}/faucet', json=data)
+            response = requests.post(f'{self.base_url}:{self.relay_port}/faucet', json=data, timeout=10)
             return response
         except requests.exceptions.RequestException as e:
             print(f"Error while sending request to faucet: {str(e)}")
@@ -201,7 +201,11 @@ class ChatClient:
         start_time = time.time()
         while True:
             try:
-                response = requests.post(f'{self.base_url}:{self.relay_port}/retrieve', json={"client_public_key": self.public_key_b64})
+                response = requests.post(
+                    f'{self.base_url}:{self.relay_port}/retrieve',
+                    json={"client_public_key": self.public_key_b64},
+                    timeout=10,
+                )
                 if response.status_code == 200:
                     data = response.json()
                     if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:
@@ -209,8 +213,6 @@ class ChatClient:
                         encrypted_chat_history = base64.b64decode(encrypted_chat_history_b64)
                         iv = base64.b64decode(data['iv'])
                         cipherkey = base64.b64decode(data['cipherkey'])
-                        print(f"Received cipherkey: {cipherkey}")
-                        print(f"Received IV: {iv}")
                         decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, self.private_key)
 
                         if decrypted_chat_history is not None:

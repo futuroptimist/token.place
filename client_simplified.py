@@ -13,8 +13,9 @@ from typing import List, Dict, Optional
 from utils.crypto_helpers import CryptoClient
 
 def clear_screen():
-    """Clear the terminal screen"""
-    os.system('cls' if os.name == 'nt' else 'clear')
+    """Clear the terminal screen without invoking a shell."""
+    # ANSI escape sequence clears the screen and positions cursor at top-left
+    print("\033[2J\033[H", end="")
 
 def format_message(message: Dict) -> str:
     """Format a message for display"""

@@ -2,7 +2,7 @@ import base64
 import json
 from unittest.mock import patch, MagicMock
 
-from client import ChatClient
+from client import ChatClient, REQUEST_TIMEOUT
 
 
 def test_get_server_public_key():
@@ -13,7 +13,9 @@ def test_get_server_public_key():
         mock_get.return_value = resp
         key = client.get_server_public_key()
         assert key == b'k'
-        mock_get.assert_called_with('http://testserver:5000/next_server')
+        mock_get.assert_called_with(
+            'http://testserver:5000/next_server', timeout=REQUEST_TIMEOUT
+        )
 
 
 def test_send_message_flow():

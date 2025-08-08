@@ -125,9 +125,10 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         print(f"API request failed: {e}")
         if hasattr(e, 'response') and e.response is not None:
              try:
-                 print(f"Error details: {e.response.json()}")
-             except json.JSONDecodeError:
-                 print(f"Error details: {e.response.text}")
+                 err_status = e.response.status_code
+             except Exception:
+                 err_status = "unknown"
+             print(f"Error status: {err_status}")
         return None
 
     # 6. Decrypt response

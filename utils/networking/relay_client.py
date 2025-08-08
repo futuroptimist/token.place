@@ -169,7 +169,11 @@ class RelayClient:
 
                 return relay_response
             else:
-                log_error("Error from relay /sink: {} {}", response.status_code, response.text)
+                log_error(
+                    "Error from relay /sink: status {} ({} bytes)",
+                    response.status_code,
+                    len(response.text)
+                )
                 return {
                     'error': f"HTTP {response.status_code}",
                     'next_ping_in_x_seconds': self._request_timeout
@@ -269,7 +273,11 @@ class RelayClient:
                     timeout=self._request_timeout
                 )
 
-                log_info("Response sent to /source. Status: {}, Text: {}", source_response.status_code, source_response.text)
+                log_info(
+                    "Response sent to /source. Status: {}, body length: {}",
+                    source_response.status_code,
+                    len(source_response.text)
+                )
 
                 # Validate response beyond just status code
                 if source_response.status_code != 200:

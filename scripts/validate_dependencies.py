@@ -18,9 +18,9 @@ def run_command(cmd, cwd=None):
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
     try:
+        cmd_list = shlex.split(cmd) if isinstance(cmd, str) else cmd
         result = subprocess.run(
-=======
-            cmd if isinstance(cmd, list) else shlex.split(cmd),
+            cmd_list,
             shell=False,
             capture_output=True,
             text=True,

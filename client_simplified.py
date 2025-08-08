@@ -4,6 +4,8 @@ Uses the CryptoClient helper to handle encryption and API communication
 """
 
 import argparse
+import os
+import subprocess
 import sys
 import time
 from typing import List, Dict, Optional

@@ -6,7 +6,6 @@ import os
 import argparse
 from encrypt import generate_keys, encrypt, decrypt
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 
 # Use an environment variable to determine the environment
@@ -21,6 +20,8 @@ base_url = "http://token.place" if environment == "prod" else "http://localhost"
 # If running locally with default port 5070:
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:5070/api/v1")
 # Or use "http://localhost:5070" if targeting relay endpoints directly
+
+REQUEST_TIMEOUT = 10  # seconds
 
 CLIENT_KEYS_DIR = "client_keys"
 CLIENT_PRIVATE_KEY_FILE = os.path.join(CLIENT_KEYS_DIR, "client_private.pem")
@@ -64,7 +65,7 @@ def load_or_generate_client_keys():
 def get_server_public_key():
     """Gets the public key from the API server."""
     try:
-        response = requests.get(f"{API_BASE_URL}/public-key", timeout=10)
+        response = requests.get(f"{API_BASE_URL}/public-key", timeout=REQUEST_TIMEOUT)
         response.raise_for_status() # Raise an exception for bad status codes
         data = response.json()
         return data.get('public_key')
@@ -115,16 +116,19 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     # 5. Send request
     print("Sending request to API...")
     try:
-        response = requests.post(f"{API_BASE_URL}/chat/completions", json=payload, timeout=10)
+        response = requests.post(
+            f"{API_BASE_URL}/chat/completions", json=payload, timeout=REQUEST_TIMEOUT
+        )
         response.raise_for_status()
         encrypted_response_data = response.json()
     except requests.exceptions.RequestException as e:
         print(f"API request failed: {e}")
         if hasattr(e, 'response') and e.response is not None:
              try:
-                 print(f"Error details: {e.response.json()}")
-             except json.JSONDecodeError:
-                 print(f"Error details: {e.response.text}")
+                 err_status = e.response.status_code
+             except Exception:
+                 err_status = "unknown"
+             print(f"Error status: {err_status}")
         return None
 
     # 6. Decrypt response
@@ -169,7 +173,9 @@ class ChatClient:
     def get_server_public_key(self):
         """Fetch the server's public key from the relay."""
         try:
-            response = requests.get(f'{self.base_url}:{self.relay_port}/next_server', timeout=10)
+            response = requests.get(
+                f'{self.base_url}:{self.relay_port}/next_server', timeout=REQUEST_TIMEOUT
+            )
             if response.status_code == 200:
                 data = response.json()
                 server_public_key_b64 = data['server_public_key']
@@ -191,7 +197,9 @@ class ChatClient:
                 "cipherkey": encrypted_cipherkey_b64,
                 "iv": iv_b64,
             }
-            response = requests.post(f'{self.base_url}:{self.relay_port}/faucet', json=data, timeout=10)
+            response = requests.post(
+                f'{self.base_url}:{self.relay_port}/faucet', json=data, timeout=REQUEST_TIMEOUT
+            )
             return response
         except requests.exceptions.RequestException as e:
             print(f"Error while sending request to faucet: {str(e)}")
@@ -204,7 +212,7 @@ class ChatClient:
                 response = requests.post(
                     f'{self.base_url}:{self.relay_port}/retrieve',
                     json={"client_public_key": self.public_key_b64},
-                    timeout=10,
+                    timeout=REQUEST_TIMEOUT,
                 )
                 if response.status_code == 200:
                     data = response.json()

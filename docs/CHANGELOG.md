@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- Validate PKCS#7 unpadding length to reject improperly padded input
+
 ## Version 1.0.0 (March 2025)
 
 ### New Features
@@ -36,4 +41,4 @@
 ### Documentation
 - Updated README with API documentation
 - Added API section to the web interface
-- Improved code documentation throughout the codebase 
+- Improved code documentation throughout the codebase

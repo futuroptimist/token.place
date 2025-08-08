@@ -92,7 +92,9 @@ def test_send_encrypted_message(mock_crypto_client):
     payload = {'test': 'data'}
     response = client.send_encrypted_message('/test-endpoint', payload)
 
-      mock_requests.post.assert_called_with('https://mock-server.com/test-endpoint', json=payload, timeout=10)
+    mock_requests.post.assert_called_with(
+        'https://mock-server.com/test-endpoint', json=payload, timeout=10
+    )
     assert response is not None
     assert response['success'] is True
 

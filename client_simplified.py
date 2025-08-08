@@ -5,6 +5,7 @@ Uses the CryptoClient helper to handle encryption and API communication
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 from typing import List, Dict, Optional
@@ -14,7 +15,8 @@ from utils.crypto_helpers import CryptoClient
 
 def clear_screen():
     """Clear the terminal screen"""
-    os.system('cls' if os.name == 'nt' else 'clear')
+    cmd = ['cls'] if os.name == 'nt' else ['clear']
+    subprocess.run(cmd, check=False)
 
 def format_message(message: Dict) -> str:
     """Format a message for display"""

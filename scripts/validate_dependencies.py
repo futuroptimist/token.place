@@ -10,18 +10,20 @@ import subprocess
 import sys
 import tempfile
 import os
+import shlex
 from pathlib import Path
 
 def run_command(cmd, cwd=None):
     """Run a command and return success status and output."""
     try:
+        cmd_list = shlex.split(cmd) if isinstance(cmd, str) else cmd
         result = subprocess.run(
-            cmd, 
-            shell=True, 
-            capture_output=True, 
-            text=True, 
+            cmd_list,
+            shell=False,
+            capture_output=True,
+            text=True,
             cwd=cwd,
-            check=False
+            check=False,
         )
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:

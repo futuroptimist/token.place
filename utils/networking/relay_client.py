@@ -170,9 +170,9 @@ class RelayClient:
                 return relay_response
             else:
                 log_error(
-                    "Error from relay /sink: {} ({} bytes)",
+                    "Error from relay /sink: status {} ({} bytes)",
                     response.status_code,
-                    len(response.text),
+                    len(response.text)
                 )
                 return {
                     'error': f"HTTP {response.status_code}",
@@ -274,9 +274,9 @@ class RelayClient:
                 )
 
                 log_info(
-                    "Response sent to /source. Status: {}, Length: {}",
+                    "Response sent to /source. Status: {}, body length: {}",
                     source_response.status_code,
-                    len(source_response.text),
+                    len(source_response.text)
                 )
 
                 # Validate response beyond just status code

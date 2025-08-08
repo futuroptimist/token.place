@@ -28,3 +28,10 @@ def test_unpad_zero_padding():
     padded = b"data" + b"\x00"
     with pytest.raises(ValueError):
         pkcs7_unpad(padded, 16)
+
+
+def test_unpad_non_block_multiple():
+    """Input length must be a multiple of block size."""
+    padded = b"abcde\x01"  # len=6, not divisible by block size
+    with pytest.raises(ValueError):
+        pkcs7_unpad(padded, 16)

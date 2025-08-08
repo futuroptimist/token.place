@@ -318,7 +318,7 @@ python relay.py
 The relay listens on port 5000. It automatically connects to the default server
 address baked into the project, so no environment variables are required.
 
-In a separate terminal, launch the server, which runs on http://localhost:3000:
+In a separate terminal, launch the server, which binds to `0.0.0.0` on port 3000 (accessible via http://localhost:3000):
 
 ```sh
 python server.py

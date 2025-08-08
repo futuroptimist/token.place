@@ -1,6 +1,8 @@
 import importlib
 import pathlib
 import platform
+from unittest import mock
+
 import pytest
 from utils import path_handling as ph
 
@@ -54,3 +56,14 @@ def test_get_app_data_dir_creates_directory(tmp_path, monkeypatch):
     expected = tmp_path / ".local" / "share" / "token.place"
     assert app_dir == expected
     assert app_dir.exists()
+
+
+def test_linux_uses_xdg_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg" / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg" / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg" / "cache"))
+    with mock.patch('platform.system', return_value='Linux'):
+        importlib.reload(ph)
+        assert ph.get_app_data_dir() == tmp_path / "xdg" / "data" / "token.place"
+        assert ph.get_config_dir() == tmp_path / "xdg" / "config" / "token.place"
+        assert ph.get_cache_dir() == tmp_path / "xdg" / "cache" / "token.place"

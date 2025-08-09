@@ -110,7 +110,8 @@ def get_executable_extension() -> str:
 
 def normalize_path(path: Union[str, pathlib.Path]) -> pathlib.Path:
     """Convert a path string to a normalized pathlib.Path object."""
-    return pathlib.Path(path).expanduser().resolve()
+    expanded = os.path.expandvars(str(path))
+    return pathlib.Path(expanded).expanduser().resolve()
 
 def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[str, pathlib.Path]] = None) -> pathlib.Path:
     """

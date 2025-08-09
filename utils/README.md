@@ -13,6 +13,7 @@ and automatically create directories when accessed.
 On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
 `XDG_CACHE_HOME` environment variables when they are set.
 
+- `normalize_path(path)`: Expands `~` and environment variables then returns a normalized absolute path.
 - `ensure_dir_exists(path)`: Creates the directory if missing (expands `~` to the user's home) and raises
   `NotADirectoryError` when the path points to an existing file.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.

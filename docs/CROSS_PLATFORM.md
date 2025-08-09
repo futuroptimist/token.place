@@ -49,6 +49,7 @@ We've implemented a comprehensive path handling system in `utils/path_handling.p
 - Detects the operating system and uses appropriate paths
 - Handles user directories, config paths, and cache locations correctly per platform
 - Ensures directories exist before attempting to use them
+- Expands `~` and environment variables when normalizing paths
 
 ### Platform-Specific Paths
 

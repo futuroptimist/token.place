@@ -30,6 +30,19 @@ def test_ensure_dir_exists_expands_user(tmp_path, monkeypatch):
     assert result.exists()
 
 
+def test_normalize_path_expands_env_vars(tmp_path, monkeypatch):
+    """normalize_path should expand environment variables"""
+    monkeypatch.setenv("TEST_BASE", str(tmp_path))
+    target = tmp_path / "nested"
+    target.mkdir()
+    if ph.IS_WINDOWS:
+        path_with_var = "%TEST_BASE%\\nested"
+    else:
+        path_with_var = "$TEST_BASE/nested"
+    result = ph.normalize_path(path_with_var)
+    assert result == target
+
+
 def test_get_relative_path_not_relative(tmp_path):
     a = tmp_path / "a"
     b = tmp_path / "b"

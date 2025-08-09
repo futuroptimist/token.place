@@ -7,6 +7,7 @@ import pytest
 import sys
 from unittest.mock import MagicMock, patch
 from pathlib import Path
+from encrypt import encrypt
 
 # Add the project root to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -273,3 +274,17 @@ class TestCryptoManager:
 
         with pytest.raises(KeyboardInterrupt):
             cm.log_error('bye')
+
+
+def test_decrypt_message_returns_bytes_for_non_utf8():
+    """CryptoManager.decrypt_message returns raw bytes for non UTF-8 content."""
+    manager = CryptoManager()
+    message = b"\xff\xfe\xfd"
+    ciphertext_dict, encrypted_key, iv = encrypt(message, manager.public_key)
+    encrypted_data = {
+        'chat_history': base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8'),
+        'cipherkey': base64.b64encode(encrypted_key).decode('utf-8'),
+        'iv': base64.b64encode(iv).decode('utf-8'),
+    }
+    result = manager.decrypt_message(encrypted_data)
+    assert result == message

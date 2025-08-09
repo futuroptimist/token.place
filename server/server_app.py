@@ -119,9 +119,11 @@ class ServerApp:
         # Start relay polling in a background thread
         self.start_relay_polling()
 
-        # Run the Flask app
+        # Run the Flask app. Bind to localhost by default to avoid exposing the
+        # service unintentionally; allow override via configuration.
+        host = config.get('server.host', '127.0.0.1')
         self.app.run(
-            host='0.0.0.0',
+            host=host,
             port=self.server_port,
             debug=not config.is_production,
             use_reloader=False  # Disable reloader to avoid duplicate threads

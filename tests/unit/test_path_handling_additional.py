@@ -49,7 +49,7 @@ def test_get_relative_path_not_relative(tmp_path):
     a.mkdir()
     b.mkdir()
     result = ph.get_relative_path(a, b)
-    assert result == a.resolve()
+    assert result == pathlib.Path("..") / "a"
 
 
 def test_get_relative_path_default_base(tmp_path, monkeypatch):

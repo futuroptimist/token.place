@@ -114,9 +114,11 @@ def normalize_path(path: Union[str, pathlib.Path]) -> pathlib.Path:
     return pathlib.Path(expanded).expanduser().resolve()
 
 def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[str, pathlib.Path]] = None) -> pathlib.Path:
-    """
-    Get a path relative to the base path.
-    If base_path is None, uses the current working directory.
+    """Return ``path`` relative to ``base_path``.
+
+    If ``base_path`` is ``None`` the current working directory is used. When the
+    two paths do not share a common ancestor, the returned path contains ``..``
+    segments instead of an absolute path.
     """
     path = normalize_path(path)
     if base_path is None:
@@ -127,5 +129,5 @@ def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[
     try:
         return path.relative_to(base_path)
     except ValueError:
-        # If path is not relative to base_path, return the absolute path
-        return path
+        # If path is not relative to base_path, compute a relative path
+        return pathlib.Path(os.path.relpath(path, base_path))

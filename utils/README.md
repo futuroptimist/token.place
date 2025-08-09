@@ -17,6 +17,8 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
 - `ensure_dir_exists(path)`: Creates the directory if missing (expands `~` to the user's home) and raises
   `NotADirectoryError` when the path points to an existing file.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
+- `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
+  two locations do not share a common ancestor.
 
 ### Crypto Helpers (`crypto_helpers.py`)
 

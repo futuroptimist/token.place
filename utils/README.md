@@ -22,6 +22,12 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
 
+### Crypto Manager (`crypto/crypto_manager.py`)
+
+Manages server-side encryption keys and message processing. The
+`decrypt_message` helper now returns raw bytes when decrypted content is not
+valid UTF-8 or JSON.
+
 Network requests in this module now use a default 10 second timeout to prevent
 hanging connections. You can override this by passing a `timeout` argument to
 `CryptoClient.fetch_server_public_key` or `CryptoClient.send_encrypted_message`.

@@ -65,6 +65,15 @@ class TimeMock:
         """Assert that sleep was called with the given duration"""
         assert seconds in self.sleep_calls, f"Expected sleep({seconds}), got {self.sleep_calls}"
 
+
+def test_init_propagates_keyboard_interrupt(monkeypatch):
+    monkeypatch.setattr(
+        'utils.networking.relay_client.get_config_lazy',
+        MagicMock(side_effect=KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        RelayClient('http://localhost', 8080, object(), object())
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

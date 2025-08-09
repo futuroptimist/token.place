@@ -52,7 +52,7 @@ def log_info(message, *args):
                 logger.info(message.format(*args))
             else:
                 logger.info(message)
-    except:
+    except Exception:
         # Fallback to always log if config is not available
         if args:
             logger.info(message.format(*args))
@@ -68,7 +68,7 @@ def log_error(message, *args, exc_info=False):
                 logger.error(message.format(*args), exc_info=exc_info)
             else:
                 logger.error(message, exc_info=exc_info)
-    except:
+    except Exception:
         # Fallback to always log if config is not available
         if args:
             logger.error(message.format(*args), exc_info=exc_info)
@@ -120,7 +120,7 @@ class RelayClient:
         try:
             config = get_config_lazy()
             self._request_timeout = config.get('relay.request_timeout', 10)  # Get timeout from config or use default
-        except:
+        except Exception:
             self._request_timeout = 10  # Fallback default
 
     def start(self):

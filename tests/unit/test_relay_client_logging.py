@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 import utils.networking.relay_client as rc
+import pytest
 
 
 def test_log_info_non_production():
@@ -46,3 +47,14 @@ def test_log_error_fallback():
     with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', side_effect=RuntimeError()):
         rc.log_error("oops {}", "fail")
     logger.error.assert_called_with("oops fail", exc_info=False)
+
+
+def test_log_functions_raise_keyboard_interrupt():
+    logger = MagicMock()
+    with patch.object(rc, 'logger', logger), patch.object(
+        rc, 'get_config_lazy', side_effect=KeyboardInterrupt()
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            rc.log_info("hi")
+        with pytest.raises(KeyboardInterrupt):
+            rc.log_error("bye")

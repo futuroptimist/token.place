@@ -4,6 +4,7 @@
 
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input
+- Remove unused imports from simplified CLI client to avoid unnecessary dependencies
 
 ## Version 1.0.0 (March 2025)
 

@@ -108,7 +108,7 @@ class CryptoManager:
             log_error(f"Error encrypting message: {e}", exc_info=True)
             raise
 
-    def decrypt_message(self, encrypted_data: Dict[str, str]) -> Optional[Dict]:
+    def decrypt_message(self, encrypted_data: Dict[str, str]) -> Optional[Union[Dict, str, bytes]]:
         """
         Decrypt a message using the server's private key.
 
@@ -116,7 +116,8 @@ class CryptoManager:
             encrypted_data: Dict containing 'chat_history', 'cipherkey', and 'iv' in base64
 
         Returns:
-            Decrypted message as a dict or None if decryption fails
+            Decrypted message as a dict, string, or raw bytes when the content is not UTF-8.
+            Returns None if decryption fails.
         """
         try:
             # Extract and decode the encrypted data
@@ -139,13 +140,16 @@ class CryptoManager:
                 log_error("Decryption failed, returning None")
                 return None
 
-            # Parse the decrypted JSON data
+            # Parse the decrypted data
             try:
-                decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
-                return decrypted_data
+                text = decrypted_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                return decrypted_bytes
+
+            try:
+                return json.loads(text)
             except json.JSONDecodeError:
-                # If it's not JSON, return the raw string
-                return decrypted_bytes.decode('utf-8')
+                return text
 
         except Exception as e:
             log_error(f"Error decrypting message: {e}", exc_info=True)

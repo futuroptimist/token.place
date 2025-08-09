@@ -117,7 +117,7 @@ def test_error_handling():
 
 @patch('utils.crypto_helpers.requests')
 @patch('utils.crypto_helpers.time')  # Mock time.sleep
-def test_send_chat_message(mock_time, mock_requests):
+def test_send_chat_message(_mock_time, mock_requests):
     """Test sending a chat message"""
     # Mock responses
     mock_faucet_response = MagicMock()

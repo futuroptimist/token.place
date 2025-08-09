@@ -17,10 +17,18 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
 - `ensure_dir_exists(path)`: Creates the directory if missing (expands `~` to the user's home) and raises
   `NotADirectoryError` when the path points to an existing file.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
+- `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
+  two locations do not share a common ancestor.
 
 ### Crypto Helpers (`crypto_helpers.py`)
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
+
+### Crypto Manager (`crypto/crypto_manager.py`)
+
+Manages server-side encryption keys and message processing. The
+`decrypt_message` helper now returns raw bytes when decrypted content is not
+valid UTF-8 or JSON.
 
 Network requests in this module now use a default 10 second timeout to prevent
 hanging connections. You can override this by passing a `timeout` argument to

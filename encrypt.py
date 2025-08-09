@@ -3,6 +3,7 @@
 
 import os
 import base64
+import logging
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import serialization
@@ -24,6 +25,8 @@ except ImportError:
     RSA_KEY_SIZE = 2048
     AES_KEY_SIZE = 32  # 256 bits
     IV_SIZE = 16  # 128 bits
+
+logger = logging.getLogger(__name__)
 
 def generate_keys() -> Tuple[bytes, bytes]:
     """
@@ -158,8 +161,8 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
         # Remove padding
         plaintext = pkcs7_unpad(padded_plaintext, 16)
         return plaintext
-    except Exception as e:
-        print(f"Decryption error: {e}")
+    except Exception:
+        logger.error("Decryption error", exc_info=True)
         return None
 
 def pkcs7_pad(data: bytes, block_size: int) -> bytes:

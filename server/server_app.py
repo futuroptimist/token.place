@@ -50,6 +50,7 @@ class ServerApp:
         self.server_port = server_port
         self.relay_port = relay_port
         self.relay_url = relay_url
+        self.server_host = config.get('server.host', '127.0.0.1')
 
         # Create Flask app
         self.app = Flask(__name__)
@@ -114,7 +115,7 @@ class ServerApp:
 
     def run(self):  # pragma: no cover
         """Run the server application."""
-        log_info(f"Starting server on port {self.server_port}")
+        log_info(f"Starting server on {self.server_host}:{self.server_port}")
 
         # Start relay polling in a background thread
         self.start_relay_polling()
@@ -123,7 +124,7 @@ class ServerApp:
         # service unintentionally; allow override via configuration.
         host = config.get('server.host', '127.0.0.1')
         self.app.run(
-            host=host,
+            host=self.server_host,
             port=self.server_port,
             debug=not config.is_production,
             use_reloader=False  # Disable reloader to avoid duplicate threads

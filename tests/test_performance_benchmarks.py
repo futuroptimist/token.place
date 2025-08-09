@@ -26,7 +26,8 @@ from utils.crypto.crypto_manager import CryptoManager
 
 try:
     # Try to import pytest-benchmark
-    import pytest_benchmark
+    import importlib
+    importlib.import_module('pytest_benchmark')
     BENCHMARK_AVAILABLE = True
 except ImportError:
     BENCHMARK_AVAILABLE = False

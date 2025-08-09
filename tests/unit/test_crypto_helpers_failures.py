@@ -23,7 +23,7 @@ def test_encrypt_message_requires_key():
 def test_send_encrypted_message_http_error(monkeypatch):
     client = _prep_client()
     resp = MagicMock(status_code=500, text='fail')
-    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **kw: resp)
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **_kw: resp)
     result = client.send_encrypted_message('/bad', {})
     assert result is None
 
@@ -44,14 +44,14 @@ def test_retrieve_chat_response_retry(monkeypatch):
 def test_fetch_server_public_key_non_200(monkeypatch):
     client = CryptoClient('https://example.com')
     resp = MagicMock(status_code=500, json=lambda: {})
-    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **kw: resp)
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **_kw: resp)
     assert not client.fetch_server_public_key()
 
 
 def test_fetch_server_public_key_error_field(monkeypatch):
     client = CryptoClient('https://example.com')
     resp = MagicMock(status_code=200, json=lambda: {'error': {'message': 'no'}})
-    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **kw: resp)
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **_kw: resp)
     assert not client.fetch_server_public_key()
 
 

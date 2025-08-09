@@ -1,4 +1,6 @@
 from unittest.mock import MagicMock, patch
+
+import pytest
 import utils.networking.relay_client as rc
 import pytest
 
@@ -58,3 +60,15 @@ def test_log_functions_raise_keyboard_interrupt():
             rc.log_info("hi")
         with pytest.raises(KeyboardInterrupt):
             rc.log_error("bye")
+       
+      
+def test_log_info_propagates_keyboardinterrupt():
+    with patch.object(rc, 'get_config_lazy', side_effect=KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            rc.log_info("ignored")
+
+            
+def test_log_error_propagates_keyboardinterrupt():
+    with patch.object(rc, 'get_config_lazy', side_effect=KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            rc.log_error("ignored")

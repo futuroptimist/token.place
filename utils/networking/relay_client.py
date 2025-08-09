@@ -234,12 +234,12 @@ class RelayClient:
                 log_info("Decryption failed. Skipping.")
                 return False
 
-            log_info("Decrypted request: {}", decrypted_chat_history)
+            log_info("Decrypted client request")
 
             # Process with LLM
             log_info("Getting response from LLM...")
             response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
-            log_info("LLM response history: {}", response_history)
+            log_info("LLM generated response")
 
             # Encrypt the response for the client
             log_info("Encrypting response for client...")

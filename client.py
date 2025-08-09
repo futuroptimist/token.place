@@ -136,7 +136,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     try:
         if not encrypted_response_data.get('encrypted'):
             print("Error: Response was not encrypted as expected.")
-            print("Response data:", encrypted_response_data)
+            # Avoid logging potentially sensitive response contents
             return None
 
         enc_data = encrypted_response_data['data']

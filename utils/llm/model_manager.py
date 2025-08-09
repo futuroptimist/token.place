@@ -24,7 +24,7 @@ class ModelManager:
         if config is None:
             from config import get_config
             config = get_config()
-            
+
         self.config = config
 
         # Llama model configuration
@@ -33,14 +33,14 @@ class ModelManager:
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
         self.models_dir = config.get('paths.models_dir')
         self.model_path = os.path.join(self.models_dir, self.file_name)
-        
+
         # LLM instance and lock for thread safety
         self.llm = None
         self.llm_lock = Lock()
-        
+
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
-        
+
     def log_info(self, message):
         """Log info only in non-production environments"""
         if not self.config.is_production:
@@ -55,7 +55,7 @@ class ModelManager:
         """Log errors only in non-production environments"""
         if not self.config.is_production:
             logger.error(message, exc_info=exc_info)
-        
+
     def create_models_directory(self) -> str:
         """Create the models directory if it doesn't exist."""
         if not os.path.exists(self.models_dir):
@@ -65,17 +65,17 @@ class ModelManager:
     def download_file_in_chunks(self, file_path: str, url: str, chunk_size_mb: int) -> bool:
         """
         Download a file in chunks with progress reporting.
-        
+
         Args:
             file_path: The path to save the file to
             url: The URL to download from
             chunk_size_mb: The chunk size in MB
-            
+
         Returns:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=10)
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")
@@ -138,13 +138,13 @@ class ModelManager:
     def download_model_if_needed(self) -> bool:
         """
         Download the model file if it doesn't exist.
-        
+
         Returns:
             bool: True if the model file exists (either already present or successfully downloaded),
                  False if download failed
         """
         self.create_models_directory()
-        
+
         if not os.path.exists(self.model_path):
             self.log_info(f"Downloading {self.file_name}...")
             if self.download_file_in_chunks(self.model_path, self.url, self.chunk_size_mb):
@@ -156,12 +156,12 @@ class ModelManager:
         else:
             self.log_info(f"Model file {self.file_name} already exists.")
             return True
-    
+
     def get_llm_instance(self):
         """
         Gets the Llama instance, initializing it if necessary (thread-safe),
         or returns a mock if USE_MOCK_LLM is set.
-        
+
         Returns:
             A Llama instance or a MagicMock object
         """
@@ -196,7 +196,7 @@ class ModelManager:
                         try:
                             # Dynamically import Llama only when needed
                             from llama_cpp import Llama
-                            
+
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
                             self.llm = Llama(
                                 model_path=self.model_path,
@@ -208,16 +208,16 @@ class ModelManager:
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)
                             return None
-        
+
         return self.llm
-    
+
     def llama_cpp_get_response(self, chat_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """
         Get a response from the LLM given a chat history.
-        
+
         Args:
             chat_history: List of chat messages with 'role' and 'content' keys
-            
+
         Returns:
             Updated chat history with the model's response appended
         """
@@ -229,14 +229,16 @@ class ModelManager:
                 "content": "Sorry, I'm having trouble accessing my language capabilities right now."
             })
             return chat_history
-        
+
         try:
             # If we got a list of chat messages, convert it to the format expected by the Llama API
-            self.log_info(f"Generating response for chat history: {chat_history}")
-            
+            self.log_info(
+                f"Generating response for chat history with {len(chat_history)} messages"
+            )
+
             # Create a copy of the chat history to avoid modifying the original
             result = chat_history.copy()
-            
+
             # Generate the completion
             completion = llm_instance.create_chat_completion(
                 messages=chat_history,
@@ -245,16 +247,16 @@ class ModelManager:
                 top_p=self.config.get('model.top_p', 0.9),
                 stop=self.config.get('model.stop_tokens', []),
             )
-            
+
             # Extract the assistant's response
             assistant_message = completion['choices'][0]['message']
-            self.log_info(f"Generated response: {assistant_message}")
-            
+            self.log_info("Generated assistant response")
+
             # Append the assistant's response to the chat history
             result.append(assistant_message)
-            
+
             return result
-            
+
         except Exception as e:
             self.log_error(f"Error during LLM inference: {e}", exc_info=True)
             # Return an error message
@@ -273,4 +275,4 @@ def get_model_manager():
     global model_manager
     if model_manager is None:
         model_manager = ModelManager()
-    return model_manager 
+    return model_manager

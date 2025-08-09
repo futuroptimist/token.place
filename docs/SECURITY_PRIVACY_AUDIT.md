@@ -76,4 +76,14 @@ Project structure reorganization and documentation updates.
 **Recommendations**
 - Continue to monitor for broken links or outdated paths after large refactors.
 
+### [2025-08-09] - commit TBD
 
+**Summary**
+Refined logging helpers to avoid swallowing system interrupt exceptions.
+
+**Completed Improvements**
+- Updated `log_info` and `log_error` to catch only standard exceptions, allowing
+  `KeyboardInterrupt` and `SystemExit` to propagate.
+
+**Recommendations**
+- Continue monitoring logging utilities for unintended side effects.

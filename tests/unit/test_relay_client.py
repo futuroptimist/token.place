@@ -7,7 +7,7 @@ import pytest
 import sys
 import requests
 import jsonschema
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 # Add the project root to the path for imports
@@ -56,7 +56,7 @@ class TimeMock:
         self.mock_sleep.side_effect = wrapper
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         # Restore original side_effect (if needed)
         if hasattr(self, 'original_side_effect'):
             self.mock_sleep.side_effect = self.original_side_effect

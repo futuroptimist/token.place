@@ -7,7 +7,7 @@ and compare them with baseline images to detect visual regressions.
 import pytest
 import logging
 import time
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page
 from .utils import capture_screenshot, save_as_baseline, compare_with_baseline
 
 # Setup logging

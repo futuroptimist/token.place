@@ -4,7 +4,7 @@ Unit tests for the model manager module.
 import os
 import pytest
 import shutil
-from unittest.mock import MagicMock, patch, ANY
+from unittest.mock import MagicMock, patch
 import json
 import sys
 import tempfile

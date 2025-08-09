@@ -26,12 +26,6 @@ if args.use_mock_llm or os.environ.get("USE_MOCK_LLM") == "1":
 
 from api import init_app
 
-# Import configuration
-try:
-    from config import RELAY_PORT
-except ImportError:
-    RELAY_PORT = 5010
-
 app = Flask(__name__)
 
 # Initialize the API

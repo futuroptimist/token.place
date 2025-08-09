@@ -11,7 +11,7 @@ def test_invalid_response_structure(monkeypatch):
     class Dummy:
         def create_chat_completion(self, messages):
             return {"bad": "data"}
-    monkeypatch.setattr(models, "get_model_instance", lambda mid: Dummy())
+    monkeypatch.setattr(models, "get_model_instance", lambda _mid: Dummy())
     messages = [{"role": "user", "content": "hi"}]
     with pytest.raises(models.ModelError) as exc:
         models.generate_response("llama-3-8b-instruct", messages)
@@ -24,7 +24,7 @@ def test_model_exception(monkeypatch):
     class Dummy:
         def create_chat_completion(self, messages):
             raise RuntimeError("fail")
-    monkeypatch.setattr(models, "get_model_instance", lambda mid: Dummy())
+    monkeypatch.setattr(models, "get_model_instance", lambda _mid: Dummy())
     messages = [{"role": "user", "content": "hi"}]
     with pytest.raises(models.ModelError) as exc:
         models.generate_response("llama-3-8b-instruct", messages)

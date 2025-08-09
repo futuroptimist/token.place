@@ -31,6 +31,8 @@ class ModelManager:
         self.file_name = config.get('model.filename', 'llama-3-8b-instruct.Q4_K_M.gguf')
         self.url = config.get('model.url', 'https://huggingface.co/TheBloke/Llama-3-8B-Instruct-GGUF/resolve/main/llama-3-8b-instruct.Q4_K_M.gguf')
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
+        # Network timeout for model downloads (seconds)
+        self.download_timeout = config.get('model.download_timeout', 30)
         self.models_dir = config.get('paths.models_dir')
         self.model_path = os.path.join(self.models_dir, self.file_name)
         
@@ -75,7 +77,7 @@ class ModelManager:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=self.download_timeout)
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")

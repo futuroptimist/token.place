@@ -1,0 +1,2 @@
+[bandit]
+exclude: /tests,/desktop,/node_modules

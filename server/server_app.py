@@ -121,7 +121,7 @@ class ServerApp:
 
         # Run the Flask app
         self.app.run(
-            host='0.0.0.0',
+            host='127.0.0.1',
             port=self.server_port,
             debug=not config.is_production,
             use_reloader=False  # Disable reloader to avoid duplicate threads

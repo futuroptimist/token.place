@@ -75,7 +75,8 @@ class ModelManager:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        response = requests.get(url, stream=True)
+        # Use a timeout to avoid hanging during downloads
+        response = requests.get(url, stream=True, timeout=60)
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")

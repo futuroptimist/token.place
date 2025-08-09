@@ -1,0 +1,4 @@
+exclude_dirs:
+  - tests
+  - desktop
+  - node_modules

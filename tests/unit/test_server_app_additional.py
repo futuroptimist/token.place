@@ -48,7 +48,7 @@ def test_run_method(monkeypatch):
 
         poller.assert_called_once()
         flask_runner.assert_called_once_with(
-            host='0.0.0.0',
+            host='127.0.0.1',
             port=app.server_port,
             debug=not sa.config.is_production,
             use_reloader=False,

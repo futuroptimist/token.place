@@ -12,6 +12,7 @@ import platform
 import signal
 import time
 import logging
+import importlib
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -70,10 +71,9 @@ def check_dependencies():
             return False
         
         # Try to import key dependencies
-        import cryptography
-        import fastapi
-        import pydantic
-        
+        for module in ("cryptography", "fastapi", "pydantic"):
+            importlib.import_module(module)
+
         logger.info("All key dependencies are met")
         return True
     except ImportError as e:
@@ -212,7 +212,7 @@ def stop_all():
     for component_name in reversed(components_to_stop):
         stop_component(component_name)
 
-def signal_handler(sig, frame):
+def signal_handler(_sig, _frame):
     """Handle termination signals."""
     logger.info("Termination signal received, stopping all components...")
     stop_all()

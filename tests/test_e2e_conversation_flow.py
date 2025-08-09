@@ -5,7 +5,6 @@ import time
 import subprocess
 import signal
 from contextlib import contextmanager
-import multiprocessing
 import requests
 from typing import Generator, List
 

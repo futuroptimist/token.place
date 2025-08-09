@@ -12,6 +12,12 @@ def test_format_message_user_and_assistant():
     assert "System:" in cs.format_message(other_msg)
 
 
+def test_no_unused_imports():
+    """Ensure no leftover modules remain imported unintentionally."""
+    for name in ["os", "subprocess", "time"]:
+        assert name not in cs.__dict__, f"{name} should not be imported"
+
+
 def test_main_single_message(monkeypatch, capsys):
     mock_client = MagicMock()
     mock_client.fetch_server_public_key.return_value = True

@@ -2,7 +2,6 @@
 Input validation utilities for the token.place API
 """
 
-import re
 import json
 import base64
 from typing import Dict, List, Union, Any, Optional, Tuple

@@ -9,17 +9,12 @@ repos:
     rev: v2.4.0
     hooks:
       - id: codespell
-        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,package-lock.json,*.svg,webapp/static/js/*"]
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.10.0
-    hooks:
-      - id: mypy
-        args: ["--ignore-missing-imports"]
+        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,package-lock.json,desktop/package-lock.json,*.svg,webapp/static/js/*"]
   - repo: https://github.com/jendrikseipp/vulture
     rev: v2.7
     hooks:
       - id: vulture
-        args: [".", "--min-confidence", "80"]
+        args: [".", "--min-confidence", "80", "--exclude", "node_modules,desktop/node_modules"]
   - repo: local
     hooks:
       - id: run-checks

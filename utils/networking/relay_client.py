@@ -120,7 +120,7 @@ class RelayClient:
         try:
             config = get_config_lazy()
             self._request_timeout = config.get('relay.request_timeout', 10)  # Get timeout from config or use default
-        except:
+        except Exception:
             self._request_timeout = 10  # Fallback default
 
     def start(self):

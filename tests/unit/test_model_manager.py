@@ -112,7 +112,9 @@ class TestModelManager:
         assert os.path.getsize(file_path) == 1048576  # 1MB
 
         # Verify mock calls
-        mock_get.assert_called_once_with('https://example.com/model.gguf', stream=True)
+        mock_get.assert_called_once_with(
+            'https://example.com/model.gguf', stream=True, timeout=30
+        )
         mock_response.iter_content.assert_called_once_with(chunk_size=1048576)
 
     @patch('utils.llm.model_manager.requests.get')
@@ -134,7 +136,9 @@ class TestModelManager:
         assert not os.path.exists(file_path)
 
         # Verify mock calls
-        mock_get.assert_called_once_with('https://example.com/model.gguf', stream=True)
+        mock_get.assert_called_once_with(
+            'https://example.com/model.gguf', stream=True, timeout=30
+        )
 
     @patch('os.path.exists')
     @patch('utils.llm.model_manager.ModelManager.download_file_in_chunks')

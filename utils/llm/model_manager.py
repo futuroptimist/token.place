@@ -75,7 +75,6 @@ class ModelManager:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        # Include a reasonable timeout to avoid hanging connections
         response = requests.get(url, stream=True, timeout=30)
 
         if response.status_code != 200:
@@ -233,7 +232,9 @@ class ModelManager:
 
         try:
             # If we got a list of chat messages, convert it to the format expected by the Llama API
-            self.log_info(f"Generating response for chat history: {chat_history}")
+            self.log_info(
+                f"Generating response for chat history with {len(chat_history)} messages"
+            )
 
             # Create a copy of the chat history to avoid modifying the original
             result = chat_history.copy()
@@ -249,7 +250,7 @@ class ModelManager:
 
             # Extract the assistant's response
             assistant_message = completion['choices'][0]['message']
-            self.log_info(f"Generated response: {assistant_message}")
+            self.log_info("Generated assistant response")
 
             # Append the assistant's response to the chat history
             result.append(assistant_message)

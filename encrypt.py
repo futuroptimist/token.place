@@ -162,7 +162,7 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
         plaintext = pkcs7_unpad(padded_plaintext, 16)
         return plaintext
     except Exception:
-        logger.error("Decryption error", exc_info=True)
+        logger.warning("Decryption failed")
         return None
 
 def pkcs7_pad(data: bytes, block_size: int) -> bytes:

@@ -18,7 +18,7 @@ git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
- npm ci
+npm ci
 pip install pre-commit
 pre-commit install
 pre-commit run --all-files
@@ -205,7 +205,7 @@ pip install -r config/requirements_relay.txt   # relay-only dependencies
 For JavaScript dependencies, run:
 
 ```
- npm ci
+npm ci
 ```
 
 #### troubleshooting `llama_cpp_python` builds

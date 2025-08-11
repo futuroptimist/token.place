@@ -26,9 +26,10 @@ fi
 # Get Node.js version
 node -v
 
-# Ensure Playwright browser is installed
-echo "Ensuring Playwright Chromium browser is installed..."
-npx playwright install chromium >/dev/null 2>&1 || true
+# Ensure Playwright browsers and system dependencies are installed
+if command -v playwright >/dev/null 2>&1; then
+    playwright install --with-deps chromium >/dev/null
+fi
 
 # Array to track test failures
 FAILED_TESTS=()

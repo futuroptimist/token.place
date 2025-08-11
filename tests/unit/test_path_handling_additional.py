@@ -1,4 +1,5 @@
 import importlib
+import os
 import pathlib
 import platform
 from unittest import mock
@@ -80,3 +81,18 @@ def test_linux_uses_xdg_dirs(tmp_path, monkeypatch):
         assert ph.get_app_data_dir() == tmp_path / "xdg" / "data" / "token.place"
         assert ph.get_config_dir() == tmp_path / "xdg" / "config" / "token.place"
         assert ph.get_cache_dir() == tmp_path / "xdg" / "cache" / "token.place"
+
+
+def test_get_relative_path_relpath_error(monkeypatch, tmp_path):
+    """Return absolute path when os.path.relpath raises ValueError."""
+
+    def _raise(*_args, **_kwargs):
+        raise ValueError("different drives")
+
+    monkeypatch.setattr(os.path, "relpath", _raise)
+    base = tmp_path / "base"
+    target = tmp_path / "target"
+    base.mkdir()
+    target.mkdir()
+    result = ph.get_relative_path(target, base)
+    assert result == target

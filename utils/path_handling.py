@@ -118,7 +118,9 @@ def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[
 
     If ``base_path`` is ``None`` the current working directory is used. When the
     two paths do not share a common ancestor, the returned path contains ``..``
-    segments instead of an absolute path.
+    segments instead of an absolute path. On Windows, paths on different drives
+    return the absolute ``path`` because ``os.path.relpath`` raises ``ValueError``
+    in this scenario.
     """
     path = normalize_path(path)
     if base_path is None:
@@ -129,5 +131,11 @@ def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[
     try:
         return path.relative_to(base_path)
     except ValueError:
-        # If path is not relative to base_path, compute a relative path
-        return pathlib.Path(os.path.relpath(path, base_path))
+        # If path is not relative to base_path, compute a relative path. On
+        # Windows, ``os.path.relpath`` can raise ``ValueError`` when the paths
+        # reside on different drives, in which case we return the absolute path
+        # instead of bubbling up the exception.
+        try:
+            return pathlib.Path(os.path.relpath(path, base_path))
+        except ValueError:
+            return path

@@ -268,7 +268,7 @@ class CryptoClient:
             return None
 
         if not response.get('success', False) and 'message' not in response:
-            logger.error(f"Unexpected response from faucet: {response}")
+            logger.error("Unexpected response from faucet")
             return None
 
         logger.debug("Message sent successfully, waiting for processing")
@@ -343,17 +343,17 @@ class CryptoClient:
                     if isinstance(decrypted_data, list) and len(decrypted_data) > 0:
                         for msg in decrypted_data:
                             if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
-                                logger.warning(f"Invalid message format in response: {msg}")
+                                logger.warning("Invalid message format in response")
                                 return None
                         return decrypted_data
                     else:
-                        logger.warning(f"Unexpected response format: {decrypted_data}")
+                        logger.warning("Unexpected response format type: %s", type(decrypted_data).__name__)
                         return None
                 except Exception as e:
                     logger.error(f"Failed to decrypt response: {str(e)}", exc_info=self.debug)
                     return None
             else:
-                logger.debug(f"Response doesn't contain expected fields: {response}")
+                logger.debug("Response missing expected fields: %s", list(response.keys()))
 
             # Wait before retrying
             time.sleep(retry_delay)

@@ -127,7 +127,10 @@ For convenience, you can execute all available test suites with `./run_all_tests
 - Install `pre-commit` and run `pre-commit run --all-files` before pushing changes.
 - Keep the roadmap in [README.md](README.md) updated as features progress.
 - Use `npm ci` for faster, reproducible Node.js installs (mirrors the CI pipeline's behavior).
-- Install Python dependencies with `pip install -r config/requirements_server.txt` and `pip install -r config/requirements_relay.txt` before running tests. If Playwright tests complain about missing browsers, run `playwright install chromium`.
+- Install Python dependencies with `pip install -r config/requirements_server.txt` and
+  `pip install -r config/requirements_relay.txt` before running tests.
+  If Playwright tests complain about missing browsers or system libraries,
+  run `playwright install chromium` and `playwright install-deps`.
 - For development and unit testing, also run `pip install -r requirements.txt` to install extra tooling like pytest-playwright, then run `playwright install`.
 - Every pull request triggers the GitHub Actions workflow in `.github/workflows/ci.yml` which runs `./run_all_tests.sh` with coverage enabled and uploads results to Codecov.
 - Tag **@claude** in a pull request or issue to invoke the Claude PR Assistant defined in `.github/workflows/claude.yml`.

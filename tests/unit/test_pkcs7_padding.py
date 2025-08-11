@@ -35,3 +35,11 @@ def test_unpad_non_block_multiple():
     padded = b"abcde\x01"  # len=6, not divisible by block size
     with pytest.raises(ValueError):
         pkcs7_unpad(padded, 16)
+
+
+def test_pad_invalid_block_size():
+    """Block sizes outside 1-255 should raise."""
+    with pytest.raises(ValueError):
+        pkcs7_pad(b"data", 0)
+    with pytest.raises(ValueError):
+        pkcs7_pad(b"data", 256)

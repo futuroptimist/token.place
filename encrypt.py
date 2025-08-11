@@ -166,9 +166,20 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
         return None
 
 def pkcs7_pad(data: bytes, block_size: int) -> bytes:
+    """Pad *data* to a multiple of *block_size* using PKCS#7 padding.
+
+    Args:
+        data: Input bytes to pad.
+        block_size: Size of each block in bytes (1-255).
+
+    Returns:
+        Padded byte string whose length is a multiple of *block_size*.
+
+    Raises:
+        ValueError: If *block_size* is not between 1 and 255 (inclusive).
     """
-    Pad data using PKCS#7 padding scheme
-    """
+    if block_size <= 0 or block_size > 255:
+        raise ValueError("Block size must be between 1 and 255")
     padding_length = block_size - (len(data) % block_size)
     padding = bytes([padding_length] * padding_length)
     return data + padding

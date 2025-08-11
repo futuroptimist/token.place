@@ -39,7 +39,7 @@ Open `http://localhost:5000` or run `python client.py`. Metrics are exposed at `
 |----------|---------|-------------|
 | API_RATE_LIMIT | 60/hour | Per-IP rate limit for API requests |
 | USE_MOCK_LLM | 0 | Run with mock LLM instead of downloading a real model |
-| TOKEN_PLACE_ENV | development | Deployment environment (`development`, `testing`, `production`) |
+| TOKEN_PLACE_ENV | development | Deployment environment (`development`, `testing`, `production`; case-insensitive) |
 
 ## CI pass criteria
 

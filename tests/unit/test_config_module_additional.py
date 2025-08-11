@@ -66,3 +66,16 @@ def test_env_properties_and_global_get(tmp_path, monkeypatch):
     assert cfg_dev.is_development and not cfg_dev.is_production
     assert cfg_prod.is_production and not cfg_prod.is_development
     assert isinstance(config.get_config(), config.Config)
+
+
+def test_env_variable_case_insensitive(tmp_path, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'TESTING')
+    monkeypatch.setattr('utils.path_handling.get_config_dir', lambda: tmp_path / 'config')
+    monkeypatch.setattr('utils.path_handling.get_app_data_dir', lambda: tmp_path / 'data')
+    monkeypatch.setattr('utils.path_handling.get_models_dir', lambda: tmp_path / 'models')
+    monkeypatch.setattr('utils.path_handling.get_logs_dir', lambda: tmp_path / 'logs')
+    monkeypatch.setattr('utils.path_handling.get_cache_dir', lambda: tmp_path / 'cache')
+    monkeypatch.setattr('utils.path_handling.ensure_dir_exists', lambda p: Path(p).mkdir(parents=True, exist_ok=True))
+    cfg = config.Config()
+    assert cfg.is_testing
+    assert cfg.get('server.port') == 8001

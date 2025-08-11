@@ -2,6 +2,12 @@
 
 This directory contains utility modules for token.place that provide reusable functionality across the project.
 
+The package's top level re-exports a few commonly used helpers, so you can import them directly:
+
+```python
+from utils import get_model_manager, get_crypto_manager, RelayClient
+```
+
 ## Available Utilities
 
 ### Path Handling (`path_handling.py`)

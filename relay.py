@@ -1,7 +1,7 @@
 from flask import Flask, send_from_directory, request, jsonify
 import requests
 from datetime import datetime
-import random
+import secrets
 import argparse
 import os
 import sys
@@ -63,8 +63,8 @@ def next_server():
             }
         })
 
-    # Select a server randomly
-    server_public_key = random.choice(list(known_servers.keys()))
+    # Select a server randomly using cryptographically secure randomness
+    server_public_key = secrets.choice(list(known_servers.keys()))
     return jsonify({
         'server_public_key': known_servers[server_public_key]['public_key']
     })

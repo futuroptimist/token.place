@@ -420,6 +420,8 @@ def test_openai_alias_routes_extended(client):
         data_api = res_api.get_json()
         if isinstance(data_alias, dict) and 'id' in data_alias:
             data_alias['id'] = data_api.get('id')
+            if 'created' in data_alias:
+                data_alias['created'] = data_api.get('created')
         assert data_alias == data_api
 
 

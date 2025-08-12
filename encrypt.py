@@ -121,7 +121,13 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
 
     Returns:
         Decrypted plaintext or None if decryption fails
+
+    Raises:
+        ValueError: If ``ciphertext_dict`` lacks required fields.
     """
+    if "ciphertext" not in ciphertext_dict or "iv" not in ciphertext_dict:
+        raise ValueError("ciphertext_dict must contain 'ciphertext' and 'iv' keys")
+
     try:
         # First decrypt the AES key using RSA
         private_key = serialization.load_pem_private_key(
@@ -150,8 +156,8 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
         aes_key = base64.b64decode(aes_key_b64)
 
         # Get the ciphertext and IV
-        ciphertext = ciphertext_dict['ciphertext']
-        iv = ciphertext_dict['iv']
+        ciphertext = ciphertext_dict["ciphertext"]
+        iv = ciphertext_dict["iv"]
 
         # Decrypt the ciphertext using AES-CBC
         cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())

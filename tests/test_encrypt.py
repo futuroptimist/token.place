@@ -1,6 +1,5 @@
-import os
-import base64
 import json
+import pytest
 from encrypt import generate_keys, encrypt, decrypt
 
 def test_encrypt_decrypt():
@@ -83,3 +82,11 @@ def test_encrypt_decrypt_empty_plaintext():
     # Assert that the decrypted plaintext matches the original plaintext
     assert decrypted_bytes is not None
     assert decrypted_bytes == plaintext_bytes
+
+
+def test_decrypt_missing_fields_raises_value_error():
+    private_key, public_key = generate_keys()
+    ciphertext_dict, cipherkey, _ = encrypt(b"data", public_key)
+    del ciphertext_dict["iv"]
+    with pytest.raises(ValueError):
+        decrypt(ciphertext_dict, cipherkey, private_key)

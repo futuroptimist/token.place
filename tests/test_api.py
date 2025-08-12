@@ -422,7 +422,17 @@ def test_openai_alias_routes_extended(client):
             data_alias['id'] = data_api.get('id')
             if 'created' in data_alias:
                 data_alias['created'] = data_api.get('created')
-        assert data_alias == data_api
+        # If both responses contain a timestamp, allow slight drift
+        if (
+            isinstance(data_alias, dict)
+            and 'timestamp' in data_alias
+            and 'timestamp' in data_api
+        ):
+            assert data_alias['status'] == data_api['status']
+            assert data_alias['version'] == data_api['version']
+            assert abs(data_alias['timestamp'] - data_api['timestamp']) <= 2
+        else:
+            assert data_alias == data_api
 
 
 def test_logging_prod_environment(monkeypatch):

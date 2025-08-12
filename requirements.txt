@@ -8,7 +8,7 @@ Flask==3.0.0
 idna==3.6
 itsdangerous==2.2.0
 Jinja2==3.1.6
-llama_cpp_python==0.3.14
+llama_cpp_python==0.3.15
 MarkupSafe==3.0.2
 numpy==2.0.2
 requests==2.32.4

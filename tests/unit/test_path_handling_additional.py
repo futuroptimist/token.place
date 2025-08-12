@@ -31,6 +31,19 @@ def test_ensure_dir_exists_expands_user(tmp_path, monkeypatch):
     assert result.exists()
 
 
+def test_ensure_dir_exists_expands_env_vars(tmp_path, monkeypatch):
+    """ensure_dir_exists should expand environment variables"""
+    monkeypatch.setenv("TEST_BASE", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    if ph.IS_WINDOWS:
+        path_with_var = "%TEST_BASE%\\envdir"
+    else:
+        path_with_var = "$TEST_BASE/envdir"
+    result = ph.ensure_dir_exists(path_with_var)
+    assert result == tmp_path / "envdir"
+    assert result.exists()
+
+
 def test_normalize_path_expands_env_vars(tmp_path, monkeypatch):
     """normalize_path should expand environment variables"""
     monkeypatch.setenv("TEST_BASE", str(tmp_path))

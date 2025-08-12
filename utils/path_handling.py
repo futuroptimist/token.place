@@ -83,22 +83,34 @@ def get_models_dir() -> pathlib.Path:
     return ensure_dir_exists(get_app_data_dir() / 'models')
 
 def get_logs_dir() -> pathlib.Path:
-    """Get the directory for storing log files."""
+    """Get the directory for storing log files.
+
+    On Linux, honors the ``XDG_STATE_HOME`` environment variable when set.
+    """
     if IS_WINDOWS:
         return ensure_dir_exists(get_app_data_dir() / 'logs')
     elif IS_MACOS:
-        return ensure_dir_exists(get_user_home_dir() / 'Library' / 'Logs' / 'token.place')
+        return ensure_dir_exists(
+            get_user_home_dir() / 'Library' / 'Logs' / 'token.place'
+        )
     else:  # Linux and other Unix-like
-        return ensure_dir_exists(get_user_home_dir() / '.local' / 'state' / 'token.place' / 'logs')
+        xdg_state_home = os.environ.get('XDG_STATE_HOME')
+        if xdg_state_home:
+            base_dir = pathlib.Path(xdg_state_home)
+        else:
+            base_dir = get_user_home_dir() / '.local' / 'state'
+        return ensure_dir_exists(base_dir / 'token.place' / 'logs')
 
 def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
     """
     Ensure a directory exists, creating it if necessary.
+    Expands ``~`` and environment variables before creating the directory.
     Raises NotADirectoryError if the path points to an existing file.
     Returns the path as a pathlib.Path object.
     """
-    # Expand user home (~) and normalize to an absolute path
-    path = pathlib.Path(dir_path).expanduser().resolve()
+    # Expand environment variables and user home (~), then normalize
+    path_str = os.path.expandvars(str(dir_path))
+    path = pathlib.Path(path_str).expanduser().resolve()
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
     path.mkdir(parents=True, exist_ok=True)

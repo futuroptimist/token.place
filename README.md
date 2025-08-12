@@ -20,6 +20,7 @@ cd token.place
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
 npm ci
+playwright install chromium
 pip install pre-commit
 pre-commit install
 pre-commit run --all-files

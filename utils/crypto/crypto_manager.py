@@ -2,6 +2,7 @@
 Crypto manager module for handling encryption/decryption operations.
 """
 import base64
+import binascii
 import json
 import logging
 from typing import Dict, Tuple, Any, Optional, Union, List
@@ -94,7 +95,10 @@ class CryptoManager:
 
             # Ensure client_public_key is bytes
             if isinstance(client_public_key, str):
-                client_public_key = base64.b64decode(client_public_key)
+                try:
+                    client_public_key = base64.b64decode(client_public_key)
+                except (binascii.Error, ValueError) as e:
+                    raise ValueError("Invalid base64-encoded public key") from e
 
             # Encrypt the message
             encrypted_data, encrypted_key, iv = encrypt(message_bytes, client_public_key)

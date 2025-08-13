@@ -31,6 +31,8 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 ### Crypto Helpers (`crypto_helpers.py`)
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
+`CryptoClient.decrypt_message` now validates required fields and returns `None` when data is incomplete or
+malformed to prevent unexpected exceptions.
 
 ### Crypto Manager (`crypto/crypto_manager.py`)
 

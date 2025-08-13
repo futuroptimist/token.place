@@ -164,15 +164,22 @@ class CryptoClient:
         """
         if self.client_private_key is None:
             raise ValueError("Client private key not available")
+        logger.debug("Decrypting message...")
 
-        logger.debug(f"Decrypting message...")
+        required_fields = ("ciphertext", "cipherkey", "iv")
+        if not all(field in encrypted_data for field in required_fields):
+            logger.error("Missing required encrypted fields: %s", required_fields)
+            return None
 
-        # Extract and decode the encrypted components
-        encrypted_response = {
-            'ciphertext': base64.b64decode(encrypted_data['ciphertext']),
-            'iv': base64.b64decode(encrypted_data['iv'])
-        }
-        encrypted_key = base64.b64decode(encrypted_data['cipherkey'])
+        try:
+            encrypted_response = {
+                'ciphertext': base64.b64decode(encrypted_data['ciphertext']),
+                'iv': base64.b64decode(encrypted_data['iv'])
+            }
+            encrypted_key = base64.b64decode(encrypted_data['cipherkey'])
+        except Exception:
+            logger.error("Failed to decode encrypted fields")
+            return None
 
         # Decrypt the data
         decrypted_bytes = decrypt(encrypted_response, encrypted_key, self.client_private_key)

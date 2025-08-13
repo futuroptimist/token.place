@@ -71,6 +71,19 @@ def test_decrypt_message_requires_private_key(monkeypatch):
         client.decrypt_message({'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'})
 
 
+def test_decrypt_message_missing_fields():
+    client = _prep_client()
+    # missing cipherkey
+    enc = {'ciphertext': 'Yw==', 'iv': 'aQ=='}
+    assert client.decrypt_message(enc) is None
+
+
+def test_decrypt_message_invalid_base64():
+    client = _prep_client()
+    enc = {'ciphertext': '!!', 'cipherkey': '!!', 'iv': '!!'}
+    assert client.decrypt_message(enc) is None
+
+
 def test_decrypt_message_failure(monkeypatch):
     """Decrypt returns None when underlying decrypt fails"""
     client = _prep_client()

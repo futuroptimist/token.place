@@ -104,12 +104,14 @@ def get_logs_dir() -> pathlib.Path:
 def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
     """
     Ensure a directory exists, creating it if necessary.
-    Expands ``~`` and environment variables before creating the directory.
+    Expands ``~`` and environment variables before creating the directory, and
+    strips surrounding whitespace to avoid accidental directory names.
     Raises NotADirectoryError if the path points to an existing file.
     Returns the path as a pathlib.Path object.
     """
     # Expand environment variables and user home (~), then normalize
-    path_str = os.path.expandvars(str(dir_path))
+    # Also strip surrounding whitespace to avoid creating unintended paths
+    path_str = os.path.expandvars(str(dir_path)).strip()
     path = pathlib.Path(path_str).expanduser().resolve()
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
@@ -121,8 +123,11 @@ def get_executable_extension() -> str:
     return '.exe' if IS_WINDOWS else ''
 
 def normalize_path(path: Union[str, pathlib.Path]) -> pathlib.Path:
-    """Convert a path string to a normalized pathlib.Path object."""
-    expanded = os.path.expandvars(str(path))
+    """Convert a path string to a normalized pathlib.Path object.
+
+    Strips surrounding whitespace and expands environment variables and user home (~).
+    """
+    expanded = os.path.expandvars(str(path)).strip()
     return pathlib.Path(expanded).expanduser().resolve()
 
 def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[str, pathlib.Path]] = None) -> pathlib.Path:

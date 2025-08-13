@@ -44,6 +44,14 @@ def test_ensure_dir_exists_expands_env_vars(tmp_path, monkeypatch):
     assert result.exists()
 
 
+def test_ensure_dir_exists_strips_whitespace(tmp_path):
+    """ensure_dir_exists should strip surrounding whitespace from the path"""
+    path_with_spaces = f"  {tmp_path / 'spaced'}  "
+    result = ph.ensure_dir_exists(path_with_spaces)
+    assert result == tmp_path / "spaced"
+    assert result.exists()
+
+
 def test_normalize_path_expands_env_vars(tmp_path, monkeypatch):
     """normalize_path should expand environment variables"""
     monkeypatch.setenv("TEST_BASE", str(tmp_path))
@@ -54,6 +62,15 @@ def test_normalize_path_expands_env_vars(tmp_path, monkeypatch):
     else:
         path_with_var = "$TEST_BASE/nested"
     result = ph.normalize_path(path_with_var)
+    assert result == target
+
+
+def test_normalize_path_strips_whitespace(tmp_path):
+    """normalize_path should strip leading/trailing whitespace"""
+    target = tmp_path / "clean"
+    target.mkdir()
+    path_with_spaces = f"  {target}  "
+    result = ph.normalize_path(path_with_spaces)
     assert result == target
 
 

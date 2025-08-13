@@ -4,9 +4,12 @@ import base64
 import time
 import os
 import argparse
+import logging
 from encrypt import generate_keys, encrypt, decrypt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+
+logger = logging.getLogger(__name__)
 
 # Use an environment variable to determine the environment
 environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -224,10 +227,13 @@ class ChatClient:
                         decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, self.private_key)
 
                         if decrypted_chat_history is not None:
-                            print(f"Response from AI: {decrypted_chat_history.decode('utf-8')}")
+                            logger.debug(
+                                "Received decrypted AI response (%d bytes)",
+                                len(decrypted_chat_history),
+                            )
                             return json.loads(decrypted_chat_history.decode('utf-8'))
                         else:
-                            print("Decryption failed. Skipping this response.")
+                            logger.debug("Decryption failed. Skipping this response.")
                     else:
                         print("Response data is incomplete, waiting for complete response...")
                 else:
@@ -247,7 +253,7 @@ class ChatClient:
 
         server_public_key = self.get_server_public_key()
 
-        print(f"Server public key: {server_public_key}")
+        logger.debug("Retrieved server public key (%d bytes)", len(server_public_key))
 
         if server_public_key:
             ciphertext_dict, cipherkey, iv = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)
@@ -296,7 +302,16 @@ def main():
 
         response = chat_client.send_message(user_message)
         if response:
-            print("Chat history:", response)
+            if isinstance(response, list) and response:
+                last_msg = response[-1]
+                content = (
+                    last_msg.get("content")
+                    if isinstance(last_msg, dict)
+                    else str(last_msg)
+                )
+                print(f"Assistant: {content}")
+            else:
+                print("Assistant:", response)
         else:
             print("Failed to get response from the server.")
 

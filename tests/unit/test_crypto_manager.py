@@ -122,6 +122,11 @@ class TestCryptoManager:
         # Verify mock calls
         mock_encrypt.assert_called_once_with(b'test bytes', client_public_key)
 
+    def test_encrypt_message_none_raises(self, crypto_manager):
+        """encrypt_message should reject None input."""
+        with pytest.raises(ValueError, match="Message cannot be None"):
+            crypto_manager.encrypt_message(None, b'client_public_key')
+
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_exception(self, mock_encrypt, crypto_manager):
         """Test handling of exceptions during encryption."""

@@ -1,4 +1,5 @@
 import builtins
+import io
 from unittest.mock import patch, MagicMock
 import client_simplified as cs
 
@@ -33,6 +34,17 @@ def test_main_single_message(monkeypatch, capsys):
     assert "Assistant: ok" in out
     mock_client.fetch_server_public_key.assert_called_once()
     mock_client.send_chat_message.assert_called_once()
+
+
+def test_clear_screen_skips_when_not_tty(monkeypatch):
+    class FakeStdout(io.StringIO):
+        def isatty(self):
+            return False
+
+    fake = FakeStdout()
+    monkeypatch.setattr(cs.sys, "stdout", fake)
+    cs.clear_screen()
+    assert fake.getvalue() == ""
 
 
 def test_chat_loop_single_iteration(monkeypatch, capsys):

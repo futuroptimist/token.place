@@ -624,7 +624,7 @@ docker compose up -d
 
 **Docker:**
 ```bash
-docker-compose up -d  # starts the relay service
+docker compose up -d  # starts the relay service
 ```
 
 ## Features
@@ -638,7 +638,7 @@ docker-compose up -d  # starts the relay service
 ## Quick Start
 
 1. Clone the repository
-2. Run `docker-compose up` to build and start the relay container
+2. Run `docker compose up` to build and start the relay container
 3. Open `http://localhost:5000` in your browser to begin chatting
 
 ## Development

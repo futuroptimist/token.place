@@ -49,7 +49,7 @@ Contributions describing different configurations are welcome so the project can
    ```bash
    git clone https://github.com/futuroptimist/token.place.git  # download the project
    cd token.place                                             # enter the project folder
-   sudo apt install -y docker.io docker-compose               # install Docker runtime
+    sudo apt install -y docker.io docker-compose-plugin        # install Docker runtime and Compose plugin
    sudo usermod -aG docker $USER                              # allow the current user to run Docker
    newgrp docker                                              # apply the new group membership
    ```

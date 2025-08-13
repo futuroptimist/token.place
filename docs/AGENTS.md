@@ -18,7 +18,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [docs/ONBOARDING.md](docs/ONBOARDING.md): Quick orientation to the repository structure
 - [requirements.txt](requirements.txt): Python dependencies for the project
 - [package.json](package.json): Node.js dependencies for JavaScript components
-- `docker-compose up` starts the relay container for quick local testing
+- `docker compose up` starts the relay container for quick local testing
 
 ## Core Components
 

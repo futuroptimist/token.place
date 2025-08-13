@@ -32,7 +32,9 @@ python relay.py
 python server.py
 ```
 
-Open `http://localhost:5000` or run `python client.py`. Metrics are exposed at `/metrics`.
+Open `http://localhost:5000` or run `python client.py`. For a minimal client use
+`python client_simplified.py`; it only clears the screen when running interactively. Metrics are
+exposed at `/metrics`.
 
 ### Key environment variables
 

@@ -10,10 +10,15 @@ from typing import List, Dict
 # Import our CryptoClient
 from utils.crypto_helpers import CryptoClient
 
+
 def clear_screen():
-    """Clear the terminal screen without spawning a shell"""
-    # Use ANSI escape codes to avoid shell injection via os.system
-    print("\033[2J\033[H", end="")
+    """Clear the terminal screen without spawning a shell.
+
+    Skips output when stdout is not a TTY.
+    """
+    if sys.stdout.isatty():
+        # Use ANSI escape codes to avoid shell injection via os.system
+        print("\033[2J\033[H", end="")
 
 def format_message(message: Dict) -> str:
     """Format a message for display"""

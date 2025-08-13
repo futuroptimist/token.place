@@ -31,3 +31,8 @@ A pull request URL summarizing the fix and showing passing checks.
 ```
 
 Copy this block whenever CI needs attention in token.place.
+
+## Lessons learned
+
+- CryptoManager assumed client public keys were always bytes. CI failed when tests
+  passed a base64 string. We now decode strings before encryption to support both formats.

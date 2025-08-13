@@ -70,13 +70,14 @@ class CryptoManager:
         """Get the base64-encoded public key."""
         return self._public_key_b64
 
-    def encrypt_message(self, message: Union[str, bytes, Dict, List], client_public_key: bytes) -> Dict[str, str]:
+    def encrypt_message(self, message: Union[str, bytes, Dict, List],
+                        client_public_key: Union[str, bytes]) -> Dict[str, str]:
         """
         Encrypt a message for a client using their public key.
 
         Args:
             message: The message to encrypt (string, bytes, dict, or list)
-            client_public_key: The client's public key in bytes
+            client_public_key: The client's public key in bytes or base64 string
 
         Returns:
             Dict with 'chat_history' (base64 encoded ciphertext), 'cipherkey' (encrypted key),
@@ -90,6 +91,10 @@ class CryptoManager:
                 message_bytes = message.encode('utf-8')
             else:
                 message_bytes = message
+
+            # Ensure client_public_key is bytes
+            if isinstance(client_public_key, str):
+                client_public_key = base64.b64decode(client_public_key)
 
             # Encrypt the message
             encrypted_data, encrypted_key, iv = encrypt(message_bytes, client_public_key)

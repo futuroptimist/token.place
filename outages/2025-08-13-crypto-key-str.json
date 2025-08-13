@@ -1,0 +1,8 @@
+{
+  "date": "2025-08-13",
+  "slug": "crypto-key-str",
+  "summary": "CryptoManager accepted only byte public keys causing encryption to fail when a base64 string was provided.",
+  "impact": "CI tests using string public keys failed, preventing merges.",
+  "fix": "crypto_manager.encrypt_message now decodes base64 strings before encryption.",
+  "lessons": "Validate input types and support common representations."
+}

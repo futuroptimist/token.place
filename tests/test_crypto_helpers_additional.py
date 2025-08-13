@@ -58,6 +58,14 @@ def test_decrypt_message_paths(client):
     with patch('utils.crypto_helpers.decrypt', return_value=b'{"a": 1}'):
         assert client.decrypt_message(encrypted) == {'a': 1}
 
+    # missing required encrypted fields
+    incomplete = {'ciphertext': encrypted['ciphertext'], 'iv': encrypted['iv']}
+    assert client.decrypt_message(incomplete) is None
+
+    # invalid base64 input
+    with patch('utils.crypto_helpers.base64.b64decode', side_effect=Exception('bad b64')):
+        assert client.decrypt_message(encrypted) is None
+
 
 def test_send_encrypted_message_error_and_exception(client):
     payload = {'a': 'b'}
@@ -197,4 +205,3 @@ def test_send_api_request_failure_cases(client):
          patch('utils.crypto_helpers.encrypt', return_value=({'ciphertext': b'c', 'iv': b'i'}, b'k', b'i')), \
          patch.object(client, 'decrypt_message', side_effect=Exception('boom')):
         assert client.send_api_request([], model='m') is None
-

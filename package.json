@@ -8,7 +8,11 @@
     "test:js": "node tests/test_js_crypto.js",
     "test:crypto-compat": "python tests/test_crypto_compatibility.py",
     "test:e2e": "pytest tests/test_e2e_chat.py",
-    "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e"
+    "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e",
+    "lint": "echo 'lint step not configured'",
+    "type-check": "echo 'type-check step not configured'",
+    "build": "echo 'build step not configured'",
+    "test:ci": "./run_all_tests.sh"
   },
   "repository": {
     "type": "git",

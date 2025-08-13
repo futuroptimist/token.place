@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "date": {"type": "string", "format": "date"},
+    "slug": {"type": "string"},
+    "summary": {"type": "string"},
+    "root_cause": {"type": "string"},
+    "impact": {"type": "string"},
+    "resolution": {"type": "string"},
+    "lessons": {"type": "string"}
+  },
+  "required": ["date", "slug", "summary", "root_cause", "resolution"]
+}

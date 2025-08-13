@@ -31,3 +31,8 @@ A pull request URL summarizing the fix and showing passing checks.
 ```
 
 Copy this block whenever CI needs attention in token.place.
+
+## Lessons learned
+
+- Missing npm scripts like `test:ci` caused `npm run test:ci` to fail. Adding the script ensures the
+  standard CI command runs `./run_all_tests.sh` consistently.

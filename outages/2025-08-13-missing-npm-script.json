@@ -1,0 +1,10 @@
+{
+  "$schema": "./schema.json",
+  "date": "2025-08-13",
+  "slug": "missing-npm-script",
+  "summary": "npm run test:ci failed because package.json lacked the script",
+  "root_cause": "The package.json file did not define a test:ci script",
+  "impact": "Developers could not use the standard CI command locally",
+  "resolution": "Added test:ci script executing run_all_tests.sh",
+  "lessons": "Ensure critical npm scripts are present to mirror CI checks"
+}

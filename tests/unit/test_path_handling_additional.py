@@ -44,6 +44,18 @@ def test_ensure_dir_exists_expands_env_vars(tmp_path, monkeypatch):
     assert result.exists()
 
 
+@pytest.mark.skipif(ph.IS_WINDOWS, reason="Symlink creation needs privileges on Windows")
+def test_ensure_dir_exists_preserves_symlink(tmp_path):
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    subdir = link / "newdir"
+    result = ph.ensure_dir_exists(subdir)
+    assert result == subdir
+    assert subdir.exists()
+
+
 def test_normalize_path_expands_env_vars(tmp_path, monkeypatch):
     """normalize_path should expand environment variables"""
     monkeypatch.setenv("TEST_BASE", str(tmp_path))

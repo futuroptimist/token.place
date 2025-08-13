@@ -102,15 +102,15 @@ def get_logs_dir() -> pathlib.Path:
         return ensure_dir_exists(base_dir / 'token.place' / 'logs')
 
 def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
-    """
-    Ensure a directory exists, creating it if necessary.
+    """Ensure a directory exists, creating it if necessary.
+
     Expands ``~`` and environment variables before creating the directory.
-    Raises NotADirectoryError if the path points to an existing file.
-    Returns the path as a pathlib.Path object.
+    Raises ``NotADirectoryError`` if the path points to an existing file.
+    The returned path is absolute with symlinks preserved.
     """
     # Expand environment variables and user home (~), then normalize
     path_str = os.path.expandvars(str(dir_path))
-    path = pathlib.Path(path_str).expanduser().resolve()
+    path = pathlib.Path(path_str).expanduser().absolute()
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
     path.mkdir(parents=True, exist_ok=True)

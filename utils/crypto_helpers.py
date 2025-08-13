@@ -436,5 +436,9 @@ class CryptoClient:
                 logger.error(f"Failed to decrypt API response (encrypted_content format): {str(e)}", exc_info=self.debug)
                 return None
 
-        logger.error(f"Invalid API response format: {response}")
+        # Avoid logging full response to prevent leaking ciphertext or other data
+        logger.error(
+            "Invalid API response format: keys=%s",
+            list(response.keys()) if isinstance(response, dict) else type(response).__name__,
+        )
         return None

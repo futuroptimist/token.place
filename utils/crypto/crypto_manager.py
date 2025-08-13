@@ -81,8 +81,14 @@ class CryptoManager:
         Returns:
             Dict with 'chat_history' (base64 encoded ciphertext), 'cipherkey' (encrypted key),
             and 'iv' (initialization vector)
+
+        Raises:
+            ValueError: If ``message`` is ``None``.
         """
         try:
+            if message is None:
+                raise ValueError("Message cannot be None")
+
             # Convert message to bytes if it's not already
             if isinstance(message, (dict, list)):
                 message_bytes = json.dumps(message).encode('utf-8')

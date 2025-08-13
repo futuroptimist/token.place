@@ -6,8 +6,7 @@
 [![Docs](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=docs)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/futuroptimist/token.place)](LICENSE)
 [![Dependabot](https://img.shields.io/badge/dependabot-enabled-brightgreen?logo=dependabot)](https://github.com/futuroptimist/token.place/network/updates)
-[![CodeQL](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/
-futuroptimist/token.place/actions/workflows/codeql.yml)
+[![CodeQL](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml)
 [![Secret Scanning](https://img.shields.io/badge/secret%20scanning-enabled-brightgreen)](https://docs.github.com/en/code-security/secret-scanning)
 
 Secure peer-to-peer generative AI platform

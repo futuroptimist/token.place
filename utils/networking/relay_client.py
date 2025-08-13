@@ -354,7 +354,12 @@ class RelayClient:
                 if 'error' in relay_response:
                     log_error("Error from relay: {}", relay_response['error'])
                 else:
-                    log_info("Received data from relay: {}", relay_response)
+                    # Avoid logging potentially sensitive ciphertext or keys.
+                    # Only log the top-level keys present in the relay response.
+                    log_info(
+                        "Received data from relay with keys: {}",
+                        list(relay_response.keys())
+                    )
 
                     # Check if there's a client request to process
                     required_fields = ['client_public_key', 'chat_history', 'cipherkey', 'iv']

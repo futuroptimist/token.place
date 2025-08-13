@@ -128,6 +128,29 @@ class TestCryptoManager:
             crypto_manager.encrypt_message(None, b'client_public_key')
 
     @patch('utils.crypto.crypto_manager.encrypt')
+    def test_encrypt_message_accepts_base64_key(self, mock_encrypt, crypto_manager):
+        """Public key may be provided as a base64 string."""
+        message = "hi"
+        b64_key = base64.b64encode(b'client_public_key').decode('utf-8')
+
+        mock_encrypted_data = {'ciphertext': b'encrypted_content', 'iv': b'iv_value'}
+        mock_encrypted_key = b'encrypted_key'
+        mock_iv = b'iv_value'
+        mock_encrypt.return_value = (mock_encrypted_data, mock_encrypted_key, mock_iv)
+
+        crypto_manager.encrypt_message(message, b64_key)
+
+        mock_encrypt.assert_called_once_with(b'hi', b'client_public_key')
+
+    def test_encrypt_message_invalid_base64_key(self, crypto_manager):
+        """Invalid base64 strings raise a helpful error."""
+        message = "hi"
+        invalid_key = "not_base64!!"
+
+        with pytest.raises(ValueError, match="Invalid base64-encoded public key"):
+            crypto_manager.encrypt_message(message, invalid_key)
+
+    @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_exception(self, mock_encrypt, crypto_manager):
         """Test handling of exceptions during encryption."""
         # Setup

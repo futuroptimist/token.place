@@ -186,9 +186,20 @@ def pkcs7_pad(data: bytes, block_size: int) -> bytes:
     return data + padding
 
 def pkcs7_unpad(padded_data: bytes, block_size: int) -> bytes:
+    """Remove PKCS#7 padding from *padded_data*.
+
+    Args:
+        padded_data: Input bytes to unpad.
+        block_size: Size of each block in bytes (1-255).
+
+    Returns:
+        Unpadded byte string.
+
+    Raises:
+        ValueError: If *block_size* is not between 1 and 255 (inclusive) or padding is invalid.
     """
-    Remove PKCS#7 padding
-    """
+    if block_size <= 0 or block_size > 255:
+        raise ValueError("Block size must be between 1 and 255")
     if not padded_data:
         raise ValueError("Invalid padding")
     if len(padded_data) % block_size != 0:

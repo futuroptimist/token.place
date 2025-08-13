@@ -1,7 +1,8 @@
 import pytest
 from encrypt import pkcs7_pad, pkcs7_unpad
 
-@pytest.mark.parametrize("data", [b"test", b"" , b"1234567890abcdef"*2])
+
+@pytest.mark.parametrize("data", [b"test", b"", b"1234567890abcdef" * 2])
 def test_pad_unpad_roundtrip(data):
     padded = pkcs7_pad(data, 16)
     assert len(padded) % 16 == 0
@@ -43,3 +44,12 @@ def test_pad_invalid_block_size():
         pkcs7_pad(b"data", 0)
     with pytest.raises(ValueError):
         pkcs7_pad(b"data", 256)
+
+
+def test_unpad_invalid_block_size():
+    """Block sizes outside 1-255 should raise during unpadding."""
+    padded = pkcs7_pad(b"data", 16)
+    with pytest.raises(ValueError):
+        pkcs7_unpad(padded, 0)
+    with pytest.raises(ValueError):
+        pkcs7_unpad(padded, 256)

@@ -13,10 +13,13 @@ import os
 import shlex
 from pathlib import Path
 
+
 def run_command(cmd, cwd=None):
-    """Run a command and return success status and output."""
-    if isinstance(cmd, str):
-        cmd = shlex.split(cmd)
+    """Run a command and return success status and output.
+
+    Any ``shlex.split`` failures are caught and surfaced as errors instead of
+    raising exceptions.
+    """
     try:
         cmd_list = shlex.split(cmd) if isinstance(cmd, str) else cmd
         result = subprocess.run(

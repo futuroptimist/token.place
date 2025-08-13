@@ -36,6 +36,11 @@ def test_run_command_exception(monkeypatch):
     assert not success and err
 
 
+def test_run_command_split_error():
+    success, _, err = vd.run_command("echo '")
+    assert not success and err
+
+
 def test_validate_dependencies_success(tmp_path, monkeypatch):
     project_root, fake_script = _setup(tmp_path)
     monkeypatch.setattr(vd, "__file__", str(fake_script))

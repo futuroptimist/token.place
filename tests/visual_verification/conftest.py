@@ -19,7 +19,7 @@ test_results = []
 def visual_test_context():
     """
     Fixture that provides a context for visual verification tests.
-    
+
     Returns:
         A dictionary with helper functions and test context
     """
@@ -31,13 +31,13 @@ def visual_test_context():
                 "tablet": {"width": 768, "height": 1024},
                 "desktop": {"width": 1366, "height": 768}
             }
-        
+
         def add_result(self, result: Dict[str, Any]):
             """Add a test result to the collection."""
             self.results.append(result)
             # Also add to the global results
             test_results.append(result)
-        
+
         def get_results(self) -> List[Dict[str, Any]]:
             """Get all test results."""
             return self.results
@@ -60,8 +60,8 @@ def generate_visual_report(request):
 def create_baseline_mode():
     """
     Determine if we're in baseline creation mode based on environment variable.
-    
+
     Returns:
         bool: True if CREATE_BASELINE=1 is set
     """
-    return os.environ.get("CREATE_BASELINE", "0") == "1" 
+    return os.environ.get("CREATE_BASELINE", "0") == "1"

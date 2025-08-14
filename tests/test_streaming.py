@@ -30,14 +30,14 @@ def test_streaming_chat_completion(client):
             {"choices": [{"delta": {"content": ""}, "finish_reason": "stop", "index": 0}]}
         ]
         mock_stream.return_value = (json.dumps(chunk) + "\n\n" for chunk in chunks)
-        
+
         # Make the request
         response = client.post("/api/v1/chat/completions", json=payload)
-        
+
         # Check response is streaming
         assert response.status_code == 200
         assert response.headers["Content-Type"] == "text/event-stream"
-        
+
         # Collect streaming response
         content = ""
         for chunk in response.iter_encoded():
@@ -45,7 +45,7 @@ def test_streaming_chat_completion(client):
                 data = json.loads(chunk[6:])  # Strip "data: " prefix
                 if "choices" in data and data["choices"][0].get("delta", {}).get("content"):
                     content += data["choices"][0]["delta"]["content"]
-        
+
         # Verify content
         assert "1, 2, 3, 4, 5" in content
 
@@ -79,7 +79,7 @@ def test_streaming_with_tool_use(client):
             }
         ]
     }
-    
+
     # This test is a placeholder for future tool use + streaming capabilities
     # Implementation will depend on how we integrate tools with the LLM
-    assert True 
+    assert True

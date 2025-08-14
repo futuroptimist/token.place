@@ -32,7 +32,7 @@ def setup_servers():
     print("Launched server with USE_MOCK_LLM=1. Waiting for 5 seconds...") # Reduced wait time as no model download needed
     time.sleep(5)  # Reduced wait time
 
-    # --- Wait for server to register with relay --- 
+    # --- Wait for server to register with relay ---
     print("Waiting for server to register with relay...")
     base_relay_url = f'http://localhost:{relay_port}'
     max_wait_time = 30 # seconds
@@ -59,7 +59,7 @@ def setup_servers():
         relay_process.terminate()
         server_process.terminate()
         raise TimeoutError("Server did not register with relay.")
-    # --- End wait for server --- 
+    # --- End wait for server ---
 
     yield client, relay_port, server_port, relay_process, server_process
 
@@ -160,7 +160,7 @@ def test_faucet_endpoint(setup_servers):
                 iv = base64.b64decode(data['iv'])
                 cipherkey = base64.b64decode(data['cipherkey'])
                 decrypted_chat_history = decrypt({'ciphertext': encrypted_chat_history, 'iv': iv}, cipherkey, private_key)
-                
+
                 if decrypted_chat_history is not None:
                     decrypted_response = json.loads(decrypted_chat_history.decode('utf-8'))
                     assert len(decrypted_response) == 2
@@ -168,9 +168,9 @@ def test_faucet_endpoint(setup_servers):
                     assert decrypted_response[0]['content'] == 'hello'
                     assert decrypted_response[1]['role'] == 'assistant'
                     return  # Exit the loop if the response is successfully decrypted
-        
+
         elapsed_time = time.time() - start_time
         if elapsed_time > timeout:
             raise AssertionError("Timeout while waiting for response.")
-        
+
         time.sleep(2)  # Wait for 2 seconds before the next attempt

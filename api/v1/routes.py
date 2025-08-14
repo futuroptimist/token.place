@@ -56,13 +56,13 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
             "type": error_type,
         }
     }
-    
+
     if param is not None:
         error_obj["error"]["param"] = param
-        
+
     if code is not None:
         error_obj["error"]["code"] = code
-        
+
     response = jsonify(error_obj)
     response.status_code = status_code
     return response
@@ -71,14 +71,14 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
 def list_models():
     """
     List available models (OpenAI-compatible)
-    
+
     Returns:
         JSON response with list of available models in OpenAI format
     """
     try:
         log_info("API request: GET /models")
         models = get_models_info()
-        
+
         # Transform to OpenAI format
         formatted_models = []
         for model in models:
@@ -104,7 +104,7 @@ def list_models():
                 "root": model["id"],
                 "parent": None
             })
-        
+
         log_info(f"Returning {len(formatted_models)} models")
         return jsonify({
             "object": "list",
@@ -118,10 +118,10 @@ def list_models():
 def get_model(model_id):
     """
     Get model information by ID (OpenAI-compatible)
-    
+
     Args:
         model_id: The ID of the model to retrieve
-        
+
     Returns:
         JSON response with model details in OpenAI format
     """
@@ -129,7 +129,7 @@ def get_model(model_id):
         log_info(f"API request: GET /models/{model_id}")
         models = get_models_info()
         model = next((m for m in models if m["id"] == model_id), None)
-        
+
         if not model:
             log_warning(f"Model '{model_id}' not found")
             return format_error_response(
@@ -139,7 +139,7 @@ def get_model(model_id):
                 code="model_not_found",
                 status_code=404
             )
-        
+
         log_info(f"Returning model details for {model_id}")
         return jsonify({
             "id": model["id"],
@@ -172,7 +172,7 @@ def get_public_key():
     """
     Get the public key for encryption (token.place specific)
     This endpoint is not part of the OpenAI API but is needed for our encryption.
-    
+
     Returns:
         JSON response with the server's public key
     """
@@ -199,7 +199,7 @@ def create_chat_completion():
     try:
         log_info("API request: POST /chat/completions")
         data = request.get_json()
-        
+
         # Validate request
         if not data:
             return format_error_response(
@@ -207,49 +207,49 @@ def create_chat_completion():
                 error_type="invalid_request_error",
                 status_code=400
             )
-            
+
         try:
             # Validate required fields
             validate_required_fields(data, ["model"])
-            
+
             # Get available models
             models = get_models_info()
             available_model_ids = [model["id"] for model in models]
-            
+
             # Validate model
             model_id = data['model']
             validate_model_name(model_id, available_model_ids)
-            
+
             # Get model instance - will raise ModelError if not found
             model_instance = get_model_instance(model_id)
             log_info(f"Model instance obtained for {model_id}")
-            
+
             # Process message payload based on encryption flag
             messages = None
             client_public_key = None
-            
+
             if data.get('encrypted', False):
                 log_info("Processing encrypted request")
-                
+
                 try:
                     # Validate encrypted request
                     validate_encrypted_request(data)
                     client_public_key = data['client_public_key']
-                    
+
                     # Decrypt the messages
                     encrypted_messages = data['messages']
                     decrypted_data = encryption_manager.decrypt_message({
                         'ciphertext': base64.b64decode(encrypted_messages['ciphertext']),
                         'iv': base64.b64decode(encrypted_messages['iv']),
                     }, base64.b64decode(encrypted_messages['cipherkey']))
-                    
+
                     if decrypted_data is None:
                         return format_error_response(
                             "Failed to decrypt messages",
                             error_type="encryption_error",
                             status_code=400
                         )
-                    
+
                     # Parse JSON from decrypted data
                     try:
                         messages = json.loads(decrypted_data.decode('utf-8'))
@@ -259,7 +259,7 @@ def create_chat_completion():
                             error_type="encryption_error",
                             status_code=400
                         )
-                        
+
                 except ValidationError as e:
                     return format_error_response(
                         e.message,
@@ -267,10 +267,10 @@ def create_chat_completion():
                         code=e.code,
                         status_code=400
                     )
-                    
+
             else:
                 log_info("Processing standard (non-encrypted) request")
-                
+
                 try:
                     # Validate messages field
                     validate_required_fields(data, ["messages"])
@@ -283,7 +283,7 @@ def create_chat_completion():
                         code=e.code,
                         status_code=400
                     )
-                    
+
             # Validate messages format
             try:
                 validate_chat_messages(messages)
@@ -294,15 +294,15 @@ def create_chat_completion():
                     code=e.code,
                     status_code=400
                 )
-                
+
             # Generate response using the specified model
             log_info(f"Generating response using model {model_id}")
             updated_messages = generate_response(model_id, messages)
-            
+
             # Extract the last message (the model's response)
             assistant_message = updated_messages[-1]
             log_info("Response generated successfully")
-            
+
             # Create response in OpenAI format
             response_data = {
                 "id": f"chatcmpl-{uuid.uuid4()}",
@@ -325,7 +325,7 @@ def create_chat_completion():
                     "total_tokens": -1
                 }
             }
-            
+
             # If client requested encryption and provided a public key, encrypt the response
             if data.get('encrypted', False) and client_public_key:
                 log_info("Encrypting response for client")
@@ -336,7 +336,7 @@ def create_chat_completion():
                         error_type="encryption_error",
                         status_code=500
                     )
-                    
+
                 # Wrap the encrypted data in a standard format
                 return jsonify({
                     "encrypted": True,
@@ -345,7 +345,7 @@ def create_chat_completion():
             else:
                 # Return standard response
                 return jsonify(response_data)
-                
+
         except ValidationError as e:
             return format_error_response(
                 e.message,
@@ -353,14 +353,14 @@ def create_chat_completion():
                 code=e.code,
                 status_code=400
             )
-            
+
         except ModelError as e:
             return format_error_response(
                 e.message,
                 error_type="model_error",
                 status_code=400
             )
-            
+
     except Exception as e:
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
@@ -380,7 +380,7 @@ def create_completion():
     try:
         log_info("API request: POST /completions")
         data = request.get_json()
-        
+
         if not data:
             log_warning("Invalid request body: empty or not JSON")
             return format_error_response(
@@ -388,13 +388,13 @@ def create_completion():
                 error_type="invalid_request_error",
                 status_code=400
             )
-        
+
         # Extract necessary data
         model_id = data.get("model")
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key") # For potential encryption
         is_encrypted_request = data.get("encrypted", False)
-        
+
         # Validate model ID
         if not model_id:
             log_warning("Missing required parameter: model")
@@ -404,7 +404,7 @@ def create_completion():
                 param="model",
                 status_code=400
             )
-        
+
         try:
             # Check if model exists - will raise ModelError if not found
             get_model_instance(model_id)
@@ -418,7 +418,7 @@ def create_completion():
                 code="model_not_found" if e.error_type == "model_not_found" else None,
                 status_code=e.status_code
             )
-    
+
         # Prepare messages for chat format
         messages = [
             {
@@ -454,7 +454,7 @@ def create_completion():
                     "total_tokens": 0,
                 },
             }
-            
+
             # Encrypt response if client_public_key was provided
             if is_encrypted_request and client_public_key:
                 log_info("Encrypting response for client")
@@ -472,9 +472,9 @@ def create_completion():
                     "encrypted": True,
                     "data": encrypted_response
                 })
-                
+
             return jsonify(response_data)
-            
+
         except ModelError as e:
             log_warning(f"Model error during response generation: {e.message}")
             return format_error_response(
@@ -490,7 +490,7 @@ def create_completion():
 def health_check():
     """
     API health check endpoint (token.place specific)
-    
+
     Returns:
         JSON response with API status
     """

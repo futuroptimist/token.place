@@ -29,4 +29,3 @@ def test_model_exception(monkeypatch):
     with pytest.raises(models.ModelError) as exc:
         models.generate_response("llama-3-8b-instruct", messages)
     assert exc.value.error_type == "model_inference_error"
-

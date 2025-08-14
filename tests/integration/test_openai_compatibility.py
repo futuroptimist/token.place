@@ -62,4 +62,3 @@ def test_openai_client_compatibility():
             prompt="Hello"
         )
         assert comp_resp.choices[0].text
-

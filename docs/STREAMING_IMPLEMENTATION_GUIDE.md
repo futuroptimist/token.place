@@ -28,7 +28,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
       if model_instance is None:
           yield {"error": "Model not available"}
           return
-          
+
       try:
           # Use the streaming API
           for chunk in model_instance.create_chat_completion(
@@ -80,28 +80,28 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
           method: 'POST',
           body: JSON.stringify({ messages })
       });
-      
+
       // Create a reader for the stream
       const reader = response.body.getReader();
-      
+
       // Session key for decryption (will be set on first chunk)
       let sessionKey = null;
-      
+
       while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          
+
           // Process the chunk
           const chunk = JSON.parse(new TextDecoder().decode(value));
-          
+
           // Handle first chunk with session key
           if (chunk.session_key) {
               sessionKey = decryptSessionKey(chunk.session_key);
           }
-          
+
           // Decrypt and process content
           const decryptedContent = decryptWithKey(chunk.content, sessionKey);
-          
+
           // Update UI with the new content
           updateStreamingUI(decryptedContent);
       }
@@ -163,4 +163,4 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 Implement graceful degradation when streaming fails:
 - Fall back to non-streaming mode
 - Cache partial responses for resumption
-- Provide clear error messaging to users 
+- Provide clear error messaging to users

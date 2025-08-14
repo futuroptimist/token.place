@@ -42,4 +42,3 @@ def test_log_error_prod(monkeypatch):
     monkeypatch.setattr(routes, 'logger', logger)
     routes.log_error('oops')
     logger.error.assert_not_called()
-

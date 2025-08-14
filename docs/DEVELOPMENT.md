@@ -39,7 +39,7 @@ python scripts/validate_dependencies.py
 
 **Problem**: pytest-benchmark 5.1.0+ requires pytest>=8.1, but some plugins may not support pytest 8.x yet.
 
-**Solution**: 
+**Solution**:
 1. Check plugin compatibility before upgrading
 2. Use compatible versions (e.g., pytest-playwright 0.7.0+ for pytest 8.x support)
 3. Update all related packages together
@@ -95,4 +95,4 @@ Error: `Executable doesn't exist at .../chrome-linux/headless_shell`
 2. **Use the validator script** regularly
 3. **Keep testing dependencies up-to-date** together
 4. **Document critical relationships** in requirements.txt
-5. **Monitor CI failures** for early warning signs 
+5. **Monitor CI failures** for early warning signs

@@ -101,4 +101,3 @@ def test_send_api_request_decrypt_error(monkeypatch):
     monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'data': {'encrypted': True, 'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'}})
     monkeypatch.setattr(client, 'decrypt_message', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('bad')))
     assert client.send_api_request([{'role': 'user', 'content': 'hi'}]) is None
-

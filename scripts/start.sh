@@ -72,4 +72,4 @@ fi
 echo "Running: $CMD"
 $CMD
 
-exit $? 
+exit $?

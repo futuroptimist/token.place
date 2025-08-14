@@ -35,18 +35,18 @@ def browser_context_args(browser_context_args):
 def web_server():
     """Start a web server for testing."""
     import socket
-    
+
     # Find an available port
     def find_available_port():
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(('localhost', 0))
             return s.getsockname()[1]
-    
+
     port = find_available_port()
-    
+
     # Get the current working directory
     cwd = Path.cwd()
-    
+
     # Start a HTTP server in a subprocess
     server_cmd = [sys.executable, "-m", "http.server", str(port)]
     server_process = subprocess.Popen(
@@ -57,17 +57,17 @@ def web_server():
         env=os.environ.copy(),
         text=True
     )
-    
+
     # Wait for the server to start
     server_url = f"http://localhost:{port}"
     logger.info(f"Started web server at {server_url}")
-    
+
     # Wait a moment for the server to initialize
     time.sleep(2)
-    
+
     # Yield the server URL for tests to use
     yield server_url
-    
+
     # Shutdown the server after tests
     logger.info("Stopping web server")
     server_process.terminate()
@@ -81,13 +81,13 @@ def test_python_encrypt_js_decrypt(page, web_server):
     Test that data encrypted in Python can be decrypted in browser JavaScript
     """
     logger.info("Starting Python encrypt -> JS decrypt test")
-    
+
     # Generate keys in Python
     private_key, public_key = generate_keys()
     private_key_pem = private_key.decode('utf-8')
     public_key_pem = public_key.decode('utf-8')
     logger.info("Generated RSA keys in Python")
-    
+
     # Test data to encrypt
     test_data = {
         "message": "Hello from Python!",
@@ -97,26 +97,26 @@ def test_python_encrypt_js_decrypt(page, web_server):
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
     }
-    
+
     # Encrypt with Python
     plaintext = json.dumps(test_data).encode('utf-8')
     ciphertext_dict, cipherkey, iv = encrypt(plaintext, public_key, use_pkcs1v15=True)
     logger.info(f"Encrypted data in Python, ciphertext size: {len(ciphertext_dict['ciphertext'])} bytes")
-    
+
     # Convert encrypted data to Base64 strings for JS
     ciphertext_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
-    cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8') 
+    cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
     iv_b64 = base64.b64encode(iv).decode('utf-8')
     logger.info("Prepared encrypted data for JS (Base64 encoded)")
-    
+
     # Define the URL for the crypto runner
     crypto_runner_url = f"{web_server}/tests/crypto_runner.html"
     logger.info(f"Using crypto runner at: {crypto_runner_url}")
-    
+
     # Navigate to the page and wait for it to load
     page.goto(crypto_runner_url)
     page.wait_for_load_state("networkidle")
-    
+
     # Wait for crypto libraries to be loaded
     page.wait_for_function("typeof window.JSEncrypt === 'function'", timeout=60000)
     page.wait_for_function("typeof window.CryptoJS === 'object' && typeof window.CryptoJS.AES === 'object'", timeout=60000)
@@ -132,14 +132,14 @@ def test_python_encrypt_js_decrypt(page, web_server):
 
     logger.info("Executing browser decryption logic")
     # Execute browser decryption within the page's context
-    js_output = page.evaluate(""" 
-    (args) => { 
-        // This code runs in the browser 
+    js_output = page.evaluate("""
+    (args) => {
+        // This code runs in the browser
         const { ciphertext_b64, encryptedKey_b64, iv_b64, privateKeyPem } = args;
-        
+
         try {
             console.log('[TEST] Starting browser decryption');
-            
+
             // Set up the private key for decryption
             const jsEncrypt = new window.JSEncrypt();
             jsEncrypt.setPrivateKey(privateKeyPem);
@@ -160,11 +160,11 @@ def test_python_encrypt_js_decrypt(page, web_server):
             // Convert the Base64 IV to a WordArray
             const iv = CryptoJS.enc.Base64.parse(iv_b64);
             console.log('[TEST] Parsed IV WordArray, sigBytes:', iv.sigBytes);
-            
+
             // Convert the Base64 ciphertext to a WordArray
             const ciphertextWordArray = CryptoJS.enc.Base64.parse(ciphertext_b64);
             console.log('[TEST] Parsed ciphertext WordArray, sigBytes:', ciphertextWordArray.sigBytes);
-            
+
             // Decrypt the ciphertext with AES
             console.log('[TEST] Starting AES decryption');
             const decrypted = CryptoJS.AES.decrypt(
@@ -177,26 +177,26 @@ def test_python_encrypt_js_decrypt(page, web_server):
                 }
             );
             console.log('[TEST] AES decryption complete, sigBytes:', decrypted.sigBytes);
-            
+
             // Convert the decrypted WordArray to a string
             const decryptedString = CryptoJS.enc.Utf8.stringify(decrypted);
             console.log('[TEST] Decrypted string length:', decryptedString.length);
-            
+
             console.log('[TEST] Decryption successful!');
             return decryptedString; // Return the result to Python
         } catch (error) {
             console.error('[TEST] Browser Decryption error:', error);
-            return { error: error.message || 'Unknown browser decryption error' }; 
+            return { error: error.message || 'Unknown browser decryption error' };
         }
     }
     """, js_args)
-    
+
     # Check if JS returned an error object
     if isinstance(js_output, dict) and 'error' in js_output:
         error_msg = f"Browser JavaScript decryption failed: {js_output['error']}"
         logger.error(error_msg)
         pytest.fail(error_msg)
-    
+
     # Verify the decrypted data matches the original
     js_decrypted = json.loads(js_output)
     assert js_decrypted == test_data, "Browser JavaScript decryption produced different result"
@@ -208,7 +208,7 @@ def test_js_encrypt_python_decrypt(page, web_server):
     Test that data encrypted in browser JavaScript can be decrypted in Python
     """
     logger.info("Starting JS encrypt -> Python decrypt test")
-    
+
     # Define test data in Python first
     test_data = {
         "message": "Hello from JavaScript!",
@@ -223,10 +223,10 @@ def test_js_encrypt_python_decrypt(page, web_server):
     # --- Step 1: Generate keys and encrypt using Browser JS --- #
     crypto_runner_url = f"{web_server}/tests/crypto_runner.html"
     logger.info(f"Using crypto runner at: {crypto_runner_url}")
-    
+
     page.goto(crypto_runner_url)
     page.wait_for_load_state("networkidle")
-    
+
     # Wait for crypto libraries to be loaded
     page.wait_for_function("typeof window.JSEncrypt === 'function'", timeout=60000)
     page.wait_for_function("typeof window.CryptoJS === 'object' && typeof window.CryptoJS.AES === 'object'", timeout=60000)
@@ -242,7 +242,7 @@ def test_js_encrypt_python_decrypt(page, web_server):
         const { plaintext } = args;
         try {
             console.log('[TEST] Starting browser encryption');
-            
+
             // Generate RSA keys
             const crypt = new window.JSEncrypt({default_key_size: 2048});
             console.log('[TEST] JSEncrypt instance created');
@@ -251,7 +251,7 @@ def test_js_encrypt_python_decrypt(page, web_server):
             console.log('[TEST] Private key generated, length:', privateKey.length);
             const publicKey = crypt.getPublicKey();
             console.log('[TEST] Public key generated, length:', publicKey.length);
-            
+
             // Generate a random AES key and IV using CryptoJS
             const aesKey = CryptoJS.lib.WordArray.random(32); // 256 bits
             console.log('[TEST] Generated AES key, sigBytes:', aesKey.sigBytes);
@@ -288,11 +288,11 @@ def test_js_encrypt_python_decrypt(page, web_server):
                 padding: CryptoJS.pad.Pkcs7
             });
             console.log('[TEST] AES encryption complete');
-            
+
             // Return the encrypted data as Base64 strings
             const ciphertext_b64 = CryptoJS.enc.Base64.stringify(encryptedData.ciphertext);
             console.log('[TEST] Ciphertext Base64 length:', ciphertext_b64.length);
-            
+
             console.log('[TEST] Encryption successful!');
             return {
                 ciphertext: ciphertext_b64,
@@ -315,23 +315,23 @@ def test_js_encrypt_python_decrypt(page, web_server):
 
     # --- Step 3: Decrypt using Python --- #
     private_key_bytes = encrypted_data['privateKey'].encode('utf-8')
-    
+
     # Convert the Base64 encrypted data to bytes for Python decryption
     ciphertext = base64.b64decode(encrypted_data['ciphertext'])
     cipherkey = base64.b64decode(encrypted_data['cipherkey'])
     iv = base64.b64decode(encrypted_data['iv'])
     logger.info(f"Prepared encrypted data for Python, ciphertext size: {len(ciphertext)} bytes")
-    
+
     # Decrypt with Python
     logger.info("Starting Python decryption")
     decrypted_bytes = decrypt({'ciphertext': ciphertext, 'iv': iv}, cipherkey, private_key_bytes)
-    
+
     # Verify the decryption worked
     assert decrypted_bytes is not None, "Python decryption failed"
     logger.info(f"Python decryption successful, decrypted size: {len(decrypted_bytes)} bytes")
-    
+
     # Parse the decrypted data and compare with the original
     decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
     assert decrypted_data == test_data, "Python decryption produced different result"
     logger.info("JS encrypt -> Python decrypt: Success!")
-    print("Browser JS encrypt -> Python decrypt: Success!") 
+    print("Browser JS encrypt -> Python decrypt: Success!")

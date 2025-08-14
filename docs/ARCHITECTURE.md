@@ -30,6 +30,7 @@ token.place is an end-to-end encrypted proxy service that sits between clients a
   - Generates and manages RSA key pairs
   - Provides encryption/decryption services
   - Manages secure session handling
+  - Validates presence of client public keys before encryption
 
 - **Model Manager** (`utils/models/model_manager.py`):
   - Connects to various AI providers

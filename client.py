@@ -187,7 +187,9 @@ class ChatClient:
                 print(f"Could not fetch server's public key. Status code: {response.status_code}")
                 return None
         except requests.exceptions.RequestException as e:
-            print(f"Error while fetching server's public key: {str(e)}")
+            print(
+                f"Error while fetching server's public key: {e.__class__.__name__}"
+            )
             return None
 
     def send_request_to_faucet(self, encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64):
@@ -205,7 +207,9 @@ class ChatClient:
             )
             return response
         except requests.exceptions.RequestException as e:
-            print(f"Error while sending request to faucet: {str(e)}")
+            print(
+                f"Error while sending request to faucet: {e.__class__.__name__}"
+            )
             return None
 
     def retrieve_response(self, timeout=60):
@@ -239,7 +243,9 @@ class ChatClient:
                 else:
                     print(f"Unexpected status code from /retrieve endpoint: {response.status_code}")
             except requests.exceptions.RequestException as e:
-                print(f"Error while retrieving response: {str(e)}")
+                print(
+                    f"Error while retrieving response: {e.__class__.__name__}"
+                )
 
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:

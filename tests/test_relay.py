@@ -28,14 +28,20 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_responses.clear()
-    
+
     with app.test_client() as client:
         yield client
-    
+
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     client_inference_requests.clear()
     client_responses.clear()
+
+
+def test_inference_endpoint_removed(client):
+    """Ensure deprecated /inference endpoint is unavailable."""
+    response = client.post("/inference", json={})
+    assert response.status_code == 404
 
 # --- Test /next_server ---
 
@@ -52,11 +58,11 @@ def test_next_server_one_server(client):
     """Test /next_server when one server is registered."""
     # Simulate server registration (directly modifying state for setup)
     known_servers[DUMMY_SERVER_PUB_KEY] = {
-        'public_key': DUMMY_SERVER_PUB_KEY, 
-        'last_ping': time.time(), 
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': time.time(),
         'last_ping_duration': 10
     }
-    
+
     response = client.get("/next_server")
     assert response.status_code == 200
     data = response.get_json()
@@ -81,18 +87,18 @@ def test_sink_update_existing_server(client):
     # Initial registration using datetime
     initial_ping_time = datetime.now() - timedelta(seconds=20)
     known_servers[DUMMY_SERVER_PUB_KEY] = {
-        'public_key': DUMMY_SERVER_PUB_KEY, 
-        'last_ping': initial_ping_time, 
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': initial_ping_time,
         'last_ping_duration': 10
     }
-    
+
     time.sleep(0.1) # Ensure time progresses slightly
-    
+
     # Send update ping
     payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     response = client.post("/sink", json=payload)
     assert response.status_code == 200
-    
+
     assert DUMMY_SERVER_PUB_KEY in known_servers
     # Compare datetime objects
     assert known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] > initial_ping_time
@@ -111,11 +117,11 @@ def test_faucet_submit_request(client):
     """Test submitting a valid inference request via /faucet."""
     # Register server first
     known_servers[DUMMY_SERVER_PUB_KEY] = {
-        'public_key': DUMMY_SERVER_PUB_KEY, 
-        'last_ping': time.time(), 
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': time.time(),
         'last_ping_duration': 10
     }
-    
+
     payload = {
         "client_public_key": DUMMY_CLIENT_PUB_KEY,
         "server_public_key": DUMMY_SERVER_PUB_KEY,
@@ -127,7 +133,7 @@ def test_faucet_submit_request(client):
     assert response.status_code == 200
     data = response.get_json()
     assert data['message'] == 'Request received'
-    
+
     # Check internal state
     assert DUMMY_SERVER_PUB_KEY in client_inference_requests
     assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
@@ -139,7 +145,7 @@ def test_faucet_invalid_payload(client):
     """Test /faucet with missing fields."""
     # Register server
     known_servers[DUMMY_SERVER_PUB_KEY] = {'public_key': DUMMY_SERVER_PUB_KEY, 'last_ping': time.time(), 'last_ping_duration': 10}
-    
+
     payload = { "server_public_key": DUMMY_SERVER_PUB_KEY } # Missing other fields
     response = client.post("/faucet", json=payload)
     assert response.status_code == 400
@@ -176,7 +182,7 @@ def test_source_submit_response(client):
     assert response.status_code == 200
     data = response.get_json()
     assert data['message'] == 'Response received and queued for client'
-    
+
     # Check internal state
     assert DUMMY_CLIENT_PUB_KEY in client_responses
     queued_resp = client_responses[DUMMY_CLIENT_PUB_KEY]
@@ -201,16 +207,16 @@ def test_retrieve_get_response(client):
         'cipherkey': "server_encrypted_aes_key",
         'iv': "server_iv"
     }
-    
+
     payload = {"client_public_key": DUMMY_CLIENT_PUB_KEY}
     response = client.post("/retrieve", json=payload)
     assert response.status_code == 200
     data = response.get_json()
-    
+
     assert data['chat_history'] == "server_encrypted_response_history"
     assert data['cipherkey'] == "server_encrypted_aes_key"
     assert data['iv'] == "server_iv"
-    
+
     # Check state - response should be removed after retrieval
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
@@ -263,7 +269,7 @@ def test_full_relay_flow(client):
     assert sink_data['cipherkey'] == "client_key_data"
     assert sink_data['iv'] == "client_iv_data"
     # Request should be removed from queue
-    assert not client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) 
+    assert not client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
 
     # 4. Server processes and submits response via /source
     source_payload = {
@@ -285,4 +291,4 @@ def test_full_relay_flow(client):
     assert retrieve_data['cipherkey'] == "server_key_data"
     assert retrieve_data['iv'] == "server_iv_data"
     # Response should be removed from queue
-    assert DUMMY_CLIENT_PUB_KEY not in client_responses 
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses

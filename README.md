@@ -84,7 +84,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Llama 2 -> 3 (7B -> 8B)
   - [x] end-to-end encryption on landing page (relay.py / GET)
   - [x] automated browser testing of landing page, preventing regressions of the chat ui
-  - [x] delete old /inference endpoint and everything upstream and downstream that's now unused
+  - [x] delete old /inference endpoint and everything upstream and downstream that's now unused 💯
   - [x] simplified crypto utility (CryptoClient) for easy encrypted communication
 - [ ] distribute relay.py across multiple machines
   - [x] personal gaming PC

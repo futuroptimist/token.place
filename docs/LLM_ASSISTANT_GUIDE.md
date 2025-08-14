@@ -40,7 +40,7 @@ When helping users in a Windows/PowerShell environment:
    ```powershell
    # Check processes on a port
    netstat -ano | findstr :5000
-   
+
    # Kill process
    taskkill /F /PID <pid>
    ```
@@ -63,7 +63,7 @@ When helping users in a Linux/Unix environment:
    ```bash
    # Check processes on a port
    lsof -i :5000
-   
+
    # Kill process
    kill -9 <pid>
    ```
@@ -116,4 +116,4 @@ When assisting users, refer them to these key documents:
 
 ---
 
-When in doubt, this guide should be used in conjunction with the main project documentation. 
+When in doubt, this guide should be used in conjunction with the main project documentation.

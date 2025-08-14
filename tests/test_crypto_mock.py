@@ -25,7 +25,7 @@ def mock_server_responses():
         next_server_response.json.return_value = {
             'server_public_key': base64.b64encode(b'mock_server_public_key').decode('utf-8')
         }
-        
+
         # Mock faucet endpoint
         faucet_response = MagicMock()
         faucet_response.status_code = 200
@@ -33,7 +33,7 @@ def mock_server_responses():
             'success': True,
             'message': 'Request received'
         }
-        
+
         # Mock retrieve endpoint
         retrieve_response = MagicMock()
         retrieve_response.status_code = 200
@@ -42,14 +42,14 @@ def mock_server_responses():
             'cipherkey': base64.b64encode(b'mock_cipherkey').decode('utf-8'),
             'iv': base64.b64encode(b'mock_iv').decode('utf-8')
         }
-        
+
         # Mock API public key endpoint
         api_key_response = MagicMock()
         api_key_response.status_code = 200
         api_key_response.json.return_value = {
             'public_key': base64.b64encode(b'mock_api_public_key').decode('utf-8')
         }
-        
+
         # Mock API completions endpoint
         api_completions_response = MagicMock()
         api_completions_response.status_code = 200
@@ -68,7 +68,7 @@ def mock_server_responses():
                 'iv': base64.b64encode(b'mock_api_iv').decode('utf-8')
             }
         }
-        
+
         # Configure the mock requests
         def get_side_effect(url, *args, **kwargs):
             if '/next_server' in url:
@@ -79,7 +79,7 @@ def mock_server_responses():
                 response = MagicMock()
                 response.status_code = 404
                 return response
-        
+
         def post_side_effect(url, *args, **kwargs):
             if '/faucet' in url:
                 return faucet_response
@@ -91,10 +91,10 @@ def mock_server_responses():
                 response = MagicMock()
                 response.status_code = 404
                 return response
-        
+
         mock_requests.get.side_effect = get_side_effect
         mock_requests.post.side_effect = post_side_effect
-        
+
         yield mock_requests
 
 def test_e2e_chat_flow(mock_server_responses):
@@ -102,26 +102,26 @@ def test_e2e_chat_flow(mock_server_responses):
     # Mock the encrypt/decrypt functions
     with patch('utils.crypto_helpers.encrypt') as mock_encrypt, \
          patch('utils.crypto_helpers.decrypt') as mock_decrypt:
-        
+
         # Configure the mocks
         mock_encrypt.return_value = (
             {'ciphertext': b'mock_ciphertext', 'iv': b'mock_iv'},
             b'mock_cipherkey',
             b'mock_iv'
         )
-        
+
         mock_decrypt.return_value = json.dumps(TEST_RESPONSE).encode()
-        
+
         # Create a client and test the flow
         client = CryptoClient('http://localhost:5010', debug=True)
-        
+
         # Test fetching the server key
         assert client.fetch_server_public_key() is True
         assert client.server_public_key == b'mock_server_public_key'
-        
+
         # Test sending a chat message
         response = client.send_chat_message(TEST_CHAT_HISTORY)
-        
+
         # Verify the response
         assert response is not None
         assert len(response) == 2
@@ -129,11 +129,11 @@ def test_e2e_chat_flow(mock_server_responses):
         assert response[0]['content'] == TEST_USER_MESSAGE
         assert response[1]['role'] == 'assistant'
         assert 'Mock Response' in response[1]['content']
-        
+
         # Verify the mock functions were called
         assert mock_encrypt.called
         assert mock_decrypt.called
-        
+
         # Verify API requests were made
         assert mock_server_responses.get.called
         assert mock_server_responses.post.called
@@ -143,14 +143,14 @@ def test_api_encryption_flow(mock_server_responses):
     # Mock the encrypt/decrypt functions
     with patch('utils.crypto_helpers.encrypt') as mock_encrypt, \
          patch('utils.crypto_helpers.decrypt') as mock_decrypt:
-        
+
         # Configure the mocks
         mock_encrypt.return_value = (
             {'ciphertext': b'mock_ciphertext', 'iv': b'mock_iv'},
             b'mock_cipherkey',
             b'mock_iv'
         )
-        
+
         mock_decrypt.return_value = json.dumps({
             'choices': [{
                 'message': {
@@ -159,21 +159,21 @@ def test_api_encryption_flow(mock_server_responses):
                 }
             }]
         }).encode()
-        
+
         # Create a client and test the flow
         client = CryptoClient('http://localhost:5010', debug=True)
-        
+
         # Test fetching the API key
         assert client.fetch_server_public_key('/api/v1/public-key') is True
-        
+
         # Test sending an API request
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Tell me a joke."}
         ]
-        
+
         response = client.send_api_request(messages)
-        
+
         # Verify the response
         assert response is not None
         assert 'choices' in response
@@ -181,7 +181,7 @@ def test_api_encryption_flow(mock_server_responses):
         assert 'message' in response['choices'][0]
         assert response['choices'][0]['message']['role'] == 'assistant'
         assert 'Mock Response' in response['choices'][0]['message']['content']
-        
+
         # Verify the mock functions were called
         assert mock_encrypt.called
-        assert mock_decrypt.called 
+        assert mock_decrypt.called

@@ -3,9 +3,9 @@
 $ErrorActionPreference = "Stop"
 $currentDir = Get-Location
 
-Write-Host "======================================================" 
-Write-Host " token.place Test Runner" 
-Write-Host "======================================================" 
+Write-Host "======================================================"
+Write-Host " token.place Test Runner"
+Write-Host "======================================================"
 
 # Check if Node.js is installed
 try {
@@ -26,16 +26,16 @@ function RunTest {
         [string]$Command,
         [string]$Description
     )
-    
+
     Write-Host ""
-    Write-Host "======================================================" 
-    Write-Host " Running $TestName" 
-    Write-Host "======================================================" 
+    Write-Host "======================================================"
+    Write-Host " Running $TestName"
+    Write-Host "======================================================"
     Write-Host $Description
     Write-Host ""
-    
+
     Invoke-Expression $Command
-    
+
     if ($LASTEXITCODE -ne 0) {
         Write-Host -ForegroundColor Red "❌ $TestName failed with exit code: $LASTEXITCODE"
         $script:failedTests += $TestName
@@ -76,30 +76,30 @@ RunTest -TestName "Failure Recovery Tests" -Command "python -m pytest tests/test
 # 10. Run DSPACE integration tests
 if (Test-Path "integration_tests/") {
     Write-Host ""
-    Write-Host "======================================================" 
-    Write-Host " Running DSPACE Integration Tests" 
-    Write-Host "======================================================" 
+    Write-Host "======================================================"
+    Write-Host " Running DSPACE Integration Tests"
+    Write-Host "======================================================"
     Write-Host "Testing token.place as a drop-in replacement for OpenAI in DSPACE"
     Write-Host ""
-    
+
     Set-Location integration_tests
     .\run_integration_test.ps1
-    
+
     if ($LASTEXITCODE -ne 0) {
         Write-Host -ForegroundColor Red "❌ DSPACE Integration Tests failed with exit code: $LASTEXITCODE"
         $failedTests += "DSPACE Integration Tests"
     } else {
         Write-Host -ForegroundColor Green "✅ DSPACE Integration Tests passed"
     }
-    
+
     Set-Location $currentDir
 }
 
 # Summary
 Write-Host ""
-Write-Host "======================================================" 
-Write-Host " Test Summary" 
-Write-Host "======================================================" 
+Write-Host "======================================================"
+Write-Host " Test Summary"
+Write-Host "======================================================"
 
 if ($failedTests.Count -eq 0) {
     Write-Host -ForegroundColor Green "All tests passed! 🎉"
@@ -113,4 +113,4 @@ if ($failedTests.Count -eq 0) {
     exit 1
 }
 
-exit 0 
+exit 0

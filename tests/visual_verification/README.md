@@ -5,7 +5,7 @@ This directory contains a framework for visual regression testing of the token.p
 ## How Visual Verification Works
 
 1. The framework captures screenshots of key UI states
-2. These screenshots are compared with baseline images 
+2. These screenshots are compared with baseline images
 3. Differences are highlighted and quantified
 4. A visual report is generated
 
@@ -106,4 +106,4 @@ After running the tests, check:
 
 1. The console output for test results
 2. The `visual_report.json` file for detailed information
-3. The `diffs/` directory for visual representations of differences 
+3. The `diffs/` directory for visual representations of differences

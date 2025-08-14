@@ -23,4 +23,3 @@ def test_generate_response_uses_real_model():
             mock_instance.create_chat_completion.assert_called_once_with(messages=messages)
             assert result[-1]['role'] == 'assistant'
             assert 'real resp' in result[-1]['content']
-

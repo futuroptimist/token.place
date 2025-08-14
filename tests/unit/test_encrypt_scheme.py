@@ -20,4 +20,3 @@ def test_decrypt_uses_oaep():
         result = decrypt(ciphertext, b'enc', b'priv')
         args, kwargs = private_key.decrypt.call_args
         assert isinstance(args[1], padding.OAEP)
-

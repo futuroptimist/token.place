@@ -25,13 +25,13 @@ def test_python_encrypt_js_decrypt():
     This test doesn't require a browser.
     """
     logger.info("Starting Python encrypt -> JS decrypt test")
-    
+
     # Generate keys in Python
     private_key, public_key = generate_keys()
     private_key_pem = private_key.decode('utf-8')
     public_key_pem = public_key.decode('utf-8')
     logger.info("Generated RSA keys in Python")
-    
+
     # Test data to encrypt
     test_data = {
         "message": "Hello from Python!",
@@ -41,29 +41,29 @@ def test_python_encrypt_js_decrypt():
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
     }
-    
+
     # Encrypt with Python
     plaintext = json.dumps(test_data).encode('utf-8')
     ciphertext_dict, cipherkey, iv = encrypt(plaintext, public_key)
     logger.info(f"Encrypted data in Python, ciphertext size: {len(ciphertext_dict['ciphertext'])} bytes")
-    
+
     # Convert encrypted data to Base64 strings for JS
     ciphertext_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
-    cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8') 
+    cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
     iv_b64 = base64.b64encode(iv).decode('utf-8')
     logger.info("Prepared encrypted data for JS (Base64 encoded)")
-    
+
     # Get absolute path to the js_test_shim.js file
     shim_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'js_test_shim.js'))
     # Convert Windows backslashes to forward slashes for JavaScript
     shim_path_js = shim_path.replace('\\', '/')
     logger.info(f"Using shim at: {shim_path_js}")
-    
+
     # Create temporary JavaScript file to test decryption
     with tempfile.NamedTemporaryFile(suffix='.js', mode='w', delete=False) as temp_js:
         # Replace Windows backslashes with forward slashes for JavaScript paths
         project_root_js = project_root.replace('\\', '/')
-        
+
         js_script = f"""
 // Load the shim first to create browser environment objects
 require('{shim_path_js}');
@@ -92,10 +92,10 @@ async function decryptData() {{
         );
         const decryptedKeyBase64 = decryptedKeyBuffer.toString("utf8");
         const aesKey = cryptoJs.enc.Base64.parse(decryptedKeyBase64);
-        
+
         // Convert the Base64 IV to a WordArray
         const iv = cryptoJs.enc.Base64.parse(encryptedData.iv);
-        
+
         // Decrypt the ciphertext with AES
         const decrypted = cryptoJs.AES.decrypt(
             encryptedData.ciphertext,
@@ -106,10 +106,10 @@ async function decryptData() {{
                 padding: cryptoJs.pad.Pkcs7
             }}
         );
-        
+
         // Convert the decrypted WordArray to a string
         const decryptedString = cryptoJs.enc.Utf8.stringify(decrypted);
-        
+
         console.log(decryptedString);
         return decryptedString;
     }} catch (error) {{
@@ -120,17 +120,17 @@ async function decryptData() {{
 
 decryptData();
 """
-        
+
         temp_js.write(js_script)
         temp_js_path = temp_js.name
-    
+
     try:
         # Run the Node.js script to decrypt the data
         logger.info(f"Running Node.js script: {temp_js_path}")
         result = subprocess.run(['node', temp_js_path], capture_output=True, text=True, check=True, cwd=project_root)
         js_output = result.stdout.strip()
         logger.info(f"Node.js decryption output: {js_output}")
-        
+
         # Verify the decrypted data matches the original
         js_decrypted = json.loads(js_output)
         assert js_decrypted == test_data, "Node.js JavaScript decryption produced different result"
@@ -149,7 +149,7 @@ def test_js_encrypt_python_decrypt():
     This test doesn't require a browser.
     """
     logger.info("Starting JS encrypt -> Python decrypt test")
-    
+
     # Test data to encrypt
     test_data = {
         "message": "Hello from JavaScript!",
@@ -159,18 +159,18 @@ def test_js_encrypt_python_decrypt():
         }
     }
     test_data_json = json.dumps(test_data)
-    
+
     # Get absolute path to the js_test_shim.js file
     shim_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'js_test_shim.js'))
     # Convert Windows backslashes to forward slashes for JavaScript
     shim_path_js = shim_path.replace('\\', '/')
     logger.info(f"Using shim at: {shim_path_js}")
-    
+
     # Create temporary JavaScript file to test encryption
     with tempfile.NamedTemporaryFile(suffix='.js', mode='w', delete=False) as temp_js:
         # Replace Windows backslashes with forward slashes for JavaScript paths
         project_root_js = project_root.replace('\\', '/')
-        
+
         js_script = f"""
 // Load the shim first to create browser environment objects
 require('{shim_path_js}');
@@ -219,7 +219,7 @@ async function encryptData() {{
             publicKey: publicKeyPem,
             privateKey: privateKeyPem
         }};
-        
+
         console.log(JSON.stringify(result));
     }} catch (error) {{
         console.error('Encryption error:', error);
@@ -229,38 +229,38 @@ async function encryptData() {{
 
 encryptData();
 """
-        
+
         temp_js.write(js_script)
         temp_js_path = temp_js.name
-    
+
     try:
         # Run the Node.js script to encrypt the data
         logger.info(f"Running Node.js script: {temp_js_path}")
         result = subprocess.run(['node', temp_js_path], capture_output=True, text=True, check=True, cwd=project_root)
         js_output = result.stdout.strip()
         logger.info("Node.js encryption successful")
-        
+
         # Parse the encrypted data
         encrypted_data = json.loads(js_output)
-        
+
         # Extract the needed components
         ciphertext_b64 = encrypted_data['ciphertext']
         cipherkey_b64 = encrypted_data['cipherkey']
         iv_b64 = encrypted_data['iv']
         private_key_pem = encrypted_data['privateKey'].encode('utf-8')
-        
+
         # Convert Base64 strings to bytes for Python
         ciphertext = base64.b64decode(ciphertext_b64)
         cipherkey = base64.b64decode(cipherkey_b64)
         iv = base64.b64decode(iv_b64)
-        
+
         # Decrypt with Python
         logger.info("Starting Python decryption")
         decrypted_bytes = decrypt({'ciphertext': ciphertext, 'iv': iv}, cipherkey, private_key_pem)
-        
+
         # Verify the decryption worked
         assert decrypted_bytes is not None, "Python decryption failed"
-        
+
         # Parse the decrypted data and compare with the original
         decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
         assert decrypted_data == test_data, "Python decryption produced different result"
@@ -276,4 +276,4 @@ encryptData();
 if __name__ == "__main__":
     # Run the tests directly when script is executed
     test_python_encrypt_js_decrypt()
-    test_js_encrypt_python_decrypt() 
+    test_js_encrypt_python_decrypt()

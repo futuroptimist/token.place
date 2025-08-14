@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import our path handling utilities
 from utils.path_handling import (
-    IS_WINDOWS, IS_MACOS, IS_LINUX, 
+    IS_WINDOWS, IS_MACOS, IS_LINUX,
     ensure_dir_exists, normalize_path
 )
 
@@ -60,7 +60,7 @@ def test_config(temp_data_dir: Path) -> Config:
     Uses a temporary directory for data and sets the environment to testing.
     """
     os.environ["TOKEN_PLACE_ENV"] = "testing"
-    
+
     # Create a test config file
     config_path = temp_data_dir / "test_config.json"
     config_content = {
@@ -72,18 +72,18 @@ def test_config(temp_data_dir: Path) -> Config:
             "keys_dir": str(temp_data_dir / "keys"),
         }
     }
-    
+
     # Create all the directories
     for dir_path in config_content["paths"].values():
         ensure_dir_exists(dir_path)
-    
+
     # Create and initialize the config
     config = Config(env="testing")
-    
+
     # Override paths with temp directories
     for key, path in config_content["paths"].items():
         config.set(f"paths.{key}", path)
-    
+
     return config
 
 @pytest.fixture(scope="function")
@@ -95,7 +95,7 @@ def temp_file() -> Generator[Path, None, None]:
     with tempfile.NamedTemporaryFile(delete=False) as temp_f:
         temp_path = Path(temp_f.name)
         yield temp_path
-        
+
         # Clean up after the test
         if temp_path.exists():
             temp_path.unlink()
@@ -118,13 +118,13 @@ def configure_test_environment():
     """
     # Set environment variables for testing
     os.environ["TOKEN_PLACE_ENV"] = "testing"
-    
+
     # Detect platform
     platform_name = platform.system().lower()
     os.environ["PLATFORM"] = platform_name
-    
+
     yield
-    
+
     # Clean up after all tests
     # (Nothing to do here, temp directories and files are cleaned up by their fixtures)
 
@@ -144,7 +144,7 @@ E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None, None]:
     """
     Start the server and relay processes for end-to-end testing.
-    
+
     This fixture:
     1. Starts the relay on port 5010 with --use_mock_llm flag
     2. Starts the server on port 8010 (with USE_MOCK_LLM=1 environment variable)
@@ -153,12 +153,12 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
     5. Cleans up the processes after tests
     """
     print("\nSetting up servers for E2E tests...")
-    
+
     # Ensure environment variables are set properly
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
     test_env["USE_MOCK_LLM"] = "1"  # This is the key setting for mocking the LLM
-    
+
     # Start the relay server with the --use_mock_llm flag
     relay_process = subprocess.Popen(
         [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT), "--use_mock_llm"],
@@ -168,10 +168,10 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
         env=test_env
     )
     print(f"Started relay server on port {E2E_RELAY_PORT} with --use_mock_llm flag")
-    
+
     # Wait for relay to start - increased wait time
     time.sleep(3)
-    
+
     # Check if relay is running
     relay_ready = False
     for _ in range(15):  # Try for 15 seconds
@@ -183,7 +183,7 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
                 break
         except requests.RequestException:
             time.sleep(1)
-    
+
     if not relay_ready:
         print("✗ Relay server failed to start")
         relay_process.terminate()
@@ -192,11 +192,11 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
         print(f"Relay stdout: {stdout}")
         print(f"Relay stderr: {stderr}")
         pytest.skip("Relay server failed to start")
-    
+
     # Start the server with mock LLM enabled via environment variable
     # Note: server.py doesn't accept --use_mock_llm flag, it uses the environment variable
     server_process = subprocess.Popen(
-        [sys.executable, "server.py", "--server_port", str(E2E_SERVER_PORT), 
+        [sys.executable, "server.py", "--server_port", str(E2E_SERVER_PORT),
          "--relay_port", str(E2E_RELAY_PORT)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -204,7 +204,7 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
         env=test_env
     )
     print(f"Started server on port {E2E_SERVER_PORT} with USE_MOCK_LLM=1 (via environment variable)")
-    
+
     # Wait longer for server to start and register with relay
     time.sleep(5)
     print("Waiting for server to register with relay...")
@@ -226,7 +226,7 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
                     print(f"Error from relay: {data['error'].get('message', 'Unknown error')}")
             time.sleep(1)
         time.sleep(1)
-    
+
     if not server_registered:
         print("✗ Server failed to register with relay")
         # Print server output for debugging
@@ -236,19 +236,19 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
         relay_process.terminate()
         server_process.terminate()
         pytest.skip("Server failed to register with relay")
-    
+
     # Additional wait after server registration
     time.sleep(3)
     print("Server and relay are ready for tests")
-    
+
     # Return the processes
     yield relay_process, server_process
-    
+
     # Cleanup
     print("\nCleaning up E2E test servers...")
     server_process.terminate()
     relay_process.terminate()
-    
+
     # Wait for processes to terminate gracefully or force kill
     for proc, name in [(server_process, "Server"), (relay_process, "Relay")]:
         try:
@@ -259,14 +259,14 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], check=False)
             else:
                 proc.kill()
-    
+
     print("Server and relay processes terminated")
 
 @pytest.fixture(scope="module")
 def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], None, None]:
     """
     Create a browser context for Playwright tests.
-    
+
     This fixture:
     1. Uses the setup_servers fixture to ensure servers are running
     2. Creates a browser and context
@@ -276,12 +276,12 @@ def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context()
-        
+
         # Add console log handler
         context.on("console", print_console_message)
-        
+
         yield browser, context
-        
+
         # Cleanup
         context.close()
         browser.close()
@@ -290,7 +290,7 @@ def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], 
 def page(browser_context) -> Generator[Page, None, None]:
     """
     Create a page for Playwright tests.
-    
+
     This fixture:
     1. Uses the browser_context fixture to get the browser and context
     2. Creates a new page
@@ -306,4 +306,4 @@ def page(browser_context) -> Generator[Page, None, None]:
 @pytest.fixture(scope="session")
 def base_url() -> str:
     """Return the base URL for E2E tests"""
-    return E2E_BASE_URL 
+    return E2E_BASE_URL

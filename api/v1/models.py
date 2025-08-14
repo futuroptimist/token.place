@@ -69,7 +69,7 @@ class ModelError(Exception):
 def get_models_info():
     """
     Get information about available models
-    
+
     Returns:
         list: List of model metadata dictionaries
     """
@@ -80,44 +80,44 @@ def get_models_info():
 def get_model_instance(model_id):
     """
     Get or load a model instance by ID
-    
+
     Args:
         model_id: The ID of the model to get
-        
+
     Returns:
         Llama: The model instance
-        
+
     Raises:
         ModelError: If the model is not found or cannot be loaded
     """
     # Add detailed debug info
     logger.info(f"Getting model instance for: {model_id}")
-    
+
     # Check input
     if not model_id:
         raise ModelError("Model ID cannot be empty", status_code=400, error_type="invalid_request_error")
-    
+
     # First check if the model ID exists in available models
     model_meta = next((m for m in AVAILABLE_MODELS if m["id"] == model_id), None)
     if not model_meta:
         available_ids = [m["id"] for m in AVAILABLE_MODELS]
         logger.warning(f"Model {model_id} not found. Available models: {available_ids}")
         raise ModelError(
-            f"Model '{model_id}' not found. Available models: {', '.join(available_ids)}", 
-            status_code=400, 
+            f"Model '{model_id}' not found. Available models: {', '.join(available_ids)}",
+            status_code=400,
             error_type="model_not_found"
         )
-    
+
     # For testing or when mock is enabled, return a mock model
     if USE_MOCK_LLM:
         logger.info(f"Using mock LLM for model_id: {model_id} (mock mode enabled)")
         return "MOCK_MODEL"
-    
+
     # In real operation, check if model is already loaded
     if model_id in _loaded_models:
         logger.info(f"Using cached model instance for {model_id}")
         return _loaded_models[model_id]
-    
+
     # Load the model from disk if not already loaded
     try:
         model_path = model_meta["file_name"]
@@ -138,24 +138,24 @@ def get_model_instance(model_id):
 def generate_response(model_id, messages):
     """
     Generate a response using the specified model
-    
+
     Args:
         model_id: The ID of the model to use
         messages: List of message dictionaries with 'role' and 'content' keys
-        
+
     Returns:
         list: Updated messages list with the model's response appended
-        
+
     Raises:
         ModelError: If there's an error with the model or input
     """
     start_time = time.time()
     logger.info(f"Generating response using model: {model_id}")
-    
+
     # Validate input
     if not messages:
         raise ModelError("Messages cannot be empty", status_code=400, error_type="invalid_request_error")
-    
+
     # Validate message format
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
@@ -164,15 +164,15 @@ def generate_response(model_id, messages):
                 status_code=400,
                 error_type="invalid_request_error"
             )
-    
+
     try:
         # Get the model instance (or mock)
         model = get_model_instance(model_id)
-        
+
         # Check if we're using a mock model - either through env variable or the returned model is the string "MOCK_MODEL"
         mock_mode = USE_MOCK_LLM or model == "MOCK_MODEL"
         logger.debug(f"Generate response using mock_mode={mock_mode}, model={model}")
-        
+
         # If we're using a mock model, generate a mock response
         if mock_mode:
             logger.info("Generating mock response")
@@ -187,32 +187,32 @@ def generate_response(model_id, messages):
                 "content": random.choice(mock_responses)
             }
             messages.append(assistant_message)
-            
+
             # Log completion time
             elapsed = time.time() - start_time
             logger.info(f"Response generated in {elapsed:.2f}s (mock mode)")
             return messages
-        
+
         # Generate response with the real model
         logger.info("Generating response with real model")
         response = model.create_chat_completion(messages=messages)
-        
+
         # Extract and append the assistant's message
         if response and 'choices' in response and response['choices']:
             assistant_message = response['choices'][0]['message']
             messages.append(assistant_message)
-            
+
             # Log completion time
             elapsed = time.time() - start_time
             logger.info(f"Response generated in {elapsed:.2f}s")
             return messages
         else:
             raise ModelError(
-                "Model returned an invalid response structure", 
+                "Model returned an invalid response structure",
                 status_code=500,
                 error_type="model_response_error"
             )
-            
+
     except ModelError:
         # Re-raise ModelError exceptions without wrapping
         raise
@@ -222,4 +222,4 @@ def generate_response(model_id, messages):
             f"Failed to generate response: {str(e)}",
             status_code=500,
             error_type="model_inference_error"
-        ) 
+        )

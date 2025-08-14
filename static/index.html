@@ -272,16 +272,16 @@
         body.light-mode #toggleMode:hover {
             background-color: #0056b3;
         }
-        
+
         body.light-mode pre {
             background-color: #f0f0f0;
             color: #333;
         }
-        
+
         body.light-mode code {
             background-color: #e8e8e8;
         }
-        
+
         body.light-mode .api-endpoint {
             border-left-color: #007bff;
         }
@@ -309,7 +309,7 @@
 
         <h2>API</h2>
         <p>The token.place API is designed to be compatible with the OpenAI API format, making it easy to integrate with existing applications that use OpenAI's services.</p>
-        
+
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models</span></h3>
             <p>Lists the available models.</p>
@@ -329,7 +329,7 @@
   ]
 }</pre>
         </div>
-        
+
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models/{model_id}</span></h3>
             <p>Retrieves information about a specific model.</p>
@@ -344,7 +344,7 @@
   "parent": null
 }</pre>
         </div>
-        
+
         <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/chat/completions</span></h3>
             <p>Creates a completion for the chat message.</p>
@@ -379,7 +379,7 @@
   }
 }</pre>
         </div>
-        
+
         <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/completions</span></h3>
             <p>Creates a completion for the prompt (traditional completion API).</p>
@@ -391,7 +391,7 @@
 }</pre>
             <p><strong>Example Response:</strong> (Same format as chat/completions)</p>
         </div>
-        
+
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/public-key</span></h3>
             <p>Retrieves the server's public key for end-to-end encryption.</p>
@@ -400,7 +400,7 @@
   "public_key": "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUl..."
 }</pre>
         </div>
-        
+
         <h3>Encrypted API Usage</h3>
         <p>For enhanced privacy, you can use end-to-end encryption with the API:</p>
         <ol>
@@ -410,7 +410,7 @@
             <li>Send the encrypted request with <code>"encrypted": true</code> flag</li>
             <li>The server will encrypt its response with your public key</li>
         </ol>
-        
+
         <p><strong>Example Encrypted Request:</strong></p>
         <pre>{
   "model": "llama-3-8b-instruct",
@@ -448,17 +448,17 @@
     <!-- Vue.js -->
     <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
     <!-- Use JSEncrypt 3.3.2 from jsDelivr, matching the test runner -->
-    <script 
-        src="https://cdn.jsdelivr.net/npm/jsencrypt@3.3.2/bin/jsencrypt.min.js" 
+    <script
+        src="https://cdn.jsdelivr.net/npm/jsencrypt@3.3.2/bin/jsencrypt.min.js"
         integrity="sha512-94ncgEEqkuZ4yNTFmu2dSn1TJ6Ij+ANQqpR7eLVU99kzvYzu6UjBxuVoNHtnd29R+T6nvK+ugCVI698pbyEkvQ=="
-        crossorigin="anonymous" 
+        crossorigin="anonymous"
         referrerpolicy="no-referrer"
     ></script>
     <!-- Use CryptoJS 4.2.0 from cdnjs, matching the test runner -->
-    <script 
-        src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js" 
+    <script
+        src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"
         integrity="sha512-a+SUDuwNzXDvz4XrIcXHuCf089/iJAoN4lmrXJg18XnduKK6YlDHNRalv4yd1N40OKI80tFidF+rqTFKGPoWFQ=="
-        crossorigin="anonymous" 
+        crossorigin="anonymous"
         referrerpolicy="no-referrer"
     ></script>
     <script src="/static/chat.js"></script>
@@ -468,7 +468,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             const toggleModeButton = document.getElementById('toggleMode');
             const body = document.body;
-      
+
             const switchTheme = () => {
                 if (body.classList.contains('dark-mode')) {
                     body.classList.remove('dark-mode');
@@ -480,9 +480,9 @@
                     toggleModeButton.textContent = '☀️ switch to light mode';
                 }
             };
-      
+
             toggleModeButton.addEventListener('click', switchTheme);
-      
+
             // Set initial button text
             toggleModeButton.textContent = '☀️ switch to light mode';
         });

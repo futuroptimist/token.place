@@ -1,4 +1,5 @@
 import base64
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -53,6 +54,15 @@ def test_fetch_server_public_key_error_field(monkeypatch):
     resp = MagicMock(status_code=200, json=lambda: {'error': {'message': 'no'}})
     monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **_kw: resp)
     assert not client.fetch_server_public_key()
+
+
+def test_fetch_server_public_key_error_string(monkeypatch, caplog):
+    client = CryptoClient('https://example.com')
+    resp = MagicMock(status_code=200, json=lambda: {'error': 'no'})
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *a, **_kw: resp)
+    with caplog.at_level(logging.ERROR):
+        assert not client.fetch_server_public_key()
+    assert "Server returned error: no" in caplog.text
 
 
 def test_fetch_server_public_key_exception(monkeypatch):

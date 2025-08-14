@@ -103,7 +103,11 @@ class CryptoClient:
 
             # Check if there's an error in the response
             if 'error' in data:
-                error_msg = data['error'].get('message', 'Unknown error')
+                error_val = data['error']
+                if isinstance(error_val, dict):
+                    error_msg = error_val.get('message', 'Unknown error')
+                else:
+                    error_msg = str(error_val)
                 logger.error(f"Server returned error: {error_msg}")
                 return False
 

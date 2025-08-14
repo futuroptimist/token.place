@@ -533,7 +533,10 @@ def test_health_check_exception(client, monkeypatch):
     assert 'error' in resp.get_json()
 
 
-def test_alias_get_model(client):
+def test_alias_get_model(client, monkeypatch):
+    """Alias endpoint should mirror the canonical model details endpoint."""
+    fixed_time = 1234567890
+    monkeypatch.setattr(time, "time", lambda: fixed_time)
     resp = client.get('/api/v1/models')
     model_id = resp.get_json()['data'][0]['id']
     resp_alias = client.get(f'/v1/models/{model_id}')

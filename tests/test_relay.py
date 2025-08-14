@@ -37,6 +37,12 @@ def client():
     client_inference_requests.clear()
     client_responses.clear()
 
+
+def test_inference_endpoint_removed(client):
+    """Ensure deprecated /inference endpoint is unavailable."""
+    response = client.post("/inference", json={})
+    assert response.status_code == 404
+
 # --- Test /next_server ---
 
 def test_next_server_no_servers(client):

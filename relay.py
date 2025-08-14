@@ -1,5 +1,4 @@
 from flask import Flask, send_from_directory, request, jsonify
-import requests
 from datetime import datetime
 import secrets
 import argparse
@@ -32,7 +31,6 @@ app = Flask(__name__)
 init_app(app)
 
 known_servers = {}
-client_queue = []
 client_inference_requests = {}
 client_responses = {}
 
@@ -68,21 +66,6 @@ def next_server():
     return jsonify({
         'server_public_key': known_servers[server_public_key]['public_key']
     })
-
-# deprecated; use /faucet instead
-@app.route('/inference', methods=['POST'])
-def inference():
-    # Get JSON data from the incoming request
-    data = request.get_json()
-
-    # Define the URL to which we will forward the request
-    url = 'http://localhost:3000/'
-
-    # Forward the POST request to the other service and get the response
-    response = requests.post(url, json=data, timeout=10)
-
-    # Return the response received from the other service to the client
-    return jsonify(response.json()), response.status_code
 
 @app.route('/faucet', methods=['POST'])
 def faucet():

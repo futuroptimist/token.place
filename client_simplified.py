@@ -99,7 +99,8 @@ def main():
 
     if args.message:
         # Single message mode
-        print(f"Sending message: {args.message}")
+        # Avoid logging plaintext user content
+        print("Sending message to server...")
         if client.fetch_server_public_key():
             response = client.send_chat_message(args.message)
             if response:

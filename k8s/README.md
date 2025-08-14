@@ -14,5 +14,11 @@ These manifests run `relay.py` as a Deployment and expose it via a Service.
 
 Edit `relay-deployment.yaml` to point `image:` at your registry if needed.
 
+For a Raspberry Pi k3s cluster, use `relay-raspi-pod.yaml` to run a single ARM64 pod:
+
+```bash
+kubectl apply -f k8s/relay-raspi-pod.yaml
+```
+
 The deployment manifest includes resource requests/limits and basic health
 probes. Adjust these values according to your cluster capacity.

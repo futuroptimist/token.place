@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tokenplace-relay-raspi
+  labels:
+    app: tokenplace-relay
+spec:
+  nodeSelector:
+    kubernetes.io/arch: arm64
+  containers:
+    - name: relay
+      image: tokenplace-relay:latest
+      imagePullPolicy: IfNotPresent
+      command: ["python", "relay.py"]
+      ports:
+        - containerPort: 5010
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"

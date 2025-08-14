@@ -34,6 +34,7 @@ playwright>=1.40.0        # Required by pytest-playwright 0.7.0+
 pytest-cov                # Code coverage
 pytest-mock               # Mocking utilities
 pytest-benchmark==5.1.0   # Performance benchmarking, requires pytest>=8.1
+PyYAML>=6.0
 
 # JavaScript test dependencies
 # Note: Install these with npm ci

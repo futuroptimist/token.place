@@ -126,3 +126,15 @@ def test_get_relative_path_relpath_error(monkeypatch, tmp_path):
     target.mkdir()
     result = ph.get_relative_path(target, base)
     assert result == target
+
+
+def test_normalize_path_none():
+    """normalize_path should reject None values"""
+    with pytest.raises(TypeError):
+        ph.normalize_path(None)
+
+
+def test_ensure_dir_exists_none():
+    """ensure_dir_exists should reject None values"""
+    with pytest.raises(TypeError):
+        ph.ensure_dir_exists(None)

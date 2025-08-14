@@ -19,9 +19,10 @@ and automatically create directories when accessed.
 On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 `XDG_CACHE_HOME`, and `XDG_STATE_HOME` environment variables when they are set.
 
-- `normalize_path(path)`: Strips surrounding whitespace, expands `~` and environment variables, then returns a normalized absolute path.
-- `ensure_dir_exists(path)`: Strips whitespace and creates the directory if missing, expanding `~` and environment variables, and
-  raises `NotADirectoryError` when the path points to an existing file.
+- `normalize_path(path)`: Strips surrounding whitespace, expands `~` and environment variables, then returns a normalized
+  absolute path. Raises a `TypeError` when `path` is `None`.
+- `ensure_dir_exists(path)`: Strips whitespace and creates the directory if missing, expanding `~` and environment
+  variables, and raises `NotADirectoryError` when the path points to an existing file. Passing `None` now raises `TypeError`.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
 - `get_logs_dir()`: Returns the platform-specific logs directory and ensures it exists.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the

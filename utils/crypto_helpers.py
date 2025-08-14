@@ -36,9 +36,9 @@ import time
 # Import encryption functions
 from encrypt import generate_keys, encrypt, decrypt
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('crypto_client')
+# Set up module-level logger without configuring global logging
+logger = logging.getLogger("crypto_client")
+logger.addHandler(logging.NullHandler())
 
 class CryptoClient:
     """

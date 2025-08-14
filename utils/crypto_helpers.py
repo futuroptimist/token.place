@@ -118,7 +118,11 @@ class CryptoClient:
             logger.info(f"Successfully fetched server public key")
             return True
         except Exception as e:
-            logger.error(f"Exception while fetching server public key: {str(e)}", exc_info=self.debug)
+            logger.error(
+                "Exception while fetching server public key: %s",
+                e.__class__.__name__,
+                exc_info=self.debug,
+            )
             return False
 
     def encrypt_message(self, message: Union[Dict, List, str]) -> Dict[str, str]:
@@ -225,7 +229,11 @@ class CryptoClient:
 
             return response.json()
         except Exception as e:
-            logger.error(f"Exception while sending encrypted message: {str(e)}", exc_info=self.debug)
+            logger.error(
+                "Exception while sending encrypted message: %s",
+                e.__class__.__name__,
+                exc_info=self.debug,
+            )
             return None
 
     def send_chat_message(self, message: Union[str, List[Dict]], max_retries: int = 5) -> Optional[List[Dict]]:
@@ -256,7 +264,11 @@ class CryptoClient:
         try:
             encrypted_data = self.encrypt_message(chat_history)
         except Exception as e:
-            logger.error(f"Failed to encrypt message: {str(e)}", exc_info=self.debug)
+            logger.error(
+                "Failed to encrypt message: %s",
+                e.__class__.__name__,
+                exc_info=self.debug,
+            )
             return None
 
         # Prepare the payload
@@ -357,7 +369,11 @@ class CryptoClient:
                         logger.warning("Unexpected response format type: %s", type(decrypted_data).__name__)
                         return None
                 except Exception as e:
-                    logger.error(f"Failed to decrypt response: {str(e)}", exc_info=self.debug)
+                    logger.error(
+                        "Failed to decrypt response: %s",
+                        e.__class__.__name__,
+                        exc_info=self.debug,
+                    )
                     return None
             else:
                 logger.debug("Response missing expected fields: %s", list(response.keys()))
@@ -389,7 +405,11 @@ class CryptoClient:
         try:
             encrypted_data = self.encrypt_message(messages)
         except Exception as e:
-            logger.error(f"Failed to encrypt API request: {str(e)}", exc_info=self.debug)
+            logger.error(
+                "Failed to encrypt API request: %s",
+                e.__class__.__name__,
+                exc_info=self.debug,
+            )
             return None
 
         # Prepare the payload
@@ -426,7 +446,11 @@ class CryptoClient:
                 })
                 return decrypted_content
             except Exception as e:
-                logger.error(f"Failed to decrypt API response (data format): {str(e)}", exc_info=self.debug)
+                logger.error(
+                    "Failed to decrypt API response (data format): %s",
+                    e.__class__.__name__,
+                    exc_info=self.debug,
+                )
                 return None
 
         # Original format: response has 'encrypted_content' key
@@ -440,7 +464,11 @@ class CryptoClient:
                 })
                 return decrypted_content
             except Exception as e:
-                logger.error(f"Failed to decrypt API response (encrypted_content format): {str(e)}", exc_info=self.debug)
+                logger.error(
+                    "Failed to decrypt API response (encrypted_content format): %s",
+                    e.__class__.__name__,
+                    exc_info=self.debug,
+                )
                 return None
 
         # Avoid logging full response to prevent leaking ciphertext or other data

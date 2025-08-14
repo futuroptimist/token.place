@@ -12,7 +12,7 @@ token.place is an end-to-end encrypted proxy service that sits between clients a
 
 ### 1. Client-Side Components
 
-- **JavaScript Client Library** (`static/chat.js`): 
+- **JavaScript Client Library** (`static/chat.js`):
   - Generates client-side RSA key pairs
   - Encrypts messages using a hybrid RSA-AES approach
   - Decrypts responses from the server
@@ -30,6 +30,7 @@ token.place is an end-to-end encrypted proxy service that sits between clients a
   - Generates and manages RSA key pairs
   - Provides encryption/decryption services
   - Manages secure session handling
+  - Validates presence of client public keys before encryption
 
 - **Model Manager** (`utils/models/model_manager.py`):
   - Connects to various AI providers
@@ -112,4 +113,4 @@ token.place is designed to be deployed in various configurations:
 
 1. **Self-Hosted**: Run on your own infrastructure
 2. **Cloud Services**: Deploy to standard cloud providers
-3. **Development Mode**: Local setup for testing and development 
+3. **Development Mode**: Local setup for testing and development

@@ -90,6 +90,8 @@ class CryptoManager:
         try:
             if message is None:
                 raise ValueError("Message cannot be None")
+            if client_public_key is None:
+                raise ValueError("Client public key cannot be None")
 
             # Convert message to bytes if it's not already
             if isinstance(message, (dict, list)):

@@ -17,3 +17,18 @@ def test_exceeding_rate_limit_returns_429():
 
         second = client.get("/api/v1/models")
         assert second.status_code == 429
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1000/minute", "API_DAILY_QUOTA": "2/day"},
+)
+def test_exceeding_daily_quota_returns_429():
+    app = Flask(__name__)
+    init_app(app)
+
+    with app.test_client() as client:
+        assert client.get("/api/v1/models").status_code == 200
+        assert client.get("/api/v1/models").status_code == 200
+        third = client.get("/api/v1/models")
+        assert third.status_code == 429

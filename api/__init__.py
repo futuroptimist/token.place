@@ -15,7 +15,10 @@ def init_app(app):
     Limiter(
         get_remote_address,
         app=app,
-        default_limits=[os.environ.get("API_RATE_LIMIT", "60/hour")],
+        default_limits=[
+            os.environ.get("API_RATE_LIMIT", "60/hour"),
+            os.environ.get("API_DAILY_QUOTA", "1000/day"),
+        ],
     )
     PrometheusMetrics(app)
     app.register_blueprint(v1_routes.v1_bp)

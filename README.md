@@ -41,6 +41,7 @@ with flushed output. Metrics are exposed at `/metrics`.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | API_RATE_LIMIT | 60/hour | Per-IP rate limit for API requests |
+| API_DAILY_QUOTA | 1000/day | Per-IP daily request quota |
 | USE_MOCK_LLM | 0 | Run with mock LLM instead of downloading a real model |
 | TOKEN_PLACE_ENV | development | Deployment environment (`development`, `testing`, `production`) |
 
@@ -126,7 +127,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [ ] Batched inference for relay servers with multiple connected clients
 - [ ] Advanced security features
   - [ ] Client authentication for relay servers
-  - [ ] Rate limiting and quota enforcement
+  - [x] Rate limiting and quota enforcement 💯
 - [ ] Enhanced encryption options for model weights and inference data
   - [ ] Key rotation for relay and server certificates
   - [ ] Signed relay binaries for client verification

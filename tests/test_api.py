@@ -128,7 +128,6 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     assert data['choices'][0]['message']['role'] == 'assistant'
     assert len(data['choices'][0]['message']['content']) > 0
     assert 'Mock response' in data['choices'][0]['message']['content']
-    print(f"Unencrypted Response: {data['choices'][0]['message']['content']}")
 
 def test_encrypted_chat_completion(client, client_keys, mock_llama):
     """Test the chat completion API with encryption"""
@@ -192,7 +191,6 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert decrypted_data['choices'][0]['message']['role'] == 'assistant'
     assert len(decrypted_data['choices'][0]['message']['content']) > 0
     assert 'Mock response' in decrypted_data['choices'][0]['message']['content']
-    print(f"Decrypted Response: {decrypted_data['choices'][0]['message']['content']}")
 
 def test_completions_endpoint(client, mock_llama):
     """Test the regular completions endpoint (redirects to chat)"""
@@ -213,7 +211,6 @@ def test_completions_endpoint(client, mock_llama):
     assert len(data['choices']) > 0
     assert 'text' in data['choices'][0]
     assert 'Mock response' in data['choices'][0]['text']
-    print(f"Completions Endpoint Response: {data['choices'][0]['text']}")
 
 def test_error_handling(client, mock_llama):
     """Test API error handling"""

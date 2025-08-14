@@ -88,7 +88,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] simplified crypto utility (CryptoClient) for easy encrypted communication
 - [ ] distribute relay.py across multiple machines
   - [x] personal gaming PC
-  - [ ] raspi k3s pod
+  - [x] raspi k3s pod 💯
   - [ ] once k3s pod is stable, run relay.py only on the cluster
   - [ ] optional cloud fallback via Cloudflare
 - [x] OpenAI-compatible API with end-to-end encryption

@@ -18,7 +18,7 @@ def clear_screen():
     """
     if sys.stdout.isatty():
         # Use ANSI escape codes to avoid shell injection via os.system
-        print("\033[2J\033[H", end="")
+        print("\033[2J\033[H", end="", flush=True)
 
 def format_message(message: Dict) -> str:
     """Format a message for display"""

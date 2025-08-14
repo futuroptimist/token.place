@@ -156,3 +156,27 @@ def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[
             return pathlib.Path(os.path.relpath(path, base_path))
         except ValueError:
             return path
+
+
+def is_case_sensitive_filesystem(path: Union[str, pathlib.Path] = ".") -> bool:
+    """Return True if the filesystem at ``path`` treats names as case-sensitive.
+
+    The check creates two temporary files whose names differ only by case and
+    verifies whether both can exist simultaneously.
+    """
+    base = normalize_path(path)
+    base.mkdir(parents=True, exist_ok=True)
+    test_lower = base / "tmp_case_test"
+    test_upper = base / "TMP_CASE_TEST"
+    try:
+        test_lower.write_text("a")
+        if test_upper.exists():
+            return False
+        test_upper.write_text("b")
+        return True
+    finally:
+        for p in (test_lower, test_upper):
+            try:
+                p.unlink()
+            except OSError:
+                pass

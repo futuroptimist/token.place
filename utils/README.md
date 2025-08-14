@@ -27,6 +27,8 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives
   (Windows), the absolute `path` is returned instead of raising an error.
+- `is_case_sensitive_filesystem(path)`: Detects whether the filesystem treats names with different
+  casing as distinct.
 
 ### Crypto Helpers (`crypto_helpers.py`)
 

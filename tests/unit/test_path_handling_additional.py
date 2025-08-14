@@ -126,3 +126,11 @@ def test_get_relative_path_relpath_error(monkeypatch, tmp_path):
     target.mkdir()
     result = ph.get_relative_path(target, base)
     assert result == target
+
+
+def test_is_case_sensitive_filesystem(tmp_path):
+    """is_case_sensitive_filesystem returns expected boolean and cleans up."""
+    result = ph.is_case_sensitive_filesystem(tmp_path)
+    assert isinstance(result, bool)
+    if ph.IS_LINUX:
+        assert result is True

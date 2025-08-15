@@ -116,6 +116,8 @@ def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
     # Expand environment variables and user home (~), then normalize
     # Also strip surrounding whitespace to avoid creating unintended paths
     path_str = os.path.expandvars(str(dir_path)).strip()
+    if path_str == "":
+        raise ValueError("dir_path cannot be empty")
     path = pathlib.Path(path_str).expanduser().resolve()
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
@@ -136,6 +138,8 @@ def normalize_path(path: Union[str, pathlib.Path]) -> pathlib.Path:
         raise TypeError("path cannot be None")
 
     expanded = os.path.expandvars(str(path)).strip()
+    if expanded == "":
+        raise ValueError("path cannot be empty")
     return pathlib.Path(expanded).expanduser().resolve()
 
 def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[str, pathlib.Path]] = None) -> pathlib.Path:

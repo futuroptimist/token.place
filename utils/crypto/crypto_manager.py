@@ -85,7 +85,8 @@ class CryptoManager:
             and 'iv' (initialization vector)
 
         Raises:
-            ValueError: If ``message`` is ``None``.
+            ValueError: If ``message`` or ``client_public_key`` is ``None``.
+            TypeError: If ``message`` is of an unsupported type.
         """
         try:
             if message is None:
@@ -98,8 +99,12 @@ class CryptoManager:
                 message_bytes = json.dumps(message).encode('utf-8')
             elif isinstance(message, str):
                 message_bytes = message.encode('utf-8')
-            else:
+            elif isinstance(message, bytes):
                 message_bytes = message
+            else:
+                raise TypeError(
+                    f"Unsupported message type: {type(message).__name__}"
+                )
 
             # Ensure client_public_key is bytes
             if isinstance(client_public_key, str):

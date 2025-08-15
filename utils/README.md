@@ -45,8 +45,9 @@ valid UTF-8 or JSON.
 Network requests in this module now use a default 10 second timeout to prevent
 hanging connections. You can override this by passing a `timeout` argument to
 `CryptoClient.fetch_server_public_key` or `CryptoClient.send_encrypted_message`.
-`encrypt_message` validates inputs and raises a `ValueError` when provided
-`None`, avoiding confusing cryptography errors.
+`encrypt_message` validates inputs, raising a `ValueError` for `None` and a
+`TypeError` for unsupported message types to avoid confusing cryptography
+errors.
 
 ## Crypto Helpers
 

@@ -110,6 +110,13 @@ def test_decrypt_with_missing_fields():
         decrypt_message(bad_data, private_key)
 ```
 
+- Ensure encryption helpers reject invalid types:
+
+```python
+with pytest.raises(TypeError):
+    pkcs7_unpad("not-bytes", 16)
+```
+
 ## 10. Mock Server for JavaScript Tests
 
 Create a simple mock server to test the JavaScript client without relying on the full Python server:

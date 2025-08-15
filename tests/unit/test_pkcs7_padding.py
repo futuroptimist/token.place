@@ -53,3 +53,15 @@ def test_unpad_invalid_block_size():
         pkcs7_unpad(padded, 0)
     with pytest.raises(ValueError):
         pkcs7_unpad(padded, 256)
+
+
+def test_pad_non_bytes_input():
+    """Non-byte inputs to pkcs7_pad should raise TypeError."""
+    with pytest.raises(TypeError):
+        pkcs7_pad("not-bytes", 16)
+
+
+def test_unpad_non_bytes_input():
+    """Non-byte inputs to pkcs7_unpad should raise TypeError."""
+    with pytest.raises(TypeError):
+        pkcs7_unpad("not-bytes", 16)

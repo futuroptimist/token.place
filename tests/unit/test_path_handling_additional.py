@@ -8,6 +8,16 @@ import pytest
 from utils import path_handling as ph
 
 
+class DummyPath:
+    """Simple ``os.PathLike`` implementation without ``__str__``."""
+
+    def __init__(self, path: pathlib.Path):
+        self._path = path
+
+    def __fspath__(self) -> str:  # pragma: no cover - trivial
+        return str(self._path)
+
+
 def test_ensure_dir_exists_existing(tmp_path):
     p = tmp_path / 'sub'
     p.mkdir()
@@ -52,6 +62,14 @@ def test_ensure_dir_exists_strips_whitespace(tmp_path):
     assert result.exists()
 
 
+def test_ensure_dir_exists_pathlike(tmp_path):
+    """ensure_dir_exists should accept ``os.PathLike`` objects"""
+    target = tmp_path / "pathlike"
+    result = ph.ensure_dir_exists(DummyPath(target))
+    assert result == target
+    assert result.exists()
+
+
 def test_normalize_path_expands_env_vars(tmp_path, monkeypatch):
     """normalize_path should expand environment variables"""
     monkeypatch.setenv("TEST_BASE", str(tmp_path))
@@ -71,6 +89,14 @@ def test_normalize_path_strips_whitespace(tmp_path):
     target.mkdir()
     path_with_spaces = f"  {target}  "
     result = ph.normalize_path(path_with_spaces)
+    assert result == target
+
+
+def test_normalize_path_pathlike(tmp_path):
+    """normalize_path should accept ``os.PathLike`` objects"""
+    target = tmp_path / "pl"
+    target.mkdir()
+    result = ph.normalize_path(DummyPath(target))
     assert result == target
 
 

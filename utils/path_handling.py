@@ -112,6 +112,8 @@ def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     if dir_path is None:
         raise TypeError("dir_path cannot be None")
+    if not isinstance(dir_path, (str, os.PathLike)):
+        raise TypeError("dir_path must be path-like")
 
     # Expand environment variables and user home (~), then normalize
     # Also strip surrounding whitespace to avoid creating unintended paths
@@ -137,6 +139,8 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     if path is None:
         raise TypeError("path cannot be None")
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be path-like")
 
     expanded = os.path.expandvars(os.fspath(path)).strip()
     if expanded == "":

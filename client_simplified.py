@@ -78,7 +78,7 @@ def chat_loop(client: CryptoClient):
             # Display updated conversation
             display_conversation(conversation)
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\nChat session ended by user.")
 
     print("Thank you for using token.place!")

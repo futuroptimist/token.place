@@ -63,3 +63,21 @@ def test_chat_loop_single_iteration(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Assistant is thinking" in out
     assert "ok" in out
+
+
+def test_chat_loop_eof(monkeypatch, capsys):
+    """Gracefully exit when stdin closes."""
+    mock_client = MagicMock()
+    mock_client.fetch_server_public_key.return_value = True
+
+    def raise_eof(_):
+        raise EOFError
+
+    monkeypatch.setattr(builtins, "input", raise_eof)
+    monkeypatch.setattr(cs, "clear_screen", lambda: None)
+
+    cs.chat_loop(mock_client)
+
+    out = capsys.readouterr().out
+    assert "Chat session ended" in out
+    mock_client.send_chat_message.assert_not_called()

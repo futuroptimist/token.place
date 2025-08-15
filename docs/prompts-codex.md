@@ -29,10 +29,11 @@ OUTPUT:
 A pull request describing the change and summarizing test results.
 ```
 
-For specialized tasks, see:
+## Specialized prompts
 
 - [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md)
 - [Codex Security Review Prompt](prompts-codex-security.md)
+- [Codex Docs Update Prompt](prompts-codex-docs.md)
 
 ## Implementation prompts
 

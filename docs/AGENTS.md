@@ -40,6 +40,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [../llms.txt](../llms.txt): Machine-readable project summary for LLM assistants
 - [docs/prompts-codex-ci-fix.md](docs/prompts-codex-ci-fix.md): Codex prompt for fixing CI failures
 - [docs/prompts-codex-security.md](docs/prompts-codex-security.md): Codex prompt for security reviews
+- [docs/prompts-codex-docs.md](docs/prompts-codex-docs.md): Codex prompt for doc updates
 
 ## User Journeys
 

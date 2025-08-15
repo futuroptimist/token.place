@@ -29,10 +29,16 @@ def log_info(message):
         logger.info(message)
 
 def log_error(message, exc_info=False):
-    """Log errors only in non-production environments"""
+    """Log errors in all environments.
+
+    In production environments, stack traces are suppressed even if
+    ``exc_info`` is set to avoid leaking sensitive information.
+    """
     try:
         config = get_config_lazy()
-        if not config.is_production:
+        if config.is_production:
+            logger.error(message)
+        else:
             logger.error(message, exc_info=exc_info)
     except Exception:
         # Fallback to always log if config is not available

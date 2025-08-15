@@ -84,6 +84,7 @@ Refined logging helpers to avoid swallowing system interrupt exceptions.
 **Completed Improvements**
 - Updated `log_info` and `log_error` to catch only standard exceptions, allowing
   `KeyboardInterrupt` and `SystemExit` to propagate.
+- Ensured `log_error` always logs messages even in production.
 
 **Recommendations**
 - Continue monitoring logging utilities for unintended side effects.

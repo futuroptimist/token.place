@@ -138,3 +138,15 @@ def test_ensure_dir_exists_none():
     """ensure_dir_exists should reject None values"""
     with pytest.raises(TypeError):
         ph.ensure_dir_exists(None)
+
+
+def test_ensure_dir_exists_empty_string():
+    """ensure_dir_exists should reject empty or whitespace-only paths"""
+    with pytest.raises(ValueError):
+        ph.ensure_dir_exists("   ")
+
+
+def test_normalize_path_empty_string():
+    """normalize_path should reject empty or whitespace-only paths"""
+    with pytest.raises(ValueError):
+        ph.normalize_path("")

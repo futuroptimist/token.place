@@ -178,7 +178,10 @@ def pkcs7_pad(data: bytes, block_size: int) -> bytes:
 
     Raises:
         ValueError: If *block_size* is not between 1 and 255 (inclusive).
+        TypeError: If *data* is not bytes-like.
     """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes-like")
     if block_size <= 0 or block_size > 255:
         raise ValueError("Block size must be between 1 and 255")
     padding_length = block_size - (len(data) % block_size)
@@ -197,7 +200,10 @@ def pkcs7_unpad(padded_data: bytes, block_size: int) -> bytes:
 
     Raises:
         ValueError: If *block_size* is not between 1 and 255 (inclusive) or padding is invalid.
+        TypeError: If *padded_data* is not bytes-like.
     """
+    if not isinstance(padded_data, (bytes, bytearray)):
+        raise TypeError("padded_data must be bytes-like")
     if block_size <= 0 or block_size > 255:
         raise ValueError("Block size must be between 1 and 255")
     if not padded_data:

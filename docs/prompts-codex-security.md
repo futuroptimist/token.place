@@ -15,9 +15,9 @@ CONTEXT:
 - Do not log plaintext or ciphertext of user messages.
 CHECKS:
   - `pytest -q tests/test_security.py`
-  - `bandit -r tokenplace -lll`
-  - Verify README badges for Dependabot, CodeQL, secret-scanning.
-FAIL if any badge missing or Bandit score \u2265 MEDIUM.
+  - `bandit -r . -lll`
+  - Verify README includes badges for Dependabot, CodeQL, and secret scanning.
+Fail if any badge is missing or Bandit reports findings at MEDIUM severity or higher.
 REQUEST:
 1. Run all checks.
 2. Inspect code for potential leaks or missing encryption steps.

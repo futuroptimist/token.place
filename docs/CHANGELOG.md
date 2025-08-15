@@ -6,6 +6,7 @@
 - Validate PKCS#7 unpadding length to reject improperly padded input
 - Remove unused imports from simplified CLI client to avoid unnecessary dependencies
 - Handle EOF in simplified CLI client to end sessions cleanly
+- Deep copy default configuration to prevent cross-test mutations
 
 ## Version 1.0.0 (March 2025)
 

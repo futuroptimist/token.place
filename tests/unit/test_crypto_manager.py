@@ -132,6 +132,11 @@ class TestCryptoManager:
         with pytest.raises(ValueError, match="Client public key cannot be None"):
             crypto_manager.encrypt_message("hi", None)
 
+    def test_encrypt_message_invalid_type(self, crypto_manager):
+        """encrypt_message should reject unsupported message types."""
+        with pytest.raises(TypeError, match="Unsupported message type: int"):
+            crypto_manager.encrypt_message(123, crypto_manager.public_key)
+
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_accepts_base64_key(self, mock_encrypt, crypto_manager):
         """Public key may be provided as a base64 string."""

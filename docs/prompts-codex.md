@@ -5,7 +5,13 @@ slug: 'prompts-codex'
 
 # token.place Codex Prompt
 
-This document stores the baseline prompt for instructing automated agents to contribute to token.place. Keeping prompts versioned lets us refine them over time.
+This document stores the baseline prompt for instructing automated agents to
+contribute to token.place. Keeping prompts versioned lets us refine them over
+time.
+
+See also [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md) and
+[Codex Security Review Prompt](prompts-codex-security.md) for specialized
+tasks.
 
 ```
 SYSTEM:
@@ -16,6 +22,7 @@ Make small, well-tested improvements that keep token.place secure and usable.
 
 CONTEXT:
 - Follow the conventions in AGENTS.md and README.md.
+- Run `npm run lint`, `npm run type-check`, `npm run build`, and `npm run test:ci`.
 - Run `pre-commit run --all-files` before committing.
 - If Playwright browsers are missing, run `playwright install chromium`.
 

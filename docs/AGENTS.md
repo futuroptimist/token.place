@@ -38,6 +38,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [docs/LLM_ASSISTANT_GUIDE.md](docs/LLM_ASSISTANT_GUIDE.md): Guide for AI assistants working with this codebase
 - [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials): Hardware list, setup instructions, and troubleshooting tips for Raspberry Pi deployments (including rpi-clone prompt walkthrough)
 - [../llms.txt](../llms.txt): Machine-readable project summary for LLM assistants
+- [docs/prompts-codex.md](docs/prompts-codex.md): Baseline Codex prompt for routine contributions
 - [docs/prompts-codex-ci-fix.md](docs/prompts-codex-ci-fix.md): Codex prompt for fixing CI failures
 - [docs/prompts-codex-security.md](docs/prompts-codex-security.md): Codex prompt for security reviews
 - [docs/prompts-codex-docs.md](docs/prompts-codex-docs.md): Codex prompt for doc updates

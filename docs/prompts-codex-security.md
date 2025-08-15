@@ -7,6 +7,9 @@ slug: 'prompts-codex-security'
 
 Use this prompt to audit token.place for security flaws and verify encryption integrity.
 
+See also [Baseline Codex Prompt](prompts-codex.md) and
+[Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md) for complementary guidance.
+
 ```
 SYSTEM: Automated security reviewer for token.place.
 GOAL: Harden crypto & dependency hygiene.
@@ -14,6 +17,11 @@ CONTEXT:
 - Follow [AGENTS.md](../AGENTS.md) and [docs/AGENTS.md](AGENTS.md).
 - Do not log plaintext or ciphertext of user messages.
 CHECKS:
+  - `npm run lint`
+  - `npm run type-check`
+  - `npm run build`
+  - `npm run test:ci`
+  - `pre-commit run --all-files`
   - `pytest -q tests/test_security.py`
   - `bandit -r tokenplace -lll`
   - Ensure [README.md](../README.md) includes badges for Dependabot, CodeQL, and secret scanning.

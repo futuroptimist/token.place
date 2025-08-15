@@ -314,6 +314,23 @@ class TestCryptoManager:
             cm.log_error('bye')
 
 
+def test_log_error_logs_in_production(monkeypatch, caplog):
+    """log_error should emit messages in production without tracebacks."""
+    from utils.crypto import crypto_manager as cm
+    monkeypatch.setattr(
+        cm,
+        'get_config_lazy',
+        MagicMock(return_value=MagicMock(is_production=True)),
+    )
+    with caplog.at_level('ERROR', logger='crypto_manager'):
+        try:
+            raise ValueError('boom')
+        except ValueError:
+            cm.log_error('boom', exc_info=True)
+    assert 'boom' in caplog.text
+    assert 'ValueError' not in caplog.text
+
+
 def test_decrypt_message_returns_bytes_for_non_utf8():
     """CryptoManager.decrypt_message returns raw bytes for non UTF-8 content."""
     manager = CryptoManager()

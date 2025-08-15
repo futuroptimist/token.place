@@ -17,7 +17,10 @@ Diagnose and fix CI failures so tests and checks pass.
 CONTEXT:
 - Follow AGENTS.md and docs/AGENTS.md instructions.
 - Run `pre-commit run --all-files` (which executes `./run_all_tests.sh`).
-- Install dependencies with `npm ci` for Node.js and `pip install -r config/requirements_server.txt` plus `pip install -r config/requirements_relay.txt` as needed.
+- Install dependencies:
+  - `npm ci`
+  - `pip install -r config/requirements_server.txt`
+  - `pip install -r config/requirements_relay.txt`
 
 REQUEST:
 1. Reproduce the failing check locally with `pre-commit run --all-files`.

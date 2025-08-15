@@ -96,8 +96,9 @@ def validate_string_length(data: Dict[str, Any], field: str,
 
 
 def validate_base64(data: Dict[str, Any], field: str) -> None:
-    """
-    Validate that a field contains valid base64 data.
+    """Validate that a field contains valid base64 data.
+
+    Uses strict decoding to reject any characters outside the base64 alphabet.
 
     Args:
         data: The data containing the field
@@ -113,7 +114,7 @@ def validate_base64(data: Dict[str, Any], field: str) -> None:
 
     try:
         # Check if it can be decoded
-        base64.b64decode(value)
+        base64.b64decode(value, validate=True)
     except Exception:
         raise ValidationError(
             f"Invalid base64 encoding for {field}",

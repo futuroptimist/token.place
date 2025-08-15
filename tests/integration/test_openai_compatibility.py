@@ -3,6 +3,7 @@ import time
 import subprocess
 import requests
 import openai
+import sys
 from contextlib import contextmanager
 
 # We reuse the port used in other tests
@@ -13,7 +14,7 @@ BASE_URL = f"http://localhost:{API_PORT}"
 def start_relay_with_mock():
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
-    cmd = ["python", "relay.py", "--port", str(API_PORT)]
+    cmd = [sys.executable, "relay.py", "--port", str(API_PORT)]
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         # wait for server

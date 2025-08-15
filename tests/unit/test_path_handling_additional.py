@@ -150,3 +150,15 @@ def test_normalize_path_empty_string():
     """normalize_path should reject empty or whitespace-only paths"""
     with pytest.raises(ValueError):
         ph.normalize_path("")
+
+
+def test_ensure_dir_exists_invalid_type():
+    """ensure_dir_exists should reject non-path-like values"""
+    with pytest.raises(TypeError):
+        ph.ensure_dir_exists(123)  # type: ignore[arg-type]
+
+
+def test_normalize_path_invalid_type():
+    """normalize_path should reject non-path-like values"""
+    with pytest.raises(TypeError):
+        ph.normalize_path(123)  # type: ignore[arg-type]

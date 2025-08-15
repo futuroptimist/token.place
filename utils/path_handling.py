@@ -101,17 +101,19 @@ def get_logs_dir() -> pathlib.Path:
             base_dir = get_user_home_dir() / '.local' / 'state'
         return ensure_dir_exists(base_dir / 'token.place' / 'logs')
 
-def ensure_dir_exists(dir_path: Union[str, pathlib.Path]) -> pathlib.Path:
+def ensure_dir_exists(dir_path: Union[str, os.PathLike]) -> pathlib.Path:
     """
     Ensure a directory exists, creating it if necessary.
     Expands ``~`` and environment variables before creating the directory, and
     strips surrounding whitespace to avoid accidental directory names.
-    Raises ``TypeError`` if ``dir_path`` is ``None`` and ``NotADirectoryError``
-    if the path points to an existing file. Returns the path as a
-    ``pathlib.Path`` object.
+    Raises ``TypeError`` if ``dir_path`` is ``None`` or not path-like and
+    ``NotADirectoryError`` if the path points to an existing file. Returns the
+    path as a ``pathlib.Path`` object.
     """
     if dir_path is None:
         raise TypeError("dir_path cannot be None")
+    if not isinstance(dir_path, (str, os.PathLike)):
+        raise TypeError("dir_path must be path-like")
 
     # Expand environment variables and user home (~), then normalize
     # Also strip surrounding whitespace to avoid creating unintended paths
@@ -128,14 +130,17 @@ def get_executable_extension() -> str:
     """Get the appropriate executable extension for the current platform."""
     return '.exe' if IS_WINDOWS else ''
 
-def normalize_path(path: Union[str, pathlib.Path]) -> pathlib.Path:
+def normalize_path(path: Union[str, os.PathLike]) -> pathlib.Path:
     """Convert a path string to a normalized ``pathlib.Path`` object.
 
     Strips surrounding whitespace and expands environment variables and user
-    home (``~``). Raises ``TypeError`` when ``path`` is ``None``.
+    home (``~``). Raises ``TypeError`` when ``path`` is ``None`` or not
+    path-like.
     """
     if path is None:
         raise TypeError("path cannot be None")
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be path-like")
 
     expanded = os.path.expandvars(str(path)).strip()
     if expanded == "":

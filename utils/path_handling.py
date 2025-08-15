@@ -2,7 +2,7 @@ import os
 import sys
 import platform
 import pathlib
-from typing import Optional, Union, List
+from typing import Optional, Union
 
 # Define platform-specific constants
 PLATFORM = platform.system().lower()
@@ -101,14 +101,14 @@ def get_logs_dir() -> pathlib.Path:
             base_dir = get_user_home_dir() / '.local' / 'state'
         return ensure_dir_exists(base_dir / 'token.place' / 'logs')
 
-def ensure_dir_exists(dir_path: Union[str, os.PathLike]) -> pathlib.Path:
+def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     Ensure a directory exists, creating it if necessary.
-    Expands ``~`` and environment variables before creating the directory, and
-    strips surrounding whitespace to avoid accidental directory names.
-    Raises ``TypeError`` if ``dir_path`` is ``None`` or not path-like and
-    ``NotADirectoryError`` if the path points to an existing file. Returns the
-    path as a ``pathlib.Path`` object.
+    Accepts strings or ``os.PathLike`` objects, expands ``~`` and environment
+    variables before creating the directory, and strips surrounding whitespace to
+    avoid accidental directory names. Raises ``TypeError`` if ``dir_path`` is
+    ``None`` and ``NotADirectoryError`` if the path points to an existing file.
+    Returns the path as a ``pathlib.Path`` object.
     """
     if dir_path is None:
         raise TypeError("dir_path cannot be None")
@@ -117,7 +117,7 @@ def ensure_dir_exists(dir_path: Union[str, os.PathLike]) -> pathlib.Path:
 
     # Expand environment variables and user home (~), then normalize
     # Also strip surrounding whitespace to avoid creating unintended paths
-    path_str = os.path.expandvars(str(dir_path)).strip()
+    path_str = os.path.expandvars(os.fspath(dir_path)).strip()
     if path_str == "":
         raise ValueError("dir_path cannot be empty")
     path = pathlib.Path(path_str).expanduser().resolve()
@@ -130,24 +130,27 @@ def get_executable_extension() -> str:
     """Get the appropriate executable extension for the current platform."""
     return '.exe' if IS_WINDOWS else ''
 
-def normalize_path(path: Union[str, os.PathLike]) -> pathlib.Path:
-    """Convert a path string to a normalized ``pathlib.Path`` object.
+def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
+    """Convert a path to a normalized ``pathlib.Path`` object.
 
-    Strips surrounding whitespace and expands environment variables and user
-    home (``~``). Raises ``TypeError`` when ``path`` is ``None`` or not
-    path-like.
+    Accepts strings or ``os.PathLike`` objects, strips surrounding whitespace,
+    and expands environment variables and user home (``~``). Raises
+    ``TypeError`` when ``path`` is ``None``.
     """
     if path is None:
         raise TypeError("path cannot be None")
     if not isinstance(path, (str, os.PathLike)):
         raise TypeError("path must be path-like")
 
-    expanded = os.path.expandvars(str(path)).strip()
+    expanded = os.path.expandvars(os.fspath(path)).strip()
     if expanded == "":
         raise ValueError("path cannot be empty")
     return pathlib.Path(expanded).expanduser().resolve()
 
-def get_relative_path(path: Union[str, pathlib.Path], base_path: Optional[Union[str, pathlib.Path]] = None) -> pathlib.Path:
+def get_relative_path(
+    path: Union[str, os.PathLike[str]],
+    base_path: Optional[Union[str, os.PathLike[str]]] = None,
+) -> pathlib.Path:
     """Return ``path`` relative to ``base_path``.
 
     If ``base_path`` is ``None`` the current working directory is used. When the

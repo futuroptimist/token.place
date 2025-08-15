@@ -28,6 +28,11 @@ def test_validate_base64_invalid():
         val.validate_base64({'b64': 'abc!'}, 'b64')
 
 
+def test_validate_base64_invalid_chars():
+    with pytest.raises(val.ValidationError):
+        val.validate_base64({'b64': 'ab$cd'}, 'b64')
+
+
 def test_validate_json_string_invalid():
     with pytest.raises(val.ValidationError):
         val.validate_json_string({'js': 'not-json'}, 'js')

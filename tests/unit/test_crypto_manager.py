@@ -132,6 +132,11 @@ class TestCryptoManager:
         with pytest.raises(ValueError, match="Client public key cannot be None"):
             crypto_manager.encrypt_message("hi", None)
 
+    def test_encrypt_message_invalid_type(self, crypto_manager):
+        """encrypt_message should reject unsupported message types."""
+        with pytest.raises(TypeError, match="Unsupported message type: int"):
+            crypto_manager.encrypt_message(123, crypto_manager.public_key)
+
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_accepts_base64_key(self, mock_encrypt, crypto_manager):
         """Public key may be provided as a base64 string."""
@@ -307,6 +312,23 @@ class TestCryptoManager:
 
         with pytest.raises(KeyboardInterrupt):
             cm.log_error('bye')
+
+
+def test_log_error_logs_in_production(monkeypatch, caplog):
+    """log_error should emit messages in production without tracebacks."""
+    from utils.crypto import crypto_manager as cm
+    monkeypatch.setattr(
+        cm,
+        'get_config_lazy',
+        MagicMock(return_value=MagicMock(is_production=True)),
+    )
+    with caplog.at_level('ERROR', logger='crypto_manager'):
+        try:
+            raise ValueError('boom')
+        except ValueError:
+            cm.log_error('boom', exc_info=True)
+    assert 'boom' in caplog.text
+    assert 'ValueError' not in caplog.text
 
 
 def test_decrypt_message_returns_bytes_for_non_utf8():

@@ -8,6 +8,7 @@ import sys
 import platform
 import json
 import logging
+import copy
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -150,8 +151,8 @@ class Config:
         # Detect platform if not already set
         self.platform = os.environ.get('PLATFORM', platform.system().lower())
 
-        # Load base configuration
-        self.config = DEFAULT_CONFIG.copy()
+        # Load base configuration using a deep copy to avoid mutating DEFAULT_CONFIG
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
 
         # Apply environment-specific overrides
         if self.env in ENV_OVERRIDES:

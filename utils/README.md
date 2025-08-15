@@ -19,11 +19,12 @@ and automatically create directories when accessed.
 On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 `XDG_CACHE_HOME`, and `XDG_STATE_HOME` environment variables when they are set.
 
-- `normalize_path(path)`: Strips surrounding whitespace, expands `~` and environment variables, then returns a normalized
-  absolute path. Raises a `TypeError` when `path` is `None` or not path-like and `ValueError` for empty strings.
-- `ensure_dir_exists(path)`: Strips whitespace and creates the directory if missing, expanding `~` and environment
-  variables, and raises `NotADirectoryError` when the path points to an existing file. Passing `None` or non-path-like values
-  now raises `TypeError`, and empty paths raise `ValueError`.
+- `normalize_path(path)`: Accepts strings or `os.PathLike` objects, strips surrounding whitespace, expands `~` and environment
+  variables, then returns a normalized absolute path. Raises a `TypeError` when `path` is `None` and `ValueError` for empty
+  strings.
+- `ensure_dir_exists(path)`: Accepts strings or `os.PathLike` objects, strips whitespace and creates the directory if missing,
+  expanding `~` and environment variables, and raises `NotADirectoryError` when the path points to an existing file. Passing
+  `None` now raises `TypeError`, and empty paths raise `ValueError`.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
 - `get_logs_dir()`: Returns the platform-specific logs directory and ensures it exists.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
@@ -45,8 +46,9 @@ valid UTF-8 or JSON.
 Network requests in this module now use a default 10 second timeout to prevent
 hanging connections. You can override this by passing a `timeout` argument to
 `CryptoClient.fetch_server_public_key` or `CryptoClient.send_encrypted_message`.
-`encrypt_message` validates inputs and raises a `ValueError` when provided
-`None`, avoiding confusing cryptography errors.
+`encrypt_message` validates inputs, raising a `ValueError` for `None` and a
+`TypeError` for unsupported message types to avoid confusing cryptography
+errors.
 
 ## Crypto Helpers
 

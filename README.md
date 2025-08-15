@@ -1,13 +1,27 @@
 # token.place
 
-[![Lint & Format](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=lint%20%26%20format)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=tests)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/futuroptimist/token.place/branch/main/graph/badge.svg)](https://codecov.io/gh/futuroptimist/token.place)
-[![Docs](https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/.github/workflows/ci.yml?label=docs)](https://github.com/futuroptimist/token.place/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/futuroptimist/token.place)](LICENSE)
-[![Dependabot](https://img.shields.io/badge/dependabot-enabled-brightgreen?logo=dependabot)](https://github.com/futuroptimist/token.place/network/updates)
-[![CodeQL](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml)
-[![Secret Scanning](https://img.shields.io/badge/secret%20scanning-enabled-brightgreen)](https://docs.github.com/en/code-security/secret-scanning)
+[![Lint & Format][ci-lint-badge]][ci-workflow]
+[![Tests][ci-tests-badge]][ci-workflow]
+[![Coverage][coverage-badge]][coverage-url]
+[![Docs][ci-docs-badge]][ci-workflow]
+[![License][license-badge]](LICENSE)
+[![Dependabot][dependabot-badge]][dependabot-url]
+[![CodeQL][codeql-badge]][codeql-url]
+[![Secret Scanning][secret-badge]][secret-url]
+
+[ci-workflow]: https://github.com/futuroptimist/token.place/actions/workflows/ci.yml
+[ci-lint-badge]: https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/ci.yml?label=lint-format
+[ci-tests-badge]: https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/ci.yml?label=tests
+[ci-docs-badge]: https://img.shields.io/github/actions/workflow/status/futuroptimist/token.place/ci.yml?label=docs
+[coverage-badge]: https://codecov.io/gh/futuroptimist/token.place/graph/badge.svg?branch=main
+[coverage-url]: https://codecov.io/gh/futuroptimist/token.place
+[license-badge]: https://img.shields.io/github/license/futuroptimist/token.place
+[dependabot-badge]: https://img.shields.io/badge/dependabot-enabled-brightgreen?logo=dependabot
+[dependabot-url]: https://github.com/futuroptimist/token.place/network/updates
+[codeql-badge]: https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml/badge.svg?branch=main
+[codeql-url]: https://github.com/futuroptimist/token.place/actions/workflows/codeql.yml
+[secret-badge]: https://img.shields.io/badge/secret%20scanning-enabled-brightgreen
+[secret-url]: https://docs.github.com/en/code-security/secret-scanning
 
 Secure peer-to-peer generative AI platform
 

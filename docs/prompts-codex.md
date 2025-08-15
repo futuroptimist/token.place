@@ -29,6 +29,11 @@ OUTPUT:
 A pull request describing the change and summarizing test results.
 ```
 
+For specialized tasks, see:
+
+- [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md)
+- [Codex Security Review Prompt](prompts-codex-security.md)
+
 ## Implementation prompts
 
 ### 1 Document environment variables in README

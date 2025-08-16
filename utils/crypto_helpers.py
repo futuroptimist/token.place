@@ -82,12 +82,15 @@ class CryptoClient:
         Fetch the server's public key
 
         Args:
-            endpoint: API endpoint to fetch the public key
+            endpoint: API endpoint to fetch the public key. May be provided with or without a
+                leading slash.
             timeout: Maximum time in seconds to wait for a response
 
         Returns:
             True if successful, False otherwise
         """
+        if not endpoint.startswith('/'):
+            endpoint = f"/{endpoint}"
         full_url = f"{self.base_url}{endpoint}"
         logger.debug(f"Fetching server public key from: {full_url}")
 

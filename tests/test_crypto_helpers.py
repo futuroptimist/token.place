@@ -58,6 +58,13 @@ def test_fetch_server_public_key(mock_crypto_client):
     assert result is True
     mock_requests.get.assert_called_with('https://mock-server.com/api/v1/public-key', timeout=10)
 
+    # Test endpoint without leading slash
+    result = client.fetch_server_public_key('api/v1/public-key')
+    assert result is True
+    mock_requests.get.assert_called_with(
+        'https://mock-server.com/api/v1/public-key', timeout=10
+    )
+
     # Test server key was set
     assert client.server_public_key is not None
     assert client.server_public_key_b64 is not None

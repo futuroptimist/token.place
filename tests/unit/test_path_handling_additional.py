@@ -117,6 +117,15 @@ def test_get_relative_path_default_base(tmp_path, monkeypatch):
     assert result == pathlib.Path("sub")
 
 
+def test_get_relative_path_base_is_file(tmp_path):
+    base_file = tmp_path / "base.txt"
+    base_file.write_text("data")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    with pytest.raises(NotADirectoryError):
+        ph.get_relative_path(sub, base_file)
+
+
 def test_get_app_data_dir_creates_directory(tmp_path, monkeypatch):
     """get_app_data_dir should ensure the directory exists"""
     monkeypatch.setenv("HOME", str(tmp_path))

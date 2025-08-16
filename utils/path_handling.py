@@ -157,13 +157,16 @@ def get_relative_path(
     two paths do not share a common ancestor, the returned path contains ``..``
     segments instead of an absolute path. On Windows, paths on different drives
     return the absolute ``path`` because ``os.path.relpath`` raises ``ValueError``
-    in this scenario.
+    in this scenario. Raises ``NotADirectoryError`` when ``base_path`` points to
+    an existing file.
     """
     path = normalize_path(path)
     if base_path is None:
         base_path = pathlib.Path.cwd()
     else:
         base_path = normalize_path(base_path)
+        if base_path.exists() and not base_path.is_dir():
+            raise NotADirectoryError(f"{base_path} is not a directory")
 
     try:
         return path.relative_to(base_path)

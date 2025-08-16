@@ -88,6 +88,9 @@ config.set('server.workers', 8)
 # Save user configuration
 config.save_user_config()
 
+# Save to a custom path; parent directories are created automatically
+config.save_user_config('/tmp/token.place/settings.json')
+
 # Check environment and platform
 if config.is_development and config.is_windows:
     # Windows-specific development logic

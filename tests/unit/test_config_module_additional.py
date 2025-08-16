@@ -66,3 +66,12 @@ def test_env_properties_and_global_get(tmp_path, monkeypatch):
     assert cfg_dev.is_development and not cfg_dev.is_production
     assert cfg_prod.is_production and not cfg_prod.is_development
     assert isinstance(config.get_config(), config.Config)
+
+
+def test_save_user_config_creates_parent_dirs(tmp_path, monkeypatch):
+    """save_user_config should create missing parent directories"""
+    base = patched_paths_no_config(tmp_path, monkeypatch)
+    cfg = config.Config()
+    custom = base / 'nested' / 'configs' / 'settings.json'
+    cfg.save_user_config(str(custom))
+    assert custom.exists()

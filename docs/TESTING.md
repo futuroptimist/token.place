@@ -10,7 +10,7 @@ Before running the tests, install the required Python and Node.js dependencies a
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
 pip install -r requirements.txt
- npm ci
+npm ci
 playwright install
 ```
 
@@ -263,6 +263,16 @@ python -m pytest tests/test_parameterized.py
 ```sh
 python -m pytest tests/test_security.py
 ```
+
+### Running all tests
+
+To execute the complete test suite that CI runs, use:
+
+```sh
+npm run test:ci
+```
+
+This wraps `./run_all_tests.sh` and runs every available test.
 
 ## Additional Resources
 

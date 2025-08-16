@@ -40,6 +40,7 @@ yarn-error.log
 
 # Test artifacts
 ui_test_screenshot_*.png
+tests/visual_verification/visual_report.json
 
 # IDEs and editors
 .idea/

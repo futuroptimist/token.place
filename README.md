@@ -624,7 +624,7 @@ token.place now has full cross-platform support for Windows, macOS, and Linux. T
 - Cross-platform testing framework
 - Automated desktop installers for Windows (.exe) and macOS (.dmg) built via GitHub Actions
 
-For detailed information on cross-platform features and containerization, see [CROSS_PLATFORM.md](CROSS_PLATFORM.md).
+For detailed information on cross-platform features and containerization, see [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md).
 
 ### Quick Start on Different Platforms
 

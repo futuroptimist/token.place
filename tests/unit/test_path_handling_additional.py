@@ -135,7 +135,7 @@ def test_linux_uses_xdg_dirs(tmp_path, monkeypatch):
     with mock.patch('platform.system', return_value='Linux'):
         importlib.reload(ph)
         assert ph.get_app_data_dir() == tmp_path / "xdg" / "data" / "token.place"
-        assert ph.get_config_dir() == tmp_path / "xdg" / "config" / "token.place"
+        assert ph.get_config_dir() == tmp_path / "xdg" / "config" / "token.place" / "config"
         assert ph.get_cache_dir() == tmp_path / "xdg" / "cache" / "token.place"
 
 

@@ -15,7 +15,7 @@ client.fetch_server_public_key()
 
 # Send a chat message and get the response
 response = client.send_chat_message("Hello, how are you?")
-print(response)
+# handle the response without logging plaintext
 
 # For API usage
 client.fetch_server_public_key('/api/v1/public-key')
@@ -23,7 +23,7 @@ api_response = client.send_api_request([
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Tell me a joke."}
 ])
-print(api_response['choices'][0]['message']['content'])
+# process api_response without logging plaintext
 """
 
 import json

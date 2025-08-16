@@ -207,8 +207,9 @@ class ChatClient:
             )
             return response
         except requests.exceptions.RequestException as e:
-            print(
-                f"Error while sending request to faucet: {e.__class__.__name__}"
+            logger.warning(
+                "Error while sending request to faucet: %s",
+                e.__class__.__name__,
             )
             return None
 
@@ -239,17 +240,23 @@ class ChatClient:
                         else:
                             logger.debug("Decryption failed. Skipping this response.")
                     else:
-                        print("Response data is incomplete, waiting for complete response...")
+                        logger.debug(
+                            "Response data is incomplete, waiting for complete response..."
+                        )
                 else:
-                    print(f"Unexpected status code from /retrieve endpoint: {response.status_code}")
+                    logger.warning(
+                        "Unexpected status code from /retrieve endpoint: %s",
+                        response.status_code,
+                    )
             except requests.exceptions.RequestException as e:
-                print(
-                    f"Error while retrieving response: {e.__class__.__name__}"
+                logger.warning(
+                    "Error while retrieving response: %s",
+                    e.__class__.__name__,
                 )
 
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
-                print("Timeout while waiting for response.")
+                logger.warning("Timeout while waiting for response.")
                 return None
 
             time.sleep(2)  # Wait for a short interval before trying again
@@ -284,7 +291,7 @@ class ChatClient:
 
                     elapsed_time = time.time() - start_time
                     if elapsed_time > timeout:
-                        print("Timeout while waiting for response.")
+                        logger.warning("Timeout while waiting for response.")
                         break
 
                     time.sleep(2)  # Adjust the polling interval as needed

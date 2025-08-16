@@ -74,7 +74,7 @@ class TestPathHandling:
         elif IS_MACOS:
             assert "Library/Application Support/token.place/config" in str(config_dir)
         elif IS_LINUX:
-            assert ".config/token.place" in str(config_dir)
+            assert ".config/token.place/config" in str(config_dir)
 
     def test_ensure_dir_exists(self, temp_dir):
         """Test that ensure_dir_exists creates directories correctly"""

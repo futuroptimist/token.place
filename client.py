@@ -73,7 +73,7 @@ def get_server_public_key():
         data = response.json()
         return data.get('public_key')
     except requests.exceptions.RequestException as e:
-        print(f"Error getting server public key: {e}")
+        print(f"Error getting server public key: {e.__class__.__name__}")
         return None
 
 def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_pub_key_pem):
@@ -89,7 +89,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     try:
         server_public_key_bytes = base64.b64decode(server_pub_key_b64)
     except Exception as e:
-        print(f"Error decoding server public key: {e}")
+        print(f"Error decoding server public key: {e.__class__.__name__}")
         return None
 
     # 3. Encrypt message using encrypt.py functions
@@ -100,7 +100,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         # Encrypt using server's public key
         ciphertext_dict, cipherkey, iv = encrypt(message_bytes, server_public_key_bytes)
     except Exception as e:
-        print(f"Error during request encryption: {e}")
+        print(f"Error during request encryption: {e.__class__.__name__}")
         return None
 
     # 4. Prepare payload
@@ -162,7 +162,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         return decrypted_response
 
     except Exception as e:
-        print(f"Error during response decryption or parsing: {e}")
+        print(f"Error during response decryption or parsing: {e.__class__.__name__}")
         return None
 
 class ChatClient:
@@ -207,8 +207,9 @@ class ChatClient:
             )
             return response
         except requests.exceptions.RequestException as e:
-            print(
-                f"Error while sending request to faucet: {e.__class__.__name__}"
+            logger.warning(
+                "Error while sending request to faucet: %s",
+                e.__class__.__name__,
             )
             return None
 
@@ -239,17 +240,23 @@ class ChatClient:
                         else:
                             logger.debug("Decryption failed. Skipping this response.")
                     else:
-                        print("Response data is incomplete, waiting for complete response...")
+                        logger.debug(
+                            "Response data is incomplete, waiting for complete response..."
+                        )
                 else:
-                    print(f"Unexpected status code from /retrieve endpoint: {response.status_code}")
+                    logger.warning(
+                        "Unexpected status code from /retrieve endpoint: %s",
+                        response.status_code,
+                    )
             except requests.exceptions.RequestException as e:
-                print(
-                    f"Error while retrieving response: {e.__class__.__name__}"
+                logger.warning(
+                    "Error while retrieving response: %s",
+                    e.__class__.__name__,
                 )
 
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
-                print("Timeout while waiting for response.")
+                logger.warning("Timeout while waiting for response.")
                 return None
 
             time.sleep(2)  # Wait for a short interval before trying again
@@ -284,7 +291,7 @@ class ChatClient:
 
                     elapsed_time = time.time() - start_time
                     if elapsed_time > timeout:
-                        print("Timeout while waiting for response.")
+                        logger.warning("Timeout while waiting for response.")
                         break
 
                     time.sleep(2)  # Adjust the polling interval as needed

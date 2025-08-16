@@ -14,34 +14,34 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 
 ## Setup and Installation
 
-- [README.md](README.md): Project overview and getting started instructions
-- [docs/ONBOARDING.md](docs/ONBOARDING.md): Quick orientation to the repository structure
-- [requirements.txt](requirements.txt): Python dependencies for the project
-- [package.json](package.json): Node.js dependencies for JavaScript components
+- [README.md](../README.md): Project overview and getting started instructions
+- [ONBOARDING.md](ONBOARDING.md): Quick orientation to the repository structure
+- [requirements.txt](../requirements.txt): Python dependencies for the project
+- [package.json](../package.json): Node.js dependencies for JavaScript components
 - `docker compose up` starts the relay container for quick local testing
 
 ## Core Components
 
-- [encrypt.py](encrypt.py): The core encryption/decryption implementation in Python
-- [static/chat.js](static/chat.js): JavaScript client library for encryption/decryption in browsers
-- [utils/crypto/crypto_manager.py](utils/crypto/crypto_manager.py): Python class managing key generation and encryption/decryption operations
-- [server.py](server.py): Main server implementation for the proxy service
-- [relay.py](relay.py): Middleware server that forwards encrypted messages between clients and servers
+- [encrypt.py](../encrypt.py): The core encryption/decryption implementation in Python
+- [static/chat.js](../static/chat.js): JavaScript client library for encryption/decryption in browsers
+- [utils/crypto/crypto_manager.py](../utils/crypto/crypto_manager.py): Python class managing key generation and encryption/decryption operations
+- [server.py](../server.py): Main server implementation for the proxy service
+- [relay.py](../relay.py): Middleware server that forwards encrypted messages between clients and servers
 
 ## Documentation
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md): Contribution guidelines for developers
-- [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md): Style and branding guidelines, including proper name stylization
-- [docs/TESTING.md](docs/TESTING.md): Comprehensive guide to the testing approach
-- [docs/TESTING_IMPROVEMENTS.md](docs/TESTING_IMPROVEMENTS.md): Ideas for further testing improvements
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Detailed architectural overview of the system
-- [docs/LLM_ASSISTANT_GUIDE.md](docs/LLM_ASSISTANT_GUIDE.md): Guide for AI assistants working with this codebase
-- [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials): Hardware list, setup instructions, and troubleshooting tips for Raspberry Pi deployments (including rpi-clone prompt walkthrough)
+- [STYLE_GUIDE.md](STYLE_GUIDE.md): Style and branding guidelines, including proper name stylization
+- [TESTING.md](TESTING.md): Comprehensive guide to the testing approach
+- [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md): Ideas for further testing improvements
+- [ARCHITECTURE.md](ARCHITECTURE.md): Detailed architectural overview of the system
+- [LLM_ASSISTANT_GUIDE.md](LLM_ASSISTANT_GUIDE.md): Guide for AI assistants working with this codebase
+- [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md#bill-of-materials): Hardware list, setup instructions, and troubleshooting tips for Raspberry Pi deployments (including rpi-clone prompt walkthrough)
 - [../llms.txt](../llms.txt): Machine-readable project summary for LLM assistants
-- [docs/prompts-codex.md](docs/prompts-codex.md): Baseline Codex prompt for routine contributions
-- [docs/prompts-codex-ci-fix.md](docs/prompts-codex-ci-fix.md): Codex prompt for fixing CI failures
-- [docs/prompts-codex-security.md](docs/prompts-codex-security.md): Codex prompt for security reviews
-- [docs/prompts-codex-docs.md](docs/prompts-codex-docs.md): Codex prompt for doc updates
+- [prompts-codex.md](prompts-codex.md): Baseline Codex prompt for routine contributions
+- [prompts-codex-ci-fix.md](prompts-codex-ci-fix.md): Codex prompt for fixing CI failures
+- [prompts-codex-security.md](prompts-codex-security.md): Codex prompt for security reviews
+- [prompts-codex-docs.md](prompts-codex-docs.md): Codex prompt for doc updates
 
 ## User Journeys
 
@@ -55,7 +55,7 @@ The project tests are organized around key user journeys that represent how user
 6. **Real LLM Integration**: A user interacts with a real LLM model through the system
 7. **Integration with External Applications**: token.place is used as a drop-in replacement for OpenAI in external applications
 
-Each journey is mapped to specific test files that verify the functionality works as expected. See [docs/TESTING.md](docs/TESTING.md) for details.
+Each journey is mapped to specific test files that verify the functionality works as expected. See [TESTING.md](TESTING.md) for details.
 
 ## API Structure
 
@@ -85,13 +85,13 @@ token.place uses a comprehensive testing approach with multiple test types:
 
 ### Key Test Files
 
-- [tests/unit/](tests/unit/): Unit tests for individual components
-- [tests/test_e2e_conversation_flow.py](tests/test_e2e_conversation_flow.py): End-to-end tests for conversation flows
-- [tests/test_crypto_compatibility_local.py](tests/test_crypto_compatibility_local.py): Tests for crypto compatibility between Python and JavaScript
-- [tests/test_performance_benchmarks.py](tests/test_performance_benchmarks.py): Performance benchmark tests
-- [tests/test_failure_recovery.py](tests/test_failure_recovery.py): Tests for system resilience and error recovery
-- [tests/test_security.py](tests/test_security.py): Tests for security properties
-- [tests/test_real_llm.py](tests/test_real_llm.py): Tests with actual LLM models
+- [tests/unit/](../tests/unit/): Unit tests for individual components
+- [tests/test_e2e_conversation_flow.py](../tests/test_e2e_conversation_flow.py): End-to-end tests for conversation flows
+- [tests/test_crypto_compatibility_local.py](../tests/test_crypto_compatibility_local.py): Tests for crypto compatibility between Python and JavaScript
+- [tests/test_performance_benchmarks.py](../tests/test_performance_benchmarks.py): Performance benchmark tests
+- [tests/test_failure_recovery.py](../tests/test_failure_recovery.py): Tests for system resilience and error recovery
+- [tests/test_security.py](../tests/test_security.py): Tests for security properties
+- [tests/test_real_llm.py](../tests/test_real_llm.py): Tests with actual LLM models
 
 ### Test Markers
 
@@ -118,16 +118,16 @@ For convenience, you can execute all available test suites with `./run_all_tests
 
 ## Configuration
 
-- [config.py](config.py): Configuration management for different environments
-- [utils/logging/logger.py](utils/logging/logger.py): Logging infrastructure for the application
-- [pytest.ini](pytest.ini): Configuration for Python test suite
+- [config.py](../config.py): Configuration management for different environments
+- [utils/logging/logger.py](../utils/logging/logger.py): Logging infrastructure for the application
+- [pytest.ini](../pytest.ini): Configuration for Python test suite
 - **Privacy**: Do not log plaintext or ciphertext of user messages. Remove debugging statements that could leak sensitive data.
 
 ## Development Tips
 
 - Run `./run_all_tests.sh` to verify changes before committing. Set `TEST_COVERAGE=1` to collect coverage data when running this script. Coverage is uploaded to Codecov automatically via the GitHub Actions workflow.
 - Install `pre-commit` and run `pre-commit run --all-files` before pushing changes.
-- Keep the roadmap in [README.md](README.md) updated as features progress.
+- Keep the roadmap in [README.md](../README.md) updated as features progress.
 - Use `npm ci` for faster, reproducible Node.js installs (mirrors the CI pipeline's behavior).
 - Install Python dependencies with `pip install -r config/requirements_server.txt` and
   `pip install -r config/requirements_relay.txt` before running tests.

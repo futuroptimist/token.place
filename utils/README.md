@@ -29,7 +29,8 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 - `get_logs_dir()`: Returns the platform-specific logs directory and ensures it exists.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives
-  (Windows), the absolute `path` is returned instead of raising an error.
+  (Windows), the absolute `path` is returned instead of raising an error. Passing a
+  base path that points to a file now raises `NotADirectoryError`.
 
 ### Crypto Helpers (`crypto_helpers.py`)
 

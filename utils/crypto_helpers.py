@@ -15,7 +15,7 @@ client.fetch_server_public_key()
 
 # Send a chat message and get the response
 response = client.send_chat_message("Hello, how are you?")
-# Handle the response without logging sensitive content
+# handle the response without logging plaintext
 
 # For API usage
 client.fetch_server_public_key('/api/v1/public-key')

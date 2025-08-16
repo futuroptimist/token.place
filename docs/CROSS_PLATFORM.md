@@ -55,7 +55,7 @@ We've implemented a comprehensive path handling system in `utils/path_handling.p
 
 | Path Type | Windows | macOS | Linux |
 |-----------|---------|-------|-------|
-| Config | %APPDATA%\token.place\config | ~/Library/Application Support/token.place/config | ~/.config/token.place |
+| Config | %APPDATA%\token.place\config | ~/Library/Application Support/token.place/config | ~/.config/token.place/config |
 | Data | %APPDATA%\token.place | ~/Library/Application Support/token.place | ~/.local/share/token.place |
 | Cache | %LOCALAPPDATA%\token.place\cache | ~/Library/Caches/token.place | ~/.cache/token.place |
 | Logs | %APPDATA%\token.place\logs | ~/Library/Logs/token.place | ~/.local/state/token.place/logs |
@@ -87,6 +87,9 @@ config.set('server.workers', 8)
 
 # Save user configuration
 config.save_user_config()
+
+# Save to a custom path; parent directories are created automatically
+config.save_user_config('/tmp/token.place/settings.json')
 
 # Check environment and platform
 if config.is_development and config.is_windows:

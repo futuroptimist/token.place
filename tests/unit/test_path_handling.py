@@ -11,7 +11,7 @@ def test_paths_linux(tmp_path):
         importlib.reload(ph)
         home = Path.home()
         assert ph.get_app_data_dir() == home / '.local' / 'share' / 'token.place'
-        assert ph.get_config_dir() == home / '.config' / 'token.place'
+        assert ph.get_config_dir() == home / '.config' / 'token.place' / 'config'
         assert ph.get_cache_dir() == home / '.cache' / 'token.place'
         assert ph.get_models_dir() == home / '.local' / 'share' / 'token.place' / 'models'
         assert ph.get_logs_dir() == home / '.local' / 'state' / 'token.place' / 'logs'

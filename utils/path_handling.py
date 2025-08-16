@@ -42,7 +42,7 @@ def get_config_dir() -> pathlib.Path:
     Get the appropriate configuration directory based on platform:
     - Windows: %APPDATA%/token.place/config
     - macOS: ~/Library/Application Support/token.place/config
-    - Linux: $XDG_CONFIG_HOME/token.place or ~/.config/token.place
+    - Linux: $XDG_CONFIG_HOME/token.place/config or ~/.config/token.place/config
     """
     if IS_WINDOWS or IS_MACOS:
         return ensure_dir_exists(get_app_data_dir() / 'config')
@@ -52,7 +52,7 @@ def get_config_dir() -> pathlib.Path:
             base_dir = pathlib.Path(xdg_config_home)
         else:
             base_dir = get_user_home_dir() / '.config'
-        return ensure_dir_exists(base_dir / 'token.place')
+        return ensure_dir_exists(base_dir / 'token.place' / 'config')
 
 def get_cache_dir() -> pathlib.Path:
     """
@@ -157,13 +157,16 @@ def get_relative_path(
     two paths do not share a common ancestor, the returned path contains ``..``
     segments instead of an absolute path. On Windows, paths on different drives
     return the absolute ``path`` because ``os.path.relpath`` raises ``ValueError``
-    in this scenario.
+    in this scenario. Raises ``NotADirectoryError`` when ``base_path`` points to
+    an existing file.
     """
     path = normalize_path(path)
     if base_path is None:
         base_path = pathlib.Path.cwd()
     else:
         base_path = normalize_path(base_path)
+        if base_path.exists() and not base_path.is_dir():
+            raise NotADirectoryError(f"{base_path} is not a directory")
 
     try:
         return path.relative_to(base_path)

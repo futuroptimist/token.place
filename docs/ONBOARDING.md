@@ -23,7 +23,7 @@ This ensures that plaintext prompts and responses never reach the relay or any i
 
 ## Cross-Platform Notes
 
-The project runs on Windows, macOS and Linux. Path handling, configuration locations and launcher scripts adapt automatically. For platform specifics and Docker instructions, see [CROSS_PLATFORM.md](../CROSS_PLATFORM.md).
+The project runs on Windows, macOS and Linux. Path handling, configuration locations and launcher scripts adapt automatically. For platform specifics and Docker instructions, see [CROSS_PLATFORM.md](CROSS_PLATFORM.md).
 
 ## Where to Go Next
 

@@ -23,7 +23,7 @@ api_response = client.send_api_request([
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Tell me a joke."}
 ])
-# process api_response without logging plaintext
+# Avoid printing plaintext responses in production environments
 """
 
 import json

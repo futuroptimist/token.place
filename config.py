@@ -253,12 +253,20 @@ class Config:
         config[keys[-1]] = value
 
     def save_user_config(self, config_path: Optional[str] = None):
-        """
-        Save the current configuration to a user config file.
+        """Save the current configuration to a user config file.
+
+        When ``config_path`` points to a file inside a non-existent directory, the
+        missing parent directories are created automatically before writing the
+        file.
         """
         path = config_path or self.config_path
         if not path:
             path = os.path.join(self.config['paths']['config_dir'], 'user_config.json')
+
+        # Import locally to avoid circular import at module load time
+        from utils.path_handling import ensure_dir_exists
+
+        ensure_dir_exists(os.path.dirname(path))
 
         try:
             with open(path, 'w') as f:

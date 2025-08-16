@@ -10,7 +10,9 @@
     "test:e2e": "pytest tests/test_e2e_chat.py",
     "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e",
     "lint": "echo \"No lint configured\"",
-    "test:ci": "./run_all_tests.sh"
+    "test:ci": "./run_all_tests.sh",
+    "type-check": "echo \"No type-check configured\"",
+    "build": "echo \"No build configured\""
   },
   "repository": {
     "type": "git",

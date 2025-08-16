@@ -73,7 +73,7 @@ def get_server_public_key():
         data = response.json()
         return data.get('public_key')
     except requests.exceptions.RequestException as e:
-        print(f"Error getting server public key: {e}")
+        print(f"Error getting server public key: {e.__class__.__name__}")
         return None
 
 def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_pub_key_pem):
@@ -89,7 +89,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     try:
         server_public_key_bytes = base64.b64decode(server_pub_key_b64)
     except Exception as e:
-        print(f"Error decoding server public key: {e}")
+        print(f"Error decoding server public key: {e.__class__.__name__}")
         return None
 
     # 3. Encrypt message using encrypt.py functions
@@ -100,7 +100,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         # Encrypt using server's public key
         ciphertext_dict, cipherkey, iv = encrypt(message_bytes, server_public_key_bytes)
     except Exception as e:
-        print(f"Error during request encryption: {e}")
+        print(f"Error during request encryption: {e.__class__.__name__}")
         return None
 
     # 4. Prepare payload
@@ -162,7 +162,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         return decrypted_response
 
     except Exception as e:
-        print(f"Error during response decryption or parsing: {e}")
+        print(f"Error during response decryption or parsing: {e.__class__.__name__}")
         return None
 
 class ChatClient:

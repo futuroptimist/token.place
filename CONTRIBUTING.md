@@ -66,7 +66,7 @@ By default, the server runs on http://localhost:5000. You can configure the port
 
 ### Running Tests
 
-See the comprehensive test guide in [tests/README.md](../tests/README.md).
+See the comprehensive test guide in [tests/README.md](tests/README.md).
 
 Basic test commands:
 ```bash
@@ -219,7 +219,7 @@ When adding new features or fixing bugs, please include appropriate tests:
 ### Naming and Stylization
 
 - Always style the project name as lowercase `token.place` (not Title case "Token.place")
-- Follow the complete style guidelines in [STYLE_GUIDE.md](./STYLE_GUIDE.md)
+- Follow the complete style guidelines in [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md)
 - Use appropriate naming conventions for your code (snake_case for Python, camelCase for JavaScript)
 
 ## Architecture Guidelines
@@ -239,7 +239,7 @@ When adding new features or fixing bugs, please include appropriate tests:
 ## Documentation
 
 - Update documentation when making changes to APIs or adding new features
-- Follow the style guidelines in [STYLE_GUIDE.md](./STYLE_GUIDE.md)
+- Follow the style guidelines in [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md)
 - Make sure your changes are reflected in both code comments and external documentation
 
 ## Pull Request Process
@@ -248,7 +248,7 @@ When adding new features or fixing bugs, please include appropriate tests:
 2. Make your changes, following the coding standards
 3. Write tests for your changes
 4. Update documentation as needed
-5. Ensure all tests pass
+5. Run `pre-commit run --all-files` and ensure all tests pass
 6. Submit a pull request to the main repository
 7. Address any review comments
 
@@ -265,7 +265,8 @@ When adding new features or fixing bugs, please include appropriate tests:
 
 ## License
 
-By contributing to token.place, you agree that your contributions will be licensed under the project's [LICENSE](../LICENSE) file.
+By contributing to token.place, you agree that your contributions will be licensed under the
+project's [LICENSE](LICENSE) file.
 
 ## Contact
 

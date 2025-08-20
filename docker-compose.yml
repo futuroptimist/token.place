@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    ports:
+      - "3000:3000"
+    environment:
+      - PLATFORM=${PLATFORM:-linux}
+      - ENV=${ENV:-development}
+    restart: unless-stopped
+
+  relay:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.relay
+    ports:
+      - "5000:5000"
+    environment:
+      - PLATFORM=${PLATFORM:-linux}
+      - ENV=${ENV:-development}
+    depends_on:
+      - server
+    restart: unless-stopped

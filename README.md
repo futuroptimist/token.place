@@ -65,7 +65,7 @@ All pull requests must:
 
 - run `pre-commit run --all-files`
 - pass `pytest -q tests/test_security.py`
-- pass `bandit -r tokenplace -lll` with no medium or high findings
+- pass `bandit -r . -lll` with no medium or high findings
 - keep Dependabot, CodeQL, and secret-scanning badges in this README
 
 See [docs/TESTING.md](docs/TESTING.md) for the full testing guide.
@@ -664,7 +664,7 @@ docker compose up -d  # starts the relay service
 
 ### Testing
 
-We have comprehensive testing to ensure quality:
+We have comprehensive testing to ensure quality. See [docs/TESTING.md](docs/TESTING.md) for a complete overview:
 
 ```bash
 # Run all Python tests

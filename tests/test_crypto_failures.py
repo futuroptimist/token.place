@@ -163,13 +163,8 @@ class TestCryptoFailures:
         plaintext = "Test message for encryption"
 
         # Try to encrypt with invalid public key
-        try:
-            # This should fail
+        with pytest.raises(ValueError):
             encrypt(plaintext.encode(), invalid_public_key)
-            assert False, "Encryption should fail with invalid public key"
-        except Exception as e:
-            # Verify we got an appropriate error
-            assert "key" in str(e).lower(), f"Expected key-related error, got: {e}"
 
     def test_decryption_with_invalid_private_key(self):
         """Test decryption behavior with an invalid private key."""

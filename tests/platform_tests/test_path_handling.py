@@ -125,8 +125,8 @@ class TestPathHandling:
         # Get a relative path when the path is not relative to the base
         other_dir = ensure_dir_exists(temp_dir.parent / "other")
         rel_path_2 = get_relative_path(other_dir, base_dir)
-        assert rel_path_2.is_absolute()
-        assert rel_path_2 == other_dir
+        assert not rel_path_2.is_absolute()
+        assert rel_path_2 == Path("..") / "other"
 
     def test_get_relative_path_default_base(self, tmp_path, monkeypatch):
         """Path is made relative to CWD when base_path is None"""

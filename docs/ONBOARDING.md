@@ -33,4 +33,16 @@ The project runs on Windows, macOS and Linux. Path handling, configuration locat
 - **Style guide** – [docs/STYLE_GUIDE.md](STYLE_GUIDE.md)
 - **LLM assistant tips** – [docs/LLM_ASSISTANT_GUIDE.md](LLM_ASSISTANT_GUIDE.md)
 
+## Local checks
+
+Set up development dependencies and run the full test suite before pushing changes:
+
+```bash
+pip install pre-commit
+npm ci
+pip install -r config/requirements_server.txt
+pip install -r config/requirements_relay.txt
+pre-commit run --all-files
+```
+
 Happy hacking!

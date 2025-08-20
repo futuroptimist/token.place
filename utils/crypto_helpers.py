@@ -78,8 +78,12 @@ class CryptoClient:
         logger.debug("Client keys generated successfully")
 
     def fetch_server_public_key(self, endpoint: str = "/next_server", timeout: float = 10) -> bool:
-        """
-        Fetch the server's public key
+        """Fetch the server's public key.
+
+        By default this queries the relay's ``/next_server`` endpoint to
+        discover a server and retrieve its public key. When connecting
+        directly to a token.place server, pass ``"/api/v1/public-key"`` as the
+        ``endpoint`` parameter instead.
 
         Args:
             endpoint: API endpoint to fetch the public key

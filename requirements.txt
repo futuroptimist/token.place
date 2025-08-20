@@ -35,6 +35,7 @@ pytest-cov                # Code coverage
 pytest-mock               # Mocking utilities
 pytest-benchmark==5.1.0   # Performance benchmarking, requires pytest>=8.1
 PyYAML>=6.0
+pre-commit
 
 # JavaScript test dependencies
 # Note: Install these with npm ci

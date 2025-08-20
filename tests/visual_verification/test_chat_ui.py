@@ -10,6 +10,9 @@ import time
 from playwright.sync_api import Page
 from .utils import capture_screenshot, save_as_baseline, compare_with_baseline
 
+# Skip tests if Pillow is not installed
+pytest.importorskip("PIL", reason="Pillow is required for image comparison")
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('visual_verification.chat_ui')

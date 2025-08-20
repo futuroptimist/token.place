@@ -23,7 +23,7 @@ CHECKS:
   - `npm run test:ci`
   - `pre-commit run --all-files`
   - `pytest -q tests/test_security.py`
-  - `bandit -r tokenplace -lll`
+  - `bandit -r . -lll`
   - Ensure [README.md](../README.md) includes badges for Dependabot, CodeQL, and secret scanning.
 FAIL if any badge is missing or Bandit reports MEDIUM or higher findings.
 REQUEST:

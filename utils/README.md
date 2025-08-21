@@ -21,10 +21,10 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 
 - `normalize_path(path)`: Accepts strings or `os.PathLike` objects, strips surrounding whitespace, expands `~` and environment
   variables, then returns a normalized absolute path. Raises a `TypeError` when `path` is `None` and `ValueError` for empty
-  strings.
+  strings or when environment variables remain unexpanded.
 - `ensure_dir_exists(path)`: Accepts strings or `os.PathLike` objects, strips whitespace and creates the directory if missing,
   expanding `~` and environment variables, and raises `NotADirectoryError` when the path points to an existing file. Passing
-  `None` now raises `TypeError`, and empty paths raise `ValueError`.
+  `None` now raises `TypeError`, and empty paths or unexpanded environment variables raise `ValueError`.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
 - `get_logs_dir()`: Returns the platform-specific logs directory and ensures it exists.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the

@@ -225,6 +225,7 @@ class CryptoClient:
 
         Returns:
             Server response as dictionary or None if failed
+            or if the response body is not valid JSON
         """
         full_url = f"{self.base_url}{endpoint}"
         logger.debug(f"Sending encrypted message to: {full_url}")
@@ -235,11 +236,19 @@ class CryptoClient:
             logger.debug(f"Server response status: {response.status_code}")
 
             if response.status_code != 200:
-                logger.error(f"Server returned error status: {response.status_code}")
-                logger.debug("Response content length: %d", len(response.text))
+                logger.error(
+                    f"Server returned error status: {response.status_code}"
+                )
+                logger.debug(
+                    "Response content length: %d", len(response.text)
+                )
                 return None
 
-            return response.json()
+            try:
+                return response.json()
+            except ValueError:
+                logger.error("Server returned non-JSON response")
+                return None
         except Exception as e:
             logger.error(
                 "Exception while sending encrypted message: %s",

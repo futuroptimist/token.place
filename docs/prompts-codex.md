@@ -41,6 +41,8 @@ A pull request describing the change and summarizing test results.
 - [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md)
 - [Codex Security Review Prompt](prompts-codex-security.md)
 - [Codex Docs Update Prompt](prompts-codex-docs.md)
+- [Codex Refactor Prompt](prompts-codex-refactor.md)
+- [Codex Chore Prompt](prompts-codex-chore.md)
 
 ## Implementation prompts
 
@@ -55,7 +57,8 @@ FILES OF INTEREST
 - README.md
 
 REQUIREMENTS
-1. Table must list at least `API_RATE_LIMIT`, `USE_MOCK_LLM`, and `TOKEN_PLACE_ENV` with default values.
+1. Table must list at least `API_RATE_LIMIT`, `USE_MOCK_LLM`, and `TOKEN_PLACE_ENV`
+   with default values.
 2. Keep line width ≤ 120 characters.
 3. Run `pre-commit run --all-files` and update any affected docs.
 

@@ -125,6 +125,7 @@ during tests or `https://token.place/v1` in production.
 - Correct path resolution across Windows, macOS, and Linux
 - Configuration loading from platform-specific locations
 - Platform-specific behavior adaptations
+- Support for XDG environment variables like `XDG_CONFIG_HOME` and `XDG_STATE_HOME`
 
 ### 5. Security and Failure Recovery
 

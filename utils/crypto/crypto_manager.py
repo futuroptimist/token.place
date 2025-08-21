@@ -148,6 +148,10 @@ class CryptoManager:
             Returns None if decryption fails.
         """
         try:
+            if not isinstance(encrypted_data, dict):
+                log_error("Encrypted data must be a dict")
+                return None
+
             # Extract and decode the encrypted data
             encrypted_chat_history_b64 = encrypted_data.get('chat_history')
             cipherkey_b64 = encrypted_data.get('cipherkey')

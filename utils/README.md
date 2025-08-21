@@ -42,7 +42,8 @@ malformed to prevent unexpected exceptions.
 
 Manages server-side encryption keys and message processing. The
 `decrypt_message` helper now returns raw bytes when decrypted content is not
-valid UTF-8 or JSON.
+valid UTF-8 or JSON and returns `None` when given non-dict input to avoid
+attribute errors.
 
 Network requests in this module now use a default 10 second timeout to prevent
 hanging connections. You can override this by passing a `timeout` argument to

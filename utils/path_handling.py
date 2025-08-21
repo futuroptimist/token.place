@@ -83,7 +83,7 @@ def get_models_dir() -> pathlib.Path:
     return ensure_dir_exists(get_app_data_dir() / 'models')
 
 def get_logs_dir() -> pathlib.Path:
-    """Get the directory for storing log files.
+    """Get the directory for storing log files, creating it if missing.
 
     On Linux, honors the ``XDG_STATE_HOME`` environment variable when set.
     """

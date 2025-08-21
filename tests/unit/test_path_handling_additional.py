@@ -137,6 +137,17 @@ def test_get_app_data_dir_creates_directory(tmp_path, monkeypatch):
     assert app_dir.exists()
 
 
+def test_get_logs_dir_creates_directory(tmp_path, monkeypatch):
+    """get_logs_dir should ensure the directory exists"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    importlib.reload(ph)
+    logs_dir = ph.get_logs_dir()
+    expected = tmp_path / ".local" / "state" / "token.place" / "logs"
+    assert logs_dir == expected
+    assert logs_dir.exists()
+
+
 def test_linux_uses_xdg_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg" / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg" / "config"))

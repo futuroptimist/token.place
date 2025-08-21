@@ -11,22 +11,23 @@ Use this prompt to restructure code in token.place without changing behavior.
 SYSTEM:
 You are an automated contributor for the token.place repository.
 
-PURPOSE:
-Refactor existing code to improve clarity, reduce duplication, or align with conventions.
+GOAL:
+Refactor existing code without changing behavior.
 
 CONTEXT:
 - Follow AGENTS.md and docs/AGENTS.md instructions.
-- Run `npm run lint`, `npm run type-check`, `npm run build`, `npm run test:ci`.
 - Run `pre-commit run --all-files` before committing.
+- Ensure `npm run lint` and `npm run test:ci` succeed.
 
 REQUEST:
-1. Identify a safe refactor in the codebase.
-2. Make the change without altering functionality.
-3. Update related tests or docs if needed.
-4. Run the commands above and ensure they pass.
+1. Identify code that can be simplified or clarified.
+2. Refactor while preserving functionality and tests.
+3. Adjust or add tests if necessary.
+4. Run linters and tests to verify no regressions.
+5. Commit changes and open a pull request.
 
 OUTPUT:
-A pull request URL summarizing the refactor and test results.
+A pull request URL summarizing the refactor.
 ```
 
 Copy this block whenever code needs refactoring in token.place.

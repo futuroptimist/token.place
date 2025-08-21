@@ -41,6 +41,7 @@ A pull request describing the change and summarizing test results.
 - [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md)
 - [Codex Security Review Prompt](prompts-codex-security.md)
 - [Codex Docs Update Prompt](prompts-codex-docs.md)
+- [Codex Feature Prompt](prompts-codex-feature.md)
 - [Codex Refactor Prompt](prompts-codex-refactor.md)
 - [Codex Chore Prompt](prompts-codex-chore.md)
 

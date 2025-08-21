@@ -1,6 +1,6 @@
-# token.place Onboarding Guide
+# `token.place` Onboarding Guide
 
-Welcome to **token.place**! This document provides a high-level overview of the project structure and pointers for where to learn more.
+Welcome to `token.place`! This document provides a high-level overview of the project structure and pointers for where to learn more.
 
 ## Repository Layout
 
@@ -32,6 +32,7 @@ The project runs on Windows, macOS and Linux. Path handling, configuration locat
 - **Contribution guidelines** – [CONTRIBUTING.md](../CONTRIBUTING.md)
 - **Style guide** – [docs/STYLE_GUIDE.md](STYLE_GUIDE.md)
 - **LLM assistant tips** – [docs/LLM_ASSISTANT_GUIDE.md](LLM_ASSISTANT_GUIDE.md)
+- **Automation guidelines** – [AGENTS.md](AGENTS.md)
 
 ## Local checks
 
@@ -42,6 +43,8 @@ pip install pre-commit
 npm ci
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
+npm run lint
+npm run test:ci
 pre-commit run --all-files
 ```
 

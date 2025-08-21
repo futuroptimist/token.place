@@ -20,6 +20,12 @@ def test_encrypt_message_requires_key():
         client.encrypt_message({'msg': 'hi'})
 
 
+def test_encrypt_message_none():
+    client = _prep_client()
+    with pytest.raises(ValueError):
+        client.encrypt_message(None)
+
+
 def test_send_encrypted_message_http_error(monkeypatch):
     client = _prep_client()
     resp = MagicMock(status_code=500, text='fail')

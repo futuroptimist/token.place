@@ -33,7 +33,7 @@
   "homepage": "https://github.com/futuroptimist/token.place#readme",
   "dependencies": {
     "crypto-js": "^4.2.0",
-    "jsencrypt": "^3.3.2",
+    "jsencrypt": "^3.5.4",
     "mocha": "^11.7.1",
     "selenium-webdriver": "^4.35.0"
   },

@@ -3,6 +3,8 @@ const crypto = require('crypto');
 
 // Mock window object
 global.window = global;
+// Some libraries (e.g., jsencrypt) expect a `self` global
+global.self = global;
 
 // Add navigator object
 global.navigator = {

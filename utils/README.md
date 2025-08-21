@@ -36,7 +36,8 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
 `CryptoClient.decrypt_message` now validates required fields and returns `None` when data is incomplete or
-malformed to prevent unexpected exceptions.
+malformed to prevent unexpected exceptions. `CryptoClient.send_encrypted_message` returns `None` when a 200 OK
+response cannot be decoded as JSON, avoiding unhandled `ValueError` exceptions.
 
 ### Crypto Manager (`crypto/crypto_manager.py`)
 

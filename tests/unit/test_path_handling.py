@@ -35,6 +35,15 @@ def test_paths_linux_with_xdg_state_home(tmp_path):
             assert ph.get_logs_dir() == base / 'token.place' / 'logs'
 
 
+def test_paths_linux_with_xdg_config_home(tmp_path):
+    env = {'XDG_CONFIG_HOME': str(tmp_path / 'xdg' / 'config')}
+    with mock.patch('platform.system', return_value='Linux'):
+        with mock.patch.dict(os.environ, env, clear=False):
+            importlib.reload(ph)
+            base = tmp_path / 'xdg' / 'config'
+            assert ph.get_config_dir() == base / 'token.place' / 'config'
+
+
 def test_paths_windows(tmp_path):
     env = {
         'APPDATA': str(tmp_path / 'AppData' / 'Roaming'),

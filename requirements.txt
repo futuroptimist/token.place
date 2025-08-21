@@ -20,7 +20,7 @@ cryptography==45.0.6
 python-dotenv==1.1.1
 openai==1.99.7
 httpx==0.28.1
-jsonschema==4.24.0
+jsonschema==4.25.1
 Flask-Limiter==3.11.0
 prometheus_flask_exporter==0.23.2
 

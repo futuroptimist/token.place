@@ -1,5 +1,5 @@
 import base64
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import pytest
 from utils.crypto_helpers import CryptoClient
 
@@ -56,6 +56,18 @@ def test_retrieve_chat_invalid_message_structure(monkeypatch):
     monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role': 'assistant'}]))
     res = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert res is None
+
+
+def test_send_chat_message_empty_input(monkeypatch):
+    """Reject empty user messages before any network calls."""
+    client = _prep_client()
+    with patch.object(client, 'fetch_server_public_key') as fetch, \
+         patch('utils.crypto_helpers.encrypt') as encrypt, \
+         patch.object(client, 'send_encrypted_message') as send:
+        assert client.send_chat_message('   ') is None
+        fetch.assert_not_called()
+        encrypt.assert_not_called()
+        send.assert_not_called()
 
 
 def test_send_api_request_missing_fields(monkeypatch):

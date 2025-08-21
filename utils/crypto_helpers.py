@@ -253,22 +253,28 @@ class CryptoClient:
         Send a chat message through the relay server
 
         Args:
-            message: Message content or chat history to send
+            message: Message content or chat history to send (must be non-empty)
             max_retries: Maximum number of retry attempts for retrieving the response
 
         Returns:
             Decrypted server response or None if failed
         """
+        # Validate and prepare the chat history
+        if isinstance(message, str):
+            if not message.strip():
+                logger.error("Message cannot be empty")
+                return None
+            chat_history = [{"role": "user", "content": message}]
+        else:
+            if not message:
+                logger.error("Chat history cannot be empty")
+                return None
+            chat_history = message
+
         # Ensure we have the server's public key
         if not self.server_public_key and not self.fetch_server_public_key():
             logger.error("Failed to get server public key")
             return None
-
-        # Prepare the chat history
-        if isinstance(message, str):
-            chat_history = [{"role": "user", "content": message}]
-        else:
-            chat_history = message
 
         logger.debug("Sending chat message with %d entries", len(chat_history))
 

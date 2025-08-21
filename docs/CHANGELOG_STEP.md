@@ -18,3 +18,7 @@ This document captures incremental improvements to `token.place` over time. Add 
 ## [2025-08-06]
 ### Changed
 - Windows path helpers now default to `AppData` directories when environment variables are missing.
+
+## [2025-08-20]
+### Fixed
+- Crypto client now rejects empty chat messages before hitting the network.

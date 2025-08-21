@@ -242,6 +242,13 @@ class TestCryptoManager:
         mock_decrypt.assert_not_called()
 
     @patch('utils.crypto.crypto_manager.decrypt')
+    def test_decrypt_message_invalid_input(self, mock_decrypt, crypto_manager):
+        """Decrypting None should return None without calling decrypt."""
+        result = crypto_manager.decrypt_message(None)
+        assert result is None
+        mock_decrypt.assert_not_called()
+
+    @patch('utils.crypto.crypto_manager.decrypt')
     def test_decrypt_message_decrypt_returns_none(self, mock_decrypt, crypto_manager):
         """Test when the decrypt function returns None."""
         # Setup

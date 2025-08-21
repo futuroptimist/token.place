@@ -70,6 +70,8 @@ with flushed output. Metrics are exposed at `/metrics`.
 All pull requests must:
 
 - run `pre-commit run --all-files`
+- pass `npm run lint`
+- pass `npm run test:ci`
 - pass `pytest -q tests/test_security.py`
 - pass `bandit -r . -lll` with no medium or high findings
 - keep Dependabot, CodeQL, and secret-scanning badges in this README

@@ -115,6 +115,10 @@ def test_decrypt_with_missing_fields():
 ```python
 with pytest.raises(TypeError):
     pkcs7_unpad("not-bytes", 16)
+
+# New: block size must be an integer
+with pytest.raises(TypeError):
+    pkcs7_pad(b"data", 16.0)
 ```
 
 ## 10. Mock Server for JavaScript Tests

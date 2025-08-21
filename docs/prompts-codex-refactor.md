@@ -5,7 +5,7 @@ slug: 'prompts-codex-refactor'
 
 # Codex Refactor Prompt
 
-Use this prompt to safely refactor token.place code.
+Use this prompt to restructure code in token.place without changing behavior.
 
 ```
 SYSTEM:
@@ -30,4 +30,4 @@ OUTPUT:
 A pull request URL summarizing the refactor.
 ```
 
-Copy this block whenever refactoring code in token.place.
+Copy this block whenever code needs refactoring in token.place.

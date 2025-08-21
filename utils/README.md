@@ -21,12 +21,12 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 
 - `normalize_path(path)`: Accepts strings or `os.PathLike` objects, strips surrounding whitespace, expands `~` and environment
   variables, then returns a normalized absolute path. Raises a `TypeError` when `path` is `None` and `ValueError` for empty
-  strings.
+  strings or when environment variables remain unexpanded.
 - `ensure_dir_exists(path)`: Accepts strings or `os.PathLike` objects, strips whitespace and creates the directory if missing,
   expanding `~` and environment variables, and raises `NotADirectoryError` when the path points to an existing file. Passing
-  `None` now raises `TypeError`, and empty paths raise `ValueError`.
+  `None` now raises `TypeError`, and empty paths or unexpanded environment variables raise `ValueError`.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
-- `get_logs_dir()`: Returns the platform-specific logs directory and ensures it exists.
+- `get_logs_dir()`: Returns the platform-specific logs directory, creating it if missing.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives
   (Windows), the absolute `path` is returned instead of raising an error. Passing a
@@ -36,7 +36,8 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
 `CryptoClient.decrypt_message` now validates required fields and returns `None` when data is incomplete or
-malformed to prevent unexpected exceptions.
+malformed to prevent unexpected exceptions. `CryptoClient.send_encrypted_message` returns `None` when a 200 OK
+response cannot be decoded as JSON, avoiding unhandled `ValueError` exceptions.
 
 ### Crypto Manager (`crypto/crypto_manager.py`)
 

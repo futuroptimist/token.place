@@ -1,7 +1,7 @@
 import os
-import sys
 import platform
 import pathlib
+import re
 from typing import Optional, Union
 
 # Define platform-specific constants
@@ -9,6 +9,14 @@ PLATFORM = platform.system().lower()
 IS_WINDOWS = PLATFORM == "windows"
 IS_MACOS = PLATFORM == "darwin"
 IS_LINUX = PLATFORM == "linux"
+
+_UNIX_ENV_PATTERN = re.compile(r"\$(?:\{[^}]+\}|[A-Za-z_][A-Za-z0-9_]*)")
+_WIN_ENV_PATTERN = re.compile(r"%(?:[^%]+)%")
+
+
+def _has_unexpanded_vars(path_str: str) -> bool:
+    """Return True if ``path_str`` still contains environment variable markers."""
+    return bool(_UNIX_ENV_PATTERN.search(path_str) or _WIN_ENV_PATTERN.search(path_str))
 
 def get_user_home_dir() -> pathlib.Path:
     """Get the user's home directory path in a cross-platform way."""
@@ -83,7 +91,7 @@ def get_models_dir() -> pathlib.Path:
     return ensure_dir_exists(get_app_data_dir() / 'models')
 
 def get_logs_dir() -> pathlib.Path:
-    """Get the directory for storing log files.
+    """Get the directory for storing log files, creating it if missing.
 
     On Linux, honors the ``XDG_STATE_HOME`` environment variable when set.
     """
@@ -107,8 +115,9 @@ def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     Accepts strings or ``os.PathLike`` objects, expands ``~`` and environment
     variables before creating the directory, and strips surrounding whitespace to
     avoid accidental directory names. Raises ``TypeError`` if ``dir_path`` is
-    ``None`` and ``NotADirectoryError`` if the path points to an existing file.
-    Returns the path as a ``pathlib.Path`` object.
+    ``None``, ``ValueError`` when environment variables remain unexpanded or the
+    path is empty, and ``NotADirectoryError`` if the path points to an existing
+    file. Returns the path as a ``pathlib.Path`` object.
     """
     if dir_path is None:
         raise TypeError("dir_path cannot be None")
@@ -118,6 +127,8 @@ def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     # Expand environment variables and user home (~), then normalize
     # Also strip surrounding whitespace to avoid creating unintended paths
     path_str = os.path.expandvars(os.fspath(dir_path)).strip()
+    if _has_unexpanded_vars(path_str):
+        raise ValueError("dir_path contains unexpanded environment variables")
     if path_str == "":
         raise ValueError("dir_path cannot be empty")
     path = pathlib.Path(path_str).expanduser().resolve()
@@ -135,7 +146,8 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
 
     Accepts strings or ``os.PathLike`` objects, strips surrounding whitespace,
     and expands environment variables and user home (``~``). Raises
-    ``TypeError`` when ``path`` is ``None``.
+    ``TypeError`` when ``path`` is ``None`` and ``ValueError`` when environment
+    variables remain unexpanded or the path is empty.
     """
     if path is None:
         raise TypeError("path cannot be None")
@@ -143,6 +155,8 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
         raise TypeError("path must be path-like")
 
     expanded = os.path.expandvars(os.fspath(path)).strip()
+    if _has_unexpanded_vars(expanded):
+        raise ValueError("path contains unexpanded environment variables")
     if expanded == "":
         raise ValueError("path cannot be empty")
     return pathlib.Path(expanded).expanduser().resolve()

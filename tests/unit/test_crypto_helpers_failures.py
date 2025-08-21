@@ -34,6 +34,14 @@ def test_send_encrypted_message_http_error(monkeypatch):
     assert result is None
 
 
+def test_send_encrypted_message_invalid_json(monkeypatch):
+    client = _prep_client()
+    resp = MagicMock(status_code=200, text='not json')
+    resp.json.side_effect = ValueError('boom')
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **_kw: resp)
+    assert client.send_encrypted_message('/ok', {}) is None
+
+
 def test_retrieve_chat_response_retry(monkeypatch):
     client = _prep_client()
     enc = {'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'}

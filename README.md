@@ -70,6 +70,8 @@ with flushed output. Metrics are exposed at `/metrics`.
 All pull requests must:
 
 - run `pre-commit run --all-files`
+- pass `npm run lint`
+- pass `npm run test:ci`
 - pass `pytest -q tests/test_security.py`
 - pass `bandit -r . -lll` with no medium or high findings
 - keep Dependabot, CodeQL, and secret-scanning badges in this README
@@ -503,9 +505,9 @@ The token.place API is designed to be compatible with the OpenAI API format, mak
 
 ### API Endpoints
 
-All routes are available under `/api/v1` as well as `/v1` so that the standard
-OpenAI Python client can interact with `token.place` by simply changing the
-base URL to `https://token.place/v1`.
+All routes are served under `/api/v1` (preferred) and are also available at
+`/v1` for compatibility with standard OpenAI clients. Set the base URL to
+`https://token.place/api/v1`.
 
 #### List Models
 ```

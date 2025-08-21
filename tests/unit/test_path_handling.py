@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 import utils.path_handling as ph
 
 
@@ -78,3 +80,11 @@ def test_paths_macos(tmp_path):
         assert ph.get_config_dir() == home / 'Library' / 'Application Support' / 'token.place' / 'config'
         assert ph.get_cache_dir() == home / 'Library' / 'Caches' / 'token.place'
         assert ph.get_logs_dir() == home / 'Library' / 'Logs' / 'token.place'
+
+
+def test_unexpanded_env_var_raises():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ValueError):
+            ph.normalize_path("$UNSET_VAR/path")
+        with pytest.raises(ValueError):
+            ph.ensure_dir_exists("$UNSET_VAR/path")

@@ -101,7 +101,7 @@ token.place tests are organized around key user journeys that represent how user
 
 The API routes are mirrored at `/v1` specifically so that the OpenAI Python
 client can be used by simply setting `base_url` to `http://localhost:5055/v1`
-during tests or `https://token.place/v1` in production.
+during tests or `https://token.place/api/v1` in production.
 
 **Test Files**:
 - `tests/test_api.py` - Tests all API endpoints for functionality and compatibility

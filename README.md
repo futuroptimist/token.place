@@ -505,9 +505,9 @@ The token.place API is designed to be compatible with the OpenAI API format, mak
 
 ### API Endpoints
 
-All routes are available under `/api/v1` as well as `/v1` so that the standard
-OpenAI Python client can interact with `token.place` by simply changing the
-base URL to `https://token.place/v1`.
+All routes are served under `/api/v1` (preferred) and are also available at
+`/v1` for compatibility with standard OpenAI clients. Set the base URL to
+`https://token.place/api/v1`.
 
 #### List Models
 ```

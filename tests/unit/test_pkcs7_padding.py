@@ -65,3 +65,12 @@ def test_unpad_non_bytes_input():
     """Non-byte inputs to pkcs7_unpad should raise TypeError."""
     with pytest.raises(TypeError):
         pkcs7_unpad("not-bytes", 16)
+
+
+def test_non_int_block_size():
+    """Non-integer block sizes should raise TypeError with a helpful message."""
+    padded = pkcs7_pad(b"data", 16)
+    with pytest.raises(TypeError, match="block_size must be an integer"):
+        pkcs7_pad(b"data", 16.0)
+    with pytest.raises(TypeError, match="block_size must be an integer"):
+        pkcs7_unpad(padded, 16.0)

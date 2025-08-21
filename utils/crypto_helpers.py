@@ -131,22 +131,30 @@ class CryptoClient:
 
     def encrypt_message(self, message: Union[Dict, List, str]) -> Dict[str, str]:
         """
-        Encrypt a message for the server
+        Encrypt a message for the server.
 
         Args:
-            message: Message to encrypt (will be converted to JSON)
+            message: Message to encrypt (string, list, or dict). Must not be ``None``.
 
         Returns:
-            Dictionary with base64-encoded ciphertext, cipherkey, and iv
+            Dictionary with base64-encoded ciphertext, cipherkey, and iv.
+
+        Raises:
+            ValueError: If ``message`` is ``None`` or the server key is missing.
+            TypeError: If ``message`` is not a ``dict``, ``list``, or ``str``.
         """
         if self.server_public_key is None:
             raise ValueError("Server public key not available. Call fetch_server_public_key() first.")
+        if message is None:
+            raise ValueError("message cannot be None")
+        if not isinstance(message, (dict, list, str)):
+            raise TypeError(f"Unsupported message type: {type(message).__name__}")
 
         # Convert to JSON if it's a dict or list
         if isinstance(message, (dict, list)):
             plaintext = json.dumps(message).encode('utf-8')
         else:
-            plaintext = str(message).encode('utf-8')
+            plaintext = message.encode('utf-8')
 
         logger.debug("Encrypting message of length %d bytes", len(plaintext))
 

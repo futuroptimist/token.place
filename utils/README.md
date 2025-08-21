@@ -49,7 +49,8 @@ hanging connections. You can override this by passing a `timeout` argument to
 `CryptoClient.fetch_server_public_key` or `CryptoClient.send_encrypted_message`.
 `encrypt_message` validates inputs, raising a `ValueError` for `None` and a
 `TypeError` for unsupported message types to avoid confusing cryptography
-errors.
+errors. Passing `None` previously encrypted the string "None"; now it raises
+`ValueError` to surface invalid inputs early.
 
 ## Crypto Helpers
 

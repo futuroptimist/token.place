@@ -30,6 +30,7 @@ wheels/
 # Coverage
 .coverage
 htmlcov/
+coverage/
 coverage.xml
 
 # Node.js

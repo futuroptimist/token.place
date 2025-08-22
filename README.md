@@ -58,12 +58,12 @@ with flushed output. Metrics are exposed at `/metrics`.
 
 ### Key environment variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| API_RATE_LIMIT | 60/hour | Per-IP rate limit for API requests |
-| API_DAILY_QUOTA | 1000/day | Per-IP daily request quota |
-| USE_MOCK_LLM | 0 | Run with mock LLM instead of downloading a real model |
-| TOKEN_PLACE_ENV | development | Deployment environment (`development`, `testing`, `production`) |
+| Variable        | Default      | Description                                                        |
+|-----------------|--------------|--------------------------------------------------------------------|
+| API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
+| API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
+| USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
+| TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
 
 ## CI pass criteria
 

@@ -71,6 +71,8 @@ All pull requests must:
 
 - run `pre-commit run --all-files`
 - pass `npm run lint`
+- pass `npm run type-check`
+- pass `npm run build`
 - pass `npm run test:ci`
 - pass `pytest -q tests/test_security.py`
 - pass `bandit -r . -lll` with no medium or high findings

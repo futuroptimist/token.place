@@ -1,6 +1,7 @@
 {
   "name": "token-place",
   "version": "1.0.0",
+  "private": true,
   "description": "p2p generative AI platform",
   "main": "index.js",
   "scripts": {

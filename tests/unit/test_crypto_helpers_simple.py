@@ -58,3 +58,13 @@ def test_send_chat_message():
         resp = client.send_chat_message('hi')
         assert isinstance(resp, list) and resp[1]['role'] == 'assistant'
         assert mock_requests.post.call_count == 2
+
+def test_has_server_public_key():
+    client = CryptoClient('https://example.com')
+    assert not client.has_server_public_key()
+    with patch('utils.crypto_helpers.requests') as mock_requests:
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {'server_public_key': base64.b64encode(b'k').decode()}
+        mock_requests.get.return_value = resp
+        assert client.fetch_server_public_key()
+    assert client.has_server_public_key()

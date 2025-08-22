@@ -43,25 +43,27 @@ class ModelManager:
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
 
+    def _log(self, level: int, message: str, **kwargs) -> None:
+        """Log a message when not in production."""
+        if self.config.is_production:
+            return
+        logger.log(level, message, **kwargs)
+
     def log_info(self, message):
         """Log info only in non-production environments"""
-        if not self.config.is_production:
-            logger.info(message)
+        self._log(logging.INFO, message)
 
     def log_warning(self, message):
         """Log warnings only in non-production environments"""
-        if not self.config.is_production:
-            logger.warning(message)
+        self._log(logging.WARNING, message)
 
     def log_error(self, message, exc_info=False):
         """Log errors only in non-production environments"""
-        if not self.config.is_production:
-            logger.error(message, exc_info=exc_info)
+        self._log(logging.ERROR, message, exc_info=exc_info)
 
     def create_models_directory(self) -> str:
         """Create the models directory if it doesn't exist."""
-        if not os.path.exists(self.models_dir):
-            os.makedirs(self.models_dir)
+        os.makedirs(self.models_dir, exist_ok=True)
         return self.models_dir
 
     def download_file_in_chunks(self, file_path: str, url: str, chunk_size_mb: int) -> bool:

@@ -10,6 +10,13 @@ def test_pad_unpad_roundtrip(data):
     assert result == data
 
 
+def test_pad_unpad_memoryview():
+    """Ensure pkcs7 helpers accept memoryview inputs."""
+    data = memoryview(b"example")
+    padded = pkcs7_pad(data, 16)
+    assert pkcs7_unpad(padded, 16) == data.tobytes()
+
+
 def test_unpad_invalid_padding():
     # invalid sequence: last byte value 3 but previous bytes not all 3
     padded = b"invalidpadding" + b"\x01\x02\x03"

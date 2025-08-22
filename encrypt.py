@@ -170,7 +170,7 @@ def pkcs7_pad(data: bytes, block_size: int) -> bytes:
     """Pad *data* to a multiple of *block_size* using PKCS#7 padding.
 
     Args:
-        data: Input bytes to pad.
+        data: Input bytes-like object to pad.
         block_size: Size of each block in bytes (1-255).
 
     Returns:
@@ -180,6 +180,8 @@ def pkcs7_pad(data: bytes, block_size: int) -> bytes:
         ValueError: If *block_size* is not between 1 and 255 (inclusive).
         TypeError: If *data* is not bytes-like or *block_size* is not an ``int``.
     """
+    if isinstance(data, memoryview):
+        data = data.tobytes()
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("data must be bytes-like")
     if not isinstance(block_size, int):
@@ -194,7 +196,7 @@ def pkcs7_unpad(padded_data: bytes, block_size: int) -> bytes:
     """Remove PKCS#7 padding from *padded_data*.
 
     Args:
-        padded_data: Input bytes to unpad.
+        padded_data: Input bytes-like object to unpad.
         block_size: Size of each block in bytes (1-255).
 
     Returns:
@@ -204,6 +206,8 @@ def pkcs7_unpad(padded_data: bytes, block_size: int) -> bytes:
         ValueError: If *block_size* is not between 1 and 255 (inclusive) or padding is invalid.
         TypeError: If *padded_data* is not bytes-like or *block_size* is not an ``int``.
     """
+    if isinstance(padded_data, memoryview):
+        padded_data = padded_data.tobytes()
     if not isinstance(padded_data, (bytes, bytearray)):
         raise TypeError("padded_data must be bytes-like")
     if not isinstance(block_size, int):

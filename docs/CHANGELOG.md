@@ -7,6 +7,7 @@
 - Remove unused imports from simplified CLI client to avoid unnecessary dependencies
 - Handle EOF in simplified CLI client to end sessions cleanly
 - Deep copy default configuration to prevent cross-test mutations
+- Accept memoryview inputs in PKCS#7 padding helpers to support more bytes-like objects
 
 ## Version 1.0.0 (March 2025)
 

@@ -149,6 +149,16 @@ def test_get_logs_dir_creates_directory(tmp_path, monkeypatch):
     assert logs_dir.exists()
 
 
+def test_get_temp_dir_creates_directory(tmp_path, monkeypatch):
+    """get_temp_dir should create a token.place directory under the temp path"""
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    importlib.reload(ph)
+    temp_dir = ph.get_temp_dir()
+    expected = tmp_path / "tmp" / "token.place"
+    assert temp_dir == expected
+    assert temp_dir.exists()
+
+
 def test_linux_uses_xdg_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg" / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg" / "config"))

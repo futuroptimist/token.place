@@ -1,6 +1,5 @@
-import os
-import base64
 import json
+import pytest
 from encrypt import generate_keys, encrypt, decrypt
 
 def test_encrypt_decrypt():
@@ -83,3 +82,24 @@ def test_encrypt_decrypt_empty_plaintext():
     # Assert that the decrypted plaintext matches the original plaintext
     assert decrypted_bytes is not None
     assert decrypted_bytes == plaintext_bytes
+
+
+def test_encrypt_rejects_non_bytes_inputs():
+    """encrypt should raise TypeError when given non-bytes arguments."""
+    _, public_key = generate_keys()
+    with pytest.raises(TypeError, match="plaintext must be bytes-like"):
+        encrypt("not-bytes", public_key)
+    with pytest.raises(TypeError, match="public_key_pem must be bytes-like"):
+        encrypt(b"data", "not-bytes")
+
+
+def test_decrypt_rejects_non_bytes_inputs():
+    """decrypt should raise TypeError on malformed inputs."""
+    private_key, public_key = generate_keys()
+    ciphertext_dict, cipherkey, _ = encrypt(b"hello", public_key)
+    with pytest.raises(TypeError, match="ciphertext_dict must be a dict"):
+        decrypt("not-dict", cipherkey, private_key)
+    with pytest.raises(TypeError, match="encrypted_key must be bytes-like"):
+        decrypt(ciphertext_dict, "not-bytes", private_key)
+    with pytest.raises(TypeError, match="private_key_pem must be bytes-like"):
+        decrypt(ciphertext_dict, cipherkey, "not-bytes")

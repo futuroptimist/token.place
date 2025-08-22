@@ -574,6 +574,8 @@ GET /v1/public-key
 
 2. Encrypt your request with the server's public key
 
+   The helper functions `encrypt` and `decrypt` operate on bytes and raise `TypeError` for strings.
+
 3. Send your encrypted request:
 ```json
 {

@@ -68,7 +68,14 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
         - ciphertext_dict: Dictionary with 'ciphertext' and 'iv' keys
         - encrypted_key: The AES key encrypted with RSA
         - iv: Initialization vector used for AES-CBC
+
+    Raises:
+        TypeError: If ``plaintext`` or ``public_key_pem`` are not bytes-like objects.
     """
+    if not isinstance(plaintext, (bytes, bytearray)):
+        raise TypeError("plaintext must be bytes-like")
+    if not isinstance(public_key_pem, (bytes, bytearray)):
+        raise TypeError("public_key_pem must be bytes-like")
     # Generate a random AES key
     aes_key = secrets.token_bytes(AES_KEY_SIZE)  # 256-bit key
 
@@ -121,7 +128,23 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
 
     Returns:
         Decrypted plaintext or None if decryption fails
+
+    Raises:
+        TypeError: If inputs are not bytes-like or ``ciphertext_dict`` is malformed.
     """
+    if not isinstance(ciphertext_dict, dict):
+        raise TypeError("ciphertext_dict must be a dict")
+    if 'ciphertext' not in ciphertext_dict or 'iv' not in ciphertext_dict:
+        raise TypeError("ciphertext_dict must contain 'ciphertext' and 'iv'")
+    if not isinstance(ciphertext_dict['ciphertext'], (bytes, bytearray)):
+        raise TypeError("ciphertext must be bytes-like")
+    if not isinstance(ciphertext_dict['iv'], (bytes, bytearray)):
+        raise TypeError("iv must be bytes-like")
+    if not isinstance(encrypted_key, (bytes, bytearray)):
+        raise TypeError("encrypted_key must be bytes-like")
+    if not isinstance(private_key_pem, (bytes, bytearray)):
+        raise TypeError("private_key_pem must be bytes-like")
+
     try:
         # First decrypt the AES key using RSA
         private_key = serialization.load_pem_private_key(

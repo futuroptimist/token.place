@@ -18,6 +18,7 @@ and automatically create directories when accessed.
 
 On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
 `XDG_CACHE_HOME`, and `XDG_STATE_HOME` environment variables when they are set.
+Environment variable values are stripped of surrounding whitespace before use.
 
 - `normalize_path(path)`: Accepts strings or `os.PathLike` objects, strips surrounding whitespace, expands `~` and environment
   variables, then returns a normalized absolute path. Raises a `TypeError` when `path` is `None` and `ValueError` for empty

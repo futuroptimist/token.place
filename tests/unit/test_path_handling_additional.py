@@ -2,6 +2,7 @@ import importlib
 import os
 import pathlib
 import platform
+import tempfile
 from unittest import mock
 
 import pytest
@@ -196,6 +197,14 @@ def test_normalize_path_empty_string():
     """normalize_path should reject empty or whitespace-only paths"""
     with pytest.raises(ValueError):
         ph.normalize_path("")
+
+
+def test_get_temp_dir_uses_system_temp(tmp_path, monkeypatch):
+    """get_temp_dir should derive from the system temp directory."""
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    result = ph.get_temp_dir()
+    assert result == tmp_path / "token.place"
+    assert result.exists()
 
 
 def test_ensure_dir_exists_invalid_type():

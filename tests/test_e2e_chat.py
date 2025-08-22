@@ -2,6 +2,7 @@ import pytest
 from playwright.sync_api import Page
 import time
 import os
+import tempfile
 
 # Import the new crypto helper
 from utils.crypto_helpers import CryptoClient
@@ -41,7 +42,7 @@ def test_chat_encryption_e2e(page, base_url, setup_servers):
     assert encryption_presence, "Page should contain encryption-related technology"
 
     # Take a screenshot for debugging
-    screenshot_path = os.path.join(os.path.dirname(__file__), "encryption_test_screenshot.png")
+    screenshot_path = os.path.join(tempfile.gettempdir(), "encryption_test_screenshot.png")
     page.screenshot(path=screenshot_path)
     print(f"Screenshot saved to {screenshot_path}")
     assert os.path.exists(screenshot_path)
@@ -90,7 +91,7 @@ def test_multiple_turns_conversation(page, base_url, setup_servers):
     print(f"API response content: {response['choices'][0]['message']['content']}")
 
     # Take a screenshot to document the UI state
-    screenshot_path = os.path.join(os.path.dirname(__file__), "chat_test_screenshot.png")
+    screenshot_path = os.path.join(tempfile.gettempdir(), "chat_test_screenshot.png")
     page.screenshot(path=screenshot_path)
     print(f"Screenshot saved to {screenshot_path}")
 

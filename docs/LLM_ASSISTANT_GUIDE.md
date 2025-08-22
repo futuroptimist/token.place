@@ -113,6 +113,9 @@ When assisting users, refer them to these key documents:
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md): General contribution guidelines
 - [tests/README.md](../tests/README.md): General testing guide
+- [ONBOARDING.md](ONBOARDING.md): Repository overview and setup
+- [AGENTS.md](../AGENTS.md): Automation helpers and required checks
+- [STYLE_GUIDE.md](STYLE_GUIDE.md): Naming and style conventions
 
 ---
 

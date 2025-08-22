@@ -59,6 +59,7 @@ errors. Passing `None` previously encrypted the string "None"; now it raises
 The `CryptoClient` class provides a high-level abstraction over the encryption/decryption process, making it easy to:
 
 - Fetch public keys from the server
+- Check if the server public key has been loaded
 - Encrypt messages for the server
 - Decrypt messages from the server
 - Send encrypted chat messages

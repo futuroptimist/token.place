@@ -77,6 +77,10 @@ class CryptoClient:
         self.client_public_key_b64 = base64.b64encode(self.client_public_key).decode('utf-8')
         logger.debug("Client keys generated successfully")
 
+    def has_server_public_key(self) -> bool:
+        """Return True if a server public key has been loaded."""
+        return self.server_public_key is not None
+
     def fetch_server_public_key(self, endpoint: str = "/next_server", timeout: float = 10) -> bool:
         """Fetch the server's public key.
 

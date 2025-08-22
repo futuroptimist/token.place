@@ -27,6 +27,7 @@ On Linux, these functions honor the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
   `None` now raises `TypeError`, and empty paths or unexpanded environment variables raise `ValueError`.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
 - `get_logs_dir()`: Returns the platform-specific logs directory, creating it if missing.
+- `get_temp_dir()`: Returns the system temporary directory for token.place, ensuring it exists.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives
   (Windows), the absolute `path` is returned instead of raising an error. Passing a

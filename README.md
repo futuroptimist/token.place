@@ -726,7 +726,8 @@ pre-commit run --all-files
 
 ## Security
 
-Security is our top priority. Please report any vulnerabilities responsibly. See [Security and Privacy Audit](SECURITY_PRIVACY_AUDIT.md) for details.
+Security is our top priority. Please report any vulnerabilities responsibly.
+See [Security and Privacy Audit](docs/SECURITY_PRIVACY_AUDIT.md) for details.
 token.place intentionally avoids storing user prompts or LLM responses in logs to protect user privacy.
 
 ## License

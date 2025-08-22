@@ -45,9 +45,12 @@ pip install pre-commit
 npm ci
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
+pip install -r requirements.txt
 npm run lint
 npm run test:ci
 pre-commit run --all-files
 ```
+
+Development dependencies live in [requirements.txt](../requirements.txt).
 
 Happy hacking!

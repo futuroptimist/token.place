@@ -32,12 +32,15 @@ git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
+pip install -r requirements.txt
 npm ci
 playwright install --with-deps chromium
 pip install pre-commit
 pre-commit install
 pre-commit run --all-files
 ```
+
+The development requirements live in [requirements.txt](requirements.txt).
 
 Run the relay and server in separate terminals:
 

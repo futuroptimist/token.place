@@ -13,6 +13,15 @@ def test_format_message_user_and_assistant():
     assert "System:" in cs.format_message(other_msg)
 
 
+def test_format_message_colors():
+    msg = {"role": "user", "content": "hi"}
+    assert "\033[1;34m" in cs.format_message(msg)
+    msg["role"] = "assistant"
+    assert "\033[1;32m" in cs.format_message(msg)
+    msg["role"] = "system"
+    assert "\033[1;33m" in cs.format_message(msg)
+
+
 def test_no_unused_imports():
     """Ensure no leftover modules remain imported unintentionally."""
     for name in ["os", "subprocess", "time"]:

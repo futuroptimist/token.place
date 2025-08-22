@@ -20,16 +20,17 @@ def clear_screen():
         # Use ANSI escape codes to avoid shell injection via os.system
         print("\033[2J\033[H", end="", flush=True)
 
+ROLE_COLORS = {
+    "User": "1;34",
+    "Assistant": "1;32",
+}
+
+
 def format_message(message: Dict) -> str:
-    """Format a message for display"""
+    """Format a message for display."""
     role = message["role"].capitalize()
-    content = message["content"]
-    if role == "User":
-        return f"\033[1;34m{role}: \033[0m{content}"
-    elif role == "Assistant":
-        return f"\033[1;32m{role}: \033[0m{content}"
-    else:
-        return f"\033[1;33m{role}: \033[0m{content}"
+    color = ROLE_COLORS.get(role, "1;33")
+    return f"\033[{color}m{role}: \033[0m{message['content']}"
 
 def display_conversation(messages: List[Dict]):
     """Display the conversation history"""

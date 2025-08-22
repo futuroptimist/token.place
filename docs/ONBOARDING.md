@@ -25,6 +25,8 @@ This ensures that plaintext prompts and responses never reach the relay or any i
 
 The project runs on Windows, macOS and Linux. Path handling, configuration locations and launcher scripts adapt automatically. For platform specifics and Docker instructions, see [CROSS_PLATFORM.md](CROSS_PLATFORM.md).
 
+The `.gitignore` file keeps OS artifacts like `.DS_Store` and `Thumbs.db` out of commits.
+
 ## Where to Go Next
 
 - **Architecture** – [docs/ARCHITECTURE.md](ARCHITECTURE.md)

@@ -50,6 +50,7 @@ tests/visual_verification/visual_report.json
 *.swp
 *.swo
 .DS_Store
+Thumbs.db
 
 # Integration tests
 integration_tests/

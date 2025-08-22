@@ -43,37 +43,28 @@ RELAY_RESPONSE_SCHEMA = {
     }
 }
 
-def log_info(message, *args):
-    """Log info only in non-production environments using consistent formatting"""
+def _log(level: str, message: str, *args, exc_info: Optional[bool] = None) -> None:
+    """Log a message if not in production; fallback to always logging on error"""
     try:
         config = get_config_lazy()
-        if not config.is_production:
-            if args:
-                logger.info(message.format(*args))
-            else:
-                logger.info(message)
+        if config.is_production:
+            return
     except Exception:
-        # Fallback to always log if config is not available
-        if args:
-            logger.info(message.format(*args))
-        else:
-            logger.info(message)
+        pass
+    log_func = getattr(logger, level)
+    formatted = message.format(*args) if args else message
+    kwargs = {"exc_info": exc_info} if exc_info is not None else {}
+    log_func(formatted, **kwargs)
 
-def log_error(message, *args, exc_info=False):
+
+def log_info(message, *args) -> None:
+    """Log info only in non-production environments using consistent formatting"""
+    _log("info", message, *args)
+
+
+def log_error(message, *args, exc_info: bool = False) -> None:
     """Log errors only in non-production environments using consistent formatting"""
-    try:
-        config = get_config_lazy()
-        if not config.is_production:
-            if args:
-                logger.error(message.format(*args), exc_info=exc_info)
-            else:
-                logger.error(message, exc_info=exc_info)
-    except Exception:
-        # Fallback to always log if config is not available
-        if args:
-            logger.error(message.format(*args), exc_info=exc_info)
-        else:
-            logger.error(message, exc_info=exc_info)
+    _log("error", message, *args, exc_info=exc_info)
 
 class RelayClient:
     """

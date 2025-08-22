@@ -2,6 +2,7 @@ import os
 import platform
 import pathlib
 import re
+import tempfile
 from typing import Optional, Union
 
 # Define platform-specific constants
@@ -85,6 +86,11 @@ def get_cache_dir() -> pathlib.Path:
         else:
             base_dir = get_user_home_dir() / '.cache'
         return ensure_dir_exists(base_dir / 'token.place')
+
+
+def get_temp_dir() -> pathlib.Path:
+    """Get the directory for storing temporary files."""
+    return ensure_dir_exists(pathlib.Path(tempfile.gettempdir()) / 'token.place')
 
 def get_models_dir() -> pathlib.Path:
     """Get the directory for storing downloaded models."""

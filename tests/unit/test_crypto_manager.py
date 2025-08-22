@@ -46,6 +46,24 @@ class TestCryptoManager:
         assert crypto_manager.public_key == b'test_public_key'
         assert crypto_manager.public_key_b64 == 'dGVzdF9wdWJsaWNfa2V5'
 
+    @patch('utils.crypto.crypto_manager.generate_keys', side_effect=[(b'priv1', b'pub1'), (b'priv2', b'pub2')])
+    def test_rotate_keys_generates_new_pair(self, mock_generate_keys):
+        """rotate_keys should replace the existing key pair."""
+        with patch('utils.crypto.crypto_manager.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_get_config.return_value = mock_config
+
+            manager = CryptoManager()
+
+        original_key = manager.public_key
+        manager.rotate_keys()
+
+        assert manager.public_key != original_key
+        assert manager.public_key == b'pub2'
+        assert manager.public_key_b64 == base64.b64encode(b'pub2').decode('utf-8')
+        assert mock_generate_keys.call_count == 2
+
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_dict(self, mock_encrypt, crypto_manager):
         """Test encrypting a dictionary message."""

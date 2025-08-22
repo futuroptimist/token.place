@@ -77,6 +77,10 @@ class CryptoManager:
         """Get the base64-encoded public key."""
         return self._public_key_b64
 
+    def rotate_keys(self):
+        """Regenerate the RSA key pair for key rotation."""
+        self.initialize_keys()
+
     def encrypt_message(self, message: Union[str, bytes, Dict, List],
                         client_public_key: Union[str, bytes]) -> Dict[str, str]:
         """

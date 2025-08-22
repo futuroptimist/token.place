@@ -89,8 +89,9 @@ def get_cache_dir() -> pathlib.Path:
 
 
 def get_temp_dir() -> pathlib.Path:
-    """Get the directory for storing temporary files."""
-    return ensure_dir_exists(pathlib.Path(tempfile.gettempdir()) / 'token.place')
+    """Get the directory for temporary files."""
+    base_dir = pathlib.Path(tempfile.gettempdir())
+    return ensure_dir_exists(base_dir / 'token.place')
 
 def get_models_dir() -> pathlib.Path:
     """Get the directory for storing downloaded models."""

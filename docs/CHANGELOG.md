@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Provide `get_temp_dir()` utility for temporary token.place files
+
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input
 - Remove unused imports from simplified CLI client to avoid unnecessary dependencies

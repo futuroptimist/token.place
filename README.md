@@ -169,7 +169,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 create a virtual environment:
 
 ```sh
-$ python -m venv env
+$ python -m venv .venv
 ```
 
 Depending on your environment, you may need to replace `python` in the above command with `python3`.
@@ -185,7 +185,7 @@ activate the virtual environment:
 #### unix/linux/macos
 
 ```sh
-source env/bin/activate
+source .venv/bin/activate
 ```
 
 #### windows
@@ -265,7 +265,7 @@ Summarizing:
   - Windows 10/11 SDK
 - [CUDA Toolkit](https://developer.nvidia.com/cuda-12-2-0-download-archive?target_os=Windows)
 
-The next steps need to be executed in the same virtual environment you set up above. You'll see something like (env) on the bottom left in your terminal (may not be true on all platforms in all terminals).
+The next steps need to be executed in the same virtual environment you set up above. You'll see something like (.venv) on the bottom left in your terminal (may not be true on all platforms in all terminals).
 
 This will replace the llama-cpp-python you installed via `pip install -r requirements.txt` and will instruct it to use [cuBLAS](https://docs.nvidia.com/cuda/cublas/index.html).
 

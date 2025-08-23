@@ -732,4 +732,4 @@ token.place intentionally avoids storing user prompts or LLM responses in logs t
 
 ## License
 
-This project is licensed under the terms in [LICENSE](LICENSE).
+This project is licensed under the MIT License as detailed in [LICENSE](LICENSE).

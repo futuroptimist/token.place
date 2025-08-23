@@ -27,6 +27,8 @@ Secure peer-to-peer generative AI platform
 
 # Quickstart
 
+Ensure you have Node.js 18+ installed.
+
 ```bash
 git clone https://github.com/futuroptimist/token.place.git
 cd token.place

@@ -6,7 +6,8 @@ from client import ChatClient
 import base64
 import json
 from encrypt import encrypt, decrypt, generate_keys
-import os # Import os
+import os  # Import os
+import sys
 
 @pytest.fixture(scope="session")
 def setup_servers():
@@ -18,7 +19,7 @@ def setup_servers():
     client = ChatClient('http://localhost', relay_port)
 
     # Start the relay server
-    relay_process = subprocess.Popen(["python", "relay.py", "--port", str(relay_port)])
+    relay_process = subprocess.Popen([sys.executable, "relay.py", "--port", str(relay_port)])
     print("Launched relay server. Waiting for 5 seconds...")
     time.sleep(5)  # Give the relay server some time to start
 
@@ -26,7 +27,7 @@ def setup_servers():
     server_env = os.environ.copy() # Get a copy of the current environment
     server_env["USE_MOCK_LLM"] = "1" # Set the variable
     server_process = subprocess.Popen(
-        ["python", "server.py", "--server_port", str(server_port), "--relay_port", str(relay_port)],
+        [sys.executable, "server.py", "--server_port", str(server_port), "--relay_port", str(relay_port)],
         env=server_env # Pass the modified environment
     )
     print("Launched server with USE_MOCK_LLM=1. Waiting for 5 seconds...") # Reduced wait time as no model download needed

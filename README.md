@@ -67,6 +67,7 @@ with flushed output. Metrics are exposed at `/metrics`.
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
+| PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 
 ## CI pass criteria
 

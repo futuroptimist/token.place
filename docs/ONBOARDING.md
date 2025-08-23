@@ -47,7 +47,11 @@ pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
 pip install -r requirements.txt
 npm run lint
+npm run type-check
+npm run build
 npm run test:ci
+pytest -q tests/test_security.py
+bandit -r . -lll
 pre-commit run --all-files
 ```
 

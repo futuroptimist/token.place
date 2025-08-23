@@ -1,4 +1,5 @@
 import importlib
+import importlib
 import os
 import pathlib
 import platform
@@ -18,6 +19,19 @@ class DummyPath:
     def __fspath__(self) -> str:  # pragma: no cover - trivial
         return str(self._path)
 
+
+def test_get_env_unset(monkeypatch):
+    """_get_env should return None when the variable is missing or blank."""
+    monkeypatch.delenv("TP_MISSING", raising=False)
+    assert ph._get_env("TP_MISSING") is None
+    monkeypatch.setenv("TP_MISSING", "   ")
+    assert ph._get_env("TP_MISSING") is None
+
+
+def test_get_env_strips_whitespace(monkeypatch):
+    """_get_env should strip surrounding whitespace from the value."""
+    monkeypatch.setenv("TP_VALUE", "  actual  ")
+    assert ph._get_env("TP_VALUE") == "actual"
 
 def test_ensure_dir_exists_existing(tmp_path):
     p = tmp_path / 'sub'

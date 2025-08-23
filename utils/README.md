@@ -57,7 +57,8 @@ hanging connections. You can override this by passing a `timeout` argument to
 `encrypt_message` validates inputs, raising a `ValueError` for `None` and a
 `TypeError` for unsupported message types to avoid confusing cryptography
 errors. Passing `None` previously encrypted the string "None"; now it raises
-`ValueError` to surface invalid inputs early.
+`ValueError` to surface invalid inputs early. `encrypt_message` also accepts
+raw ``bytes`` messages in addition to strings and JSON-serializable objects.
 
 ## Crypto Helpers
 

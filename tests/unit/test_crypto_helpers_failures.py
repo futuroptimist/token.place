@@ -26,6 +26,19 @@ def test_encrypt_message_none():
         client.encrypt_message(None)
 
 
+def test_encrypt_message_invalid_type():
+    """encrypt_message should reject unsupported message types."""
+    client = _prep_client()
+    with pytest.raises(TypeError):
+        client.encrypt_message(123)
+
+
+def test_send_chat_message_empty_list():
+    """send_chat_message should reject an empty chat history list."""
+    client = _prep_client()
+    assert client.send_chat_message([]) is None
+
+
 def test_send_encrypted_message_http_error(monkeypatch):
     client = _prep_client()
     resp = MagicMock(status_code=500, text='fail')

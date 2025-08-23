@@ -242,7 +242,20 @@ def test_normalize_path_invalid_type():
     with pytest.raises(TypeError):
         ph.normalize_path(123)  # type: ignore[arg-type]
 
+        
+def test_is_subpath(tmp_path):
+    """is_subpath should detect when a path lies within a base directory"""
+    base = tmp_path / "base"
+    sub = base / "child"
+    other = tmp_path / "other"
+    base.mkdir()
+    sub.mkdir()
+    other.mkdir()
+    assert ph.is_subpath(sub, base) is True
+    assert ph.is_subpath(base, base) is True
+    assert ph.is_subpath(other, base) is False
 
+    
 def test_get_env_strips_and_handles_missing(monkeypatch):
     """_get_env should strip whitespace and return None when unset."""
     monkeypatch.delenv("TP_TEST_ENV", raising=False)

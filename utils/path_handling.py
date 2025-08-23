@@ -155,6 +155,19 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
         raise TypeError("path cannot be None")
     return _expand_and_normalize_path(path)
 
+def is_subpath(
+    path: Union[str, os.PathLike[str]],
+    parent: Union[str, os.PathLike[str]],
+) -> bool:
+    """Return ``True`` if ``path`` is the same as or lies within ``parent``."""
+    path = normalize_path(path)
+    parent = normalize_path(parent)
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
 def get_relative_path(
     path: Union[str, os.PathLike[str]],
     base_path: Optional[Union[str, os.PathLike[str]]] = None,

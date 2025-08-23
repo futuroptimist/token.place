@@ -59,6 +59,7 @@ def test_api_health(client):
     data = response.get_json()
     assert data['status'] == 'ok'
     assert data['version'] == 'v1'
+    assert data['service'] == 'token.place'
     assert 'timestamp' in data
 
 def test_list_models(client):

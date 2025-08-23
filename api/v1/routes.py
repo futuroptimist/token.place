@@ -20,6 +20,7 @@ from api.v1.validation import (
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
+SERVICE_NAME = os.getenv('SERVICE_NAME', 'token.place')
 
 # Configure logging based on environment
 if ENVIRONMENT != 'prod':
@@ -499,6 +500,7 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'version': 'v1',
+            'service': SERVICE_NAME,
             'timestamp': int(time.time())
         })
     except Exception as e:

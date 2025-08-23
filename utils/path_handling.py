@@ -16,13 +16,9 @@ _WIN_ENV_PATTERN = re.compile(r"%(?:[^%]+)%")
 
 
 def _get_env(name: str) -> Optional[str]:
-    """Return the value of ``name`` stripped of whitespace or ``None`` when unset."""
-    value = os.environ.get(name)
-    if value:
-        value = value.strip()
-        if value:
-            return value
-    return None
+    """Return ``name``'s value stripped of whitespace or ``None`` when unset."""
+    value = os.environ.get(name, "").strip()
+    return value or None
 
 
 def _has_unexpanded_vars(path_str: str) -> bool:

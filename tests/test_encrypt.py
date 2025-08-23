@@ -83,3 +83,27 @@ def test_encrypt_decrypt_empty_plaintext():
     # Assert that the decrypted plaintext matches the original plaintext
     assert decrypted_bytes is not None
     assert decrypted_bytes == plaintext_bytes
+
+
+def test_encrypt_decrypt_str_plaintext():
+    # Generate RSA key pair
+    private_key, public_key = generate_keys()
+
+    # Plaintext string
+    plaintext_str = "Hello, token.place!"
+
+    # Encrypt the plaintext directly from str
+    ciphertext_dict, cipherkey, iv = encrypt(plaintext_str, public_key)
+
+    # Assert that the ciphertext and cipherkey are generated
+    assert "iv" in ciphertext_dict
+    assert "ciphertext" in ciphertext_dict
+    assert cipherkey is not None
+    assert iv is not None
+
+    # Decrypt the ciphertext
+    decrypted_bytes = decrypt(ciphertext_dict, cipherkey, private_key)
+
+    # Assert that the decrypted plaintext matches the original plaintext
+    assert decrypted_bytes is not None
+    assert decrypted_bytes.decode("utf-8") == plaintext_str

@@ -55,12 +55,16 @@ def generate_keys() -> Tuple[bytes, bytes]:
 
     return private_key_pem, public_key_pem
 
-def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False) -> Tuple[Dict[str, bytes], bytes, bytes]:
+def encrypt(
+    plaintext: bytes | str,
+    public_key_pem: bytes,
+    use_pkcs1v15: bool = False,
+) -> Tuple[Dict[str, bytes], bytes, bytes]:
     """
     Encrypt plaintext using AES-CBC with a random key, then encrypt that key with RSA.
 
     Args:
-        plaintext: The data to encrypt
+        plaintext: The data to encrypt. ``bytes`` are used as-is; ``str`` is UTF-8 encoded.
         public_key_pem: RSA public key in PEM format
 
     Returns:
@@ -79,8 +83,15 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
     cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
 
-    # We need to pad the plaintext to a multiple of 16 bytes
-    padded_data = pkcs7_pad(plaintext, 16)
+    # Convert plaintext to bytes and pad to a multiple of 16 bytes
+    if isinstance(plaintext, str):
+        plaintext_bytes = plaintext.encode("utf-8")
+    elif isinstance(plaintext, (bytes, bytearray)):
+        plaintext_bytes = bytes(plaintext)
+    else:
+        raise TypeError("plaintext must be bytes or str")
+
+    padded_data = pkcs7_pad(plaintext_bytes, 16)
     ciphertext = encryptor.update(padded_data) + encryptor.finalize()
 
     # Now encrypt the AES key with RSA

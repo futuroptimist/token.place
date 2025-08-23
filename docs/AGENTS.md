@@ -22,7 +22,8 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 
 ## Core Components
 
-- [encrypt.py](../encrypt.py): The core encryption/decryption implementation in Python
+- [encrypt.py](../encrypt.py): The core encryption/decryption implementation in Python. Accepts
+  plaintext as bytes or UTF-8 strings.
 - [static/chat.js](../static/chat.js): JavaScript client library for encryption/decryption in browsers
 - [utils/crypto/crypto_manager.py](../utils/crypto/crypto_manager.py): Python class managing key generation and encryption/decryption operations
 - [server.py](../server.py): Main server implementation for the proxy service

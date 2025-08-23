@@ -178,6 +178,19 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
         raise ValueError("path cannot be empty")
     return pathlib.Path(expanded).expanduser().resolve()
 
+def is_subpath(
+    path: Union[str, os.PathLike[str]],
+    parent: Union[str, os.PathLike[str]],
+) -> bool:
+    """Return ``True`` if ``path`` is the same as or lies within ``parent``."""
+    path = normalize_path(path)
+    parent = normalize_path(parent)
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
 def get_relative_path(
     path: Union[str, os.PathLike[str]],
     base_path: Optional[Union[str, os.PathLike[str]]] = None,

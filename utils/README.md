@@ -30,6 +30,7 @@ Environment variable values are stripped of surrounding whitespace before use.
 - `get_logs_dir()`: Returns the platform-specific logs directory, creating it if missing.
 - `get_temp_dir()`: Returns a token.place subdirectory inside the system temporary
   directory and ensures it exists.
+- `is_subpath(path, parent)`: Returns `True` when `path` is the same as or within `parent`.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives
   (Windows), the absolute `path` is returned instead of raising an error. Passing a

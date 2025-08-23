@@ -38,7 +38,11 @@ playwright install --with-deps chromium
 pip install pre-commit
 pre-commit install
 pre-commit run --all-files
+npm run lint
+npm run test:ci
 ```
+
+Verify code style and tests with `npm run lint` and `npm run test:ci`.
 
 The development requirements live in [requirements.txt](requirements.txt).
 

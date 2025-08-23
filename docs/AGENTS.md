@@ -10,7 +10,9 @@ Key components:
 - Hybrid RSA/AES encryption system ensuring secure message exchange
 - Cross-language compatibility between Python and JavaScript implementations
 
-Important: Always stylize the project name as lowercase `token.place` (not Title case "Token.place") to emphasize that it's a URL.
+Important: Always stylize the project name as lowercase `token.place` (not Title case
+"Token.place") to emphasize that it's a URL. See
+[STYLE_GUIDE.md](STYLE_GUIDE.md) for full branding guidelines.
 
 ## Setup and Installation
 

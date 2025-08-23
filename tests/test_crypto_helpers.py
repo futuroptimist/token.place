@@ -128,6 +128,17 @@ def test_error_handling():
         result = client.fetch_server_public_key()
         assert result is False
 
+    # Set a server key for additional validation
+    client.server_public_key = generate_keys()[1]
+
+    # Unsupported message types should raise TypeError
+    with pytest.raises(TypeError):
+        client.encrypt_message(123)
+
+    # None message should raise ValueError after server key is set
+    with pytest.raises(ValueError, match="message cannot be None"):
+        client.encrypt_message(None)
+
 @patch('utils.crypto_helpers.requests')
 @patch('utils.crypto_helpers.time')  # Mock time.sleep
 def test_send_chat_message(_mock_time, mock_requests):

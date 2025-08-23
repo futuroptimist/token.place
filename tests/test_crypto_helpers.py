@@ -84,6 +84,13 @@ def test_encrypt_message():
     assert 'cipherkey' in encrypted
     assert 'iv' in encrypted
 
+    # Test with bytes
+    test_bytes = b"binary data\x00"
+    encrypted = client.encrypt_message(test_bytes)
+    assert 'ciphertext' in encrypted
+    assert 'cipherkey' in encrypted
+    assert 'iv' in encrypted
+
 def test_send_encrypted_message(mock_crypto_client):
     """Test sending an encrypted message"""
     client, mock_requests = mock_crypto_client

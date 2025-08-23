@@ -17,12 +17,14 @@ _WIN_ENV_PATTERN = re.compile(r"%(?:[^%]+)%")
 
 def _get_env(name: str) -> Optional[str]:
     """Return the value of ``name`` stripped of whitespace or ``None`` when unset."""
-    value = os.environ.get(name)
-    if value:
-        value = value.strip()
-        if value:
-            return value
-    return None
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+def _get_env_path(name: str, fallback: pathlib.Path) -> pathlib.Path:
+    """Return ``name`` from environment as ``Path`` or ``fallback`` if unset."""
+    value = _get_env(name)
+    return pathlib.Path(value) if value else fallback
 
 
 def _has_unexpanded_vars(path_str: str) -> bool:
@@ -41,19 +43,11 @@ def get_app_data_dir() -> pathlib.Path:
     - Linux: $XDG_DATA_HOME/token.place or ~/.local/share/token.place
     """
     if IS_WINDOWS:
-        appdata = _get_env('APPDATA')
-        if appdata:
-            base_dir = pathlib.Path(appdata)
-        else:
-            base_dir = get_user_home_dir() / 'AppData' / 'Roaming'
+        base_dir = _get_env_path('APPDATA', get_user_home_dir() / 'AppData' / 'Roaming')
     elif IS_MACOS:
         base_dir = get_user_home_dir() / 'Library' / 'Application Support'
     else:  # Linux and other Unix-like
-        xdg_data_home = _get_env('XDG_DATA_HOME')
-        if xdg_data_home:
-            base_dir = pathlib.Path(xdg_data_home)
-        else:
-            base_dir = get_user_home_dir() / '.local' / 'share'
+        base_dir = _get_env_path('XDG_DATA_HOME', get_user_home_dir() / '.local' / 'share')
     return ensure_dir_exists(base_dir / 'token.place')
 
 def get_config_dir() -> pathlib.Path:
@@ -66,11 +60,7 @@ def get_config_dir() -> pathlib.Path:
     if IS_WINDOWS or IS_MACOS:
         return ensure_dir_exists(get_app_data_dir() / 'config')
     else:  # Linux and other Unix-like
-        xdg_config_home = _get_env('XDG_CONFIG_HOME')
-        if xdg_config_home:
-            base_dir = pathlib.Path(xdg_config_home)
-        else:
-            base_dir = get_user_home_dir() / '.config'
+        base_dir = _get_env_path('XDG_CONFIG_HOME', get_user_home_dir() / '.config')
         return ensure_dir_exists(base_dir / 'token.place' / 'config')
 
 def get_cache_dir() -> pathlib.Path:
@@ -81,20 +71,12 @@ def get_cache_dir() -> pathlib.Path:
     - Linux: $XDG_CACHE_HOME/token.place or ~/.cache/token.place
     """
     if IS_WINDOWS:
-        local_appdata = _get_env('LOCALAPPDATA')
-        if local_appdata:
-            base_dir = pathlib.Path(local_appdata)
-        else:
-            base_dir = get_user_home_dir() / 'AppData' / 'Local'
+        base_dir = _get_env_path('LOCALAPPDATA', get_user_home_dir() / 'AppData' / 'Local')
         return ensure_dir_exists(base_dir / 'token.place' / 'cache')
     elif IS_MACOS:
         return ensure_dir_exists(get_user_home_dir() / 'Library' / 'Caches' / 'token.place')
     else:  # Linux and other Unix-like
-        xdg_cache_home = _get_env('XDG_CACHE_HOME')
-        if xdg_cache_home:
-            base_dir = pathlib.Path(xdg_cache_home)
-        else:
-            base_dir = get_user_home_dir() / '.cache'
+        base_dir = _get_env_path('XDG_CACHE_HOME', get_user_home_dir() / '.cache')
         return ensure_dir_exists(base_dir / 'token.place')
 
 
@@ -119,11 +101,7 @@ def get_logs_dir() -> pathlib.Path:
             get_user_home_dir() / 'Library' / 'Logs' / 'token.place'
         )
     else:  # Linux and other Unix-like
-        xdg_state_home = _get_env('XDG_STATE_HOME')
-        if xdg_state_home:
-            base_dir = pathlib.Path(xdg_state_home)
-        else:
-            base_dir = get_user_home_dir() / '.local' / 'state'
+        base_dir = _get_env_path('XDG_STATE_HOME', get_user_home_dir() / '.local' / 'state')
         return ensure_dir_exists(base_dir / 'token.place' / 'logs')
 
 def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:

@@ -31,6 +31,23 @@ def _has_unexpanded_vars(path_str: str) -> bool:
     """Return True if ``path_str`` still contains environment variable markers."""
     return bool(_UNIX_ENV_PATTERN.search(path_str) or _WIN_ENV_PATTERN.search(path_str))
 
+
+def _expand_and_normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
+    """Expand environment vars and ``~`` then return an absolute ``Path``.
+
+    Strips surrounding whitespace to avoid accidental directory names and raises
+    ``ValueError`` when environment variables remain unexpanded or the path is
+    empty. ``TypeError`` is raised when ``path`` is not path-like.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be path-like")
+    expanded = os.path.expandvars(os.fspath(path)).strip()
+    if _has_unexpanded_vars(expanded):
+        raise ValueError("path contains unexpanded environment variables")
+    if expanded == "":
+        raise ValueError("path cannot be empty")
+    return pathlib.Path(expanded).expanduser().resolve()
+
 def get_user_home_dir() -> pathlib.Path:
     """Get the user's home directory path in a cross-platform way."""
     return pathlib.Path.home()
@@ -116,17 +133,7 @@ def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     if dir_path is None:
         raise TypeError("dir_path cannot be None")
-    if not isinstance(dir_path, (str, os.PathLike)):
-        raise TypeError("dir_path must be path-like")
-
-    # Expand environment variables and user home (~), then normalize
-    # Also strip surrounding whitespace to avoid creating unintended paths
-    path_str = os.path.expandvars(os.fspath(dir_path)).strip()
-    if _has_unexpanded_vars(path_str):
-        raise ValueError("dir_path contains unexpanded environment variables")
-    if path_str == "":
-        raise ValueError("dir_path cannot be empty")
-    path = pathlib.Path(path_str).expanduser().resolve()
+    path = _expand_and_normalize_path(dir_path)
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
     path.mkdir(parents=True, exist_ok=True)
@@ -146,15 +153,7 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     if path is None:
         raise TypeError("path cannot be None")
-    if not isinstance(path, (str, os.PathLike)):
-        raise TypeError("path must be path-like")
-
-    expanded = os.path.expandvars(os.fspath(path)).strip()
-    if _has_unexpanded_vars(expanded):
-        raise ValueError("path contains unexpanded environment variables")
-    if expanded == "":
-        raise ValueError("path cannot be empty")
-    return pathlib.Path(expanded).expanduser().resolve()
+    return _expand_and_normalize_path(path)
 
 def get_relative_path(
     path: Union[str, os.PathLike[str]],

@@ -11,6 +11,9 @@
 - Handle EOF in simplified CLI client to end sessions cleanly
 - Deep copy default configuration to prevent cross-test mutations
 
+### Maintenance
+- Bump Playwright dev dependency to v1.55.0
+
 ## Version 1.0.0 (March 2025)
 
 ### New Features

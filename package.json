@@ -39,6 +39,6 @@
     "selenium-webdriver": "^4.35.0"
   },
   "devDependencies": {
-    "playwright": "^1.54.1"
+    "playwright": "^1.55.0"
   }
 }

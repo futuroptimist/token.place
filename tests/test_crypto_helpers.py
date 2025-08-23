@@ -113,6 +113,12 @@ def test_error_handling():
     with pytest.raises(ValueError):
         client.encrypt_message("This should fail")
 
+    # Test encrypt_message with None message
+    _, public_key = generate_keys()
+    client.server_public_key = public_key
+    with pytest.raises(ValueError):
+        client.encrypt_message(None)
+
     # Mock a failed server key fetch
     with patch('utils.crypto_helpers.requests.get') as mock_get:
         mock_response = MagicMock()

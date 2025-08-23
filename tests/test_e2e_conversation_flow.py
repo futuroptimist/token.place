@@ -7,6 +7,7 @@ import signal
 from contextlib import contextmanager
 import requests
 from typing import Generator, List
+import sys
 
 from tests.utils.client_simulator import ClientSimulator
 
@@ -30,7 +31,7 @@ def start_server(use_mock_llm: bool = True) -> Generator[None, None, None]:
         env['USE_MOCK_LLM'] = '1'
 
     # Start the server process
-    server_cmd = ["python", "server.py", "--server_port", "3000", "--relay_port", "5000"]
+    server_cmd = [sys.executable, "server.py", "--server_port", "3000", "--relay_port", "5000"]
     if use_mock_llm:
         server_cmd.append("--use_mock_llm")
 
@@ -82,7 +83,7 @@ def start_relay() -> Generator[None, None, None]:
         None
     """
     # Start the relay process
-    relay_cmd = ["python", "relay.py", "--port", "5000"]
+    relay_cmd = [sys.executable, "relay.py", "--port", "5000"]
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
     process = subprocess.Popen(

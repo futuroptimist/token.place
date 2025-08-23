@@ -1,4 +1,5 @@
 import importlib
+import importlib
 import os
 import pathlib
 import platform
@@ -18,6 +19,19 @@ class DummyPath:
     def __fspath__(self) -> str:  # pragma: no cover - trivial
         return str(self._path)
 
+
+def test_get_env_unset(monkeypatch):
+    """_get_env should return None when the variable is missing or blank."""
+    monkeypatch.delenv("TP_MISSING", raising=False)
+    assert ph._get_env("TP_MISSING") is None
+    monkeypatch.setenv("TP_MISSING", "   ")
+    assert ph._get_env("TP_MISSING") is None
+
+
+def test_get_env_strips_whitespace(monkeypatch):
+    """_get_env should strip surrounding whitespace from the value."""
+    monkeypatch.setenv("TP_VALUE", "  actual  ")
+    assert ph._get_env("TP_VALUE") == "actual"
 
 def test_ensure_dir_exists_existing(tmp_path):
     p = tmp_path / 'sub'
@@ -227,3 +241,24 @@ def test_normalize_path_invalid_type():
     """normalize_path should reject non-path-like values"""
     with pytest.raises(TypeError):
         ph.normalize_path(123)  # type: ignore[arg-type]
+
+
+def test_is_subpath(tmp_path):
+    """is_subpath should detect when a path lies within a base directory"""
+    base = tmp_path / "base"
+    sub = base / "child"
+    other = tmp_path / "other"
+    base.mkdir()
+    sub.mkdir()
+    other.mkdir()
+    assert ph.is_subpath(sub, base) is True
+    assert ph.is_subpath(base, base) is True
+    assert ph.is_subpath(other, base) is False
+
+
+def test_get_env_strips_and_handles_missing(monkeypatch):
+    """_get_env should strip whitespace and return None when unset."""
+    monkeypatch.delenv("TP_TEST_ENV", raising=False)
+    assert ph._get_env("TP_TEST_ENV") is None
+    monkeypatch.setenv("TP_TEST_ENV", "  value  ")
+    assert ph._get_env("TP_TEST_ENV") == "value"

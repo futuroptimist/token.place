@@ -30,6 +30,7 @@ Environment variable values are stripped of surrounding whitespace before use.
 - `get_logs_dir()`: Returns the platform-specific logs directory, creating it if missing.
 - `get_temp_dir()`: Returns a token.place subdirectory inside the system temporary
   directory and ensures it exists.
+- `is_subpath(path, parent)`: Returns `True` when `path` is the same as or within `parent`.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives
   (Windows), the absolute `path` is returned instead of raising an error. Passing a
@@ -38,9 +39,10 @@ Environment variable values are stripped of surrounding whitespace before use.
 ### Crypto Helpers (`crypto_helpers.py`)
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
-`CryptoClient.decrypt_message` now validates required fields and returns `None` when data is incomplete or
-malformed to prevent unexpected exceptions. `CryptoClient.send_encrypted_message` returns `None` when a 200 OK
-response cannot be decoded as JSON, avoiding unhandled `ValueError` exceptions.
+`CryptoClient.decrypt_message` now validates required fields, returns `None` when data is incomplete or
+malformed to prevent unexpected exceptions, and correctly yields an empty string when the decrypted content is empty.
+`CryptoClient.send_encrypted_message` returns `None` when a 200 OK response cannot be decoded as JSON, avoiding
+unhandled `ValueError` exceptions.
 
 ### Crypto Manager (`crypto/crypto_manager.py`)
 
@@ -55,7 +57,8 @@ hanging connections. You can override this by passing a `timeout` argument to
 `encrypt_message` validates inputs, raising a `ValueError` for `None` and a
 `TypeError` for unsupported message types to avoid confusing cryptography
 errors. Passing `None` previously encrypted the string "None"; now it raises
-`ValueError` to surface invalid inputs early.
+`ValueError` to surface invalid inputs early. `encrypt_message` also accepts
+raw ``bytes`` messages in addition to strings and JSON-serializable objects.
 
 ## Crypto Helpers
 

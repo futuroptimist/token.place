@@ -4,6 +4,7 @@
 
 ### Added
 - Provide `get_temp_dir()` utility for temporary token.place files
+- Add `clear_server_public_key()` to `CryptoClient` for resetting cached server keys
 
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input

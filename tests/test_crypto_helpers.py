@@ -62,6 +62,17 @@ def test_fetch_server_public_key(mock_crypto_client):
     assert client.server_public_key is not None
     assert client.server_public_key_b64 is not None
 
+
+def test_clear_server_public_key(mock_crypto_client):
+    """Clearing the server key resets client state"""
+    client, _ = mock_crypto_client
+    assert client.fetch_server_public_key() is True
+    assert client.has_server_public_key() is True
+    client.clear_server_public_key()
+    assert client.server_public_key is None
+    assert client.server_public_key_b64 is None
+    assert client.has_server_public_key() is False
+
 def test_encrypt_message():
     """Test encrypting a message"""
     client = CryptoClient('https://test-server.com')

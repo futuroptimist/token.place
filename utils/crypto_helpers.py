@@ -81,6 +81,11 @@ class CryptoClient:
         """Return True if a server public key has been loaded."""
         return self.server_public_key is not None
 
+    def clear_server_public_key(self) -> None:
+        """Clear any cached server public key to force a refetch."""
+        self.server_public_key = None
+        self.server_public_key_b64 = None
+
     def fetch_server_public_key(self, endpoint: str = "/next_server", timeout: float = 10) -> bool:
         """Fetch the server's public key.
 

@@ -27,6 +27,8 @@ Secure peer-to-peer generative AI platform
 
 # Quickstart
 
+Ensure you have Node.js 18+ installed.
+
 ```bash
 git clone https://github.com/futuroptimist/token.place.git
 cd token.place
@@ -732,4 +734,4 @@ token.place intentionally avoids storing user prompts or LLM responses in logs t
 
 ## License
 
-This project is licensed under the terms in [LICENSE](LICENSE).
+This project is licensed under the MIT License as detailed in [LICENSE](LICENSE).

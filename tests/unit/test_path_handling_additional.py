@@ -241,3 +241,11 @@ def test_normalize_path_invalid_type():
     """normalize_path should reject non-path-like values"""
     with pytest.raises(TypeError):
         ph.normalize_path(123)  # type: ignore[arg-type]
+
+
+def test_get_env_strips_and_handles_missing(monkeypatch):
+    """_get_env should strip whitespace and return None when unset."""
+    monkeypatch.delenv("TP_TEST_ENV", raising=False)
+    assert ph._get_env("TP_TEST_ENV") is None
+    monkeypatch.setenv("TP_TEST_ENV", "  value  ")
+    assert ph._get_env("TP_TEST_ENV") == "value"

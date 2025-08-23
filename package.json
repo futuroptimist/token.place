@@ -27,7 +27,10 @@
     "P2P"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "bugs": {
     "url": "https://github.com/futuroptimist/token.place/issues"
   },
@@ -39,6 +42,6 @@
     "selenium-webdriver": "^4.35.0"
   },
   "devDependencies": {
-    "playwright": "^1.54.1"
+    "playwright": "^1.55.0"
   }
 }

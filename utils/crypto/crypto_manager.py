@@ -19,30 +19,28 @@ def get_config_lazy():
     return get_config()
 
 def log_info(message):
-    """Log info only in non-production environments"""
+    """Log info only in non-production environments."""
+    config = None
     try:
         config = get_config_lazy()
-        if not config.is_production:
-            logger.info(message)
     except Exception:
-        # Fallback to always log if config is not available
+        pass
+    if config is None or not config.is_production:
         logger.info(message)
 
 def log_error(message, exc_info=False):
     """Log errors in all environments.
 
-    In production environments, stack traces are suppressed even if
-    ``exc_info`` is set to avoid leaking sensitive information.
+    In production, stack traces are suppressed even when ``exc_info`` is True to avoid
+    leaking sensitive information.
     """
+    config = None
     try:
         config = get_config_lazy()
-        if config.is_production:
-            logger.error(message)
-        else:
-            logger.error(message, exc_info=exc_info)
     except Exception:
-        # Fallback to always log if config is not available
-        logger.error(message, exc_info=exc_info)
+        pass
+    show_exc = exc_info and (config is None or not config.is_production)
+    logger.error(message, exc_info=show_exc)
 
 class CryptoManager:
     """

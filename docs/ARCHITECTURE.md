@@ -43,6 +43,8 @@ token.place is an end-to-end encrypted proxy service that sits between clients a
 - **Encryption Implementation** (`encrypt.py`):
   - Provides the core encryption and decryption functions
   - Implements hybrid RSA-AES encryption
+  - Uses RSA-OAEP by default with an optional PKCS#1 v1.5 mode for legacy JavaScript
+    compatibility
   - Ensures compatibility between Python and JavaScript implementations
 
 ## Data Flow

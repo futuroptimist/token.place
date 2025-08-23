@@ -39,9 +39,10 @@ Environment variable values are stripped of surrounding whitespace before use.
 ### Crypto Helpers (`crypto_helpers.py`)
 
 Simplifies encryption and decryption operations for end-to-end encrypted communication with the token.place server and relay.
-`CryptoClient.decrypt_message` now validates required fields and returns `None` when data is incomplete or
-malformed to prevent unexpected exceptions. `CryptoClient.send_encrypted_message` returns `None` when a 200 OK
-response cannot be decoded as JSON, avoiding unhandled `ValueError` exceptions.
+`CryptoClient.decrypt_message` now validates required fields, returns `None` when data is incomplete or
+malformed to prevent unexpected exceptions, and correctly yields an empty string when the decrypted content is empty.
+`CryptoClient.send_encrypted_message` returns `None` when a 200 OK response cannot be decoded as JSON, avoiding
+unhandled `ValueError` exceptions.
 
 ### Crypto Manager (`crypto/crypto_manager.py`)
 

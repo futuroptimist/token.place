@@ -17,17 +17,36 @@ _WIN_ENV_PATTERN = re.compile(r"%(?:[^%]+)%")
 
 def _get_env(name: str) -> Optional[str]:
     """Return the value of ``name`` stripped of whitespace or ``None`` when unset."""
-    value = os.environ.get(name)
-    if value:
-        value = value.strip()
-        if value:
-            return value
-    return None
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+def _get_env_path(name: str, fallback: pathlib.Path) -> pathlib.Path:
+    """Return ``name`` from environment as ``Path`` or ``fallback`` if unset."""
+    value = _get_env(name)
+    return pathlib.Path(value) if value else fallback
 
 
 def _has_unexpanded_vars(path_str: str) -> bool:
     """Return True if ``path_str`` still contains environment variable markers."""
     return bool(_UNIX_ENV_PATTERN.search(path_str) or _WIN_ENV_PATTERN.search(path_str))
+
+
+def _expand_and_normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
+    """Expand environment vars and ``~`` then return an absolute ``Path``.
+
+    Strips surrounding whitespace to avoid accidental directory names and raises
+    ``ValueError`` when environment variables remain unexpanded or the path is
+    empty. ``TypeError`` is raised when ``path`` is not path-like.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be path-like")
+    expanded = os.path.expandvars(os.fspath(path)).strip()
+    if _has_unexpanded_vars(expanded):
+        raise ValueError("path contains unexpanded environment variables")
+    if expanded == "":
+        raise ValueError("path cannot be empty")
+    return pathlib.Path(expanded).expanduser().resolve()
 
 def get_user_home_dir() -> pathlib.Path:
     """Get the user's home directory path in a cross-platform way."""
@@ -41,19 +60,11 @@ def get_app_data_dir() -> pathlib.Path:
     - Linux: $XDG_DATA_HOME/token.place or ~/.local/share/token.place
     """
     if IS_WINDOWS:
-        appdata = _get_env('APPDATA')
-        if appdata:
-            base_dir = pathlib.Path(appdata)
-        else:
-            base_dir = get_user_home_dir() / 'AppData' / 'Roaming'
+        base_dir = _get_env_path('APPDATA', get_user_home_dir() / 'AppData' / 'Roaming')
     elif IS_MACOS:
         base_dir = get_user_home_dir() / 'Library' / 'Application Support'
     else:  # Linux and other Unix-like
-        xdg_data_home = _get_env('XDG_DATA_HOME')
-        if xdg_data_home:
-            base_dir = pathlib.Path(xdg_data_home)
-        else:
-            base_dir = get_user_home_dir() / '.local' / 'share'
+        base_dir = _get_env_path('XDG_DATA_HOME', get_user_home_dir() / '.local' / 'share')
     return ensure_dir_exists(base_dir / 'token.place')
 
 def get_config_dir() -> pathlib.Path:
@@ -66,11 +77,7 @@ def get_config_dir() -> pathlib.Path:
     if IS_WINDOWS or IS_MACOS:
         return ensure_dir_exists(get_app_data_dir() / 'config')
     else:  # Linux and other Unix-like
-        xdg_config_home = _get_env('XDG_CONFIG_HOME')
-        if xdg_config_home:
-            base_dir = pathlib.Path(xdg_config_home)
-        else:
-            base_dir = get_user_home_dir() / '.config'
+        base_dir = _get_env_path('XDG_CONFIG_HOME', get_user_home_dir() / '.config')
         return ensure_dir_exists(base_dir / 'token.place' / 'config')
 
 def get_cache_dir() -> pathlib.Path:
@@ -81,20 +88,12 @@ def get_cache_dir() -> pathlib.Path:
     - Linux: $XDG_CACHE_HOME/token.place or ~/.cache/token.place
     """
     if IS_WINDOWS:
-        local_appdata = _get_env('LOCALAPPDATA')
-        if local_appdata:
-            base_dir = pathlib.Path(local_appdata)
-        else:
-            base_dir = get_user_home_dir() / 'AppData' / 'Local'
+        base_dir = _get_env_path('LOCALAPPDATA', get_user_home_dir() / 'AppData' / 'Local')
         return ensure_dir_exists(base_dir / 'token.place' / 'cache')
     elif IS_MACOS:
         return ensure_dir_exists(get_user_home_dir() / 'Library' / 'Caches' / 'token.place')
     else:  # Linux and other Unix-like
-        xdg_cache_home = _get_env('XDG_CACHE_HOME')
-        if xdg_cache_home:
-            base_dir = pathlib.Path(xdg_cache_home)
-        else:
-            base_dir = get_user_home_dir() / '.cache'
+        base_dir = _get_env_path('XDG_CACHE_HOME', get_user_home_dir() / '.cache')
         return ensure_dir_exists(base_dir / 'token.place')
 
 
@@ -119,11 +118,7 @@ def get_logs_dir() -> pathlib.Path:
             get_user_home_dir() / 'Library' / 'Logs' / 'token.place'
         )
     else:  # Linux and other Unix-like
-        xdg_state_home = _get_env('XDG_STATE_HOME')
-        if xdg_state_home:
-            base_dir = pathlib.Path(xdg_state_home)
-        else:
-            base_dir = get_user_home_dir() / '.local' / 'state'
+        base_dir = _get_env_path('XDG_STATE_HOME', get_user_home_dir() / '.local' / 'state')
         return ensure_dir_exists(base_dir / 'token.place' / 'logs')
 
 def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
@@ -138,17 +133,7 @@ def ensure_dir_exists(dir_path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     if dir_path is None:
         raise TypeError("dir_path cannot be None")
-    if not isinstance(dir_path, (str, os.PathLike)):
-        raise TypeError("dir_path must be path-like")
-
-    # Expand environment variables and user home (~), then normalize
-    # Also strip surrounding whitespace to avoid creating unintended paths
-    path_str = os.path.expandvars(os.fspath(dir_path)).strip()
-    if _has_unexpanded_vars(path_str):
-        raise ValueError("dir_path contains unexpanded environment variables")
-    if path_str == "":
-        raise ValueError("dir_path cannot be empty")
-    path = pathlib.Path(path_str).expanduser().resolve()
+    path = _expand_and_normalize_path(dir_path)
     if path.exists() and not path.is_dir():
         raise NotADirectoryError(f"{path} exists and is not a directory")
     path.mkdir(parents=True, exist_ok=True)
@@ -168,15 +153,7 @@ def normalize_path(path: Union[str, os.PathLike[str]]) -> pathlib.Path:
     """
     if path is None:
         raise TypeError("path cannot be None")
-    if not isinstance(path, (str, os.PathLike)):
-        raise TypeError("path must be path-like")
-
-    expanded = os.path.expandvars(os.fspath(path)).strip()
-    if _has_unexpanded_vars(expanded):
-        raise ValueError("path contains unexpanded environment variables")
-    if expanded == "":
-        raise ValueError("path cannot be empty")
-    return pathlib.Path(expanded).expanduser().resolve()
+    return _expand_and_normalize_path(path)
 
 def is_subpath(
     path: Union[str, os.PathLike[str]],

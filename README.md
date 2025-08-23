@@ -27,6 +27,8 @@ Secure peer-to-peer generative AI platform
 
 # Quickstart
 
+Ensure you have Node.js 18+ installed.
+
 ```bash
 git clone https://github.com/futuroptimist/token.place.git
 cd token.place
@@ -68,6 +70,14 @@ Open `http://localhost:5000` or run `python client.py`. For a minimal client use
 `python client_simplified.py`; it clears the screen when running interactively using ANSI codes
 with flushed output. Metrics are exposed at `/metrics`.
 
+### Key environment variables
+
+| Variable        | Default     | Description                                               |
+|-----------------|-------------|-----------------------------------------------------------|
+| API_RATE_LIMIT  | 60/hour     | Per-IP rate limit for API requests                        |
+| API_DAILY_QUOTA | 1000/day    | Per-IP daily request quota                                |
+| USE_MOCK_LLM    | 0           | Use mock LLM instead of downloading a model (`1` to enable)|
+| TOKEN_PLACE_ENV | development | Deployment environment (`development`, `testing`, `production`) |
 ## CI pass criteria
 
 All pull requests must:
@@ -593,6 +603,8 @@ GET /v1/public-key
 }
 ```
 
+`client_public_key` may be provided as a PEM-formatted string or a base64-encoded key.
+
 The server will encrypt its response with your public key, ensuring end-to-end encryption.
 
 ## System Architecture
@@ -732,4 +744,4 @@ token.place intentionally avoids storing user prompts or LLM responses in logs t
 
 ## License
 
-This project is licensed under the terms in [LICENSE](LICENSE).
+This project is licensed under the MIT License as detailed in [LICENSE](LICENSE).

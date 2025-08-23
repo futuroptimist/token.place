@@ -4,12 +4,16 @@
 
 ### Added
 - Provide `get_temp_dir()` utility for temporary token.place files
+- Include `service` field in `/api/v1/health` responses
 
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input
 - Remove unused imports from simplified CLI client to avoid unnecessary dependencies
 - Handle EOF in simplified CLI client to end sessions cleanly
 - Deep copy default configuration to prevent cross-test mutations
+
+### Maintenance
+- Bump Playwright dev dependency to v1.55.0
 
 ## Version 1.0.0 (March 2025)
 

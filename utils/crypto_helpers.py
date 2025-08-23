@@ -133,30 +133,32 @@ class CryptoClient:
             )
             return False
 
-    def encrypt_message(self, message: Union[Dict, List, str]) -> Dict[str, str]:
+    def encrypt_message(self, message: Union[Dict, List, str, bytes]) -> Dict[str, str]:
         """
         Encrypt a message for the server.
 
         Args:
-            message: Message to encrypt (string, list, or dict). Must not be ``None``.
+            message: Message to encrypt (string, bytes, list, or dict). Must not be ``None``.
 
         Returns:
             Dictionary with base64-encoded ciphertext, cipherkey, and iv.
 
         Raises:
             ValueError: If ``message`` is ``None`` or the server key is missing.
-            TypeError: If ``message`` is not a ``dict``, ``list``, or ``str``.
+            TypeError: If ``message`` is not a ``dict``, ``list``, ``str``, or ``bytes``.
         """
         if self.server_public_key is None:
             raise ValueError("Server public key not available. Call fetch_server_public_key() first.")
         if message is None:
             raise ValueError("message cannot be None")
-        if not isinstance(message, (dict, list, str)):
+        if not isinstance(message, (dict, list, str, bytes)):
             raise TypeError(f"Unsupported message type: {type(message).__name__}")
 
         # Convert to JSON if it's a dict or list
         if isinstance(message, (dict, list)):
             plaintext = json.dumps(message).encode('utf-8')
+        elif isinstance(message, bytes):
+            plaintext = message
         else:
             plaintext = message.encode('utf-8')
 
@@ -181,6 +183,7 @@ class CryptoClient:
 
         Returns:
             Decrypted data (parsed from JSON if possible)
+            or an empty string when the decrypted content is empty
         """
         if self.client_private_key is None:
             raise ValueError("Client private key not available")
@@ -204,7 +207,7 @@ class CryptoClient:
         # Decrypt the data
         decrypted_bytes = decrypt(encrypted_response, encrypted_key, self.client_private_key)
 
-        if not decrypted_bytes:
+        if decrypted_bytes is None:
             logger.error("Decryption failed, got None")
             return None
 

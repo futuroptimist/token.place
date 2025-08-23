@@ -62,6 +62,8 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
     Args:
         plaintext: The data to encrypt
         public_key_pem: RSA public key in PEM format
+        use_pkcs1v15: Use PKCS#1 v1.5 padding instead of OAEP for RSA key encryption
+            (for compatibility with legacy JavaScript clients)
 
     Returns:
         Tuple (ciphertext_dict, encrypted_key, iv)

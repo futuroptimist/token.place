@@ -84,6 +84,13 @@ def test_encrypt_message():
     assert 'cipherkey' in encrypted
     assert 'iv' in encrypted
 
+    # Test with bytes
+    test_bytes = b"binary data\x00"
+    encrypted = client.encrypt_message(test_bytes)
+    assert 'ciphertext' in encrypted
+    assert 'cipherkey' in encrypted
+    assert 'iv' in encrypted
+
 def test_send_encrypted_message(mock_crypto_client):
     """Test sending an encrypted message"""
     client, mock_requests = mock_crypto_client
@@ -106,6 +113,12 @@ def test_error_handling():
     with pytest.raises(ValueError):
         client.encrypt_message("This should fail")
 
+    # Test encrypt_message with None message
+    _, public_key = generate_keys()
+    client.server_public_key = public_key
+    with pytest.raises(ValueError):
+        client.encrypt_message(None)
+
     # Mock a failed server key fetch
     with patch('utils.crypto_helpers.requests.get') as mock_get:
         mock_response = MagicMock()
@@ -114,6 +127,17 @@ def test_error_handling():
 
         result = client.fetch_server_public_key()
         assert result is False
+
+    # Set a server key for additional validation
+    client.server_public_key = generate_keys()[1]
+
+    # Unsupported message types should raise TypeError
+    with pytest.raises(TypeError):
+        client.encrypt_message(123)
+
+    # None message should raise ValueError after server key is set
+    with pytest.raises(ValueError, match="message cannot be None"):
+        client.encrypt_message(None)
 
 @patch('utils.crypto_helpers.requests')
 @patch('utils.crypto_helpers.time')  # Mock time.sleep

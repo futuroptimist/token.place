@@ -2,6 +2,7 @@ import base64
 import logging
 from unittest.mock import patch
 
+from encrypt import encrypt
 from utils.crypto_helpers import CryptoClient, logger
 
 
@@ -42,3 +43,14 @@ def test_send_api_request_old_format_decrypt_exception():
          patch('utils.crypto_helpers.encrypt', return_value=({'ciphertext': b'c', 'iv': b'i'}, b'k', b'i')), \
          patch.object(client, 'decrypt_message', side_effect=Exception('fail')):
         assert client.send_api_request([{'role': 'user', 'content': 'hi'}]) is None
+
+
+def test_decrypt_message_empty_plaintext():
+    client = CryptoClient('https://empty.test')
+    cipher_dict, enc_key, _ = encrypt(b'', client.client_public_key)
+    encrypted = {
+        'ciphertext': base64.b64encode(cipher_dict['ciphertext']).decode(),
+        'cipherkey': base64.b64encode(enc_key).decode(),
+        'iv': base64.b64encode(cipher_dict['iv']).decode(),
+    }
+    assert client.decrypt_message(encrypted) == ''

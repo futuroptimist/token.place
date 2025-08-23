@@ -181,6 +181,7 @@ class CryptoClient:
 
         Returns:
             Decrypted data (parsed from JSON if possible)
+            or an empty string when the decrypted content is empty
         """
         if self.client_private_key is None:
             raise ValueError("Client private key not available")
@@ -204,7 +205,7 @@ class CryptoClient:
         # Decrypt the data
         decrypted_bytes = decrypt(encrypted_response, encrypted_key, self.client_private_key)
 
-        if not decrypted_bytes:
+        if decrypted_bytes is None:
             logger.error("Decryption failed, got None")
             return None
 

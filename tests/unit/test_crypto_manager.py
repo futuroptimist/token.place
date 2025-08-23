@@ -7,7 +7,7 @@ import pytest
 import sys
 from unittest.mock import MagicMock, patch
 from pathlib import Path
-from encrypt import encrypt
+from encrypt import encrypt, decrypt, generate_keys
 
 # Add the project root to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -368,3 +368,16 @@ def test_decrypt_message_returns_bytes_for_non_utf8():
     }
     result = manager.decrypt_message(encrypted_data)
     assert result == message
+
+
+def test_encrypt_message_accepts_pem_string():
+    """encrypt_message accepts PEM-formatted client keys."""
+    manager = CryptoManager()
+    client_private, client_public = generate_keys()
+    pem_key = client_public.decode('utf-8')
+    encrypted = manager.encrypt_message("hello", pem_key)
+    ciphertext = base64.b64decode(encrypted['chat_history'])
+    cipherkey = base64.b64decode(encrypted['cipherkey'])
+    iv = base64.b64decode(encrypted['iv'])
+    decrypted = decrypt({'ciphertext': ciphertext, 'iv': iv}, cipherkey, client_private)
+    assert decrypted.decode('utf-8') == "hello"

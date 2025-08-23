@@ -118,10 +118,17 @@ class CryptoManager:
 
             # Ensure client_public_key is bytes
             if isinstance(client_public_key, str):
-                try:
-                    client_public_key = base64.b64decode(client_public_key)
-                except (binascii.Error, ValueError) as e:
-                    raise ValueError("Invalid base64-encoded public key") from e
+                if "-----BEGIN" in client_public_key:
+                    client_public_key = client_public_key.encode('utf-8')
+                else:
+                    try:
+                        client_public_key = base64.b64decode(
+                            client_public_key, validate=True
+                        )
+                    except (binascii.Error, ValueError) as e:
+                        raise ValueError(
+                            "Invalid base64-encoded public key"
+                        ) from e
 
             # Encrypt the message
             encrypted_data, encrypted_key, iv = encrypt(message_bytes, client_public_key)

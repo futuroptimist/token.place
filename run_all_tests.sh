@@ -1,10 +1,11 @@
 #!/bin/bash
 # Shell script to run all tests for token.place
 
-set -e
+# Fail on errors, unset variables, and pipeline failures
+set -euo pipefail
 
 # Enable coverage collection if TEST_COVERAGE=1
-if [ "$TEST_COVERAGE" = "1" ]; then
+if [ "${TEST_COVERAGE:-0}" = "1" ]; then
     echo "Coverage mode enabled"
     COVERAGE_ARGS="--cov=. --cov-append"
     COVERAGE_MODE=true
@@ -92,14 +93,14 @@ run_test "JavaScript Tests" "npm run test:js" "Testing JavaScript functionality"
 run_test "Cgroup Setup Script Tests" "bash tests/test_cgroup.sh" "Validating prepare-pi-cgroups.sh logic"
 
 # 8. Run E2E tests
-if [ "$RUN_E2E" = "1" ]; then
+if [ "${RUN_E2E:-0}" = "1" ]; then
     run_test "End-to-End Tests" "$PYTHON_CMD -m pytest tests/test_e2e_*.py -v $COVERAGE_ARGS" "Testing complete workflows"
 else
     echo "Skipping End-to-End Tests (set RUN_E2E=1 to enable)"
 fi
 
 # 9. Run failure recovery tests
-if [ "$RUN_E2E" = "1" ]; then
+if [ "${RUN_E2E:-0}" = "1" ]; then
     run_test "Failure Recovery Tests" "$PYTHON_CMD -m pytest tests/test_failure_recovery.py -v $COVERAGE_ARGS" "Testing system resilience against errors"
 else
     echo "Skipping Failure Recovery Tests (set RUN_E2E=1 to enable)"

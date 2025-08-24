@@ -59,6 +59,8 @@ hanging connections. You can override this by passing a `timeout` argument to
 errors. Passing `None` previously encrypted the string "None"; now it raises
 `ValueError` to surface invalid inputs early. `encrypt_message` also accepts
 raw ``bytes`` messages in addition to strings and JSON-serializable objects.
+It now trims whitespace from base64-encoded public keys before decoding so
+keys copied with line breaks do not raise errors.
 
 ## Crypto Helpers
 
@@ -72,6 +74,8 @@ The `CryptoClient` class provides a high-level abstraction over the encryption/d
 - Make encrypted API requests
 
 ### Basic Usage
+
+The `CryptoClient` requires a base URL with an explicit `http://` or `https://` scheme.
 
 ```python
 from utils.crypto_helpers import CryptoClient

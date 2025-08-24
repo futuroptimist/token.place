@@ -6,12 +6,12 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.0
+    rev: v2.4.1
     hooks:
       - id: codespell
         args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,package-lock.json,desktop/package-lock.json,*.svg,webapp/static/js/*"]
   - repo: https://github.com/jendrikseipp/vulture
-    rev: v2.7
+    rev: v2.14
     hooks:
       - id: vulture
         args: [".", "--min-confidence", "80", "--exclude", "node_modules,desktop/node_modules"]

@@ -724,6 +724,7 @@ pip install pre-commit
 pre-commit install
 pre-commit run --all-files
 ```
+These hooks run linting, tests, and spelling checks via codespell.
 
 ## Security
 

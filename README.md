@@ -44,6 +44,8 @@ pre-commit run --all-files
 
 ### Key environment variables
 
+Environment variables can be stored in a `.env` file and overridden in a `.env.local` file, which is ignored by git.
+
 | Variable        | Default      | Description                                                        |
 |-----------------|--------------|--------------------------------------------------------------------|
 | API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
@@ -66,6 +68,10 @@ Or start both services with Docker Compose:
 ```bash
 docker compose up --build
 ```
+
+Open `http://localhost:5000` or run `python client.py`. For a minimal client use
+`python client_simplified.py`; it clears the screen when running interactively using ANSI codes
+with flushed output. Metrics are exposed at `/metrics`.
 
 ## CI pass criteria
 

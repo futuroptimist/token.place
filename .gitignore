@@ -5,6 +5,7 @@ models.bak
 __pycache__
 .pytest_cache
 .env
+.env.local
 f2clipboard.py
 
 # Python

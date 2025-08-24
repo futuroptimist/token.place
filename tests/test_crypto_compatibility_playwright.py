@@ -52,10 +52,9 @@ def web_server():
     server_process = subprocess.Popen(
         server_cmd,
         cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         env=os.environ.copy(),
-        text=True
     )
 
     # Wait for the server to start

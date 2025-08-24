@@ -381,3 +381,11 @@ def test_encrypt_message_accepts_pem_string():
     iv = base64.b64decode(encrypted['iv'])
     decrypted = decrypt({'ciphertext': ciphertext, 'iv': iv}, cipherkey, client_private)
     assert decrypted.decode('utf-8') == "hello"
+
+
+def test_encrypt_message_accepts_base64_with_whitespace():
+    """encrypt_message handles base64 keys containing whitespace."""
+    manager = CryptoManager()
+    public_key_b64_with_ws = manager.public_key_b64 + "\n"
+    result = manager.encrypt_message("hello", public_key_b64_with_ws)
+    assert {"chat_history", "cipherkey", "iv"}.issubset(result)

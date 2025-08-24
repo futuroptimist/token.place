@@ -19,29 +19,38 @@ def get_config_lazy():
     from config import get_config
     return get_config()
 
-def log_info(message):
-    """Log info only in non-production environments."""
-    config = None
+def _log(level: str, message: str, *, exc_info: bool = False) -> None:
+    """Internal helper to log messages based on environment settings.
+
+    Info logs are suppressed in production; error logs always emit but hide
+    stack traces in production environments.
+    """
     try:
         config = get_config_lazy()
+        is_production = config.is_production
     except Exception:
-        pass
-    if config is None or not config.is_production:
-        logger.info(message)
+        is_production = False
 
-def log_error(message, exc_info=False):
+    logger_func = getattr(logger, level)
+    if level == "info":
+        if not is_production:
+            logger_func(message)
+    else:
+        logger_func(message, exc_info=exc_info and not is_production)
+
+
+def log_info(message: str) -> None:
+    """Log info only in non-production environments."""
+    _log("info", message)
+
+
+def log_error(message: str, exc_info: bool = False) -> None:
     """Log errors in all environments.
 
-    In production, stack traces are suppressed even when ``exc_info`` is True to avoid
-    leaking sensitive information.
+    In production, stack traces are suppressed even when ``exc_info`` is True
+    to avoid leaking sensitive information.
     """
-    config = None
-    try:
-        config = get_config_lazy()
-    except Exception:
-        pass
-    show_exc = exc_info and (config is None or not config.is_production)
-    logger.error(message, exc_info=show_exc)
+    _log("error", message, exc_info=exc_info)
 
 class CryptoManager:
     """

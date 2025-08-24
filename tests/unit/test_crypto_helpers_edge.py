@@ -1,6 +1,7 @@
 import base64
 import logging
 from unittest.mock import patch
+import pytest
 
 from encrypt import encrypt
 from utils.crypto_helpers import CryptoClient, logger
@@ -16,6 +17,12 @@ def _prep_client():
 def test_debug_logging_level():
     CryptoClient('https://debug.com', debug=True)
     assert logger.level == logging.DEBUG
+
+
+@pytest.mark.parametrize("url", ["", "example.com", "ftp://example.com"])
+def test_base_url_requires_scheme(url: str) -> None:
+    with pytest.raises(ValueError):
+        CryptoClient(url)
 
 
 def test_send_chat_message_list_branch():

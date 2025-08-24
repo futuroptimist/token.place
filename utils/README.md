@@ -73,6 +73,8 @@ The `CryptoClient` class provides a high-level abstraction over the encryption/d
 
 ### Basic Usage
 
+The `CryptoClient` requires a base URL with an explicit `http://` or `https://` scheme.
+
 ```python
 from utils.crypto_helpers import CryptoClient
 

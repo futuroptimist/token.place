@@ -51,9 +51,12 @@ class CryptoClient:
         Initialize the crypto client
 
         Args:
-            base_url: Base URL for the relay server
+            base_url: Base URL for the relay server. Must include http:// or https://.
             debug: Whether to enable debug logging
         """
+        base_url = base_url.strip()
+        if not base_url or not base_url.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
         self.base_url = base_url.rstrip('/')  # Remove trailing slash if present
         self.server_public_key = None
         self.server_public_key_b64 = None

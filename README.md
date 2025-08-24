@@ -27,7 +27,7 @@ Secure peer-to-peer generative AI platform
 
 # Quickstart
 
-Ensure you have Node.js 18+ installed.
+Ensure you have Node.js 18+ installed (`nvm use` respects the included .nvmrc).
 
 ```bash
 git clone https://github.com/futuroptimist/token.place.git

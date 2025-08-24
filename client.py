@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # Use an environment variable to determine the environment
 environment = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -36,7 +37,7 @@ def load_or_generate_client_keys():
     """Loads client keys if they exist, otherwise generates and saves them."""
     os.makedirs(CLIENT_KEYS_DIR, exist_ok=True)
     if os.path.exists(CLIENT_PRIVATE_KEY_FILE) and os.path.exists(CLIENT_PUBLIC_KEY_FILE):
-        print("Loading existing client keys...")
+        logger.info("Loading existing client keys...")
         with open(CLIENT_PRIVATE_KEY_FILE, "rb") as f:
             private_key = serialization.load_pem_private_key(
                 f.read(),
@@ -46,7 +47,7 @@ def load_or_generate_client_keys():
         with open(CLIENT_PUBLIC_KEY_FILE, "rb") as f:
             public_key_pem = f.read()
     else:
-        print("Generating new client keys...")
+        logger.info("Generating new client keys...")
         private_key, public_key_pem = generate_keys()
         # Save keys
         with open(CLIENT_PRIVATE_KEY_FILE, "wb") as f:
@@ -59,7 +60,7 @@ def load_or_generate_client_keys():
             )
         with open(CLIENT_PUBLIC_KEY_FILE, "wb") as f:
             f.write(public_key_pem)
-        print(f"New keys saved in {CLIENT_KEYS_DIR}/")
+        logger.info("New keys saved in %s/", CLIENT_KEYS_DIR)
 
     return private_key, public_key_pem
 
@@ -73,7 +74,7 @@ def get_server_public_key():
         data = response.json()
         return data.get('public_key')
     except requests.exceptions.RequestException as e:
-        print(f"Error getting server public key: {e.__class__.__name__}")
+        logger.warning("Error getting server public key: %s", e.__class__.__name__)
         return None
 
 def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_pub_key_pem):
@@ -89,18 +90,18 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     try:
         server_public_key_bytes = base64.b64decode(server_pub_key_b64)
     except Exception as e:
-        print(f"Error decoding server public key: {e.__class__.__name__}")
+        logger.warning("Error decoding server public key: %s", e.__class__.__name__)
         return None
 
     # 3. Encrypt message using encrypt.py functions
-    print("Encrypting request...")
+    logger.debug("Encrypting request...")
     try:
         # Ensure message is JSON bytes
         message_bytes = json.dumps(messages).encode('utf-8')
         # Encrypt using server's public key
         ciphertext_dict, cipherkey, iv = encrypt(message_bytes, server_public_key_bytes)
     except Exception as e:
-        print(f"Error during request encryption: {e.__class__.__name__}")
+        logger.warning("Error during request encryption: %s", e.__class__.__name__)
         return None
 
     # 4. Prepare payload
@@ -117,7 +118,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     }
 
     # 5. Send request
-    print("Sending request to API...")
+    logger.debug("Sending request to API...")
     try:
         response = requests.post(
             f"{API_BASE_URL}/chat/completions", json=payload, timeout=REQUEST_TIMEOUT
@@ -132,14 +133,14 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
                  err_status = e.response.status_code
              except Exception:
                  err_status = "unknown"
-             print(f"Error status: {err_status}")
+             logger.warning("Error status: %s", err_status)
         return None
 
     # 6. Decrypt response
-    print("Decrypting response...")
+    logger.debug("Decrypting response...")
     try:
         if not encrypted_response_data.get('encrypted'):
-            print("Error: Response was not encrypted as expected.")
+            logger.warning("Response was not encrypted as expected.")
             # Avoid logging potentially sensitive response contents
             return None
 
@@ -155,7 +156,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         decrypted_bytes = decrypt(ciphertext_resp_dict, cipherkey_resp, client_priv_key)
 
         if decrypted_bytes is None:
-            print("Failed to decrypt response.")
+            logger.warning("Failed to decrypt response.")
             return None
 
         # Decode and parse JSON
@@ -163,7 +164,7 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         return decrypted_response
 
     except Exception as e:
-        print(f"Error during response decryption or parsing: {e.__class__.__name__}")
+        logger.warning("Error during response decryption or parsing: %s", e.__class__.__name__)
         return None
 
 class ChatClient:
@@ -185,11 +186,15 @@ class ChatClient:
                 server_public_key_b64 = data['server_public_key']
                 return base64.b64decode(server_public_key_b64)
             else:
-                print(f"Could not fetch server's public key. Status code: {response.status_code}")
+                logger.warning(
+                    "Could not fetch server's public key. Status code: %s",
+                    response.status_code,
+                )
                 return None
         except requests.exceptions.RequestException as e:
-            print(
-                f"Error while fetching server's public key: {e.__class__.__name__}"
+            logger.warning(
+                "Error while fetching server's public key: %s",
+                e.__class__.__name__,
             )
             return None
 

@@ -241,6 +241,24 @@ class TestCryptoManager:
         mock_decrypt.assert_called_once_with(expected_encrypted_dict, b'encrypted_key', b'test_private_key')
 
     @patch('utils.crypto.crypto_manager.decrypt')
+    def test_decrypt_message_json_string(self, mock_decrypt, crypto_manager):
+        """Decrypt_message should handle JSON strings as input."""
+        encrypted_data = {
+            'chat_history': base64.b64encode(b'encrypted_content').decode('utf-8'),
+            'cipherkey': base64.b64encode(b'encrypted_key').decode('utf-8'),
+            'iv': base64.b64encode(b'iv_value').decode('utf-8')
+        }
+
+        mock_decrypt.return_value = b'hello'
+
+        result = crypto_manager.decrypt_message(json.dumps(encrypted_data))
+
+        assert result == 'hello'
+
+        expected_encrypted_dict = {'ciphertext': b'encrypted_content', 'iv': b'iv_value'}
+        mock_decrypt.assert_called_once_with(expected_encrypted_dict, b'encrypted_key', b'test_private_key')
+
+    @patch('utils.crypto.crypto_manager.decrypt')
     def test_decrypt_message_missing_fields(self, mock_decrypt, crypto_manager):
         """Test decrypting a message with missing fields."""
         # Setup - missing 'iv'

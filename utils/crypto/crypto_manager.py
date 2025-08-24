@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 from typing import Dict, Tuple, Any, Optional, Union, List
 
 # Import from the existing encrypt.py
@@ -120,8 +121,9 @@ class CryptoManager:
                     client_public_key = client_public_key.encode('utf-8')
                 else:
                     try:
+                        cleaned_key = re.sub(r"\s+", "", client_public_key)
                         client_public_key = base64.b64decode(
-                            client_public_key, validate=True
+                            cleaned_key, validate=True
                         )
                     except (binascii.Error, ValueError) as e:
                         raise ValueError(

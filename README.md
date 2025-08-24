@@ -27,7 +27,7 @@ Secure peer-to-peer generative AI platform
 
 # Quickstart
 
-Ensure you have Node.js 18+ installed.
+Ensure you have Node.js 18+ installed (`nvm use` respects the included .nvmrc).
 
 ```bash
 git clone https://github.com/futuroptimist/token.place.git
@@ -44,12 +44,15 @@ pre-commit run --all-files
 
 ### Key environment variables
 
-| Variable        | Default     | Description                                                      |
-|-----------------|-------------|------------------------------------------------------------------|
-| API_RATE_LIMIT  | 60/hour     | Per-IP rate limit for API requests                               |
-| API_DAILY_QUOTA | 1000/day    | Per-IP daily request quota                                       |
-| USE_MOCK_LLM    | 0           | Use mock LLM instead of downloading a model (`1` to enable)      |
-| TOKEN_PLACE_ENV | development | Deployment environment (development, testing, production)        |
+Environment variables can be stored in a `.env` file and overridden in a `.env.local` file, which is ignored by git.
+
+| Variable        | Default      | Description                                                        |
+|-----------------|--------------|--------------------------------------------------------------------|
+| API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
+| API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
+| USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
+| TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
+| PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 
 The development requirements live in [requirements.txt](requirements.txt).
 
@@ -69,16 +72,6 @@ docker compose up --build
 Open `http://localhost:5000` or run `python client.py`. For a minimal client use
 `python client_simplified.py`; it clears the screen when running interactively using ANSI codes
 with flushed output. Metrics are exposed at `/metrics`.
-
-### Key environment variables
-
-| Variable        | Default      | Description                                                        |
-|-----------------|--------------|--------------------------------------------------------------------|
-| API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
-| API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
-| USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
-| TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
-| PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 
 ## CI pass criteria
 
@@ -737,6 +730,7 @@ pip install pre-commit
 pre-commit install
 pre-commit run --all-files
 ```
+These hooks run linting, tests, and spelling checks via codespell.
 
 ## Security
 

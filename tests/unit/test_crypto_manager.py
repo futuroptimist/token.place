@@ -241,6 +241,24 @@ class TestCryptoManager:
         mock_decrypt.assert_called_once_with(expected_encrypted_dict, b'encrypted_key', b'test_private_key')
 
     @patch('utils.crypto.crypto_manager.decrypt')
+    def test_decrypt_message_json_string(self, mock_decrypt, crypto_manager):
+        """Decrypt_message should handle JSON strings as input."""
+        encrypted_data = {
+            'chat_history': base64.b64encode(b'encrypted_content').decode('utf-8'),
+            'cipherkey': base64.b64encode(b'encrypted_key').decode('utf-8'),
+            'iv': base64.b64encode(b'iv_value').decode('utf-8')
+        }
+
+        mock_decrypt.return_value = b'hello'
+
+        result = crypto_manager.decrypt_message(json.dumps(encrypted_data))
+
+        assert result == 'hello'
+
+        expected_encrypted_dict = {'ciphertext': b'encrypted_content', 'iv': b'iv_value'}
+        mock_decrypt.assert_called_once_with(expected_encrypted_dict, b'encrypted_key', b'test_private_key')
+
+    @patch('utils.crypto.crypto_manager.decrypt')
     def test_decrypt_message_missing_fields(self, mock_decrypt, crypto_manager):
         """Test decrypting a message with missing fields."""
         # Setup - missing 'iv'
@@ -381,3 +399,11 @@ def test_encrypt_message_accepts_pem_string():
     iv = base64.b64decode(encrypted['iv'])
     decrypted = decrypt({'ciphertext': ciphertext, 'iv': iv}, cipherkey, client_private)
     assert decrypted.decode('utf-8') == "hello"
+
+
+def test_encrypt_message_accepts_base64_with_whitespace():
+    """encrypt_message handles base64 keys containing whitespace."""
+    manager = CryptoManager()
+    public_key_b64_with_ws = manager.public_key_b64 + "\n"
+    result = manager.encrypt_message("hello", public_key_b64_with_ws)
+    assert {"chat_history", "cipherkey", "iv"}.issubset(result)

@@ -47,9 +47,9 @@ unhandled `ValueError` exceptions.
 ### Crypto Manager (`crypto/crypto_manager.py`)
 
 Manages server-side encryption keys and message processing. The
-`decrypt_message` helper now returns raw bytes when decrypted content is not
-valid UTF-8 or JSON and returns `None` when given non-dict input to avoid
-attribute errors.
+`decrypt_message` helper accepts dicts or JSON strings, returns raw bytes when
+decrypted content is not valid UTF-8 or JSON, and yields `None` for invalid
+inputs or when required fields are missing.
 
 Network requests in this module now use a default 10 second timeout to prevent
 hanging connections. You can override this by passing a `timeout` argument to
@@ -59,6 +59,8 @@ hanging connections. You can override this by passing a `timeout` argument to
 errors. Passing `None` previously encrypted the string "None"; now it raises
 `ValueError` to surface invalid inputs early. `encrypt_message` also accepts
 raw ``bytes`` messages in addition to strings and JSON-serializable objects.
+It now trims whitespace from base64-encoded public keys before decoding so
+keys copied with line breaks do not raise errors.
 
 ## Crypto Helpers
 
@@ -72,6 +74,8 @@ The `CryptoClient` class provides a high-level abstraction over the encryption/d
 - Make encrypted API requests
 
 ### Basic Usage
+
+The `CryptoClient` requires a base URL with an explicit `http://` or `https://` scheme.
 
 ```python
 from utils.crypto_helpers import CryptoClient

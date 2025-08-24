@@ -126,7 +126,8 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
         response.raise_for_status()
         encrypted_response_data = response.json()
     except requests.exceptions.RequestException as e:
-        logger.warning("API request failed: %s", e)
+        # Avoid logging potentially sensitive error details
+        print(f"API request failed: {e.__class__.__name__}")
         if hasattr(e, 'response') and e.response is not None:
              try:
                  err_status = e.response.status_code

@@ -5,6 +5,7 @@
 ### Added
 - Provide `get_temp_dir()` utility for temporary token.place files
 - Include `service` field in `/api/v1/health` responses
+- Allow `CryptoManager.decrypt_message` to accept JSON string input
 
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input
@@ -14,6 +15,7 @@
 
 ### Maintenance
 - Bump Playwright dev dependency to v1.55.0
+- Update pre-commit hooks: codespell to v2.4.1 and vulture to v2.14
 
 ## Version 1.0.0 (March 2025)
 

@@ -130,10 +130,10 @@ def configure_test_environment():
 
 # Helper function to print console messages
 def print_console_message(msg):
-    """Callback function to print console messages."""
-    # Avoid printing the noisy [Server Poll] messages coming from server.py
-    if "[Server Poll]" not in msg.text:
-        print(f"Browser Console [{msg.type}]: {msg.text}")
+    """Callback for console messages with redacted content."""
+    if "[Server Poll]" in msg.text:
+        return
+    print(f"Browser Console [{msg.type}]: <redacted>")
 
 # CONSTANTS USED BY THE TEST FIXTURES
 E2E_SERVER_PORT = 8010

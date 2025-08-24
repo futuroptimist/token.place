@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 from typing import Dict, Tuple, Any, Optional, Union, List
 
 # Import from the existing encrypt.py
@@ -18,29 +19,38 @@ def get_config_lazy():
     from config import get_config
     return get_config()
 
-def log_info(message):
-    """Log info only in non-production environments."""
-    config = None
+def _log(level: str, message: str, *, exc_info: bool = False) -> None:
+    """Internal helper to log messages based on environment settings.
+
+    Info logs are suppressed in production; error logs always emit but hide
+    stack traces in production environments.
+    """
     try:
         config = get_config_lazy()
+        is_production = config.is_production
     except Exception:
-        pass
-    if config is None or not config.is_production:
-        logger.info(message)
+        is_production = False
 
-def log_error(message, exc_info=False):
+    logger_func = getattr(logger, level)
+    if level == "info":
+        if not is_production:
+            logger_func(message)
+    else:
+        logger_func(message, exc_info=exc_info and not is_production)
+
+
+def log_info(message: str) -> None:
+    """Log info only in non-production environments."""
+    _log("info", message)
+
+
+def log_error(message: str, exc_info: bool = False) -> None:
     """Log errors in all environments.
 
-    In production, stack traces are suppressed even when ``exc_info`` is True to avoid
-    leaking sensitive information.
+    In production, stack traces are suppressed even when ``exc_info`` is True
+    to avoid leaking sensitive information.
     """
-    config = None
-    try:
-        config = get_config_lazy()
-    except Exception:
-        pass
-    show_exc = exc_info and (config is None or not config.is_production)
-    logger.error(message, exc_info=show_exc)
+    _log("error", message, exc_info=exc_info)
 
 class CryptoManager:
     """
@@ -120,8 +130,9 @@ class CryptoManager:
                     client_public_key = client_public_key.encode('utf-8')
                 else:
                     try:
+                        cleaned_key = re.sub(r"\s+", "", client_public_key)
                         client_public_key = base64.b64decode(
-                            client_public_key, validate=True
+                            cleaned_key, validate=True
                         )
                     except (binascii.Error, ValueError) as e:
                         raise ValueError(
@@ -145,20 +156,26 @@ class CryptoManager:
             log_error(f"Error encrypting message: {e}", exc_info=True)
             raise
 
-    def decrypt_message(self, encrypted_data: Dict[str, str]) -> Optional[Union[Dict, str, bytes]]:
-        """
-        Decrypt a message using the server's private key.
+    def decrypt_message(self, encrypted_data: Dict[str, str] | str) -> Optional[Union[Dict, str, bytes]]:
+        """Decrypt a message using the server's private key.
 
         Args:
-            encrypted_data: Dict containing 'chat_history', 'cipherkey', and 'iv' in base64
+            encrypted_data: Dict or JSON string containing 'chat_history', 'cipherkey', and 'iv' in
+                base64
 
         Returns:
             Decrypted message as a dict, string, or raw bytes when the content is not UTF-8.
             Returns None if decryption fails.
         """
         try:
-            if not isinstance(encrypted_data, dict):
-                log_error("Encrypted data must be a dict")
+            if isinstance(encrypted_data, str):
+                try:
+                    encrypted_data = json.loads(encrypted_data)
+                except json.JSONDecodeError:
+                    log_error("Encrypted data string is not valid JSON")
+                    return None
+            elif not isinstance(encrypted_data, dict):
+                log_error("Encrypted data must be a dict or JSON string")
                 return None
 
             # Extract and decode the encrypted data

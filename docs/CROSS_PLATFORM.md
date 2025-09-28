@@ -217,27 +217,31 @@ The `CryptoClient` utility significantly reduces the amount of boilerplate code 
 
 See the detailed documentation in `utils/README.md` for more information on using the CryptoClient.
 
+## Desktop distribution improvements
+
+token.place now ships electron-builder targets for truly cross-platform installers:
+
+- Windows `.msi` and `.exe` packages (via NSIS and MSI targets)
+- macOS `.dmg` and `.pkg` artifacts
+- Linux `.AppImage`, `.deb`, and `.rpm` bundles for x64 and arm64
+
+See `desktop/electron-builder.json` for the authoritative configuration that powers these builds.
+
 ## Next Steps
 
 To further enhance cross-platform support, future work includes:
 
-1. **Cross-Platform Installers**:
-   - Windows installer (.msi)
-   - macOS package (.pkg)
-   - Linux package (.deb, .rpm)
-   - Windows `.exe` and macOS `.dmg` builds are generated automatically via GitHub Actions
-
-2. **Platform-Specific UI Optimizations**:
+1. **Platform-Specific UI Optimizations**:
    - Native UI integrations
    - Platform-specific UX enhancements
    - Touch support for mobile devices
 
-3. **Performance Tuning**:
+2. **Performance Tuning**:
    - Platform-specific performance optimizations
    - Hardware acceleration on supported platforms
    - Resource usage monitoring and tuning
 
-4. **CI/CD Pipeline**:
+3. **CI/CD Pipeline**:
    - Matrix testing across all supported platforms
    - Automated builds for all platforms
    - Containerized testing environments

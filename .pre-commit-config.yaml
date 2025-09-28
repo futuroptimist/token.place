@@ -20,6 +20,8 @@ repos:
     hooks:
       - id: bandit
         args: ["-lll", "-x", "tests"]
+        additional_dependencies:
+          - pbr
   - repo: local
     hooks:
       - id: run-checks

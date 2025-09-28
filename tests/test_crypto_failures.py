@@ -126,10 +126,8 @@ class TestCryptoFailures:
         }
 
         # Try to decrypt with missing ciphertext
-        result = decrypt(incomplete_dict, cipherkey, private_key)
-
-        # The decrypt function should return None for missing data
-        assert result is None, "Decryption with missing ciphertext should return None"
+        with pytest.raises(ValueError, match="Missing required field: ciphertext"):
+            decrypt(incomplete_dict, cipherkey, private_key)
 
     def test_decryption_with_missing_iv(self):
         """Test decryption behavior when IV is missing."""
@@ -149,10 +147,8 @@ class TestCryptoFailures:
         }
 
         # Try to decrypt with missing IV
-        result = decrypt(incomplete_dict, cipherkey, private_key)
-
-        # The decrypt function should return None for missing IV
-        assert result is None, "Decryption with missing IV should return None"
+        with pytest.raises(ValueError, match="Missing required field: iv"):
+            decrypt(incomplete_dict, cipherkey, private_key)
 
     def test_encryption_with_invalid_public_key(self):
         """Test encryption behavior with an invalid public key."""

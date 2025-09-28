@@ -4,6 +4,7 @@
 import os
 import base64
 import logging
+from collections.abc import Mapping
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import serialization
@@ -112,7 +113,7 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
 
     return {'ciphertext': ciphertext, 'iv': iv}, encrypted_key, iv
 
-def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key_pem: bytes) -> Optional[bytes]:
+def decrypt(ciphertext_dict: Mapping[str, bytes], encrypted_key: bytes, private_key_pem: bytes) -> Optional[bytes]:
     """
     Decrypt ciphertext that was encrypted with the encrypt function.
 
@@ -123,11 +124,31 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
 
     Returns:
         Decrypted plaintext or None if decryption fails
+
+    Raises:
+        TypeError: If inputs are not bytes-like or ciphertext_dict is not a mapping.
+        ValueError: If required fields are missing from ciphertext_dict.
     """
+    if not isinstance(ciphertext_dict, Mapping):
+        raise TypeError("ciphertext_dict must be a mapping with ciphertext and iv entries")
+
+    required_fields = ("ciphertext", "iv")
+    for field in required_fields:
+        if field not in ciphertext_dict:
+            raise ValueError(f"Missing required field: {field}")
+        value = ciphertext_dict[field]
+        if not isinstance(value, (bytes, bytearray)):
+            raise TypeError(f"{field} must be bytes-like")
+
+    if not isinstance(encrypted_key, (bytes, bytearray)):
+        raise TypeError("encrypted_key must be bytes-like")
+    if not isinstance(private_key_pem, (bytes, bytearray)):
+        raise TypeError("private_key_pem must be bytes-like")
+
     try:
         # First decrypt the AES key using RSA
         private_key = serialization.load_pem_private_key(
-            private_key_pem,
+            bytes(private_key_pem),
             password=None,
             backend=default_backend()
         )
@@ -152,8 +173,8 @@ def decrypt(ciphertext_dict: Dict[str, bytes], encrypted_key: bytes, private_key
         aes_key = base64.b64decode(aes_key_b64)
 
         # Get the ciphertext and IV
-        ciphertext = ciphertext_dict['ciphertext']
-        iv = ciphertext_dict['iv']
+        ciphertext = bytes(ciphertext_dict['ciphertext'])
+        iv = bytes(ciphertext_dict['iv'])
 
         # Decrypt the ciphertext using AES-CBC
         cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())

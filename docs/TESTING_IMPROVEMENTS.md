@@ -98,28 +98,14 @@ def test_encryption_output_format_consistency(snapshot):
     snapshot.assert_match(json.dumps(result, sort_keys=True), "encryption_output.json")
 ```
 
-## 9. Negative Testing
+## ✅ 9. Negative Testing (IMPLEMENTED)
 
-Add more explicit negative tests to verify proper error handling:
-
-```python
-def test_decrypt_with_missing_fields():
-    # Test with missing IV
-    bad_data = {'ciphertext': base64.b64encode(b'data').decode()}
-    with pytest.raises(ValueError, match="Missing required field: iv"):
-        decrypt_message(bad_data, private_key)
-```
-
-- Ensure encryption helpers reject invalid types:
-
-```python
-with pytest.raises(TypeError):
-    pkcs7_unpad("not-bytes", 16)
-
-# New: block size must be an integer
-with pytest.raises(TypeError):
-    pkcs7_pad(b"data", 16.0)
-```
+**IMPLEMENTED in tests/unit/test_encrypt_input_validation.py and updated tests/test_crypto_failures.py, which include:**
+- Validation that `encrypt.decrypt` raises helpful `ValueError` messages when required fields are
+  missing.
+- Type checks that reject non-mapping ciphertext payloads and non-bytes values before decrypting.
+- Regression coverage to ensure missing-field scenarios now surface explicit exceptions rather than
+  returning `None` silently.
 
 ## 10. Mock Server for JavaScript Tests
 

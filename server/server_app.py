@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional
 from utils.llm.model_manager import get_model_manager
 from utils.crypto.crypto_manager import get_crypto_manager
 from utils.networking.relay_client import RelayClient
+from utils.system import collect_resource_usage
 
 # Import config
 from config import get_config
@@ -100,6 +101,12 @@ class ServerApp:
                 'version': config.get('version', 'dev'),
                 'mock_mode': get_model_manager().use_mock_llm
             })
+
+        @self.app.route('/metrics/resource')
+        def resource_metrics():
+            """Expose basic CPU and memory usage metrics for cross-platform monitoring."""
+            usage = collect_resource_usage()
+            return jsonify(usage)
 
         # Endpoints for direct API access (if needed)
         # These endpoints might be unused if all communication goes through the relay

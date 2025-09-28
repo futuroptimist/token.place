@@ -16,6 +16,7 @@ GOAL: Harden crypto & dependency hygiene.
 CONTEXT:
 - Follow [AGENTS.md](../AGENTS.md) and [docs/AGENTS.md](AGENTS.md).
 - Do not log plaintext or ciphertext of user messages.
+- Aim for 100% patch coverage to catch security regressions early.
 CHECKS:
   - `npm run lint`
   - `npm run type-check`

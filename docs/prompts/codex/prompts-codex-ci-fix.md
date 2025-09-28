@@ -25,6 +25,7 @@ CONTEXT:
   - `npm ci`
   - `pip install -r config/requirements_server.txt`
   - `pip install -r config/requirements_relay.txt`
+- Aim for 100% patch coverage to minimize regressions or new failures.
 
 REQUEST:
 1. Reproduce the failing check locally with `pre-commit run --all-files`.

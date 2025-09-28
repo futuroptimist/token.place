@@ -18,6 +18,7 @@ CONTEXT:
 - Follow AGENTS.md and docs/AGENTS.md instructions.
 - Run `pre-commit run --all-files` before committing.
 - Ensure `npm run lint` and `npm run test:ci` succeed.
+- Aim for 100% patch coverage to guard against behavioral drift.
 
 REQUEST:
 1. Identify code that can be simplified or clarified.

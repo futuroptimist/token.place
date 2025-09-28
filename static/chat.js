@@ -14,6 +14,9 @@ new Vue({
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
+        this.$nextTick(() => {
+            this.adjustMessageInputHeight();
+        });
     },
     methods: {
         detectTouchInput() {
@@ -99,6 +102,50 @@ new Vue({
                 .replace(/-----BEGIN.*?-----/, '')
                 .replace(/-----END.*?-----/, '')
                 .replace(/\s/g, '');
+        },
+
+        handleMessageKeydown(event) {
+            if (event.key !== 'Enter') {
+                return;
+            }
+
+            if (event.isComposing || event.keyCode === 229) {
+                return;
+            }
+
+            if (event.shiftKey) {
+                return;
+            }
+
+            if (event.altKey || event.ctrlKey || event.metaKey) {
+                return;
+            }
+
+            if (this.isTouchInput) {
+                return;
+            }
+
+            event.preventDefault();
+            this.sendMessage();
+        },
+
+        handleMessageInput(event) {
+            const target = event && event.target ? event.target : undefined;
+            this.adjustMessageInputHeight(target);
+        },
+
+        adjustMessageInputHeight(target) {
+            const textarea = target || this.$refs.messageInput;
+
+            if (!textarea) {
+                return;
+            }
+
+            textarea.style.height = 'auto';
+            const minHeight = 48;
+            const maxHeight = 240;
+            const boundedHeight = Math.max(minHeight, Math.min(textarea.scrollHeight, maxHeight));
+            textarea.style.height = `${boundedHeight}px`;
         },
 
         /**
@@ -269,6 +316,9 @@ new Vue({
             this.isGeneratingResponse = true;
             this.chatHistory.push({ role: "user", content: messageContent });
             this.newMessage = '';
+            this.$nextTick(() => {
+                this.adjustMessageInputHeight();
+            });
 
             try {
                 // Send the message via the API

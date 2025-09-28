@@ -89,6 +89,12 @@
             border-radius: 5px;
             color: #ffffff;
             font-size: 16px;
+            line-height: 1.5;
+            resize: vertical;
+            min-height: 48px;
+            max-height: 240px;
+            overflow-y: auto;
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
         }
         .message {
             padding: 15px;
@@ -105,6 +111,15 @@
         }
         .input-container {
             display: flex;
+            gap: 12px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+        }
+        .input-container .message-input {
+            flex: 1 1 auto;
+        }
+        .input-container .send-button {
+            margin-top: 15px;
         }
         .send-button {
             padding: 15px 20px;
@@ -306,7 +321,19 @@
                 <span v-html="message.content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>').replace(/```(.*?)```/gs, '<pre><code>$1</code></pre>')"></span>
             </div>
             <div class="input-container">
-                <input type="text" v-model="newMessage" @keyup.enter="sendMessage" class="message-input" placeholder="Type your message here...">
+                <textarea
+                    ref="messageInput"
+                    v-model="newMessage"
+                    @keydown="handleMessageKeydown"
+                    @input="handleMessageInput"
+                    class="message-input"
+                    placeholder="Type your message here..."
+                    rows="1"
+                    autocomplete="off"
+                    autocapitalize="sentences"
+                    spellcheck="true"
+                    aria-label="Message"
+                ></textarea>
                 <button
                     @click="sendMessage"
                     @touchstart.prevent="sendMessage"

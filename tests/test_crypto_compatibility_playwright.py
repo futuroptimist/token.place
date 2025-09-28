@@ -2,9 +2,6 @@ import pytest
 import base64
 import json
 import sys
-import os
-import subprocess
-import time
 from pathlib import Path
 
 # Add the project root to the path for imports
@@ -20,60 +17,6 @@ logger = logging.getLogger('crypto_tests')
 jsencrypt_path = Path(__file__).resolve().parent.parent / 'node_modules' / 'jsencrypt'
 if not jsencrypt_path.exists():
     pytest.skip("jsencrypt module not available", allow_module_level=True)
-
-# Playwright fixture with web server configuration
-@pytest.fixture(scope="module")
-def browser_context_args(browser_context_args):
-    """Modify the browser context arguments to include webServer configuration."""
-    return {
-        **browser_context_args,
-        "ignore_https_errors": True,
-    }
-
-# Configure the web server fixture
-@pytest.fixture(scope="module")
-def web_server():
-    """Start a web server for testing."""
-    import socket
-
-    # Find an available port
-    def find_available_port():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('localhost', 0))
-            return s.getsockname()[1]
-
-    port = find_available_port()
-
-    # Get the current working directory
-    cwd = Path.cwd()
-
-    # Start a HTTP server in a subprocess
-    server_cmd = [sys.executable, "-m", "http.server", str(port)]
-    server_process = subprocess.Popen(
-        server_cmd,
-        cwd=str(cwd),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=os.environ.copy(),
-    )
-
-    # Wait for the server to start
-    server_url = f"http://localhost:{port}"
-    logger.info(f"Started web server at {server_url}")
-
-    # Wait a moment for the server to initialize
-    time.sleep(2)
-
-    # Yield the server URL for tests to use
-    yield server_url
-
-    # Shutdown the server after tests
-    logger.info("Stopping web server")
-    server_process.terminate()
-    try:
-        server_process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        server_process.kill()
 
 def test_python_encrypt_js_decrypt(page, web_server):
     """

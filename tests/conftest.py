@@ -8,6 +8,7 @@ import sys
 import pytest
 import platform
 import tempfile
+import socket
 import shutil
 import subprocess
 import time
@@ -139,6 +140,46 @@ def print_console_message(msg):
 E2E_SERVER_PORT = 8010
 E2E_RELAY_PORT = 5010
 E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
+
+
+@pytest.fixture(scope="session")
+def browser_context_args(browser_context_args):
+    """Ensure browser contexts ignore HTTPS errors for local testing."""
+    return {**browser_context_args, "ignore_https_errors": True}
+
+
+@pytest.fixture(scope="session")
+def web_server() -> Generator[str, None, None]:
+    """Start a simple HTTP server serving the repository root for browser tests."""
+
+    def find_available_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("localhost", 0))
+            return sock.getsockname()[1]
+
+    port = find_available_port()
+    repo_root = Path(__file__).resolve().parent.parent
+
+    server_cmd = [sys.executable, "-m", "http.server", str(port)]
+    server_process = subprocess.Popen(
+        server_cmd,
+        cwd=str(repo_root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=os.environ.copy(),
+    )
+
+    server_url = f"http://localhost:{port}"
+    time.sleep(2)
+
+    try:
+        yield server_url
+    finally:
+        server_process.terminate()
+        try:
+            server_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_process.kill()
 
 @pytest.fixture(scope="module")
 def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None, None]:

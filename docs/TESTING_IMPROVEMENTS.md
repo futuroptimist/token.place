@@ -86,17 +86,14 @@ python -m pytest --cov=. --cov-report=term-missing
 # Then add tests for the modules with lower coverage percentages
 ```
 
-## 8. Snapshot Testing
+## ✅ 8. Snapshot Testing (IMPLEMENTED)
 
-Implement snapshot testing for stable parts of your crypto implementation:
-
-```python
-def test_encryption_output_format_consistency(snapshot):
-    # Encrypt with a fixed key and seed for deterministic output
-    result = encrypt_with_fixed_parameters("test")
-    # Compare with saved snapshot
-    snapshot.assert_match(json.dumps(result, sort_keys=True), "encryption_output.json")
-```
+**IMPLEMENTED in tests/unit/test_encrypt_snapshot.py, which includes:**
+- Deterministic fixtures for AES key and IV generation to produce stable ciphertext snapshots.
+- A saved JSON snapshot at `tests/unit/snapshots/encrypt_default_payload.json` capturing the
+  canonical encryption output structure.
+- Assertions that decrypted ciphertext matches the original payload while ensuring snapshot
+  parity for ciphertext and metadata lengths.
 
 ## ✅ 9. Negative Testing (IMPLEMENTED)
 

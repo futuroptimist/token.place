@@ -38,3 +38,19 @@ def test_decrypt_rejects_non_bytes_payloads():
 
     with pytest.raises(TypeError, match="ciphertext must be bytes-like"):
         decrypt(bad_payload, cipherkey, private_key)
+
+
+def test_decrypt_rejects_non_bytes_encrypted_key():
+    """decrypt should raise TypeError when encrypted_key is not bytes-like."""
+    private_key, ciphertext_dict, _ = _generate_encrypted_payload()
+
+    with pytest.raises(TypeError, match="encrypted_key must be bytes-like"):
+        decrypt(ciphertext_dict, "not-bytes", private_key)
+
+
+def test_decrypt_rejects_non_bytes_private_key():
+    """decrypt should raise TypeError when private_key_pem is not bytes-like."""
+    _, ciphertext_dict, cipherkey = _generate_encrypted_payload()
+
+    with pytest.raises(TypeError, match="private_key_pem must be bytes-like"):
+        decrypt(ciphertext_dict, cipherkey, "not-bytes")

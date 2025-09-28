@@ -62,6 +62,22 @@ raw ``bytes`` messages in addition to strings and JSON-serializable objects.
 It now trims whitespace from base64-encoded public keys before decoding so
 keys copied with line breaks do not raise errors.
 
+With the new performance monitor integration, successful encrypt and decrypt
+operations optionally record payload sizes, durations, and throughput metrics
+when the `TOKEN_PLACE_PERF_MONITOR=1` environment variable is set. Metrics can
+be inspected through `utils.performance.get_encryption_monitor()` for basic
+resource usage tuning during profiling sessions.
+
+### Performance Monitoring (`performance/monitor.py`)
+
+Provides a lightweight in-memory collector that tracks recent encryption and
+decryption samples. Enable it by setting `TOKEN_PLACE_PERF_MONITOR=1` (and
+optionally `TOKEN_PLACE_PERF_SAMPLES` to control the sliding window length).
+The aggregated statistics expose counts, average payload sizes, operation
+durations, and computed throughput so you can baseline performance while
+keeping overhead negligible in production where the monitor remains disabled
+by default.
+
 ## Crypto Helpers
 
 The `CryptoClient` class provides a high-level abstraction over the encryption/decryption process, making it easy to:

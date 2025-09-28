@@ -25,6 +25,7 @@ CONTEXT:
 - Run `npm run lint`, `npm run type-check`, `npm run build`, and `npm run test:ci`.
 - Run `pre-commit run --all-files` before committing.
 - If Playwright browsers are missing, run `playwright install chromium`.
+- Aim for 100% patch coverage to minimize regressions or unexpected behavior.
 
 REQUEST:
 1. Identify a straightforward improvement or bug fix.
@@ -62,6 +63,7 @@ REQUIREMENTS
    with default values.
 2. Keep line width ≤ 120 characters.
 3. Run `pre-commit run --all-files` and update any affected docs.
+4. Aim for 100% patch coverage on the changes to avoid regressions.
 
 ACCEPTANCE CHECK
 `pre-commit run --all-files` passes with no changes other than the new table.
@@ -85,6 +87,7 @@ REQUIREMENTS
 1. Use pytest to send two rapid requests with a limit of `1/minute`.
 2. Assert that the second request responds with status code 429.
 3. Run `pre-commit run --all-files` to verify tests pass.
+4. Aim for 100% patch coverage on the modifications to prevent regressions.
 
 ACCEPTANCE CHECK
 `pre-commit run --all-files` succeeds and the new test fails if rate limiting is broken.

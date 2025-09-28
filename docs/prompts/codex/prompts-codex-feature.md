@@ -18,6 +18,7 @@ CONTEXT:
 - Follow AGENTS.md and docs/AGENTS.md instructions.
 - Run `pre-commit run --all-files` before committing.
 - Ensure `npm run lint` and `npm run test:ci` succeed.
+- Aim for 100% patch coverage to reduce the risk of regressions.
 
 REQUEST:
 1. Write a failing test that captures the new behavior.

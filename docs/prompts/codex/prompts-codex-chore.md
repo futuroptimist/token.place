@@ -18,6 +18,7 @@ CONTEXT:
 - Follow AGENTS.md and docs/AGENTS.md instructions.
 - Run `npm run lint`, `npm run type-check`, `npm run build`, `npm run test:ci`.
 - Run `pre-commit run --all-files` before committing.
+- Aim for 100% patch coverage to minimize regressions.
 
 REQUEST:
 1. Make a minimal maintenance change.

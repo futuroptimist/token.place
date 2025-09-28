@@ -17,6 +17,7 @@ Improve documentation accuracy, links, or readability.
 CONTEXT:
 - Follow AGENTS.md and docs/AGENTS.md instructions.
 - Run `pre-commit run --all-files` before committing.
+- Aim for 100% patch coverage to minimize regressions in documentation examples.
 
 REQUEST:
 1. Identify outdated, unclear, or missing docs.

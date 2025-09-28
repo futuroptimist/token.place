@@ -234,20 +234,21 @@ The token.place server now publishes lightweight CPU and memory utilisation metr
 warnings when workloads spike, enabling operators to diagnose performance regressions without
 attaching external profilers.
 
+## Mobile touch optimizations
+
+The browser chat client now detects touch-capable environments and applies larger tap targets and
+`touchstart` handlers for the send button. This reduces latency on phones and tablets while keeping
+the desktop layout unchanged.
+
 ## Next Steps
 
 To further enhance cross-platform support, future work includes:
 
-1. **Platform-Specific UI Optimizations**:
-   - Native UI integrations
-   - Platform-specific UX enhancements
-   - Touch support for mobile devices
-
-2. **Performance Tuning**:
+1. **Performance Tuning**:
    - Platform-specific performance optimizations
    - Hardware acceleration on supported platforms
 
-3. **CI/CD Pipeline**:
+2. **CI/CD Pipeline**:
    - Matrix testing across all supported platforms
    - Automated builds for all platforms
    - Containerized testing environments

@@ -116,6 +116,12 @@
             cursor: pointer;
             transition: background-color 0.3s ease;
         }
+
+        .send-button.touch-optimized {
+            padding: 18px 24px;
+            font-size: 18px;
+            touch-action: manipulation;
+        }
         .send-button:hover {
             background-color: #ffffff;
         }
@@ -301,7 +307,14 @@
             </div>
             <div class="input-container">
                 <input type="text" v-model="newMessage" @keyup.enter="sendMessage" class="message-input" placeholder="Type your message here...">
-                <button @click="sendMessage" class="send-button">Send</button>
+                <button
+                    @click="sendMessage"
+                    @touchstart.prevent="sendMessage"
+                    class="send-button"
+                    :class="{'touch-optimized': isTouchInput}"
+                >
+                    Send
+                </button>
             </div>
         </div>
 

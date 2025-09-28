@@ -6,14 +6,39 @@ new Vue({
         serverPublicKey: null,
         clientPrivateKey: null,
         clientPublicKey: null,
-        isGeneratingResponse: false
+        isGeneratingResponse: false,
+        isTouchInput: false
     },
     mounted() {
+        this.detectTouchInput();
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
     },
     methods: {
+        detectTouchInput() {
+            try {
+                const hasWindow = typeof window !== 'undefined';
+                const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+                const doc = typeof document !== 'undefined' ? document : undefined;
+                const hasTouch =
+                    (hasWindow && 'ontouchstart' in window) ||
+                    (nav && (nav.maxTouchPoints > 0 || nav.msMaxTouchPoints > 0));
+
+                this.isTouchInput = Boolean(hasTouch);
+
+                if (doc && doc.body) {
+                    if (this.isTouchInput) {
+                        doc.body.classList.add('touch-device');
+                    } else {
+                        doc.body.classList.remove('touch-device');
+                    }
+                }
+            } catch (error) {
+                console.warn('Unable to determine touch capabilities:', error);
+                this.isTouchInput = false;
+            }
+        },
         getServerPublicKey() {
             // Fetch the server's public key from the API
             return fetch('/api/v1/public-key')

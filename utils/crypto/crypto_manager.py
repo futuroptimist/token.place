@@ -6,10 +6,12 @@ import binascii
 import json
 import logging
 import re
+from time import perf_counter
 from typing import Dict, Tuple, Any, Optional, Union, List
 
 # Import from the existing encrypt.py
 from encrypt import encrypt, decrypt, generate_keys
+from utils.performance import get_encryption_monitor
 
 # Configure logging
 logger = logging.getLogger('crypto_manager')
@@ -139,6 +141,10 @@ class CryptoManager:
                             "Invalid base64-encoded public key"
                         ) from e
 
+            monitor = get_encryption_monitor()
+            record_metrics = monitor.is_enabled
+            start_time = perf_counter() if record_metrics else None
+
             # Encrypt the message
             encrypted_data, encrypted_key, iv = encrypt(message_bytes, client_public_key)
 
@@ -147,11 +153,16 @@ class CryptoManager:
             encrypted_key_b64 = base64.b64encode(encrypted_key).decode('utf-8')
             iv_b64 = base64.b64encode(iv).decode('utf-8')
 
-            return {
+            response = {
                 'chat_history': encrypted_data_b64,
                 'cipherkey': encrypted_key_b64,
                 'iv': iv_b64
             }
+
+            if record_metrics and start_time is not None:
+                monitor.record('encrypt', len(message_bytes), perf_counter() - start_time)
+
+            return response
         except Exception as e:
             log_error(f"Error encrypting message: {e}", exc_info=True)
             raise
@@ -178,6 +189,10 @@ class CryptoManager:
                 log_error("Encrypted data must be a dict or JSON string")
                 return None
 
+            monitor = get_encryption_monitor()
+            record_metrics = monitor.is_enabled
+            start_time = perf_counter() if record_metrics else None
+
             # Extract and decode the encrypted data
             encrypted_chat_history_b64 = encrypted_data.get('chat_history')
             cipherkey_b64 = encrypted_data.get('cipherkey')
@@ -193,6 +208,13 @@ class CryptoManager:
 
             # Decrypt the message
             decrypted_bytes = decrypt(encrypted_chat_history_dict, cipherkey, self._private_key)
+
+            if record_metrics and start_time is not None and decrypted_bytes is not None:
+                monitor.record(
+                    'decrypt',
+                    len(encrypted_chat_history_dict['ciphertext']),
+                    perf_counter() - start_time,
+                )
 
             if decrypted_bytes is None:
                 log_error("Decryption failed, returning None")

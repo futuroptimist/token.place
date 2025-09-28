@@ -240,7 +240,8 @@ To further enhance cross-platform support, future work includes:
 1. **Performance Tuning**:
    - Platform-specific performance optimizations
    - Hardware acceleration on supported platforms
-   - Resource usage monitoring and tuning
+   - ✅ Resource usage monitoring instrumentation via the Python performance monitor
+     (`utils/performance/monitor.py`) and accompanying tests
 
 2. **CI/CD Pipeline**:
    - Matrix testing across all supported platforms

@@ -53,3 +53,21 @@ def test_run_method(monkeypatch):
             debug=not sa.config.is_production,
             use_reloader=False,
         )
+
+
+def test_resource_metrics_route():
+    """The resource metrics endpoint should expose CPU and memory usage."""
+    mm = MagicMock()
+    mm.use_mock_llm = True
+    mm.download_model_if_needed.return_value = True
+
+    with patch('server.server_app.get_model_manager', return_value=mm), \
+         patch('server.server_app.RelayClient'), \
+         patch('server.server_app.collect_resource_usage', return_value={'cpu_percent': 4.2, 'memory_percent': 73.1}):
+        app = sa.ServerApp()
+        client = app.app.test_client()
+        response = client.get('/metrics/resource')
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {'cpu_percent': 4.2, 'memory_percent': 73.1}

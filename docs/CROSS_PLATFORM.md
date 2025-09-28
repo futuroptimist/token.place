@@ -227,6 +227,13 @@ token.place now ships electron-builder targets for truly cross-platform installe
 
 See `desktop/electron-builder.json` for the authoritative configuration that powers these builds.
 
+## Resource usage metrics
+
+The token.place server now publishes lightweight CPU and memory utilisation metrics via the
+`/metrics/resource` endpoint. Desktop shells can poll this JSON payload to surface platform-native
+warnings when workloads spike, enabling operators to diagnose performance regressions without
+attaching external profilers.
+
 ## Next Steps
 
 To further enhance cross-platform support, future work includes:
@@ -239,7 +246,6 @@ To further enhance cross-platform support, future work includes:
 2. **Performance Tuning**:
    - Platform-specific performance optimizations
    - Hardware acceleration on supported platforms
-   - Resource usage monitoring and tuning
 
 3. **CI/CD Pipeline**:
    - Matrix testing across all supported platforms

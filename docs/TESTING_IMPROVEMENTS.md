@@ -423,7 +423,9 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 
 ## Implementation Priority
 
-1. End-to-End Tests - To ensure the full workflow functions correctly
+1. ✅ End-to-End Tests - To ensure the full workflow functions correctly
+   Expanded via `tests/test_e2e_conversation_flow.py::test_openai_alias_end_to_end_flow` to cover
+   the `/v1` OpenAI alias
 2. ✅ Performance Benchmarks - To identify performance bottlenecks
 3. ✅ Failure and Recovery Testing - To ensure the system is robust
 4. ✅ Parameterized Tests - To verify functionality across different configurations

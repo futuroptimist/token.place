@@ -1,9 +1,9 @@
 ---
-title: 'Codex Chore Prompt'
-slug: 'prompts-codex-chore'
+title: 'token.place Chore Prompt'
+slug: 'chore'
 ---
 
-# Codex Chore Prompt
+# token.place Chore Prompt
 
 Use this prompt for dependency bumps, CI tweaks, or other routine upkeep in token.place.
 

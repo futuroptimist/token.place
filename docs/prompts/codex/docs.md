@@ -1,9 +1,9 @@
 ---
-title: 'Codex Docs Update Prompt'
-slug: 'prompts-codex-docs'
+title: 'token.place Docs Update Prompt'
+slug: 'docs'
 ---
 
-# Codex Docs Update Prompt
+# token.place Docs Update Prompt
 
 Use this prompt to enhance or fix token.place documentation.
 

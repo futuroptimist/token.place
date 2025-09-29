@@ -164,7 +164,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Rate limiting and quota enforcement 💯
 - [ ] Enhanced encryption options for model weights and inference data
   - [ ] Key rotation for relay and server certificates
-  - [ ] Signed relay binaries for client verification
+- [x] Signed relay binaries for client verification
   - [ ] Optional content moderation hooks
   - [ ] External security review of protocol and code
 - [ ] Community features
@@ -737,6 +737,16 @@ These hooks run linting, tests, and spelling checks via codespell.
 Security is our top priority. Please report any vulnerabilities responsibly.
 See [Security and Privacy Audit](docs/SECURITY_PRIVACY_AUDIT.md) for details.
 token.place intentionally avoids storing user prompts or LLM responses in logs to protect user privacy.
+
+Relay distributions now ship with Ed25519 signatures so operators can confirm binaries before running
+them. Verify a download with the bundled helper:
+
+```bash
+python -m utils.signing.relay_signature relay.py config/signing/relay.py.sig
+```
+
+Use `--public-key` to supply a custom key if you host your own release channel. The command exits with
+status code `0` on success and `1` if verification fails.
 
 ## License
 

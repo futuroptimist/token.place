@@ -46,3 +46,21 @@ def test_build_pytest_args_includes_marker_expression(
     assert args[:2] == ["-m", "crypto and (" + entry["marker_expression"] + ")"]
     # Ensure the command can be serialized for JSON consumption
     json.dumps(args)
+
+
+def test_build_pytest_args_with_no_existing_marker(matrix: Iterable[dict[str, object]]) -> None:
+    """If no marker flag is present the helper should inject one."""
+
+    entry = next(item for item in matrix if item["os"] == "ubuntu-latest")
+    args = build_pytest_args(entry, base_args=["-k", "not slow"])
+    assert args[:3] == ["-m", entry["marker_expression"], "-k"]
+
+
+def test_build_pytest_args_rejects_missing_marker_expression(
+    matrix: Iterable[dict[str, object]]
+) -> None:
+    """Validate that the helper safeguards against malformed CLI args."""
+
+    entry = next(item for item in matrix if item["os"] == "ubuntu-latest")
+    with pytest.raises(ValueError, match="must be followed"):
+        build_pytest_args(entry, base_args=["-m"])

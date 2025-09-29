@@ -11,19 +11,27 @@ class ClientSimulator:
     encryption, API requests, and decryption.
     """
 
-    def __init__(self, base_url: str = "http://localhost:5000"):
+    def __init__(self, base_url: str = "http://localhost:5000", api_prefix: str = "/api/v1"):
         """
         Initialize the client simulator with API endpoint.
 
         Args:
             base_url: Base URL for the API endpoint
+            api_prefix: API prefix path (e.g., "/api/v1" or "/v1")
         """
-        self.base_url = base_url
+        self.base_url = base_url.rstrip('/')
+        normalized_prefix = api_prefix if api_prefix.startswith('/') else f"/{api_prefix}"
+        self.api_base = f"{self.base_url}{normalized_prefix.rstrip('/')}"
         self.session = requests.Session()
 
         # Generate client keys
         self.private_key, self.public_key = generate_keys()
         self.server_public_key = None
+
+    def _url(self, path: str) -> str:
+        """Build a fully-qualified API URL for the configured prefix."""
+        suffix = path if path.startswith('/') else f"/{path}"
+        return f"{self.api_base}{suffix}"
 
     def fetch_server_public_key(self) -> bytes:
         """
@@ -32,7 +40,7 @@ class ClientSimulator:
         Returns:
             The server's public key as bytes
         """
-        response = self.session.get(f"{self.base_url}/api/v1/public-key")
+        response = self.session.get(self._url("/public-key"))
         response.raise_for_status()
 
         data = response.json()
@@ -132,7 +140,7 @@ class ClientSimulator:
 
         # Send the request
         response = self.session.post(
-            f"{self.base_url}/api/v1/chat/completions",
+            self._url("/chat/completions"),
             json=payload
         )
         response.raise_for_status()

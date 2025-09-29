@@ -226,6 +226,24 @@ def test_encryption_decryption_integrity():
         assert response, "Empty response from server"
         assert len(response) > 10, "Response suspiciously short"
 
+
+@pytest.mark.e2e
+def test_openai_alias_end_to_end_flow():
+    """Exercise the OpenAI-compatible /v1 alias using the encrypted chat workflow."""
+    with start_relay(), start_server(use_mock_llm=USE_MOCK_LLM):
+        # Point the simulator at the OpenAI-compatible alias
+        client = ClientSimulator(base_url="http://localhost:5000", api_prefix="/v1")
+
+        # Run an encrypted chat completion through the alias endpoint
+        response_text = client.send_message(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Name a secure city in France."},
+            ]
+        )
+
+        assert "paris" in response_text.lower(), "Expected the mock response to mention Paris"
+
 if __name__ == "__main__":
     # Run the tests directly if executed as a script
     test_complete_encrypted_conversation_flow()

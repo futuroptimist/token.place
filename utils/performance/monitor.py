@@ -56,9 +56,11 @@ class PerformanceMonitor:
         max_samples: Optional[int] = None
         if max_samples_raw:
             try:
-                max_samples = int(max_samples_raw)
+                parsed_max_samples = int(max_samples_raw)
             except ValueError:
                 max_samples = None
+            else:
+                max_samples = parsed_max_samples if parsed_max_samples > 0 else None
         self.configure(enabled=monitor_enabled, max_samples=max_samples)
 
     def record(self, operation: str, payload_bytes: int, duration_seconds: float) -> None:

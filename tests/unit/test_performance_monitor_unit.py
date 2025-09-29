@@ -110,3 +110,36 @@ def test_refresh_from_env_parses_values(monkeypatch):
 
     assert not monitor.is_enabled
     assert monitor._max_samples == 5
+
+
+def test_refresh_from_env_ignores_non_positive_max_samples(monkeypatch):
+    monitor = PerformanceMonitor()
+
+    monkeypatch.setenv("TOKEN_PLACE_PERF_MONITOR", "1")
+    monkeypatch.setenv("TOKEN_PLACE_PERF_SAMPLES", "-5")
+
+    monitor.refresh_from_env()
+
+    assert monitor.is_enabled
+    assert monitor._max_samples == 100
+
+    monkeypatch.setenv("TOKEN_PLACE_PERF_MONITOR", "yes")
+    monkeypatch.setenv("TOKEN_PLACE_PERF_SAMPLES", "0")
+
+    monitor.refresh_from_env()
+
+    assert monitor.is_enabled
+    assert monitor._max_samples == 100
+
+
+def test_summary_combines_operations_and_reports_throughput():
+    monitor = PerformanceMonitor(enabled=True, max_samples=2)
+    monitor.record("encrypt", payload_bytes=10, duration_seconds=0.1)
+    monitor.record("decrypt", payload_bytes=30, duration_seconds=0.3)
+
+    summary = monitor.summary()
+
+    assert summary["count"] == 2.0
+    assert summary["avg_payload_bytes"] == pytest.approx(20.0)
+    assert summary["avg_duration_ms"] == pytest.approx(200.0)
+    assert summary["throughput_bytes_per_sec"] == pytest.approx(100.0)

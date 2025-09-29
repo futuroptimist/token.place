@@ -77,6 +77,12 @@ python -m pytest --cov=. --cov-report=term-missing
 # Then add tests for the modules with lower coverage percentages
 ```
 
+**Progress:** Added targeted unit tests in
+`tests/unit/test_performance_monitor_unit.py` covering throughput calculations
+and resilient environment parsing for `utils/performance/monitor.py`. Remaining
+modules with low coverage (`utils/crypto_helpers.py`, `utils/crypto/crypto_manager.py`,
+`utils/llm/model_manager.py`) still need focused suites.
+
 ## ✅ 8. Snapshot Testing (IMPLEMENTED)
 
 **IMPLEMENTED in tests/unit/test_encrypt_snapshot.py, which includes:**

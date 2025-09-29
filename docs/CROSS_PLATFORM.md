@@ -253,5 +253,5 @@ To further enhance cross-platform support, future work includes:
 2. **CI/CD Pipeline**:
    - ✅ Matrix testing across all supported platforms via `utils/testing/platform_matrix.py`
      and the accompanying regression in `tests/unit/test_platform_matrix.py`
-   - Automated builds for all platforms
+   - ✅ Automated builds for all platforms through the `desktop/package:all` script
    - Containerized testing environments

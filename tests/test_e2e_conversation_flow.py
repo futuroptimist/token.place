@@ -146,6 +146,24 @@ def test_complete_encrypted_conversation_flow():
         assert decrypted_response, "Empty response from server"
         assert isinstance(decrypted_response, str), "Response is not a string"
 
+@pytest.mark.e2e
+def test_manual_encrypted_conversation_flow_matches_docs_example():
+    """Ensure the documented manual flow of encrypt -> send -> decrypt works end-to-end."""
+    with start_relay(), start_server(use_mock_llm=USE_MOCK_LLM):
+        client = ClientSimulator(base_url="http://localhost:5000")
+
+        server_key = client.fetch_server_public_key()
+        assert server_key, "Expected to retrieve a public key before encrypting"
+
+        plaintext = "Hello, secure world!"
+        encrypted_request = client.encrypt_message(plaintext, server_key)
+
+        encrypted_response = client.send_request(encrypted_request)
+        decrypted_response = client.decrypt_response(encrypted_response)
+
+        assert "mock response" in decrypted_response.lower()
+        assert "paris" in decrypted_response.lower()
+
         # A more complete test with multiple messages
         conversation = [
             {"role": "system", "content": "You are a helpful assistant."},

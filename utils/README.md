@@ -78,6 +78,14 @@ durations, and computed throughput so you can baseline performance while
 keeping overhead negligible in production where the monitor remains disabled
 by default.
 
+### Relay Signing (`signing/relay_signature.py`)
+
+Ships helpers for loading the project's Ed25519 relay signing public key and
+verifying release artifacts. Invoke the CLI with
+`python -m utils.signing.relay_signature <artifact> <signature>` to validate a
+download before running it. The module exports reusable functions for other
+tooling to integrate signature checks into automated workflows.
+
 ## Crypto Helpers
 
 The `CryptoClient` class provides a high-level abstraction over the encryption/decryption process, making it easy to:

@@ -347,8 +347,25 @@ def get_public_key():
     """
     try:
         log_info("API request: GET /public-key")
+        if encryption_manager is None:
+            log_warning("Encryption manager not initialized")
+            return format_error_response(
+                "Encryption manager not initialized",
+                error_type="invalid_request_error",
+                status_code=400,
+            )
+
+        public_key_b64 = getattr(encryption_manager, 'public_key_b64', None)
+        if public_key_b64 is None:
+            log_warning("Encryption manager missing public key")
+            return format_error_response(
+                "Encryption manager not initialized",
+                error_type="invalid_request_error",
+                status_code=400,
+            )
+
         return jsonify({
-            'public_key': encryption_manager.public_key_b64
+            'public_key': public_key_b64
         })
     except Exception:
         log_error("Error in get_public_key endpoint", exc_info=True)
@@ -726,6 +743,14 @@ def health_check():
     """
     try:
         log_info("API request: GET /health")
+        if time is None or getattr(time, 'time', None) is None:
+            log_warning("Time module unavailable for health check")
+            return format_error_response(
+                "Time module not available",
+                error_type="invalid_request_error",
+                status_code=400,
+            )
+
         return jsonify({
             'status': 'ok',
             'version': 'v1',

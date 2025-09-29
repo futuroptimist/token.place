@@ -309,8 +309,26 @@ def test_health_check_exception(client, monkeypatch):
         return orig_jsonify(*args, **kwargs)
     monkeypatch.setattr(routes, 'jsonify', fake_jsonify)
     resp = client.get('/api/v1/health')
-    assert resp.status_code == 400
-    assert 'Health check failed' in resp.get_json()['error']['message']
+    assert resp.status_code == 500
+    payload = resp.get_json()
+    assert payload['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+    assert payload['error']['type'] == 'server_error'
+
+
+def test_get_public_key_exception(client, monkeypatch):
+    class ExplosivePublicKey:
+        @property
+        def public_key_b64(self):
+            raise RuntimeError('boom')
+
+    monkeypatch.setattr(routes, 'encryption_manager', ExplosivePublicKey())
+
+    resp = client.get('/api/v1/public-key')
+
+    assert resp.status_code == 500
+    payload = resp.get_json()
+    assert payload['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+    assert payload['error']['type'] == 'server_error'
 
 
 def test_openai_alias_get_model(client):

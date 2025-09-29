@@ -350,9 +350,13 @@ def get_public_key():
         return jsonify({
             'public_key': encryption_manager.public_key_b64
         })
-    except Exception as e:
-        log_error("Error in get_public_key endpoint")
-        return format_error_response(f"Failed to retrieve public key: {str(e)}")
+    except Exception:
+        log_error("Error in get_public_key endpoint", exc_info=True)
+        return format_error_response(
+            INTERNAL_SERVER_ERROR_MESSAGE,
+            error_type="server_error",
+            status_code=500,
+        )
 
 
 def _process_chat_completion_request(data, *, stream_override=None):
@@ -728,9 +732,13 @@ def health_check():
             'service': SERVICE_NAME,
             'timestamp': int(time.time())
         })
-    except Exception as e:
-        log_error("Error in health_check endpoint")
-        return format_error_response(f"Health check failed: {str(e)}")
+    except Exception:
+        log_error("Error in health_check endpoint", exc_info=True)
+        return format_error_response(
+            INTERNAL_SERVER_ERROR_MESSAGE,
+            error_type="server_error",
+            status_code=500,
+        )
 
 # --- OpenAI-compatible alias routes ---
 

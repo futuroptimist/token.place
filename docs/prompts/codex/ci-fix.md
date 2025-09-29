@@ -1,3 +1,4 @@
+---
 title: 'token.place CI-Failure Fix Prompt'
 slug: 'ci-fix'
 ---

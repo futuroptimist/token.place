@@ -1,3 +1,4 @@
+---
 title: 'token.place Chore Prompt'
 slug: 'chore'
 ---

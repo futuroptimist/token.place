@@ -1,3 +1,4 @@
+---
 title: 'token.place Docs Update Prompt'
 slug: 'docs'
 ---

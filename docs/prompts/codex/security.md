@@ -1,3 +1,4 @@
+---
 title: 'token.place Security Review Prompt'
 slug: 'security'
 ---

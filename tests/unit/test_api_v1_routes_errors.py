@@ -16,14 +16,14 @@ def test_list_models_exception(client, monkeypatch):
     assert resp.status_code == 400
     data = resp.get_json()
     assert "error" in data
-    assert "Internal server error" in data["error"]["message"]
+    assert "An internal server error occurred." in data["error"]["message"]
 
 
 def test_get_model_exception(client, monkeypatch):
     monkeypatch.setattr(routes, "get_models_info", lambda: (_ for _ in ()).throw(RuntimeError("fail")))
     resp = client.get("/api/v1/models/test-model")
     assert resp.status_code == 400
-    assert "Internal server error" in resp.get_json()["error"]["message"]
+    assert "An internal server error occurred." in resp.get_json()["error"]["message"]
 
 
 def test_chat_completion_unexpected_error(client, monkeypatch):
@@ -33,4 +33,4 @@ def test_chat_completion_unexpected_error(client, monkeypatch):
     payload = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
     resp = client.post("/api/v1/chat/completions", json=payload)
     assert resp.status_code == 500
-    assert "Internal server error" in resp.get_json()["error"]["message"]
+    assert "An internal server error occurred." in resp.get_json()["error"]["message"]

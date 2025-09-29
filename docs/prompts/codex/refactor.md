@@ -1,9 +1,8 @@
----
-title: 'Codex Refactor Prompt'
-slug: 'prompts-codex-refactor'
+title: 'token.place Refactor Prompt'
+slug: 'refactor'
 ---
 
-# Codex Refactor Prompt
+# token.place Refactor Prompt
 
 Use this prompt to restructure code in token.place without changing behavior.
 

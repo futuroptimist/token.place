@@ -1,14 +1,13 @@
----
-title: 'Codex Security Review Prompt'
-slug: 'prompts-codex-security'
+title: 'token.place Security Review Prompt'
+slug: 'security'
 ---
 
-# Codex Security Review Prompt
+# token.place Security Review Prompt
 
 Use this prompt to audit token.place for security flaws and verify encryption integrity.
 
-See also [Baseline Codex Prompt](prompts-codex.md) and
-[Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md) for complementary guidance.
+See also [Baseline Prompt](baseline.md) and
+[CI-Failure Fix Prompt](ci-fix.md) for complementary guidance.
 
 ```
 SYSTEM: Automated security reviewer for token.place.

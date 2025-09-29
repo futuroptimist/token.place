@@ -1,16 +1,15 @@
----
-title: 'token.place Codex Prompt'
-slug: 'prompts-codex'
+title: 'token.place Baseline Prompt'
+slug: 'baseline'
 ---
 
-# token.place Codex Prompt
+# token.place Baseline Prompt
 
 This document stores the baseline prompt for instructing automated agents to
 contribute to token.place. Keeping prompts versioned lets us refine them over
 time.
 
-See also [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md) and
-[Codex Security Review Prompt](prompts-codex-security.md) for specialized
+See also [CI-Failure Fix Prompt](ci-fix.md) and
+[Security Review Prompt](security.md) for specialized
 tasks.
 
 ```
@@ -39,12 +38,12 @@ A pull request describing the change and summarizing test results.
 
 ## Specialized prompts
 
-- [Codex CI-Failure Fix Prompt](prompts-codex-ci-fix.md)
-- [Codex Security Review Prompt](prompts-codex-security.md)
-- [Codex Docs Update Prompt](prompts-codex-docs.md)
-- [Codex Feature Prompt](prompts-codex-feature.md)
-- [Codex Refactor Prompt](prompts-codex-refactor.md)
-- [Codex Chore Prompt](prompts-codex-chore.md)
+- [CI-Failure Fix Prompt](ci-fix.md)
+- [Security Review Prompt](security.md)
+- [Docs Update Prompt](docs.md)
+- [Feature Prompt](feature.md)
+- [Refactor Prompt](refactor.md)
+- [Chore Prompt](chore.md)
 
 ## Implementation prompts
 

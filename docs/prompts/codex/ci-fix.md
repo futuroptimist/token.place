@@ -1,14 +1,13 @@
----
-title: 'Codex CI-Failure Fix Prompt'
-slug: 'prompts-codex-ci-fix'
+title: 'token.place CI-Failure Fix Prompt'
+slug: 'ci-fix'
 ---
 
-# Codex CI-Failure Fix Prompt
+# token.place CI-Failure Fix Prompt
 
 Use this prompt to investigate and resolve continuous integration failures in token.place.
 
-See also [Baseline Codex Prompt](prompts-codex.md) and
-[Codex Security Review Prompt](prompts-codex-security.md) for related workflows.
+See also [Baseline Prompt](baseline.md) and
+[Security Review Prompt](security.md) for related workflows.
 
 ```
 SYSTEM:

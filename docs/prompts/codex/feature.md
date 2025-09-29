@@ -1,9 +1,8 @@
----
-title: 'Codex Feature Prompt'
-slug: 'prompts-codex-feature'
+title: 'token.place Feature Prompt'
+slug: 'feature'
 ---
 
-# Codex Feature Prompt
+# token.place Feature Prompt
 
 Use this prompt when adding a small feature to token.place.
 

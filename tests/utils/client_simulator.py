@@ -43,7 +43,7 @@ class ClientSimulator:
         self.server_public_key = base64.b64decode(key_b64)
         return self.server_public_key
 
-    def encrypt_message(self, message: Union[str, Dict], server_key: Optional[bytes] = None) -> Dict:
+    def encrypt_message(self, message: Union[str, Dict, List[Dict]], server_key: Optional[bytes] = None) -> Dict:
         """
         Encrypt a message to send to the server.
 
@@ -62,11 +62,17 @@ class ClientSimulator:
                 self.fetch_server_public_key()
             server_key = self.server_public_key
 
-        # Convert message to JSON string if it's a dict or list
-        if isinstance(message, (dict, list)):
-            message_str = json.dumps(message)
+        # Normalize the message into the structure expected by the API and JSON encode it
+        normalized_message: Union[str, Dict, List[Dict[str, Any]]]
+
+        if isinstance(message, str):
+            normalized_message = [{"role": "user", "content": message}]
+        elif isinstance(message, dict) and {"role", "content"}.issubset(message.keys()):
+            normalized_message = [message]  # Single chat turn provided directly
         else:
-            message_str = str(message)
+            normalized_message = message
+
+        message_str = json.dumps(normalized_message)
 
         # Encrypt the message
         ciphertext_dict, cipherkey, iv = encrypt(message_str.encode('utf-8'), server_key)
@@ -131,8 +137,26 @@ class ClientSimulator:
         )
         response.raise_for_status()
 
-        # Return parsed JSON
-        return response.json()
+        response_json = response.json()
+
+        if not isinstance(response_json, dict):
+            raise ValueError("Unexpected response format: expected JSON object")
+
+        # Handle API responses that include an encrypted payload wrapper
+        if response_json.get("encrypted") and isinstance(response_json.get("data"), dict):
+            payload = response_json["data"]
+        else:
+            choices = response_json.get("choices") if isinstance(response_json.get("choices"), list) else []
+            payload = choices[0]["message"] if choices else None
+
+        if not isinstance(payload, dict):
+            raise ValueError("Encrypted response payload missing or malformed")
+
+        required_fields = {"ciphertext", "cipherkey", "iv"}
+        if not required_fields.issubset(payload.keys()):
+            raise ValueError("Encrypted response payload missing required fields")
+
+        return payload
 
     def send_message(self, message: Union[str, Dict, List[Dict]], model: str = "llama-3-8b-instruct") -> str:
         """
@@ -163,13 +187,5 @@ class ClientSimulator:
         encrypted_data = self.encrypt_message(formatted_message)
 
         # Send the request
-        response_data = self.send_request(encrypted_data, model)
-
-        # Handle different response formats
-        if isinstance(response_data, dict):
-            if "data" in response_data:
-                return self.decrypt_response(response_data["data"])
-            elif "choices" in response_data and response_data["choices"]:
-                return self.decrypt_response(response_data["choices"][0]["message"])
-
-        raise ValueError("Unexpected response format")
+        encrypted_payload = self.send_request(encrypted_data, model)
+        return self.decrypt_response(encrypted_payload)

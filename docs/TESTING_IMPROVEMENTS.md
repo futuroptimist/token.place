@@ -2,25 +2,16 @@
 
 This document serves as a scratch pad for potential testing improvements to implement in the token.place project.
 
-## 1. End-to-End Tests
+## ✅ 1. End-to-End Tests (IMPLEMENTED)
 
-Create full workflow tests that trace a request from client encryption through API transmission to server decryption and back:
+**IMPLEMENTED in `tests/test_e2e_conversation_flow.py::test_manual_encrypted_conversation_flow_matches_docs_example`, which:**
 
-```python
-def test_complete_encrypted_conversation_flow():
-    # Set up client keys
-    client = ClientSimulator()
-    # Get server public key
-    server_key = client.fetch_server_public_key()
-    # Encrypt a message
-    encrypted_request = client.encrypt_message("Hello, secure world!", server_key)
-    # Send to server
-    response = client.send_request(encrypted_request)
-    # Decrypt response
-    decrypted_response = client.decrypt_response(response)
-    # Verify expected flow completed correctly
-    assert "Hello" in decrypted_response
-```
+- Exercises the documented manual workflow of fetching the server key, encrypting a user prompt,
+  dispatching it to `/api/v1/chat/completions`, and decrypting the encrypted assistant reply.
+- Verifies that the decrypted response originates from the mock LLM, proving the round-trip
+  succeeded end-to-end.
+- Ensures `ClientSimulator.encrypt_message` normalises string prompts into chat message payloads
+  so developers can copy the documented snippet directly into their own tests or tooling.
 
 ## ✅ 2. Performance Benchmarks (IMPLEMENTED)
 

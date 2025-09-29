@@ -77,6 +77,10 @@ python -m pytest --cov=. --cov-report=term-missing
 # Then add tests for the modules with lower coverage percentages
 ```
 
+- ✅ Added regression coverage for `api.v1.routes.create_chat_completion` to ensure streaming
+  requests are rejected with an explicit `stream_not_supported` error, improving the
+  OpenAI-compatibility surface area tests.
+
 - ✅ Added regression coverage for `utils.system.resource_monitor.collect_resource_usage`
   to ensure CPU/memory metrics degrade gracefully when `psutil` raises errors.
 

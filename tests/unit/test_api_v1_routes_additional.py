@@ -31,6 +31,23 @@ def test_chat_completion_encrypted_validation_error(client, monkeypatch):
     assert data['error']['code'] == 'code'
 
 
+def test_chat_completion_streaming_not_supported(client):
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [
+            {'role': 'user', 'content': 'hi there'},
+        ],
+        'stream': True,
+    }
+
+    resp = client.post('/api/v1/chat/completions', json=payload)
+
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body['error']['code'] == 'stream_not_supported'
+    assert 'Streaming' in body['error']['message']
+
+
 def test_create_completion_missing_body(client):
     resp = client.post('/api/v1/completions', data='', content_type='application/json')
     assert resp.status_code == 400

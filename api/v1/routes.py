@@ -209,6 +209,18 @@ def create_chat_completion():
                 status_code=400
             )
 
+        stream_requested = data.get('stream', False)
+        if isinstance(stream_requested, str):
+            stream_requested = stream_requested.lower() not in {"false", "0", "no", "off", ""}
+
+        if stream_requested:
+            return format_error_response(
+                "Streaming responses are not yet supported. Submit requests with stream disabled.",
+                error_type="invalid_request_error",
+                code="stream_not_supported",
+                status_code=400,
+            )
+
         try:
             # Validate required fields
             validate_required_fields(data, ["model"])

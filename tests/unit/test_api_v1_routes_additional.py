@@ -199,6 +199,96 @@ def test_create_completion_missing_model(client):
     assert 'Invalid request body' in resp.get_json()['error']['message']
 
 
+def test_list_models_internal_error(client, monkeypatch):
+    monkeypatch.setattr(routes, 'get_models_info', MagicMock(side_effect=RuntimeError('boom')))
+
+    resp = client.get('/api/v1/models')
+
+    assert resp.status_code == 400
+    assert resp.get_json()['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+
+
+def test_get_model_internal_error(client, monkeypatch):
+    monkeypatch.setattr(routes, 'get_models_info', MagicMock(side_effect=RuntimeError('boom')))
+
+    resp = client.get('/api/v1/models/llama-3-8b-instruct')
+
+    assert resp.status_code == 400
+    assert resp.get_json()['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+
+
+def test_chat_completion_internal_error(client, monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        '_process_chat_completion_request',
+        MagicMock(side_effect=RuntimeError('unexpected')),
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'hello'}],
+    }
+
+    resp = client.post('/api/v1/chat/completions', json=payload)
+
+    assert resp.status_code == 500
+    assert resp.get_json()['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+
+
+def test_chat_completion_stream_internal_error(client, monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        '_process_chat_completion_request',
+        MagicMock(side_effect=RuntimeError('unexpected')),
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'hello'}],
+    }
+
+    resp = client.post('/api/v1/chat/completions/stream', json=payload)
+
+    assert resp.status_code == 500
+    assert resp.get_json()['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+
+
+def test_completion_internal_error(client, monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        '_process_completion_request',
+        MagicMock(side_effect=RuntimeError('unexpected')),
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'prompt': 'Hello',
+    }
+
+    resp = client.post('/api/v1/completions', json=payload)
+
+    assert resp.status_code == 400
+    assert resp.get_json()['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+
+
+def test_completion_stream_internal_error(client, monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        '_process_completion_request',
+        MagicMock(side_effect=RuntimeError('unexpected')),
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'prompt': 'Hello',
+    }
+
+    resp = client.post('/api/v1/completions/stream', json=payload)
+
+    assert resp.status_code == 400
+    assert resp.get_json()['error']['message'] == routes.INTERNAL_SERVER_ERROR_MESSAGE
+
+
 def test_create_completion_model_error(client, monkeypatch):
     monkeypatch.setattr(
         routes,

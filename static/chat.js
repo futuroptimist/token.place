@@ -96,6 +96,19 @@ new Vue({
             return btoa(binary);
         },
 
+        updateAssistantMessage(index, delta) {
+            if (!this.chatHistory[index]) {
+                return;
+            }
+
+            const existing = this.chatHistory[index];
+            const updatedContent = (existing.content || '') + delta;
+
+            this.$set(this.chatHistory, index, Object.assign({}, existing, {
+                content: updatedContent
+            }));
+        },
+
         // Extract the Base64 content from PEM format
         extractBase64(pemString) {
             return pemString
@@ -162,16 +175,18 @@ new Vue({
                 const iv = CryptoJS.lib.WordArray.random(16);
 
                 // Pad and encrypt the plaintext with AES in CBC mode
-                // const paddedData = CryptoJS.pad.Pkcs7.pad(CryptoJS.enc.Utf8.parse(plaintext), 16); // Remove manual padding
-                const encrypted = CryptoJS.AES.encrypt(CryptoJS.enc.Utf8.parse(plaintext), aesKey, { // Encrypt original plaintext
-                    iv: iv,
-                    mode: CryptoJS.mode.CBC,
-                    padding: CryptoJS.pad.Pkcs7 // Let CryptoJS handle PKCS7 padding
-                });
+                const encrypted = CryptoJS.AES.encrypt(
+                    CryptoJS.enc.Utf8.parse(plaintext),
+                    aesKey,
+                    {
+                        iv: iv,
+                        mode: CryptoJS.mode.CBC,
+                        padding: CryptoJS.pad.Pkcs7, // Let CryptoJS handle PKCS7 padding
+                    }
+                );
 
                 // Prepare the RSA encryption
                 const jsEncrypt = new JSEncrypt();
-                // console.log('Public key PEM provided to encrypt function:', publicKeyPem); // Remove log
                 jsEncrypt.setPublicKey(publicKeyPem);
 
                 // Encrypt the AES key with RSA-OAEP (SHA-256)
@@ -239,8 +254,102 @@ new Vue({
             }
         },
 
+        async consumeStreamingResponse(response, { assistantIndex, encrypted }) {
+            if (!response.body) {
+                console.warn('Streaming response body is not available');
+                return;
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+
+                    buffer += decoder.decode(value, { stream: true });
+
+                    let boundary;
+                    while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+                        const event = buffer.slice(0, boundary);
+                        buffer = buffer.slice(boundary + 2);
+
+                        if (!event.trim()) {
+                            continue;
+                        }
+
+                        const dataLines = event
+                            .split('\n')
+                            .filter(line => line.startsWith('data: '))
+                            .map(line => line.slice(6));
+
+                        for (const line of dataLines) {
+                            if (line === '[DONE]') {
+                                return;
+                            }
+
+                            let payload;
+                            try {
+                                payload = JSON.parse(line);
+                            } catch (error) {
+                                console.error('Failed to parse streaming payload:', error);
+                                continue;
+                            }
+
+                            let contentDelta = '';
+
+                            if (encrypted && payload && payload.encrypted && payload.chunk) {
+                                const decrypted = await this.decrypt(
+                                    payload.chunk.ciphertext,
+                                    payload.chunk.cipherkey,
+                                    payload.chunk.iv
+                                );
+
+                                if (!decrypted) {
+                                    console.error('Failed to decrypt streaming chunk');
+                                    continue;
+                                }
+
+                                try {
+                                    const parsed = JSON.parse(decrypted);
+                                    const choice = parsed.choices && parsed.choices[0];
+                                    if (
+                                        choice &&
+                                        choice.delta &&
+                                        typeof choice.delta.content === 'string'
+                                    ) {
+                                        contentDelta = choice.delta.content;
+                                    }
+                                } catch (error) {
+                                    console.error('Invalid decrypted streaming chunk:', error);
+                                }
+                            } else if (payload && payload.choices && payload.choices[0]) {
+                                const choice = payload.choices[0];
+                                if (choice.delta && typeof choice.delta.content === 'string') {
+                                    contentDelta = choice.delta.content;
+                                } else if (typeof choice.text === 'string') {
+                                    contentDelta = choice.text;
+                                }
+                            }
+
+                            if (contentDelta) {
+                                this.updateAssistantMessage(assistantIndex, contentDelta);
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Streaming consumption error:', error);
+                throw error;
+            }
+        },
+
         // Send a message to the server using the new API
-        async sendMessageApi() {
+        async sendMessageApi(assistantIndex) {
             if (!this.serverPublicKey) {
                 console.error('Server public key not available');
                 return null;
@@ -248,8 +357,9 @@ new Vue({
 
             try {
                 // Encrypt the chat history
+                const historyForRequest = this.chatHistory.slice(0, assistantIndex);
                 const encryptedData = await this.encrypt(
-                    JSON.stringify(this.chatHistory),
+                    JSON.stringify(historyForRequest),
                     this.serverPublicKey
                 );
 
@@ -262,7 +372,8 @@ new Vue({
                     model: "llama-3-8b-instruct",
                     encrypted: true,
                     client_public_key: this.extractBase64(this.clientPublicKey),
-                    messages: encryptedData
+                    messages: encryptedData,
+                    stream: true
                 };
 
                 // Send the request to the API
@@ -277,6 +388,15 @@ new Vue({
                 if (!response.ok) {
                     const errorData = await response.json();
                     throw new Error(`API error: ${errorData.error?.message || 'Unknown error'}`);
+                }
+
+                const contentType = response.headers.get('Content-Type') || '';
+                if (contentType.includes('text/event-stream')) {
+                    await this.consumeStreamingResponse(response, {
+                        assistantIndex,
+                        encrypted: true
+                    });
+                    return { streamed: true };
                 }
 
                 const responseData = await response.json();
@@ -315,41 +435,44 @@ new Vue({
 
             this.isGeneratingResponse = true;
             this.chatHistory.push({ role: "user", content: messageContent });
+            this.chatHistory.push({ role: "assistant", content: '' });
+            const assistantIndex = this.chatHistory.length - 1;
             this.newMessage = '';
             this.$nextTick(() => {
                 this.adjustMessageInputHeight();
             });
 
             try {
-                // Send the message via the API
-                let response = await this.sendMessageApi();
+                const response = await this.sendMessageApi(assistantIndex);
 
-                // Process the response
+                if (response && response.streamed) {
+                    return;
+                }
+
                 if (response) {
-                    // For API response, extract last message
                     if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
-                        this.chatHistory.push(assistantMessage);
-                    }
-                    // For legacy response format (full chat history)
-                    else if (Array.isArray(response)) {
+                        this.$set(this.chatHistory, assistantIndex, assistantMessage);
+                    } else if (Array.isArray(response)) {
                         this.chatHistory = response;
-                    }
-                    else {
+                    } else {
                         throw new Error('Unexpected response format');
                     }
                 } else {
-                    // Add a failure message if we couldn't get a response
-                    this.chatHistory.push({
+                    this.$set(this.chatHistory, assistantIndex, {
                         role: 'assistant',
-                        content: 'Sorry, I encountered an issue generating a response. Please try again.'
+                        content:
+                            'Sorry, I encountered an issue generating a response. ' +
+                            'Please try again.'
                     });
                 }
             } catch (error) {
                 console.error('Error sending message:', error);
-                this.chatHistory.push({
+                this.$set(this.chatHistory, assistantIndex, {
                     role: 'assistant',
-                    content: 'Sorry, an error occurred while sending your message. Please try again.'
+                    content:
+                        'Sorry, an error occurred while sending your message. ' +
+                        'Please try again.'
                 });
             } finally {
                 this.isGeneratingResponse = false;

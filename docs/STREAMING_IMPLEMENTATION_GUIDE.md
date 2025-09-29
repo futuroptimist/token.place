@@ -1,6 +1,7 @@
 # Streaming Implementation Guide for token.place
 
-This guide outlines the steps required to implement streaming inference in the token.place application, allowing users to see responses as they are generated.
+This guide outlines the steps required to implement streaming inference in the
+token.place application, allowing users to see responses as they are generated.
 
 ## Architecture Overview
 
@@ -11,7 +12,8 @@ Client → Encrypted Request → Relay → Server → LLM → Complete Response 
 
 The streaming architecture would be:
 ```
-Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks → Encrypted Chunks → Relay → Client → Real-time Display
+Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks →
+Encrypted Chunks → Relay → Client → Real-time Display
 ```
 
 ## Implementation Steps
@@ -117,8 +119,12 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 
 #### 3.1 Add Streaming Endpoints
 - Create new endpoints specifically for streaming:
-  - `/api/v1/chat/completions/stream`
-  - `/api/v1/completions/stream`
+  - ✅ `/api/v1/chat/completions/stream`
+  - ✅ `/api/v1/completions/stream`
+
+> **Update (May 2024):** The API now serves streaming responses for both chat and legacy completions
+> while keeping the original non-streaming behaviour available. See the unit tests in
+> `tests/unit/test_api_v1_routes_additional.py` for examples of the SSE payloads.
 
 #### 3.2 Update API Documentation
 - Document the streaming APIs
@@ -127,9 +133,9 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 ### 4. Testing Infrastructure
 
 #### 4.1 Streaming Tests
-- Implement tests for streaming functionality
+- ✅ Implement tests for streaming functionality
 - Test different chunk sizes and timing scenarios
-- Verify encryption/decryption with streaming
+- ✅ Verify encryption/decryption with streaming
 
 #### 4.2 Integration Tests
 - Create end-to-end tests for the streaming experience

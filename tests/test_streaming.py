@@ -3,7 +3,8 @@ from unittest.mock import patch, MagicMock
 import json
 
 # This test will verify future streaming capabilities
-# Currently marked as skipped since streaming isn't implemented yet
+# Currently marked as skipped since streaming isn't implemented yet and the API returns
+# an explicit error when `stream=True`.
 
 @pytest.mark.skip(reason="Streaming feature not yet implemented")
 def test_streaming_chat_completion(client):

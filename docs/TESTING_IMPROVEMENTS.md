@@ -1,10 +1,13 @@
 # Testing Improvement Ideas
 
-This document serves as a scratch pad for potential testing improvements to implement in the token.place project.
+This document serves as a scratch pad for potential testing improvements to
+implement in the token.place project.
 
 ## ✅ 1. End-to-End Tests (IMPLEMENTED)
 
-**IMPLEMENTED in `tests/test_e2e_conversation_flow.py::test_manual_encrypted_conversation_flow_matches_docs_example`, which:**
+**IMPLEMENTED:** see
+`tests/test_e2e_conversation_flow.py::test_manual_encrypted_conversation_flow_matches_docs_example`,
+which:
 
 - Exercises the documented manual workflow of fetching the server key, encrypting a user prompt,
   dispatching it to `/api/v1/chat/completions`, and decrypting the encrypted assistant reply.
@@ -77,6 +80,12 @@ python -m pytest --cov=. --cov-report=term-missing
 # Then add tests for the modules with lower coverage percentages
 ```
 
+- ✅ Added regression coverage for `api.v1.routes.create_chat_completion` and
+  `api.v1.routes.create_completion_stream` to ensure SSE streaming works for
+  both plaintext and encrypted clients, replacing the previous guard that
+  rejected streaming attempts outright to expand the OpenAI-compatibility
+  surface area tests.
+
 - ✅ Added regression coverage for `utils.system.resource_monitor.collect_resource_usage`
   to ensure CPU/memory metrics degrade gracefully when `psutil` raises errors.
 
@@ -91,7 +100,8 @@ python -m pytest --cov=. --cov-report=term-missing
 
 ## ✅ 9. Negative Testing (IMPLEMENTED)
 
-**IMPLEMENTED in tests/unit/test_encrypt_input_validation.py and updated tests/test_crypto_failures.py, which include:**
+**IMPLEMENTED:** see `tests/unit/test_encrypt_input_validation.py` and the
+updated `tests/test_crypto_failures.py`, which include:
 - Validation that `encrypt.decrypt` raises helpful `ValueError` messages when required fields are
   missing.
 - Type checks that reject non-mapping ciphertext payloads and non-bytes values before decrypting.
@@ -114,7 +124,9 @@ app.post('/api/chat', (req, res) => {
 
 ## 11. Real-World Integration Testing with DSPACE
 
-Implement integration tests with the [DSPACE project](https://github.com/democratizedspace/dspace) to verify token.place works as a drop-in replacement for OpenAI's API:
+Implement integration tests with the
+[DSPACE project](https://github.com/democratizedspace/dspace) to verify
+token.place works as a drop-in replacement for OpenAI's API:
 
 ### Setup:
 

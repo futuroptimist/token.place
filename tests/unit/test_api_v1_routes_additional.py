@@ -1,10 +1,14 @@
+import base64
+import json
 from unittest.mock import MagicMock
+
 import pytest
 
 from relay import app
 from api.v1 import routes
 from api.v1.models import ModelError
 from api.v1.validation import ValidationError
+from encrypt import encrypt as encrypt_payload, decrypt as decrypt_payload, generate_keys
 
 
 @pytest.fixture
@@ -15,20 +19,173 @@ def client():
 
 
 def test_get_public_key_exception(client, monkeypatch):
-    monkeypatch.setattr(routes, 'encryption_manager', MagicMock(public_key_b64=property(lambda self: (_ for _ in ()).throw(RuntimeError('fail')))))
+    class FailingEncryptionManager:
+        @property
+        def public_key_b64(self):
+            raise RuntimeError('fail')
+
+    monkeypatch.setattr(routes, 'encryption_manager', FailingEncryptionManager())
     resp = client.get('/api/v1/public-key')
     assert resp.status_code == 400
     assert 'Failed to retrieve public key' in resp.get_json()['error']['message']
 
 
 def test_chat_completion_encrypted_validation_error(client, monkeypatch):
-    monkeypatch.setattr(routes, 'validate_encrypted_request', MagicMock(side_effect=ValidationError('bad', 'field', 'code')))
-    payload = {'model': 'llama-3-8b-instruct', 'encrypted': True, 'client_public_key': 'x', 'messages': {}}
+    monkeypatch.setattr(
+        routes,
+        'validate_encrypted_request',
+        MagicMock(side_effect=ValidationError('bad', 'field', 'code')),
+    )
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'encrypted': True,
+        'client_public_key': 'x',
+        'messages': {},
+    }
     resp = client.post('/api/v1/chat/completions', json=payload)
     assert resp.status_code == 400
     data = resp.get_json()
     assert data['error']['message'] == 'bad'
     assert data['error']['code'] == 'code'
+
+
+def _mock_stream_chunks():
+    return iter([
+        {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"content": " world"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ])
+
+
+def _extract_sse_payloads(response):
+    raw = response.get_data(as_text=True)
+    events = [segment for segment in raw.split("\n\n") if segment]
+    payloads = []
+    for event in events:
+        for line in event.splitlines():
+            if line.startswith('data: '):
+                payloads.append(line[len('data: '):])
+    return payloads
+
+
+def test_chat_completion_stream_plaintext(client, monkeypatch):
+    monkeypatch.setattr(routes, 'get_model_instance', MagicMock(return_value='MOCK'))
+    monkeypatch.setattr(
+        routes,
+        'stream_chat_completion',
+        lambda *args, **kwargs: _mock_stream_chunks(),
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [
+            {'role': 'user', 'content': 'hi there'},
+        ],
+        'stream': True,
+    }
+
+    resp = client.post('/api/v1/chat/completions', json=payload)
+
+    assert resp.status_code == 200
+    assert resp.headers['Content-Type'].startswith('text/event-stream')
+
+    payloads = _extract_sse_payloads(resp)
+    assert payloads[-1] == '[DONE]'
+
+    accumulated = ''
+    for chunk in payloads[:-1]:
+        data = json.loads(chunk)
+        delta = data['choices'][0]['delta']
+        accumulated += delta.get('content', '')
+
+    assert accumulated == 'Hello world'
+
+
+def test_chat_completion_stream_encrypted(client, monkeypatch):
+    monkeypatch.setattr(routes, 'get_model_instance', MagicMock(return_value='MOCK'))
+    monkeypatch.setattr(
+        routes,
+        'stream_chat_completion',
+        lambda *args, **kwargs: _mock_stream_chunks(),
+    )
+
+    private_key, public_key = generate_keys()
+    client_public_key_b64 = base64.b64encode(public_key).decode('utf-8')
+
+    server_public_key = base64.b64decode(routes.encryption_manager.public_key_b64)
+    messages = [{"role": "user", "content": "hi there"}]
+    ciphertext_dict, cipherkey, iv = encrypt_payload(
+        json.dumps(messages).encode('utf-8'),
+        server_public_key,
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'encrypted': True,
+        'client_public_key': client_public_key_b64,
+        'messages': {
+            'ciphertext': base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8'),
+            'cipherkey': base64.b64encode(cipherkey).decode('utf-8'),
+            'iv': base64.b64encode(iv).decode('utf-8'),
+        },
+        'stream': True,
+    }
+
+    resp = client.post('/api/v1/chat/completions', json=payload)
+
+    assert resp.status_code == 200
+    assert resp.headers['Content-Type'].startswith('text/event-stream')
+
+    payloads = _extract_sse_payloads(resp)
+    assert payloads[-1] == '[DONE]'
+
+    accumulated = ''
+    for chunk in payloads[:-1]:
+        data = json.loads(chunk)
+        assert data['encrypted'] is True
+        encrypted_chunk = data['chunk']
+        decrypted = decrypt_payload(
+            {
+                'ciphertext': base64.b64decode(encrypted_chunk['ciphertext']),
+                'iv': base64.b64decode(encrypted_chunk['iv']),
+            },
+            base64.b64decode(encrypted_chunk['cipherkey']),
+            private_key,
+        )
+        chunk_payload = json.loads(decrypted.decode('utf-8'))
+        accumulated += chunk_payload['choices'][0]['delta'].get('content', '')
+
+    assert accumulated == 'Hello world'
+
+
+def test_completion_stream_plaintext(client, monkeypatch):
+    monkeypatch.setattr(routes, 'get_model_instance', MagicMock(return_value='MOCK'))
+    monkeypatch.setattr(
+        routes,
+        'stream_chat_completion',
+        lambda *args, **kwargs: _mock_stream_chunks(),
+    )
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'prompt': 'hello',
+    }
+
+    resp = client.post('/api/v1/completions/stream', json=payload)
+
+    assert resp.status_code == 200
+    assert resp.headers['Content-Type'].startswith('text/event-stream')
+
+    payloads = _extract_sse_payloads(resp)
+    assert payloads[-1] == '[DONE]'
+
+    accumulated = ''
+    for chunk in payloads[:-1]:
+        data = json.loads(chunk)
+        accumulated += data['choices'][0].get('text', '')
+
+    assert accumulated == 'Hello world'
 
 
 def test_create_completion_missing_body(client):
@@ -43,7 +200,11 @@ def test_create_completion_missing_model(client):
 
 
 def test_create_completion_model_error(client, monkeypatch):
-    monkeypatch.setattr(routes, 'get_model_instance', MagicMock(side_effect=ModelError('oops', status_code=400)))
+    monkeypatch.setattr(
+        routes,
+        'get_model_instance',
+        MagicMock(side_effect=ModelError('oops', status_code=400)),
+    )
     payload = {'model': 'bad', 'prompt': 'hi'}
     resp = client.post('/api/v1/completions', json=payload)
     assert resp.status_code == 400

@@ -205,6 +205,9 @@ def _stream_completion_response(model_id, prompt, *, encrypted, client_public_ke
 # Create a Blueprint for v1 API
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
 
+
+INTERNAL_SERVER_ERROR_MESSAGE = "An internal server error occurred."
+
 def format_error_response(
     message,
     error_type="invalid_request_error",
@@ -273,9 +276,9 @@ def list_models():
             "object": "list",
             "data": formatted_models
         })
-    except Exception as e:
-        log_error("Error in list_models endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Error in list_models endpoint", exc_info=True)
+        return format_error_response(INTERNAL_SERVER_ERROR_MESSAGE)
 
 @v1_bp.route('/models/<model_id>', methods=['GET'])
 def get_model(model_id):
@@ -326,9 +329,12 @@ def get_model(model_id):
             "root": model["id"],
             "parent": None
         })
-    except Exception as e:
-        log_error(f"Error in get_model endpoint for model {model_id}")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error(
+            f"Error in get_model endpoint for model {model_id}",
+            exc_info=True,
+        )
+        return format_error_response(INTERNAL_SERVER_ERROR_MESSAGE)
 
 @v1_bp.route('/public-key', methods=['GET'])
 def get_public_key():
@@ -621,10 +627,10 @@ def create_chat_completion():
 
         return _process_chat_completion_request(data)
 
-    except Exception as e:
+    except Exception:
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
-            f"Internal server error: {str(e)}",
+            INTERNAL_SERVER_ERROR_MESSAGE,
             error_type="server_error",
             status_code=500
         )
@@ -647,10 +653,10 @@ def create_chat_completion_stream():
 
         return _process_chat_completion_request(data, stream_override=True)
 
-    except Exception as e:
+    except Exception:
         log_error("Unexpected error in create_chat_completion_stream endpoint", exc_info=True)
         return format_error_response(
-            f"Internal server error: {str(e)}",
+            INTERNAL_SERVER_ERROR_MESSAGE,
             error_type="server_error",
             status_code=500
         )
@@ -678,9 +684,9 @@ def create_completion():
 
         return _process_completion_request(data)
 
-    except Exception as e:
-        log_error("Unexpected error in create_completion endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Unexpected error in create_completion endpoint", exc_info=True)
+        return format_error_response(INTERNAL_SERVER_ERROR_MESSAGE)
 
 
 @v1_bp.route('/completions/stream', methods=['POST'])
@@ -701,9 +707,9 @@ def create_completion_stream():
 
         return _process_completion_request(data, stream_override=True)
 
-    except Exception as e:
-        log_error("Unexpected error in create_completion_stream endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Unexpected error in create_completion_stream endpoint", exc_info=True)
+        return format_error_response(INTERNAL_SERVER_ERROR_MESSAGE)
 
 
 @v1_bp.route('/health', methods=['GET'])

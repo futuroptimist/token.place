@@ -86,6 +86,9 @@ python -m pytest --cov=. --cov-report=term-missing
 # Then add tests for the modules with lower coverage percentages
 ```
 
+- ✅ Added regression coverage for `utils.system.resource_monitor.collect_resource_usage`
+  to ensure CPU/memory metrics degrade gracefully when `psutil` raises errors.
+
 ## ✅ 8. Snapshot Testing (IMPLEMENTED)
 
 **IMPLEMENTED in tests/unit/test_encrypt_snapshot.py, which includes:**

@@ -12,7 +12,9 @@
     "watch:renderer": "esbuild src/renderer/index.tsx --bundle --outdir=dist/renderer --platform=browser --loader:.tsx=tsx --watch",
     "lint": "eslint src --ext .ts,.tsx",
     "package:mac": "electron-builder --config electron-builder.json --mac",
-    "package:win": "electron-builder --config electron-builder.json --win"
+    "package:win": "electron-builder --config electron-builder.json --win",
+    "package:linux": "electron-builder --config electron-builder.json --linux",
+    "package:all": "electron-builder --config electron-builder.json --mac --win --linux"
   },
   "dependencies": {
     "electron-store": "^8.1.0",

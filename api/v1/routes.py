@@ -12,6 +12,7 @@ import logging
 import os
 
 from api.v1.encryption import encryption_manager
+from api.v1.community import get_provider_directory, CommunityDirectoryError
 from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
@@ -185,6 +186,32 @@ def get_public_key():
     except Exception as e:
         log_error("Error in get_public_key endpoint")
         return format_error_response(f"Failed to retrieve public key: {str(e)}")
+
+
+@v1_bp.route('/community/providers', methods=['GET'])
+def list_community_providers():
+    """Expose the community-operated relay directory."""
+
+    try:
+        log_info("API request: GET /community/providers")
+        directory = get_provider_directory()
+
+        response_payload = {
+            "object": "list",
+            "data": directory["providers"],
+        }
+
+        if directory.get("updated"):
+            response_payload["updated"] = directory["updated"]
+
+        return jsonify(response_payload)
+    except CommunityDirectoryError as exc:
+        log_error("Invalid community directory data", exc_info=True)
+        return format_error_response(
+            "Community directory temporarily unavailable",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 @v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion():

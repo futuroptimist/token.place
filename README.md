@@ -168,7 +168,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [ ] Optional content moderation hooks
   - [ ] External security review of protocol and code
 - [ ] Community features
-  - [ ] Server provider directory/registry
+  - [x] Server provider directory/registry
   - [ ] Model leaderboard based on community feedback
   - [ ] Contribution system for donating compute resources
 
@@ -570,6 +570,15 @@ Request body:
   "max_tokens": 256
 }
 ```
+
+#### Community Provider Directory
+```
+GET /api/v1/community/providers
+```
+Lists community-operated relay nodes that have opted into the public registry.
+Each entry includes the provider identifier, advertised region, contact details,
+current status, and a representative latency measurement to help clients pick a
+nearby relay.
 
 ### End-to-End Encryption
 

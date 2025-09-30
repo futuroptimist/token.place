@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "test": "pytest tests/",
-    "test:js": "node tests/test_js_crypto.js",
+    "test:js": "node tests/test_js_crypto.js && node tests/test_js_mock_server.js",
     "test:crypto-compat": "python tests/test_crypto_compatibility.py",
     "test:e2e": "pytest tests/test_e2e_chat.py",
     "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e",

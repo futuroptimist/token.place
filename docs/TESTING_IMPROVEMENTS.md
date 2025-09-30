@@ -98,19 +98,18 @@ python -m pytest --cov=. --cov-report=term-missing
 - Regression coverage to ensure missing-field scenarios now surface explicit exceptions rather than
   returning `None` silently.
 
-## 10. Mock Server for JavaScript Tests
+## ✅ 10. Mock Server for JavaScript Tests (IMPLEMENTED)
 
-Create a simple mock server to test the JavaScript client without relying on the full Python server:
+**IMPLEMENTED in `tests/mock_js_server.js` with coverage in
+`tests/test_js_mock_server.js`, which:**
 
-```javascript
-// mock_server.js
-const express = require('express');
-const app = express();
-app.post('/api/chat', (req, res) => {
-  // Return mock encrypted responses
-});
-// Then use this in js tests
-```
+- Spins up a lightweight HTTP server that mimics the encrypted `/api/v1/chat/completions`
+  contract entirely in Node.js, avoiding the need to boot the Python stack for JavaScript
+  tests.
+- Handles RSA key exchange plus AES-CBC encryption/decryption using the same JSEncrypt and
+  CryptoJS libraries as the browser client, ensuring wire compatibility.
+- Responds with deterministic assistant messages so tests can assert on decrypted content.
+- Is exercised automatically via `npm run test:js`, alongside the existing crypto unit tests.
 
 ## 11. Real-World Integration Testing with DSPACE
 

@@ -15,7 +15,13 @@ import signal
 import requests
 from pathlib import Path
 from typing import Dict, Any, Generator, List, Optional, Tuple
-from playwright.sync_api import Page, sync_playwright, Browser, BrowserContext
+from playwright.sync_api import (
+    Page,
+    sync_playwright,
+    Browser,
+    BrowserContext,
+    Error as PlaywrightError,
+)
 
 # Add the project root to the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -139,6 +145,7 @@ def print_console_message(msg):
 E2E_SERVER_PORT = 8010
 E2E_RELAY_PORT = 5010
 E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
+BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 
 @pytest.fixture(scope="module")
 def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None, None]:
@@ -273,18 +280,21 @@ def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], 
     3. Yields the browser and context
     4. Cleans up after tests
     """
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context()
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(headless=True)
+    context = browser.new_context()
 
-        # Add console log handler
-        context.on("console", print_console_message)
+    # Add console log handler
+    context.on("console", print_console_message)
 
+    try:
         yield browser, context
-
-        # Cleanup
-        context.close()
-        browser.close()
+    finally:
+        try:
+            context.close()
+        finally:
+            browser.close()
+            playwright.stop()
 
 @pytest.fixture(scope="function")
 def page(browser_context) -> Generator[Page, None, None]:
@@ -301,6 +311,29 @@ def page(browser_context) -> Generator[Page, None, None]:
     page = context.new_page()
     yield page
     page.close()
+
+
+@pytest.fixture(scope="function", params=BROWSER_MATRIX_TARGETS)
+def browser_matrix(request) -> Generator[Tuple[str, Page], None, None]:
+    """Yield a Playwright page for each supported browser engine."""
+
+    browser_name: str = request.param
+
+    try:
+        with sync_playwright() as playwright:
+            browser_launcher = getattr(playwright, browser_name)
+            browser = browser_launcher.launch(headless=True)
+            context = browser.new_context()
+            context.on("console", print_console_message)
+
+            page = context.new_page()
+            try:
+                yield browser_name, page
+            finally:
+                context.close()
+                browser.close()
+    except PlaywrightError as exc:  # pragma: no cover - skip when browser unavailable
+        pytest.skip(f"Playwright browser '{browser_name}' unavailable: {exc}")
 
 # Provide base_url as a fixture
 @pytest.fixture(scope="session")

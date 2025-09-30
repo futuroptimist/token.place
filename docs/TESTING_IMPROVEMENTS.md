@@ -54,17 +54,17 @@ This document serves as a scratch pad for potential testing improvements to impl
 - Testing with binary data
 - Testing encryption compatibility between different key sizes
 
-## 6. Cross-Platform Browser Tests
+## ✅ 6. Cross-Platform Browser Tests (IMPLEMENTED)
 
-Expand browser testing to include different environments:
+**IMPLEMENTED in `tests/test_crypto_browser_matrix.py`, which:**
 
-```python
-@pytest.mark.parametrize("browser_type", ["chromium", "firefox", "webkit"])
-def test_js_encryption_in_different_browsers(browser_type, playwright):
-    browser = getattr(playwright, browser_type).launch()
-    page = browser.new_page()
-    # Run your encryption tests in this browser
-```
+- Parameterizes Playwright across Chromium, Firefox, and WebKit using the
+  shared `browser_matrix` fixture in `tests/conftest.py`.
+- Exercises the documented encryption runner (`tests/crypto_runner.html`) in
+  each browser engine to prove Python-encrypted payloads decrypt correctly in
+  JavaScript.
+- Skips gracefully if a browser runtime is unavailable locally while still
+  providing coverage wherever Playwright installs are present.
 
 ## 7. Test Coverage Improvements
 

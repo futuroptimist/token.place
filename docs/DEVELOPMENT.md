@@ -71,6 +71,10 @@ python scripts/validate_dependencies.py
 
 # 4. Run tests
 ./run_all_tests.sh
+
+# 5. (Optional) Validate the suite inside a container
+python scripts/run_tests_in_container.py --dry-run  # inspect command
+# python scripts/run_tests_in_container.py          # execute via docker/podman
 ```
 
 ### Troubleshooting

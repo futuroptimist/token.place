@@ -165,8 +165,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Enhanced encryption options for model weights and inference data
   - [ ] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
-  - [ ] Optional content moderation hooks
-  - [ ] External security review of protocol and code
+- [ ] Optional content moderation hooks
+- [ ] External security review of protocol and code
 - [ ] Community features
   - [x] Server provider directory/registry
   - [ ] Model leaderboard based on community feedback
@@ -575,10 +575,32 @@ Request body:
 ```
 GET /api/v1/community/providers
 ```
-Lists community-operated relay nodes that have opted into the public registry.
-Each entry includes the provider identifier, advertised region, contact details,
-current status, and a representative latency measurement to help clients pick a
-nearby relay.
+Lists community-operated relay nodes and server operators that have opted into the public registry.  
+Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.  
+A representative latency measurement may also be included to help clients pick a nearby relay.
+
+Example response snippet:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "local-dev",
+      "name": "Local Development Node",
+      "region": "local",
+      "status": "active",
+      "endpoints": [
+        {"type": "relay", "url": "http://localhost:5010"},
+        {"type": "server", "url": "http://localhost:3000"}
+      ]
+    }
+  ],
+  "metadata": {
+    "updated_at": "2025-02-15T00:00:00Z"
+  }
+}
+```
 
 ### End-to-End Encryption
 

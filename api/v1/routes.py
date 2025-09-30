@@ -18,6 +18,7 @@ from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name
 )
+from utils.providers import get_provider_directory, ProviderRegistryError
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -190,28 +191,31 @@ def get_public_key():
 
 @v1_bp.route('/community/providers', methods=['GET'])
 def list_community_providers():
-    """Expose the community-operated relay directory."""
+    """Expose the community-operated relay and server provider directory."""
 
     try:
         log_info("API request: GET /community/providers")
         directory = get_provider_directory()
-
-        response_payload = {
-            "object": "list",
-            "data": directory["providers"],
-        }
-
-        if directory.get("updated"):
-            response_payload["updated"] = directory["updated"]
-
-        return jsonify(response_payload)
-    except CommunityDirectoryError as exc:
-        log_error("Invalid community directory data", exc_info=True)
+    except ProviderRegistryError as exc:
+        log_error("Error loading provider registry", exc_info=True)
         return format_error_response(
-            "Community directory temporarily unavailable",
-            error_type="internal_server_error",
+            f"Failed to load provider registry: {exc}",
+            error_type="internal_error",
+            code="provider_registry_unavailable",
             status_code=500,
         )
+
+    response_payload = {
+        "object": "list",
+        "data": directory.get("providers", []),
+    }
+
+    metadata = directory.get("metadata")
+    if metadata:
+        response_payload["metadata"] = metadata
+
+    return jsonify(response_payload)
+  
 
 @v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion():

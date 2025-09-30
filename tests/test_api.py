@@ -106,6 +106,28 @@ def test_get_public_key(client):
     assert 'public_key' in data
     assert len(data['public_key']) > 0
 
+
+def test_server_provider_directory(client):
+    """The server provider registry should list known compute providers."""
+    response = client.get("/api/v1/server-providers")
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    assert payload["object"] == "list"
+    providers = payload["data"]
+    assert isinstance(providers, list)
+    assert providers, "expected at least one provider"
+
+    sample = providers[0]
+    required_fields = {"id", "name", "region", "status", "endpoints"}
+    assert required_fields.issubset(sample)
+    assert isinstance(sample["endpoints"], list)
+    assert sample["endpoints"], "providers should surface at least one endpoint"
+
+    for endpoint in sample["endpoints"]:
+        assert "type" in endpoint
+        assert "url" in endpoint
+
 def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     """Test the chat completion API without encryption"""
     payload = {

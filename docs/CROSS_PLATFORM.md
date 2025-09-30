@@ -254,4 +254,6 @@ To further enhance cross-platform support, future work includes:
    - ✅ Matrix testing across all supported platforms via `utils/testing/platform_matrix.py`
      and the accompanying regression in `tests/unit/test_platform_matrix.py`
    - ✅ Automated builds for all platforms through the `desktop/package:all` script
-   - Containerized testing environments
+   - ✅ Containerized testing environments with `scripts/run_tests_in_container.py`
+     orchestrating the Docker-based test runner defined in
+     `docker/test-runner.Dockerfile`

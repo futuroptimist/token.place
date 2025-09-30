@@ -1,7 +1,10 @@
 import base64
+
 import pytest
-from relay import app
+
 from api.v1 import routes
+from relay import app
+from utils.providers import ProviderRegistryError
 
 @pytest.fixture
 def client():
@@ -34,3 +37,16 @@ def test_chat_completion_unexpected_error(client, monkeypatch):
     resp = client.post("/api/v1/chat/completions", json=payload)
     assert resp.status_code == 500
     assert "Internal server error" in resp.get_json()["error"]["message"]
+
+
+def test_list_server_providers_registry_error(client, monkeypatch):
+    def _boom():
+        raise ProviderRegistryError("broken registry")
+
+    monkeypatch.setattr(routes, "get_provider_directory", _boom)
+
+    resp = client.get("/api/v1/server-providers")
+    assert resp.status_code == 500
+    data = resp.get_json()
+    assert data["error"]["code"] == "provider_registry_unavailable"
+    assert "Failed to load provider registry" in data["error"]["message"]

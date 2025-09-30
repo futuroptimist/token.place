@@ -165,10 +165,10 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Enhanced encryption options for model weights and inference data
   - [ ] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
-  - [ ] Optional content moderation hooks
-  - [ ] External security review of protocol and code
+- [ ] Optional content moderation hooks
+- [ ] External security review of protocol and code
 - [ ] Community features
-  - [ ] Server provider directory/registry
+  - [x] Server provider directory/registry
   - [ ] Model leaderboard based on community feedback
   - [ ] Contribution system for donating compute resources
 
@@ -568,6 +568,37 @@ Request body:
   "model": "llama-3-8b-instruct",
   "prompt": "Write a poem about AI",
   "max_tokens": 256
+}
+```
+
+#### Server Providers Directory
+```
+GET /api/v1/server-providers
+```
+Returns a curated directory of relay and server operators that have opted-in to
+list their infrastructure. Each entry includes status, region, and the exposed
+endpoint URLs so clients can preselect a compatible provider.
+
+Example response snippet:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "local-dev",
+      "name": "Local Development Node",
+      "region": "local",
+      "status": "active",
+      "endpoints": [
+        {"type": "relay", "url": "http://localhost:5010"},
+        {"type": "server", "url": "http://localhost:3000"}
+      ]
+    }
+  ],
+  "metadata": {
+    "updated_at": "2025-02-15T00:00:00Z"
+  }
 }
 ```
 

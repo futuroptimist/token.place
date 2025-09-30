@@ -1,0 +1,33 @@
+metadata:
+  updated_at: 2025-02-15T00:00:00Z
+  note: "Curated sample registry for local development and community providers."
+providers:
+  - id: local-dev
+    name: Local Development Node
+    region: local
+    status: active
+    description: "Reference node that ships with token.place for smoke testing."
+    capabilities:
+      - mock-llm
+      - llama-3-8b-instruct
+    contact:
+      email: ops@token.place
+    endpoints:
+      - type: relay
+        url: http://localhost:5010
+      - type: server
+        url: http://localhost:3000
+  - id: community-eu-west
+    name: Community Cluster (EU-West)
+    region: eu-west
+    status: onboarding
+    description: "Community maintained cluster accepting beta operators."
+    capabilities:
+      - llama-3-8b-instruct
+      - llama-3-70b-instruct
+    contact:
+      matrix: "#token.place:matrix.org"
+      email: community@token.place
+    endpoints:
+      - type: relay
+        url: https://relay.eu-west.community.token.place

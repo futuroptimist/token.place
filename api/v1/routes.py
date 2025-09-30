@@ -17,6 +17,7 @@ from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name
 )
+from utils.providers import get_provider_directory, ProviderRegistryError
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -185,6 +186,33 @@ def get_public_key():
     except Exception as e:
         log_error("Error in get_public_key endpoint")
         return format_error_response(f"Failed to retrieve public key: {str(e)}")
+
+
+@v1_bp.route('/server-providers', methods=['GET'])
+def list_server_providers():
+    """Expose the curated registry of known token.place server providers."""
+
+    try:
+        directory = get_provider_directory()
+    except ProviderRegistryError as exc:
+        log_error("Error loading provider registry", exc_info=True)
+        return format_error_response(
+            f"Failed to load provider registry: {exc}",
+            error_type="internal_error",
+            code="provider_registry_unavailable",
+            status_code=500,
+        )
+
+    response_payload = {
+        "object": "list",
+        "data": directory.get("providers", []),
+    }
+
+    metadata = directory.get("metadata")
+    if metadata:
+        response_payload["metadata"] = metadata
+
+    return jsonify(response_payload)
 
 @v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion():

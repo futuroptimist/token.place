@@ -1,0 +1,35 @@
+{
+  "updated": "2025-02-01T00:00:00Z",
+  "providers": [
+    {
+      "id": "token-place-lab",
+      "name": "token.place Lab",
+      "region": "us-west",
+      "latency_ms": 42,
+      "status": "online",
+      "contact": {
+        "email": "community@token.place"
+      },
+      "capabilities": [
+        "openai-compatible",
+        "mock-llm"
+      ],
+      "notes": "Reference node used for integration tests and community demos."
+    },
+    {
+      "id": "community-eu-testnet",
+      "name": "Community EU Testnet",
+      "region": "eu-central",
+      "latency_ms": 85,
+      "status": "maintenance",
+      "contact": {
+        "matrix": "#token-place:example.org"
+      },
+      "capabilities": [
+        "chat-completions",
+        "encryption"
+      ],
+      "notes": "Volunteer-operated relay currently upgrading GPUs."
+    }
+  ]
+}

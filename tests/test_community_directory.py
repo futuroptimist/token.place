@@ -103,7 +103,7 @@ def test_list_community_providers_handles_directory_error(client, monkeypatch):
     def _raise_error() -> Path:
         raise community.CommunityDirectoryError("boom")
 
-    monkeypatch.setattr("api.v1.routes.get_provider_directory", _raise_error)
+    monkeypatch.setattr("api.v1.routes.get_community_provider_directory", _raise_error)
 
     response = client.get("/api/v1/community/providers")
     assert response.status_code == 500
@@ -133,7 +133,7 @@ def test_list_community_providers_omits_updated_when_missing(client, monkeypatch
             "updated": None,
         }
 
-    monkeypatch.setattr("api.v1.routes.get_provider_directory", _return_directory)
+    monkeypatch.setattr("api.v1.routes.get_community_provider_directory", _return_directory)
 
     response = client.get("/api/v1/community/providers")
     assert response.status_code == 200

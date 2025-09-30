@@ -12,13 +12,28 @@ import logging
 import os
 
 from api.v1.encryption import encryption_manager
-from api.v1.community import get_provider_directory, CommunityDirectoryError
+from api.v1.community import (
+    get_provider_directory as _get_community_provider_directory,
+    CommunityDirectoryError,
+)
 from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name
 )
-from utils.providers import get_provider_directory, ProviderRegistryError
+from utils.providers import (
+    get_provider_directory as _get_registry_provider_directory,
+    ProviderRegistryError,
+)
+
+# Expose directory loaders for tests and backwards compatibility
+get_community_provider_directory = _get_community_provider_directory
+get_registry_provider_directory = _get_registry_provider_directory
+
+# Historically, tests patch `api.v1.routes.get_provider_directory` when
+# exercising the server provider endpoint. Keep that alias pointing at the
+# registry loader so existing test suites continue to work.
+get_provider_directory = get_registry_provider_directory
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -195,6 +210,33 @@ def list_community_providers():
 
     try:
         log_info("API request: GET /community/providers")
+        directory = get_community_provider_directory()
+    except CommunityDirectoryError:
+        log_error("Error loading community provider directory", exc_info=True)
+        return format_error_response(
+            "Community directory temporarily unavailable",
+            error_type="internal_server_error",
+            status_code=500,
+        )
+
+    response_payload = {
+        "object": "list",
+        "data": directory.get("providers", []),
+    }
+
+    updated = directory.get("updated")
+    if updated:
+        response_payload["updated"] = updated
+
+    return jsonify(response_payload)
+
+
+@v1_bp.route('/server-providers', methods=['GET'])
+def list_server_providers():
+    """Expose the self-hosted relay provider registry."""
+
+    try:
+        log_info("API request: GET /server-providers")
         directory = get_provider_directory()
     except ProviderRegistryError as exc:
         log_error("Error loading provider registry", exc_info=True)

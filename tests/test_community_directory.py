@@ -68,6 +68,35 @@ def test_get_provider_directory_invalid_provider_entry(monkeypatch, tmp_path):
         community.get_provider_directory()
 
 
+def test_get_provider_directory_applies_optional_defaults(monkeypatch, tmp_path):
+    """Optional provider fields should default to safe values."""
+
+    payload_path = tmp_path / "providers.json"
+    payload = {
+        "providers": [
+            {
+                "id": "defaults-test",
+                "name": "Defaults Test",
+                "region": "test-region",
+            }
+        ],
+        "updated": "2025-03-04T00:00:00Z",
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(community, "COMMUNITY_DIRECTORY_PATH", payload_path)
+    _reset_directory_cache()
+
+    directory = community.get_provider_directory()
+    provider = directory["providers"][0]
+
+    assert provider["latency_ms"] is None
+    assert provider["status"] == "unknown"
+    assert provider["contact"] == {}
+    assert provider["capabilities"] == []
+    assert provider["notes"] is None
+
+
 def test_list_community_providers_handles_directory_error(client, monkeypatch):
     """The HTTP endpoint should convert directory errors into API responses."""
 
@@ -82,3 +111,35 @@ def test_list_community_providers_handles_directory_error(client, monkeypatch):
     payload = response.get_json()
     assert payload["error"]["type"] == "internal_server_error"
     assert payload["error"]["message"] == "Community directory temporarily unavailable"
+
+
+def test_list_community_providers_omits_updated_when_missing(client, monkeypatch):
+    """The HTTP response should only include an updated timestamp when provided."""
+
+    def _return_directory():
+        return {
+            "providers": [
+                {
+                    "id": "relay-one",
+                    "name": "Relay One",
+                    "region": "moon-base",
+                    "latency_ms": 12,
+                    "status": "online",
+                    "contact": {},
+                    "capabilities": [],
+                    "notes": None,
+                }
+            ],
+            "updated": None,
+        }
+
+    monkeypatch.setattr("api.v1.routes.get_provider_directory", _return_directory)
+
+    response = client.get("/api/v1/community/providers")
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    assert payload == {
+        "object": "list",
+        "data": _return_directory()["providers"],
+    }

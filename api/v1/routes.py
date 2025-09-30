@@ -3,7 +3,7 @@ API routes for token.place API v1
 This module follows OpenAI API conventions to serve as a drop-in replacement.
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 import base64
 import time
 import json
@@ -241,6 +241,9 @@ def create_chat_completion():
             # Validate required fields
             validate_required_fields(data, ["model"])
 
+            is_encrypted_request = bool(data.get('encrypted', False))
+            stream_requested = bool(data.get('stream', False))
+
             # Get available models
             models = get_models_info()
             available_model_ids = [model["id"] for model in models]
@@ -257,7 +260,7 @@ def create_chat_completion():
             messages = None
             client_public_key = None
 
-            if data.get('encrypted', False):
+            if is_encrypted_request:
                 log_info("Processing encrypted request")
 
                 try:
@@ -356,7 +359,48 @@ def create_chat_completion():
             }
 
             # If client requested encryption and provided a public key, encrypt the response
-            if data.get('encrypted', False) and client_public_key:
+            if stream_requested and is_encrypted_request:
+                log_warning("Streaming requested for encrypted payload; falling back to encrypted single response")
+                stream_requested = False
+
+            if stream_requested:
+                log_info("Returning streaming response")
+
+                stream_id = f"chatcmpl-{uuid.uuid4()}"
+                created_ts = int(time.time())
+                role = assistant_message.get("role", "assistant")
+                content_text = assistant_message.get("content", "")
+
+                def build_chunk(delta, finish_reason=None):
+                    return {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish_reason
+                            }
+                        ]
+                    }
+
+                def event_stream():
+                    role_chunk = build_chunk({"role": role}, None)
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                    if content_text:
+                        content_chunk = build_chunk({"content": content_text}, None)
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
+                    stop_chunk = build_chunk({}, "stop")
+                    yield f"data: {json.dumps(stop_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                response = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+                response.headers['Cache-Control'] = 'no-cache'
+                return response
+
+            if is_encrypted_request and client_public_key:
                 log_info("Encrypting response for client")
                 encrypted_response = encryption_manager.encrypt_message(response_data, client_public_key)
                 if encrypted_response is None:

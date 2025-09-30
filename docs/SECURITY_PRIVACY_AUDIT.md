@@ -45,7 +45,7 @@ Initial audit establishing baseline security and privacy posture.
 - Add rate limiting to protect against DoS attacks.
 - Move sensitive configuration values to environment variables.
 - Enhance input validation for all API endpoints.
-- Plan for streaming implementation, key rotation, and a dedicated cryptographic audit.
+- Streaming implementation delivered (2025-09-30); continue planning for key rotation and a dedicated cryptographic audit.
 - Consider zero-knowledge architecture, formal verification, and an external security review.
 
 **Privacy Enhancements**

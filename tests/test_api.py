@@ -215,6 +215,88 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert len(decrypted_data['choices'][0]['message']['content']) > 0
     assert 'Mock response' in decrypted_data['choices'][0]['message']['content']
 
+
+def test_streaming_chat_completion(client, mock_llama):
+    """Streaming chat completions should return Server-Sent Events chunks."""
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Count from 1 to 5"}
+        ],
+        "stream": True
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    events = []
+    for raw_chunk in response.iter_encoded():
+        text = raw_chunk.decode("utf-8")
+        if not text.strip():
+            continue
+        assert text.startswith("data: ")
+        events.append(text[len("data: "):].strip())
+
+    assert events[-1] == "[DONE]"
+
+    role_event = json.loads(events[0])
+    content_event = json.loads(events[1])
+    stop_event = json.loads(events[2])
+
+    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
+    assert "Mock response" in content_event["choices"][0]["delta"]["content"]
+    assert stop_event["choices"][0]["finish_reason"] == "stop"
+
+
+def test_encrypted_streaming_falls_back_to_single_response(client, client_keys, mock_llama):
+    """Encrypted streaming requests fall back to encrypted JSON responses."""
+
+    response = client.get("/api/v1/public-key")
+    assert response.status_code == 200
+    server_public_key = response.get_json()['public_key']
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Say hello."}
+    ]
+
+    server_public_key_bytes = base64.b64decode(server_public_key)
+    ciphertext_dict, cipherkey, iv = encrypt(json.dumps(messages).encode('utf-8'), server_public_key_bytes)
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "encrypted": True,
+        "stream": True,
+        "client_public_key": client_keys['public_key_b64'],
+        "messages": {
+            "ciphertext": base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8'),
+            "cipherkey": base64.b64encode(cipherkey).decode('utf-8'),
+            "iv": base64.b64encode(iv).decode('utf-8')
+        }
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.is_json
+
+    encrypted_payload = response.get_json()
+    assert encrypted_payload["encrypted"] is True
+
+    ciphertext = base64.b64decode(encrypted_payload['data']['ciphertext'])
+    encrypted_key = base64.b64decode(encrypted_payload['data']['cipherkey'])
+    iv_bytes = base64.b64decode(encrypted_payload['data']['iv'])
+
+    decrypted_bytes = decrypt({'ciphertext': ciphertext, 'iv': iv_bytes}, encrypted_key, client_keys['private_key'])
+    decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
+
+    assert decrypted_data['choices'][0]['message']['role'] == 'assistant'
+    assert "Mock response" in decrypted_data['choices'][0]['message']['content']
+
 def test_completions_endpoint(client, mock_llama):
     """Test the regular completions endpoint (redirects to chat)"""
     payload = {

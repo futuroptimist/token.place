@@ -1,55 +1,120 @@
-import pytest
-from unittest.mock import patch, MagicMock
 import json
 
-# This test will verify future streaming capabilities
-# Currently marked as skipped since streaming isn't implemented yet
+import pytest
 
-@pytest.mark.skip(reason="Streaming feature not yet implemented")
-def test_streaming_chat_completion(client):
-    """Test streaming chat completion API (future feature)"""
+from relay import app as relay_app
+from api.v1 import routes
+
+
+@pytest.fixture
+def client():
+    relay_app.config["TESTING"] = True
+    with relay_app.test_client() as test_client:
+        yield test_client
+
+
+def test_streaming_chat_completion(client, monkeypatch):
+    """Streaming chat completions should return Server-Sent Events chunks."""
     payload = {
         "model": "llama-3-8b-instruct",
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Count from 1 to 5"}
         ],
-        "stream": True  # Enable streaming
+        "stream": True
     }
 
-    # Mock the streaming response
-    with patch('api.v1.routes.generate_streaming_response') as mock_stream:
-        # Set up mock to yield chunks of a streaming response
-        chunks = [
-            {"choices": [{"delta": {"role": "assistant"}, "index": 0}]},
-            {"choices": [{"delta": {"content": "1"}, "index": 0}]},
-            {"choices": [{"delta": {"content": ", 2"}, "index": 0}]},
-            {"choices": [{"delta": {"content": ", 3"}, "index": 0}]},
-            {"choices": [{"delta": {"content": ", 4"}, "index": 0}]},
-            {"choices": [{"delta": {"content": ", 5"}, "index": 0}]},
-            {"choices": [{"delta": {"content": ""}, "finish_reason": "stop", "index": 0}]}
-        ]
-        mock_stream.return_value = (json.dumps(chunk) + "\n\n" for chunk in chunks)
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_model_instance", lambda model_id: object())
 
-        # Make the request
-        response = client.post("/api/v1/chat/completions", json=payload)
+    def fake_generate_response(model_id, messages):
+        assert model_id == "llama-3-8b-instruct"
+        assert messages[-1]["content"] == "Count from 1 to 5"
+        return messages + [{"role": "assistant", "content": "1, 2, 3, 4, 5"}]
 
-        # Check response is streaming
-        assert response.status_code == 200
-        assert response.headers["Content-Type"] == "text/event-stream"
+    monkeypatch.setattr(routes, "generate_response", fake_generate_response)
 
-        # Collect streaming response
-        content = ""
-        for chunk in response.iter_encoded():
-            if chunk.startswith(b"data: "):
-                data = json.loads(chunk[6:])  # Strip "data: " prefix
-                if "choices" in data and data["choices"][0].get("delta", {}).get("content"):
-                    content += data["choices"][0]["delta"]["content"]
+    response = client.post("/api/v1/chat/completions", json=payload)
 
-        # Verify content
-        assert "1, 2, 3, 4, 5" in content
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
 
-@pytest.mark.skip(reason="Streaming feature not yet implemented")
+    events = []
+    for raw_chunk in response.iter_encoded():
+        text = raw_chunk.decode("utf-8")
+        if not text.strip():
+            continue
+        assert text.startswith("data: ")
+        events.append(text[len("data: "):].strip())
+
+    assert events[-1] == "[DONE]"
+
+    role_event = json.loads(events[0])
+    content_event = json.loads(events[1])
+    stop_event = json.loads(events[2])
+
+    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
+    assert content_event["choices"][0]["delta"]["content"] == "1, 2, 3, 4, 5"
+    assert stop_event["choices"][0]["finish_reason"] == "stop"
+
+
+def test_encrypted_streaming_falls_back_to_single_response(client, monkeypatch):
+    """Encrypted streaming requests should fall back to encrypted single responses."""
+
+    class DummyEncryptionManager:
+        public_key_b64 = "server-public-key"
+
+        def decrypt_message(self, encrypted_payload, cipherkey):
+            # The route should hand us the decoded ciphertext and iv, but we only need to
+            # return valid chat messages JSON to exercise the encrypted branch.
+            _ = encrypted_payload, cipherkey
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Say hello."}
+            ]
+            return json.dumps(messages).encode("utf-8")
+
+        def encrypt_message(self, response_data, client_public_key):
+            assert client_public_key == "client-public-key"
+            # Return a deterministic payload so the test can assert on it.
+            return {"ciphertext": "encrypted", "iv": "iv", "cipherkey": "key"}
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "stream": True,
+        "encrypted": True,
+        "client_public_key": "client-public-key",
+        "messages": {
+            "ciphertext": "Y2lwaGVydGV4dA==",
+            "cipherkey": "Y2lwaGVya2V5",
+            "iv": "aXY="
+        }
+    }
+
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_model_instance", lambda model_id: object())
+    monkeypatch.setattr(routes, "encryption_manager", DummyEncryptionManager())
+    monkeypatch.setattr(routes, "validate_encrypted_request", lambda data: None)
+
+    def fake_generate_response(model_id, messages):
+        assert messages[-1]["content"] == "Say hello."
+        return messages + [{"role": "assistant", "content": "Hello!"}]
+
+    monkeypatch.setattr(routes, "generate_response", fake_generate_response)
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.is_json
+
+    data = response.get_json()
+    assert data == {
+        "encrypted": True,
+        "data": {"ciphertext": "encrypted", "iv": "iv", "cipherkey": "key"}
+    }
+
+
+@pytest.mark.skip(reason="Streaming tool-call support not yet implemented")
 def test_streaming_with_tool_use(client):
     """Test streaming with tool use capabilities (future feature)"""
     payload = {
@@ -80,6 +145,5 @@ def test_streaming_with_tool_use(client):
         ]
     }
 
-    # This test is a placeholder for future tool use + streaming capabilities
-    # Implementation will depend on how we integrate tools with the LLM
+    # Placeholder: streaming tool integrations will be validated once tool calling is wired up.
     assert True

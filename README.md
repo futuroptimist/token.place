@@ -143,7 +143,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [x] landing page chat UI integrated with API v1
 - [ ] use best available llama family model that can run on an RTX 4090
 - [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
-- [ ] set up production k3s raspberry pi pod running relay.py
+- [x] set up production k3s raspberry pi pod running relay.py
   - [ ] server.py stays on personal gaming PC
   - [ ] potential cloud fallback node via Cloudflare
 - [ ] allow participation from other server.pys
@@ -383,6 +383,8 @@ Alternatively, you can visit http://localhost:5000 in your browser to use the we
 ### Raspberry Pi 5 deployment
 
 For a complete walkthrough of the Raspberry Pi 5 setup—including hardware recommendations, Docker instructions, k3s cluster steps, and troubleshooting (including rpi-clone prompts)—see [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials).
+
+If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, copy the Helm bundle from [`k8s/sugarkube/`](k8s/sugarkube/) into `/etc/sugarkube/helm-bundles.d/` so the relay deploys automatically once k3s is ready.
 
 ## Testing
 

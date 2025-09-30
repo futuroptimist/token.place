@@ -12,6 +12,14 @@ spec:
       image: tokenplace-relay:latest
       imagePullPolicy: IfNotPresent
       command: ["python", "relay.py"]
+      args:
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "5010"
+      env:
+        - name: TOKEN_PLACE_ENV
+          value: "production"
       ports:
         - containerPort: 5010
       resources:

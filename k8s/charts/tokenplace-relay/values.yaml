@@ -1,0 +1,35 @@
+replicaCount: 1
+
+image:
+  repository: tokenplace-relay
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 5010
+
+relay:
+  host: 0.0.0.0
+  port: 5010
+  extraArgs: []
+
+env:
+  TOKEN_PLACE_ENV: production
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+nodeSelector: {}
+podAnnotations: {}
+affinity: {}
+tolerations: []

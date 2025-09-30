@@ -149,7 +149,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] allow participation from other server.pys
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
 - [ ] API v2 with at least 10 models supported and available
-  - [ ] Streaming response support for faster UI feedback
+  - [x] Streaming response support for faster UI feedback
   - [ ] Function/tool calling support via Machine Conversation Protocol (MCP)
   - [ ] Multi-modal support (text + images input)
   - [ ] Local image generation support (Stable Diffusion 3, Flux)

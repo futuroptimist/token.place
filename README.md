@@ -52,9 +52,20 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
+| CONTENT_MODERATION_MODE | disabled     | Set to `block` to enable request filtering before inference           |
+| CONTENT_MODERATION_BLOCKLIST | (defaults)  | Comma-separated phrases added to the default safety blocklist         |
+| CONTENT_MODERATION_INCLUDE_DEFAULTS | 1            | Set to `0` to skip the built-in phrases when filtering requests        |
 | PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 
 The development requirements live in [requirements.txt](requirements.txt).
+
+### Content moderation hooks
+
+Set `CONTENT_MODERATION_MODE=block` to enable pre-inference moderation for both
+`/api/v1/chat/completions` and `/api/v1/completions`.
+Requests containing phrases from the built-in safety blocklist (or any terms supplied via
+`CONTENT_MODERATION_BLOCKLIST`) are rejected with a standardized `content_policy_violation` error before they reach the model.
+Set `CONTENT_MODERATION_INCLUDE_DEFAULTS=0` if you only want to enforce your custom blocklist.
 
 Run the relay and server in separate terminals:
 
@@ -165,7 +176,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Enhanced encryption options for model weights and inference data
   - [ ] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
-- [ ] Optional content moderation hooks
+- [x] Optional content moderation hooks
 - [ ] External security review of protocol and code
 - [ ] Community features
   - [x] Server provider directory/registry
@@ -577,8 +588,8 @@ Request body:
 ```
 GET /api/v1/community/providers
 ```
-Lists community-operated relay nodes and server operators that have opted into the public registry.  
-Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.  
+Lists community-operated relay nodes and server operators that have opted into the public registry.
+Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.
 A representative latency measurement may also be included to help clients pick a nearby relay.
 
 Example response snippet:

@@ -229,10 +229,11 @@ See `desktop/electron-builder.json` for the authoritative configuration that pow
 
 ## Resource usage metrics
 
-The token.place server now publishes lightweight CPU and memory utilisation metrics via the
+The token.place server now publishes lightweight CPU, memory, **and GPU** utilisation metrics via the
 `/metrics/resource` endpoint. Desktop shells can poll this JSON payload to surface platform-native
 warnings when workloads spike, enabling operators to diagnose performance regressions without
-attaching external profilers.
+attaching external profilers. When NVIDIA hardware and the `pynvml` runtime are present, the
+response now reports aggregate GPU usage so operators can confirm hardware acceleration is active.
 
 On Windows and macOS hosts these metrics now benefit from a non-blocking CPU sampling strategy that
 avoids the initial all-zero readings returned by `psutil`. Linux retains the lazy sampling mode to
@@ -250,7 +251,8 @@ To further enhance cross-platform support, future work includes:
 
 1. **Performance Tuning**:
    - ✅ Platform-specific performance optimizations
-   - Hardware acceleration on supported platforms
+   - ✅ Hardware acceleration on supported platforms via GPU-aware resource metrics exposed
+     through the `/metrics/resource` endpoint
    - ✅ Resource usage monitoring instrumentation via the Python performance monitor
      (`utils/performance/monitor.py`) and accompanying tests
 

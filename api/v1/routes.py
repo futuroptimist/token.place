@@ -12,6 +12,7 @@ import logging
 import os
 
 from api.v1.encryption import encryption_manager
+from api.v1.moderation import evaluate_messages_for_policy
 from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
     CommunityDirectoryError,
@@ -372,6 +373,19 @@ def create_chat_completion():
                     status_code=400
                 )
 
+            decision = evaluate_messages_for_policy(messages)
+            if not decision.allowed:
+                log_warning(
+                    "Blocking chat completion request due to content policy violation: %s"
+                    % (decision.matched_term or "unknown term")
+                )
+                return format_error_response(
+                    decision.reason or "Request blocked by content moderation policy.",
+                    error_type="content_policy_violation",
+                    code="content_blocked",
+                    status_code=400,
+                )
+
             # Generate response using the specified model
             log_info(f"Generating response using model {model_id}")
             updated_messages = generate_response(model_id, messages)
@@ -544,6 +558,19 @@ def create_completion():
                 "content": prompt,
             }
         ]
+
+        decision = evaluate_messages_for_policy(messages)
+        if not decision.allowed:
+            log_warning(
+                "Blocking legacy completion request due to content policy violation: %s"
+                % (decision.matched_term or "unknown term")
+            )
+            return format_error_response(
+                decision.reason or "Request blocked by content moderation policy.",
+                error_type="content_policy_violation",
+                code="content_blocked",
+                status_code=400,
+            )
 
         # Generate response
         try:

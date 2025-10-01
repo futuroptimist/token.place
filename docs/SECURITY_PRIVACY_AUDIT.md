@@ -41,7 +41,6 @@ Initial audit establishing baseline security and privacy posture.
 - Improved test reliability by explicitly passing mock LLM flags and fixing encoding issues.
 
 **Recommendations**
-- Implement content safety measures to prevent misuse of the system.
 - Add rate limiting to protect against DoS attacks.
 - Move sensitive configuration values to environment variables.
 - Enhance input validation for all API endpoints.
@@ -85,6 +84,7 @@ Refined logging helpers to avoid swallowing system interrupt exceptions.
 - Updated `log_info` and `log_error` to catch only standard exceptions, allowing
   `KeyboardInterrupt` and `SystemExit` to propagate.
 - Ensured `log_error` always logs messages even in production.
+- Added configurable content moderation hooks that reject disallowed prompts before inference.
 
 **Recommendations**
 - Continue monitoring logging utilities for unintended side effects.

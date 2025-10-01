@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding as asymmetric
 from cryptography.hazmat.primitives.serialization import load_pem_public_key, load_pem_private_key
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import AES
-from cryptography.hazmat.primitives.ciphers.modes import CBC
+from cryptography.hazmat.primitives.ciphers.modes import CBC, GCM
 from cryptography.hazmat.primitives.hashes import SHA256
 import secrets
 from typing import Tuple, Dict, Optional
@@ -20,12 +20,18 @@ from typing import Tuple, Dict, Optional
 # Import config, but use fallback values if import fails
 # This allows encrypt.py to work standalone but also in the larger application
 try:
-    from config import RSA_KEY_SIZE, AES_KEY_SIZE, IV_SIZE
+    import config as _config  # type: ignore[import-not-found]
 except ImportError:
     # Default values if config.py is not available
     RSA_KEY_SIZE = 2048
     AES_KEY_SIZE = 32  # 256 bits
     IV_SIZE = 16  # 128 bits
+    GCM_IV_SIZE = 12  # 96 bits recommended for GCM
+else:
+    RSA_KEY_SIZE = getattr(_config, "RSA_KEY_SIZE", 2048)
+    AES_KEY_SIZE = getattr(_config, "AES_KEY_SIZE", 32)
+    IV_SIZE = getattr(_config, "IV_SIZE", 16)
+    GCM_IV_SIZE = getattr(_config, "GCM_IV_SIZE", 12)
 
 logger = logging.getLogger(__name__)
 
@@ -56,35 +62,60 @@ def generate_keys() -> Tuple[bytes, bytes]:
 
     return private_key_pem, public_key_pem
 
-def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False) -> Tuple[Dict[str, bytes], bytes, bytes]:
+def encrypt(
+    plaintext: bytes,
+    public_key_pem: bytes,
+    use_pkcs1v15: bool = False,
+    cipher_mode: str = "CBC",
+    associated_data: Optional[bytes] = None,
+) -> Tuple[Dict[str, bytes], bytes, bytes]:
     """
-    Encrypt plaintext using AES-CBC with a random key, then encrypt that key with RSA.
+    Encrypt plaintext using AES with a random key, then encrypt that key with RSA.
 
     Args:
         plaintext: The data to encrypt
         public_key_pem: RSA public key in PEM format
         use_pkcs1v15: Use PKCS#1 v1.5 padding instead of OAEP for RSA key encryption
             (for compatibility with legacy JavaScript clients)
+        cipher_mode: Symmetric encryption mode to use. Defaults to "CBC" but also accepts
+            "GCM" for authenticated encryption of model weights or inference payloads.
+        associated_data: Optional bytes that should be authenticated (but not encrypted)
+            alongside the ciphertext when using AES-GCM.
 
     Returns:
         Tuple (ciphertext_dict, encrypted_key, iv)
-        - ciphertext_dict: Dictionary with 'ciphertext' and 'iv' keys
+        - ciphertext_dict: Dictionary with 'ciphertext' and 'iv' keys (and 'tag' when using GCM)
         - encrypted_key: The AES key encrypted with RSA
         - iv: Initialization vector used for AES-CBC
     """
     # Generate a random AES key
     aes_key = secrets.token_bytes(AES_KEY_SIZE)  # 256-bit key
 
-    # Generate a random IV
-    iv = secrets.token_bytes(IV_SIZE)  # 128-bit IV for AES
+    mode = cipher_mode.upper()
 
-    # Encrypt the plaintext with AES-CBC
-    cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-
-    # We need to pad the plaintext to a multiple of 16 bytes
-    padded_data = pkcs7_pad(plaintext, 16)
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+    if mode == "CBC":
+        iv = secrets.token_bytes(IV_SIZE)  # 128-bit IV for AES-CBC
+        cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        padded_data = pkcs7_pad(plaintext, 16)
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+        ciphertext_dict: Dict[str, bytes] = {"ciphertext": ciphertext, "iv": iv}
+    elif mode == "GCM":
+        iv = secrets.token_bytes(GCM_IV_SIZE)
+        encryptor = Cipher(AES(aes_key), GCM(iv), backend=default_backend()).encryptor()
+        if associated_data:
+            if not isinstance(associated_data, (bytes, bytearray)):
+                raise TypeError("associated_data must be bytes-like when provided")
+            encryptor.authenticate_additional_data(bytes(associated_data))
+        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+        ciphertext_dict = {
+            "ciphertext": ciphertext,
+            "iv": iv,
+            "tag": encryptor.tag,
+            "mode": "GCM",
+        }
+    else:
+        raise ValueError(f"Unsupported cipher_mode: {cipher_mode}")
 
     # Now encrypt the AES key with RSA
     public_key = serialization.load_pem_public_key(
@@ -111,16 +142,25 @@ def encrypt(plaintext: bytes, public_key_pem: bytes, use_pkcs1v15: bool = False)
             )
         )
 
-    return {'ciphertext': ciphertext, 'iv': iv}, encrypted_key, iv
+    return ciphertext_dict, encrypted_key, iv
 
-def decrypt(ciphertext_dict: Mapping[str, bytes], encrypted_key: bytes, private_key_pem: bytes) -> Optional[bytes]:
+def decrypt(
+    ciphertext_dict: Mapping[str, bytes],
+    encrypted_key: bytes,
+    private_key_pem: bytes,
+    cipher_mode: Optional[str] = None,
+    associated_data: Optional[bytes] = None,
+) -> Optional[bytes]:
     """
     Decrypt ciphertext that was encrypted with the encrypt function.
 
     Args:
         ciphertext_dict: Dictionary with 'ciphertext' and 'iv'
+            (and 'tag' when decrypting AES-GCM payloads)
         encrypted_key: The AES key encrypted with RSA
         private_key_pem: RSA private key in PEM format
+        cipher_mode: Optional override for the symmetric mode (defaults to autodetect)
+        associated_data: Authenticated data expected when decrypting AES-GCM payloads
 
     Returns:
         Decrypted plaintext or None if decryption fails
@@ -132,13 +172,23 @@ def decrypt(ciphertext_dict: Mapping[str, bytes], encrypted_key: bytes, private_
     if not isinstance(ciphertext_dict, Mapping):
         raise TypeError("ciphertext_dict must be a mapping with ciphertext and iv entries")
 
-    required_fields = ("ciphertext", "iv")
+    mode_hint = cipher_mode or ciphertext_dict.get("mode")
+    if mode_hint is None and "tag" in ciphertext_dict:
+        mode_hint = "GCM"
+    mode = (mode_hint or "CBC").upper()
+
+    required_fields = ["ciphertext", "iv"]
+    if mode == "GCM":
+        required_fields.append("tag")
     for field in required_fields:
         if field not in ciphertext_dict:
             raise ValueError(f"Missing required field: {field}")
         value = ciphertext_dict[field]
         if not isinstance(value, (bytes, bytearray)):
             raise TypeError(f"{field} must be bytes-like")
+
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes-like when provided")
 
     if not isinstance(encrypted_key, (bytes, bytearray)):
         raise TypeError("encrypted_key must be bytes-like")
@@ -172,17 +222,24 @@ def decrypt(ciphertext_dict: Mapping[str, bytes], encrypted_key: bytes, private_
         # Decode the Base64 to get the actual AES key
         aes_key = base64.b64decode(aes_key_b64)
 
-        # Get the ciphertext and IV
         ciphertext = bytes(ciphertext_dict['ciphertext'])
         iv = bytes(ciphertext_dict['iv'])
 
-        # Decrypt the ciphertext using AES-CBC
-        cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        if mode == "CBC":
+            cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
+            decryptor = cipher.decryptor()
+            padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            plaintext = pkcs7_unpad(padded_plaintext, 16)
+            return plaintext
 
-        # Remove padding
-        plaintext = pkcs7_unpad(padded_plaintext, 16)
+        if mode != "GCM":
+            raise ValueError(f"Unsupported cipher_mode: {mode}")
+
+        tag = bytes(ciphertext_dict['tag'])
+        decryptor = Cipher(AES(aes_key), GCM(iv, tag), backend=default_backend()).decryptor()
+        if associated_data:
+            decryptor.authenticate_additional_data(bytes(associated_data))
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         return plaintext
     except Exception:
         # Avoid leaking sensitive details in logs

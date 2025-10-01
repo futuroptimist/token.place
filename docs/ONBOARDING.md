@@ -16,6 +16,7 @@ Welcome to `token.place`! This document provides a high-level overview of the pr
 
 1. Clients generate an RSA key pair and fetch the server's public key.
 2. Each message is encrypted with a random AES key and IV. The AES key is encrypted with the server's RSA key.
+   AES-CBC remains the default, but AES-GCM can be enabled when authenticated encryption is needed.
 3. The server decrypts the AES key, forwards the encrypted message to the LLM and returns an encrypted result.
 4. The client decrypts the response with its AES key.
 

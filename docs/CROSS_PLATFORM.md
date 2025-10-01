@@ -235,6 +235,10 @@ warnings when workloads spike, enabling operators to diagnose performance regres
 attaching external profilers. When NVIDIA hardware and the `pynvml` runtime are present, the
 response now reports aggregate GPU usage so operators can confirm hardware acceleration is active.
 
+On Windows and macOS hosts these metrics now benefit from a non-blocking CPU sampling strategy that
+avoids the initial all-zero readings returned by `psutil`. Linux retains the lazy sampling mode to
+minimise overhead while still reporting accurate utilisation.
+
 ## Mobile touch optimizations
 
 The browser chat client now detects touch-capable environments and applies larger tap targets and
@@ -246,7 +250,7 @@ the desktop layout unchanged.
 To further enhance cross-platform support, future work includes:
 
 1. **Performance Tuning**:
-   - Platform-specific performance optimizations
+   - ✅ Platform-specific performance optimizations
    - ✅ Hardware acceleration on supported platforms via GPU-aware resource metrics exposed
      through the `/metrics/resource` endpoint
    - ✅ Resource usage monitoring instrumentation via the Python performance monitor

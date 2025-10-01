@@ -56,6 +56,7 @@ token.place is an end-to-end encrypted proxy service that sits between clients a
 2. **Request Encryption**:
    - Client generates a random AES key and initialization vector (IV)
    - Message is encrypted with AES using CBC mode and PKCS7 padding
+     (or AES-GCM when authenticated encryption is requested)
    - AES key is encrypted with the server's public RSA key
    - Encrypted message, encrypted AES key, and IV are sent to the server
 
@@ -78,9 +79,10 @@ token.place uses a hybrid encryption approach:
    - Used to encrypt/decrypt the AES key
    - Provides asymmetric encryption for secure key transmission
 
-2. **AES-256-CBC** for message content:
+2. **AES-256** for message content:
    - Uses a randomly generated key for each message
-   - Employs PKCS7 padding
+   - CBC mode (default) employs PKCS7 padding for compatibility with existing clients
+   - GCM mode (optional) adds integrity protection for model weights and inference payloads
    - Provides efficient symmetric encryption for potentially large messages
 
 3. **Compatibility Measures**:

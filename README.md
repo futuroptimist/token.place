@@ -52,9 +52,20 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
+| CONTENT_MODERATION_MODE | disabled     | Set to `block` to enable request filtering before inference           |
+| CONTENT_MODERATION_BLOCKLIST | (defaults)  | Comma-separated phrases added to the default safety blocklist         |
+| CONTENT_MODERATION_INCLUDE_DEFAULTS | 1            | Set to `0` to skip the built-in phrases when filtering requests        |
 | PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 
 The development requirements live in [requirements.txt](requirements.txt).
+
+### Content moderation hooks
+
+Set `CONTENT_MODERATION_MODE=block` to enable pre-inference moderation for both
+`/api/v1/chat/completions` and `/api/v1/completions`.
+Requests containing phrases from the built-in safety blocklist (or any terms supplied via
+`CONTENT_MODERATION_BLOCKLIST`) are rejected with a standardized `content_policy_violation` error before they reach the model.
+Set `CONTENT_MODERATION_INCLUDE_DEFAULTS=0` if you only want to enforce your custom blocklist.
 
 Run the relay and server in separate terminals:
 
@@ -162,10 +173,11 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Advanced security features
   - [ ] Client authentication for relay servers
   - [x] Rate limiting and quota enforcement 💯
-- [ ] Enhanced encryption options for model weights and inference data
+- [x] Enhanced encryption options for model weights and inference data
+  - [x] Optional AES-GCM mode with associated data for protecting weights and inference payloads
   - [ ] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
-- [ ] Optional content moderation hooks
+- [x] Optional content moderation hooks
 - [ ] External security review of protocol and code
 - [ ] Community features
   - [x] Server provider directory/registry
@@ -634,6 +646,11 @@ GET /v1/public-key
 `client_public_key` may be provided as a PEM-formatted string or a base64-encoded key.
 
 The server will encrypt its response with your public key, ensuring end-to-end encryption.
+
+> **New:** When encrypting high-value assets such as model weights or inference payloads, call
+> `encrypt(..., cipher_mode="GCM", associated_data=...)` to switch to AES-GCM.
+> The response payload includes an additional `tag` field alongside `ciphertext` and `iv`, providing
+> authenticated encryption without breaking compatibility with existing AES-CBC clients.
 
 ## System Architecture
 

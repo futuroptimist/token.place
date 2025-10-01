@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from typing import Dict
 
 import psutil
@@ -91,11 +92,22 @@ def _collect_gpu_metrics() -> GpuMetrics:
             pass
 
 
+def _cpu_interval_for_platform(platform: str) -> float | None:
+    """Return the psutil sampling interval tuned for the active platform."""
+
+    normalized = platform.lower()
+    if normalized.startswith(("win", "cygwin")) or normalized == "darwin":
+        return 0.0
+    return None
+
+
 def collect_resource_usage() -> Dict[str, float | int | bool]:
     """Return current CPU, memory, and GPU utilisation metrics."""
 
+    interval = _cpu_interval_for_platform(sys.platform)
+
     try:
-        cpu_percent_raw = psutil.cpu_percent(interval=None)
+        cpu_percent_raw = psutil.cpu_percent(interval=interval)
     except Exception:
         cpu_percent_raw = None
 

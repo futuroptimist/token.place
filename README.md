@@ -162,7 +162,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Advanced security features
   - [ ] Client authentication for relay servers
   - [x] Rate limiting and quota enforcement 💯
-- [ ] Enhanced encryption options for model weights and inference data
+- [x] Enhanced encryption options for model weights and inference data
+  - [x] Optional AES-GCM mode with associated data for protecting weights and inference payloads
   - [ ] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
 - [ ] Optional content moderation hooks
@@ -577,8 +578,8 @@ Request body:
 ```
 GET /api/v1/community/providers
 ```
-Lists community-operated relay nodes and server operators that have opted into the public registry.  
-Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.  
+Lists community-operated relay nodes and server operators that have opted into the public registry.
+Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.
 A representative latency measurement may also be included to help clients pick a nearby relay.
 
 Example response snippet:
@@ -634,6 +635,11 @@ GET /v1/public-key
 `client_public_key` may be provided as a PEM-formatted string or a base64-encoded key.
 
 The server will encrypt its response with your public key, ensuring end-to-end encryption.
+
+> **New:** When encrypting high-value assets such as model weights or inference payloads, call
+> `encrypt(..., cipher_mode="GCM", associated_data=...)` to switch to AES-GCM.
+> The response payload includes an additional `tag` field alongside `ciphertext` and `iv`, providing
+> authenticated encryption without breaking compatibility with existing AES-CBC clients.
 
 ## System Architecture
 

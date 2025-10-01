@@ -577,8 +577,8 @@ Request body:
 ```
 GET /api/v1/community/providers
 ```
-Lists community-operated relay nodes and server operators that have opted into the public registry.  
-Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.  
+Lists community-operated relay nodes and server operators that have opted into the public registry.
+Each entry includes the provider identifier, advertised region, contact details, current status, and the exposed endpoint URLs so clients can preselect a compatible provider.
 A representative latency measurement may also be included to help clients pick a nearby relay.
 
 Example response snippet:

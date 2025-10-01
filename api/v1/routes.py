@@ -257,7 +257,7 @@ def list_server_providers():
         response_payload["metadata"] = metadata
 
     return jsonify(response_payload)
-  
+
 
 @v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion():

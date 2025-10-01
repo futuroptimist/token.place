@@ -71,3 +71,56 @@ def test_collect_resource_usage_reports_gpu_metrics_when_available(monkeypatch):
     assert usage['gpu_count'] == 2
     assert usage['gpu_utilization_percent'] == pytest.approx(55.0)
     assert usage['gpu_memory_percent'] == pytest.approx((400.0 + 1000.0) / (1000.0 + 2000.0) * 100.0)
+
+
+def test_collect_gpu_metrics_defaults_when_nvml_missing(monkeypatch):
+    """When NVML cannot be imported the GPU metrics should return defaults."""
+    from utils.system import resource_monitor as rm
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: None, raising=False)
+
+    assert rm._collect_gpu_metrics() == rm._gpu_metrics_default()
+
+
+def test_collect_gpu_metrics_handles_initialisation_errors(monkeypatch):
+    """NVML initialisation failures should not bubble up."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(side_effect=RuntimeError("no nvml")),
+        nvmlShutdown=MagicMock(),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm._collect_gpu_metrics() == rm._gpu_metrics_default()
+    fake_nvml.nvmlShutdown.assert_not_called()
+
+
+def test_collect_gpu_metrics_marks_availability_when_sampling_fails(monkeypatch):
+    """If NVML is present but sampling fails we still report availability."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    shutdown_called = False
+
+    def fake_shutdown():
+        nonlocal shutdown_called
+        shutdown_called = True
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=fake_shutdown,
+        nvmlDeviceGetCount=MagicMock(return_value=2),
+        nvmlDeviceGetHandleByIndex=MagicMock(side_effect=RuntimeError("fail")),
+        nvmlDeviceGetUtilizationRates=MagicMock(),
+        nvmlDeviceGetMemoryInfo=MagicMock(),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    metrics = rm._collect_gpu_metrics()
+
+    assert metrics == rm._gpu_metrics_default(available=True, count=2)
+    assert shutdown_called is True

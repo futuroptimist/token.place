@@ -196,20 +196,12 @@ def get_model(model_id):
             status_code=500,
         )
 
-@v2_bp.route('/public-key', methods=['GET'])
-def get_public_key():
-    """
-    Get the public key for encryption (token.place specific)
-    This endpoint is not part of the OpenAI API but is needed for our encryption.
-
-    Returns:
-        JSON response with the server's public key
-    """
+def _public_key_response(log_label: str | None = None):
     try:
-        log_info("API request: GET /public-key")
-        return jsonify({
-            'public_key': encryption_manager.public_key_b64
-        })
+        if log_label is None:
+            log_label = f"{request.method.upper()} {request.path}"
+        log_info(f"API request: {log_label}")
+        return jsonify({'public_key': encryption_manager.public_key_b64})
     except Exception:
         log_error("Error in get_public_key endpoint", exc_info=True)
         return format_error_response(
@@ -217,6 +209,34 @@ def get_public_key():
             error_type="internal_server_error",
             status_code=500,
         )
+
+
+def _rotate_public_key_response(log_label: str | None = None):
+    try:
+        if log_label is None:
+            log_label = f"{request.method.upper()} {request.path}"
+        log_info(f"API request: {log_label}")
+        encryption_manager.rotate_keys()
+        return jsonify({'public_key': encryption_manager.public_key_b64})
+    except Exception:
+        log_error("Error rotating public key", exc_info=True)
+        return format_error_response(
+            "Failed to rotate public key",
+            error_type="internal_server_error",
+            status_code=500,
+        )
+
+
+@v2_bp.route('/public-key', methods=['GET'])
+def get_public_key():
+    """Expose the current public key used for encrypted requests."""
+    return _public_key_response()
+
+
+@v2_bp.route('/public-key/rotate', methods=['POST'])
+def rotate_public_key():
+    """Rotate the RSA key pair powering encrypted API traffic."""
+    return _rotate_public_key_response()
 
 
 @v2_bp.route('/community/providers', methods=['GET'])
@@ -748,6 +768,11 @@ def get_model_openai(model_id):
 @openai_v2_bp.route('/public-key', methods=['GET'])
 def get_public_key_openai():
     return get_public_key()
+
+
+@openai_v2_bp.route('/public-key/rotate', methods=['POST'])
+def rotate_public_key_openai():
+    return rotate_public_key()
 
 @openai_v2_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion_openai():

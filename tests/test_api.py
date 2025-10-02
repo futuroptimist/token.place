@@ -216,6 +216,72 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert 'Mock response' in decrypted_data['choices'][0]['message']['content']
 
 
+def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_llama):
+    """Rotating the public key should issue a new key and keep encrypted flows working."""
+
+    # Capture the original key
+    original_key_resp = client.get("/api/v2/public-key")
+    assert original_key_resp.status_code == 200
+    original_key = original_key_resp.get_json()["public_key"]
+
+    # Rotate via the v1 endpoint to ensure backwards compatibility
+    rotate_resp = client.post("/api/v1/public-key/rotate")
+    assert rotate_resp.status_code == 200
+    rotated_key = rotate_resp.get_json()["public_key"]
+
+    assert rotated_key != original_key
+
+    # The v2 endpoint should now expose the rotated key as well
+    follow_up_resp = client.get("/api/v2/public-key")
+    assert follow_up_resp.status_code == 200
+    assert follow_up_resp.get_json()["public_key"] == rotated_key
+
+    # Encrypt a new chat payload with the rotated key
+    server_public_key_bytes = base64.b64decode(rotated_key)
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Demonstrate key rotation."}
+    ]
+
+    ciphertext_dict, cipherkey, iv = encrypt(
+        json.dumps(messages).encode("utf-8"),
+        server_public_key_bytes,
+    )
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "encrypted": True,
+        "client_public_key": client_keys["public_key_b64"],
+        "messages": {
+            "ciphertext": base64.b64encode(ciphertext_dict["ciphertext"]).decode("utf-8"),
+            "cipherkey": base64.b64encode(cipherkey).decode("utf-8"),
+            "iv": base64.b64encode(iv).decode("utf-8"),
+        },
+    }
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+    assert response.status_code == 200
+    data = response.get_json()
+
+    assert data.get("encrypted") is True
+    encrypted_body = data["data"]
+
+    decrypted_bytes = decrypt(
+        {
+            "ciphertext": base64.b64decode(encrypted_body["ciphertext"]),
+            "iv": base64.b64decode(encrypted_body["iv"]),
+        },
+        base64.b64decode(encrypted_body["cipherkey"]),
+        client_keys["private_key"],
+    )
+
+    assert decrypted_bytes is not None
+    decrypted_data = json.loads(decrypted_bytes.decode("utf-8"))
+
+    assert decrypted_data["choices"][0]["message"]["role"] == "assistant"
+    assert "Mock response" in decrypted_data["choices"][0]["message"]["content"]
+
+
 def test_streaming_chat_completion(client, mock_llama):
     """Streaming chat completions should return Server-Sent Events chunks."""
 

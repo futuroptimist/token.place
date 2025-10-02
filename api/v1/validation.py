@@ -169,13 +169,95 @@ def validate_chat_messages(messages: List[Dict[str, Any]]) -> None:
 
         validate_required_fields(message, ["role", "content"])
         validate_field_type(message, "role", str)
-        validate_field_type(message, "content", str)
 
         if message.get("role") not in ["system", "user", "assistant", "function"]:
             raise ValidationError(
                 f"Invalid role in messages[{i}]: {message.get('role')}",
                 field="messages"
             )
+
+        content = message.get("content")
+        if isinstance(content, str):
+            continue
+
+        if isinstance(content, list):
+            if not content:
+                raise ValidationError(
+                    f"messages[{i}].content must contain at least one item",
+                    field="messages",
+                )
+
+            for j, item in enumerate(content):
+                if not isinstance(item, dict):
+                    raise ValidationError(
+                        f"messages[{i}].content[{j}] must be an object",
+                        field="messages",
+                    )
+
+                item_type = item.get("type")
+                if item_type in {"input_text", "text"}:
+                    text_value = item.get("text")
+                    if not isinstance(text_value, str) or not text_value:
+                        raise ValidationError(
+                            f"messages[{i}].content[{j}].text must be a non-empty string",
+                            field="messages",
+                        )
+                    continue
+
+                if item_type == "image_url":
+                    image_url = item.get("image_url")
+                    if isinstance(image_url, dict):
+                        url_value = image_url.get("url")
+                    else:
+                        url_value = image_url
+                    if not isinstance(url_value, str) or not url_value:
+                        raise ValidationError(
+                            f"messages[{i}].content[{j}].image_url.url must be a non-empty string",
+                            field="messages",
+                        )
+                    continue
+
+                if item_type == "input_image":
+                    image_payload = item.get("image") or item.get("image_url")
+                    if not isinstance(image_payload, dict):
+                        raise ValidationError(
+                            f"messages[{i}].content[{j}].image must be an object",
+                            field="messages",
+                        )
+
+                    encoded = (
+                        image_payload.get("b64_json")
+                        or image_payload.get("base64")
+                        or image_payload.get("data")
+                    )
+
+                    if not isinstance(encoded, str) or not encoded:
+                        raise ValidationError(
+                            f"messages[{i}].content[{j}].image must include base64 data",
+                            field="messages",
+                        )
+
+                    try:
+                        base64.b64decode(encoded, validate=True)
+                    except Exception as exc:  # pragma: no cover - defensive branch
+                        raise ValidationError(
+                            f"messages[{i}].content[{j}].image must contain valid base64 data",
+                            field="messages",
+                        ) from exc
+
+                    continue
+
+                raise ValidationError(
+                    f"Unsupported content type in messages[{i}]: {item_type}",
+                    field="messages",
+                )
+
+            continue
+
+        raise ValidationError(
+            f"messages[{i}].content must be a string or array of content blocks",
+            field="messages",
+        )
 
 
 def validate_encrypted_request(data: Dict[str, Any]) -> None:

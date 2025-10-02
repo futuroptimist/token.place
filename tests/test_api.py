@@ -216,8 +216,10 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert 'Mock response' in decrypted_data['choices'][0]['message']['content']
 
 
-def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_llama):
+def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_llama, monkeypatch):
     """Rotating the public key should issue a new key and keep encrypted flows working."""
+
+    monkeypatch.setenv("TOKEN_PLACE_OPERATOR_TOKEN", "test-operator-token")
 
     # Capture the original key
     original_key_resp = client.get("/api/v2/public-key")
@@ -225,7 +227,10 @@ def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_l
     original_key = original_key_resp.get_json()["public_key"]
 
     # Rotate via the v1 endpoint to ensure backwards compatibility
-    rotate_resp = client.post("/api/v1/public-key/rotate")
+    rotate_resp = client.post(
+        "/api/v1/public-key/rotate",
+        headers={"Authorization": "Bearer test-operator-token"},
+    )
     assert rotate_resp.status_code == 200
     rotated_key = rotate_resp.get_json()["public_key"]
 

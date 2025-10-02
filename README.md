@@ -634,6 +634,13 @@ rotate the credentials:
 POST /api/v1/public-key/rotate
 # or
 POST /v1/public-key/rotate
+
+# Include your operator token via either header:
+# Authorization: Bearer <token>
+# X-Token-Place-Operator: <token>
+
+Configure the server-side secret by setting `TOKEN_PLACE_OPERATOR_TOKEN` (or
+`TOKEN_PLACE_KEY_ROTATION_TOKEN`) in the environment before starting the API.
 ```
 
 2. Encrypt your request with the server's public key

@@ -12,6 +12,7 @@ import logging
 import os
 
 from api.v1.encryption import encryption_manager
+from api.security import ensure_operator_access
 from api.v1.moderation import evaluate_messages_for_policy
 from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
@@ -224,6 +225,9 @@ def get_public_key():
 @v1_bp.route('/public-key/rotate', methods=['POST'])
 def rotate_public_key():
     """Rotate the server's RSA key pair and return the refreshed public key."""
+    auth_error = ensure_operator_access(format_error_response, log_warning)
+    if auth_error:
+        return auth_error
     return _rotate_public_key_response()
 
 

@@ -138,7 +138,7 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
         ]
     }
 
-    response = client.post("/api/v1/chat/completions", json=payload)
+    response = client.post("/api/v2/chat/completions", json=payload)
     assert response.status_code == 200
     data = response.get_json()
 
@@ -155,7 +155,7 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
 def test_encrypted_chat_completion(client, client_keys, mock_llama):
     """Test the chat completion API with encryption"""
     # Get the server's public key
-    response = client.get("/api/v1/public-key")
+    response = client.get("/api/v2/public-key")
     assert response.status_code == 200
     server_public_key = response.get_json()['public_key']
 
@@ -182,7 +182,7 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     }
 
     # Send the request
-    response = client.post("/api/v1/chat/completions", json=payload)
+    response = client.post("/api/v2/chat/completions", json=payload)
     assert response.status_code == 200
     data = response.get_json()
 
@@ -228,7 +228,7 @@ def test_streaming_chat_completion(client, mock_llama):
         "stream": True
     }
 
-    response = client.post("/api/v1/chat/completions", json=payload)
+    response = client.post("/api/v2/chat/completions", json=payload)
 
     assert response.status_code == 200
     assert response.headers["Content-Type"].startswith("text/event-stream")
@@ -255,7 +255,7 @@ def test_streaming_chat_completion(client, mock_llama):
 def test_encrypted_streaming_falls_back_to_single_response(client, client_keys, mock_llama):
     """Encrypted streaming requests fall back to encrypted JSON responses."""
 
-    response = client.get("/api/v1/public-key")
+    response = client.get("/api/v2/public-key")
     assert response.status_code == 200
     server_public_key = response.get_json()['public_key']
 

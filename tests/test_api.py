@@ -13,6 +13,19 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from relay import app
 from api.v1.routes import format_error_response
 
+OPERATOR_TOKEN_ENV_VARS = (
+    "TOKEN_PLACE_OPERATOR_TOKEN",
+    "TOKEN_PLACE_KEY_ROTATION_TOKEN",
+    "PUBLIC_KEY_ROTATION_TOKEN",
+)
+
+
+def clear_operator_token_env(monkeypatch):
+    """Remove any configured operator tokens for the duration of a test."""
+
+    for env_var in OPERATOR_TOKEN_ENV_VARS:
+        monkeypatch.delenv(env_var, raising=False)
+
 # API base URL for testing - No longer needed with test client
 # API_BASE_URL = "http://localhost:5000/api/v1"
 
@@ -214,6 +227,52 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert decrypted_data['choices'][0]['message']['role'] == 'assistant'
     assert len(decrypted_data['choices'][0]['message']['content']) > 0
     assert 'Mock response' in decrypted_data['choices'][0]['message']['content']
+
+
+def test_public_key_rotation_rejected_without_operator_token_config(client, monkeypatch):
+    """Rotation should fail fast if operator authentication is not configured."""
+
+    clear_operator_token_env(monkeypatch)
+
+    response = client.post("/api/v1/public-key/rotate")
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["code"] == "operator_auth_not_configured"
+
+
+def test_public_key_rotation_rejects_invalid_token(client, monkeypatch):
+    """Configured rotation should reject requests without a valid operator token."""
+
+    clear_operator_token_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_KEY_ROTATION_TOKEN", "expected-token")
+
+    response = client.post(
+        "/api/v1/public-key/rotate",
+        headers={"X-Token-Place-Operator": "wrong-token"},
+    )
+
+    assert response.status_code == 401
+    payload = response.get_json()
+    assert payload["error"]["code"] == "operator_token_invalid"
+
+
+def test_public_key_rotation_accepts_custom_header(client, monkeypatch):
+    """The X-Token-Place-Operator header should authorize key rotation across APIs."""
+
+    clear_operator_token_env(monkeypatch)
+    # Ensure we exercise the fallback environment variables, not just the primary one.
+    monkeypatch.setenv("TOKEN_PLACE_OPERATOR_TOKEN", "", prepend=False)
+    monkeypatch.setenv("TOKEN_PLACE_KEY_ROTATION_TOKEN", "expected-token")
+
+    response = client.post(
+        "/api/v2/public-key/rotate",
+        headers={"X-Token-Place-Operator": "expected-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert "public_key" in payload
+    assert isinstance(payload["public_key"], str)
 
 
 def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_llama, monkeypatch):

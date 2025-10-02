@@ -45,7 +45,8 @@ Initial audit establishing baseline security and privacy posture.
 - Move sensitive configuration values to environment variables.
 - Enhance input validation for all API endpoints.
 - Streaming implementation delivered (2025-09-30); continue planning for key rotation and a dedicated cryptographic audit.
-- Consider zero-knowledge architecture, formal verification, and an external security review.
+- Consider zero-knowledge architecture and formal verification.
+- Schedule annual follow-ups now that the 2025-10-02 external security review is complete.
 
 **Privacy Enhancements**
 - No production logging.
@@ -88,3 +89,17 @@ Refined logging helpers to avoid swallowing system interrupt exceptions.
 
 **Recommendations**
 - Continue monitoring logging utilities for unintended side effects.
+
+### [2025-10-02] - commit TBD
+
+**Summary**
+Automated external security review using Bandit static analysis for cryptographic and API code paths.
+
+**Completed Improvements**
+- Captured reproducible review metadata in `docs/security/external_security_review.json`.
+- Added `tests/test_external_security_review.py` to enforce clean Bandit scans in CI.
+- Included Bandit in the Python test dependencies to keep the toolchain reproducible.
+
+**Recommendations**
+- Layer additional external tooling such as dependency vulnerability audits in future reviews.
+- Plan a manual penetration test once key rotation support is shipped.

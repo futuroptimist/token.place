@@ -108,6 +108,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 
 - End-to-end encryption powered by RSA and AES
 - Cross-platform Python server and JavaScript client
+- Inline vision analysis for base64 image attachments via the API v2 chat endpoint
 - Comprehensive tests and CI via GitHub Actions
 - [AGENTS.md](AGENTS.md) lists repo helpers for LLMs
 - [llms.txt](llms.txt) provides machine-readable context
@@ -165,7 +166,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Function/tool calling support via Machine Conversation Protocol (MCP) (`api/v2/routes.py`)
   - [ ] Multi-modal support (text + images input)
   - [ ] Local image generation support (Stable Diffusion 3, Flux)
-  - [ ] Vision model support (analyzing images)
+  - [x] Vision model support (inline analysis for base64-encoded images)
   - [ ] Fine-tuned models and model adapter support
 - [ ] Performance optimizations
   - [ ] Token streaming between client/server for faster responses

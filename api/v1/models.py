@@ -7,7 +7,10 @@ import os
 import random
 import logging
 import time
+from typing import Any, Dict, List, Optional, Sequence
+
 from llama_cpp import Llama
+from utils.vision import analyze_base64_image, summarize_analysis
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -35,6 +38,83 @@ def log_error(message, exc_info=False):
     """Log errors only in non-production environments"""
     if ENVIRONMENT != 'prod':
         logger.error(message, exc_info=exc_info)
+
+
+def _extract_base64_payload(block: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "encoded": None,
+        "skipped_remote": False,
+    }
+
+    block_type = block.get("type")
+
+    if block_type == "input_image" or block_type == "image":
+        image_payload = block.get("image") or block.get("image_url") or {}
+        if isinstance(image_payload, dict):
+            encoded = (
+                image_payload.get("b64_json")
+                or image_payload.get("base64")
+                or image_payload.get("data")
+            )
+            if isinstance(encoded, str) and encoded.strip():
+                payload["encoded"] = encoded
+    elif block_type == "image_url":
+        image_url = block.get("image_url")
+        if isinstance(image_url, dict):
+            url_value = image_url.get("url")
+        else:
+            url_value = image_url
+
+        if isinstance(url_value, str):
+            if url_value.startswith("data:"):
+                payload["encoded"] = url_value
+            else:
+                payload["skipped_remote"] = True
+
+    return payload
+
+
+def _build_vision_summary(messages: Sequence[Dict[str, Any]]) -> Optional[str]:
+    analyses: List[Dict[str, Any]] = []
+    skipped_remote = False
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            payload = _extract_base64_payload(block)
+            encoded = payload.get("encoded")
+            if encoded:
+                try:
+                    analyses.append(analyze_base64_image(encoded))
+                except ValueError as exc:
+                    log_warning(f"Skipping invalid image payload: {exc}")
+                continue
+
+            if payload.get("skipped_remote"):
+                skipped_remote = True
+
+    if analyses:
+        summary_text = summarize_analysis(analyses)
+        if skipped_remote:
+            summary_text += (
+                " Additional attachments reference remote URLs; "
+                "provide base64 data for inline analysis."
+            )
+        return summary_text
+
+    if skipped_remote:
+        return (
+            "Vision analysis unavailable: remote image URLs require base64 "
+            "data URIs for inspection."
+        )
+
+    return None
 
 # Check if we're using mock LLM
 USE_MOCK_LLM = os.environ.get('USE_MOCK_LLM', '0') == '1'
@@ -168,6 +248,17 @@ def generate_response(model_id, messages, **options):
             )
 
     try:
+        vision_summary = _build_vision_summary(messages)
+        if vision_summary:
+            logger.info("Generated inline vision analysis without invoking model")
+            messages.append({
+                "role": "assistant",
+                "content": vision_summary,
+            })
+            elapsed = time.time() - start_time
+            logger.info(f"Response generated in {elapsed:.2f}s (vision analysis)")
+            return messages
+
         # Get the model instance (or mock)
         model = get_model_instance(model_id)
 

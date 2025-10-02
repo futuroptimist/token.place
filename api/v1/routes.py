@@ -12,6 +12,7 @@ import logging
 import os
 
 from api.v1.encryption import encryption_manager
+from api.security import ensure_operator_access
 from api.v1.moderation import evaluate_messages_for_policy
 from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
@@ -186,23 +187,48 @@ def get_model(model_id):
         log_error(f"Error in get_model endpoint for model {model_id}")
         return format_error_response(f"Internal server error: {str(e)}")
 
+def _public_key_response(log_label: str | None = None):
+    try:
+        if log_label is None:
+            log_label = f"{request.method.upper()} {request.path}"
+        log_info(f"API request: {log_label}")
+        return jsonify({'public_key': encryption_manager.public_key_b64})
+    except Exception as exc:
+        log_error("Error in get_public_key endpoint", exc_info=True)
+        return format_error_response(
+            f"Failed to retrieve public key: {str(exc)}",
+        )
+
+
+def _rotate_public_key_response(log_label: str | None = None):
+    try:
+        if log_label is None:
+            log_label = f"{request.method.upper()} {request.path}"
+        log_info(f"API request: {log_label}")
+        encryption_manager.rotate_keys()
+        return jsonify({'public_key': encryption_manager.public_key_b64})
+    except Exception as exc:
+        log_error("Error rotating public key", exc_info=True)
+        return format_error_response(
+            "Failed to rotate public key",
+            error_type="internal_server_error",
+            status_code=500,
+        )
+
+
 @v1_bp.route('/public-key', methods=['GET'])
 def get_public_key():
-    """
-    Get the public key for encryption (token.place specific)
-    This endpoint is not part of the OpenAI API but is needed for our encryption.
+    """Expose the current public key used for encrypted requests."""
+    return _public_key_response()
 
-    Returns:
-        JSON response with the server's public key
-    """
-    try:
-        log_info("API request: GET /public-key")
-        return jsonify({
-            'public_key': encryption_manager.public_key_b64
-        })
-    except Exception as e:
-        log_error("Error in get_public_key endpoint")
-        return format_error_response(f"Failed to retrieve public key: {str(e)}")
+
+@v1_bp.route('/public-key/rotate', methods=['POST'])
+def rotate_public_key():
+    """Rotate the server's RSA key pair and return the refreshed public key."""
+    auth_error = ensure_operator_access(format_error_response, log_warning)
+    if auth_error:
+        return auth_error
+    return _rotate_public_key_response()
 
 
 @v1_bp.route('/community/providers', methods=['GET'])
@@ -632,6 +658,11 @@ def get_model_openai(model_id):
 @openai_v1_bp.route('/public-key', methods=['GET'])
 def get_public_key_openai():
     return get_public_key()
+
+
+@openai_v1_bp.route('/public-key/rotate', methods=['POST'])
+def rotate_public_key_openai():
+    return rotate_public_key()
 
 @openai_v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion_openai():

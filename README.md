@@ -177,7 +177,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Rate limiting and quota enforcement 💯
 - [x] Enhanced encryption options for model weights and inference data
   - [x] Optional AES-GCM mode with associated data for protecting weights and inference payloads
-  - [ ] Key rotation for relay and server certificates
+  - [x] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
 - [x] Optional content moderation hooks
 - [ ] External security review of protocol and code
@@ -627,6 +627,21 @@ For enhanced privacy, you can use end-to-end encryption with the API:
 GET /api/v1/public-key
 # or
 GET /v1/public-key
+```
+
+If you need to invalidate the existing key pair (for example after suspected compromise),
+rotate the credentials:
+```
+POST /api/v1/public-key/rotate
+# or
+POST /v1/public-key/rotate
+
+# Include your operator token via either header:
+# Authorization: Bearer <token>
+# X-Token-Place-Operator: <token>
+
+Configure the server-side secret by setting `TOKEN_PLACE_OPERATOR_TOKEN` (or
+`TOKEN_PLACE_KEY_ROTATION_TOKEN`) in the environment before starting the API.
 ```
 
 2. Encrypt your request with the server's public key

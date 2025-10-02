@@ -28,6 +28,11 @@ class EncryptionManager:
         self._private_key_pem, self._public_key_pem = generate_keys()
         self.public_key_b64 = base64.b64encode(self._public_key_pem).decode('utf-8')
 
+    def rotate_keys(self) -> None:
+        """Rotate the RSA key pair and refresh the cached base64 variant."""
+        self._private_key_pem, self._public_key_pem = generate_keys()
+        self.public_key_b64 = base64.b64encode(self._public_key_pem).decode('utf-8')
+
     def encrypt_message(self,
                        data: Dict[str, Any],
                        client_public_key: Union[str, bytes]) -> Optional[Dict[str, str]]:

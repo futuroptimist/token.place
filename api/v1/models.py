@@ -135,13 +135,15 @@ def get_model_instance(model_id):
             error_type="model_load_error",
         )
 
-def generate_response(model_id, messages):
+def generate_response(model_id, messages, **options):
     """
     Generate a response using the specified model
 
     Args:
         model_id: The ID of the model to use
         messages: List of message dictionaries with 'role' and 'content' keys
+        **options: Additional OpenAI-compatible parameters to pass through to the
+            underlying model implementation (e.g. temperature, tools)
 
     Returns:
         list: Updated messages list with the model's response appended
@@ -195,7 +197,7 @@ def generate_response(model_id, messages):
 
         # Generate response with the real model
         logger.info("Generating response with real model")
-        response = model.create_chat_completion(messages=messages)
+        response = model.create_chat_completion(messages=messages, **options)
 
         # Extract and append the assistant's message
         if response and 'choices' in response and response['choices']:

@@ -32,7 +32,11 @@ def test_get_model_exception(client, monkeypatch):
 def test_chat_completion_unexpected_error(client, monkeypatch):
     monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "test-model"}])
     monkeypatch.setattr(routes, "get_model_instance", lambda m: object())
-    monkeypatch.setattr(routes, "generate_response", lambda m, msgs: (_ for _ in ()).throw(RuntimeError("oops")))
+    monkeypatch.setattr(
+        routes,
+        "generate_response",
+        lambda m, msgs, **kwargs: (_ for _ in ()).throw(RuntimeError("oops")),
+    )
     payload = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
     resp = client.post("/api/v1/chat/completions", json=payload)
     assert resp.status_code == 500

@@ -1,9 +1,9 @@
 """
-API routes for token.place API v1
-This module follows OpenAI API conventions to serve as a drop-in replacement.
+API routes for token.place API v2.
+This module extends the OpenAI-compatible surface with enhanced capabilities.
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 import base64
 import time
 import json
@@ -31,9 +31,8 @@ from utils.providers import (
 get_community_provider_directory = _get_community_provider_directory
 get_registry_provider_directory = _get_registry_provider_directory
 
-# Historically, tests patch `api.v1.routes.get_provider_directory` when
-# exercising the server provider endpoint. Keep that alias pointing at the
-# registry loader so existing test suites continue to work.
+# Maintain compatibility with existing tests that expect a get_provider_directory
+# attribute exposed on the routes module.
 get_provider_directory = get_registry_provider_directory
 
 # Check environment
@@ -43,11 +42,11 @@ SERVICE_NAME = os.getenv('SERVICE_NAME', 'token.place')
 # Configure logging based on environment
 if ENVIRONMENT != 'prod':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger('api.v1.routes')
+    logger = logging.getLogger('api.v2.routes')
 else:
     # In production, set up a null handler to suppress all logs
     logging.basicConfig(handlers=[logging.NullHandler()])
-    logger = logging.getLogger('api.v1.routes')
+    logger = logging.getLogger('api.v2.routes')
 
 def log_info(message):
     """Log info only in non-production environments"""
@@ -64,8 +63,8 @@ def log_error(message, exc_info=False):
     if ENVIRONMENT != 'prod':
         logger.error(message, exc_info=exc_info)
 
-# Create a Blueprint for v1 API
-v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
+# Create a Blueprint for v2 API
+v2_bp = Blueprint('v2', __name__, url_prefix='/api/v2')
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
     """Format an error response in a standardized way for the API"""
@@ -86,7 +85,7 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
     response.status_code = status_code
     return response
 
-@v1_bp.route('/models', methods=['GET'])
+@v2_bp.route('/models', methods=['GET'])
 def list_models():
     """
     List available models (OpenAI-compatible)
@@ -129,11 +128,15 @@ def list_models():
             "object": "list",
             "data": formatted_models
         })
-    except Exception as e:
-        log_error("Error in list_models endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Error in list_models endpoint", exc_info=True)
+        return format_error_response(
+            "Internal server error",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
-@v1_bp.route('/models/<model_id>', methods=['GET'])
+@v2_bp.route('/models/<model_id>', methods=['GET'])
 def get_model(model_id):
     """
     Get model information by ID (OpenAI-compatible)
@@ -182,11 +185,18 @@ def get_model(model_id):
             "root": model["id"],
             "parent": None
         })
-    except Exception as e:
-        log_error(f"Error in get_model endpoint for model {model_id}")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error(
+            f"Error in get_model endpoint for model {model_id}",
+            exc_info=True,
+        )
+        return format_error_response(
+            "Internal server error",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
-@v1_bp.route('/public-key', methods=['GET'])
+@v2_bp.route('/public-key', methods=['GET'])
 def get_public_key():
     """
     Get the public key for encryption (token.place specific)
@@ -200,12 +210,16 @@ def get_public_key():
         return jsonify({
             'public_key': encryption_manager.public_key_b64
         })
-    except Exception as e:
-        log_error("Error in get_public_key endpoint")
-        return format_error_response(f"Failed to retrieve public key: {str(e)}")
+    except Exception:
+        log_error("Error in get_public_key endpoint", exc_info=True)
+        return format_error_response(
+            "Failed to retrieve public key",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 
-@v1_bp.route('/community/providers', methods=['GET'])
+@v2_bp.route('/community/providers', methods=['GET'])
 def list_community_providers():
     """Expose the community-operated relay and server provider directory."""
 
@@ -232,7 +246,7 @@ def list_community_providers():
     return jsonify(response_payload)
 
 
-@v1_bp.route('/server-providers', methods=['GET'])
+@v2_bp.route('/server-providers', methods=['GET'])
 def list_server_providers():
     """Expose the self-hosted relay provider registry."""
 
@@ -260,7 +274,7 @@ def list_server_providers():
     return jsonify(response_payload)
 
 
-@v1_bp.route('/chat/completions', methods=['POST'])
+@v2_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion():
     """
     Create a chat completion. Compatible with OpenAI's API format.
@@ -388,13 +402,52 @@ def create_chat_completion():
 
             # Generate response using the specified model
             log_info(f"Generating response using model {model_id}")
-            updated_messages = generate_response(model_id, messages)
+
+            openai_option_keys = {
+                "frequency_penalty",
+                "logit_bias",
+                "max_tokens",
+                "n",
+                "presence_penalty",
+                "response_format",
+                "seed",
+                "stop",
+                "temperature",
+                "tool_choice",
+                "tools",
+                "top_p",
+                "user",
+                "function_call",
+                "functions",
+            }
+            model_request_options = {
+                key: data[key]
+                for key in openai_option_keys
+                if key in data
+            }
+
+            updated_messages = generate_response(
+                model_id,
+                messages,
+                **model_request_options,
+            )
 
             # Extract the last message (the model's response)
             assistant_message = updated_messages[-1]
             log_info("Response generated successfully")
 
             # Create response in OpenAI format
+            tool_calls = assistant_message.get("tool_calls")
+            finish_reason = "tool_calls" if tool_calls else "stop"
+
+            message_payload = {
+                "role": assistant_message.get("role", "assistant"),
+                "content": assistant_message.get("content")
+            }
+
+            if tool_calls:
+                message_payload["tool_calls"] = tool_calls
+
             response_data = {
                 "id": f"chatcmpl-{uuid.uuid4()}",
                 "object": "chat.completion",
@@ -403,11 +456,8 @@ def create_chat_completion():
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": assistant_message.get("role", "assistant"),
-                            "content": assistant_message.get("content", "")
-                        },
-                        "finish_reason": "stop"
+                        "message": message_payload,
+                        "finish_reason": finish_reason
                     }
                 ],
                 "usage": {
@@ -418,9 +468,67 @@ def create_chat_completion():
             }
 
             # If client requested encryption and provided a public key, encrypt the response
-            if stream_requested:
-                log_warning("Streaming is not available on API v1; returning a standard response")
+            if stream_requested and is_encrypted_request:
+                log_warning("Streaming requested for encrypted payload; falling back to encrypted single response")
                 stream_requested = False
+
+            if stream_requested:
+                log_info("Returning streaming response")
+
+                stream_id = f"chatcmpl-{uuid.uuid4()}"
+                created_ts = int(time.time())
+                role = assistant_message.get("role", "assistant")
+                content_text = assistant_message.get("content") or ""
+
+                def serialize_tool_call(call, index):
+                    function = call.get("function") if isinstance(call, dict) else {}
+                    if not isinstance(function, dict):
+                        function = {}
+                    return {
+                        "index": index,
+                        "id": call.get("id"),
+                        "type": call.get("type", "function"),
+                        "function": {
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments", ""),
+                        },
+                    }
+
+                def build_chunk(delta, finish_reason=None):
+                    return {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish_reason
+                            }
+                        ]
+                    }
+
+                def event_stream():
+                    role_chunk = build_chunk({"role": role}, None)
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                    if content_text:
+                        content_chunk = build_chunk({"content": content_text}, None)
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
+                    if tool_calls:
+                        for idx, call in enumerate(tool_calls):
+                            call_delta = {
+                                "tool_calls": [serialize_tool_call(call, idx)]
+                            }
+                            tool_chunk = build_chunk(call_delta, None)
+                            yield f"data: {json.dumps(tool_chunk)}\n\n"
+                    stop_chunk = build_chunk({}, finish_reason)
+                    yield f"data: {json.dumps(stop_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                response = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+                response.headers['Cache-Control'] = 'no-cache'
+                return response
 
             if is_encrypted_request and client_public_key:
                 log_info("Encrypting response for client")
@@ -456,15 +564,15 @@ def create_chat_completion():
                 status_code=400
             )
 
-    except Exception as e:
+    except Exception:
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
-            f"Internal server error: {str(e)}",
+            "Internal server error",
             error_type="server_error",
             status_code=500
         )
 
-@v1_bp.route('/completions', methods=['POST'])
+@v2_bp.route('/completions', methods=['POST'])
 def create_completion():
     """
     Text completion API (OpenAI-compatible).
@@ -590,11 +698,15 @@ def create_completion():
                 error_type=e.error_type,
                 status_code=e.status_code
             )
-    except Exception as e:
-        log_error("Unexpected error in create_completion endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Unexpected error in create_completion endpoint", exc_info=True)
+        return format_error_response(
+            "Internal server error",
+            error_type="server_error",
+            status_code=500,
+        )
 
-@v1_bp.route('/health', methods=['GET'])
+@v2_bp.route('/health', methods=['GET'])
 def health_check():
     """
     API health check endpoint (token.place specific)
@@ -606,41 +718,45 @@ def health_check():
         log_info("API request: GET /health")
         return jsonify({
             'status': 'ok',
-            'version': 'v1',
+            'version': 'v2',
             'service': SERVICE_NAME,
             'timestamp': int(time.time())
         })
-    except Exception as e:
-        log_error("Error in health_check endpoint")
-        return format_error_response(f"Health check failed: {str(e)}")
+    except Exception:
+        log_error("Error in health_check endpoint", exc_info=True)
+        return format_error_response(
+            "Health check failed",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 # --- OpenAI-compatible alias routes ---
 
-# Create a second blueprint that mirrors the /api/v1 endpoints at /v1 so
+# Create a second blueprint that mirrors the /api/v2 endpoints at /v2 so
 # the OpenAI Python client can talk to token.place by simply changing the
 # base URL.
-openai_v1_bp = Blueprint('openai_v1', __name__, url_prefix='/v1')
+openai_v2_bp = Blueprint('openai_v2', __name__, url_prefix='/v2')
 
-@openai_v1_bp.route('/models', methods=['GET'])
+@openai_v2_bp.route('/models', methods=['GET'])
 def list_models_openai():
     return list_models()
 
-@openai_v1_bp.route('/models/<model_id>', methods=['GET'])
+@openai_v2_bp.route('/models/<model_id>', methods=['GET'])
 def get_model_openai(model_id):
     return get_model(model_id)
 
-@openai_v1_bp.route('/public-key', methods=['GET'])
+@openai_v2_bp.route('/public-key', methods=['GET'])
 def get_public_key_openai():
     return get_public_key()
 
-@openai_v1_bp.route('/chat/completions', methods=['POST'])
+@openai_v2_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion_openai():
     return create_chat_completion()
 
-@openai_v1_bp.route('/completions', methods=['POST'])
+@openai_v2_bp.route('/completions', methods=['POST'])
 def create_completion_openai():
     return create_completion()
 
-@openai_v1_bp.route('/health', methods=['GET'])
+@openai_v2_bp.route('/health', methods=['GET'])
 def health_check_openai():
     return health_check()

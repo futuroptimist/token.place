@@ -3,7 +3,7 @@ import json
 import pytest
 
 from relay import app as relay_app
-from api.v1 import routes
+from api.v2 import routes
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def test_streaming_chat_completion(client, monkeypatch):
 
     monkeypatch.setattr(routes, "generate_response", fake_generate_response)
 
-    response = client.post("/api/v1/chat/completions", json=payload)
+    response = client.post("/api/v2/chat/completions", json=payload)
 
     assert response.status_code == 200
     assert response.headers["Content-Type"].startswith("text/event-stream")
@@ -102,7 +102,7 @@ def test_encrypted_streaming_falls_back_to_single_response(client, monkeypatch):
 
     monkeypatch.setattr(routes, "generate_response", fake_generate_response)
 
-    response = client.post("/api/v1/chat/completions", json=payload)
+    response = client.post("/api/v2/chat/completions", json=payload)
 
     assert response.status_code == 200
     assert response.is_json
@@ -114,9 +114,9 @@ def test_encrypted_streaming_falls_back_to_single_response(client, monkeypatch):
     }
 
 
-@pytest.mark.skip(reason="Streaming tool-call support not yet implemented")
-def test_streaming_with_tool_use(client):
-    """Test streaming with tool use capabilities (future feature)"""
+def test_streaming_with_tool_use(client, monkeypatch):
+    """Streaming responses should surface tool call deltas when tools are requested."""
+
     payload = {
         "model": "llama-3-8b-instruct",
         "messages": [
@@ -145,5 +145,47 @@ def test_streaming_with_tool_use(client):
         ]
     }
 
-    # Placeholder: streaming tool integrations will be validated once tool calling is wired up.
-    assert True
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "get_model_instance", lambda model_id: object())
+
+    def fake_generate_response(model_id, messages):
+        call = {
+            "id": "call_get_weather",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": json.dumps({"location": "San Francisco"})
+            }
+        }
+        return messages + [{"role": "assistant", "tool_calls": [call], "content": None}]
+
+    monkeypatch.setattr(routes, "generate_response", fake_generate_response)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    events = []
+    for raw_chunk in response.iter_encoded():
+        text = raw_chunk.decode("utf-8")
+        if not text.strip():
+            continue
+        assert text.startswith("data: ")
+        events.append(text[len("data: "):].strip())
+
+    assert events[-1] == "[DONE]"
+
+    role_event = json.loads(events[0])
+    tool_event = json.loads(events[1])
+    finish_event = json.loads(events[2])
+
+    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
+
+    tool_delta = tool_event["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_delta["id"] == "call_get_weather"
+    assert tool_delta["type"] == "function"
+    assert tool_delta["function"]["name"] == "get_weather"
+    assert json.loads(tool_delta["function"]["arguments"]) == {"location": "San Francisco"}
+
+    assert finish_event["choices"][0]["finish_reason"] == "tool_calls"

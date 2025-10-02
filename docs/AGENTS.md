@@ -66,6 +66,8 @@ The API is designed to be compatible with OpenAI's API format:
 - `/api/v1/chat/completions`: Create chat completions
 - `/api/v1/completions`: Create completions (legacy)
 - `/api/v1/public-key`: Retrieve server's public key for encryption
+- `/api/v2/chat/completions`: Chat completions with streaming tool-calls
+- `/api/v2/completions`: Legacy completions surfaced through the v2 schema
 
 All API endpoints support both encrypted and unencrypted modes for maximum flexibility.
 

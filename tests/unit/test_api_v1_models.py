@@ -18,8 +18,11 @@ def test_generate_response_uses_real_model():
             mock_llama.return_value = mock_instance
 
             messages = [{'role': 'user', 'content': 'hi'}]
-            result = models.generate_response('llama-3-8b-instruct', messages)
+            result = models.generate_response('llama-3-8b-instruct', messages, temperature=0.7)
 
-            mock_instance.create_chat_completion.assert_called_once_with(messages=messages)
+            mock_instance.create_chat_completion.assert_called_once_with(
+                messages=messages,
+                temperature=0.7,
+            )
             assert result[-1]['role'] == 'assistant'
             assert 'real resp' in result[-1]['content']

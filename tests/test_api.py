@@ -377,7 +377,10 @@ def test_completions_encryption_error(client, monkeypatch, mock_llama):
 
 def test_create_completion_encrypted_success(client, monkeypatch, mock_llama):
     monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
-    monkeypatch.setattr('api.v1.routes.generate_response', lambda m, msgs: msgs + [{'role':'assistant','content':'ok'}])
+    monkeypatch.setattr(
+        'api.v1.routes.generate_response',
+        lambda m, msgs, **kwargs: msgs + [{'role':'assistant','content':'ok'}],
+    )
     monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda data, key: {'ciphertext':'a','cipherkey':'b','iv':'c'})
     payload = {'model':'llama-3-8b-instruct','prompt':'hi','encrypted':True,'client_public_key':'x'}
     res = client.post('/api/v1/completions', json=payload)
@@ -391,7 +394,10 @@ def test_create_chat_completion_model_error(client, monkeypatch, mock_llama):
         pass
     from api.v1.models import ModelError
     monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
-    monkeypatch.setattr('api.v1.routes.generate_response', lambda m, msgs: (_ for _ in ()).throw(ModelError('boom')))
+    monkeypatch.setattr(
+        'api.v1.routes.generate_response',
+        lambda m, msgs, **kwargs: (_ for _ in ()).throw(ModelError('boom')),
+    )
     payload = {'model':'llama-3-8b-instruct','messages':[{'role':'user','content':'hi'}]}
     res = client.post('/api/v1/chat/completions', json=payload)
     assert res.status_code == 400
@@ -480,7 +486,10 @@ def test_chat_completion_invalid_role(client):
 
 def test_chat_completion_encrypt_failure_on_response(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
-    monkeypatch.setattr('api.v1.routes.generate_response', lambda m, msgs: msgs + [{'role': 'assistant', 'content': 'ok'}])
+    monkeypatch.setattr(
+        'api.v1.routes.generate_response',
+        lambda m, msgs, **kwargs: msgs + [{'role': 'assistant', 'content': 'ok'}],
+    )
     monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda *a, **k: None)
     monkeypatch.setattr('api.v1.routes.encryption_manager.decrypt_message', lambda *a, **k: b'[{"role":"user","content":"hi"}]')
     monkeypatch.setattr('api.v1.validation.validate_encrypted_request', lambda data: None)

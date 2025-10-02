@@ -128,9 +128,13 @@ def list_models():
             "object": "list",
             "data": formatted_models
         })
-    except Exception as e:
-        log_error("Error in list_models endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Error in list_models endpoint", exc_info=True)
+        return format_error_response(
+            "Internal server error",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 @v2_bp.route('/models/<model_id>', methods=['GET'])
 def get_model(model_id):
@@ -181,9 +185,16 @@ def get_model(model_id):
             "root": model["id"],
             "parent": None
         })
-    except Exception as e:
-        log_error(f"Error in get_model endpoint for model {model_id}")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error(
+            f"Error in get_model endpoint for model {model_id}",
+            exc_info=True,
+        )
+        return format_error_response(
+            "Internal server error",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 @v2_bp.route('/public-key', methods=['GET'])
 def get_public_key():
@@ -199,9 +210,13 @@ def get_public_key():
         return jsonify({
             'public_key': encryption_manager.public_key_b64
         })
-    except Exception as e:
-        log_error("Error in get_public_key endpoint")
-        return format_error_response(f"Failed to retrieve public key: {str(e)}")
+    except Exception:
+        log_error("Error in get_public_key endpoint", exc_info=True)
+        return format_error_response(
+            "Failed to retrieve public key",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 
 @v2_bp.route('/community/providers', methods=['GET'])
@@ -387,7 +402,35 @@ def create_chat_completion():
 
             # Generate response using the specified model
             log_info(f"Generating response using model {model_id}")
-            updated_messages = generate_response(model_id, messages)
+
+            openai_option_keys = {
+                "frequency_penalty",
+                "logit_bias",
+                "max_tokens",
+                "n",
+                "presence_penalty",
+                "response_format",
+                "seed",
+                "stop",
+                "temperature",
+                "tool_choice",
+                "tools",
+                "top_p",
+                "user",
+                "function_call",
+                "functions",
+            }
+            model_request_options = {
+                key: data[key]
+                for key in openai_option_keys
+                if key in data
+            }
+
+            updated_messages = generate_response(
+                model_id,
+                messages,
+                **model_request_options,
+            )
 
             # Extract the last message (the model's response)
             assistant_message = updated_messages[-1]
@@ -521,10 +564,10 @@ def create_chat_completion():
                 status_code=400
             )
 
-    except Exception as e:
+    except Exception:
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
-            f"Internal server error: {str(e)}",
+            "Internal server error",
             error_type="server_error",
             status_code=500
         )
@@ -655,9 +698,13 @@ def create_completion():
                 error_type=e.error_type,
                 status_code=e.status_code
             )
-    except Exception as e:
-        log_error("Unexpected error in create_completion endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
+    except Exception:
+        log_error("Unexpected error in create_completion endpoint", exc_info=True)
+        return format_error_response(
+            "Internal server error",
+            error_type="server_error",
+            status_code=500,
+        )
 
 @v2_bp.route('/health', methods=['GET'])
 def health_check():
@@ -675,9 +722,13 @@ def health_check():
             'service': SERVICE_NAME,
             'timestamp': int(time.time())
         })
-    except Exception as e:
-        log_error("Error in health_check endpoint")
-        return format_error_response(f"Health check failed: {str(e)}")
+    except Exception:
+        log_error("Error in health_check endpoint", exc_info=True)
+        return format_error_response(
+            "Health check failed",
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 # --- OpenAI-compatible alias routes ---
 

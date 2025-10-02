@@ -20,7 +20,7 @@ def test_chat_completion_blocked_by_content_policy(client, monkeypatch):
     monkeypatch.setattr(
         routes,
         "generate_response",
-        lambda model_id, messages: messages + [{"role": "assistant", "content": "ack"}],
+        lambda model_id, messages, **kwargs: messages + [{"role": "assistant", "content": "ack"}],
     )
 
     payload = {
@@ -43,7 +43,7 @@ def test_text_completion_blocked_by_content_policy(client, monkeypatch):
 
     monkeypatch.setattr(routes, "get_model_instance", lambda model_id: object())
 
-    def _generate(model_id, messages):
+    def _generate(model_id, messages, **kwargs):
         return messages + [{"role": "assistant", "content": "ack"}]
 
     monkeypatch.setattr(routes, "generate_response", _generate)

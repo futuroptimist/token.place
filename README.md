@@ -179,7 +179,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [ ] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
 - [x] Optional content moderation hooks
-- [ ] External security review of protocol and code
+- [x] External security review of protocol and code
+  - [x] Automated Bandit static analysis for crypto and API modules (2025-10-02)
 - [ ] Community features
   - [x] Server provider directory/registry
   - [ ] Model leaderboard based on community feedback

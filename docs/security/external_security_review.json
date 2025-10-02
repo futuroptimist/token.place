@@ -1,0 +1,13 @@
+{
+  "tool": "bandit",
+  "version": "1.7.10",
+  "review_date": "2025-10-02",
+  "reviewed_paths": [
+    "encrypt.py",
+    "server.py",
+    "utils/crypto"
+  ],
+  "expected_issue_count": 0,
+  "expected_maximum_severity": "LOW",
+  "notes": "Bandit static analysis covering cryptographic entry points and server request handlers"
+}

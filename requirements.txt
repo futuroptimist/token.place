@@ -35,6 +35,7 @@ playwright>=1.40.0        # Required by pytest-playwright 0.7.0+
 pytest-cov                # Code coverage
 pytest-mock               # Mocking utilities
 pytest-benchmark==5.1.0   # Performance benchmarking, requires pytest>=8.1
+bandit==1.7.10            # Static analysis for external security review
 PyYAML>=6.0
 pre-commit
 

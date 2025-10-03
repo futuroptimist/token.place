@@ -82,6 +82,19 @@ def test_analyze_base64_image_orientation_variants(monkeypatch):
     assert analysis["height"] is None
 
 
+def test_analyze_base64_image_accepts_uppercase_data_scheme():
+    """Data URLs should be handled case-insensitively."""
+
+    payload = base64.b64encode(_make_png(2, 1)).decode()
+    uppercase_url = f"DATA:image/png;base64,{payload}"
+
+    analysis = ia.analyze_base64_image(uppercase_url)
+
+    assert analysis["format"] == "png"
+    assert analysis["width"] == 2
+    assert analysis["height"] == 1
+
+
 def test_summarize_analysis_variants():
     single = {"format": "png", "width": 1, "height": 2, "size_bytes": 42, "orientation": "portrait"}
     assert ia.summarize_analysis(single) == "Vision analysis: PNG image, 1x2 px, 42 bytes, portrait orientation."
@@ -92,4 +105,3 @@ def test_summarize_analysis_variants():
     assert "2. UNKNOWN image" in summary
 
     assert ia.summarize_analysis([]) == "Vision analysis unavailable."
-

@@ -13,10 +13,11 @@ AnalysisRecord = Dict[str, Optional[Union[str, int]]]
 
 def _strip_data_url(encoded: str) -> str:
     """Remove any data URL prefix from a base64 string."""
-    if encoded.startswith("data:"):
-        _, _, payload = encoded.partition(",")
+    trimmed = encoded.lstrip()
+    if trimmed[:5].lower() == "data:":
+        _, _, payload = trimmed.partition(",")
         return payload.strip()
-    return encoded.strip()
+    return trimmed.strip()
 
 
 def _decode_base64_image(encoded: str) -> bytes:
@@ -161,4 +162,3 @@ def summarize_analysis(
 
     enumerated = [f"{idx}. {line}" for idx, line in enumerate(lines, start=1)]
     return "Vision analysis:\n" + "\n".join(enumerated)
-

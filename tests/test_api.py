@@ -382,6 +382,66 @@ def test_v1_streaming_chat_completion(client, mock_llama):
     assert stop_event["choices"][0]["finish_reason"] == "stop"
 
 
+def test_v1_streaming_chat_completion_with_tool_calls(client, mocker):
+    """Streaming responses should include tool call deltas and finish as tool_calls."""
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [
+            {"role": "system", "content": "You are a function calling assistant."},
+            {"role": "user", "content": "Call the math function."},
+        ],
+        "stream": True,
+    }
+
+    assistant_message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "math.add", "arguments": "{\"a\": 1, \"b\": 2}"},
+            },
+            {
+                "id": "call_2",
+                "type": "function",
+                "function": "unexpected-structure",
+            },
+        ],
+    }
+
+    mocker.patch(
+        "api.v1.routes.generate_response",
+        return_value=payload["messages"] + [assistant_message],
+    )
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    chunks = [chunk.decode("utf-8") for chunk in response.iter_encoded() if chunk.strip()]
+
+    assert chunks[-1].strip() == "data: [DONE]"
+
+    role_event = json.loads(chunks[0][len("data: "):])
+    tool_event_first = json.loads(chunks[1][len("data: "):])
+    tool_event_second = json.loads(chunks[2][len("data: "):])
+    stop_event = json.loads(chunks[3][len("data: "):])
+
+    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
+
+    first_call = tool_event_first["choices"][0]["delta"]["tool_calls"][0]
+    assert first_call["function"]["name"] == "math.add"
+    assert "\"a\"" in first_call["function"]["arguments"]
+
+    second_call = tool_event_second["choices"][0]["delta"]["tool_calls"][0]
+    assert second_call["function"] == {"name": None, "arguments": ""}
+
+    assert stop_event["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_streaming_chat_completion(client, mock_llama):
     """Streaming chat completions should return Server-Sent Events chunks."""
 

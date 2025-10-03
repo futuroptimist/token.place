@@ -346,6 +346,42 @@ def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_l
     assert "Mock response" in decrypted_data["choices"][0]["message"]["content"]
 
 
+def test_v1_streaming_chat_completion(client, mock_llama):
+    """API v1 should support streaming SSE responses for chat completions."""
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Count from 1 to 5"}
+        ],
+        "stream": True
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    events = []
+    for raw_chunk in response.iter_encoded():
+        text = raw_chunk.decode("utf-8")
+        if not text.strip():
+            continue
+        assert text.startswith("data: ")
+        events.append(text[len("data: "):].strip())
+
+    assert events[-1] == "[DONE]"
+
+    role_event = json.loads(events[0])
+    content_event = json.loads(events[1])
+    stop_event = json.loads(events[2])
+
+    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
+    assert "Mock response" in content_event["choices"][0]["delta"]["content"]
+    assert stop_event["choices"][0]["finish_reason"] == "stop"
+
+
 def test_streaming_chat_completion(client, mock_llama):
     """Streaming chat completions should return Server-Sent Events chunks."""
 

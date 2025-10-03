@@ -169,7 +169,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Vision model support (inline analysis for base64-encoded images)
   - [ ] Fine-tuned models and model adapter support
 - [ ] Performance optimizations
-  - [ ] Token streaming between client/server for faster responses
+  - [x] Token streaming between client/server for faster responses
   - [ ] GPU memory optimizations for running multiple models
   - [ ] Batched inference for relay servers with multiple connected clients
 - [ ] Advanced security features

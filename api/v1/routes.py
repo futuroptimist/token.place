@@ -3,7 +3,7 @@ API routes for token.place API v1
 This module follows OpenAI API conventions to serve as a drop-in replacement.
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 import base64
 import time
 import json
@@ -443,10 +443,73 @@ def create_chat_completion():
                 }
             }
 
-            # If client requested encryption and provided a public key, encrypt the response
-            if stream_requested:
-                log_warning("Streaming is not available on API v1; returning a standard response")
+            # Streaming support: fall back to encrypted single responses when necessary
+            if stream_requested and is_encrypted_request:
+                log_warning(
+                    "Streaming requested for encrypted payload; falling back to encrypted single response"
+                )
                 stream_requested = False
+
+            if stream_requested:
+                log_info("Returning streaming response for API v1")
+
+                stream_id = f"chatcmpl-{uuid.uuid4()}"
+                created_ts = int(time.time())
+                role = assistant_message.get("role", "assistant")
+                content_text = assistant_message.get("content") or ""
+                tool_calls = assistant_message.get("tool_calls")
+                finish_reason = "tool_calls" if tool_calls else "stop"
+
+                def serialize_tool_call(call, index):
+                    function = call.get("function") if isinstance(call, dict) else {}
+                    if not isinstance(function, dict):
+                        function = {}
+                    return {
+                        "index": index,
+                        "id": call.get("id"),
+                        "type": call.get("type", "function"),
+                        "function": {
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments", ""),
+                        },
+                    }
+
+                def build_chunk(delta, finish_reason_value=None):
+                    return {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish_reason_value,
+                            }
+                        ],
+                    }
+
+                def event_stream():
+                    role_chunk = build_chunk({"role": role})
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+
+                    if content_text:
+                        content_chunk = build_chunk({"content": content_text})
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
+
+                    if tool_calls:
+                        for idx, call in enumerate(tool_calls):
+                            call_delta = {"tool_calls": [serialize_tool_call(call, idx)]}
+                            tool_chunk = build_chunk(call_delta)
+                            yield f"data: {json.dumps(tool_chunk)}\n\n"
+
+                    stop_chunk = build_chunk({}, finish_reason)
+                    yield f"data: {json.dumps(stop_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                response = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+                response.headers['Cache-Control'] = 'no-cache'
+                return response
 
             if is_encrypted_request and client_public_key:
                 log_info("Encrypting response for client")

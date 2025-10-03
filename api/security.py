@@ -22,7 +22,10 @@ def _expected_operator_token() -> Optional[str]:
     """Return the configured operator token, if present."""
 
     for env_var in _OPERATOR_TOKEN_ENV_VARS:
-        token = os.getenv(env_var)
+        raw = os.getenv(env_var)
+        if not raw:
+            continue
+        token = raw.strip()
         if token:
             return token
     return None
@@ -62,4 +65,3 @@ def ensure_operator_access(
         )
 
     return None
-

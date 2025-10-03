@@ -79,6 +79,8 @@ python -m pytest --cov=. --cov-report=term-missing
 
 - ✅ Added regression coverage for `utils.system.resource_monitor.collect_resource_usage`
   to ensure CPU/memory metrics degrade gracefully when `psutil` raises errors.
+- ✅ Added unit tests for `api.security.ensure_operator_access` to cover whitespace-tolerant
+  operator tokens and Bearer authorization fallbacks.
 
 ## ✅ 8. Snapshot Testing (IMPLEMENTED)
 

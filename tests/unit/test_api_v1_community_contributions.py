@@ -69,10 +69,97 @@ def test_submit_contribution_appends_record(client, tmp_path: Path):
     "payload, expected_message",
     [
         ({}, "operator_name"),
-        ({"operator_name": "Org", "region": "", "availability": "always", "capabilities": ["gpu"], "contact": {"email": "ops@example.org"}}, "region"),
-        ({"operator_name": "Org", "region": "us", "availability": "", "capabilities": ["gpu"], "contact": {"email": "ops@example.org"}}, "availability"),
-        ({"operator_name": "Org", "region": "us", "availability": "always", "capabilities": [], "contact": {"email": "ops@example.org"}}, "Capabilities"),
-        ({"operator_name": "Org", "region": "us", "availability": "always", "capabilities": ["gpu"], "contact": {}}, "Contact"),
+        (
+            {
+                "operator_name": "Org",
+                "region": "",
+                "availability": "always",
+                "capabilities": ["gpu"],
+                "contact": {"email": "ops@example.org"},
+            },
+            "region",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "",
+                "capabilities": ["gpu"],
+                "contact": {"email": "ops@example.org"},
+            },
+            "availability",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": [],
+                "contact": {"email": "ops@example.org"},
+            },
+            "Capabilities must be a non-empty list of strings",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": ["gpu"],
+                "contact": {},
+            },
+            "Contact information must include at least one method",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": ["gpu"],
+                "contact": {"twitter": "@org"},
+            },
+            "Unsupported contact field",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": ["gpu"],
+                "contact": {"email": ""},
+            },
+            "Contact field 'email' must be a non-empty string",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": "gpu",
+                "contact": {"email": "ops@example.org"},
+            },
+            "Capabilities must be a non-empty list of strings",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": [""],
+                "contact": {"email": "ops@example.org"},
+            },
+            "Capabilities must contain non-empty strings",
+        ),
+        (
+            {
+                "operator_name": "Org",
+                "region": "us",
+                "availability": "always",
+                "capabilities": ["gpu"],
+                "contact": {"email": "ops@example.org"},
+                "hardware": 123,
+            },
+            "hardware must be a string when provided",
+        ),
     ],
 )
 def test_submit_contribution_validation_errors(
@@ -87,4 +174,16 @@ def test_submit_contribution_validation_errors(
 
     assert response.status_code == 400
     assert expected_message in response.get_json()["error"]["message"]
+
+
+def test_submit_contribution_rejects_non_object_payload(client):
+    """The endpoint should reject JSON payloads that are not objects."""
+
+    response = client.post("/api/v1/community/contributions", json=["not", "an", "object"])
+
+    assert response.status_code == 400
+    assert (
+        response.get_json()["error"]["message"]
+        == "Request body must be a JSON object"
+    )
 

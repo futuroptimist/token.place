@@ -17,6 +17,8 @@ from api.v1.moderation import evaluate_messages_for_policy
 from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
     CommunityDirectoryError,
+    ContributionSubmissionError,
+    queue_contribution_submission,
 )
 from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
 from api.v1.validation import (
@@ -256,6 +258,52 @@ def list_community_providers():
         response_payload["updated"] = updated
 
     return jsonify(response_payload)
+
+
+@v1_bp.route('/community/contributions', methods=['POST'])
+def submit_community_contribution():
+    """Queue a contribution offer from community operators."""
+
+    try:
+        payload = request.get_json(force=True, silent=False)
+    except Exception:  # pragma: no cover - handled by validation below
+        payload = None
+
+    if not isinstance(payload, dict):
+        return format_error_response(
+            "Request body must be a JSON object",
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+
+    try:
+        record = queue_contribution_submission(payload)
+    except ContributionSubmissionError as exc:
+        return format_error_response(
+            str(exc),
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+    except OSError as exc:  # pragma: no cover - filesystem failures
+        log_error("Failed to persist community contribution", exc_info=True)
+        return format_error_response(
+            "Unable to record contribution submission",
+            error_type="internal_server_error",
+            status_code=500,
+        )
+
+    log_info(
+        "Queued community contribution from %s for region %s"
+        % (record["operator_name"], record["region"])
+    )
+    response = jsonify(
+        {
+            "status": "queued",
+            "submission_id": record["submission_id"],
+        }
+    )
+    response.status_code = 202
+    return response
 
 
 @v1_bp.route('/server-providers', methods=['GET'])

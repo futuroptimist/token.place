@@ -184,7 +184,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Community features
   - [x] Server provider directory/registry
   - [ ] Model leaderboard based on community feedback
-  - [ ] Contribution system for donating compute resources
+  - [x] Contribution system for donating compute resources
 
 ## installation
 
@@ -617,6 +617,38 @@ Example response snippet:
   }
 }
 ```
+
+#### Community Contribution Queue
+```
+POST /api/v1/community/contributions
+```
+Allows community operators to offer spare compute resources for the shared relay network.
+Submissions are validated server-side, assigned a UUID, and appended to a JSONL queue so maintainers can review and onboard new providers.
+
+Request body:
+
+```json
+{
+  "operator_name": "Compute Collective",
+  "region": "us-west",
+  "availability": "weekends",
+  "capabilities": ["openai-compatible", "gpu"],
+  "contact": {"email": "ops@example.org"},
+  "hardware": "2x RTX 4090",
+  "notes": "Can scale to 4 nodes with notice"
+}
+```
+
+Response body:
+
+```json
+{
+  "status": "queued",
+  "submission_id": "82b900a7-1c05-4e2a-8ce0-3b18a835adcb"
+}
+```
+
+For deployments that need to relocate the queue file, set `TOKEN_PLACE_CONTRIBUTION_QUEUE` to an absolute path. The server will create the file if it does not exist and append one JSON document per line.
 
 ### End-to-End Encryption
 

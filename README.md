@@ -56,6 +56,10 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | CONTENT_MODERATION_BLOCKLIST | (defaults)  | Comma-separated phrases added to the default safety blocklist         |
 | CONTENT_MODERATION_INCLUDE_DEFAULTS | 1            | Set to `0` to skip the built-in phrases when filtering requests        |
 | PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
+| API_FALLBACK_URLS | (empty)   | Comma-separated Cloudflare or other relay fallbacks tried in order |
+
+Set `API_FALLBACK_URLS=https://relay.cloudflare.workers.dev/api/v1` to let the bundled clients
+retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable.
 
 The development requirements live in [requirements.txt](requirements.txt).
 
@@ -157,7 +161,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
 - [x] set up production k3s raspberry pi pod running relay.py
   - [ ] server.py stays on personal gaming PC
-  - [ ] potential cloud fallback node via Cloudflare
+  - [x] potential cloud fallback node via Cloudflare
 - [ ] allow participation from other server.pys
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
 - [ ] API v2 with at least 10 models supported and available
@@ -167,7 +171,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [ ] Multi-modal support (text + images input)
   - [ ] Local image generation support (Stable Diffusion 3, Flux)
   - [x] Vision model support (inline analysis for base64-encoded images)
-  - [ ] Fine-tuned models and model adapter support
+  - [x] Fine-tuned models and model adapter support
 - [ ] Performance optimizations
   - [x] Token streaming between client/server for faster responses
   - [ ] GPU memory optimizations for running multiple models
@@ -528,6 +532,11 @@ Always stylize the project name as lowercase `token.place` (not Title case "Toke
 ## API (OpenAI-compatible)
 
 The token.place API is designed to be compatible with the OpenAI API format, making it easy to integrate with existing applications that use OpenAI's services.
+
+API v2 extends the surface with adapter-aware metadata. Fine-tuned variants such as
+`llama-3-8b-instruct:alignment` inherit the base weights and automatically prepend their
+alignment charter as a system prompt. OpenAI SDKs can opt into domain-specific behaviour by
+selecting the derived model ID.
 
 ### API Endpoints
 

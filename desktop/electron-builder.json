@@ -1,6 +1,6 @@
 {
   "appId": "com.tokenplace.desktop",
-  "productName": "token.place Desktop",
+  "productName": "tokenplace Desktop",
   "files": ["dist/**/*"],
   "directories": {
     "buildResources": "assets"

@@ -2,6 +2,8 @@
   "name": "token-place-desktop",
   "version": "0.1.0",
   "private": true,
+  "description": "Desktop app for token.place",
+  "author": "token.place",
   "main": "dist/main/Main.js",
   "scripts": {
     "build": "npm run build:main && npm run build:renderer",

@@ -7,7 +7,7 @@ import os
 import random
 import logging
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from llama_cpp import Llama
 from utils.vision import analyze_base64_image, summarize_analysis
@@ -131,12 +131,65 @@ AVAILABLE_MODELS = [
         "quantization": "Q4_K_M",
         "context_length": 8192,
         "url": "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
-        "file_name": "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+        "file_name": "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
+        "adapters": [
+            {
+                "id": "llama-3-8b-instruct:alignment",
+                "name": "Meta Llama 3 8B Alignment Assistant",
+                "description": (
+                    "Alignment-tuned variant emphasising helpful, honest, and harmless replies "
+                    "using constitutional guardrails."
+                ),
+                "instructions": (
+                    "You are the alignment-focused variant of Meta Llama 3 8B. Follow the "
+                    "provided safety charter to remain helpful, honest, harmless, and to call "
+                    "out uncertain answers."
+                ),
+                "share_base": True,
+            }
+        ],
     }
 ]
 
 # Dictionary mapping model IDs to loaded model instances
 _loaded_models = {}
+
+
+def _iter_model_entries() -> Iterable[Dict[str, Any]]:
+    """Yield flattened model entries, expanding adapter metadata."""
+
+    for base in AVAILABLE_MODELS:
+        base_entry = {key: value for key, value in base.items() if key != "adapters"}
+        base_entry["base_model_id"] = base["id"]
+        yield base_entry
+
+        for adapter in base.get("adapters", []):
+            derived = {key: value for key, value in base.items() if key != "adapters"}
+            derived["id"] = adapter["id"]
+            derived["name"] = adapter.get("name", base_entry["name"])
+            derived["description"] = adapter.get("description", base_entry["description"])
+            derived["file_name"] = adapter.get("file_name", base_entry.get("file_name"))
+            derived["parameters"] = adapter.get("parameters", base_entry.get("parameters"))
+            derived["quantization"] = adapter.get("quantization", base_entry.get("quantization"))
+            derived["context_length"] = adapter.get("context_length", base_entry.get("context_length"))
+            derived["url"] = adapter.get("url", base_entry.get("url"))
+            derived["base_model_id"] = base["id"]
+            derived["adapter"] = {
+                "id": adapter["id"],
+                "instructions": adapter.get("instructions"),
+                "prompt_template": adapter.get("prompt_template"),
+                "share_base": adapter.get("share_base", False),
+            }
+            yield derived
+
+
+def _get_model_metadata(model_id: str) -> Optional[Dict[str, Any]]:
+    """Return metadata for a model or adapter by ID."""
+
+    for entry in _iter_model_entries():
+        if entry["id"] == model_id:
+            return entry
+    return None
 
 class ModelError(Exception):
     """Custom exception for model-related errors"""
@@ -154,8 +207,7 @@ def get_models_info():
         list: List of model metadata dictionaries
     """
     logger.debug("Retrieving models information")
-    # Return a copy of the models list to avoid external modification
-    return AVAILABLE_MODELS.copy()
+    return list(_iter_model_entries())
 
 def get_model_instance(model_id):
     """
@@ -178,9 +230,9 @@ def get_model_instance(model_id):
         raise ModelError("Model ID cannot be empty", status_code=400, error_type="invalid_request_error")
 
     # First check if the model ID exists in available models
-    model_meta = next((m for m in AVAILABLE_MODELS if m["id"] == model_id), None)
+    model_meta = _get_model_metadata(model_id)
     if not model_meta:
-        available_ids = [m["id"] for m in AVAILABLE_MODELS]
+        available_ids = [m["id"] for m in _iter_model_entries()]
         logger.warning(f"Model {model_id} not found. Available models: {available_ids}")
         raise ModelError(
             f"Model '{model_id}' not found. Available models: {', '.join(available_ids)}",
@@ -194,17 +246,33 @@ def get_model_instance(model_id):
         return "MOCK_MODEL"
 
     # In real operation, check if model is already loaded
-    if model_id in _loaded_models:
-        logger.info(f"Using cached model instance for {model_id}")
-        return _loaded_models[model_id]
+    adapter_meta = model_meta.get("adapter")
+    cache_key = model_id
+    if adapter_meta and adapter_meta.get("share_base"):
+        cache_key = model_meta["base_model_id"]
+
+    if cache_key in _loaded_models:
+        logger.info(f"Using cached model instance for {cache_key}")
+        llama = _loaded_models[cache_key]
+        _loaded_models[model_id] = llama
+        return llama
 
     # Load the model from disk if not already loaded
     try:
-        model_path = model_meta["file_name"]
+        model_path = model_meta.get("file_name")
+        if adapter_meta and adapter_meta.get("share_base"):
+            base_meta = _get_model_metadata(model_meta["base_model_id"])
+            if base_meta:
+                model_path = base_meta.get("file_name")
+
+        if not model_path:
+            raise ValueError("Model metadata missing file name")
+
         if not os.path.isabs(model_path):
-            model_path = os.path.join("models", model_meta["file_name"])
+            model_path = os.path.join("models", model_path)
         logger.info(f"Loading model from {model_path}")
         llama = Llama(model_path=model_path)
+        _loaded_models[cache_key] = llama
         _loaded_models[model_id] = llama
         return llama
     except Exception as e:
@@ -247,6 +315,9 @@ def generate_response(model_id, messages, **options):
                 error_type="invalid_request_error"
             )
 
+    model_meta = _get_model_metadata(model_id)
+    adapter_meta = (model_meta or {}).get("adapter")
+
     try:
         vision_summary = _build_vision_summary(messages)
         if vision_summary:
@@ -261,6 +332,19 @@ def generate_response(model_id, messages, **options):
 
         # Get the model instance (or mock)
         model = get_model_instance(model_id)
+
+        if adapter_meta and adapter_meta.get("instructions"):
+            adapter_name = f"adapter:{adapter_meta.get('id', model_id)}"
+            already_injected = any(
+                msg.get("role") == "system" and msg.get("name") == adapter_name
+                for msg in messages
+            )
+            if not already_injected:
+                messages.insert(0, {
+                    "role": "system",
+                    "name": adapter_name,
+                    "content": adapter_meta["instructions"],
+                })
 
         # Check if we're using a mock model - either through env variable or the returned model is the string "MOCK_MODEL"
         mock_mode = USE_MOCK_LLM or model == "MOCK_MODEL"

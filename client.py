@@ -23,6 +23,12 @@ base_url = "http://token.place" if environment == "prod" else "http://localhost"
 # You can override this with the API_BASE_URL environment variable.
 # If running locally with default port 5070:
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:5070/api/v1")
+# Optionally provide a comma separated list of fallback URLs (e.g. Cloudflare Worker endpoints).
+API_FALLBACK_URLS = [
+    url.strip()
+    for url in os.getenv("API_FALLBACK_URLS", "").split(",")
+    if url.strip()
+]
 # Or use "http://localhost:5070" if targeting relay endpoints directly
 
 REQUEST_TIMEOUT = 10  # seconds
@@ -66,16 +72,36 @@ def load_or_generate_client_keys():
 
 # --- API Interaction ---
 
+
+def _iter_api_base_urls():
+    """Yield unique API base URLs, preferring the primary and then any fallbacks."""
+
+    seen = set()
+    for candidate in [API_BASE_URL, *API_FALLBACK_URLS]:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        yield candidate
+
+
 def get_server_public_key():
     """Gets the public key from the API server."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/public-key", timeout=REQUEST_TIMEOUT)
-        response.raise_for_status() # Raise an exception for bad status codes
-        data = response.json()
-        return data.get('public_key')
-    except requests.exceptions.RequestException as e:
-        logger.warning("Error getting server public key: %s", e.__class__.__name__)
-        return None
+    for base_url in _iter_api_base_urls():
+        try:
+            response = requests.get(
+                f"{base_url}/public-key", timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()  # Raise an exception for bad status codes
+            data = response.json()
+            return data.get('public_key')
+        except requests.exceptions.RequestException as e:
+            logger.warning(
+                "Error getting server public key from %s: %s",
+                base_url,
+                e.__class__.__name__,
+            )
+            continue
+    return None
 
 def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_pub_key_pem):
     """Calls the encrypted chat completions endpoint."""
@@ -119,21 +145,34 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
 
     # 5. Send request
     logger.debug("Sending request to API...")
-    try:
-        response = requests.post(
-            f"{API_BASE_URL}/chat/completions", json=payload, timeout=REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-        encrypted_response_data = response.json()
-    except requests.exceptions.RequestException as e:
-        # Avoid logging potentially sensitive error details
-        print(f"API request failed: {e.__class__.__name__}")
-        if hasattr(e, 'response') and e.response is not None:
-             try:
-                 err_status = e.response.status_code
-             except Exception:
-                 err_status = "unknown"
-             logger.warning("Error status: %s", err_status)
+    encrypted_response_data = None
+    last_error = None
+    for base_url in _iter_api_base_urls():
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions", json=payload, timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            encrypted_response_data = response.json()
+            break
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            logger.warning(
+                "API request to %s failed: %s",
+                base_url,
+                e.__class__.__name__,
+            )
+            continue
+    else:
+        if last_error is not None:
+            # Avoid logging potentially sensitive error details
+            print(f"API request failed: {last_error.__class__.__name__}")
+            if hasattr(last_error, 'response') and last_error.response is not None:
+                try:
+                    err_status = last_error.response.status_code
+                except Exception:
+                    err_status = "unknown"
+                logger.warning("Error status: %s", err_status)
         return None
 
     # 6. Decrypt response

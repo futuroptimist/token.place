@@ -101,7 +101,16 @@ def list_models():
         # Transform to OpenAI format
         formatted_models = []
         for model in models:
-            formatted_models.append({
+            base_model_id = model.get("base_model_id", model["id"])
+            parent_id = base_model_id if base_model_id != model["id"] else None
+            adapter_meta = model.get("adapter")
+            metadata = {}
+            if adapter_meta:
+                metadata["adapter"] = {
+                    "id": adapter_meta.get("id", model["id"]),
+                    "share_base": adapter_meta.get("share_base", False),
+                }
+            entry = {
                 "id": model["id"],
                 "object": "model",
                 "created": int(time.time()),
@@ -120,9 +129,12 @@ def list_models():
                     "group": None,
                     "is_blocking": False
                 }],
-                "root": model["id"],
-                "parent": None
-            })
+                "root": base_model_id,
+                "parent": parent_id,
+            }
+            if metadata:
+                entry["metadata"] = metadata
+            formatted_models.append(entry)
 
         log_info(f"Returning {len(formatted_models)} models")
         return jsonify({
@@ -164,7 +176,17 @@ def get_model(model_id):
             )
 
         log_info(f"Returning model details for {model_id}")
-        return jsonify({
+        base_model_id = model.get("base_model_id", model["id"])
+        parent_id = base_model_id if base_model_id != model["id"] else None
+        adapter_meta = model.get("adapter")
+        metadata = {}
+        if adapter_meta:
+            metadata["adapter"] = {
+                "id": adapter_meta.get("id", model["id"]),
+                "share_base": adapter_meta.get("share_base", False),
+            }
+
+        entry = {
             "id": model["id"],
             "object": "model",
             "created": int(time.time()),
@@ -183,9 +205,13 @@ def get_model(model_id):
                 "group": None,
                 "is_blocking": False
             }],
-            "root": model["id"],
-            "parent": None
-        })
+            "root": base_model_id,
+            "parent": parent_id,
+        }
+        if metadata:
+            entry["metadata"] = metadata
+
+        return jsonify(entry)
     except Exception:
         log_error(
             f"Error in get_model endpoint for model {model_id}",

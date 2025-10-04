@@ -14,9 +14,13 @@
       {
         "target": "nsis",
         "arch": ["x64", "arm64"]
+      },
+      {
+        "target": "msi",
+        "arch": ["x64", "arm64"]
       }
     ],
-    "icon": "assets/icon.ico"
+    "icon": "../static/icon.ico"
   },
   "linux": {
     "target": [

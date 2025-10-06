@@ -62,7 +62,31 @@ For URLs and domains, always use the full form:
 
 ## Color Scheme
 
-[TBD: Add color scheme when finalized]
+`token.place` uses a high-contrast palette that mirrors the production chat UI. The
+brand colors are defined in `utils/branding/colors.py` and are available to both
+Python and JavaScript tooling via the exported `BRAND_COLORS` mapping.
+
+| Token          | Hex Code | Typical Usage                                               |
+| -------------- | -------- | ----------------------------------------------------------- |
+| primary cyan   | `#00FFFF`| Primary accent for call-to-action buttons and focus states. |
+| accent blue    | `#007BFF`| Secondary links, toggles, and hover states.                 |
+| accent green   | `#4CAF50`| Success badges and “system healthy” notifications.          |
+| background dark| `#111111`| Default chat background in dark mode.                       |
+| background light| `#FFFFFF`| Base background in light mode.                             |
+| surface dark   | `#1A1A1A`| Message bubbles and cards in dark mode.                     |
+| surface light  | `#F5F5F5`| Message bubbles and cards in light mode.                    |
+| text on dark   | `#FFFFFF`| Primary copy when rendered over dark surfaces.             |
+| text on light  | `#333333`| Primary copy when rendered over light surfaces.            |
+
+Two derived palettes help designers and engineers pick the right semantic colors:
+
+- **Dark mode palette**: background `#111111`, surface `#1A1A1A`, text `#FFFFFF`, accent
+  `#00FFFF`, supporting accent `#007BFF`.
+- **Light mode palette**: background `#FFFFFF`, surface `#F5F5F5`, text `#333333`, accent
+  `#007BFF`, supporting accent `#4CAF50`.
+
+These values are intentionally duplicated in code so automated tooling, lint rules, and
+tests can detect accidental drift between the implementation and the brand guidelines.
 
 ## Language and Tone
 

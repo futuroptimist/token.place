@@ -1,6 +1,6 @@
-"""
-Relay client module for managing communication with relay servers.
-"""
+"""Relay client module for managing communication with relay servers."""
+from __future__ import annotations
+
 import json
 import logging
 import requests
@@ -8,6 +8,7 @@ import time
 import base64
 import jsonschema
 from typing import Dict, Optional, Any, List, Union, Tuple
+from urllib.parse import urlparse, urlunparse
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -106,13 +107,87 @@ class RelayClient:
         self.port = port
         self.crypto_manager = crypto_manager
         self.model_manager = model_manager
-        self.relay_url = f"{base_url}:{port}"
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         try:
             config = get_config_lazy()
-            self._request_timeout = config.get('relay.request_timeout', 10)  # Get timeout from config or use default
+            self._request_timeout = config.get('relay.request_timeout', 10)
+            configured_servers = config.get('relay.additional_servers', []) or []
         except Exception:
             self._request_timeout = 10  # Fallback default
+            configured_servers = []
+
+        self._relay_urls = self._build_relay_targets(base_url, port, configured_servers)
+        self._active_relay_index = 0
+
+    @staticmethod
+    def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
+        """Normalise relay targets into canonical URLs."""
+
+        base = (base_url or '').strip()
+        if not base:
+            return ''
+        base = base.rstrip('/')
+
+        parsed = urlparse(base if '://' in base else f'http://{base}')
+        scheme = parsed.scheme or 'http'
+        netloc = parsed.netloc or parsed.path
+        path = parsed.path if parsed.netloc else ''
+
+        if parsed.port is None and port is not None:
+            hostname = parsed.hostname or netloc
+            userinfo = ''
+            if parsed.username:
+                userinfo = parsed.username
+                if parsed.password:
+                    userinfo = f"{userinfo}:{parsed.password}"
+                userinfo = f"{userinfo}@"
+            netloc = f"{userinfo}{hostname}:{int(port)}"
+
+        return urlunparse((scheme, netloc, path, '', '', '')).rstrip('/')
+
+    @classmethod
+    def _build_relay_targets(
+        cls,
+        primary_base: str,
+        primary_port: int,
+        additional: Union[List[Any], Tuple[Any, ...]],
+    ) -> List[str]:
+        """Combine primary and additional relay endpoints into an ordered list."""
+
+        targets: List[str] = []
+
+        def _append(url: str, port: Optional[int] = None) -> None:
+            normalised = cls._compose_relay_url(url, port)
+            if normalised and normalised not in targets:
+                targets.append(normalised)
+
+        _append(primary_base, primary_port)
+
+        for entry in additional or []:
+            if isinstance(entry, str):
+                _append(entry)
+            elif isinstance(entry, dict):
+                base = entry.get('base_url') or entry.get('url') or entry.get('host')
+                port = entry.get('port')
+                if base:
+                    _append(base, port)
+
+        if not targets:
+            raise ValueError("At least one relay target must be provided")
+
+        return targets
+
+    @property
+    def relay_url(self) -> str:
+        """Return the currently active relay endpoint."""
+
+        return self._relay_urls[self._active_relay_index]
+
+    @property
+    def relay_urls(self) -> Tuple[str, ...]:
+        """Expose configured relay endpoints for diagnostics."""
+
+        return tuple(self._relay_urls)
 
     def start(self):
         """Start the polling loop by setting stop_polling to False"""
@@ -136,54 +211,71 @@ class RelayClient:
             requests.RequestException: For other request-related errors
             ValueError: If the server response is not valid JSON or fails schema validation
         """
-        try:
-            log_info("Pinging relay {}/sink with key {}...", self.relay_url, self.crypto_manager.public_key_b64[:10])
+        last_error: Optional[Dict[str, Any]] = None
 
-            response = requests.post(
-                f'{self.relay_url}/sink',
-                json={'server_public_key': self.crypto_manager.public_key_b64},
-                timeout=self._request_timeout
-            )
+        for offset in range(len(self._relay_urls)):
+            index = (self._active_relay_index + offset) % len(self._relay_urls)
+            candidate_url = self._relay_urls[index]
 
-            if response.status_code == 200:
+            try:
+                log_info(
+                    "Pinging relay {}/sink with key {}...",
+                    candidate_url,
+                    self.crypto_manager.public_key_b64[:10],
+                )
+
+                response = requests.post(
+                    f'{candidate_url}/sink',
+                    json={'server_public_key': self.crypto_manager.public_key_b64},
+                    timeout=self._request_timeout,
+                )
+
+                if response.status_code != 200:
+                    log_error(
+                        "Error from relay /sink: status {} ({} bytes)",
+                        response.status_code,
+                        len(response.text),
+                    )
+                    last_error = {
+                        'error': f"HTTP {response.status_code}",
+                        'next_ping_in_x_seconds': self._request_timeout,
+                    }
+                    continue
+
                 relay_response = response.json()
-
-                # Validate response against schema
                 try:
                     jsonschema.validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
-                except jsonschema.exceptions.ValidationError as e:
-                    log_error("Invalid relay response format: {}", str(e))
-                    return {
-                        'error': f"Invalid response format: {str(e)}",
-                        'next_ping_in_x_seconds': self._request_timeout
+                except jsonschema.exceptions.ValidationError as exc:
+                    log_error("Invalid relay response format: {}", str(exc))
+                    last_error = {
+                        'error': f"Invalid response format: {str(exc)}",
+                        'next_ping_in_x_seconds': self._request_timeout,
                     }
+                    continue
 
+                self._active_relay_index = index
                 return relay_response
-            else:
-                log_error(
-                    "Error from relay /sink: status {} ({} bytes)",
-                    response.status_code,
-                    len(response.text)
-                )
-                return {
-                    'error': f"HTTP {response.status_code}",
-                    'next_ping_in_x_seconds': self._request_timeout
-                }
-        except requests.ConnectionError as e:
-            log_error("Connection error when pinging relay: {}", str(e), exc_info=True)
-            return {'error': str(e), 'next_ping_in_x_seconds': self._request_timeout}
-        except requests.Timeout as e:
-            log_error("Request timeout when pinging relay: {}", str(e), exc_info=True)
-            return {'error': str(e), 'next_ping_in_x_seconds': self._request_timeout}
-        except requests.RequestException as e:
-            log_error("Request exception when pinging relay: {}", str(e), exc_info=True)
-            return {'error': str(e), 'next_ping_in_x_seconds': self._request_timeout}
-        except json.JSONDecodeError as e:
-            log_error("Invalid JSON response from relay: {}", str(e), exc_info=True)
-            return {'error': str(e), 'next_ping_in_x_seconds': self._request_timeout}
-        except Exception as e:
-            log_error("Unexpected error when pinging relay: {}", str(e), exc_info=True)
-            return {'error': str(e), 'next_ping_in_x_seconds': self._request_timeout}
+
+            except requests.ConnectionError as exc:
+                log_error("Connection error when pinging relay: {}", str(exc), exc_info=True)
+                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+            except requests.Timeout as exc:
+                log_error("Request timeout when pinging relay: {}", str(exc), exc_info=True)
+                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+            except requests.RequestException as exc:
+                log_error("Request exception when pinging relay: {}", str(exc), exc_info=True)
+                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+            except json.JSONDecodeError as exc:
+                log_error("Invalid JSON response from relay: {}", str(exc), exc_info=True)
+                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+            except Exception as exc:  # pragma: no cover - unexpected edge cases
+                log_error("Unexpected error when pinging relay: {}", str(exc), exc_info=True)
+                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+
+        return last_error or {
+            'error': 'No relay targets responded',
+            'next_ping_in_x_seconds': self._request_timeout,
+        }
 
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
         """

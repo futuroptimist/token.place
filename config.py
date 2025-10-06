@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
         'port': 5000,
         'server_url': 'http://localhost:5000',
         'workers': 2,
+        'additional_servers': [],
     },
 
     # API settings

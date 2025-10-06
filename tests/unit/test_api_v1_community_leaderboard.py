@@ -79,6 +79,32 @@ def test_leaderboard_endpoint_applies_limit(feedback_file: Path) -> None:
     assert payload["entries"][0]["model_id"] == "gpt-4o"
 
 
+def test_leaderboard_endpoint_rejects_non_integer_limit() -> None:
+    """The HTTP endpoint should validate non-integer limit query parameters."""
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.get("/api/v1/community/leaderboard?limit=abc")
+
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["error"]["message"] == "limit must be a positive integer"
+    assert payload["error"]["param"] == "limit"
+
+
+def test_leaderboard_endpoint_rejects_non_positive_limit() -> None:
+    """The HTTP endpoint should reject zero or negative limit values."""
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.get("/api/v1/community/leaderboard?limit=0")
+
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["error"]["message"] == "limit must be a positive integer"
+    assert payload["error"]["param"] == "limit"
+
+
 def test_leaderboard_rejects_naive_timestamps(feedback_file: Path) -> None:
     """Feedback entries must include timezone-aware timestamps."""
 
@@ -92,6 +118,40 @@ def test_leaderboard_rejects_naive_timestamps(feedback_file: Path) -> None:
     with pytest.raises(
         community.ModelFeedbackError,
         match="timezone information",
+    ):
+        community.get_model_leaderboard()
+
+
+def test_leaderboard_rejects_blank_timestamps(feedback_file: Path) -> None:
+    """Feedback entries with blank timestamps should be rejected."""
+
+    _prepare_feedback(
+        [
+            {"model_id": "gpt-4o", "rating": 5, "submitted_at": "  "},
+        ],
+        feedback_file,
+    )
+
+    with pytest.raises(
+        community.ModelFeedbackError,
+        match="ISO-8601",
+    ):
+        community.get_model_leaderboard()
+
+
+def test_leaderboard_rejects_malformed_timestamps(feedback_file: Path) -> None:
+    """Feedback entries with malformed timestamps should surface errors."""
+
+    _prepare_feedback(
+        [
+            {"model_id": "gpt-4o", "rating": 5, "submitted_at": "not-a-timestamp"},
+        ],
+        feedback_file,
+    )
+
+    with pytest.raises(
+        community.ModelFeedbackError,
+        match="ISO-8601",
     ):
         community.get_model_leaderboard()
 
@@ -111,4 +171,53 @@ def test_leaderboard_normalises_timezones(feedback_file: Path) -> None:
 
     assert leaderboard["entries"][0]["last_feedback_at"] == "2024-08-01T12:00:00Z"
     assert leaderboard["updated"] == "2024-08-01T12:00:00Z"
+
+
+def test_leaderboard_handles_missing_timestamps(feedback_file: Path) -> None:
+    """Entries without timestamps should not break aggregation."""
+
+    _prepare_feedback(
+        [
+            {"model_id": "gpt-4o", "rating": 5},
+        ],
+        feedback_file,
+    )
+
+    leaderboard = community.get_model_leaderboard()
+
+    assert leaderboard["entries"][0]["last_feedback_at"] is None
+    assert leaderboard["updated"] is None
+
+
+def test_leaderboard_rejects_invalid_limit_type() -> None:
+    """Passing a non-integer limit raises a validation error."""
+
+    with pytest.raises(community.ModelFeedbackError, match="positive integer"):
+        community.get_model_leaderboard(limit="abc")  # type: ignore[arg-type]
+
+
+def test_leaderboard_rejects_non_positive_limit() -> None:
+    """Passing a non-positive limit raises a validation error."""
+
+    with pytest.raises(community.ModelFeedbackError, match="positive integer"):
+        community.get_model_leaderboard(limit=0)
+
+
+def test_leaderboard_endpoint_handles_model_feedback_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model feedback errors from the aggregator should return HTTP 500."""
+
+    def _raise_model_feedback_error(*_: object, **__: object) -> None:
+        raise community.ModelFeedbackError("boom")
+
+    monkeypatch.setattr("api.v1.routes.get_model_leaderboard", _raise_model_feedback_error)
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.get("/api/v1/community/leaderboard")
+
+    assert response.status_code == 500
+    payload = response.get_json()
+    assert payload["error"]["message"] == "boom"
 

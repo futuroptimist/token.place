@@ -18,6 +18,8 @@ from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
     CommunityDirectoryError,
     ContributionSubmissionError,
+    ModelFeedbackError,
+    get_model_leaderboard,
     queue_contribution_submission,
 )
 from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
@@ -258,6 +260,43 @@ def list_community_providers():
         response_payload["updated"] = updated
 
     return jsonify(response_payload)
+
+
+@v1_bp.route('/community/leaderboard', methods=['GET'])
+def community_model_leaderboard():
+    """Return the community feedback leaderboard for deployed models."""
+
+    limit_param = request.args.get('limit')
+    limit_value = None
+    if limit_param is not None:
+        try:
+            limit_value = int(limit_param)
+        except (TypeError, ValueError):
+            return format_error_response(
+                "limit must be a positive integer",
+                error_type="invalid_request_error",
+                param="limit",
+                status_code=400,
+            )
+        if limit_value <= 0:
+            return format_error_response(
+                "limit must be a positive integer",
+                error_type="invalid_request_error",
+                param="limit",
+                status_code=400,
+            )
+
+    try:
+        log_info("API request: GET /community/leaderboard")
+        payload = get_model_leaderboard(limit=limit_value)
+        return jsonify(payload)
+    except ModelFeedbackError as exc:
+        log_error("Error aggregating community leaderboard", exc_info=True)
+        return format_error_response(
+            str(exc),
+            error_type="internal_server_error",
+            status_code=500,
+        )
 
 
 @v1_bp.route('/community/contributions', methods=['POST'])

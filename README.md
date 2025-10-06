@@ -188,7 +188,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] External security review of protocol and code
 - [ ] Community features
   - [x] Server provider directory/registry
-  - [ ] Model leaderboard based on community feedback
+  - [x] Model leaderboard based on community feedback
   - [x] Contribution system for donating compute resources
 
 ## installation
@@ -625,6 +625,29 @@ Example response snippet:
   "metadata": {
     "updated_at": "2025-02-15T00:00:00Z"
   }
+}
+```
+
+#### Community Model Leaderboard
+```
+GET /api/v1/community/leaderboard
+```
+Aggregates community ratings for deployed models, returning the highest-rated experiences first.
+Each entry reports the average rating, number of submitted votes, and the most recent feedback timestamp so client applications can highlight trending models.
+
+Example response snippet:
+
+```json
+{
+  "entries": [
+    {
+      "model_id": "anthropic/claude-3.5-sonnet",
+      "average_rating": 4.8,
+      "ratings_count": 27,
+      "last_feedback_at": "2024-12-19T09:10:00Z"
+    }
+  ],
+  "updated": "2024-12-19T09:10:00Z"
 }
 ```
 

@@ -186,4 +186,3 @@ def test_submit_contribution_rejects_non_object_payload(client):
         response.get_json()["error"]["message"]
         == "Request body must be a JSON object"
     )
-

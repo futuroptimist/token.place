@@ -83,4 +83,3 @@ def test_build_vision_summary_no_entries_returns_none(monkeypatch):
     monkeypatch.setattr(models, "analyze_base64_image", lambda _: {"format": "png"})
     messages = [{"content": [{"type": "input_text", "text": "hello"}]}]
     assert models._build_vision_summary(messages) is None
-

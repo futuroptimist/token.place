@@ -138,6 +138,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] delete old /inference endpoint and everything upstream and downstream that's now unused 💯
   - [x] simplified crypto utility (CryptoClient) for easy encrypted communication
 - [ ] distribute relay.py across multiple machines
+  - [x] Multi-relay failover via `relay.additional_servers` configuration (server auto-rotates backups)
   - [x] personal gaming PC
   - [x] raspi k3s pod 💯
   - [ ] once k3s pod is stable, run relay.py only on the cluster

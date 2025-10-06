@@ -78,3 +78,37 @@ def test_leaderboard_endpoint_applies_limit(feedback_file: Path) -> None:
     assert len(payload["entries"]) == 1
     assert payload["entries"][0]["model_id"] == "gpt-4o"
 
+
+def test_leaderboard_rejects_naive_timestamps(feedback_file: Path) -> None:
+    """Feedback entries must include timezone-aware timestamps."""
+
+    _prepare_feedback(
+        [
+            {"model_id": "gpt-4o", "rating": 5, "submitted_at": "2024-08-01T12:00:00"},
+        ],
+        feedback_file,
+    )
+
+    with pytest.raises(
+        community.ModelFeedbackError,
+        match="timezone information",
+    ):
+        community.get_model_leaderboard()
+
+
+def test_leaderboard_normalises_timezones(feedback_file: Path) -> None:
+    """Timestamps with offsets should be normalised to UTC in the payload."""
+
+    _prepare_feedback(
+        [
+            {"model_id": "gpt-4o", "rating": 5, "submitted_at": "2024-08-01T14:00:00+02:00"},
+            {"model_id": "gpt-4o", "rating": 4, "submitted_at": "2024-08-01T10:00:00-02:00"},
+        ],
+        feedback_file,
+    )
+
+    leaderboard = community.get_model_leaderboard()
+
+    assert leaderboard["entries"][0]["last_feedback_at"] == "2024-08-01T12:00:00Z"
+    assert leaderboard["updated"] == "2024-08-01T12:00:00Z"
+

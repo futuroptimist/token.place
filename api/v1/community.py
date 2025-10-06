@@ -136,7 +136,12 @@ def _parse_timestamp(timestamp: Any, line_no: int) -> datetime | None:
     try:
         if value.endswith("Z"):
             value = value[:-1] + "+00:00"
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ModelFeedbackError(
+                f"submitted_at must include timezone information (line {line_no})"
+            )
+        return parsed.astimezone(timezone.utc)
     except ValueError as exc:
         raise ModelFeedbackError(
             f"submitted_at must be an ISO-8601 string (line {line_no})"

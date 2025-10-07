@@ -14,6 +14,20 @@ def test_get_model_instance_mock():
 
 
 @patch.dict(os.environ, {"USE_MOCK_LLM": "1"})
+def test_get_model_instance_v2_catalogue():
+    import api.v1.models as models
+    import api.v2.models as models_v2
+
+    # Reload both catalogues so the environment flag is picked up and the
+    # fallback to the v2 listings is available within the v1 loader.
+    importlib.reload(models_v2)
+    importlib.reload(models)
+
+    inst = models.get_model_instance('mistral-7b-instruct')
+    assert inst == "MOCK_MODEL"
+
+
+@patch.dict(os.environ, {"USE_MOCK_LLM": "1"})
 def test_get_model_instance_invalid():
     import api.v1.models as models
     importlib.reload(models)

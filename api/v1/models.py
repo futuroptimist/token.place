@@ -193,6 +193,19 @@ def _get_model_metadata(model_id: str) -> Optional[Dict[str, Any]]:
     for entry in _iter_model_entries():
         if entry["id"] == model_id:
             return entry
+
+    # Fall back to the v2 catalogue so chat completions can load any model
+    # surfaced via the API v2 listings. Import lazily to avoid a hard dependency
+    # when the v2 module is unused (e.g. in legacy API v1 only deployments).
+    try:
+        from api.v2.models import get_models_info as get_v2_models_info  # type: ignore
+    except Exception as exc:  # pragma: no cover - defensive logging branch
+        log_warning(f"Unable to load API v2 catalogue: {exc}")
+        return None
+
+    for entry in get_v2_models_info():
+        if entry["id"] == model_id:
+            return entry
     return None
 
 class ModelError(Exception):

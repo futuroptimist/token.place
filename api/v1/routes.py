@@ -27,6 +27,7 @@ from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name
 )
+from config import get_config
 from utils.providers import (
     get_provider_directory as _get_registry_provider_directory,
     ProviderRegistryError,
@@ -71,6 +72,14 @@ def log_error(message, exc_info=False):
 
 # Create a Blueprint for v1 API
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
+
+
+def _configured_relay_servers() -> list[str]:
+    """Return the configured relay upstream server pool."""
+
+    config = get_config()
+    servers = config.get('relay.server_pool', []) or []
+    return list(servers)
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
     """Format an error response in a standardized way for the API"""
@@ -371,6 +380,21 @@ def list_server_providers():
         response_payload["metadata"] = metadata
 
     return jsonify(response_payload)
+
+
+@v1_bp.route('/relay/server-nodes', methods=['GET'])
+def relay_server_nodes():
+    """Expose configured relay server nodes for diagnostics and onboarding."""
+
+    log_info("API request: GET /relay/server-nodes")
+    servers = _configured_relay_servers()
+    payload = {
+        'configured_servers': servers,
+        'primary': servers[0] if servers else None,
+        'secondary': servers[1:],
+        'total': len(servers),
+    }
+    return jsonify(payload)
 
 
 @v1_bp.route('/chat/completions', methods=['POST'])

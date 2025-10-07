@@ -9,7 +9,7 @@ import platform
 import json
 import logging
 import copy
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 # Global constants for platform detection
@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
         'host': '127.0.0.1',
         'port': 5000,
         'server_url': 'http://localhost:5000',
+        'server_pool': [],
+        'server_pool_secondary': [],
         'workers': 2,
         'additional_servers': [],
     },
@@ -167,6 +169,9 @@ class Config:
         if self.config_path:
             self._load_user_config()
 
+        # Apply late-binding environment overrides such as deployment-specific hosts.
+        self._apply_runtime_env_overrides()
+
         logger.info(f"Configuration initialized for environment: {self.env}, platform: {self.platform}")
 
     def _configure_platform_paths(self):
@@ -225,6 +230,98 @@ class Config:
                 self._merge_configs(base_config[key], value)
             else:
                 base_config[key] = value
+
+    def _apply_runtime_env_overrides(self) -> None:
+        """Apply runtime environment variable overrides to the configuration tree."""
+
+        relay_upstreams = self._gather_configured_relay_upstreams()
+        if relay_upstreams:
+            self.set('relay.server_pool', relay_upstreams)
+            self.set('relay.server_url', relay_upstreams[0])
+
+        self._normalise_relay_server_pool()
+
+    def _gather_configured_relay_upstreams(self) -> List[str]:
+        """Collect relay upstream URLs from supported environment variables."""
+
+        upstreams: List[str] = []
+
+        raw_pool = os.environ.get('TOKEN_PLACE_RELAY_UPSTREAMS', '').strip()
+        if raw_pool:
+            upstreams.extend(self._parse_relay_upstreams(raw_pool))
+
+        legacy_alias = self._normalise_url(os.environ.get('PERSONAL_GAMING_PC_URL', ''))
+        if legacy_alias:
+            upstreams.insert(0, legacy_alias)
+
+        deduped: List[str] = []
+        seen = set()
+        for url in upstreams:
+            if url and url not in seen:
+                seen.add(url)
+                deduped.append(url)
+
+        return deduped
+
+    def _parse_relay_upstreams(self, raw_value: str) -> List[str]:
+        """Parse comma- or JSON-delimited upstream specifications."""
+
+        candidates: List[str] = []
+
+        try:
+            loaded = json.loads(raw_value)
+        except json.JSONDecodeError:
+            normalised = raw_value.replace('\n', ',')
+            for entry in normalised.split(','):
+                normalised_url = self._normalise_url(entry)
+                if normalised_url:
+                    candidates.append(normalised_url)
+        else:
+            if isinstance(loaded, str):
+                normalised_url = self._normalise_url(loaded)
+                if normalised_url:
+                    candidates.append(normalised_url)
+            elif isinstance(loaded, (list, tuple)):
+                for item in loaded:
+                    if isinstance(item, str):
+                        normalised_url = self._normalise_url(item)
+                        if normalised_url:
+                            candidates.append(normalised_url)
+            else:
+                logger.warning(
+                    "Unsupported TOKEN_PLACE_RELAY_UPSTREAMS format: %s", type(loaded)
+                )
+
+        return candidates
+
+    @staticmethod
+    def _normalise_url(value: str) -> str:
+        """Normalise URL-like strings for consistent comparisons."""
+
+        if not value:
+            return ''
+        return value.strip().rstrip('/')
+
+    def _normalise_relay_server_pool(self) -> None:
+        """Ensure relay.server_url and relay.server_pool stay consistent."""
+
+        relay_config = self.config.setdefault('relay', {})
+        server_url = self._normalise_url(relay_config.get('server_url', ''))
+        pool = relay_config.get('server_pool') or []
+        pool = [self._normalise_url(entry) for entry in pool if self._normalise_url(entry)]
+
+        if server_url:
+            if not pool or pool[0] != server_url:
+                pool = [server_url] + [entry for entry in pool if entry != server_url]
+        elif pool:
+            server_url = pool[0]
+        else:
+            server_url = self._normalise_url(DEFAULT_CONFIG['relay']['server_url'])
+            pool = [server_url]
+
+        relay_config['server_url'] = server_url
+        relay_config['server_pool'] = pool
+        relay_config['server_pool_secondary'] = pool[1:]
 
     def get(self, key: str, default: Any = None) -> Any:
         """

@@ -161,7 +161,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] use best available llama family model that can run on an RTX 4090
 - [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
 - [x] set up production k3s raspberry pi pod running relay.py
-  - [ ] server.py stays on personal gaming PC
+  - [x] server.py stays on personal gaming PC
   - [x] potential cloud fallback node via Cloudflare
 - [ ] allow participation from other server.pys
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
@@ -382,6 +382,29 @@ For testing with mock LLM (faster startup):
 ```sh
 python server.py --use_mock_llm
 ```
+
+#### Configuring relay upstream server nodes
+
+token.place is bootstrapping its first community LLM cluster with volunteer-run
+`server.py` nodes. The pioneer machine still lives on futuroptimist's gaming PC,
+but the relay now accepts a list of upstream hosts so new contributors can join
+without code changes.
+
+When the Raspberry Pi relay cluster runs in production, set
+`TOKEN_PLACE_RELAY_UPSTREAMS` before launching `relay.py` to provide a
+comma-separated (or JSON array) list of volunteer nodes:
+
+```sh
+export TOKEN_PLACE_ENV=production
+export TOKEN_PLACE_RELAY_UPSTREAMS="https://gaming-pc.local:8000,https://your-node.example.com:8443"
+python relay.py
+```
+
+`Config` normalises these URLs, keeps the historical gaming PC entry as the
+default, and surfaces any secondary nodes from `/api/v1/relay/server-nodes` so
+relay operators can verify who is online. The legacy `PERSONAL_GAMING_PC_URL`
+variable still works; it is treated as shorthand for a single-entry upstream
+list.
 
 ### Using the Application
 

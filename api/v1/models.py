@@ -130,7 +130,10 @@ AVAILABLE_MODELS = [
         "parameters": "8B",
         "quantization": "Q4_K_M",
         "context_length": 8192,
-        "url": "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
+        "url": (
+            "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/"
+            "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+        ),
         "file_name": "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
         "adapters": [
             {
@@ -150,6 +153,7 @@ AVAILABLE_MODELS = [
         ],
     }
 ]
+
 
 # Dictionary mapping model IDs to loaded model instances
 _loaded_models = {}

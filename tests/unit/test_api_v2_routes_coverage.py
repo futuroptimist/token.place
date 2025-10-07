@@ -321,7 +321,8 @@ def test_chat_completion_standard_response(client, monkeypatch):
     monkeypatch.setattr(
         v2_routes,
         "generate_response",
-        lambda model_id, messages, **opts: messages + [{"role": "assistant", "content": "ok"}],
+        lambda model_id, messages, **_kwargs: messages
+        + [{"role": "assistant", "content": "ok"}],
     )
 
     payload = {
@@ -385,7 +386,8 @@ def test_chat_completion_encryption_failure_after_generation(client, monkeypatch
     monkeypatch.setattr(
         v2_routes,
         "generate_response",
-        lambda model_id, messages, **opts: messages + [{"role": "assistant", "content": "ok"}],
+        lambda model_id, messages, **_kwargs: messages
+        + [{"role": "assistant", "content": "ok"}],
     )
 
     payload = _base_encrypted_payload()
@@ -416,7 +418,7 @@ def test_chat_completion_model_error(client, monkeypatch):
 
 
 def test_chat_completion_top_level_validation_error(client, monkeypatch):
-    def _raise_validation_error(data, required):
+    def _raise_validation_error(data, _required):
         raise ValidationError("missing", field="model", code="missing_model")
 
     monkeypatch.setattr(v2_routes, "validate_required_fields", _raise_validation_error)

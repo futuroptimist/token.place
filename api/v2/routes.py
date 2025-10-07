@@ -18,7 +18,8 @@ from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
     CommunityDirectoryError,
 )
-from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
+from api.v1.models import generate_response, get_model_instance, ModelError
+from api.v2.models import get_models_info
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name

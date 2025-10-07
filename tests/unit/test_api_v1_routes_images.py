@@ -1,0 +1,74 @@
+import base64
+import pytest
+
+from relay import app
+
+
+@pytest.fixture
+def client():
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        yield client
+
+
+def test_image_generation_returns_png_payload(client):
+    payload = {
+        "prompt": "vibrant sunrise over the ocean",
+        "size": "64x64",
+        "seed": 42,
+    }
+    response = client.post("/api/v1/images/generations", json=payload)
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert "data" in data and isinstance(data["data"], list)
+    assert data["data"], "expected at least one image entry"
+
+    image_entry = data["data"][0]
+    assert image_entry["revised_prompt"] == payload["prompt"]
+
+    binary = base64.b64decode(image_entry["b64_json"], validate=True)
+    assert binary.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(binary) > 100
+
+
+def test_image_generation_requires_prompt(client):
+    response = client.post("/api/v1/images/generations", json={})
+    assert response.status_code == 400
+
+    error = response.get_json()["error"]
+    assert "prompt" in error["message"].lower()
+    assert error["type"] == "invalid_request_error"
+
+
+def test_image_generation_rejects_non_json_body(client):
+    response = client.post(
+        "/api/v1/images/generations",
+        data="prompt=hello",
+        content_type="application/x-www-form-urlencoded",
+    )
+
+    assert response.status_code == 400
+    error = response.get_json()["error"]
+    assert "invalid request body" in error["message"].lower()
+
+
+def test_image_generation_handles_generation_failures(client, monkeypatch):
+    from api.v1 import routes
+
+    def boom(*args, **kwargs):
+        from utils.vision.image_generator import ImageGenerationError
+
+        raise ImageGenerationError("kaboom")
+
+    monkeypatch.setattr(routes._image_generator, "generate", boom)
+
+    response = client.post(
+        "/api/v1/images/generations",
+        json={"prompt": "a dramatic failure"},
+    )
+
+    assert response.status_code == 500
+    error = response.get_json()["error"]
+    assert error["type"] == "image_generation_error"
+    assert "kaboom" in error["message"]

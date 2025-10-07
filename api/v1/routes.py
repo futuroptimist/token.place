@@ -25,13 +25,15 @@ from api.v1.community import (
 from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
-    validate_chat_messages, validate_encrypted_request, validate_model_name
+    validate_chat_messages, validate_encrypted_request, validate_model_name,
+    validate_image_generation_payload,
 )
 from config import get_config
 from utils.providers import (
     get_provider_directory as _get_registry_provider_directory,
     ProviderRegistryError,
 )
+from utils.vision import ImageGenerationError, LocalImageGenerator
 
 # Expose directory loaders for tests and backwards compatibility
 get_community_provider_directory = _get_community_provider_directory
@@ -80,6 +82,10 @@ def _configured_relay_servers() -> list[str]:
     config = get_config()
     servers = config.get('relay.server_pool', []) or []
     return list(servers)
+
+
+_image_generator = LocalImageGenerator()
+
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
     """Format an error response in a standardized way for the API"""
@@ -146,6 +152,62 @@ def list_models():
     except Exception as e:
         log_error("Error in list_models endpoint")
         return format_error_response(f"Internal server error: {str(e)}")
+
+
+@v1_bp.route('/images/generations', methods=['POST'])
+def create_image_generation():
+    """Generate an image locally using a deterministic placeholder renderer."""
+
+    log_info("API request: POST /images/generations")
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return format_error_response(
+            "Invalid request body: empty or not JSON",
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+
+    try:
+        normalized = validate_image_generation_payload(payload)
+    except ValidationError as exc:
+        return format_error_response(
+            exc.message,
+            param=exc.field,
+            code=exc.code,
+            status_code=400,
+        )
+
+    try:
+        encoded_image = _image_generator.generate(
+            normalized["prompt"],
+            width=normalized["width"],
+            height=normalized["height"],
+            seed=normalized.get("seed"),
+        )
+    except ImageGenerationError as exc:
+        log_error(f"Local image generation failed: {exc}")
+        return format_error_response(
+            f"Image generation failed: {exc}",
+            error_type="image_generation_error",
+            status_code=500,
+        )
+
+    response_payload = {
+        "created": int(time.time()),
+        "data": [
+            {
+                "b64_json": encoded_image,
+                "revised_prompt": normalized["prompt"],
+            }
+        ],
+        "size": f"{normalized['width']}x{normalized['height']}",
+    }
+
+    if normalized.get("seed") is not None:
+        response_payload["seed"] = normalized["seed"]
+
+    return jsonify(response_payload)
 
 @v1_bp.route('/models/<model_id>', methods=['GET'])
 def get_model(model_id):
@@ -845,6 +907,10 @@ def create_chat_completion_openai():
 @openai_v1_bp.route('/completions', methods=['POST'])
 def create_completion_openai():
     return create_completion()
+
+@openai_v1_bp.route('/images/generations', methods=['POST'])
+def create_image_generation_openai():
+    return create_image_generation()
 
 @openai_v1_bp.route('/health', methods=['GET'])
 def health_check_openai():

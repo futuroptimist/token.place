@@ -220,4 +220,3 @@ def test_leaderboard_endpoint_handles_model_feedback_error(
     assert response.status_code == 500
     payload = response.get_json()
     assert payload["error"]["message"] == "boom"
-

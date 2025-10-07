@@ -4,6 +4,7 @@ Input validation utilities for the token.place API
 
 import json
 import base64
+import re
 from typing import Dict, List, Union, Any, Optional, Tuple
 
 class ValidationError(Exception):
@@ -120,6 +121,88 @@ def validate_base64(data: Dict[str, Any], field: str) -> None:
             f"Invalid base64 encoding for {field}",
             field=field
         )
+
+
+_DIMENSION_RANGE: Tuple[int, int] = (32, 1024)
+_SIZE_PATTERN = re.compile(r"^(?P<width>\d{2,4})x(?P<height>\d{2,4})$")
+
+
+def _ensure_dimension(value: Any, field: str) -> int:
+    if not isinstance(value, int):
+        raise ValidationError(f"{field} must be an integer", field=field)
+
+    low, high = _DIMENSION_RANGE
+    if value < low or value > high:
+        raise ValidationError(
+            f"{field} must be between {low} and {high} pixels",
+            field=field,
+        )
+
+    return value
+
+
+def _parse_size_field(size_value: Any) -> Tuple[int, int]:
+    if not isinstance(size_value, str):
+        raise ValidationError("size must be a string formatted as WIDTHxHEIGHT", field="size")
+
+    match = _SIZE_PATTERN.match(size_value.strip().lower())
+    if not match:
+        raise ValidationError("size must follow the WIDTHxHEIGHT format", field="size")
+
+    width = int(match.group("width"))
+    height = int(match.group("height"))
+    width = _ensure_dimension(width, "size")
+    height = _ensure_dimension(height, "size")
+    return width, height
+
+
+def _derive_dimensions(payload: Dict[str, Any]) -> Tuple[int, int]:
+    if "size" in payload and payload["size"] is not None:
+        return _parse_size_field(payload["size"])
+
+    width = payload.get("width")
+    height = payload.get("height")
+
+    if width is None and height is None:
+        return 512, 512
+
+    if width is None:
+        raise ValidationError("Missing required parameter: width", field="width")
+    if height is None:
+        raise ValidationError("Missing required parameter: height", field="height")
+
+    width = _ensure_dimension(width, "width")
+    height = _ensure_dimension(height, "height")
+    return width, height
+
+
+def validate_image_generation_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and normalise payloads for the image generation endpoint."""
+
+    if not isinstance(data, dict):
+        raise ValidationError("Invalid request body: expected a JSON object")
+
+    validate_required_fields(data, ["prompt"])
+    validate_field_type(data, "prompt", str)
+
+    prompt = data.get("prompt", "")
+    prompt = prompt.strip()
+    if not prompt:
+        raise ValidationError("prompt must be a non-empty string", field="prompt")
+
+    validate_field_type(data, "seed", int, allow_none=True)
+    seed = data.get("seed")
+    if isinstance(seed, int) and seed < 0:
+        raise ValidationError("seed must be a non-negative integer", field="seed")
+
+    width, height = _derive_dimensions(data)
+
+    return {
+        "prompt": prompt,
+        "seed": seed,
+        "width": width,
+        "height": height,
+    }
 
 
 def validate_json_string(data: Dict[str, Any], field: str) -> None:

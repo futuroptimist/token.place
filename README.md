@@ -165,7 +165,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] potential cloud fallback node via Cloudflare
 - [ ] allow participation from other server.pys
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
-- [ ] API v2 with at least 10 models supported and available
+- [x] API v2 with at least 10 models supported and available
+  - [x] Catalogue exposes Llama 3, Mixtral, Phi-3, Mistral Nemo, and Qwen2.5 variants
   - [x] Dedicated Flask blueprint in `api/v2/routes.py`
   - [x] Streaming response support for faster UI feedback (`api/v2/routes.py`)
   - [x] Function/tool calling support via Machine Conversation Protocol (MCP) (`api/v2/routes.py`)
@@ -537,7 +538,8 @@ The token.place API is designed to be compatible with the OpenAI API format, mak
 API v2 extends the surface with adapter-aware metadata. Fine-tuned variants such as
 `llama-3-8b-instruct:alignment` inherit the base weights and automatically prepend their
 alignment charter as a system prompt. OpenAI SDKs can opt into domain-specific behaviour by
-selecting the derived model ID.
+selecting the derived model ID. The curated v2 catalogue, including deployment notes for
+RTX 4090-class hardware, is documented in [docs/api_v2_model_catalog.md](docs/api_v2_model_catalog.md).
 
 ### API Endpoints
 
@@ -552,6 +554,11 @@ GET /api/v1/models
 GET /v1/models
 ```
 Returns a list of available models.
+
+> **API v1 catalogue**: token.place intentionally restricts `/api/v1/models` to the
+> `llama-3-8b-instruct` base model and its safety-tuned
+> `llama-3-8b-instruct:alignment` adapter. The broader RTX 4090-ready line-up
+> lives behind `/api/v2/models`.
 
 #### Get Model
 ```

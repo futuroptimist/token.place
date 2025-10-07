@@ -58,7 +58,28 @@ For URLs and domains, always use the full form:
 
 ## Logo and Visual Elements
 
-[TBD: Add logo usage guidelines when a logo is created]
+### Logo usage guidelines
+
+`token.place` ships a minimalist logomark derived from the production favicon. The canonical
+vector source lives at `static/favicon.svg`, and a multi-resolution raster bundle is available as
+`static/icon.ico` for legacy platforms. Always source artwork directly from these files instead of
+re-exporting screenshots or compressed assets.
+
+- Maintain a clear space equal to the height of the "t" glyph on all sides. This spacing prevents
+  neighboring interface elements from crowding the logomark and keeps the glyph legible at small
+  sizes.
+- Preserve the original cyan-on-dark color pairing. If you must place the mark on a light surface,
+  invert it by rendering the glyph in `#00FFFF` atop a solid `#111111` circular backdrop sized to the
+  logomark's viewbox.
+- Do not apply drop shadows, gradients, or color shifts. The favicon's flat styling ensures the
+  brand remains crisp across Retina, OLED, and e-ink displays.
+- When a square avatar is required (for example, Slack workspaces or GitHub org icons), use the ICO
+  file directly so operating systems can pick the resolution that best matches the display density.
+
+### Animated usage
+
+Avoid animating the logo. Motion is reserved for contextual loading indicators inside the
+application UI to keep the brand calm and trustworthy.
 
 ## Color Scheme
 

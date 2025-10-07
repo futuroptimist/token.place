@@ -5,6 +5,7 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        exclude: ^k8s/charts/tokenplace-relay/templates/
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:

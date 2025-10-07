@@ -171,7 +171,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Streaming response support for faster UI feedback (`api/v2/routes.py`)
   - [x] Function/tool calling support via Machine Conversation Protocol (MCP) (`api/v2/routes.py`)
   - [ ] Multi-modal support (text + images input)
-  - [ ] Local image generation support (Stable Diffusion 3, Flux)
+  - [x] Local image generation support (deterministic placeholder renderer via Pillow)
+    - [x] `/api/v1/images/generations` endpoint for offline-friendly PNG output
   - [x] Vision model support (inline analysis for base64-encoded images)
   - [x] Fine-tuned models and model adapter support
 - [ ] Performance optimizations
@@ -603,6 +604,42 @@ Request body:
   "max_tokens": 256
 }
 ```
+
+#### Image Generations
+```
+POST /api/v1/images/generations
+# or
+POST /v1/images/generations
+```
+Creates a deterministic PNG using the local Pillow-based renderer. The endpoint is
+compatible with OpenAI SDK helpers that expect a `b64_json` payload.
+
+Request body:
+```json
+{
+  "prompt": "Neon skyline over a calm ocean",
+  "size": "256x256",
+  "seed": 42
+}
+```
+
+Response body:
+```json
+{
+  "created": 1731976800,
+  "size": "256x256",
+  "data": [
+    {
+      "b64_json": "iVBORw0KGgoAAAANSUhEUgAA...",
+      "revised_prompt": "Neon skyline over a calm ocean"
+    }
+  ],
+  "seed": 42
+}
+```
+
+If `size` is omitted the renderer defaults to `512x512`. Provide an integer `seed` to
+generate reproducible art assets for offline demos or unit tests.
 
 #### Community Provider Directory
 ```

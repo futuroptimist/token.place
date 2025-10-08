@@ -39,6 +39,10 @@ class ContributionSubmissionError(RuntimeError):
     """Raised when a community contribution submission is invalid."""
 
 
+class ContributionQueueError(RuntimeError):
+    """Raised when contribution queue data cannot be processed."""
+
+
 class ModelFeedbackError(RuntimeError):
     """Raised when community feedback data cannot be processed."""
 
@@ -111,6 +115,39 @@ def _contribution_queue_path() -> Path:
     if override:
         return Path(override)
     return DEFAULT_CONTRIBUTION_QUEUE_PATH
+
+
+def _load_contribution_queue() -> Tuple[Dict[str, Any], ...]:
+    """Load raw contribution submissions from the queue file."""
+
+    path = _contribution_queue_path()
+    if not path.exists():
+        return ()
+
+    entries: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_no, raw_line in enumerate(handle, 1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:  # pragma: no cover - defensive guard
+                    raise ContributionQueueError(
+                        f"Invalid JSON in contribution queue (line {line_no})"
+                    ) from exc
+
+                if not isinstance(payload, dict):
+                    raise ContributionQueueError(
+                        f"Queued contribution must be a JSON object (line {line_no})"
+                    )
+
+                entries.append(payload)
+    except OSError as exc:  # pragma: no cover - IO errors should surface clearly
+        raise ContributionQueueError("Unable to read contribution queue") from exc
+
+    return tuple(entries)
 
 
 def _model_feedback_path() -> Path:
@@ -386,3 +423,60 @@ def queue_contribution_submission(payload: Dict[str, Any]) -> Dict[str, Any]:
         handle.write(json.dumps(record) + "\n")
 
     return record
+
+
+def get_contribution_summary() -> Dict[str, Any]:
+    """Aggregate contribution submissions for maintainers."""
+
+    entries = list(_load_contribution_queue())
+    total_submissions = len(entries)
+
+    if not entries:
+        return {
+            "object": "community.contribution_summary",
+            "total_submissions": 0,
+            "regions": [],
+            "capability_counts": {},
+            "last_submission_at": None,
+        }
+
+    regions = sorted(
+        {
+            entry.get("region").strip()
+            for entry in entries
+            if isinstance(entry.get("region"), str) and entry.get("region").strip()
+        }
+    )
+
+    capability_counts: Dict[str, int] = {}
+    for entry in entries:
+        capabilities = entry.get("capabilities", [])
+        if not isinstance(capabilities, list):
+            continue
+        for capability in capabilities:
+            if not isinstance(capability, str) or not capability.strip():
+                continue
+            key = capability.strip()
+            capability_counts[key] = capability_counts.get(key, 0) + 1
+
+    sorted_capabilities = dict(
+        sorted(
+            capability_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    )
+
+    submission_times = [
+        entry.get("submitted_at")
+        for entry in entries
+        if isinstance(entry.get("submitted_at"), str) and entry.get("submitted_at").strip()
+    ]
+    last_submission_at = max(submission_times, default=None)
+
+    return {
+        "object": "community.contribution_summary",
+        "total_submissions": total_submissions,
+        "regions": regions,
+        "capability_counts": sorted_capabilities,
+        "last_submission_at": last_submission_at,
+    }

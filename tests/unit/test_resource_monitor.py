@@ -132,6 +132,30 @@ def test_collect_gpu_metrics_handles_count_errors(monkeypatch):
     fake_nvml.nvmlShutdown.assert_called_once()
 
 
+def test_collect_gpu_metrics_ignores_shutdown_errors(monkeypatch):
+    """NVML shutdown failures should not surface as test errors."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    shutdown_calls = 0
+
+    def boom_shutdown():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        raise RuntimeError("shutdown boom")
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=boom_shutdown,
+        nvmlDeviceGetCount=MagicMock(return_value=0),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm._collect_gpu_metrics() == rm._gpu_metrics_default()
+    assert shutdown_calls == 1
+
+
 def test_collect_gpu_metrics_marks_availability_when_sampling_fails(monkeypatch):
     """If NVML is present but sampling fails we still report availability."""
     from utils.system import resource_monitor as rm
@@ -259,6 +283,16 @@ def test_can_allocate_gpu_memory_defaults_to_true_without_nvml(monkeypatch):
     assert rm.can_allocate_gpu_memory(4_000_000_000) is True
 
 
+def test_can_allocate_gpu_memory_handles_non_numeric_requirements(monkeypatch):
+    """Non-numeric inputs should coerce to zero and allow allocation."""
+    from utils.system import resource_monitor as rm
+
+    sentinel = object()
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: sentinel, raising=False)
+
+    assert rm.can_allocate_gpu_memory("not-a-number") is True
+
+
 @pytest.mark.parametrize(
     'input_value, expected',
     [
@@ -323,3 +357,71 @@ def test_can_allocate_gpu_memory_allows_when_count_lookup_fails(monkeypatch):
 
     assert rm.can_allocate_gpu_memory(4_000_000_000) is True
     fake_nvml.nvmlShutdown.assert_called_once()
+
+
+def test_can_allocate_gpu_memory_allows_when_no_gpus_present(monkeypatch):
+    """Returning zero devices should allow allocation and still shutdown NVML."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(return_value=0),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000) is True
+    fake_nvml.nvmlShutdown.assert_called_once()
+
+
+def test_can_allocate_gpu_memory_skips_devices_with_errors(monkeypatch):
+    """Devices that raise during sampling should be ignored in the loop."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(return_value=2),
+        nvmlDeviceGetHandleByIndex=MagicMock(side_effect=[RuntimeError("bad"), 1]),
+        nvmlDeviceGetMemoryInfo=lambda handle: types.SimpleNamespace(
+            free=1_000_000_000.0,
+            total=2_000_000_000.0,
+        ),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000, headroom_percent=0.1) is False
+    fake_nvml.nvmlShutdown.assert_called_once()
+
+
+def test_can_allocate_gpu_memory_ignores_shutdown_errors(monkeypatch):
+    """Errors during NVML shutdown should be suppressed in the finally block."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    shutdown_calls = 0
+
+    def boom_shutdown():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        raise RuntimeError("shutdown boom")
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=boom_shutdown,
+        nvmlDeviceGetCount=MagicMock(return_value=1),
+        nvmlDeviceGetHandleByIndex=lambda idx: idx,
+        nvmlDeviceGetMemoryInfo=lambda handle: types.SimpleNamespace(
+            free=500_000_000.0,
+            total=1_000_000_000.0,
+        ),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000) is False
+    assert shutdown_calls == 1

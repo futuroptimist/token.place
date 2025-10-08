@@ -181,6 +181,45 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_ping_relay_uses_registration_token(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Registration tokens should be sent with sink requests when configured."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.server_registration_token': 'alpha-token',
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://localhost",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = TEST_NO_REQUEST_RESPONSE
+        mock_post.return_value = mock_response
+
+        result = client.ping_relay()
+
+        assert result == TEST_NO_REQUEST_RESPONSE
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_http_error(self, mock_post, relay_client):
         """Test ping to relay with HTTP error."""
         # Setup mock response
@@ -244,6 +283,61 @@ class TestRelayClient:
             'http://backup-relay:6000/sink',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
+
+    def test_cluster_only_uses_remote_targets_first(
+        self,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Cluster-only mode should skip the local relay host."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.additional_servers': ['https://cluster-relay:7443'],
+            'relay.cluster_only': True,
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://primary-relay",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        assert client.relay_urls == ('https://cluster-relay:7443',)
+        assert client.relay_url == 'https://cluster-relay:7443'
+
+    def test_cluster_only_without_targets_raises(
+        self,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Cluster-only mode should fail fast when no remote targets are configured."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.cluster_only': True,
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            with pytest.raises(ValueError):
+                RelayClient(
+                    base_url="http://primary-relay",
+                    port=5000,
+                    crypto_manager=mock_crypto_manager,
+                    model_manager=mock_model_manager,
+                )
 
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_request_exception(self, mock_post, relay_client):
@@ -380,6 +474,45 @@ class TestRelayClient:
             json=expected_payload,
             timeout=relay_client._request_timeout
         )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_uses_registration_token(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Registration tokens should be propagated to the source endpoint."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.server_registration_token': 'alpha-token',
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://localhost",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "OK"
+        mock_post.return_value = mock_response
+
+        result = client.process_client_request(TEST_VALID_RESPONSE.copy())
+
+        assert result is True
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
     @patch('utils.networking.relay_client.jsonschema.validate', side_effect=jsonschema.exceptions.ValidationError("bad"))
     @patch('utils.networking.relay_client.requests.post')

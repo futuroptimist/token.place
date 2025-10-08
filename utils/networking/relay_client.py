@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import requests
 import time
 import base64
@@ -43,6 +44,37 @@ RELAY_RESPONSE_SCHEMA = {
         "error": {"type": "string"}
     }
 }
+
+
+def _normalise_registration_token(value: Optional[str]) -> Optional[str]:
+    """Normalise optional registration tokens from config or environment."""
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _coerce_optional_bool(value: Optional[Any]) -> Optional[bool]:
+    """Interpret truthy values from config/environment settings."""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return None
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+
+    return None
 
 def _log(level: str, message: str, *args, exc_info: Optional[bool] = None) -> None:
     """Log a message if not in production; fallback to always logging on error"""
@@ -108,15 +140,61 @@ class RelayClient:
         self.crypto_manager = crypto_manager
         self.model_manager = model_manager
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
+        self._registration_token: Optional[str] = None
+        configured_servers: List[Any] = []
+        self._cluster_only = False
+
         try:
             config = get_config_lazy()
             self._request_timeout = config.get('relay.request_timeout', 10)
-            configured_servers = config.get('relay.additional_servers', []) or []
+
+            configured_servers = list(config.get('relay.additional_servers', []) or [])
+
+            pool_secondary = config.get('relay.server_pool_secondary', []) or []
+            for entry in pool_secondary:
+                if entry not in configured_servers:
+                    configured_servers.append(entry)
+
+            primary_config_url = config.get('relay.server_url', '')
+            if primary_config_url and primary_config_url not in configured_servers:
+                configured_servers.insert(0, primary_config_url)
+
+            cluster_only_value = config.get('relay.cluster_only', False)
+            parsed_cluster_only = _coerce_optional_bool(cluster_only_value)
+            if parsed_cluster_only is not None:
+                self._cluster_only = parsed_cluster_only
+            elif isinstance(cluster_only_value, bool):
+                self._cluster_only = cluster_only_value
+
+            token_value = config.get('relay.server_registration_token', None)
+            if not token_value:
+                token_value = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+            self._registration_token = _normalise_registration_token(token_value)
+
         except Exception:
             self._request_timeout = 10  # Fallback default
-            configured_servers = []
+            cluster_env = _coerce_optional_bool(os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY'))
+            self._cluster_only = cluster_env if cluster_env is not None else False
 
-        self._relay_urls = self._build_relay_targets(base_url, port, configured_servers)
+            upstreams_raw = os.environ.get('TOKEN_PLACE_RELAY_UPSTREAMS', '')
+            if upstreams_raw:
+                normalised = upstreams_raw.replace('\n', ',')
+                configured_servers.extend(
+                    entry.strip()
+                    for entry in normalised.split(',')
+                    if entry and entry.strip()
+                )
+
+            self._registration_token = _normalise_registration_token(
+                os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+            )
+
+        self._relay_urls = self._build_relay_targets(
+            base_url,
+            port,
+            configured_servers,
+            cluster_only=self._cluster_only,
+        )
         self._active_relay_index = 0
 
     @staticmethod
@@ -151,6 +229,8 @@ class RelayClient:
         primary_base: str,
         primary_port: int,
         additional: Union[List[Any], Tuple[Any, ...]],
+        *,
+        cluster_only: bool = False,
     ) -> List[str]:
         """Combine primary and additional relay endpoints into an ordered list."""
 
@@ -161,9 +241,14 @@ class RelayClient:
             if normalised and normalised not in targets:
                 targets.append(normalised)
 
-        _append(primary_base, primary_port)
+        additional_entries: Union[List[Any], Tuple[Any, ...]] = additional or []
 
-        for entry in additional or []:
+        if not cluster_only:
+            _append(primary_base, primary_port)
+        elif not additional_entries:
+            raise ValueError("Cluster-only mode requires at least one relay target")
+
+        for entry in additional_entries:
             if isinstance(entry, str):
                 _append(entry)
             elif isinstance(entry, dict):
@@ -188,6 +273,13 @@ class RelayClient:
         """Expose configured relay endpoints for diagnostics."""
 
         return tuple(self._relay_urls)
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Return authentication headers when a registration token is configured."""
+
+        if not self._registration_token:
+            return {}
+        return {"X-Relay-Server-Token": self._registration_token}
 
     def start(self):
         """Start the polling loop by setting stop_polling to False"""
@@ -224,10 +316,17 @@ class RelayClient:
                     self.crypto_manager.public_key_b64[:10],
                 )
 
+                request_kwargs = {
+                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'timeout': self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs['headers'] = headers
+
                 response = requests.post(
                     f'{candidate_url}/sink',
-                    json={'server_public_key': self.crypto_manager.public_key_b64},
-                    timeout=self._request_timeout,
+                    **request_kwargs,
                 )
 
                 if response.status_code != 200:
@@ -350,10 +449,17 @@ class RelayClient:
 
             # Send the response to the relay
             try:
+                request_kwargs = {
+                    'json': source_payload,
+                    'timeout': self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs['headers'] = headers
+
                 source_response = requests.post(
                     f'{self.relay_url}/source',
-                    json=source_payload,
-                    timeout=self._request_timeout
+                    **request_kwargs
                 )
 
                 log_info(

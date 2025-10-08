@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
         'server_pool_secondary': [],
         'workers': 2,
         'additional_servers': [],
+        'server_registration_token': None,
+        'cluster_only': False,
     },
 
     # API settings
@@ -239,6 +241,21 @@ class Config:
             self.set('relay.server_pool', relay_upstreams)
             self.set('relay.server_url', relay_upstreams[0])
 
+        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+        if token:
+            self.set('relay.server_registration_token', token.strip())
+
+        cluster_only_env = os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY')
+        if cluster_only_env is not None:
+            parsed_cluster_only = self._parse_bool(cluster_only_env)
+            if parsed_cluster_only is not None:
+                self.set('relay.cluster_only', parsed_cluster_only)
+            elif cluster_only_env.strip():
+                logger.warning(
+                    "Invalid TOKEN_PLACE_RELAY_CLUSTER_ONLY value: %s",
+                    cluster_only_env,
+                )
+
         self._normalise_relay_server_pool()
 
     def _gather_configured_relay_upstreams(self) -> List[str]:
@@ -301,6 +318,24 @@ class Config:
         if not value:
             return ''
         return value.strip().rstrip('/')
+
+    @staticmethod
+    def _parse_bool(value: Optional[str]) -> Optional[bool]:
+        """Parse boolean-like environment overrides."""
+
+        if value is None:
+            return None
+
+        lowered = str(value).strip().lower()
+        if not lowered:
+            return None
+
+        if lowered in {'1', 'true', 'yes', 'on'}:
+            return True
+        if lowered in {'0', 'false', 'no', 'off'}:
+            return False
+
+        return None
 
     def _normalise_relay_server_pool(self) -> None:
         """Ensure relay.server_url and relay.server_pool stay consistent."""

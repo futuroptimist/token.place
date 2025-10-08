@@ -83,3 +83,44 @@ def test_build_vision_summary_no_entries_returns_none(monkeypatch):
     monkeypatch.setattr(models, "analyze_base64_image", lambda _: {"format": "png"})
     messages = [{"content": [{"type": "input_text", "text": "hello"}]}]
     assert models._build_vision_summary(messages) is None
+
+
+def test_generate_response_normalises_text_blocks(monkeypatch):
+    """Structured text content should collapse to strings before inference."""
+
+    captured = {}
+
+    class _DummyModel:
+        def create_chat_completion(self, messages, **_):
+            captured["messages"] = messages
+            assert messages[0]["content"] == "First segment\n\nSecond segment"
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Acknowledged.",
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(models, "USE_MOCK_LLM", False)
+    monkeypatch.setattr(models, "_build_vision_summary", lambda *_: None)
+    monkeypatch.setattr(models, "get_model_instance", lambda _model_id: _DummyModel())
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "First segment"},
+                {"type": "text", "text": "Second segment"},
+            ],
+        }
+    ]
+
+    result = models.generate_response("llama-3-8b-instruct", messages)
+
+    assert captured["messages"][0]["content"] == "First segment\n\nSecond segment"
+    assert result[-1]["role"] == "assistant"
+    assert result[-1]["content"] == "Acknowledged."

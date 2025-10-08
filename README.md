@@ -174,7 +174,9 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Dedicated Flask blueprint in `api/v2/routes.py`
   - [x] Streaming response support for faster UI feedback (`api/v2/routes.py`)
   - [x] Function/tool calling support via Machine Conversation Protocol (MCP) (`api/v2/routes.py`)
-  - [ ] Multi-modal support (text + images input)
+  - [x] Multi-modal support (text + images input)
+    - [x] Structured chat content is flattened for llama.cpp compatibility while inline images
+      continue to receive automatic analysis summaries.
   - [x] Local image generation support (deterministic placeholder renderer via Pillow)
     - [x] `/api/v1/images/generations` endpoint for offline-friendly PNG output
   - [x] Vision model support (inline analysis for base64-encoded images)

@@ -98,6 +98,40 @@ def test_collect_gpu_metrics_handles_initialisation_errors(monkeypatch):
     fake_nvml.nvmlShutdown.assert_not_called()
 
 
+def test_collect_gpu_metrics_handles_zero_device_counts(monkeypatch):
+    """A zero GPU count should still trigger NVML shutdown and defaults."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(return_value=0),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm._collect_gpu_metrics() == rm._gpu_metrics_default()
+    fake_nvml.nvmlShutdown.assert_called_once()
+
+
+def test_collect_gpu_metrics_handles_count_errors(monkeypatch):
+    """Errors when retrieving the GPU count should be swallowed."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(side_effect=RuntimeError("count fail")),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm._collect_gpu_metrics() == rm._gpu_metrics_default()
+    fake_nvml.nvmlShutdown.assert_called_once()
+
+
 def test_collect_gpu_metrics_marks_availability_when_sampling_fails(monkeypatch):
     """If NVML is present but sampling fails we still report availability."""
     from utils.system import resource_monitor as rm
@@ -272,3 +306,20 @@ def test_can_allocate_gpu_memory_handles_nvml_init_errors(monkeypatch):
 
     assert rm.can_allocate_gpu_memory(4_000_000_000) is True
     assert shutdown_called is True
+
+
+def test_can_allocate_gpu_memory_allows_when_count_lookup_fails(monkeypatch):
+    """GPU allocation should allow if NVML cannot report the device count."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(side_effect=RuntimeError("no count")),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000) is True
+    fake_nvml.nvmlShutdown.assert_called_once()

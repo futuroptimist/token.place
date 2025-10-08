@@ -339,6 +339,35 @@ class TestRelayClient:
                     model_manager=mock_model_manager,
                 )
 
+    def test_cluster_only_rejects_localhost_primary_configuration(
+        self,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Cluster-only mode should not silently accept localhost from config defaults."""
+
+        config_values = {
+            'relay.request_timeout': 20,
+            'relay.cluster_only': True,
+            'relay.server_url': 'http://localhost:5000',
+            'relay.additional_servers': [],
+            'relay.server_pool_secondary': [],
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            with pytest.raises(ValueError, match='At least one relay target must be provided'):
+                RelayClient(
+                    base_url="http://localhost",
+                    port=5000,
+                    crypto_manager=mock_crypto_manager,
+                    model_manager=mock_model_manager,
+                )
+
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_request_exception(self, mock_post, relay_client):
         """Test ping to relay with request exception."""

@@ -238,7 +238,11 @@ class RelayClient:
 
         def _append(url: str, port: Optional[int] = None) -> None:
             normalised = cls._compose_relay_url(url, port)
-            if normalised and normalised not in targets:
+            if not normalised:
+                return
+            if cluster_only and cls._is_local_url(normalised):
+                return
+            if normalised not in targets:
                 targets.append(normalised)
 
         additional_entries: Union[List[Any], Tuple[Any, ...]] = additional or []
@@ -261,6 +265,27 @@ class RelayClient:
             raise ValueError("At least one relay target must be provided")
 
         return targets
+
+    @staticmethod
+    def _is_local_url(url: str) -> bool:
+        """Determine whether the given URL resolves to a localhost target."""
+
+        parsed = urlparse(url if '://' in url else f'http://{url}')
+        hostname = (parsed.hostname or '').strip().lower()
+
+        if not hostname:
+            return True
+
+        if hostname in {'localhost', '::1', '::'}:
+            return True
+
+        if hostname.startswith('127.'):
+            return True
+
+        if hostname in {'0.0.0.0', '[::]'}:
+            return True
+
+        return False
 
     @property
     def relay_url(self) -> str:

@@ -18,6 +18,10 @@ def test_extract_base64_payload_variants():
     payload = models._extract_base64_payload(block)
     assert payload == {"encoded": "aaa", "skipped_remote": False}
 
+    block = {"type": "image", "image": {"base64": "bbb"}}
+    payload = models._extract_base64_payload(block)
+    assert payload == {"encoded": "bbb", "skipped_remote": False}
+
     block = {"type": "image_url", "image_url": {"url": _png_data_uri()}}
     payload = models._extract_base64_payload(block)
     assert payload["encoded"].startswith("data:image/png;base64,")
@@ -25,6 +29,36 @@ def test_extract_base64_payload_variants():
     block = {"type": "image_url", "image_url": "https://example.com/image.png"}
     payload = models._extract_base64_payload(block)
     assert payload == {"encoded": None, "skipped_remote": True}
+
+
+def test_stringify_content_blocks_variants():
+    inline_uri = "   DATA:image/jpeg;base64,ZmFrZQ=="
+    content = [
+        {"type": "input_text", "text": "  First segment  "},
+        {"type": "text", "text": "Second segment"},
+        {"type": "image_url", "image_url": {"url": inline_uri}},
+        {"type": "image_url", "image_url": "https://example.com/remote.png"},
+        {"type": "input_image", "image": {"b64_json": "ZmFrZQ=="}},
+        {"type": "image"},
+        "ignored",
+    ]
+
+    result = models._stringify_content_blocks(content)
+    assert result == (
+        "First segment\n\n"
+        "Second segment\n\n"
+        "[Inline image attached]\n\n"
+        "[Image: https://example.com/remote.png]\n\n"
+        "[Inline image attached]\n\n"
+        "[Inline image attached]"
+    )
+
+
+def test_stringify_content_blocks_falls_back_gracefully():
+    assert models._stringify_content_blocks("plain text") == "plain text"
+    assert models._stringify_content_blocks(None) is None
+    assert models._stringify_content_blocks({"unexpected": "structure"}) == {"unexpected": "structure"}
+    assert models._stringify_content_blocks([{"type": "unknown"}]) == ""
 
 
 def test_build_vision_summary_happy_path(monkeypatch):
@@ -83,6 +117,21 @@ def test_build_vision_summary_no_entries_returns_none(monkeypatch):
     monkeypatch.setattr(models, "analyze_base64_image", lambda _: {"format": "png"})
     messages = [{"content": [{"type": "input_text", "text": "hello"}]}]
     assert models._build_vision_summary(messages) is None
+
+
+def test_normalise_chat_messages_in_place():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": " hi "}]},
+        {"role": "assistant", "content": "ready"},
+        "raw-string-entry",
+    ]
+
+    result = models._normalise_chat_messages(messages)
+
+    assert result is messages
+    assert messages[0]["content"] == "hi"
+    assert messages[1]["content"] == "ready"
+    assert messages[2] == "raw-string-entry"
 
 
 def test_generate_response_normalises_text_blocks(monkeypatch):

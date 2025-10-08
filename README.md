@@ -188,10 +188,11 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [x] Signed relay binaries for client verification
 - [x] Optional content moderation hooks
 - [ ] External security review of protocol and code
-- [ ] Community features
+- [x] Community features
   - [x] Server provider directory/registry
   - [x] Model leaderboard based on community feedback
   - [x] Contribution system for donating compute resources
+  - [x] Contribution summary endpoint for maintainers
 
 ## installation
 
@@ -749,6 +750,25 @@ Response body:
 ```
 
 For deployments that need to relocate the queue file, set `TOKEN_PLACE_CONTRIBUTION_QUEUE` to an absolute path. The server will create the file if it does not exist and append one JSON document per line.
+
+#### Community Contribution Summary
+```
+GET /api/v1/community/contributions/summary
+```
+Summarises queued community contributions so maintainers can understand incoming capacity at a glance.
+Returns the total number of submissions, a sorted list of participating regions, the occurrence count for each advertised capability, and the timestamp of the most recent submission.
+
+Example response:
+
+```json
+{
+  "object": "community.contribution_summary",
+  "total_submissions": 2,
+  "regions": ["eu-central", "us-west"],
+  "capability_counts": {"gpu": 2, "openai-compatible": 1},
+  "last_submission_at": "2025-01-15T09:30:00Z"
+}
+```
 
 ### End-to-End Encryption
 

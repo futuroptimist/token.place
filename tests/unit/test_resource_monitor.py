@@ -223,3 +223,52 @@ def test_can_allocate_gpu_memory_defaults_to_true_without_nvml(monkeypatch):
     monkeypatch.setattr(rm, "_import_pynvml", lambda: None, raising=False)
 
     assert rm.can_allocate_gpu_memory(4_000_000_000) is True
+
+
+@pytest.mark.parametrize(
+    'input_value, expected',
+    [
+        (0.1, 1.1),
+        ('25', 1.25),
+        (-5, 1.0),
+        ('not-a-number', 1.0),
+    ],
+)
+def test_gpu_headroom_multiplier_normalizes_inputs(input_value, expected):
+    """The headroom helper should coerce to floats and clamp values sensibly."""
+    from utils.system import resource_monitor as rm
+
+    assert rm._gpu_headroom_multiplier(input_value) == pytest.approx(expected)
+
+
+def test_can_allocate_gpu_memory_returns_true_for_non_positive_requirements(monkeypatch):
+    """Zero or negative requirements should trivially pass the headroom guard."""
+    from utils.system import resource_monitor as rm
+
+    sentinel = object()
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: sentinel, raising=False)
+
+    assert rm.can_allocate_gpu_memory(0) is True
+    assert rm.can_allocate_gpu_memory(-1024) is True
+
+
+def test_can_allocate_gpu_memory_handles_nvml_init_errors(monkeypatch):
+    """Initialisation failures should fall back to allowing allocation."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    shutdown_called = False
+
+    def fake_shutdown():
+        nonlocal shutdown_called
+        shutdown_called = True
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(side_effect=RuntimeError("init boom")),
+        nvmlShutdown=fake_shutdown,
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000) is True
+    assert shutdown_called is True

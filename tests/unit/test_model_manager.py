@@ -208,7 +208,7 @@ class TestModelManager:
     @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)
     @patch('utils.llm.model_manager.os.path.exists', return_value=True)
     @patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=False)
-    @patch('llama_cpp.Llama')
+    @patch('llama_cpp.Llama', create=True)
     def test_get_llm_instance_falls_back_to_cpu_on_low_gpu_memory(
         self,
         mock_llama,
@@ -233,7 +233,7 @@ class TestModelManager:
     @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)
     @patch('utils.llm.model_manager.os.path.exists', return_value=True)
     @patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=True)
-    @patch('llama_cpp.Llama')
+    @patch('llama_cpp.Llama', create=True)
     def test_get_llm_instance_uses_gpu_when_headroom_available(
         self,
         mock_llama,
@@ -253,6 +253,23 @@ class TestModelManager:
         kwargs = mock_llama.call_args.kwargs
         assert kwargs['n_gpu_layers'] == -1
         mock_can_allocate.assert_called_once_with(4_000_000_000, headroom_percent=0.1)
+
+    def test_get_llm_instance_skips_headroom_when_size_unknown(self, model_manager):
+        """If the model size cannot be determined we skip the headroom check."""
+
+        instance = MagicMock()
+
+        with patch('llama_cpp.Llama', return_value=instance, create=True) as mock_llama, \
+             patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory') as mock_can_allocate, \
+             patch('utils.llm.model_manager.os.path.exists', return_value=True), \
+             patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')):
+
+            result = model_manager.get_llm_instance()
+
+        assert result is instance
+        mock_can_allocate.assert_not_called()
+        kwargs = mock_llama.call_args.kwargs
+        assert kwargs['n_gpu_layers'] == -1
 
     def test_get_llm_instance_mock_mode(self, model_manager):
         """Test get_llm_instance in mock mode."""

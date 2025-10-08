@@ -184,7 +184,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [ ] GPU memory optimizations for running multiple models
   - [ ] Batched inference for relay servers with multiple connected clients
 - [ ] Advanced security features
-  - [ ] Client authentication for relay servers
+  - [ ] Zero-trust relay challenge/response hardening
   - [x] Rate limiting and quota enforcement 💯
 - [x] Enhanced encryption options for model weights and inference data
   - [x] Optional AES-GCM mode with associated data for protecting weights and inference payloads
@@ -410,6 +410,18 @@ default, and surfaces any secondary nodes from `/api/v1/relay/server-nodes` so
 relay operators can verify who is online. The legacy `PERSONAL_GAMING_PC_URL`
 variable still works; it is treated as shorthand for a single-entry upstream
 list.
+
+#### Zero-trust relay verification
+
+`token.place` maintains its zero-authentication promise: relays never demand
+shared secrets from clients. Instead, we focus on zero-trust techniques to
+detect and respond to misbehaving participants. Relay operators can rotate
+their signing keys, require fresh public keys from servers, and layer
+challenge/response flows (for example, asking clients to prove possession of
+their RSA private keys before enqueuing work) without exposing identity-based
+credentials. These primitives keep the network open while still empowering
+operators to quarantine suspicious activity using cryptography rather than
+passwords.
 
 Once that upstream list is stable, export `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1`
 before launching `server.py`. The background `RelayClient` will refuse to talk

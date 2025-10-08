@@ -181,7 +181,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Fine-tuned models and model adapter support
 - [ ] Performance optimizations
   - [x] Token streaming between client/server for faster responses
-  - [ ] GPU memory optimizations for running multiple models
+  - [x] GPU memory guardrails for multi-model hosting (auto CPU fallback when VRAM is tight)
   - [ ] Batched inference for relay servers with multiple connected clients
 - [ ] Advanced security features
   - [ ] Zero-trust relay challenge/response hardening

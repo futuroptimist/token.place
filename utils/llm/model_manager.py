@@ -11,6 +11,8 @@ from threading import Lock
 from unittest.mock import MagicMock
 from typing import Dict, List, Any, Optional, Union, Tuple
 
+from utils.system import resource_monitor
+
 # Configure logging
 logger = logging.getLogger('model_manager')
 
@@ -42,6 +44,9 @@ class ModelManager:
 
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
+        self.default_n_gpu_layers = config.get('model.n_gpu_layers', -1)
+        self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
+        self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
 
     def _log(self, level: int, message: str, **kwargs) -> None:
         """Log a message when not in production."""
@@ -201,10 +206,27 @@ class ModelManager:
                             # Dynamically import Llama only when needed
                             from llama_cpp import Llama
 
+                            n_gpu_layers = self.default_n_gpu_layers
+                            if self.enforce_gpu_headroom and n_gpu_layers != 0:
+                                try:
+                                    model_size = os.path.getsize(self.model_path)
+                                except OSError:
+                                    model_size = None
+                                if model_size:
+                                    if not resource_monitor.can_allocate_gpu_memory(
+                                        model_size,
+                                        headroom_percent=self.gpu_headroom_percent,
+                                    ):
+                                        self.log_warning(
+                                            "Insufficient GPU memory headroom detected; falling back "
+                                            "to CPU inference for this model."
+                                        )
+                                        n_gpu_layers = 0
+
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
                             self.llm = Llama(
                                 model_path=self.model_path,
-                                n_gpu_layers=-1,
+                                n_gpu_layers=n_gpu_layers,
                                 n_ctx=self.config.get('model.context_size', 8192),
                                 chat_format=self.config.get('model.chat_format', 'llama-3')
                             )

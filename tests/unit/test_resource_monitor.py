@@ -170,3 +170,56 @@ def test_collect_resource_usage_linux_keeps_lazy_interval(monkeypatch):
     assert recorded['interval'] is None
     assert usage['cpu_percent'] == pytest.approx(27.0)
     assert usage['memory_percent'] == pytest.approx(55.0)
+
+
+def test_can_allocate_gpu_memory_returns_true_with_sufficient_headroom(monkeypatch):
+    """The helper returns True when any GPU has enough free memory."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(return_value=2),
+        nvmlDeviceGetHandleByIndex=lambda idx: idx,
+        nvmlDeviceGetMemoryInfo=lambda handle: types.SimpleNamespace(
+            total=8_000_000_000.0,
+            free=6_000_000_000.0 if handle == 0 else 500_000_000.0,
+        ),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000, headroom_percent=0.1) is True
+    fake_nvml.nvmlShutdown.assert_called_once()
+
+
+def test_can_allocate_gpu_memory_returns_false_when_all_gpus_full(monkeypatch):
+    """When no GPU meets the requirement the helper reports False."""
+    from utils.system import resource_monitor as rm
+    import types
+
+    fake_nvml = types.SimpleNamespace(
+        nvmlInit=MagicMock(),
+        nvmlShutdown=MagicMock(),
+        nvmlDeviceGetCount=MagicMock(return_value=1),
+        nvmlDeviceGetHandleByIndex=lambda idx: idx,
+        nvmlDeviceGetMemoryInfo=lambda handle: types.SimpleNamespace(
+            total=8_000_000_000.0,
+            free=1_000_000_000.0,
+        ),
+    )
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: fake_nvml, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000, headroom_percent=0.2) is False
+    fake_nvml.nvmlShutdown.assert_called_once()
+
+
+def test_can_allocate_gpu_memory_defaults_to_true_without_nvml(monkeypatch):
+    """CPU-only hosts should not be blocked by the GPU guard."""
+    from utils.system import resource_monitor as rm
+
+    monkeypatch.setattr(rm, "_import_pynvml", lambda: None, raising=False)
+
+    assert rm.can_allocate_gpu_memory(4_000_000_000) is True

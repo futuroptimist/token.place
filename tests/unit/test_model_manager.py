@@ -56,6 +56,9 @@ class TestModelManager:
             'model.temperature': 0.7,  # Match the actual value used in the code
             'model.top_p': 0.9,        # Match the actual value used in the code
             'model.stop_tokens': [],
+            'model.n_gpu_layers': -1,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
         }
         return config_values.get(key, default)
 
@@ -201,6 +204,55 @@ class TestModelManager:
             'https://example.com/model.gguf',
             1
         )
+
+    @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)
+    @patch('utils.llm.model_manager.os.path.exists', return_value=True)
+    @patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=False)
+    @patch('llama_cpp.Llama')
+    def test_get_llm_instance_falls_back_to_cpu_on_low_gpu_memory(
+        self,
+        mock_llama,
+        mock_can_allocate,
+        mock_exists,
+        _mock_getsize,
+        model_manager,
+    ):
+        """When GPU headroom is insufficient the model should load on CPU."""
+
+        instance = MagicMock()
+        mock_llama.return_value = instance
+
+        result = model_manager.get_llm_instance()
+
+        assert result is instance
+        mock_llama.assert_called_once()
+        kwargs = mock_llama.call_args.kwargs
+        assert kwargs['n_gpu_layers'] == 0
+        mock_can_allocate.assert_called_once()
+
+    @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)
+    @patch('utils.llm.model_manager.os.path.exists', return_value=True)
+    @patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=True)
+    @patch('llama_cpp.Llama')
+    def test_get_llm_instance_uses_gpu_when_headroom_available(
+        self,
+        mock_llama,
+        mock_can_allocate,
+        mock_exists,
+        _mock_getsize,
+        model_manager,
+    ):
+        """When memory is available the model continues to use the GPU."""
+
+        instance = MagicMock()
+        mock_llama.return_value = instance
+
+        result = model_manager.get_llm_instance()
+
+        assert result is instance
+        kwargs = mock_llama.call_args.kwargs
+        assert kwargs['n_gpu_layers'] == -1
+        mock_can_allocate.assert_called_once_with(4_000_000_000, headroom_percent=0.1)
 
     def test_get_llm_instance_mock_mode(self, model_manager):
         """Test get_llm_instance in mock mode."""

@@ -235,6 +235,12 @@ warnings when workloads spike, enabling operators to diagnose performance regres
 attaching external profilers. When NVIDIA hardware and the `pynvml` runtime are present, the
 response now reports aggregate GPU usage so operators can confirm hardware acceleration is active.
 
+In addition to reporting utilisation, the Llama loader now checks for available GPU memory
+headroom before placing all layers on the GPU. When free VRAM is scarce—such as when multiple
+quantised models compete for the same card—token.place automatically falls back to CPU execution
+instead of triggering an out-of-memory crash. Operators can tune the guardrail via
+`model.gpu_memory_headroom_percent` in the configuration.
+
 On Windows and macOS hosts these metrics now benefit from a non-blocking CPU sampling strategy that
 avoids the initial all-zero readings returned by `psutil`. Linux retains the lazy sampling mode to
 minimise overhead while still reporting accurate utilisation.

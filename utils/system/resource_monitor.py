@@ -5,6 +5,18 @@ import importlib
 import sys
 from typing import Dict
 
+
+def _gpu_headroom_multiplier(headroom_percent: float) -> float:
+    """Return the multiplier applied to required memory for headroom calculations."""
+
+    try:
+        percent = float(headroom_percent)
+    except Exception:
+        percent = 0.0
+    if percent < 0.0:
+        percent = 0.0
+    return 1.0 + (percent / 100.0 if percent > 1.0 else percent)
+
 import psutil
 
 
@@ -85,6 +97,57 @@ def _collect_gpu_metrics() -> GpuMetrics:
             'gpu_utilization_percent': max(0.0, min(100.0, avg_gpu_util)),
             'gpu_memory_percent': max(0.0, min(100.0, memory_percent)),
         }
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def can_allocate_gpu_memory(required_bytes: float, *, headroom_percent: float = 0.1) -> bool:
+    """Return ``True`` when at least one GPU has sufficient free memory."""
+
+    try:
+        requirement = float(required_bytes)
+    except Exception:
+        requirement = 0.0
+
+    if requirement <= 0.0:
+        return True
+
+    multiplier = _gpu_headroom_multiplier(headroom_percent)
+    adjusted_requirement = requirement * multiplier
+
+    pynvml = _import_pynvml()
+    if pynvml is None:
+        return True
+
+    try:
+        try:
+            pynvml.nvmlInit()
+        except Exception:
+            return True
+
+        try:
+            count = int(pynvml.nvmlDeviceGetCount())
+        except Exception:
+            return True
+
+        if count <= 0:
+            return True
+
+        for index in range(count):
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+                memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                free_bytes = float(getattr(memory_info, 'free', 0.0))
+            except Exception:
+                continue
+
+            if free_bytes >= adjusted_requirement:
+                return True
+
+        return False
     finally:
         try:
             pynvml.nvmlShutdown()

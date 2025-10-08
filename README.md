@@ -141,7 +141,10 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Multi-relay failover via `relay.additional_servers` configuration (server auto-rotates backups)
   - [x] personal gaming PC
   - [x] raspi k3s pod 💯
-  - [ ] once k3s pod is stable, run relay.py only on the cluster
+  - [x] once k3s pod is stable, run relay.py only on the cluster
+    - `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1` (or `relay.cluster_only` in `config.json`) disables the
+      localhost fallback and requires at least one upstream from `relay.additional_servers` or
+      the normalised `relay.server_pool`.
   - [ ] optional cloud fallback via Cloudflare
 - [x] OpenAI-compatible API with end-to-end encryption
   - [x] Models listing endpoint
@@ -163,7 +166,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [x] set up production k3s raspberry pi pod running relay.py
   - [x] server.py stays on personal gaming PC
   - [x] potential cloud fallback node via Cloudflare
-- [ ] allow participation from other server.pys
+- [x] allow participation from other server.pys
+  - [x] Relay enforces invitation tokens so community-run `server.py` nodes can authenticate `/sink` and `/source`
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
 - [x] API v2 with at least 10 models supported and available
   - [x] Catalogue exposes Llama 3, Mixtral, Phi-3, Mistral Nemo, and Qwen2.5 variants
@@ -406,6 +410,13 @@ default, and surfaces any secondary nodes from `/api/v1/relay/server-nodes` so
 relay operators can verify who is online. The legacy `PERSONAL_GAMING_PC_URL`
 variable still works; it is treated as shorthand for a single-entry upstream
 list.
+
+Once that upstream list is stable, export `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1`
+before launching `server.py`. The background `RelayClient` will refuse to talk
+to `localhost` and instead require at least one upstream derived from
+`TOKEN_PLACE_RELAY_UPSTREAMS`, `relay.additional_servers`, or the
+`relay.server_pool` values surfaced by `config`. This keeps production traffic
+pinned to the k3s pod rather than silently falling back to the gaming PC.
 
 ### Using the Application
 
@@ -750,6 +761,16 @@ Response body:
 ```
 
 For deployments that need to relocate the queue file, set `TOKEN_PLACE_CONTRIBUTION_QUEUE` to an absolute path. The server will create the file if it does not exist and append one JSON document per line.
+
+#### Authorising community-operated servers
+
+Once an operator is ready to host `server.py`, generate an invitation token and expose it to the relay by
+setting `TOKEN_PLACE_RELAY_SERVER_TOKENS` (comma or newline delimited) before launching `relay.py`.
+Each joined node must supply the matching token via the `TOKEN_PLACE_RELAY_SERVER_TOKEN` environment
+variable, which the relay client automatically forwards to the `/sink` and `/source` endpoints as the
+`X-Relay-Server-Token` header. Requests without a valid token are rejected, preventing uninvited nodes
+from queueing or retrieving encrypted workloads while still keeping the workflow simple for approved
+operators.
 
 #### Community Contribution Summary
 ```

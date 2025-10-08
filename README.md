@@ -183,8 +183,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Token streaming between client/server for faster responses
   - [ ] GPU memory optimizations for running multiple models
   - [ ] Batched inference for relay servers with multiple connected clients
-- [ ] Advanced security features
-  - [ ] Zero-trust relay challenge/response hardening
+- [x] Advanced security features
+  - [x] Zero-trust relay challenge/response hardening
   - [x] Rate limiting and quota enforcement 💯
 - [x] Enhanced encryption options for model weights and inference data
   - [x] Optional AES-GCM mode with associated data for protecting weights and inference payloads
@@ -413,15 +413,27 @@ list.
 
 #### Zero-trust relay verification
 
-`token.place` maintains its zero-authentication promise: relays never demand
-shared secrets from clients. Instead, we focus on zero-trust techniques to
-detect and respond to misbehaving participants. Relay operators can rotate
-their signing keys, require fresh public keys from servers, and layer
-challenge/response flows (for example, asking clients to prove possession of
-their RSA private keys before enqueuing work) without exposing identity-based
-credentials. These primitives keep the network open while still empowering
-operators to quarantine suspicious activity using cryptography rather than
-passwords.
+`token.place` now ships with an opt-in challenge/response layer for compute
+nodes. Set `TOKEN_PLACE_RELAY_SERVER_TOKEN` (or
+`relay.server_registration_token` in `config.json`) before launching the relay
+and every `/sink` or `/source` call must include an `X-Relay-Server-Token`
+header that matches the configured value. Requests missing the header are
+rejected with an HTTP 401 so unknown machines can no longer impersonate
+trusted servers.
+
+The bundled `RelayClient` automatically reads the same configuration and sends
+the header, so volunteer operators only need to export the token once:
+
+```sh
+export TOKEN_PLACE_RELAY_SERVER_TOKEN="rotate-me-often"
+python relay.py --host 0.0.0.0
+# on the compute node
+python server.py --relay_url http://relay.example.com --relay_port 5010
+```
+
+Clients remain zero-auth: they never see or transmit the relay token. This
+keeps the network open for end users while letting operators quarantine
+suspicious server nodes using cryptography instead of static passwords.
 
 Once that upstream list is stable, export `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1`
 before launching `server.py`. The background `RelayClient` will refuse to talk

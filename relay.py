@@ -24,6 +24,50 @@ if args.use_mock_llm or os.environ.get("USE_MOCK_LLM") == "1":
     print("Running with USE_MOCK_LLM=1 (mock mode enabled)")
 
 from api import init_app
+from config import get_config
+
+
+def _load_server_registration_token():
+    """Return the configured relay server token, if any."""
+
+    token = None
+    try:
+        token = get_config().get('relay.server_registration_token')
+    except Exception:
+        token = None
+
+    if not token:
+        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+
+    if isinstance(token, str):
+        token = token.strip()
+        if not token:
+            return None
+
+    return token
+
+
+SERVER_REGISTRATION_TOKEN = _load_server_registration_token()
+
+
+def _validate_server_registration():
+    """Ensure relay compute nodes present the expected token when configured."""
+
+    if not SERVER_REGISTRATION_TOKEN:
+        return None
+
+    provided = request.headers.get('X-Relay-Server-Token', '')
+    candidate = provided.strip()
+    if candidate and secrets.compare_digest(candidate, SERVER_REGISTRATION_TOKEN):
+        return None
+
+    return jsonify({
+        'error': {
+            'message': 'Missing or invalid relay server token',
+            'code': 401,
+        }
+    }), 401
+
 
 app = Flask(__name__)
 
@@ -155,6 +199,10 @@ def sink():
             Conforms to the same JSON format as the request body.
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
     data = request.get_json()
     public_key = data.get('server_public_key', None)
 
@@ -192,6 +240,10 @@ def source():
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
     data = request.get_json()
     if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({'error': 'Invalid request data'}), 400

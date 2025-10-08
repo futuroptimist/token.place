@@ -116,6 +116,69 @@ def _build_vision_summary(messages: Sequence[Dict[str, Any]]) -> Optional[str]:
 
     return None
 
+
+def _stringify_content_blocks(content: Any) -> Any:
+    """Normalise structured OpenAI message content into newline-delimited text."""
+
+    if isinstance(content, str) or content is None:
+        return content
+
+    if not isinstance(content, list):
+        return content
+
+    segments: List[str] = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+
+        block_type = block.get("type")
+        if block_type in {"input_text", "text"}:
+            text_value = block.get("text")
+            if isinstance(text_value, str) and text_value.strip():
+                segments.append(text_value.strip())
+            continue
+
+        if block_type == "image_url":
+            image_url = block.get("image_url")
+            if isinstance(image_url, dict):
+                url_value = image_url.get("url")
+            else:
+                url_value = image_url
+
+            if isinstance(url_value, str) and url_value.strip():
+                if url_value.lstrip().lower().startswith("data:"):
+                    segments.append("[Inline image attached]")
+                else:
+                    segments.append(f"[Image: {url_value.strip()}]")
+            continue
+
+        if block_type in {"input_image", "image"}:
+            segments.append("[Inline image attached]")
+
+    if not segments:
+        return ""
+
+    return "\n\n".join(segments)
+
+
+def _normalise_chat_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse list-based content blocks in-place for llama.cpp compatibility."""
+
+    normalised: List[Dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            normalised.append(message)
+            continue
+
+        updated = dict(message)
+        updated["content"] = _stringify_content_blocks(message.get("content"))
+        normalised.append(updated)
+
+    messages[:] = normalised
+    return messages
+
 # Check if we're using mock LLM
 USE_MOCK_LLM = os.environ.get('USE_MOCK_LLM', '0') == '1'
 if ENVIRONMENT != 'prod':
@@ -346,6 +409,9 @@ def generate_response(model_id, messages, **options):
             elapsed = time.time() - start_time
             logger.info(f"Response generated in {elapsed:.2f}s (vision analysis)")
             return messages
+
+        # Collapse multi-part text blocks so llama.cpp receives plain strings.
+        messages = _normalise_chat_messages(messages)
 
         # Get the model instance (or mock)
         model = get_model_instance(model_id)

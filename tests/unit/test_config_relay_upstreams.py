@@ -163,3 +163,36 @@ def test_normalise_reorders_pool_to_match_primary(monkeypatch: pytest.MonkeyPatc
     assert config.get("relay.server_pool_secondary") == [
         "https://secondary.example.net",
     ]
+
+
+def test_cluster_only_env_true_and_registration_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boolean cluster-only overrides and registration tokens are applied."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_CLUSTER_ONLY", "TrUE")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", "  secret-token  ")
+
+    from config import Config
+
+    config = Config()
+
+    assert config.get("relay.cluster_only") is True
+    assert config.get("relay.server_registration_token") == "secret-token"
+
+
+def test_cluster_only_env_invalid_logs_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid cluster-only overrides are ignored with a warning."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_CLUSTER_ONLY", "sometimes")
+
+    from config import Config
+
+    with caplog.at_level("WARNING"):
+        config = Config()
+
+    assert "Invalid TOKEN_PLACE_RELAY_CLUSTER_ONLY value" in caplog.text
+    assert config.get("relay.cluster_only") is False

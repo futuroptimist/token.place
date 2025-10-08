@@ -18,8 +18,10 @@ from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
     CommunityDirectoryError,
     ContributionSubmissionError,
+    ContributionQueueError,
     ModelFeedbackError,
     get_model_leaderboard,
+    get_contribution_summary,
     queue_contribution_submission,
 )
 from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
@@ -414,6 +416,24 @@ def submit_community_contribution():
     )
     response.status_code = 202
     return response
+
+
+@v1_bp.route('/community/contributions/summary', methods=['GET'])
+def community_contribution_summary():
+    """Summarise queued contribution offers for maintainers."""
+
+    try:
+        log_info("API request: GET /community/contributions/summary")
+        summary = get_contribution_summary()
+    except ContributionQueueError:
+        log_error("Failed to load contribution summary", exc_info=True)
+        return format_error_response(
+            "Unable to summarise contribution queue",
+            error_type="internal_server_error",
+            status_code=500,
+        )
+
+    return jsonify(summary)
 
 
 @v1_bp.route('/server-providers', methods=['GET'])

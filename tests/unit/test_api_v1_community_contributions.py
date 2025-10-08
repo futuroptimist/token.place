@@ -186,3 +186,79 @@ def test_submit_contribution_rejects_non_object_payload(client):
         response.get_json()["error"]["message"]
         == "Request body must be a JSON object"
     )
+
+
+def test_contribution_summary_reports_queue_statistics(client):
+    """Summaries should aggregate queued submissions for maintainers."""
+
+    first_payload = {
+        "operator_name": "Compute Collective",
+        "region": "us-west",
+        "availability": "weekends",
+        "capabilities": ["openai-compatible", "gpu"],
+        "contact": {"email": "ops@example.org"},
+    }
+    second_payload = {
+        "operator_name": "European Node",
+        "region": "eu-central",
+        "availability": "weekday evenings",
+        "capabilities": ["gpu"],
+        "contact": {"matrix": "@ops:example.org"},
+    }
+
+    first_response = client.post(
+        "/api/v1/community/contributions", json=first_payload
+    )
+    second_response = client.post(
+        "/api/v1/community/contributions", json=second_payload
+    )
+
+    assert first_response.status_code == 202
+    assert second_response.status_code == 202
+
+    summary_response = client.get(
+        "/api/v1/community/contributions/summary"
+    )
+
+    assert summary_response.status_code == 200
+    payload = summary_response.get_json()
+    assert payload["object"] == "community.contribution_summary"
+    assert payload["total_submissions"] == 2
+    assert payload["regions"] == ["eu-central", "us-west"]
+    assert payload["capability_counts"] == {"gpu": 2, "openai-compatible": 1}
+    assert payload["last_submission_at"].endswith("Z")
+
+
+def test_contribution_summary_handles_empty_queue(client):
+    """Empty queues should return zeroed summary data."""
+
+    summary_response = client.get(
+        "/api/v1/community/contributions/summary"
+    )
+
+    assert summary_response.status_code == 200
+    payload = summary_response.get_json()
+    assert payload == {
+        "object": "community.contribution_summary",
+        "total_submissions": 0,
+        "regions": [],
+        "capability_counts": {},
+        "last_submission_at": None,
+    }
+
+
+def test_contribution_summary_reports_queue_errors(client, tmp_path: Path, monkeypatch):
+    """Invalid queue files should surface as internal errors."""
+
+    queue_path = tmp_path / "queue.jsonl"
+    queue_path.write_text("not json\n", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_PLACE_CONTRIBUTION_QUEUE", str(queue_path))
+
+    summary_response = client.get(
+        "/api/v1/community/contributions/summary"
+    )
+
+    assert summary_response.status_code == 500
+    assert summary_response.get_json()["error"]["message"] == (
+        "Unable to summarise contribution queue"
+    )

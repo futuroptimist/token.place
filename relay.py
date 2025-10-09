@@ -206,6 +206,16 @@ def sink():
     data = request.get_json()
     public_key = data.get('server_public_key', None)
 
+    raw_batch_size = data.get('max_batch_size') if isinstance(data, dict) else None
+    max_batch_size = 1
+    if raw_batch_size is not None:
+        try:
+            max_batch_size = int(raw_batch_size)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Invalid max_batch_size'}), 400
+        if max_batch_size < 1:
+            return jsonify({'error': 'Invalid max_batch_size'}), 400
+
     if public_key is None:
         return jsonify({'error': 'Invalid public key'}), 400
 
@@ -224,14 +234,22 @@ def sink():
     }
 
     # Check if there are any client requests for this server
-    if public_key in client_inference_requests and client_inference_requests[public_key]:
-        request_data = client_inference_requests[public_key].pop(0)
+    queued_requests = client_inference_requests.get(public_key, [])
+    if queued_requests:
+        batch = []
+        while queued_requests and len(batch) < max_batch_size:
+            batch.append(queued_requests.pop(0))
+
+        first_request = batch[0]
         response_data.update({
-            'client_public_key': request_data['client_public_key'],
-            'chat_history': request_data['chat_history'],
-            'cipherkey': request_data['cipherkey'],
-            'iv': request_data.get('iv', ''),
+            'client_public_key': first_request['client_public_key'],
+            'chat_history': first_request['chat_history'],
+            'cipherkey': first_request['cipherkey'],
+            'iv': first_request.get('iv', ''),
         })
+
+        if max_batch_size > 1:
+            response_data['batch'] = batch
 
     return jsonify(response_data)
 

@@ -81,6 +81,8 @@ python -m pytest --cov=. --cov-report=term-missing
   to ensure CPU/memory metrics degrade gracefully when `psutil` raises errors.
 - ✅ Added unit tests for `api.security.ensure_operator_access` to cover whitespace-tolerant
   operator tokens and Bearer authorization fallbacks.
+- ✅ Added focused coverage for `utils.vision.image_analysis` to exercise whitespace-tolerant
+  base64 decoding and defensive dimension parsing across PNG, GIF, and JPEG helpers.
 
 ## ✅ 8. Snapshot Testing (IMPLEMENTED)
 

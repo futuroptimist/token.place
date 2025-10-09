@@ -6,6 +6,7 @@ import binascii
 import json
 import logging
 import re
+from functools import lru_cache
 from time import perf_counter
 from typing import Dict, Tuple, Any, Optional, Union, List
 
@@ -15,6 +16,14 @@ from utils.performance import get_encryption_monitor
 
 # Configure logging
 logger = logging.getLogger('crypto_manager')
+
+
+@lru_cache(maxsize=256)
+def _decode_client_public_key(cleaned_key: str) -> bytes:
+    """Decode a base64 public key string with whitespace removed."""
+
+    return base64.b64decode(cleaned_key, validate=True)
+
 
 def get_config_lazy():
     """Lazy import of config to avoid circular imports"""
@@ -133,9 +142,7 @@ class CryptoManager:
                 else:
                     try:
                         cleaned_key = re.sub(r"\s+", "", client_public_key)
-                        client_public_key = base64.b64decode(
-                            cleaned_key, validate=True
-                        )
+                        client_public_key = _decode_client_public_key(cleaned_key)
                     except (binascii.Error, ValueError) as e:
                         raise ValueError(
                             "Invalid base64-encoded public key"

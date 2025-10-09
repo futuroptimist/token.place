@@ -35,15 +35,27 @@ else:
 
 logger = logging.getLogger(__name__)
 
+MIN_RSA_KEY_SIZE = 2048
+
 def generate_keys() -> Tuple[bytes, bytes]:
     """
     Generate RSA keys for encryption and decryption.
     Returns private_key_pem, public_key_pem
     """
+    try:
+        key_size = int(RSA_KEY_SIZE)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("RSA_KEY_SIZE must be an integer number of bits") from exc
+
+    if key_size < MIN_RSA_KEY_SIZE:
+        raise ValueError("RSA_KEY_SIZE must be at least {min_bits} bits for secure operation".format(min_bits=MIN_RSA_KEY_SIZE))
+    if key_size % 256 != 0:
+        raise ValueError("RSA_KEY_SIZE must be a multiple of 256 bits")
+
     # Generate private key
     private_key = rsa.generate_private_key(
         public_exponent=65537,
-        key_size=RSA_KEY_SIZE,
+        key_size=key_size,
         backend=default_backend()
     )
 

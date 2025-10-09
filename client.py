@@ -23,7 +23,7 @@ base_url = "http://token.place" if environment == "prod" else "http://localhost"
 # You can override this with the API_BASE_URL environment variable.
 # If running locally with default port 5070:
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:5070/api/v1")
-# Optionally provide a comma separated list of fallback URLs (e.g. Cloudflare Worker endpoints).
+# Optionally provide a comma separated list of fallback URLs (e.g. additional community relays).
 API_FALLBACK_URLS = [
     url.strip()
     for url in os.getenv("API_FALLBACK_URLS", "").split(",")

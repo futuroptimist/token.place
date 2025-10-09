@@ -56,10 +56,6 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | CONTENT_MODERATION_BLOCKLIST | (defaults)  | Comma-separated phrases added to the default safety blocklist         |
 | CONTENT_MODERATION_INCLUDE_DEFAULTS | 1            | Set to `0` to skip the built-in phrases when filtering requests        |
 | PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
-| API_FALLBACK_URLS | (empty)   | Comma-separated Cloudflare or other relay fallbacks tried in order |
-
-Set `API_FALLBACK_URLS=https://relay.cloudflare.workers.dev/api/v1` to let the bundled clients
-retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable.
 
 The development requirements live in [requirements.txt](requirements.txt).
 
@@ -145,7 +141,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
     - `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1` (or `relay.cluster_only` in `config.json`) disables the
       localhost fallback and requires at least one upstream from `relay.additional_servers` or
       the normalised `relay.server_pool`.
-  - [ ] optional cloud fallback via Cloudflare
+  - [ ] high-availability purely via community-operated relay nodes (no cloud fallbacks)
 - [x] OpenAI-compatible API with end-to-end encryption
   - [x] Models listing endpoint
   - [x] Chat completions endpoint
@@ -165,7 +161,6 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
 - [x] set up production k3s raspberry pi pod running relay.py
   - [x] server.py stays on personal gaming PC
-  - [x] potential cloud fallback node via Cloudflare
 - [x] allow participation from other server.pys
   - [x] Relay enforces invitation tokens so community-run `server.py` nodes can authenticate `/sink` and `/source`
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
@@ -410,6 +405,13 @@ default, and surfaces any secondary nodes from `/api/v1/relay/server-nodes` so
 relay operators can verify who is online. The legacy `PERSONAL_GAMING_PC_URL`
 variable still works; it is treated as shorthand for a single-entry upstream
 list.
+
+Instead of leaning on cloud fallbacks, we prioritise redundant consumer-run
+relays. Populate `relay.additional_servers`, `relay.server_pool`, or
+`TOKEN_PLACE_RELAY_UPSTREAMS` with community-operated nodes to keep traffic on
+donated hardware. Cloudflare remains in the stack solely as a tunnel provider
+so relays hosted on residential connections can be reached securely without
+exposing raw IPs.
 
 #### Zero-trust relay verification
 

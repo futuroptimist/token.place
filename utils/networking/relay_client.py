@@ -159,6 +159,7 @@ class RelayClient:
             if primary_config_url and primary_config_url not in configured_servers:
                 configured_servers.insert(0, primary_config_url)
 
+
             cluster_only_value = config.get('relay.cluster_only', False)
             parsed_cluster_only = _coerce_optional_bool(cluster_only_value)
             if parsed_cluster_only is not None:
@@ -184,6 +185,7 @@ class RelayClient:
                     for entry in normalised.split(',')
                     if entry and entry.strip()
                 )
+
 
             self._registration_token = _normalise_registration_token(
                 os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')

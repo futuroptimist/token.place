@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import imghdr
+import re
 import struct
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 BytesLike = Union[bytes, bytearray, memoryview]
 AnalysisRecord = Dict[str, Optional[Union[str, int]]]
+
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _strip_data_url(encoded: str) -> str:
@@ -23,9 +27,13 @@ def _strip_data_url(encoded: str) -> str:
 def _decode_base64_image(encoded: str) -> bytes:
     """Decode base64 content, validating the alphabet."""
     normalized = _strip_data_url(encoded)
+    normalized = _WHITESPACE_RE.sub("", normalized)
     if not normalized:
         raise ValueError("Image payload is empty")
-    return base64.b64decode(normalized, validate=True)
+    try:
+        return base64.b64decode(normalized, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Image payload is not valid base64") from exc
 
 
 def _extract_png_dimensions(data: BytesLike) -> Optional[Tuple[int, int]]:

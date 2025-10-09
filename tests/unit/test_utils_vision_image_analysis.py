@@ -51,15 +51,38 @@ def test_png_and_gif_dimension_extractors():
     gif_bytes = _make_gif(3, 4)
     assert ia._extract_gif_dimensions(gif_bytes) == (3, 4)
 
+    # Invalid headers or truncated payloads should yield graceful fallbacks
+    assert ia._extract_png_dimensions(b"not a png") is None
+    assert ia._extract_gif_dimensions(b"GIF00") is None
+
 
 def test_jpeg_dimension_extractor():
     jpeg_bytes = _make_jpeg(5, 6)
     assert ia._extract_jpeg_dimensions(jpeg_bytes) == (5, 6)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xff\xd8",  # Too short to contain a marker segment
+        b"\xff\xd8\xff\xd8\x00\x00",  # Additional SOI marker should be skipped
+        b"\xff\xd8\xff\xe0\x00",  # Marker without a declared length should abort
+        b"\xff\xd8\xff\xe0\x00\x01",  # Declared length shorter than header
+        b"\xff\xd8\xff\xc0\x00\x05abcde",  # SOF marker with insufficient payload
+    ],
+)
+def test_jpeg_dimension_extractor_handles_incomplete_segments(payload):
+    """Malformed JPEG streams should return ``None`` instead of raising."""
+
+    assert ia._extract_jpeg_dimensions(payload) is None
+
+
 def test_derive_dimensions_handles_unknown_types():
     assert ia._derive_dimensions(None, b"data") == (None, None)
     assert ia._derive_dimensions("bmp", b"data") == (None, None)
+
+    # Known extractor returning no dimensions should propagate the fallback
+    assert ia._derive_dimensions("png", b"truncated") == (None, None)
 
 
 def test_analyze_base64_image_orientation_variants(monkeypatch):
@@ -73,6 +96,10 @@ def test_analyze_base64_image_orientation_variants(monkeypatch):
     png_square = base64.b64encode(_make_png(3, 3)).decode()
     analysis = ia.analyze_base64_image(png_square)
     assert analysis["orientation"] == "square"
+
+    png_portrait = base64.b64encode(_make_png(2, 5)).decode()
+    analysis = ia.analyze_base64_image(png_portrait)
+    assert analysis["orientation"] == "portrait"
 
     # Force an unknown type to exercise the graceful fallback path
     monkeypatch.setattr(ia.imghdr, "what", lambda *_a, **_k: None)
@@ -93,6 +120,20 @@ def test_analyze_base64_image_accepts_uppercase_data_scheme():
     assert analysis["format"] == "png"
     assert analysis["width"] == 2
     assert analysis["height"] == 1
+
+
+def test_analyze_base64_image_handles_embedded_whitespace():
+    """Base64 payloads with incidental whitespace should still decode."""
+
+    payload = base64.b64encode(_make_png(4, 3)).decode()
+    # Insert whitespace and newlines in the payload to mimic wrapped base64 output
+    wrapped = f"{payload[:6]}\n  {payload[6:12]}\t{payload[12:]}  "
+
+    analysis = ia.analyze_base64_image(wrapped)
+
+    assert analysis["format"] == "png"
+    assert analysis["width"] == 4
+    assert analysis["height"] == 3
 
 
 def test_summarize_analysis_variants():

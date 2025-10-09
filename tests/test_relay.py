@@ -111,6 +111,44 @@ def test_sink_invalid_payload(client):
     assert 'error' in data
     assert data['error'] == 'Invalid public key'
 
+
+def test_sink_returns_batch_when_requested(client):
+    """Servers can opt into batched work retrieval via max_batch_size."""
+    sink_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    response = client.post("/sink", json=sink_payload)
+    assert response.status_code == 200
+
+    for idx in range(3):
+        faucet_payload = {
+            "client_public_key": base64.b64encode(f"client_{idx}".encode()).decode(),
+            "server_public_key": DUMMY_SERVER_PUB_KEY,
+            "chat_history": f"encrypted_payload_{idx}",
+            "cipherkey": f"cipher_{idx}",
+            "iv": f"iv_{idx}",
+        }
+        faucet_response = client.post("/faucet", json=faucet_payload)
+        assert faucet_response.status_code == 200
+
+    batch_response = client.post(
+        "/sink",
+        json={"server_public_key": DUMMY_SERVER_PUB_KEY, "max_batch_size": 2},
+    )
+    assert batch_response.status_code == 200
+    batch_data = batch_response.get_json()
+
+    assert 'batch' in batch_data
+    assert isinstance(batch_data['batch'], list)
+    assert len(batch_data['batch']) == 2
+
+    first_request, second_request = batch_data['batch']
+    assert first_request['chat_history'] == "encrypted_payload_0"
+    assert first_request['client_public_key'] == batch_data['client_public_key']
+    assert second_request['chat_history'] == "encrypted_payload_1"
+
+    remaining_queue = client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
+    assert len(remaining_queue) == 1
+    assert remaining_queue[0]['chat_history'] == "encrypted_payload_2"
+
 # --- Test /faucet ---
 
 def test_faucet_submit_request(client):

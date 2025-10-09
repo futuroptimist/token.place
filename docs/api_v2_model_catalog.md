@@ -7,7 +7,7 @@ the headroom check.
 
 | Model ID | Notes on deployability | Reference |
 | --- | --- | --- |
-| `llama-3-8b-instruct` | Q4_K_M GGUF is ~4.92 GB, well under the 24 GB VRAM budget. | `Meta-Llama-3-8B-Instruct-Q4_K_M.gguf` entry.【9f6427†L1-L2】 |
+| `llama-3-8b-instruct` | Q4_K_M GGUF is ~4.92 GB, well under the 24 GB VRAM budget. | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` entry.【9f6427†L1-L2】 |
 | `gpt-oss-20b` | Official model card notes the 20B MoE variant runs within 16 GB. | `unsloth/gpt-oss-20b-GGUF` README.【6d129f†L1-L2】 |
 | `mistral-7b-instruct` | Recommended Q4_K_M build consumes ~6.87 GB of RAM when fully offloaded. | TheBloke GGUF table.【445fd2†L1-L2】 |
 | `mixtral-8x7b-instruct` | Q3_K_M mixtral file is ~20.36 GB with a 22.86 GB RAM requirement, fitting a 24 GB card. | TheBloke GGUF table.【6569fa†L1-L2】 |
@@ -23,6 +23,6 @@ These measurements stay within RTX 4090 limits while covering general chat, codi
 and compact helper workloads. Future additions should update this file with the
 supporting citation before advertising new models.
 
-The safety-tuned adapter `llama-3-8b-instruct:alignment` reuses the same quantised
-artifact as the base `llama-3-8b-instruct` entry, so no additional GPU budget is
-required beyond the 4.9 GB captured in the table.
+The safety-tuned adapter `llama-3-8b-instruct:alignment` reuses the same
+Meta Llama 3.1 quantised artifact as the base `llama-3-8b-instruct` entry, so no
+additional GPU budget is required beyond the 4.9 GB captured in the table.

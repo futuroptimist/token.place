@@ -30,8 +30,16 @@ class ModelManager:
         self.config = config
 
         # Llama model configuration
-        self.file_name = config.get('model.filename', 'llama-3-8b-instruct.Q4_K_M.gguf')
-        self.url = config.get('model.url', 'https://huggingface.co/TheBloke/Llama-3-8B-Instruct-GGUF/resolve/main/llama-3-8b-instruct.Q4_K_M.gguf')
+        self.file_name = config.get(
+            'model.filename', 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+        )
+        self.url = config.get(
+            'model.url',
+            (
+                'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
+                'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+            ),
+        )
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
         # Network timeout for model downloads (seconds)
         self.download_timeout = config.get('model.download_timeout', 30)

@@ -188,26 +188,29 @@ if ENVIRONMENT != 'prod':
 AVAILABLE_MODELS = [
     {
         "id": "llama-3-8b-instruct",
-        "name": "Meta Llama 3 8B Instruct",
-        "description": "Llama 3 8B Instruct model from Meta AI",
+        "name": "Meta Llama 3.1 8B Instruct",
+        "description": (
+            "Meta's July 2024 refresh of the 8B instruction-tuned model using the "
+            "Q4_K_M quantisation that comfortably fits within a 24 GB RTX 4090."
+        ),
         "parameters": "8B",
         "quantization": "Q4_K_M",
         "context_length": 8192,
         "url": (
-            "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/"
-            "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+            "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
+            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
         ),
-        "file_name": "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
+        "file_name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
         "adapters": [
             {
                 "id": "llama-3-8b-instruct:alignment",
-                "name": "Meta Llama 3 8B Alignment Assistant",
+                "name": "Meta Llama 3.1 8B Alignment Assistant",
                 "description": (
                     "Alignment-tuned variant emphasising helpful, honest, and harmless replies "
                     "using constitutional guardrails."
                 ),
                 "instructions": (
-                    "You are the alignment-focused variant of Meta Llama 3 8B. Follow the "
+                    "You are the alignment-focused variant of Meta Llama 3.1 8B. Follow the "
                     "provided safety charter to remain helpful, honest, harmless, and to call "
                     "out uncertain answers."
                 ),

@@ -185,7 +185,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Token streaming between client/server for faster responses
   - [x] GPU memory guardrails for multi-model hosting (auto CPU fallback when VRAM is tight)
   - [x] Cached decoded client public keys to avoid repeated base64 work during encryption
-  - [ ] Batched inference for relay servers with multiple connected clients
+  - [x] Batched inference for relay servers with multiple connected clients
 - [x] Advanced security features
   - [x] Zero-trust relay challenge/response hardening
   - [x] Rate limiting and quota enforcement 💯
@@ -456,6 +456,14 @@ You can test things out using the simple command-line client, `client.py`:
 ```sh
 python client.py
 ```
+
+#### Relay batching
+
+Operators running `server.py` can include a `max_batch_size` integer in their `/sink` polls to
+retrieve multiple pending jobs at once. The relay removes up to that many queued faucet requests,
+returns the first item via the legacy `client_public_key`/`chat_history` fields, and exposes the full
+batch under a `batch` array for upgraded workers. Leaving `max_batch_size` unset preserves the
+single-request behavior.
 
 Type your message when prompted and press Enter. All of this is now happening on your local hardware, thanks to `llama-cpp-python`, a binding for llama.cpp.
 

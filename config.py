@@ -80,8 +80,11 @@ DEFAULT_CONFIG = {
         'temperature': 0.7,
         'max_tokens': 1000,
         'use_mock': False,
-        'filename': 'llama-3-8b-instruct.Q4_K_M.gguf',
-        'url': 'https://huggingface.co/TheBloke/Llama-3-8B-Instruct-GGUF/resolve/main/llama-3-8b-instruct.Q4_K_M.gguf',
+        'filename': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
+        'url': (
+            'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
+            'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
+        ),
         'context_size': 8192,
         'chat_format': 'llama-3',
         'download_chunk_size_mb': 10,

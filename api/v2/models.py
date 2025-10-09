@@ -9,29 +9,29 @@ from typing import Any, Dict, Iterable, List
 AVAILABLE_MODELS: List[Dict[str, Any]] = [
     {
         "id": "llama-3-8b-instruct",
-        "name": "Meta Llama 3 8B Instruct",
+        "name": "Meta Llama 3.1 8B Instruct",
         "description": (
-            "Meta's 8B instruction-tuned release with Q4_K_M quantisation; the artifact "
-            "is roughly 4.9 GB, making it straightforward to deploy on a 24 GB GPU."
+            "Meta's refreshed 8B instruction-tuned release with Q4_K_M quantisation; the "
+            "artifact is roughly 4.9 GB and stays well within a 24 GB RTX 4090 budget."
         ),
         "parameters": "8B",
         "quantization": "Q4_K_M",
         "context_length": 8192,
         "url": (
-            "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/"
-            "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+            "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
+            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
         ),
-        "file_name": "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
+        "file_name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
         "adapters": [
             {
                 "id": "llama-3-8b-instruct:alignment",
-                "name": "Meta Llama 3 8B Alignment Assistant",
+                "name": "Meta Llama 3.1 8B Alignment Assistant",
                 "description": (
                     "Alignment-focused profile that layers a safety charter on the base "
                     "model while reusing the same 4.9 GB quantised weights."
                 ),
                 "instructions": (
-                    "You are the alignment-focused variant of Meta Llama 3 8B. Follow the "
+                    "You are the alignment-focused variant of Meta Llama 3.1 8B. Follow the "
                     "provided safety charter to remain helpful, honest, harmless, and to call "
                     "out uncertain answers."
                 ),

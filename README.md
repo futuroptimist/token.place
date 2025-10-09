@@ -161,7 +161,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] CI caching for faster dependency installs
 - [x] API v1 with at least 1 model supported and available
 - [x] landing page chat UI integrated with API v1
-- [ ] use best available llama family model that can run on an RTX 4090
+- [x] use best available llama family model that can run on an RTX 4090
 - [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
 - [x] set up production k3s raspberry pi pod running relay.py
   - [x] server.py stays on personal gaming PC
@@ -627,7 +627,7 @@ GET /v1/models
 Returns a list of available models.
 
 > **API v1 catalogue**: token.place intentionally restricts `/api/v1/models` to the
-> `llama-3-8b-instruct` base model and its safety-tuned
+> `llama-3-8b-instruct` base model (backed by the Meta Llama 3.1 8B Q4_K_M weights) and its safety-tuned
 > `llama-3-8b-instruct:alignment` adapter. The broader RTX 4090-ready line-up
 > lives behind `/api/v2/models`.
 

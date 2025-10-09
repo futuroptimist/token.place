@@ -15,9 +15,9 @@ from typing import Dict, Any, List
 
 # Model information for testing
 MODEL_INFO = {
-    "name": "llama-3-8b-instruct.Q4_K_M.gguf",
+    "name": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
     "size_mb": 4800,
-    "expected_checksum": "abc123def456"
+    "expected_checksum": "placeholder-checksum"
 }
 
 # Check if we should run with the mock LLM to avoid downloading large models

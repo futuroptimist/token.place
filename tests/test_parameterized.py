@@ -16,11 +16,13 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
+import encrypt as encrypt_module
+
 # Add the project root to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import the modules to test
-from encrypt import encrypt, decrypt, generate_keys
+from encrypt import encrypt, decrypt, generate_keys, MIN_RSA_KEY_SIZE
 
 # Check if RSA_KEY_SIZE is configurable directly
 try:
@@ -75,18 +77,21 @@ def generate_keys_with_size(key_size: int) -> Tuple[bytes, bytes]:
     """Generate RSA keys with specific key size."""
     if CAN_MODIFY_KEY_SIZE:
         # If we can directly modify the constant
-        original_size = globals()['RSA_KEY_SIZE']
-        globals()['RSA_KEY_SIZE'] = key_size
+        original_size = encrypt_module.RSA_KEY_SIZE
+        encrypt_module.RSA_KEY_SIZE = key_size
         try:
             return generate_keys()
         finally:
-            globals()['RSA_KEY_SIZE'] = original_size
+            encrypt_module.RSA_KEY_SIZE = original_size
     else:
         # Use mocking to patch the RSA_KEY_SIZE
         with unittest.mock.patch('encrypt.RSA_KEY_SIZE', key_size):
             return generate_keys()
 
-@pytest.mark.parametrize("key_size", [1024, 2048, 4096])
+@pytest.mark.parametrize(
+    "key_size",
+    [MIN_RSA_KEY_SIZE, MIN_RSA_KEY_SIZE * 2],
+)
 def test_encryption_with_different_key_sizes(key_size):
     """Test encryption and decryption with different RSA key sizes."""
     private_key, public_key = generate_keys_with_size(key_size)
@@ -209,32 +214,49 @@ def test_encryption_with_binary_data(binary_data, crypto_keys_default):
 def test_encryption_compatibility_between_key_sizes():
     """Test that messages encrypted with one key size can't be decrypted with another."""
     # Generate keys with different sizes
-    private_key_1024, public_key_1024 = generate_keys_with_size(1024)
-    private_key_2048, public_key_2048 = generate_keys_with_size(2048)
+    private_key_min, public_key_min = generate_keys_with_size(MIN_RSA_KEY_SIZE)
+    private_key_large, public_key_large = generate_keys_with_size(MIN_RSA_KEY_SIZE * 2)
 
     # Test data
     plaintext = b"Test message for cross-key-size test"
 
-    # Encrypt with 1024-bit key
-    ciphertext_dict_1024, cipherkey_1024, iv_1024 = encrypt(plaintext, public_key_1024)
+    # Encrypt with the minimum allowed key size
+    ciphertext_dict_min, cipherkey_min, iv_min = encrypt(plaintext, public_key_min)
 
-    # Encrypt with 2048-bit key
-    ciphertext_dict_2048, cipherkey_2048, iv_2048 = encrypt(plaintext, public_key_2048)
+    # Encrypt with a larger key size for comparison
+    ciphertext_dict_large, cipherkey_large, iv_large = encrypt(plaintext, public_key_large)
 
     # Verify correct decryption with matching keys
-    assert decrypt(ciphertext_dict_1024, cipherkey_1024, private_key_1024) == plaintext
-    assert decrypt(ciphertext_dict_2048, cipherkey_2048, private_key_2048) == plaintext
+    assert decrypt(ciphertext_dict_min, cipherkey_min, private_key_min) == plaintext
+    assert decrypt(ciphertext_dict_large, cipherkey_large, private_key_large) == plaintext
 
     # Verify that decryption fails with mismatched keys
     # Note: This might not always raise an exception, but should at least not return the original plaintext
     try:
-        result = decrypt(ciphertext_dict_1024, cipherkey_1024, private_key_2048)
+        result = decrypt(ciphertext_dict_min, cipherkey_min, private_key_large)
         assert result != plaintext, "Decryption with wrong key should not succeed"
     except:
         pass  # Exception is expected and acceptable
 
     try:
-        result = decrypt(ciphertext_dict_2048, cipherkey_2048, private_key_1024)
+        result = decrypt(ciphertext_dict_large, cipherkey_large, private_key_min)
         assert result != plaintext, "Decryption with wrong key should not succeed"
     except:
         pass  # Exception is expected and acceptable
+
+
+@skip_if_cannot_modify
+@pytest.mark.parametrize(
+    "invalid_key_size",
+    [
+        MIN_RSA_KEY_SIZE - 256,
+        MIN_RSA_KEY_SIZE - 1024,
+    ],
+)
+def test_generate_keys_rejects_small_key_sizes(invalid_key_size):
+    """generate_keys should reject RSA key sizes below the enforced minimum."""
+
+    with pytest.raises(ValueError) as excinfo:
+        generate_keys_with_size(invalid_key_size)
+
+    assert "at least" in str(excinfo.value)

@@ -84,6 +84,7 @@ Refined logging helpers to avoid swallowing system interrupt exceptions.
 - Updated `log_info` and `log_error` to catch only standard exceptions, allowing
   `KeyboardInterrupt` and `SystemExit` to propagate.
 - Ensured `log_error` always logs messages even in production.
+- Enforced a minimum 2048-bit RSA key size guard to block insecure configurations.
 - Added configurable content moderation hooks that reject disallowed prompts before inference.
 
 **Recommendations**

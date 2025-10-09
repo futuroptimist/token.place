@@ -13,7 +13,7 @@ from encrypt import encrypt, decrypt, generate_keys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
-from utils.crypto.crypto_manager import CryptoManager
+from utils.crypto.crypto_manager import CryptoManager, _decode_client_public_key
 
 class TestCryptoManager:
     """Test class for CryptoManager."""
@@ -169,6 +169,27 @@ class TestCryptoManager:
         crypto_manager.encrypt_message(message, b64_key)
 
         mock_encrypt.assert_called_once_with(b'hi', b'client_public_key')
+
+    @patch('utils.crypto.crypto_manager.encrypt')
+    def test_encrypt_message_caches_decoded_base64_key(self, mock_encrypt, crypto_manager):
+        """Decoding the same base64 public key twice should reuse cached bytes."""
+        message = "hi"
+        raw_key = b'client_public_key'
+        b64_key = base64.b64encode(raw_key).decode('utf-8')
+
+        mock_encrypted_data = {'ciphertext': b'encrypted_content', 'iv': b'iv_value'}
+        mock_encrypted_key = b'encrypted_key'
+        mock_iv = b'iv_value'
+        mock_encrypt.return_value = (mock_encrypted_data, mock_encrypted_key, mock_iv)
+
+        real_b64decode = base64.b64decode
+        _decode_client_public_key.cache_clear()
+        with patch('utils.crypto.crypto_manager.base64.b64decode', side_effect=real_b64decode) as mock_b64decode:
+            crypto_manager.encrypt_message(message, b64_key)
+            crypto_manager.encrypt_message(message, b64_key)
+
+        # Without caching the decoder would be invoked twice for identical inputs.
+        assert mock_b64decode.call_count == 1
 
     def test_encrypt_message_invalid_base64_key(self, crypto_manager):
         """Invalid base64 strings raise a helpful error."""

@@ -184,6 +184,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [ ] Performance optimizations
   - [x] Token streaming between client/server for faster responses
   - [x] GPU memory guardrails for multi-model hosting (auto CPU fallback when VRAM is tight)
+  - [x] Cached decoded client public keys to avoid repeated base64 work during encryption
   - [x] Batched inference for relay servers with multiple connected clients
 - [x] Advanced security features
   - [x] Zero-trust relay challenge/response hardening

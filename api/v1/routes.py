@@ -24,7 +24,13 @@ from api.v1.community import (
     get_contribution_summary,
     queue_contribution_submission,
 )
-from api.v1.models import get_models_info, generate_response, get_model_instance, ModelError
+from api.v1.models import (
+    get_models_info,
+    generate_response,
+    get_model_instance,
+    ModelError,
+    resolve_model_alias,
+)
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name,
@@ -514,7 +520,14 @@ def create_chat_completion():
             available_model_ids = [model["id"] for model in models]
 
             # Validate model
-            model_id = data['model']
+            requested_model_id = data['model']
+            response_model_id = requested_model_id
+            model_id = resolve_model_alias(requested_model_id) or requested_model_id
+            if model_id != requested_model_id:
+                log_info(
+                    f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
+                )
+
             validate_model_name(model_id, available_model_ids)
 
             # Get model instance - will raise ModelError if not found
@@ -618,7 +631,7 @@ def create_chat_completion():
                 "id": f"chatcmpl-{uuid.uuid4()}",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": model_id,
+                "model": response_model_id,
                 "choices": [
                     {
                         "index": 0,
@@ -672,7 +685,7 @@ def create_chat_completion():
                         "id": stream_id,
                         "object": "chat.completion.chunk",
                         "created": created_ts,
-                        "model": model_id,
+                        "model": response_model_id,
                         "choices": [
                             {
                                 "index": 0,

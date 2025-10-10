@@ -185,6 +185,14 @@ if ENVIRONMENT != 'prod':
     logger.info(f"API v1 Models module loaded with USE_MOCK_LLM={USE_MOCK_LLM}, raw env value: '{os.environ.get('USE_MOCK_LLM', 'NOT_SET')}'")
 
 # Available model metadata
+MODEL_ALIASES: Dict[str, str] = {
+    # Provide compatibility with first-party integrations that still request
+    # OpenAI-branded model identifiers.
+    "gpt-3.5-turbo": "llama-3-8b-instruct",
+    "gpt-5-chat-latest": "llama-3-8b-instruct",
+}
+
+
 AVAILABLE_MODELS = [
     {
         "id": "llama-3-8b-instruct",
@@ -273,6 +281,23 @@ def _get_model_metadata(model_id: str) -> Optional[Dict[str, Any]]:
         if entry["id"] == model_id:
             return entry
     return None
+
+
+def resolve_model_alias(model_id: str) -> Optional[str]:
+    """Resolve a requested model identifier to the canonical catalogue entry."""
+
+    target_id = MODEL_ALIASES.get(model_id)
+    if not target_id:
+        return None
+
+    if _get_model_metadata(target_id) is None:
+        warning_msg = (
+            f"Ignoring alias '{model_id}' because the target model '{target_id}' is unavailable"
+        )
+        log_warning(warning_msg)  # pragma: no cover - defensive logging
+        return None
+
+    return target_id
 
 class ModelError(Exception):
     """Custom exception for model-related errors"""

@@ -45,11 +45,10 @@ This document provides an overview of the testing approach for token.place and i
 - Command: `npm run test:js`
 
 ### 8. DSPACE Integration Tests
-- Location: `integration_tests/`
-- Purpose: Test integration with DSPACE as a drop-in replacement for OpenAI
-- Commands:
-  - Full test suite: `cd integration_tests; .\run_integration_test.ps1`
-  - Direct API test: `cd integration_tests; node dspace_tokenplace_test.mjs`
+- Location: `tests/integration/test_dspace_chat_alias.py`
+- Purpose: Validate that token.place can serve as a drop-in backend for DSPACE's dChat client
+  now that it targets `gpt-5-chat-latest`
+- Command: `python -m pytest tests/integration/test_dspace_chat_alias.py`
 
 ## Running All Tests
 
@@ -113,7 +112,7 @@ When writing new tests:
 ## Troubleshooting
 
 - If Playwright tests fail, ensure browsers are installed with `python -m playwright install`
-- For DSPACE integration test failures, check that ports 5555, 5556, and 4444 are available
+- For DSPACE integration test failures, ensure port 5056 is available for the relay mock server
 - If JavaScript tests fail, ensure Node.js dependencies are installed and up to date
 
 ## Test Results and Expected Behavior

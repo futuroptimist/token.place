@@ -68,3 +68,46 @@ def test_openai_alias_get_model(client):
     api_resp = client.get(f'/api/v1/models/{model_id}').get_json()
     alias_resp = client.get(f'/v1/models/{model_id}').get_json()
     assert api_resp == alias_resp
+
+
+def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
+    canonical_id = 'llama-3-8b-instruct'
+    payload = {
+        'model': 'gpt-5-chat-latest',
+        'messages': [
+            {'role': 'user', 'content': 'Hello'}
+        ],
+    }
+
+    monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': canonical_id}])
+    validate_model_name = MagicMock()
+    monkeypatch.setattr(routes, 'validate_model_name', validate_model_name)
+    monkeypatch.setattr(routes, 'get_model_instance', MagicMock(return_value='MOCK'))
+
+    captured = {}
+
+    def fake_generate_response(model_id, messages):
+        captured['model_id'] = model_id
+        return messages + [{'role': 'assistant', 'content': 'Mock reply'}]
+
+    monkeypatch.setattr(routes, 'generate_response', fake_generate_response)
+
+    alias = MagicMock(return_value=canonical_id)
+    monkeypatch.setattr(routes, 'resolve_model_alias', alias)
+
+    mock_log_info = MagicMock()
+    monkeypatch.setattr(routes, 'log_info', mock_log_info)
+
+    response = client.post('/api/v1/chat/completions', json=payload)
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data['model'] == 'gpt-5-chat-latest'
+    assert captured['model_id'] == canonical_id
+    validate_model_name.assert_called_once_with(canonical_id, [canonical_id])
+    alias.assert_called_once_with('gpt-5-chat-latest')
+    assert any(
+        call.args
+        and "Routing alias model 'gpt-5-chat-latest'" in str(call.args[0])
+        for call in mock_log_info.call_args_list
+    )

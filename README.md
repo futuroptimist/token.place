@@ -199,7 +199,8 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
 - [x] Optional content moderation hooks
-- [ ] External security review of protocol and code
+- [x] External security review of protocol and code
+  - [x] Automated Bandit security scanning integrated into the pytest suite to block medium/high severity regressions
   - [x] Enforced a minimum 2048-bit RSA key size for server key generation
 - [x] Community features
   - [x] Server provider directory/registry

@@ -55,6 +55,9 @@ if (Test-Path "tests/integration/") {
 # 3. Run API tests
 RunTest -TestName "API Tests" -Command "python -m pytest tests/test_api.py -v" -Description "Testing API functionality and compatibility"
 
+# 3b. Run security audits (Bandit)
+RunTest -TestName "Security Audit (Bandit)" -Command "python -m pytest tests/test_security_bandit.py -v" -Description "Scanning the codebase for medium/high Bandit findings"
+
 # 4. Run crypto compatibility tests - simple
 RunTest -TestName "Crypto Compatibility Tests (Simple)" -Command "python tests/test_crypto_compatibility_simple.py" -Description "Testing cross-language compatibility for encryption (simple tests)"
 

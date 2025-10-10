@@ -1,15 +1,17 @@
 """Relay client module for managing communication with relay servers."""
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
+import jsonschema
 import logging
 import os
-import requests
 import time
-import base64
-import jsonschema
-from typing import Dict, Optional, Any, List, Union, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
+
+import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -280,10 +282,14 @@ class RelayClient:
         if hostname in {'localhost', '::1', '::'}:
             return True
 
-        if hostname.startswith('127.'):
-            return True
+        normalised = hostname.strip('[]')
 
-        if hostname in {'0.0.0.0', '[::]'}:
+        try:
+            candidate_ip = ipaddress.ip_address(normalised)
+        except ValueError:
+            candidate_ip = None
+
+        if candidate_ip and (candidate_ip.is_loopback or candidate_ip.is_unspecified):
             return True
 
         return False
@@ -351,8 +357,10 @@ class RelayClient:
                 if headers:
                     request_kwargs['headers'] = headers
 
+                timeout = request_kwargs.pop('timeout', self._request_timeout)
                 response = requests.post(
                     f'{candidate_url}/sink',
+                    timeout=timeout,
                     **request_kwargs,
                 )
 
@@ -495,8 +503,10 @@ class RelayClient:
                 if headers:
                     request_kwargs['headers'] = headers
 
+                timeout = request_kwargs.pop('timeout', self._request_timeout)
                 source_response = requests.post(
                     f'{self.relay_url}/source',
+                    timeout=timeout,
                     **request_kwargs
                 )
 

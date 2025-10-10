@@ -1,6 +1,7 @@
 """Relay client module for managing communication with relay servers."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -283,10 +284,12 @@ class RelayClient:
         if hostname.startswith('127.'):
             return True
 
-        if hostname in {'0.0.0.0', '[::]'}:
-            return True
+        try:
+            ip_obj = ipaddress.ip_address(hostname)
+        except ValueError:
+            return False
 
-        return False
+        return ip_obj.is_loopback or ip_obj.is_unspecified
 
     @property
     def relay_url(self) -> str:
@@ -343,17 +346,14 @@ class RelayClient:
                     self.crypto_manager.public_key_b64[:10],
                 )
 
-                request_kwargs = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
-                }
                 headers = self._auth_headers()
-                if headers:
-                    request_kwargs['headers'] = headers
+                header_kwargs = {'headers': headers} if headers else {}
 
                 response = requests.post(
                     f'{candidate_url}/sink',
-                    **request_kwargs,
+                    json={'server_public_key': self.crypto_manager.public_key_b64},
+                    timeout=self._request_timeout,
+                    **header_kwargs,
                 )
 
                 if response.status_code != 200:
@@ -487,17 +487,14 @@ class RelayClient:
 
             # Send the response to the relay
             try:
-                request_kwargs = {
-                    'json': source_payload,
-                    'timeout': self._request_timeout,
-                }
                 headers = self._auth_headers()
-                if headers:
-                    request_kwargs['headers'] = headers
+                header_kwargs = {'headers': headers} if headers else {}
 
                 source_response = requests.post(
                     f'{self.relay_url}/source',
-                    **request_kwargs
+                    json=source_payload,
+                    timeout=self._request_timeout,
+                    **header_kwargs,
                 )
 
                 log_info(

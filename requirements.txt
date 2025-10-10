@@ -38,6 +38,7 @@ pytest-mock               # Mocking utilities
 pytest-benchmark==5.1.0   # Performance benchmarking, requires pytest>=8.1
 PyYAML>=6.0
 pre-commit
+bandit==1.8.6             # Static security analysis for roadmap compliance
 
 # JavaScript test dependencies
 # Note: Install these with npm ci

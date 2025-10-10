@@ -265,6 +265,13 @@ python -m pytest tests/test_parameterized.py
 python -m pytest tests/test_security.py
 ```
 
+Static analysis guardrails run via Bandit to detect medium or higher severity
+regressions in critical Python modules:
+
+```sh
+python -m pytest tests/test_bandit_scan.py
+```
+
 ### Running all tests
 
 To execute the complete test suite that CI runs, use:

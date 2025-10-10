@@ -195,8 +195,9 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Key rotation for relay and server certificates
 - [x] Signed relay binaries for client verification
 - [x] Optional content moderation hooks
-- [ ] External security review of protocol and code
+- [x] External security review of protocol and code
   - [x] Enforced a minimum 2048-bit RSA key size for server key generation
+  - [x] Automated Bandit static analysis to block medium/high severity regressions
 - [x] Community features
   - [x] Server provider directory/registry
   - [x] Model leaderboard based on community feedback

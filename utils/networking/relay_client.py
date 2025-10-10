@@ -196,6 +196,7 @@ class RelayClient:
             cluster_only=self._cluster_only,
         )
         self._active_relay_index = 0
+        self._sink_start_index = 0
 
     @staticmethod
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
@@ -331,7 +332,7 @@ class RelayClient:
         last_error: Optional[Dict[str, Any]] = None
 
         for offset in range(len(self._relay_urls)):
-            index = (self._active_relay_index + offset) % len(self._relay_urls)
+            index = (self._sink_start_index + offset) % len(self._relay_urls)
             candidate_url = self._relay_urls[index]
 
             try:
@@ -378,6 +379,7 @@ class RelayClient:
                     continue
 
                 self._active_relay_index = index
+                self._sink_start_index = (index + 1) % len(self._relay_urls)
                 return relay_response
 
             except requests.ConnectionError as exc:

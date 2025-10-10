@@ -284,6 +284,56 @@ class TestRelayClient:
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_ping_relay_rotates_between_successful_servers(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Successful sink calls should round-robin across configured relay targets."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.additional_servers': ['http://backup-relay:6000'],
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://primary-relay",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        primary_response = MagicMock()
+        primary_response.status_code = 200
+        primary_response.json.return_value = TEST_NO_REQUEST_RESPONSE
+
+        secondary_response = MagicMock()
+        secondary_response.status_code = 200
+        secondary_response.json.return_value = TEST_NO_REQUEST_RESPONSE
+
+        mock_post.side_effect = [primary_response, secondary_response]
+
+        first_result = client.ping_relay()
+        second_result = client.ping_relay()
+
+        assert first_result == TEST_NO_REQUEST_RESPONSE
+        assert second_result == TEST_NO_REQUEST_RESPONSE
+
+        requested_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert requested_urls == [
+            'http://primary-relay:5000/sink',
+            'http://backup-relay:6000/sink',
+        ]
+        assert client.relay_url == 'http://backup-relay:6000'
+
     def test_cluster_only_uses_remote_targets_first(
         self,
         mock_crypto_manager,

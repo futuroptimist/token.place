@@ -137,7 +137,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] automated browser testing of landing page, preventing regressions of the chat ui
   - [x] delete old /inference endpoint and everything upstream and downstream that's now unused 💯
   - [x] simplified crypto utility (CryptoClient) for easy encrypted communication
-- [ ] distribute relay.py across multiple machines
+- [x] distribute relay.py across multiple machines
   - [x] Multi-relay failover via `relay.additional_servers` configuration (server auto-rotates backups)
   - [x] personal gaming PC
   - [x] raspi k3s pod 💯
@@ -146,6 +146,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
       localhost fallback and requires at least one upstream from `relay.additional_servers` or
       the normalised `relay.server_pool`.
   - [ ] optional cloud fallback via Cloudflare
+  - [x] Round-robin sink polling to balance traffic across configured relays
 - [x] OpenAI-compatible API with end-to-end encryption
   - [x] Models listing endpoint
   - [x] Chat completions endpoint

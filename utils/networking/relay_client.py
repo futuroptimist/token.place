@@ -330,6 +330,7 @@ class RelayClient:
             ValueError: If the server response is not valid JSON or fails schema validation
         """
         last_error: Optional[Dict[str, Any]] = None
+        encountered_error = False
 
         for offset in range(len(self._relay_urls)):
             index = (self._sink_start_index + offset) % len(self._relay_urls)
@@ -365,6 +366,7 @@ class RelayClient:
                         'error': f"HTTP {response.status_code}",
                         'next_ping_in_x_seconds': self._request_timeout,
                     }
+                    encountered_error = True
                     continue
 
                 relay_response = response.json()
@@ -376,27 +378,36 @@ class RelayClient:
                         'error': f"Invalid response format: {str(exc)}",
                         'next_ping_in_x_seconds': self._request_timeout,
                     }
+                    encountered_error = True
                     continue
 
                 self._active_relay_index = index
-                self._sink_start_index = (index + 1) % len(self._relay_urls)
+                if encountered_error:
+                    self._sink_start_index = index
+                else:
+                    self._sink_start_index = (index + 1) % len(self._relay_urls)
                 return relay_response
 
             except requests.ConnectionError as exc:
                 log_error("Connection error when pinging relay: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                encountered_error = True
             except requests.Timeout as exc:
                 log_error("Request timeout when pinging relay: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                encountered_error = True
             except requests.RequestException as exc:
                 log_error("Request exception when pinging relay: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                encountered_error = True
             except json.JSONDecodeError as exc:
                 log_error("Invalid JSON response from relay: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                encountered_error = True
             except Exception as exc:  # pragma: no cover - unexpected edge cases
                 log_error("Unexpected error when pinging relay: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                encountered_error = True
 
         return last_error or {
             'error': 'No relay targets responded',

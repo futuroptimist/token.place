@@ -182,11 +182,12 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
     - [x] `/api/v1/images/generations` endpoint for offline-friendly PNG output
   - [x] Vision model support (inline analysis for base64-encoded images)
   - [x] Fine-tuned models and model adapter support
-- [ ] Performance optimizations
+- [x] Performance optimizations
   - [x] Token streaming between client/server for faster responses
   - [x] GPU memory guardrails for multi-model hosting (auto CPU fallback when VRAM is tight)
   - [x] Cached decoded client public keys to avoid repeated base64 work during encryption
   - [x] Batched inference for relay servers with multiple connected clients
+  - [x] Cached RSA private key deserialization to eliminate redundant parsing during decrypt
 - [x] Advanced security features
   - [x] Zero-trust relay challenge/response hardening
   - [x] Rate limiting and quota enforcement 💯

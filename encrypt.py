@@ -5,6 +5,7 @@ import os
 import base64
 import logging
 from collections.abc import Mapping
+from functools import lru_cache
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import serialization
@@ -36,6 +37,17 @@ else:
 logger = logging.getLogger(__name__)
 
 MIN_RSA_KEY_SIZE = 2048
+
+
+@lru_cache(maxsize=8)
+def _load_private_key_cached(private_key_pem: bytes):
+    """Deserialize a PEM private key while caching the result for reuse."""
+
+    return serialization.load_pem_private_key(
+        private_key_pem,
+        password=None,
+        backend=default_backend(),
+    )
 
 def generate_keys() -> Tuple[bytes, bytes]:
     """
@@ -209,11 +221,7 @@ def decrypt(
 
     try:
         # First decrypt the AES key using RSA
-        private_key = serialization.load_pem_private_key(
-            bytes(private_key_pem),
-            password=None,
-            backend=default_backend()
-        )
+        private_key = _load_private_key_cached(bytes(private_key_pem))
 
         # Decrypt the encrypted AES key. Try OAEP first, then fall back to PKCS1v15 for JS compatibility
         try:

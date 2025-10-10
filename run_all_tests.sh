@@ -77,6 +77,9 @@ fi
 # 3. Run API tests
 run_test "API Tests" "$PYTHON_CMD -m pytest tests/test_api.py -v $COVERAGE_ARGS" "Testing API functionality and compatibility"
 
+# 3b. Run security audits (Bandit)
+run_test "Security Audit (Bandit)" "$PYTHON_CMD -m pytest tests/test_security_bandit.py -v $COVERAGE_ARGS" "Scanning the codebase for medium/high Bandit findings"
+
 # 4. Run crypto compatibility tests - simple
 run_test "Crypto Compatibility Tests (Simple)" "$PYTHON_CMD tests/test_crypto_compatibility_simple.py $COVERAGE_ARGS" "Testing cross-language compatibility for encryption (simple tests)"
 

@@ -163,7 +163,10 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
 - [x] API v1 with at least 1 model supported and available
 - [x] landing page chat UI integrated with API v1
 - [x] use best available llama family model that can run on an RTX 4090
-- [ ] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
+- [x] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
+  - [x] Added compatibility aliases (including `gpt-5-chat-latest`) so dChat can target
+        token.place without code changes
+  - [x] Integration test verifies the OpenAI client flow through `/api/v1/chat/completions`
 - [x] set up production k3s raspberry pi pod running relay.py
   - [x] server.py stays on personal gaming PC
   - [x] potential cloud fallback node via Cloudflare

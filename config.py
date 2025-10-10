@@ -75,8 +75,8 @@ DEFAULT_CONFIG = {
 
     # Model settings
     'model': {
-        'default_model': 'gpt-3.5-turbo',
-        'fallback_model': 'gpt-3.5-turbo',
+        'default_model': 'gpt-5-chat-latest',
+        'fallback_model': 'gpt-5-chat-latest',
         'temperature': 0.7,
         'max_tokens': 1000,
         'use_mock': False,

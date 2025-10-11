@@ -48,6 +48,70 @@ E2E tests validate complete user workflows:
 python -m pytest tests/test_e2e_*.py
 ```
 
+### API Tests
+
+API tests exercise the OpenAI-compatible HTTP routes to ensure request and
+response formats stay stable:
+
+```sh
+python -m pytest -m api
+```
+
+This suite includes regressions such as `tests/test_api.py` and the
+`tests/integration/test_openai_compatibility.py` flow that mirrors how client
+libraries call `/v1`.
+
+### Crypto Tests
+
+Crypto tests validate the hybrid RSA/AES implementation and related helpers.
+They cover key generation, encryption/decryption, and compatibility with the
+JavaScript client:
+
+```sh
+python -m pytest -m crypto
+```
+
+Representative files include `tests/test_crypto_compatibility.py` and the
+`tests/unit/test_encrypt_*` modules that guard against padding or key handling
+regressions.
+
+### JavaScript Tests
+
+JavaScript tests confirm the browser-compatible encryption helpers behave the
+same way in Node.js and Playwright environments:
+
+```sh
+npm run test:js
+```
+
+The script runs `tests/test_js_crypto.js` and `tests/test_js_mock_server.js` to
+verify wire compatibility with the Python backend, while `pytest -m js` targets
+Playwright-assisted coverage.
+
+### Browser Tests
+
+Browser tests launch Playwright to validate the interactive chat UI and in-page
+encryption flows end-to-end:
+
+```sh
+python -m pytest -m browser
+```
+
+These tests are backed by fixtures in `tests/conftest.py` and cover scenarios in
+`tests/test_e2e_chat.py` plus `tests/test_crypto_compatibility_playwright.py`.
+
+### Slow Tests
+
+Slow tests gate longer-running suites—such as GPU-heavy inference or
+integration flows—so they only run when explicitly requested:
+
+```sh
+python -m pytest -m slow
+```
+
+This marker currently tags end-to-end encryption checks that spin up multiple
+processes and the real LLM validation paths.
+
 ### Visual Verification Tests
 
 Visual verification tests ensure UI consistency:
@@ -63,6 +127,17 @@ Tests using actual LLM models:
 ```sh
 python -m pytest tests/test_real_llm.py tests/test_real_llm_validation.py -v
 ```
+
+### Security Tests
+
+Security tests enforce cryptographic guardrails and static analysis expectations:
+
+```sh
+python -m pytest -m security
+```
+
+They execute suites such as `tests/test_security.py` and the automated Bandit
+scan in `tests/test_security_bandit.py` to catch regressions before release.
 
 ## User Journeys and E2E Testing
 
@@ -241,11 +316,14 @@ python -m pytest -m marker_name
 
 ## Specialized Test Suites
 
-### Performance Benchmarks
+### Benchmark Tests
 
 ```sh
 python -m pytest tests/test_performance_benchmarks.py
 ```
+
+These benchmark tests measure encryption throughput across payload sizes and
+track RSA/AES key generation costs to prevent performance regressions.
 
 ### Failure Recovery Tests
 

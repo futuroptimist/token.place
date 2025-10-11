@@ -440,4 +440,5 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 - Integrate with CI/CD to run tests automatically
 - Consider using docker containers for browser and integration tests
 - Implement stress tests for production readiness
-- Add documentation for each test type
+- ✅ Added documentation for each test type in `docs/TESTING.md` so contributors
+  can quickly discover how to run the associated suites

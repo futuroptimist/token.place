@@ -215,14 +215,19 @@ class RelayClient:
         path = parsed.path if parsed.netloc else ''
 
         if parsed.port is None and port is not None:
-            hostname = parsed.hostname or netloc
+            hostname = parsed.hostname or ''
+            host_for_netloc = hostname or (parsed.netloc or parsed.path or netloc)
+            if host_for_netloc and ':' in host_for_netloc and not host_for_netloc.startswith('['):
+                host_for_netloc = f"[{host_for_netloc}]"
+
             userinfo = ''
             if parsed.username:
                 userinfo = parsed.username
                 if parsed.password:
                     userinfo = f"{userinfo}:{parsed.password}"
                 userinfo = f"{userinfo}@"
-            netloc = f"{userinfo}{hostname}:{int(port)}"
+
+            netloc = f"{userinfo}{host_for_netloc}:{int(port)}"
 
         return urlunparse((scheme, netloc, path, '', '', '')).rstrip('/')
 

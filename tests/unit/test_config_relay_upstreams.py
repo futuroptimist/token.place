@@ -1,6 +1,8 @@
 """Tests for production relay upstream configuration overrides."""
 
+import json
 import sys
+from pathlib import Path
 from typing import Iterator
 
 import pytest
@@ -196,3 +198,58 @@ def test_cluster_only_env_invalid_logs_warning(
 
     assert "Invalid TOKEN_PLACE_RELAY_CLUSTER_ONLY value" in caplog.text
     assert config.get("relay.cluster_only") is False
+
+
+def test_cloudflare_fallbacks_merge_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cloudflare fallback URLs combine config and environment overrides."""
+
+    config_path = tmp_path / "user_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "relay": {
+                    "cloudflare_fallback_urls": [
+                        " https://relay.cloudflare.workers.dev/api/v1/ ",
+                    ]
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKEN_PLACE_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "TOKEN_PLACE_RELAY_CLOUDFLARE_URLS",
+        '["https://relay.cloudflare.workers.dev/api/v1", "https://beta.cloudflare.workers.dev/api/v1/"]',
+    )
+    monkeypatch.setenv(
+        "TOKEN_PLACE_RELAY_CLOUDFLARE_URL",
+        "https://single.cloudflare.workers.dev/api/v1/",
+    )
+
+    from config import Config
+
+    config = Config()
+
+    assert config.get("relay.cloudflare_fallback_urls") == [
+        "https://relay.cloudflare.workers.dev/api/v1",
+        "https://beta.cloudflare.workers.dev/api/v1",
+        "https://single.cloudflare.workers.dev/api/v1",
+    ]
+
+
+def test_cloudflare_fallbacks_ignore_blank_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blank Cloudflare overrides are ignored, leaving the list empty."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_CLOUDFLARE_URLS", "   ")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_CLOUDFLARE_URL", " \t ")
+
+    from config import Config
+
+    config = Config()
+
+    assert config.get("relay.cloudflare_fallback_urls") == []

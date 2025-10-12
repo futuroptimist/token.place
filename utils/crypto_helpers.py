@@ -28,9 +28,10 @@ api_response = client.send_api_request([
 
 import json
 import base64
+import os
 import requests
 import logging
-from typing import Dict, Tuple, Any, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import time
 
 # Import encryption functions
@@ -46,7 +47,12 @@ class CryptoClient:
     Simplifies the process of encryption, decryption, and API communication.
     """
 
-    def __init__(self, base_url: str, debug: bool = False):
+    def __init__(
+        self,
+        base_url: str,
+        debug: bool = False,
+        fallback_urls: Optional[Iterable[str]] = None,
+    ):
         """
         Initialize the crypto client
 
@@ -55,15 +61,25 @@ class CryptoClient:
             debug: Whether to enable debug logging
         """
         base_url = base_url.strip()
-        if not base_url or not base_url.startswith(("http://", "https://")):
+        if not base_url:
             raise ValueError("base_url must start with http:// or https://")
-        self.base_url = base_url.rstrip('/')  # Remove trailing slash if present
+
+        normalised_primary = self._normalise_base_url(base_url)
+        if not normalised_primary:
+            raise ValueError("base_url must start with http:// or https://")
+
+        self.base_url = normalised_primary
         self.server_public_key = None
         self.server_public_key_b64 = None
         self.client_private_key = None
         self.client_public_key = None
         self.client_public_key_b64 = None
         self.debug = debug
+
+        self._base_urls: List[str] = self._build_base_url_pool(
+            normalised_primary, fallback_urls
+        )
+        self._active_base_index = 0
 
         if debug:
             logger.setLevel(logging.DEBUG)
@@ -99,42 +115,55 @@ class CryptoClient:
         Returns:
             True if successful, False otherwise
         """
-        full_url = f"{self.base_url}{endpoint}"
-        logger.debug(f"Fetching server public key from: {full_url}")
+        for index, full_url in self._iter_base_urls(endpoint):
+            logger.debug(f"Fetching server public key from: {full_url}")
 
-        try:
-            response = requests.get(full_url, timeout=timeout)
-            logger.debug(f"Server response status: {response.status_code}")
+            try:
+                response = requests.get(full_url, timeout=timeout)
+                logger.debug(f"Server response status: {response.status_code}")
 
-            if response.status_code != 200:
-                logger.error(f"Failed to get server public key: {response.status_code}")
-                return False
+                if response.status_code != 200:
+                    logger.error(
+                        "Failed to get server public key from %s: %s",
+                        full_url,
+                        response.status_code,
+                    )
+                    continue
 
-            data = response.json()
+                data = response.json()
 
-            # Check if there's an error in the response
-            if 'error' in data:
-                error_msg = data['error'].get('message', 'Unknown error')
-                logger.error(f"Server returned error: {error_msg}")
-                return False
+                # Check if there's an error in the response
+                if 'error' in data:
+                    error_msg = data['error'].get('message', 'Unknown error')
+                    logger.error(f"Server returned error: {error_msg}")
+                    continue
 
-            key_field = "server_public_key" if "server_public_key" in data else "public_key"
+                key_field = (
+                    "server_public_key" if "server_public_key" in data else "public_key"
+                )
 
-            if key_field not in data:
-                logger.error(f"No public key found in response, available fields: {list(data.keys())}")
-                return False
+                if key_field not in data:
+                    logger.error(
+                        "No public key found in response, available fields: %s",
+                        list(data.keys()),
+                    )
+                    continue
 
-            self.server_public_key_b64 = data[key_field]
-            self.server_public_key = base64.b64decode(self.server_public_key_b64)
-            logger.info(f"Successfully fetched server public key")
-            return True
-        except Exception as e:
-            logger.error(
-                "Exception while fetching server public key: %s",
-                e.__class__.__name__,
-                exc_info=self.debug,
-            )
-            return False
+                self.server_public_key_b64 = data[key_field]
+                self.server_public_key = base64.b64decode(self.server_public_key_b64)
+                self._activate_base_index(index)
+                logger.info("Successfully fetched server public key")
+                return True
+            except Exception as e:
+                logger.error(
+                    "Exception while fetching server public key from %s: %s",
+                    full_url,
+                    e.__class__.__name__,
+                    exc_info=self.debug,
+                )
+                continue
+
+        return False
 
     def encrypt_message(self, message: Union[Dict, List, str, bytes]) -> Dict[str, str]:
         """
@@ -237,35 +266,118 @@ class CryptoClient:
             Server response as dictionary or None if failed
             or if the response body is not valid JSON
         """
-        full_url = f"{self.base_url}{endpoint}"
-        logger.debug(f"Sending encrypted message to: {full_url}")
         logger.debug(f"Payload keys: {list(payload.keys())}")
 
-        try:
-            response = requests.post(full_url, json=payload, timeout=timeout)
-            logger.debug(f"Server response status: {response.status_code}")
-
-            if response.status_code != 200:
-                logger.error(
-                    f"Server returned error status: {response.status_code}"
-                )
-                logger.debug(
-                    "Response content length: %d", len(response.text)
-                )
-                return None
+        last_error: Optional[str] = None
+        for index, full_url in self._iter_base_urls(endpoint):
+            logger.debug(f"Sending encrypted message to: {full_url}")
 
             try:
-                return response.json()
-            except ValueError:
-                logger.error("Server returned non-JSON response")
-                return None
-        except Exception as e:
-            logger.error(
-                "Exception while sending encrypted message: %s",
-                e.__class__.__name__,
-                exc_info=self.debug,
-            )
+                response = requests.post(full_url, json=payload, timeout=timeout)
+                logger.debug(f"Server response status: {response.status_code}")
+
+                if response.status_code != 200:
+                    last_error = f"status {response.status_code}"
+                    logger.error(
+                        "Server returned error status from %s: %s",
+                        full_url,
+                        response.status_code,
+                    )
+                    logger.debug(
+                        "Response content length: %d",
+                        len(response.text),
+                    )
+                    continue
+
+                try:
+                    result = response.json()
+                except ValueError:
+                    last_error = "non-JSON response"
+                    logger.error(
+                        "Server returned non-JSON response from %s", full_url
+                    )
+                    continue
+
+                self._activate_base_index(index)
+                return result
+            except Exception as e:
+                last_error = e.__class__.__name__
+                logger.error(
+                    "Exception while sending encrypted message to %s: %s",
+                    full_url,
+                    last_error,
+                    exc_info=self.debug,
+                )
+                continue
+
+        if last_error:
+            logger.error("All relay endpoints failed: %s", last_error)
+        return None
+
+    def _activate_base_index(self, index: int) -> None:
+        """Mark the base URL at ``index`` as the preferred active endpoint."""
+
+        if 0 <= index < len(self._base_urls):
+            self._active_base_index = index
+            self.base_url = self._base_urls[index]
+
+    @staticmethod
+    def _normalise_base_url(candidate: Optional[str]) -> Optional[str]:
+        """Return a cleaned base URL or ``None`` if invalid."""
+
+        if not candidate:
             return None
+        normalised = candidate.strip()
+        if not normalised:
+            return None
+        if not normalised.startswith(("http://", "https://")):
+            logger.warning("Ignoring fallback URL without scheme: %s", candidate)
+            return None
+        return normalised.rstrip('/')
+
+    def _build_base_url_pool(
+        self,
+        primary: str,
+        fallback_urls: Optional[Iterable[str]],
+    ) -> List[str]:
+        """Assemble the ordered list of relay base URLs to try."""
+
+        pool: List[str] = []
+
+        normalised_primary = self._normalise_base_url(primary)
+        if not normalised_primary:
+            raise ValueError("base_url must start with http:// or https://")
+        pool.append(normalised_primary)
+
+        if fallback_urls is None:
+            env_value = os.getenv("API_FALLBACK_URLS", "")
+            raw_candidates = env_value.split(",") if env_value else []
+        else:
+            raw_candidates = list(fallback_urls)
+
+        for candidate in raw_candidates:
+            normalised = self._normalise_base_url(candidate)
+            if not normalised or normalised in pool:
+                continue
+            pool.append(normalised)
+
+        return pool
+
+    def _iter_base_urls(self, endpoint: str) -> Iterable[Tuple[int, str]]:
+        """Yield ``(index, url)`` pairs for each relay endpoint to try."""
+
+        if not self._base_urls:
+            return []
+
+        yielded: set[int] = set()
+        ordered_indices = [self._active_base_index, *range(len(self._base_urls))]
+        for index in ordered_indices:
+            if index < 0 or index >= len(self._base_urls):
+                continue
+            if index in yielded:
+                continue
+            yielded.add(index)
+            yield index, f"{self._base_urls[index]}{endpoint}"
 
     def send_chat_message(self, message: Union[str, List[Dict]], max_retries: int = 5) -> Optional[List[Dict]]:
         """

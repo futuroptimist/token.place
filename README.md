@@ -59,7 +59,9 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_FALLBACK_URLS | (empty)   | Comma-separated Cloudflare or other relay fallbacks tried in order |
 
 Set `API_FALLBACK_URLS=https://relay.cloudflare.workers.dev/api/v1` to let the bundled clients
-retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable.
+retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable. The
+Python `CryptoClient` that powers the CLI now automatically iterates through these fallback
+URLs, so interactive sessions keep working even when the primary relay is offline.
 
 The development requirements live in [requirements.txt](requirements.txt).
 
@@ -145,7 +147,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
     - `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1` (or `relay.cluster_only` in `config.json`) disables the
       localhost fallback and requires at least one upstream from `relay.additional_servers` or
       the normalised `relay.server_pool`.
-  - [ ] optional cloud fallback via Cloudflare
+  - [x] optional cloud fallback via Cloudflare
   - [x] Round-robin sink polling to balance traffic across configured relays
 - [x] OpenAI-compatible API with end-to-end encryption
   - [x] Models listing endpoint

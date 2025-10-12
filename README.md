@@ -57,9 +57,13 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | CONTENT_MODERATION_INCLUDE_DEFAULTS | 1            | Set to `0` to skip the built-in phrases when filtering requests        |
 | PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 | API_FALLBACK_URLS | (empty)   | Comma-separated Cloudflare or other relay fallbacks tried in order |
+| TOKEN_PLACE_RELAY_CLOUDFLARE_URLS | (empty) | Optional Cloudflare relay URLs appended to the server's relay pool |
 
 Set `API_FALLBACK_URLS=https://relay.cloudflare.workers.dev/api/v1` to let the bundled clients
 retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable.
+
+Set `TOKEN_PLACE_RELAY_CLOUDFLARE_URLS` (or `TOKEN_PLACE_RELAY_CLOUDFLARE_URL` for a single
+endpoint) so `server.py` can fail over to a Cloudflare tunnel when the local relays are down.
 
 The development requirements live in [requirements.txt](requirements.txt).
 
@@ -145,7 +149,7 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
     - `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1` (or `relay.cluster_only` in `config.json`) disables the
       localhost fallback and requires at least one upstream from `relay.additional_servers` or
       the normalised `relay.server_pool`.
-  - [ ] optional cloud fallback via Cloudflare
+  - [x] optional cloud fallback via Cloudflare
   - [x] Round-robin sink polling to balance traffic across configured relays
 - [x] OpenAI-compatible API with end-to-end encryption
   - [x] Models listing endpoint

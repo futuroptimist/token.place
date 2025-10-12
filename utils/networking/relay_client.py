@@ -152,6 +152,11 @@ class RelayClient:
 
             configured_servers = list(config.get('relay.additional_servers', []) or [])
 
+            cf_fallbacks = config.get('relay.cloudflare_fallback_urls', []) or []
+            for entry in cf_fallbacks:
+                if entry not in configured_servers:
+                    configured_servers.append(entry)
+
             pool_secondary = config.get('relay.server_pool_secondary', []) or []
             for entry in pool_secondary:
                 if entry not in configured_servers:
@@ -186,6 +191,31 @@ class RelayClient:
                     for entry in normalised.split(',')
                     if entry and entry.strip()
                 )
+
+            cf_raw = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URLS', '')
+            cf_single = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', '')
+            combined = ','.join(part for part in (cf_raw, cf_single) if part)
+            if combined:
+                entries: List[str] = []
+                try:
+                    loaded = json.loads(combined)
+                except json.JSONDecodeError:
+                    normalised_cf = combined.replace('\n', ',')
+                    entries.extend(
+                        segment.strip()
+                        for segment in normalised_cf.split(',')
+                        if segment.strip()
+                    )
+                else:
+                    if isinstance(loaded, str):
+                        entries.append(loaded.strip())
+                    elif isinstance(loaded, (list, tuple)):
+                        for item in loaded:
+                            if isinstance(item, str) and item.strip():
+                                entries.append(item.strip())
+                for entry in entries:
+                    if entry and entry not in configured_servers:
+                        configured_servers.append(entry)
 
             self._registration_token = _normalise_registration_token(
                 os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')

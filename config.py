@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
         'additional_servers': [],
         'server_registration_token': None,
         'cluster_only': False,
+        'cloudflare_fallback_urls': [],
     },
 
     # API settings
@@ -248,6 +249,10 @@ class Config:
         if token:
             self.set('relay.server_registration_token', token.strip())
 
+        cf_env = self._gather_cloudflare_fallbacks()
+        if cf_env is not None:
+            self.set('relay.cloudflare_fallback_urls', cf_env)
+
         cluster_only_env = os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY')
         if cluster_only_env is not None:
             parsed_cluster_only = self._parse_bool(cluster_only_env)
@@ -277,6 +282,37 @@ class Config:
         deduped: List[str] = []
         seen = set()
         for url in upstreams:
+            if url and url not in seen:
+                seen.add(url)
+                deduped.append(url)
+
+        return deduped
+
+    def _gather_cloudflare_fallbacks(self) -> Optional[List[str]]:
+        """Collect Cloudflare fallback URLs from config overrides."""
+
+        env_value = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URLS', '').strip()
+        single_env = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', '').strip()
+
+        candidates: List[str] = []
+        configured = self.get('relay.cloudflare_fallback_urls', []) or []
+
+        for entry in configured:
+            normalised = self._normalise_url(entry)
+            if normalised:
+                candidates.append(normalised)
+
+        if env_value:
+            candidates.extend(self._parse_relay_upstreams(env_value))
+
+        if single_env:
+            normalised_single = self._normalise_url(single_env)
+            if normalised_single:
+                candidates.append(normalised_single)
+
+        deduped: List[str] = []
+        seen = set()
+        for url in candidates:
             if url and url not in seen:
                 seen.add(url)
                 deduped.append(url)

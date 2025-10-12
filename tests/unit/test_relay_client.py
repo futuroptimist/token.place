@@ -284,6 +284,54 @@ class TestRelayClient:
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
+    def test_ping_relay_cloudflare_fallback(
+        self,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """RelayClient should fall back to Cloudflare relays when configured."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.cloudflare_fallback_urls': [
+                'https://relay.cloudflare.workers.dev/api/v1'
+            ],
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://primary-relay",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        failure_response = MagicMock()
+        failure_response.status_code = 503
+        failure_response.text = "Service unavailable"
+
+        success_response = MagicMock()
+        success_response.status_code = 200
+        success_response.json.return_value = TEST_NO_REQUEST_RESPONSE
+
+        with patch('utils.networking.relay_client.requests.post') as mock_post:
+            mock_post.side_effect = [failure_response, success_response]
+
+            result = client.ping_relay()
+
+        assert result == TEST_NO_REQUEST_RESPONSE
+
+        requested_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert requested_urls == [
+            'http://primary-relay:5000/sink',
+            'https://relay.cloudflare.workers.dev/api/v1/sink',
+        ]
+
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_sticky_failover_after_failure(
         self,

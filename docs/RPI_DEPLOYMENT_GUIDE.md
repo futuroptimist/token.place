@@ -33,6 +33,9 @@ rpi-imager --config ./imager-config.json token-place-lite.img.xz
 - **Optional: USB-C power supply** if you are not using PoE
 - **Cloudflare account** with a registered domain for tunneling
 
+  Set `TOKEN_PLACE_RELAY_CLOUDFLARE_URLS` on the server host to direct relay polling through your
+  Cloudflare tunnel whenever on-prem nodes are unavailable.
+
 This list reflects our setup. Other hardware choices will also work.
 Contributions describing different configurations are welcome so the project can support a wide variety of hardware.
 

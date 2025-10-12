@@ -83,6 +83,8 @@ python -m pytest --cov=. --cov-report=term-missing
   operator tokens and Bearer authorization fallbacks.
 - ✅ Added focused coverage for `utils.vision.image_analysis` to exercise whitespace-tolerant
   base64 decoding and defensive dimension parsing across PNG, GIF, and JPEG helpers.
+- ✅ Added regression coverage for `utils.networking.relay_client._compose_relay_url` to ensure
+  IPv6 relay endpoints retain their brackets when ports are injected.
 
 ## ✅ 8. Snapshot Testing (IMPLEMENTED)
 

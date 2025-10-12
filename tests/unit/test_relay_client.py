@@ -74,6 +74,14 @@ def test_init_propagates_keyboard_interrupt(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         RelayClient('http://localhost', 8080, object(), object())
 
+
+def test_compose_relay_url_preserves_ipv6_brackets():
+    """IPv6 relay targets must keep brackets when injecting the port."""
+
+    result = RelayClient._compose_relay_url('http://[2001:db8::1]', 8080)
+    assert result == 'http://[2001:db8::1]:8080'
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

@@ -207,6 +207,29 @@ def test_collect_resource_usage_windows_uses_non_blocking_interval(monkeypatch):
     assert usage['memory_percent'] == pytest.approx(73.0)
 
 
+def test_collect_resource_usage_retries_zero_windows_sample(monkeypatch):
+    """Windows sampling should retry immediately when psutil returns zero."""
+    from utils.system import resource_monitor as rm
+
+    intervals: list[float | None] = []
+
+    def fake_cpu_percent(*, interval):
+        intervals.append(interval)
+        return 0.0 if len(intervals) == 1 else 22.5
+
+    fake_memory = MagicMock(percent=61.0)
+
+    monkeypatch.setattr(rm.sys, 'platform', 'win32', raising=False)
+    monkeypatch.setattr(rm.psutil, 'cpu_percent', fake_cpu_percent)
+    monkeypatch.setattr(rm.psutil, 'virtual_memory', lambda: fake_memory)
+
+    usage = rm.collect_resource_usage()
+
+    assert intervals == [0.0, None]
+    assert usage['cpu_percent'] == pytest.approx(22.5)
+    assert usage['memory_percent'] == pytest.approx(61.0)
+
+
 def test_collect_resource_usage_linux_keeps_lazy_interval(monkeypatch):
     """Linux platforms continue using the lazy psutil sampling strategy."""
     from utils.system import resource_monitor as rm

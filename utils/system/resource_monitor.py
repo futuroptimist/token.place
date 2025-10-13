@@ -171,6 +171,16 @@ def collect_resource_usage() -> Dict[str, float | int | bool]:
 
     try:
         cpu_percent_raw = psutil.cpu_percent(interval=interval)
+        if interval == 0.0:
+            try:
+                cpu_value = float(cpu_percent_raw)
+            except Exception:
+                cpu_value = None
+            if cpu_value == 0.0:
+                try:
+                    cpu_percent_raw = psutil.cpu_percent(interval=None)
+                except Exception:
+                    pass
     except Exception:
         cpu_percent_raw = None
 

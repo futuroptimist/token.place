@@ -245,6 +245,10 @@ On Windows and macOS hosts these metrics now benefit from a non-blocking CPU sam
 avoids the initial all-zero readings returned by `psutil`. Linux retains the lazy sampling mode to
 minimise overhead while still reporting accurate utilisation.
 
+When Windows or macOS still report a zero-percent sample the collector now performs an immediate
+retry without blocking, ensuring `/metrics/resource` surfaces realistic CPU utilisation while the
+browser continues to render smoothly.
+
 ## Mobile touch optimizations
 
 The browser chat client now detects touch-capable environments and applies larger tap targets and
@@ -253,7 +257,7 @@ the desktop layout unchanged.
 
 ## Next Steps
 
-To further enhance cross-platform support, future work includes:
+Recent cross-platform improvements now cover:
 
 1. **Performance Tuning**:
    - ✅ Platform-specific performance optimizations
@@ -261,6 +265,8 @@ To further enhance cross-platform support, future work includes:
      through the `/metrics/resource` endpoint
    - ✅ Resource usage monitoring instrumentation via the Python performance monitor
      (`utils/performance/monitor.py`) and accompanying tests
+   - ✅ Instant retry on Windows and macOS when `psutil.cpu_percent` reports 0%, ensuring
+     `/metrics/resource` keeps surfacing a realistic value without blocking the UI thread
 
 2. **CI/CD Pipeline**:
    - ✅ Matrix testing across all supported platforms via `utils/testing/platform_matrix.py`

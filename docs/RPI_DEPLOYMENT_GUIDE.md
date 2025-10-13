@@ -16,7 +16,7 @@ rpi-imager --config ./imager-config.json token-place-lite.img.xz
 <summary>What’s inside the image?</summary>
 
 - created user `token`
-- authorised SSH keys (see [`../keys/`](../keys/))
+- authorised SSH keys (see the `keys/` directory in your deployment host)
 - pre-installed packages: k3s, cloudflared, docker, python3
 - systemd services: k3s, cloudflared, relay.service
 
@@ -299,7 +299,7 @@ k3sup join   --server-host pi-1.local --user token --host pi-2.local
 k3sup join   --server-host pi-1.local --user token --host pi-3.local
 ```
 
-   The [`../playbooks/site.yml`](../playbooks/site.yml) playbook provides an
+   The `playbooks/site.yml` playbook provides an
    Ansible equivalent if you prefer automation.
 
 3. **Build the relay container and load it into the cluster**

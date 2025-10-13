@@ -6,7 +6,7 @@ This document provides an overview of the token.place architecture, explaining h
 
 token.place is an end-to-end encrypted proxy service that sits between clients and AI service providers (like OpenAI, Anthropic, etc.). It ensures that the plaintext content of prompts and responses never reaches the token.place servers, while maintaining API compatibility with the original services.
 
-![Architecture Diagram](../assets/architecture_diagram.png)
+> _Architecture diagram pending asset upload._
 
 ## Key Components
 

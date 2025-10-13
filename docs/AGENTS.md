@@ -39,9 +39,11 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md#bill-of-materials): Hardware list, setup instructions, and troubleshooting tips for Raspberry Pi deployments (including rpi-clone prompt walkthrough)
 - [../llms.txt](../llms.txt): Machine-readable project summary for LLM assistants
 - [baseline.md](prompts/codex/baseline.md): Baseline prompt for routine contributions
+- [automation.md](prompts/codex/automation.md): Prompt for upkeep and chore work
 - [ci-fix.md](prompts/codex/ci-fix.md): Prompt for fixing CI failures
 - [security.md](prompts/codex/security.md): Prompt for security reviews
 - [docs.md](prompts/codex/docs.md): Prompt for doc updates
+- [polish.md](prompts/codex/polish.md): Prompt for structural polish after saturation
 
 ## User Journeys
 
@@ -119,7 +121,7 @@ For convenience, you can execute all available test suites with `./run_all_tests
 ## Configuration
 
 - [config.py](../config.py): Configuration management for different environments
-- [utils/logging/logger.py](../utils/logging/logger.py): Logging infrastructure for the application
+- [server/server_app.py](../server/server_app.py): Logging infrastructure for the application
 - [pytest.ini](../pytest.ini): Configuration for Python test suite
 - **Privacy**: Do not log plaintext or ciphertext of user messages. Remove debugging statements that could leak sensitive data.
 

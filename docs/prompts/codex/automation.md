@@ -1,9 +1,9 @@
 ---
-title: 'token.place Chore Prompt'
-slug: 'chore'
+title: 'token.place Automation Prompt'
+slug: 'automation'
 ---
 
-# token.place Chore Prompt
+# token.place Automation Prompt
 
 Use this prompt for dependency bumps, CI tweaks, or other routine upkeep in token.place.
 
@@ -26,7 +26,7 @@ REQUEST:
 3. Run the commands above to confirm checks pass.
 
 OUTPUT:
-A pull request URL describing the chore and confirming passing checks.
+A pull request URL describing the automation task and confirming passing checks.
 ```
 
 Copy this block whenever performing routine maintenance in token.place.

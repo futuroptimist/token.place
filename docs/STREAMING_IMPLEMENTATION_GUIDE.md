@@ -125,8 +125,8 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
   - `/api/v1/completions/stream`
 
 #### 3.2 Update API Documentation
-- Document the streaming APIs
-- Provide examples of client usage
+- ✅ README now includes a "streaming usage" section with SSE examples and `stream=true`
+  guidance for both `/api/v1` and `/v1` aliases.
 
 ### 4. Testing Infrastructure
 

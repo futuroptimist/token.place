@@ -44,7 +44,7 @@ A pull request describing the change and summarizing test results.
 - [Docs Update Prompt](docs.md)
 - [Feature Prompt](feature.md)
 - [Refactor Prompt](refactor.md)
-- [Chore Prompt](chore.md)
+- [Automation Prompt](automation.md)
 
 ## Implementation prompts
 

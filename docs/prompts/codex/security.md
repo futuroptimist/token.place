@@ -14,7 +14,7 @@ See also [Baseline Prompt](baseline.md) and
 SYSTEM: Automated security reviewer for token.place.
 GOAL: Harden crypto & dependency hygiene.
 CONTEXT:
-- Follow [AGENTS.md](../AGENTS.md) and [docs/AGENTS.md](AGENTS.md).
+- Follow [AGENTS.md](../../../AGENTS.md) and [docs/AGENTS.md](../../AGENTS.md).
 - Do not log plaintext or ciphertext of user messages.
 - Aim for 100% patch coverage to catch security regressions early.
 CHECKS:
@@ -25,7 +25,7 @@ CHECKS:
   - `pre-commit run --all-files`
   - `pytest -q tests/test_security.py`
   - `bandit -r . -lll`
-  - Ensure [README.md](../README.md) includes badges for Dependabot, CodeQL, and secret scanning.
+  - Ensure [README.md](../../../README.md) includes badges for Dependabot, CodeQL, and secret scanning.
 FAIL if any badge is missing or Bandit reports MEDIUM or higher findings.
 REQUEST:
 1. Run all checks.

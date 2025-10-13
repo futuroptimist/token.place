@@ -23,6 +23,10 @@ MINIMUM_SECURE_VERSIONS: Dict[str, Tuple[str, str]] = {
     "cryptography": ("41.0.4", "GHSA-hggm-jpg3-v476"),
 }
 
+_NORMALIZED_MINIMUM_SECURE_VERSIONS: Dict[str, Tuple[str, str]] = {
+    name.lower(): metadata for name, metadata in MINIMUM_SECURE_VERSIONS.items()
+}
+
 _REQUIREMENT_PATTERN = re.compile(
     r"^\s*"  # optional leading whitespace
     r"(?P<name>[A-Za-z0-9_.-]+)"  # package name
@@ -53,7 +57,7 @@ def validate_requirements(path: Path) -> List[str]:
     contents = path.read_text(encoding="utf-8").splitlines()
 
     for package, current_version in _iter_pinned_requirements(contents):
-        metadata = MINIMUM_SECURE_VERSIONS.get(package)
+        metadata = _NORMALIZED_MINIMUM_SECURE_VERSIONS.get(package.lower())
         if not metadata:
             continue
 

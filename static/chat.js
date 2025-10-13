@@ -104,6 +104,91 @@ new Vue({
                 .replace(/\s/g, '');
         },
 
+        escapeHtml(value) {
+            if (value === null || value === undefined) {
+                return '';
+            }
+
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        },
+
+        renderMarkdown(content) {
+            if (content === null || content === undefined) {
+                return '';
+            }
+
+            const raw = typeof content === 'string' ? content : String(content);
+            const codeBlocks = [];
+            let escaped = this.escapeHtml(raw);
+
+            escaped = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
+                const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+                codeBlocks.push(`<pre><code>${code.replace(/\r?\n$/, '')}</code></pre>`);
+                return token;
+            });
+
+            escaped = escaped.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
+            escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            escaped = escaped.replace(/__(.+?)__/g, '<strong>$1</strong>');
+            escaped = escaped.replace(/\*(?!\s)([^*]+?)\*/g, '<em>$1</em>');
+            escaped = escaped.replace(/_(?!\s)([^_]+?)_/g, '<em>$1</em>');
+
+            const lines = escaped.split(/\r?\n/);
+            const htmlParts = [];
+            let listBuffer = [];
+
+            const flushList = () => {
+                if (listBuffer.length === 0) {
+                    return;
+                }
+                const items = listBuffer.map((item) => `<li>${item}</li>`).join('');
+                htmlParts.push(`<ul>${items}</ul>`);
+                listBuffer = [];
+            };
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                const placeholderMatch = /^__CODE_BLOCK_(\d+)__$/.exec(trimmed);
+                if (placeholderMatch) {
+                    flushList();
+                    const idx = Number(placeholderMatch[1]);
+                    htmlParts.push(codeBlocks[idx] || '');
+                    continue;
+                }
+
+                const listMatch = /^[-*]\s+(.*)$/.exec(trimmed);
+                if (listMatch) {
+                    listBuffer.push(listMatch[1]);
+                    continue;
+                }
+
+                flushList();
+
+                if (trimmed.length === 0) {
+                    htmlParts.push('<br>');
+                    continue;
+                }
+
+                htmlParts.push(trimmed);
+            }
+
+            flushList();
+
+            let html = htmlParts.join('<br>');
+            html = html.replace(/(<br>)+/g, '<br>');
+            html = html.replace(/<br><ul>/g, '<ul>');
+            html = html.replace(/<\/ul><br>/g, '</ul>');
+            html = html.replace(/<br><pre>/g, '<pre>');
+            html = html.replace(/<\/pre><br>/g, '</pre>');
+
+            return html;
+        },
+
         handleMessageKeydown(event) {
             if (event.key !== 'Enter') {
                 return;

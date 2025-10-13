@@ -115,7 +115,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 #### 2.2 UI Updates
 - Modify the UI to handle incremental updates
 - Implement a typing effect for a better user experience
-- Add support for rendering markdown/formatting as it arrives
+- ✅ Added support for rendering markdown/formatting as it arrives via a sanitized renderer in the chat UI
 
 ### 3. API Endpoints
 

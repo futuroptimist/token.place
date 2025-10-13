@@ -207,6 +207,89 @@ def test_collect_resource_usage_windows_uses_non_blocking_interval(monkeypatch):
     assert usage['memory_percent'] == pytest.approx(73.0)
 
 
+def test_collect_resource_usage_retries_zero_windows_sample(monkeypatch):
+    """Windows sampling should retry immediately when psutil returns zero."""
+    from utils.system import resource_monitor as rm
+
+    intervals: list[float | None] = []
+
+    def fake_cpu_percent(*, interval):
+        intervals.append(interval)
+        return 0.0 if len(intervals) == 1 else 22.5
+
+    fake_memory = MagicMock(percent=61.0)
+
+    monkeypatch.setattr(rm.sys, 'platform', 'win32', raising=False)
+    monkeypatch.setattr(rm.psutil, 'cpu_percent', fake_cpu_percent)
+    monkeypatch.setattr(rm.psutil, 'virtual_memory', lambda: fake_memory)
+
+    usage = rm.collect_resource_usage()
+
+    assert intervals == [0.0, None]
+    assert usage['cpu_percent'] == pytest.approx(22.5)
+    assert usage['memory_percent'] == pytest.approx(61.0)
+
+
+def test_collect_resource_usage_windows_handles_non_numeric_retry(monkeypatch):
+    """Non-numeric first samples should not prevent metric collection."""
+    from utils.system import resource_monitor as rm
+
+    intervals: list[float | None] = []
+
+    class FlakyValue:
+        def __init__(self):
+            self.calls = 0
+
+        def __float__(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("boom")
+            return 11.0
+
+    flaky_value = FlakyValue()
+
+    def fake_cpu_percent(*, interval):
+        intervals.append(interval)
+        return flaky_value
+
+    fake_memory = MagicMock(percent=58.0)
+
+    monkeypatch.setattr(rm.sys, 'platform', 'win32', raising=False)
+    monkeypatch.setattr(rm.psutil, 'cpu_percent', fake_cpu_percent)
+    monkeypatch.setattr(rm.psutil, 'virtual_memory', lambda: fake_memory)
+
+    usage = rm.collect_resource_usage()
+
+    assert intervals == [0.0]
+    assert usage['cpu_percent'] == pytest.approx(11.0)
+    assert usage['memory_percent'] == pytest.approx(58.0)
+
+
+def test_collect_resource_usage_windows_handles_retry_errors(monkeypatch):
+    """Errors during the immediate retry should be swallowed."""
+    from utils.system import resource_monitor as rm
+
+    intervals: list[float | None] = []
+
+    def fake_cpu_percent(*, interval):
+        intervals.append(interval)
+        if len(intervals) == 1:
+            return 0.0
+        raise RuntimeError("no sample")
+
+    fake_memory = MagicMock(percent=49.0)
+
+    monkeypatch.setattr(rm.sys, 'platform', 'win32', raising=False)
+    monkeypatch.setattr(rm.psutil, 'cpu_percent', fake_cpu_percent)
+    monkeypatch.setattr(rm.psutil, 'virtual_memory', lambda: fake_memory)
+
+    usage = rm.collect_resource_usage()
+
+    assert intervals == [0.0, None]
+    assert usage['cpu_percent'] == pytest.approx(0.0)
+    assert usage['memory_percent'] == pytest.approx(49.0)
+
+
 def test_collect_resource_usage_linux_keeps_lazy_interval(monkeypatch):
     """Linux platforms continue using the lazy psutil sampling strategy."""
     from utils.system import resource_monitor as rm

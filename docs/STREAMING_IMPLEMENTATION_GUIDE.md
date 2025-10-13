@@ -74,7 +74,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 ### 2. Client-side Changes
 
 #### 2.1 Streaming API Client
-- Implement a streaming client that can process chunks
+- ✅ Implemented streaming client chunk processing via `CryptoClient.stream_chat_completion`
 - Add support for handling and decrypting streaming data
 - Example:
   ```javascript

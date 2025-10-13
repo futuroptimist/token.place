@@ -165,6 +165,24 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     assert len(data['choices'][0]['message']['content']) > 0
     assert 'Mock response' in data['choices'][0]['message']['content']
 
+
+def test_chat_completion_rejects_empty_messages(client):
+    """Empty chat message arrays should be rejected as invalid input."""
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [],
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+    assert response.status_code == 400
+
+    error = response.get_json()
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"].get("param") == "messages"
+    assert error["error"]["message"] == "messages must contain at least one item"
+
+
 def test_encrypted_chat_completion(client, client_keys, mock_llama):
     """Test the chat completion API with encryption"""
     # Get the server's public key

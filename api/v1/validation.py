@@ -243,6 +243,9 @@ def validate_chat_messages(messages: List[Dict[str, Any]]) -> None:
     if not isinstance(messages, list):
         raise ValidationError("messages must be an array", field="messages")
 
+    if not messages:
+        raise ValidationError("messages must contain at least one item", field="messages")
+
     for i, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValidationError(

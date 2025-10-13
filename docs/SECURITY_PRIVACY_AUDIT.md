@@ -93,13 +93,35 @@ Refined logging helpers to avoid swallowing system interrupt exceptions.
 ### [2025-10-10] - commit TBD
 
 **Summary**
-Integrated automated static analysis to provide a repeatable external security review signal during CI runs.
+Integrated automated static analysis to provide a repeatable external security
+review signal during CI runs.
 
 **Completed Improvements**
-- Added a pytest-backed Bandit scan (`tests/test_security_bandit.py`) that enforces zero medium/high severity findings.
-- Configured the relay client's networking helpers to use explicit request timeouts and stricter unspecified-host detection.
-- Registered a `security` pytest marker so the scan can be targeted independently when triaging failures.
+- Added a pytest-backed Bandit scan (`tests/test_security_bandit.py`) that enforces zero
+  medium/high severity findings.
+- Configured the relay client's networking helpers to use explicit request timeouts and
+  stricter unspecified-host detection.
+- Registered a `security` pytest marker so the scan can be targeted independently when
+  triaging failures.
 
 **Recommendations**
-- Extend automated checks with dependency vulnerability auditing (e.g., `pip-audit`) for broader coverage.
-- Periodically supplement automated scans with human-led reviews to capture logic flaws beyond static analysis.
+- Periodically supplement automated scans with human-led reviews to capture logic flaws
+  beyond static analysis.
+
+### [2025-10-30] - commit TBD
+
+**Summary**
+Closed the outstanding dependency-audit action item by introducing a lightweight
+requirements baseline check.
+
+**Completed Improvements**
+- Added `utils/security/dependency_audit.py` plus regression tests to enforce minimum
+  secure versions for high-risk dependencies such as `requests`, `urllib3`, `Flask`,
+  `httpx`, and `cryptography`.
+- Wired the helper into the pytest suite via `tests/unit/test_dependency_audit.py`,
+  ensuring regressions are caught in CI.
+
+**Recommendations**
+- Expand the baseline map as new advisories land or additional dependencies join the project.
+- Continue monitoring automated feeds (e.g., GitHub Security Advisories) for
+  ecosystem-wide alerts beyond the covered packages.

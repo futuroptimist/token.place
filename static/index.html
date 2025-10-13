@@ -318,7 +318,7 @@
         <h2>Try it out:</h2>
         <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
-                <span v-html="message.content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>').replace(/```(.*?)```/gs, '<pre><code>$1</code></pre>')"></span>
+                <span v-html="renderMarkdown(message.content)"></span>
             </div>
             <div class="input-container">
                 <textarea

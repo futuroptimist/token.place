@@ -1,3 +1,4 @@
+import json
 import pytest
 from playwright.sync_api import Page
 import time
@@ -70,3 +71,55 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
     print("✓ Vue app initialization verified")
 
 # Add more E2E tests here as the UI evolves
+
+
+def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
+    """The chat UI should render markdown formatting returned by the assistant."""
+
+    markdown_reply = "**Bold** introduction\n\n- First item\n- Second item\n\nHere is `inline` code and:\n```\nblock example\n```"
+
+    def handle_chat_request(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": markdown_reply,
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    page.route("**/api/v1/chat/completions", handle_chat_request)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("Show markdown please")
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+
+    assert assistant_message.locator("strong").inner_text() == "Bold"
+
+    list_items = assistant_message.locator("li")
+    assert list_items.count() == 2
+    assert list_items.nth(0).inner_text() == "First item"
+    assert list_items.nth(1).inner_text() == "Second item"
+
+    inline_code = assistant_message.locator("code").first
+    assert inline_code.inner_text() == "inline"
+
+    block_code = assistant_message.locator("pre code").first
+    assert "block example" in block_code.inner_text()
+
+    # Ensure raw HTML isn't rendered unsanitized
+    assert assistant_message.locator("script").count() == 0

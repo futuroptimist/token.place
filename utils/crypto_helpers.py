@@ -30,7 +30,7 @@ import json
 import base64
 import requests
 import logging
-from typing import Dict, Tuple, Any, List, Optional, Union
+from typing import Dict, Tuple, Any, List, Optional, Union, Iterator
 import time
 
 # Import encryption functions
@@ -514,3 +514,114 @@ class CryptoClient:
             list(response.keys()) if isinstance(response, dict) else type(response).__name__,
         )
         return None
+
+    def stream_chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model: str = 'llama-3-8b-instruct',
+        endpoint: str = '/api/v1/chat/completions',
+        timeout: float = 30,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield Server-Sent Event chunks from a streaming chat completion request.
+
+        The helper issues a plaintext OpenAI-compatible request with ``stream=True`` and
+        parses ``text/event-stream`` responses into dictionaries. When the server falls
+        back to a standard JSON payload (e.g. because encryption was requested), the
+        iterator yields a single ``{"event": "response", "data": ...}`` entry.
+
+        Args:
+            messages: Ordered chat history to send to the model.
+            model: Model identifier to include with the request.
+            endpoint: API endpoint relative to ``self.base_url``.
+            timeout: Timeout in seconds applied to the initial request.
+
+        Returns:
+            An iterator that yields dictionaries describing each streaming update.
+        """
+
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty list of chat entries")
+        if any(not isinstance(entry, dict) for entry in messages):
+            raise TypeError("each message must be a dictionary")
+
+        payload = {
+            'model': model,
+            'messages': messages,
+            'stream': True,
+        }
+        full_url = f"{self.base_url}{endpoint}"
+        logger.debug("Starting streaming chat completion at %s", full_url)
+
+        try:
+            response = requests.post(
+                full_url,
+                json=payload,
+                timeout=timeout,
+                stream=True,
+            )
+        except requests.RequestException as exc:  # pragma: no cover - defensive
+            logger.error(
+                "Streaming request failed: %s", exc.__class__.__name__, exc_info=self.debug
+            )
+            return iter(())
+
+        content_type = response.headers.get('Content-Type', '')
+        is_event_stream = 'text/event-stream' in content_type.lower()
+
+        def _iter_chunks() -> Iterator[Dict[str, Any]]:
+            try:
+                if response.status_code != 200:
+                    logger.error(
+                        "Streaming request returned unexpected status: %s",
+                        response.status_code,
+                    )
+                    yield {
+                        'event': 'error',
+                        'data': {'status': response.status_code},
+                    }
+                    return
+
+                if not is_event_stream:
+                    logger.debug(
+                        "Non-streaming response received with content-type %s",
+                        content_type,
+                    )
+                    try:
+                        data = response.json()
+                        yield {'event': 'response', 'data': data}
+                    except ValueError:
+                        body_text = getattr(response, 'text', '')
+                        if body_text:
+                            yield {'event': 'text', 'data': body_text}
+                    return
+
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if raw_line is None:
+                        continue
+                    if isinstance(raw_line, bytes):
+                        try:
+                            line = raw_line.decode('utf-8').strip()
+                        except UnicodeDecodeError:
+                            logger.debug("Dropping undecodable chunk: %s", raw_line)
+                            continue
+                    else:
+                        line = raw_line.strip()
+                    if not line or not line.startswith('data:'):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str:
+                        continue
+                    if data_str == '[DONE]':
+                        logger.debug("Received stream terminator")
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        yield {'event': 'chunk', 'data': chunk}
+                    except json.JSONDecodeError:
+                        logger.debug("Ignoring malformed streaming chunk: %s", data_str)
+                        yield {'event': 'text', 'data': data_str}
+            finally:
+                response.close()
+
+        return _iter_chunks()

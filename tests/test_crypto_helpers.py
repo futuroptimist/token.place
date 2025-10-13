@@ -191,3 +191,69 @@ def test_send_chat_message(_mock_time, mock_requests):
         assert len(response) == 2
         assert response[0]['role'] == 'user'
         assert response[1]['role'] == 'assistant'
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_yields_chunks(mock_post):
+    """Streaming helper should yield parsed SSE chunks in order."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream; charset=utf-8"}
+    mock_response.iter_lines.return_value = iter([
+        b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n',
+        b'data: {"choices": [{"delta": {"content": "Hi there!"}}]}\n',
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_post.assert_called_with(
+        'https://stream.test/api/v1/chat/completions',
+        json={
+            'model': 'llama-3-8b-instruct',
+            'messages': messages,
+            'stream': True,
+        },
+        timeout=30,
+        stream=True,
+    )
+
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': {'choices': [{'delta': {'role': 'assistant'}}]},
+        },
+        {
+            'event': 'chunk',
+            'data': {'choices': [{'delta': {'content': 'Hi there!'}}]},
+        },
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_handles_json_fallback(mock_post):
+    """If the server falls back to JSON, expose the parsed payload once."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "application/json"}
+    mock_response.json.return_value = {"choices": [{"message": {"content": "done"}}]}
+    mock_response.text = json.dumps(mock_response.json.return_value)
+    mock_post.return_value = mock_response
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    assert chunks == [
+        {
+            'event': 'response',
+            'data': {"choices": [{"message": {"content": "done"}}]},
+        }
+    ]

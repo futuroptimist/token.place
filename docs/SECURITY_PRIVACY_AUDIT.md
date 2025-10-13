@@ -39,11 +39,12 @@ Initial audit establishing baseline security and privacy posture.
 - Verified correct implementation of the RSA–AES hybrid encryption scheme.
 - Ensured proper handling of encryption keys and secure transmission.
 - Improved test reliability by explicitly passing mock LLM flags and fixing encoding issues.
+- Hardened chat completion validation to reject empty message arrays, closing the open
+  input-validation recommendation.
 
 **Recommendations**
 - Add rate limiting to protect against DoS attacks.
 - Move sensitive configuration values to environment variables.
-- Enhance input validation for all API endpoints.
 - Streaming implementation delivered (2025-09-30); continue planning for key rotation and a dedicated cryptographic audit.
 - Consider zero-knowledge architecture, formal verification, and an external security review.
 

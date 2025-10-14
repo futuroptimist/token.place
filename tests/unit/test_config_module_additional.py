@@ -84,3 +84,7 @@ def test_typed_section_views(tmp_path, monkeypatch):
     assert cfg.server_settings['port'] == cfg.get('server.port')
     assert cfg.relay_settings['server_url'] == cfg.get('relay.server_url')
     assert 'data_dir' in cfg.paths_settings
+    assert cfg.api_settings['relay_url'] == cfg.get('api.relay_url')
+    assert cfg.security_settings['encryption_enabled'] == cfg.get('security.encryption_enabled')
+    assert cfg.model_settings['default_model'] == cfg.get('model.default_model')
+    assert cfg.constants['MB'] == cfg.get('constants.MB')

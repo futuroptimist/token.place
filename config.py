@@ -9,8 +9,20 @@ import platform
 import json
 import logging
 import copy
-from typing import Dict, Any, List, Optional
-from pathlib import Path
+from typing import Any, Dict, List, Optional, cast
+
+from utils.config_schema import (
+    APISettings,
+    AppConfig,
+    ConstantsSettings,
+    DEFAULT_CONFIG,
+    ENV_OVERRIDES,
+    ModelSettings,
+    PathsSettings,
+    RelaySettings,
+    SecuritySettings,
+    ServerSettings,
+)
 
 # Global constants for platform detection
 IS_WINDOWS = platform.system().lower() == "windows"
@@ -23,127 +35,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('config')
-
-# Default configuration values
-DEFAULT_CONFIG = {
-    # Server settings
-    'server': {
-        'host': '127.0.0.1',
-        'port': 5000,
-        'debug': False,
-        'workers': 4,
-        'timeout': 30,
-        'base_url': 'http://localhost',
-    },
-
-    # Relay settings
-    'relay': {
-        'host': '127.0.0.1',
-        'port': 5000,
-        'server_url': 'http://localhost:5000',
-        'server_pool': [],
-        'server_pool_secondary': [],
-        'workers': 2,
-        'additional_servers': [],
-        'server_registration_token': None,
-        'cluster_only': False,
-        'cloudflare_fallback_urls': [],
-    },
-
-    # API settings
-    'api': {
-        'host': '127.0.0.1',
-        'port': 3000,
-        'relay_url': 'http://localhost:5000',
-        'cors_origins': ['*'],
-    },
-
-    # Security settings
-    'security': {
-        'encryption_enabled': True,
-        'key_size': 2048,
-        'key_expiry_days': 30,
-    },
-
-    # Data paths (these will be overridden based on platform)
-    'paths': {
-        'data_dir': '',  # Will be set based on platform
-        'models_dir': '', # Will be set based on platform
-        'logs_dir': '',  # Will be set based on platform
-        'cache_dir': '',  # Will be set based on platform
-        'keys_dir': '',  # Will be set based on platform
-    },
-
-    # Model settings
-    'model': {
-        'default_model': 'gpt-5-chat-latest',
-        'fallback_model': 'gpt-5-chat-latest',
-        'temperature': 0.7,
-        'max_tokens': 1000,
-        'use_mock': False,
-        'filename': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
-        'url': (
-            'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/'
-            'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
-        ),
-        'context_size': 8192,
-        'chat_format': 'llama-3',
-        'download_chunk_size_mb': 10,
-    },
-
-    # Helper constants
-    'constants': {
-        'KB': 1024,
-        'MB': 1024 * 1024,
-        'GB': 1024 * 1024 * 1024,
-    },
-}
-
-# Environment-specific overrides
-ENV_OVERRIDES = {
-    'development': {
-        'server': {
-            'debug': True,
-        },
-        'security': {
-            'encryption_enabled': True,
-        },
-    },
-    'testing': {
-        'server': {
-            'debug': True,
-            'port': 8001,
-        },
-        'relay': {
-            'port': 5001,
-            'server_url': 'http://localhost:8001',
-        },
-        'api': {
-            'port': 3001,
-            'relay_url': 'http://localhost:5001',
-        },
-        'security': {
-            'encryption_enabled': True,
-            'key_size': 1024,  # Smaller keys for faster testing
-        },
-    },
-    'production': {
-        'server': {
-            'debug': False,
-            'workers': 8,
-            'host': os.environ.get('PROD_SERVER_HOST', '127.0.0.1'),
-        },
-        'relay': {
-            'host': os.environ.get('PROD_RELAY_HOST', '127.0.0.1'),
-        },
-        'api': {
-            'host': os.environ.get('PROD_API_HOST', '127.0.0.1'),
-        },
-        'security': {
-            'encryption_enabled': True,
-        },
-    },
-}
 
 class Config:
     """Configuration manager for token.place"""
@@ -161,11 +52,16 @@ class Config:
         self.platform = os.environ.get('PLATFORM', platform.system().lower())
 
         # Load base configuration using a deep copy to avoid mutating DEFAULT_CONFIG
-        self.config = copy.deepcopy(DEFAULT_CONFIG)
+        self.config: AppConfig = copy.deepcopy(DEFAULT_CONFIG)
 
         # Apply environment-specific overrides
         if self.env in ENV_OVERRIDES:
-            self._merge_configs(self.config, ENV_OVERRIDES[self.env])
+            # Copy to avoid mutating the shared override dictionaries when we patch
+            # production values with environment variables in _apply_runtime_env_overrides.
+            overrides = copy.deepcopy(ENV_OVERRIDES[self.env])
+            if self.env == "production":
+                self._apply_production_defaults(overrides)
+            self._merge_configs(self.config, overrides)
 
         # Set platform-specific paths
         self._configure_platform_paths()
@@ -265,6 +161,18 @@ class Config:
                 )
 
         self._normalise_relay_server_pool()
+
+    def _apply_production_defaults(self, overrides: Dict[str, Any]) -> None:
+        """Populate production overrides with environment aware defaults."""
+
+        server_overrides = overrides.setdefault('server', {})
+        server_overrides.setdefault('host', os.environ.get('PROD_SERVER_HOST', '127.0.0.1'))
+
+        relay_overrides = overrides.setdefault('relay', {})
+        relay_overrides.setdefault('host', os.environ.get('PROD_RELAY_HOST', '127.0.0.1'))
+
+        api_overrides = overrides.setdefault('api', {})
+        api_overrides.setdefault('host', os.environ.get('PROD_API_HOST', '127.0.0.1'))
 
     def _gather_configured_relay_upstreams(self) -> List[str]:
         """Collect relay upstream URLs from supported environment variables."""
@@ -476,6 +384,38 @@ class Config:
     def is_production(self) -> bool:
         """Check if the current environment is production"""
         return self.env == 'production'
+
+    # ------------------------------------------------------------------
+    # Typed section helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def server_settings(self) -> ServerSettings:
+        return cast(ServerSettings, self.config['server'])
+
+    @property
+    def relay_settings(self) -> RelaySettings:
+        return cast(RelaySettings, self.config['relay'])
+
+    @property
+    def api_settings(self) -> APISettings:
+        return cast(APISettings, self.config['api'])
+
+    @property
+    def security_settings(self) -> SecuritySettings:
+        return cast(SecuritySettings, self.config['security'])
+
+    @property
+    def paths_settings(self) -> PathsSettings:
+        return cast(PathsSettings, self.config['paths'])
+
+    @property
+    def model_settings(self) -> ModelSettings:
+        return cast(ModelSettings, self.config['model'])
+
+    @property
+    def constants(self) -> ConstantsSettings:
+        return cast(ConstantsSettings, self.config['constants'])
 
 # Create a global config instance
 config = Config()

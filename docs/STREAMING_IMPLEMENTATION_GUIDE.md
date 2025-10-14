@@ -2,7 +2,7 @@
 
 This guide outlines the steps required to implement streaming inference in the token.place application, allowing users to see responses as they are generated.
 
-> **Status update (2025-09-30):** `/api/v1/chat/completions` now supports Server-Sent Events when the `stream` flag is provided. The Flask route sends role, content, and completion markers so plaintext clients receive incremental updates without waiting for the full JSON payload. The remaining sections continue to track work for true token-by-token generation, relay integration, and encrypted streaming.
+> **Status update (2025-09-30):** `/api/v2/chat/completions` now supports Server-Sent Events when the `stream` flag is provided. The Flask route sends role, content, and completion markers so plaintext clients receive incremental updates without waiting for the full JSON payload. The remaining sections continue to track work for true token-by-token generation, relay integration, and encrypted streaming.
 
 ## Architecture Overview
 
@@ -20,7 +20,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 
 ### 1. Server-side Changes
 
-- ✅ `/api/v1/chat/completions` streams plaintext responses via SSE (role + content + stop markers) when `stream=true`.
+- ✅ `/api/v2/chat/completions` streams plaintext responses via SSE (role + content + stop markers) when `stream=true`.
 
 #### 1.1 LLM Integration
 - Modify `llama_cpp_get_response` to use the streaming mode of llama-cpp-python

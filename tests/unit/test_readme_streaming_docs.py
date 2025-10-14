@@ -14,3 +14,6 @@ def test_readme_streaming_section_exists():
     assert (
         "server-sent events" in readme_text or "sse" in readme_text
     ), "README should reference Server-Sent Events handling for streaming"
+    assert "/api/v2/chat/completions" in readme_text, (
+        "README must document that streaming support starts with the API v2 chat completions"
+    )

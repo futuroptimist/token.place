@@ -212,6 +212,65 @@ For a quick orientation to the repository layout and key docs, see [docs/ONBOARD
   - [x] Contribution system for donating compute resources
   - [x] Contribution summary endpoint for maintainers
 
+## streaming usage
+
+token.place supports server-sent events (sse) for plaintext requests starting with the api v2
+chat completions endpoints. when the `stream` flag is set to `true`, the
+`/api/v2/chat/completions` and `/v2/chat/completions` routes emit incremental chunks that match
+openai's event format so existing clients can subscribe without code changes.
+
+> ⚠️ encrypted chat payloads currently fall back to the standard json response
+> while we continue hardening end-to-end encrypted streaming.
+> ⚠️ api v1 chat endpoints continue to return full json responses even when `stream=true`.
+
+### example curl request
+
+```bash
+curl \
+  -N \
+  -H "content-type: application/json" \
+  -H "authorization: bearer $TOKEN_PLACE_API_KEY" \
+  -d '{
+        "model": "gpt-5-chat-latest",
+        "stream": true,
+        "messages": [
+          {"role": "user", "content": "summarize the roadmap"}
+        ]
+      }' \
+  http://localhost:5050/api/v2/chat/completions
+```
+
+### consuming the stream in python
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:5050/v2/chat/completions",
+    headers={"Authorization": "Bearer $TOKEN_PLACE_API_KEY"},
+    json={
+        "model": "gpt-5-chat-latest",
+        "stream": True,
+        "messages": [{"role": "user", "content": "give me a streaming demo"}],
+    },
+    stream=True,
+    timeout=30,
+)
+
+for line in response.iter_lines():
+    if not line:
+        continue
+    if line.startswith(b"data: "):
+        payload = line.removeprefix(b"data: ")
+        if payload == b"[DONE]":
+            break
+        print(payload.decode("utf-8"))
+```
+
+each chunk includes the role delta, message content, optional tool calls, and a
+final `[DONE]` marker. clients can accumulate the `delta.content` strings to
+display streaming completions in their ui.
+
 ## installation
 
 ### virtual environment

@@ -617,6 +617,37 @@ class CryptoClient:
                         break
                     try:
                         chunk = json.loads(data_str)
+                        if isinstance(chunk, dict):
+                            event_name = chunk.get('event', 'chunk')
+
+                            encrypted_body = None
+                            if chunk.get('encrypted') is True:
+                                encrypted_body = chunk.get('data')
+                            elif isinstance(chunk.get('data'), dict) and chunk['data'].get('encrypted') is True:
+                                encrypted_body = chunk['data'].get('data')
+                                event_name = chunk.get('event', event_name)
+
+                            if encrypted_body is not None:
+                                if not isinstance(encrypted_body, dict):
+                                    logger.error("Encrypted streaming chunk missing payload")
+                                    yield {
+                                        'event': 'error',
+                                        'data': {'reason': 'invalid_encrypted_chunk'},
+                                    }
+                                    continue
+
+                                decrypted_payload = self.decrypt_message(encrypted_body)
+                                if decrypted_payload is None:
+                                    logger.error("Failed to decrypt streaming chunk")
+                                    yield {
+                                        'event': 'error',
+                                        'data': {'reason': 'decrypt_failed'},
+                                    }
+                                    continue
+
+                                yield {'event': event_name, 'data': decrypted_payload}
+                                continue
+
                         yield {'event': 'chunk', 'data': chunk}
                     except json.JSONDecodeError:
                         logger.debug("Ignoring malformed streaming chunk: %s", data_str)

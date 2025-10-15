@@ -296,7 +296,7 @@ def test_stream_chat_completion_decrypts_encrypted_chunks(mock_post):
 
 
 @patch('utils.crypto_helpers.requests.post')
-def test_stream_chat_completion_decrypts_nested_encrypted_payload(mock_post):
+def test_stream_chat_completion_decrypts_flat_encrypted_payload(mock_post):
     """Decrypt when the encrypted payload lives directly under `data`."""
 
     client = CryptoClient('https://stream.test')
@@ -314,6 +314,47 @@ def test_stream_chat_completion_decrypts_nested_encrypted_payload(mock_post):
     mock_response.headers = {"Content-Type": "text/event-stream"}
     mock_response.iter_lines.return_value = iter([
         f"data: {json.dumps({'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    decrypted_chunk = {'choices': [{'delta': {'content': 'Hi there!'}}]}
+
+    with patch.object(client, 'decrypt_message', return_value=decrypted_chunk) as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': decrypted_chunk,
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_decrypts_nested_encrypted_payload(mock_post):
+    """Decrypt when the encrypted payload is nested under an inner `data` key."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'ciphertext': 'c2VjcmV0',
+        'cipherkey': 'a2V5',
+        'iv': 'aXY='
+    }
+
+    nested_encrypted_body = {
+        'encrypted': True,
+        'data': encrypted_payload,
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'data': nested_encrypted_body})}\n".encode(),
         b'data: [DONE]\n',
     ])
     mock_post.return_value = mock_response

@@ -444,6 +444,43 @@ def test_v1_streaming_chat_completion_with_tool_calls(client, mocker):
     assert choice["finish_reason"] == "tool_calls"
 
 
+def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch):
+    """Alias identifiers should execute against the canonical model entry."""
+
+    monkeypatch.setattr(
+        "api.v1.routes.get_models_info",
+        lambda: [{"id": "llama-3-8b-instruct"}],
+    )
+    monkeypatch.setattr("api.v1.routes.validate_model_name", lambda *a, **k: None)
+    monkeypatch.setattr("api.v1.routes.get_model_instance", lambda model_id: object())
+    monkeypatch.setattr("api.v1.routes.validate_chat_messages", lambda msgs: None)
+
+    captured = {}
+
+    def fake_generate_response(model_id, messages, **model_options):
+        captured["model_id"] = model_id
+        return messages + [
+            {"role": "assistant", "content": "Alias resolved response"}
+        ]
+
+    monkeypatch.setattr("api.v1.routes.generate_response", fake_generate_response)
+
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.is_json
+
+    body = response.get_json()
+    assert body["model"] == "gpt-3.5-turbo"
+    assert captured["model_id"] == "llama-3-8b-instruct"
+    assert body["choices"][0]["message"]["content"] == "Alias resolved response"
+
+
 def test_streaming_chat_completion(client, mock_llama):
     """Streaming chat completions should return Server-Sent Events chunks."""
 

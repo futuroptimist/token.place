@@ -6,7 +6,31 @@ This document provides an overview of the token.place architecture, explaining h
 
 token.place is an end-to-end encrypted proxy service that sits between clients and AI service providers (like OpenAI, Anthropic, etc.). It ensures that the plaintext content of prompts and responses never reaches the token.place servers, while maintaining API compatibility with the original services.
 
-> _Architecture diagram pending asset upload._
+```mermaid
+flowchart TD
+    user([End user])
+    clientApp[Client app<br/>(browser, CLI, SDK)]
+    cryptoClient[Local crypto helpers]
+    relay[(Relay cluster)]
+    server[server.py
+    token.place core]
+    provider[(AI provider)]
+
+    user --> clientApp
+    clientApp --> cryptoClient
+    cryptoClient -->|Encrypt request| relay
+    relay -->|Forward ciphertext| server
+    server -->|Proxy API call| provider
+    provider -->|Model response| server
+    server -->|Encrypted reply| relay
+    relay -->|Opaque ciphertext| cryptoClient
+    cryptoClient -->|Decrypt for user| clientApp
+```
+
+The diagram highlights how token.place keeps ciphertext opaque to relays and the core server while
+still proxying OpenAI-compatible API calls. Client-side helpers handle key generation and message
+encryption, relays forward ciphertext, and the server maintains compatibility with downstream AI
+providers without seeing plaintext content.
 
 ## Key Components
 

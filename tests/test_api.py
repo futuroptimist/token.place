@@ -365,7 +365,7 @@ def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_l
 
 
 def test_v1_streaming_chat_completion(client, mock_llama):
-    """API v1 should support streaming SSE responses for chat completions."""
+    """API v1 should ignore stream flags and return JSON chat responses."""
 
     payload = {
         "model": "llama-3-8b-instruct",
@@ -379,29 +379,16 @@ def test_v1_streaming_chat_completion(client, mock_llama):
     response = client.post("/api/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
-    assert response.headers["Content-Type"].startswith("text/event-stream")
+    assert response.is_json
 
-    events = []
-    for raw_chunk in response.iter_encoded():
-        text = raw_chunk.decode("utf-8")
-        if not text.strip():
-            continue
-        assert text.startswith("data: ")
-        events.append(text[len("data: "):].strip())
-
-    assert events[-1] == "[DONE]"
-
-    role_event = json.loads(events[0])
-    content_event = json.loads(events[1])
-    stop_event = json.loads(events[2])
-
-    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
-    assert "Mock response" in content_event["choices"][0]["delta"]["content"]
-    assert stop_event["choices"][0]["finish_reason"] == "stop"
+    payload = response.get_json()
+    assert payload["choices"][0]["message"]["role"] == "assistant"
+    assert "Mock response" in payload["choices"][0]["message"]["content"]
+    assert payload["choices"][0]["finish_reason"] == "stop"
 
 
 def test_v1_streaming_chat_completion_with_tool_calls(client, mocker):
-    """Streaming responses should include tool call deltas and finish as tool_calls."""
+    """JSON responses should still surface tool calls when stream is requested."""
 
     payload = {
         "model": "llama-3-8b-instruct",
@@ -437,27 +424,61 @@ def test_v1_streaming_chat_completion_with_tool_calls(client, mocker):
     response = client.post("/api/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
-    assert response.headers["Content-Type"].startswith("text/event-stream")
+    assert response.is_json
 
-    chunks = [chunk.decode("utf-8") for chunk in response.iter_encoded() if chunk.strip()]
+    body = response.get_json()
+    choice = body["choices"][0]
+    assert choice["message"]["role"] == "assistant"
+    assert choice["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "math.add", "arguments": "{\"a\": 1, \"b\": 2}"},
+        },
+        {
+            "id": "call_2",
+            "type": "function",
+            "function": "unexpected-structure",
+        },
+    ]
+    assert choice["finish_reason"] == "tool_calls"
 
-    assert chunks[-1].strip() == "data: [DONE]"
 
-    role_event = json.loads(chunks[0][len("data: "):])
-    tool_event_first = json.loads(chunks[1][len("data: "):])
-    tool_event_second = json.loads(chunks[2][len("data: "):])
-    stop_event = json.loads(chunks[3][len("data: "):])
+def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch):
+    """Alias identifiers should execute against the canonical model entry."""
 
-    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
+    monkeypatch.setattr(
+        "api.v1.routes.get_models_info",
+        lambda: [{"id": "llama-3-8b-instruct"}],
+    )
+    monkeypatch.setattr("api.v1.routes.validate_model_name", lambda *a, **k: None)
+    monkeypatch.setattr("api.v1.routes.get_model_instance", lambda model_id: object())
+    monkeypatch.setattr("api.v1.routes.validate_chat_messages", lambda msgs: None)
 
-    first_call = tool_event_first["choices"][0]["delta"]["tool_calls"][0]
-    assert first_call["function"]["name"] == "math.add"
-    assert "\"a\"" in first_call["function"]["arguments"]
+    captured = {}
 
-    second_call = tool_event_second["choices"][0]["delta"]["tool_calls"][0]
-    assert second_call["function"] == {"name": None, "arguments": ""}
+    def fake_generate_response(model_id, messages, **model_options):
+        captured["model_id"] = model_id
+        return messages + [
+            {"role": "assistant", "content": "Alias resolved response"}
+        ]
 
-    assert stop_event["choices"][0]["finish_reason"] == "tool_calls"
+    monkeypatch.setattr("api.v1.routes.generate_response", fake_generate_response)
+
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.is_json
+
+    body = response.get_json()
+    assert body["model"] == "gpt-3.5-turbo"
+    assert captured["model_id"] == "llama-3-8b-instruct"
+    assert body["choices"][0]["message"]["content"] == "Alias resolved response"
 
 
 def test_streaming_chat_completion(client, mock_llama):

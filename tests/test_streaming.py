@@ -219,3 +219,35 @@ def test_v1_stream_flag_is_ignored(client, monkeypatch):
     assert response.status_code == 200
     assert response.is_json
     assert response.get_json()["choices"][0]["message"]["content"] == "Hello"
+
+
+def test_v1_text_completion_stream_flag_is_ignored(client, monkeypatch):
+    """Legacy completions should ignore stream flags and return JSON."""
+
+    monkeypatch.setattr(v1_routes, "get_models_info", lambda: [{"id": "text-davinci-003"}])
+    monkeypatch.setattr(v1_routes, "validate_model_name", lambda *a, **k: None)
+    monkeypatch.setattr(v1_routes, "validate_required_fields", lambda *a, **k: None)
+    monkeypatch.setattr(v1_routes, "validate_field_type", lambda *a, **k: None)
+    monkeypatch.setattr(v1_routes, "validate_chat_messages", lambda *a, **k: None)
+    monkeypatch.setattr(v1_routes, "get_model_instance", lambda model_id: object())
+
+    def fake_generate_response(model_id, messages, **model_options):
+        assert model_id == "text-davinci-003"
+        assert model_options == {}
+        assert messages[-1]["content"] == "Write a haiku"
+        return messages + [{"role": "assistant", "content": "Five syllables start"}]
+
+    monkeypatch.setattr(v1_routes, "generate_response", fake_generate_response)
+
+    payload = {
+        "model": "text-davinci-003",
+        "prompt": "Write a haiku",
+        "stream": True,
+    }
+
+    response = client.post("/api/v1/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.is_json
+    body = response.get_json()
+    assert body["choices"][0]["text"] == "Five syllables start"

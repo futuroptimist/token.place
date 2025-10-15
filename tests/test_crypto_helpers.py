@@ -257,3 +257,179 @@ def test_stream_chat_completion_handles_json_fallback(mock_post):
             'data': {"choices": [{"message": {"content": "done"}}]},
         }
     ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_decrypts_encrypted_chunks(mock_post):
+    """Encrypted SSE chunks should be decrypted before yielding."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'ciphertext': 'c2VjcmV0',
+        'cipherkey': 'a2V5',
+        'iv': 'aXY='
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'event': 'delta', 'encrypted': True, 'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    decrypted_chunk = {'choices': [{'delta': {'content': 'Hi there!'}}]}
+
+    with patch.object(client, 'decrypt_message', return_value=decrypted_chunk) as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'delta',
+            'data': decrypted_chunk,
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_decrypts_flat_encrypted_payload(mock_post):
+    """Decrypt when the encrypted payload lives directly under `data`."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'encrypted': True,
+        'ciphertext': 'c2VjcmV0',
+        'cipherkey': 'a2V5',
+        'iv': 'aXY='
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'event': 'delta', 'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    decrypted_chunk = {'choices': [{'delta': {'content': 'Hi there!'}}]}
+
+    with patch.object(client, 'decrypt_message', return_value=decrypted_chunk) as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'delta',
+            'data': decrypted_chunk,
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_decrypts_nested_encrypted_payload(mock_post):
+    """Decrypt when the encrypted payload is nested under an inner `data` key."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'ciphertext': 'c2VjcmV0',
+        'cipherkey': 'a2V5',
+        'iv': 'aXY='
+    }
+
+    nested_encrypted_body = {
+        'encrypted': True,
+        'data': encrypted_payload,
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'event': 'delta', 'data': nested_encrypted_body})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    decrypted_chunk = {'choices': [{'delta': {'content': 'Hi there!'}}]}
+
+    with patch.object(client, 'decrypt_message', return_value=decrypted_chunk) as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'delta',
+            'data': decrypted_chunk,
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_handles_invalid_encrypted_payload(mock_post):
+    """An encrypted chunk without a mapping payload should raise an error event."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'encrypted': True, 'data': 'oops'})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    with patch.object(client, 'decrypt_message') as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {'reason': 'invalid_encrypted_chunk'},
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_handles_decrypt_failures(mock_post):
+    """If decryption fails the client should surface an error event."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'ciphertext': 'c2VjcmV0',
+        'cipherkey': 'a2V5',
+        'iv': 'aXY='
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'encrypted': True, 'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    with patch.object(client, 'decrypt_message', return_value=None) as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {'reason': 'decrypt_failed'},
+        }
+    ]

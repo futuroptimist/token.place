@@ -2,7 +2,7 @@
 
 This guide outlines the steps required to implement streaming inference in the token.place application, allowing users to see responses as they are generated.
 
-> **Status update (2025-09-30):** `/api/v2/chat/completions` now supports Server-Sent Events when the `stream` flag is provided. The Flask route sends role, content, and completion markers so plaintext clients receive incremental updates without waiting for the full JSON payload. The remaining sections continue to track work for true token-by-token generation, relay integration, and encrypted streaming.
+> **Status update (2025-09-30):** `/api/v2/chat/completions` now supports Server-Sent Events when the `stream` flag is provided. The Flask route sends role, content, and completion markers so plaintext clients receive incremental updates without waiting for the full JSON payload. **API v1 intentionally remains non-streaming** so we can stabilize the surface area before promoting API v2 to GA; ignore any TODOs suggesting `/api/v1/.../stream` routes.
 
 ## Architecture Overview
 
@@ -120,13 +120,12 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 ### 3. API Endpoints
 
 #### 3.1 Add Streaming Endpoints
-- Create new endpoints specifically for streaming:
-  - `/api/v1/chat/completions/stream`
-  - `/api/v1/completions/stream`
+- ✅ `/api/v2/chat/completions` streams plaintext responses via SSE when `stream=true`.
+- 🚫 **Do not implement** `/api/v1/.../stream` endpoints; v1 will stay JSON-only until it is formally deprecated in favor of API v2.
 
 #### 3.2 Update API Documentation
 - ✅ README now includes a "streaming usage" section with SSE examples and `stream=true`
-  guidance for both `/api/v1` and `/v1` aliases.
+  guidance for the `/api/v2` and `/v2` aliases.
 
 ### 4. Testing Infrastructure
 

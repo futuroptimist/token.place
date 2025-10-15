@@ -3,7 +3,7 @@ API routes for token.place API v1
 This module follows OpenAI API conventions to serve as a drop-in replacement.
 """
 
-from flask import Blueprint, request, jsonify, Response, stream_with_context
+from flask import Blueprint, request, jsonify
 import base64
 import time
 import json
@@ -113,6 +113,312 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
     response = jsonify(error_obj)
     response.status_code = status_code
     return response
+
+
+def _handle_chat_completion_request(data):
+    """Core implementation for the chat completions endpoint."""
+
+    if data is None:
+        data = {}
+
+    if not data:
+        return format_error_response(
+            "Invalid request body: empty or not JSON",
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+
+    try:
+        validate_required_fields(data, ["model"])
+
+        is_encrypted_request = bool(data.get("encrypted", False))
+        stream_requested = bool(data.get("stream", False))
+        if stream_requested:
+            log_warning(
+                "Streaming requested for API v1 chat completions; returning standard JSON response"
+            )
+
+        models = get_models_info()
+        available_model_ids = [model["id"] for model in models]
+
+        requested_model_id = data["model"]
+        response_model_id = requested_model_id
+        model_id = resolve_model_alias(requested_model_id) or requested_model_id
+        if model_id != requested_model_id:
+            log_info(
+                f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
+            )
+
+        validate_model_name(model_id, available_model_ids)
+
+        model_instance = get_model_instance(model_id)
+        log_info(f"Model instance obtained for {model_id}")
+
+        messages = None
+        client_public_key = None
+
+        if is_encrypted_request:
+            log_info("Processing encrypted request")
+
+            try:
+                validate_encrypted_request(data)
+                client_public_key = data["client_public_key"]
+
+                encrypted_messages = data["messages"]
+                decrypted_data = encryption_manager.decrypt_message(
+                    {
+                        "ciphertext": base64.b64decode(encrypted_messages["ciphertext"]),
+                        "iv": base64.b64decode(encrypted_messages["iv"]),
+                    },
+                    base64.b64decode(encrypted_messages["cipherkey"]),
+                )
+
+                if decrypted_data is None:
+                    return format_error_response(
+                        "Failed to decrypt messages",
+                        error_type="encryption_error",
+                        status_code=400,
+                    )
+
+                try:
+                    messages = json.loads(decrypted_data.decode("utf-8"))
+                except json.JSONDecodeError:
+                    return format_error_response(
+                        "Failed to parse JSON from decrypted messages",
+                        error_type="encryption_error",
+                        status_code=400,
+                    )
+
+            except ValidationError as e:
+                return format_error_response(
+                    e.message,
+                    param=e.field,
+                    code=e.code,
+                    status_code=400,
+                )
+
+        else:
+            log_info("Processing standard (non-encrypted) request")
+
+            try:
+                validate_required_fields(data, ["messages"])
+                validate_field_type(data, "messages", list)
+                messages = data["messages"]
+            except ValidationError as e:
+                return format_error_response(
+                    e.message,
+                    param=e.field,
+                    code=e.code,
+                    status_code=400,
+                )
+
+        try:
+            validate_chat_messages(messages)
+        except ValidationError as e:
+            return format_error_response(
+                e.message,
+                param=e.field,
+                code=e.code,
+                status_code=400,
+            )
+
+        decision = evaluate_messages_for_policy(messages)
+        if not decision.allowed:
+            log_warning(
+                "Blocking request due to content policy violation: %s"
+                % (decision.matched_term or "unknown term")
+            )
+            return format_error_response(
+                decision.reason or "Request blocked by content moderation policy.",
+                error_type="content_policy_violation",
+                code="content_blocked",
+                status_code=400,
+            )
+
+        log_info(f"Generating response using model {model_id}")
+        updated_messages = generate_response(model_id, messages)
+
+        assistant_message = updated_messages[-1]
+        log_info("Response generated successfully")
+
+        tool_calls = assistant_message.get("tool_calls")
+
+        message_payload = {
+            "role": assistant_message.get("role", "assistant"),
+            "content": assistant_message.get("content", ""),
+        }
+
+        if tool_calls:
+            message_payload["tool_calls"] = tool_calls
+
+        finish_reason = "tool_calls" if tool_calls else "stop"
+
+        response_data = {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": response_model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message_payload,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": -1,
+                "completion_tokens": -1,
+                "total_tokens": -1,
+            },
+        }
+
+        if is_encrypted_request and client_public_key:
+            log_info("Encrypting response for client")
+            encrypted_response = encryption_manager.encrypt_message(response_data, client_public_key)
+            if encrypted_response is None:
+                return format_error_response(
+                    "Failed to encrypt response",
+                    error_type="encryption_error",
+                    status_code=500,
+                )
+
+            return jsonify({"encrypted": True, "data": encrypted_response})
+
+        return jsonify(response_data)
+
+    except ValidationError as e:
+        return format_error_response(
+            e.message,
+            param=e.field,
+            code=e.code,
+            status_code=400,
+        )
+    except ModelError as e:
+        return format_error_response(
+            e.message,
+            error_type="model_error",
+            status_code=400,
+        )
+    except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
+        return format_error_response(
+            f"Internal server error: {str(e)}",
+            error_type="server_error",
+            status_code=500,
+        )
+
+
+def _handle_text_completion_request(data):
+    """Core implementation for the legacy text completions endpoint."""
+
+    if data is None:
+        data = {}
+
+    try:
+        if not data:
+            log_warning("Invalid request body: empty or not JSON")
+            return format_error_response(
+                "Invalid request body",
+                error_type="invalid_request_error",
+                status_code=400,
+            )
+
+        model_id = data.get("model")
+        prompt = data.get("prompt", "")
+        client_public_key = data.get("client_public_key")
+        is_encrypted_request = data.get("encrypted", False)
+        stream_requested = bool(data.get("stream", False))
+        if stream_requested:
+            log_warning(
+                "Streaming requested for API v1 text completions; returning standard JSON response"
+            )
+
+        if not model_id:
+            log_warning("Missing required parameter: model")
+            return format_error_response(
+                "Missing required parameter: model",
+                error_type="invalid_request_error",
+                param="model",
+                status_code=400,
+            )
+
+        try:
+            get_model_instance(model_id)
+            log_info(f"Model instance obtained for {model_id}")
+        except ModelError as e:
+            log_warning(f"Model error: {e.message}")
+            return format_error_response(
+                e.message,
+                error_type=e.error_type,
+                param="model",
+                code="model_not_found" if e.error_type == "model_not_found" else None,
+                status_code=e.status_code,
+            )
+
+        messages = [{"role": "user", "content": prompt}]
+
+        decision = evaluate_messages_for_policy(messages)
+        if not decision.allowed:
+            log_warning(
+                "Blocking legacy completion request due to content policy violation: %s"
+                % (decision.matched_term or "unknown term")
+            )
+            return format_error_response(
+                decision.reason or "Request blocked by content moderation policy.",
+                error_type="content_policy_violation",
+                code="content_blocked",
+                status_code=400,
+            )
+
+        log_info(f"Generating response using model {model_id}")
+        updated_messages = generate_response(model_id, messages)
+
+        assistant_message = updated_messages[-1]
+        log_info("Response generated successfully")
+
+        response_data = {
+            "id": f"cmpl-{uuid.uuid4().hex[:12]}",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "text": assistant_message.get("content", ""),
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+
+        if is_encrypted_request and client_public_key:
+            log_info("Encrypting response for client")
+            encrypted_response = encryption_manager.encrypt_message(response_data, client_public_key)
+            if encrypted_response is None:
+                log_error("Failed to encrypt response")
+                return format_error_response(
+                    "Failed to encrypt response",
+                    error_type="server_error",
+                    status_code=500,
+                )
+            return jsonify({"encrypted": True, "data": encrypted_response})
+
+        return jsonify(response_data)
+
+    except ModelError as e:
+        log_warning(f"Model error during response generation: {e.message}")
+        return format_error_response(
+            e.message,
+            error_type=e.error_type,
+            status_code=e.status_code,
+        )
+    except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        log_error("Unexpected error in create_completion endpoint")
+        return format_error_response(f"Internal server error: {str(e)}")
 
 @v1_bp.route('/models', methods=['GET'])
 def list_models():
@@ -496,268 +802,10 @@ def create_chat_completion():
         - cipherkey: Base64 encoded encrypted key
         - iv: Base64 encoded initialization vector
     """
-    try:
-        log_info("API request: POST /chat/completions")
-        data = request.get_json()
+    log_info("API request: POST /chat/completions")
+    data = request.get_json()
+    return _handle_chat_completion_request(data)
 
-        # Validate request
-        if not data:
-            return format_error_response(
-                "Invalid request body: empty or not JSON",
-                error_type="invalid_request_error",
-                status_code=400
-            )
-
-        try:
-            # Validate required fields
-            validate_required_fields(data, ["model"])
-
-            is_encrypted_request = bool(data.get('encrypted', False))
-            stream_requested = bool(data.get('stream', False))
-
-            # Get available models
-            models = get_models_info()
-            available_model_ids = [model["id"] for model in models]
-
-            # Validate model
-            requested_model_id = data['model']
-            response_model_id = requested_model_id
-            model_id = resolve_model_alias(requested_model_id) or requested_model_id
-            if model_id != requested_model_id:
-                log_info(
-                    f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
-                )
-
-            validate_model_name(model_id, available_model_ids)
-
-            # Get model instance - will raise ModelError if not found
-            model_instance = get_model_instance(model_id)
-            log_info(f"Model instance obtained for {model_id}")
-
-            # Process message payload based on encryption flag
-            messages = None
-            client_public_key = None
-
-            if is_encrypted_request:
-                log_info("Processing encrypted request")
-
-                try:
-                    # Validate encrypted request
-                    validate_encrypted_request(data)
-                    client_public_key = data['client_public_key']
-
-                    # Decrypt the messages
-                    encrypted_messages = data['messages']
-                    decrypted_data = encryption_manager.decrypt_message({
-                        'ciphertext': base64.b64decode(encrypted_messages['ciphertext']),
-                        'iv': base64.b64decode(encrypted_messages['iv']),
-                    }, base64.b64decode(encrypted_messages['cipherkey']))
-
-                    if decrypted_data is None:
-                        return format_error_response(
-                            "Failed to decrypt messages",
-                            error_type="encryption_error",
-                            status_code=400
-                        )
-
-                    # Parse JSON from decrypted data
-                    try:
-                        messages = json.loads(decrypted_data.decode('utf-8'))
-                    except json.JSONDecodeError:
-                        return format_error_response(
-                            "Failed to parse JSON from decrypted messages",
-                            error_type="encryption_error",
-                            status_code=400
-                        )
-
-                except ValidationError as e:
-                    return format_error_response(
-                        e.message,
-                        param=e.field,
-                        code=e.code,
-                        status_code=400
-                    )
-
-            else:
-                log_info("Processing standard (non-encrypted) request")
-
-                try:
-                    # Validate messages field
-                    validate_required_fields(data, ["messages"])
-                    validate_field_type(data, "messages", list)
-                    messages = data["messages"]
-                except ValidationError as e:
-                    return format_error_response(
-                        e.message,
-                        param=e.field,
-                        code=e.code,
-                        status_code=400
-                    )
-
-            # Validate messages format
-            try:
-                validate_chat_messages(messages)
-            except ValidationError as e:
-                return format_error_response(
-                    e.message,
-                    param=e.field,
-                    code=e.code,
-                    status_code=400
-                )
-
-            decision = evaluate_messages_for_policy(messages)
-            if not decision.allowed:
-                log_warning(
-                    "Blocking chat completion request due to content policy violation: %s"
-                    % (decision.matched_term or "unknown term")
-                )
-                return format_error_response(
-                    decision.reason or "Request blocked by content moderation policy.",
-                    error_type="content_policy_violation",
-                    code="content_blocked",
-                    status_code=400,
-                )
-
-            # Generate response using the specified model
-            log_info(f"Generating response using model {model_id}")
-            updated_messages = generate_response(model_id, messages)
-
-            # Extract the last message (the model's response)
-            assistant_message = updated_messages[-1]
-            log_info("Response generated successfully")
-
-            # Create response in OpenAI format
-            response_data = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": response_model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": assistant_message.get("role", "assistant"),
-                            "content": assistant_message.get("content", "")
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": -1,  # We don't track tokens
-                    "completion_tokens": -1,
-                    "total_tokens": -1
-                }
-            }
-
-            # Streaming support: fall back to encrypted single responses when necessary
-            if stream_requested and is_encrypted_request:
-                log_warning(
-                    "Streaming requested for encrypted payload; falling back to encrypted single response"
-                )
-                stream_requested = False
-
-            if stream_requested:
-                log_info("Returning streaming response for API v1")
-
-                stream_id = f"chatcmpl-{uuid.uuid4()}"
-                created_ts = int(time.time())
-                role = assistant_message.get("role", "assistant")
-                content_text = assistant_message.get("content") or ""
-                tool_calls = assistant_message.get("tool_calls")
-                finish_reason = "tool_calls" if tool_calls else "stop"
-
-                def serialize_tool_call(call, index):
-                    function = call.get("function") if isinstance(call, dict) else {}
-                    if not isinstance(function, dict):
-                        function = {}
-                    return {
-                        "index": index,
-                        "id": call.get("id"),
-                        "type": call.get("type", "function"),
-                        "function": {
-                            "name": function.get("name"),
-                            "arguments": function.get("arguments", ""),
-                        },
-                    }
-
-                def build_chunk(delta, finish_reason_value=None):
-                    return {
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": response_model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": finish_reason_value,
-                            }
-                        ],
-                    }
-
-                def event_stream():
-                    role_chunk = build_chunk({"role": role})
-                    yield f"data: {json.dumps(role_chunk)}\n\n"
-
-                    if content_text:
-                        content_chunk = build_chunk({"content": content_text})
-                        yield f"data: {json.dumps(content_chunk)}\n\n"
-
-                    if tool_calls:
-                        for idx, call in enumerate(tool_calls):
-                            call_delta = {"tool_calls": [serialize_tool_call(call, idx)]}
-                            tool_chunk = build_chunk(call_delta)
-                            yield f"data: {json.dumps(tool_chunk)}\n\n"
-
-                    stop_chunk = build_chunk({}, finish_reason)
-                    yield f"data: {json.dumps(stop_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-
-                response = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
-                response.headers['Cache-Control'] = 'no-cache'
-                return response
-
-            if is_encrypted_request and client_public_key:
-                log_info("Encrypting response for client")
-                encrypted_response = encryption_manager.encrypt_message(response_data, client_public_key)
-                if encrypted_response is None:
-                    return format_error_response(
-                        "Failed to encrypt response",
-                        error_type="encryption_error",
-                        status_code=500
-                    )
-
-                # Wrap the encrypted data in a standard format
-                return jsonify({
-                    "encrypted": True,
-                    "data": encrypted_response
-                })
-            else:
-                # Return standard response
-                return jsonify(response_data)
-
-        except ValidationError as e:
-            return format_error_response(
-                e.message,
-                param=e.field,
-                code=e.code,
-                status_code=400
-            )
-
-        except ModelError as e:
-            return format_error_response(
-                e.message,
-                error_type="model_error",
-                status_code=400
-            )
-
-    except Exception as e:
-        log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
-        return format_error_response(
-            f"Internal server error: {str(e)}",
-            error_type="server_error",
-            status_code=500
-        )
 
 @v1_bp.route('/completions', methods=['POST'])
 def create_completion():
@@ -767,127 +815,10 @@ def create_completion():
     The request is converted to chat format internally and the response is
     returned in the legacy text completion schema.
     """
-    try:
-        log_info("API request: POST /completions")
-        data = request.get_json()
+    log_info("API request: POST /completions")
+    data = request.get_json()
+    return _handle_text_completion_request(data)
 
-        if not data:
-            log_warning("Invalid request body: empty or not JSON")
-            return format_error_response(
-                "Invalid request body",
-                error_type="invalid_request_error",
-                status_code=400
-            )
-
-        # Extract necessary data
-        model_id = data.get("model")
-        prompt = data.get("prompt", "")
-        client_public_key = data.get("client_public_key") # For potential encryption
-        is_encrypted_request = data.get("encrypted", False)
-
-        # Validate model ID
-        if not model_id:
-            log_warning("Missing required parameter: model")
-            return format_error_response(
-                "Missing required parameter: model",
-                error_type="invalid_request_error",
-                param="model",
-                status_code=400
-            )
-
-        try:
-            # Check if model exists - will raise ModelError if not found
-            get_model_instance(model_id)
-            log_info(f"Model instance obtained for {model_id}")
-        except ModelError as e:
-            log_warning(f"Model error: {e.message}")
-            return format_error_response(
-                e.message,
-                error_type=e.error_type,
-                param="model",
-                code="model_not_found" if e.error_type == "model_not_found" else None,
-                status_code=e.status_code
-            )
-
-        # Prepare messages for chat format
-        messages = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
-
-        decision = evaluate_messages_for_policy(messages)
-        if not decision.allowed:
-            log_warning(
-                "Blocking legacy completion request due to content policy violation: %s"
-                % (decision.matched_term or "unknown term")
-            )
-            return format_error_response(
-                decision.reason or "Request blocked by content moderation policy.",
-                error_type="content_policy_violation",
-                code="content_blocked",
-                status_code=400,
-            )
-
-        # Generate response
-        try:
-            log_info(f"Generating response using model {model_id}")
-            updated_messages = generate_response(model_id, messages)
-
-            assistant_message = updated_messages[-1]
-            log_info("Response generated successfully")
-
-            # Create response in OpenAI text completion format
-            response_data = {
-                "id": f"cmpl-{uuid.uuid4().hex[:12]}",
-                "object": "text_completion",
-                "created": int(time.time()),
-                "model": model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": assistant_message.get("content", ""),
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-            }
-
-            # Encrypt response if client_public_key was provided
-            if is_encrypted_request and client_public_key:
-                log_info("Encrypting response for client")
-                # Note: We assume the original request might set 'encrypted:true' and 'client_public_key'
-                # even though it only sends a 'prompt', to signal it wants an encrypted response.
-                encrypted_response = encryption_manager.encrypt_message(response_data, client_public_key)
-                if encrypted_response is None:
-                    log_error("Failed to encrypt response")
-                    return format_error_response(
-                        "Failed to encrypt response",
-                        error_type="server_error",
-                        status_code=500
-                    )
-                return jsonify({
-                    "encrypted": True,
-                    "data": encrypted_response
-                })
-
-            return jsonify(response_data)
-
-        except ModelError as e:
-            log_warning(f"Model error during response generation: {e.message}")
-            return format_error_response(
-                e.message,
-                error_type=e.error_type,
-                status_code=e.status_code
-            )
-    except Exception as e:
-        log_error("Unexpected error in create_completion endpoint")
-        return format_error_response(f"Internal server error: {str(e)}")
 
 @v1_bp.route('/health', methods=['GET'])
 def health_check():

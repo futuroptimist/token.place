@@ -623,9 +623,13 @@ class CryptoClient:
                             encrypted_body = None
                             if chunk.get('encrypted') is True:
                                 encrypted_body = chunk.get('data')
-                            elif isinstance(chunk.get('data'), dict) and chunk['data'].get('encrypted') is True:
-                                encrypted_body = chunk['data'].get('data')
-                                event_name = chunk.get('event', event_name)
+                            else:
+                                data_field = chunk.get('data')
+                                if isinstance(data_field, dict) and data_field.get('encrypted') is True:
+                                    # Encrypted payload may live directly under data or inside a nested
+                                    # `data` key depending on the server schema. Support both shapes.
+                                    encrypted_body = data_field.get('data', data_field)
+                                    event_name = chunk.get('event', event_name)
 
                             if encrypted_body is not None:
                                 if not isinstance(encrypted_body, dict):

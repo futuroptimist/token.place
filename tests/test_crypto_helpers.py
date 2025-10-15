@@ -293,3 +293,40 @@ def test_stream_chat_completion_decrypts_encrypted_chunks(mock_post):
             'data': decrypted_chunk,
         }
     ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_decrypts_nested_encrypted_payload(mock_post):
+    """Decrypt when the encrypted payload lives directly under `data`."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'encrypted': True,
+        'ciphertext': 'c2VjcmV0',
+        'cipherkey': 'a2V5',
+        'iv': 'aXY='
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "text/event-stream"}
+    mock_response.iter_lines.return_value = iter([
+        f"data: {json.dumps({'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+    mock_post.return_value = mock_response
+
+    decrypted_chunk = {'choices': [{'delta': {'content': 'Hi there!'}}]}
+
+    with patch.object(client, 'decrypt_message', return_value=decrypted_chunk) as mock_decrypt:
+        chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': decrypted_chunk,
+        }
+    ]

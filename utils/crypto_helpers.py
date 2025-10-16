@@ -713,6 +713,6 @@ class CryptoClient:
                         time.sleep(retry_delay)
                     continue
 
-                return
+                return  # pragma: no cover - loop exits after successful attempt
 
         return _iter_chunks()

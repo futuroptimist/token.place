@@ -7,6 +7,8 @@ from typing import Dict, Iterable, List
 
 from unittest.mock import MagicMock, patch
 
+from requests.exceptions import ChunkedEncodingError
+
 from utils.crypto_helpers import CryptoClient
 
 
@@ -272,3 +274,57 @@ def test_stream_chat_completion_skips_non_data_lines(mock_post: MagicMock) -> No
         },
     ]
 
+
+@patch('utils.crypto_helpers.time.sleep', autospec=True)
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_reconnects_after_connection_drop(
+    mock_post: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """Connection drops should trigger a retry and surface a reconnect event."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    partial_chunk = json.dumps(
+        {
+            'event': 'chunk',
+            'data': {'delta': {'content': 'partial'}},
+        }
+    ).encode()
+
+    first_response = MagicMock()
+    first_response.status_code = 200
+    first_response.headers = {"Content-Type": "text/event-stream"}
+
+    def failing_iter_lines(*_, **__):
+        yield b'data: ' + partial_chunk + b'\n'
+        raise ChunkedEncodingError("connection lost")
+
+    first_response.iter_lines.side_effect = failing_iter_lines
+
+    second_response = _mock_stream_response([
+        "data: {\"choices\": [{\"delta\": {\"content\": \"final\"}}]}\n",
+        b'data: [DONE]\n',
+    ])
+
+    mock_post.side_effect = [first_response, second_response]
+
+    chunks = list(client.stream_chat_completion(messages, retry_delay=0))
+
+    assert mock_post.call_count == 2
+    mock_sleep.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
+        },
+        {
+            'event': 'reconnect',
+            'data': {'attempt': 1, 'reason': 'connection_lost'},
+        },
+        {
+            'event': 'chunk',
+            'data': {'choices': [{'delta': {'content': 'final'}}]},
+        },
+    ]

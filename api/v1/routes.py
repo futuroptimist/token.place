@@ -10,6 +10,7 @@ import json
 import uuid
 import logging
 import os
+import math
 
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
@@ -113,6 +114,32 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
     response = jsonify(error_obj)
     response.status_code = status_code
     return response
+
+
+def _extract_message_content_for_usage(message: dict) -> str:
+    """Return a string representation of a chat message's content."""
+
+    if not isinstance(message, dict):
+        return ""
+
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _estimate_token_length(text: str) -> int:
+    """Approximate token count using a 4-characters-per-token heuristic."""
+
+    if not text:
+        return 0
+
+    stripped = text.strip()
+    if not stripped:
+        return 0
+
+    return max(1, math.ceil(len(stripped) / 4))
 
 
 def _handle_chat_completion_request(data):
@@ -235,6 +262,14 @@ def _handle_chat_completion_request(data):
                 status_code=400,
             )
 
+        prompt_contents_for_usage = []
+        if isinstance(messages, list):
+            prompt_contents_for_usage = [
+                _extract_message_content_for_usage(message)
+                for message in messages
+                if isinstance(message, dict)
+            ]
+
         log_info(f"Generating response using model {model_id}")
         updated_messages = generate_response(model_id, messages)
 
@@ -253,6 +288,13 @@ def _handle_chat_completion_request(data):
 
         finish_reason = "tool_calls" if tool_calls else "stop"
 
+        completion_segments = [_extract_message_content_for_usage(assistant_message)]
+        if tool_calls:
+            completion_segments.append(json.dumps(tool_calls, ensure_ascii=False))
+
+        prompt_tokens = sum(_estimate_token_length(text) for text in prompt_contents_for_usage)
+        completion_tokens = _estimate_token_length("\n".join(filter(None, completion_segments)))
+
         response_data = {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -266,9 +308,9 @@ def _handle_chat_completion_request(data):
                 }
             ],
             "usage": {
-                "prompt_tokens": -1,
-                "completion_tokens": -1,
-                "total_tokens": -1,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
         }
 

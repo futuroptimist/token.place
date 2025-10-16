@@ -47,7 +47,7 @@ This document provides an overview of the testing approach for token.place and i
 ### 8. DSPACE Integration Tests
 - Location: `tests/integration/test_dspace_chat_alias.py`
 - Purpose: Validate that token.place can serve as a drop-in backend for DSPACE's dChat client
-  now that it targets `gpt-5-chat-latest`
+  now that it targets `gpt-5-chat-latest`, and surface token usage metrics expected by the UI
 - Command: `python -m pytest tests/integration/test_dspace_chat_alias.py`
 
 ## Running All Tests

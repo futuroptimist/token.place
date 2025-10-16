@@ -65,6 +65,17 @@ def log_error(message, exc_info=False):
     if ENVIRONMENT != 'prod':
         logger.error(message, exc_info=exc_info)
 
+# Streaming helpers
+def iter_stream_content_chunks(content: str, *, max_chunk_size: int = 512):
+    """Yield successive slices of ``content`` respecting the configured chunk size."""
+
+    if not content:
+        return
+
+    content_length = len(content)
+    for start in range(0, content_length, max_chunk_size):
+        yield content[start:start + max_chunk_size]
+
 # Create a Blueprint for v2 API
 v2_bp = Blueprint('v2', __name__, url_prefix='/api/v2')
 
@@ -564,8 +575,9 @@ def create_chat_completion():
                     role_chunk = build_chunk({"role": role}, None)
                     yield f"data: {json.dumps(role_chunk)}\n\n"
                     if content_text:
-                        content_chunk = build_chunk({"content": content_text}, None)
-                        yield f"data: {json.dumps(content_chunk)}\n\n"
+                        for content_segment in iter_stream_content_chunks(content_text):
+                            content_chunk = build_chunk({"content": content_segment}, None)
+                            yield f"data: {json.dumps(content_chunk)}\n\n"
                     if tool_calls:
                         for idx, call in enumerate(tool_calls):
                             call_delta = {

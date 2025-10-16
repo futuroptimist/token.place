@@ -8,7 +8,7 @@ import logging
 import re
 from functools import lru_cache
 from time import perf_counter
-from typing import Dict, Tuple, Any, Optional, Union, List
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 # Import from the existing encrypt.py
 from encrypt import encrypt, decrypt, generate_keys
@@ -18,11 +18,91 @@ from utils.performance import get_encryption_monitor
 logger = logging.getLogger('crypto_manager')
 
 
+MessagePayload = Union[str, bytes, Dict[str, Any], List[Any]]
+ClientKeyInput = Union[str, bytes]
+EncryptedPayload = Dict[str, str]
+
+
 @lru_cache(maxsize=256)
 def _decode_client_public_key(cleaned_key: str) -> bytes:
     """Decode a base64 public key string with whitespace removed."""
 
     return base64.b64decode(cleaned_key, validate=True)
+
+
+def _coerce_message_bytes(message: MessagePayload) -> bytes:
+    """Convert supported message payloads into a UTF-8 encoded byte string."""
+
+    if isinstance(message, (dict, list)):
+        return json.dumps(message).encode("utf-8")
+    if isinstance(message, str):
+        return message.encode("utf-8")
+    if isinstance(message, bytes):
+        return message
+
+    raise TypeError(f"Unsupported message type: {type(message).__name__}")
+
+
+def _normalize_client_public_key(client_public_key: ClientKeyInput) -> bytes:
+    """Convert a client-provided public key to raw bytes."""
+
+    if isinstance(client_public_key, bytes):
+        return client_public_key
+    if isinstance(client_public_key, str):
+        if "-----BEGIN" in client_public_key:
+            return client_public_key.encode("utf-8")
+        cleaned_key = re.sub(r"\s+", "", client_public_key)
+        return _decode_client_public_key(cleaned_key)
+
+    raise TypeError(
+        f"Unsupported client public key type: {type(client_public_key).__name__}"
+    )
+
+
+def _coerce_encrypted_payload(
+    encrypted_data: Union[EncryptedPayload, str]
+) -> Optional[EncryptedPayload]:
+    """Return an encrypted payload dict from either a dict or JSON string."""
+
+    if isinstance(encrypted_data, str):
+        try:
+            loaded: Any = json.loads(encrypted_data)
+        except json.JSONDecodeError:
+            log_error("Encrypted data string is not valid JSON")
+            return None
+    elif isinstance(encrypted_data, dict):
+        loaded = encrypted_data
+    else:
+        log_error("Encrypted data must be a dict or JSON string")
+        return None
+
+    if not isinstance(loaded, dict):
+        log_error("Encrypted data JSON must decode to a dictionary")
+        return None
+
+    return cast(EncryptedPayload, loaded)
+
+
+def _deserialize_encrypted_payload(
+    payload: EncryptedPayload,
+) -> Optional[Tuple[Dict[str, bytes], bytes]]:
+    """Decode the base64 payload into ciphertext and cipher key components."""
+
+    required_fields = ("chat_history", "cipherkey", "iv")
+    missing_fields = [field for field in required_fields if not payload.get(field)]
+    if missing_fields:
+        log_error("Missing required encryption fields")
+        return None
+
+    try:
+        iv = base64.b64decode(payload["iv"])
+        ciphertext = base64.b64decode(payload["chat_history"])
+        cipherkey = base64.b64decode(payload["cipherkey"])
+    except (binascii.Error, ValueError):
+        log_error("Encrypted payload contains invalid base64 data")
+        return None
+
+    return {"ciphertext": ciphertext, "iv": iv}, cipherkey
 
 
 def get_config_lazy():
@@ -100,8 +180,11 @@ class CryptoManager:
         """Regenerate the RSA key pair for key rotation."""
         self.initialize_keys()
 
-    def encrypt_message(self, message: Union[str, bytes, Dict, List],
-                        client_public_key: Union[str, bytes]) -> Dict[str, str]:
+    def encrypt_message(
+        self,
+        message: MessagePayload,
+        client_public_key: ClientKeyInput,
+    ) -> Dict[str, str]:
         """
         Encrypt a message for a client using their public key.
 
@@ -124,36 +207,22 @@ class CryptoManager:
                 raise ValueError("Client public key cannot be None")
 
             # Convert message to bytes if it's not already
-            if isinstance(message, (dict, list)):
-                message_bytes = json.dumps(message).encode('utf-8')
-            elif isinstance(message, str):
-                message_bytes = message.encode('utf-8')
-            elif isinstance(message, bytes):
-                message_bytes = message
-            else:
-                raise TypeError(
-                    f"Unsupported message type: {type(message).__name__}"
+            message_bytes = _coerce_message_bytes(message)
+            try:
+                client_public_key_bytes = _normalize_client_public_key(
+                    client_public_key
                 )
-
-            # Ensure client_public_key is bytes
-            if isinstance(client_public_key, str):
-                if "-----BEGIN" in client_public_key:
-                    client_public_key = client_public_key.encode('utf-8')
-                else:
-                    try:
-                        cleaned_key = re.sub(r"\s+", "", client_public_key)
-                        client_public_key = _decode_client_public_key(cleaned_key)
-                    except (binascii.Error, ValueError) as e:
-                        raise ValueError(
-                            "Invalid base64-encoded public key"
-                        ) from e
+            except (binascii.Error, ValueError) as e:
+                raise ValueError("Invalid base64-encoded public key") from e
 
             monitor = get_encryption_monitor()
             record_metrics = monitor.is_enabled
             start_time = perf_counter() if record_metrics else None
 
             # Encrypt the message
-            encrypted_data, encrypted_key, iv = encrypt(message_bytes, client_public_key)
+            encrypted_data, encrypted_key, iv = encrypt(
+                message_bytes, client_public_key_bytes
+            )
 
             # Base64 encode for JSON compatibility
             encrypted_data_b64 = base64.b64encode(encrypted_data['ciphertext']).decode('utf-8')
@@ -174,7 +243,9 @@ class CryptoManager:
             log_error(f"Error encrypting message: {e}", exc_info=True)
             raise
 
-    def decrypt_message(self, encrypted_data: Dict[str, str] | str) -> Optional[Union[Dict, str, bytes]]:
+    def decrypt_message(
+        self, encrypted_data: Union[EncryptedPayload, str]
+    ) -> Optional[Union[Dict, str, bytes]]:
         """Decrypt a message using the server's private key.
 
         Args:
@@ -186,14 +257,8 @@ class CryptoManager:
             Returns None if decryption fails.
         """
         try:
-            if isinstance(encrypted_data, str):
-                try:
-                    encrypted_data = json.loads(encrypted_data)
-                except json.JSONDecodeError:
-                    log_error("Encrypted data string is not valid JSON")
-                    return None
-            elif not isinstance(encrypted_data, dict):
-                log_error("Encrypted data must be a dict or JSON string")
+            payload = _coerce_encrypted_payload(encrypted_data)
+            if payload is None:
                 return None
 
             monitor = get_encryption_monitor()
@@ -201,17 +266,11 @@ class CryptoManager:
             start_time = perf_counter() if record_metrics else None
 
             # Extract and decode the encrypted data
-            encrypted_chat_history_b64 = encrypted_data.get('chat_history')
-            cipherkey_b64 = encrypted_data.get('cipherkey')
-            iv_b64 = encrypted_data.get('iv')
-
-            if not all([encrypted_chat_history_b64, cipherkey_b64, iv_b64]):
-                log_error("Missing required encryption fields")
+            parsed_payload = _deserialize_encrypted_payload(payload)
+            if parsed_payload is None:
                 return None
 
-            iv = base64.b64decode(iv_b64)
-            encrypted_chat_history_dict = {'ciphertext': base64.b64decode(encrypted_chat_history_b64), 'iv': iv}
-            cipherkey = base64.b64decode(cipherkey_b64)
+            encrypted_chat_history_dict, cipherkey = parsed_payload
 
             # Decrypt the message
             decrypted_bytes = decrypt(encrypted_chat_history_dict, cipherkey, self._private_key)

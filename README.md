@@ -87,6 +87,19 @@ retry through a Cloudflare-hosted relay whenever the primary endpoint is unreach
 Set `TOKEN_PLACE_RELAY_CLOUDFLARE_URLS` (or `TOKEN_PLACE_RELAY_CLOUDFLARE_URL` for a single
 endpoint) so `server.py` can fail over to a Cloudflare tunnel when the local relays are down.
 
+#### Configuration precedence
+
+token.place automatically loads environment files before initialising the Python configuration
+stack. The precedence is:
+
+1. `.env`
+2. `.env.<TOKEN_PLACE_ENV>` (for example `.env.production`)
+3. `.env.local`
+4. File referenced by `TOKEN_PLACE_ENV_FILE`
+
+Values already present in `os.environ` win over file-based values, so deployment platforms and
+local shells retain ultimate control.
+
 The development requirements live in [requirements.txt](requirements.txt).
 
 ### Content moderation hooks

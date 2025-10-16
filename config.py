@@ -23,6 +23,7 @@ from utils.config_schema import (
     SecuritySettings,
     ServerSettings,
 )
+from utils.env_loader import EnvLoadResult, load_project_env
 
 # Global constants for platform detection
 IS_WINDOWS = platform.system().lower() == "windows"
@@ -45,8 +46,27 @@ class Config:
         If env is None, it tries to read from TOKEN_PLACE_ENV environment variable,
         defaulting to 'development' if not set.
         """
+        # Load environment variable files before inspecting the environment name.
+        self.env_bootstrap: EnvLoadResult = load_project_env(env)
+        self.loaded_env_files = self.env_bootstrap.loaded_files
+        self.applied_env_values = dict(self.env_bootstrap.applied_values)
+
         # Determine the environment
-        self.env = env or os.environ.get('TOKEN_PLACE_ENV', 'development')
+        resolved_env = (
+            env
+            or self.env_bootstrap.resolved_env
+            or os.environ.get('TOKEN_PLACE_ENV')
+            or 'development'
+        )
+        self.env = resolved_env
+        os.environ.setdefault('TOKEN_PLACE_ENV', self.env)
+
+        if self.loaded_env_files:
+            logger.debug(
+                "Loaded environment files for %s: %s",
+                self.env,
+                ", ".join(str(path) for path in self.loaded_env_files),
+            )
 
         # Detect platform if not already set
         self.platform = os.environ.get('PLATFORM', platform.system().lower())

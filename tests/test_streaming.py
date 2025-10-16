@@ -1,4 +1,6 @@
 import json
+import time
+from itertools import accumulate
 
 import pytest
 
@@ -192,6 +194,98 @@ def test_v2_streaming_with_tool_use(client, monkeypatch):
     assert json.loads(tool_delta["function"]["arguments"]) == {"location": "San Francisco"}
 
     assert finish_event["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_v2_streaming_handles_varied_chunk_sizes_and_delays(client, monkeypatch):
+    """Streaming should deliver staggered content chunks with preserved ordering."""
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [
+            {"role": "system", "content": "Stream timing probe."},
+            {"role": "user", "content": "Generate a long multiline explanation."}
+        ],
+        "stream": True,
+    }
+
+    long_content = (
+        "token.place demonstrates streaming by gradually emitting chunks of "
+        "assistant output so clients can render partial responses before the "
+        "full completion arrives. This test feeds a lengthy body to exercise "
+        "chunk boundaries and confirm delays are respected."
+    )
+
+    monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
+
+    def fake_generate_response(model_id, messages, **model_options):
+        assert model_id == "llama-3-8b-instruct"
+        assert messages[-1]["content"] == "Generate a long multiline explanation."
+        assert model_options == {}
+        return messages + [{"role": "assistant", "content": long_content}]
+
+    monkeypatch.setattr(v2_routes, "generate_response", fake_generate_response)
+
+    segments = [
+        long_content[:60],
+        long_content[60:180],
+        long_content[180:],
+    ]
+    delays = [0.015, 0.025, 0.01]
+
+    def delayed_chunker(content: str, max_chunk_size: int = 512):
+        assert content == long_content
+        for segment, delay in zip(segments, delays):
+            time.sleep(delay)
+            yield segment
+
+    monkeypatch.setattr(v2_routes, "iter_stream_content_chunks", delayed_chunker)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    role_arrival = None
+    content_segments = []
+    content_arrivals = []
+
+    for raw_chunk in response.iter_encoded():
+        now = time.perf_counter()
+        text = raw_chunk.decode("utf-8")
+        if not text.strip():
+            continue
+        assert text.startswith("data: ")
+        payload_text = text[len("data: "):].strip()
+        if payload_text == "[DONE]":
+            break
+
+        chunk = json.loads(payload_text)
+        delta = chunk["choices"][0]["delta"]
+        if "role" in delta:
+            role_arrival = now
+            continue
+        if "content" in delta:
+            content_segments.append(delta["content"])
+            content_arrivals.append(now)
+            continue
+        # Ignore stop chunks; they are validated in other tests
+
+    assert role_arrival is not None, "Expected an assistant role chunk before content"
+    assert content_segments == segments
+    assert "".join(content_segments) == long_content
+
+    expected_cumulative = list(accumulate(delays))
+    observed_cumulative = []
+    previous_time = role_arrival
+    for arrival in content_arrivals:
+        observed_cumulative.append(arrival - role_arrival)
+        assert arrival >= previous_time
+        previous_time = arrival
+
+    for observed, expected in zip(observed_cumulative, expected_cumulative):
+        # Allow small scheduling variance but require the delay to be respected
+        assert observed >= expected - 0.01
 
 
 def test_v1_stream_flag_is_ignored(client, monkeypatch):

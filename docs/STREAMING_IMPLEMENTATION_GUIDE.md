@@ -131,7 +131,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 
 #### 4.1 Streaming Tests
 - Implement tests for streaming functionality
-- Test different chunk sizes and timing scenarios
+- ✅ Test different chunk sizes and timing scenarios (`tests/test_streaming.py::test_v2_streaming_handles_varied_chunk_sizes_and_delays`)
 - Verify encryption/decryption with streaming
 
 #### 4.2 Integration Tests

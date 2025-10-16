@@ -522,6 +522,8 @@ class CryptoClient:
         model: str = 'llama-3-8b-instruct',
         endpoint: str = '/api/v1/chat/completions',
         timeout: float = 30,
+        max_retries: int = 1,
+        retry_delay: float = 0.5,
     ) -> Iterator[Dict[str, Any]]:
         """Yield Server-Sent Event chunks from a streaming chat completion request.
 
@@ -545,6 +547,11 @@ class CryptoClient:
         if any(not isinstance(entry, dict) for entry in messages):
             raise TypeError("each message must be a dictionary")
 
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if retry_delay < 0:
+            raise ValueError("retry_delay must be non-negative")
+
         payload = {
             'model': model,
             'messages': messages,
@@ -553,110 +560,159 @@ class CryptoClient:
         full_url = f"{self.base_url}{endpoint}"
         logger.debug("Starting streaming chat completion at %s", full_url)
 
-        try:
-            response = requests.post(
-                full_url,
-                json=payload,
-                timeout=timeout,
-                stream=True,
-            )
-        except requests.RequestException as exc:  # pragma: no cover - defensive
-            logger.error(
-                "Streaming request failed: %s", exc.__class__.__name__, exc_info=self.debug
-            )
-            return iter(())
-
-        content_type = response.headers.get('Content-Type', '')
-        is_event_stream = 'text/event-stream' in content_type.lower()
-
         def _iter_chunks() -> Iterator[Dict[str, Any]]:
-            try:
-                if response.status_code != 200:
+            attempt = 0
+            reconnect_count = 0
+            while True:
+                try:
+                    response = requests.post(
+                        full_url,
+                        json=payload,
+                        timeout=timeout,
+                        stream=True,
+                    )
+                except requests.RequestException as exc:  # pragma: no cover - defensive
                     logger.error(
-                        "Streaming request returned unexpected status: %s",
-                        response.status_code,
+                        "Streaming request failed: %s",
+                        exc.__class__.__name__,
+                        exc_info=self.debug,
                     )
+                    if attempt >= max_retries:
+                        yield {
+                            'event': 'error',
+                            'data': {'reason': 'request_failed', 'error': exc.__class__.__name__},
+                        }
+                        return
+                    attempt += 1
+                    reconnect_count += 1
                     yield {
-                        'event': 'error',
-                        'data': {'status': response.status_code},
+                        'event': 'reconnect',
+                        'data': {'attempt': reconnect_count, 'reason': 'request_failed'},
                     }
-                    return
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
+                    continue
 
-                if not is_event_stream:
-                    logger.debug(
-                        "Non-streaming response received with content-type %s",
-                        content_type,
-                    )
-                    try:
-                        data = response.json()
-                        yield {'event': 'response', 'data': data}
-                    except ValueError:
-                        body_text = getattr(response, 'text', '')
-                        if body_text:
-                            yield {'event': 'text', 'data': body_text}
-                    return
+                content_type = response.headers.get('Content-Type', '')
+                is_event_stream = 'text/event-stream' in content_type.lower()
+                should_retry = False
+                retry_reason = 'connection_lost'
 
-                for raw_line in response.iter_lines(decode_unicode=True):
-                    if raw_line is None:
-                        continue
-                    if isinstance(raw_line, bytes):
+                try:
+                    if response.status_code != 200:
+                        logger.error(
+                            "Streaming request returned unexpected status: %s",
+                            response.status_code,
+                        )
+                        yield {
+                            'event': 'error',
+                            'data': {'status': response.status_code},
+                        }
+                        return
+
+                    if not is_event_stream:
+                        logger.debug(
+                            "Non-streaming response received with content-type %s",
+                            content_type,
+                        )
                         try:
-                            line = raw_line.decode('utf-8').strip()
-                        except UnicodeDecodeError:
-                            logger.debug("Dropping undecodable chunk: %s", raw_line)
+                            data = response.json()
+                            yield {'event': 'response', 'data': data}
+                        except ValueError:
+                            body_text = getattr(response, 'text', '')
+                            if body_text:
+                                yield {'event': 'text', 'data': body_text}
+                        return
+
+                    for raw_line in response.iter_lines(decode_unicode=True):
+                        if raw_line is None:
                             continue
-                    else:
-                        line = raw_line.strip()
-                    if not line or not line.startswith('data:'):
-                        continue
-                    data_str = line[5:].strip()
-                    if not data_str:
-                        continue
-                    if data_str == '[DONE]':
-                        logger.debug("Received stream terminator")
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        if isinstance(chunk, dict):
-                            event_name = chunk.get('event', 'chunk')
-
-                            encrypted_body = None
-                            if chunk.get('encrypted') is True:
-                                encrypted_body = chunk.get('data')
-                            else:
-                                data_field = chunk.get('data')
-                                if isinstance(data_field, dict) and data_field.get('encrypted') is True:
-                                    # Encrypted payload may live directly under data or inside a nested
-                                    # `data` key depending on the server schema. Support both shapes.
-                                    encrypted_body = data_field.get('data', data_field)
-                                    event_name = chunk.get('event', event_name)
-
-                            if encrypted_body is not None:
-                                if not isinstance(encrypted_body, dict):
-                                    logger.error("Encrypted streaming chunk missing payload")
-                                    yield {
-                                        'event': 'error',
-                                        'data': {'reason': 'invalid_encrypted_chunk'},
-                                    }
-                                    continue
-
-                                decrypted_payload = self.decrypt_message(encrypted_body)
-                                if decrypted_payload is None:
-                                    logger.error("Failed to decrypt streaming chunk")
-                                    yield {
-                                        'event': 'error',
-                                        'data': {'reason': 'decrypt_failed'},
-                                    }
-                                    continue
-
-                                yield {'event': event_name, 'data': decrypted_payload}
+                        if isinstance(raw_line, bytes):
+                            try:
+                                line = raw_line.decode('utf-8').strip()
+                            except UnicodeDecodeError:
+                                logger.debug("Dropping undecodable chunk: %s", raw_line)
                                 continue
+                        else:
+                            line = raw_line.strip()
+                        if not line or not line.startswith('data:'):
+                            continue
+                        data_str = line[5:].strip()
+                        if not data_str:
+                            continue
+                        if data_str == '[DONE]':
+                            logger.debug("Received stream terminator")
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            if isinstance(chunk, dict):
+                                event_name = chunk.get('event', 'chunk')
 
-                        yield {'event': 'chunk', 'data': chunk}
-                    except json.JSONDecodeError:
-                        logger.debug("Ignoring malformed streaming chunk: %s", data_str)
-                        yield {'event': 'text', 'data': data_str}
-            finally:
-                response.close()
+                                encrypted_body = None
+                                if chunk.get('encrypted') is True:
+                                    encrypted_body = chunk.get('data')
+                                else:
+                                    data_field = chunk.get('data')
+                                    if isinstance(data_field, dict) and data_field.get('encrypted') is True:
+                                        # Encrypted payload may live directly under data or inside a nested
+                                        # `data` key depending on the server schema. Support both shapes.
+                                        encrypted_body = data_field.get('data', data_field)
+                                        event_name = chunk.get('event', event_name)
+
+                                if encrypted_body is not None:
+                                    if not isinstance(encrypted_body, dict):
+                                        logger.error("Encrypted streaming chunk missing payload")
+                                        yield {
+                                            'event': 'error',
+                                            'data': {'reason': 'invalid_encrypted_chunk'},
+                                        }
+                                        continue
+
+                                    decrypted_payload = self.decrypt_message(encrypted_body)
+                                    if decrypted_payload is None:
+                                        logger.error("Failed to decrypt streaming chunk")
+                                        yield {
+                                            'event': 'error',
+                                            'data': {'reason': 'decrypt_failed'},
+                                        }
+                                        continue
+
+                                    yield {'event': event_name, 'data': decrypted_payload}
+                                    continue
+
+                            yield {'event': 'chunk', 'data': chunk}
+                        except json.JSONDecodeError:
+                            logger.debug("Ignoring malformed streaming chunk: %s", data_str)
+                            yield {'event': 'text', 'data': data_str}
+                    return
+                except requests.RequestException as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Streaming interrupted: %s",
+                        exc.__class__.__name__,
+                        exc_info=self.debug,
+                    )
+                    if attempt >= max_retries:
+                        yield {
+                            'event': 'error',
+                            'data': {'reason': 'connection_lost'},
+                        }
+                        return
+                    should_retry = True
+                    retry_reason = 'connection_lost'
+                finally:
+                    response.close()
+
+                if should_retry:
+                    attempt += 1
+                    reconnect_count += 1
+                    yield {
+                        'event': 'reconnect',
+                        'data': {'attempt': reconnect_count, 'reason': retry_reason},
+                    }
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
+                    continue
+
+                return  # pragma: no cover - loop exits after successful attempt
 
         return _iter_chunks()

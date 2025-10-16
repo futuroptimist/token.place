@@ -117,9 +117,21 @@ python -m pytest --cov=. --cov-report=term-missing
 - Responds with deterministic assistant messages so tests can assert on decrypted content.
 - Is exercised automatically via `npm run test:js`, alongside the existing crypto unit tests.
 
-## 11. Real-World Integration Testing with DSPACE
+## ✅ 11. Real-World Integration Testing with DSPACE
 
-Implement integration tests with the [DSPACE project](https://github.com/democratizedspace/dspace) to verify token.place works as a drop-in replacement for OpenAI's API:
+**IMPLEMENTED incrementally via** `tests/integration/test_dspace_chat_alias.py`, which now includes:
+
+- `test_dspace_can_request_gpt5_alias` to ensure the compatibility alias resolves correctly.
+- `test_dspace_receives_usage_metrics` to assert that chat completion responses surface non-negative
+  token usage counters required by DSPACE's UI telemetry.
+
+These tests run automatically inside `run_all_tests.sh`, exercising the mock relay path that DSPACE
+uses in production and giving us confidence that token.place remains a drop-in replacement for
+OpenAI's chat API.
+
+### Future expansion
+
+Implement deeper integration tests with the [DSPACE project](https://github.com/democratizedspace/dspace) to verify token.place works as a drop-in replacement for OpenAI's API:
 
 ### Setup:
 

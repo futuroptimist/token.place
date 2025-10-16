@@ -356,6 +356,8 @@ def test_stream_chat_completion_skips_non_data_lines(mock_post: MagicMock) -> No
             'data': {'event': 'chunk', 'data': {'delta': {'content': 'raw'}}},
         },
     ]
+
+
 @patch('utils.crypto_helpers.time.sleep', autospec=True)
 @patch('utils.crypto_helpers.requests.post')
 def test_stream_chat_completion_reconnects_after_connection_drop(

@@ -271,4 +271,3 @@ def test_stream_chat_completion_skips_non_data_lines(mock_post: MagicMock) -> No
             'data': {'event': 'chunk', 'data': {'delta': {'content': 'raw'}}},
         },
     ]
-

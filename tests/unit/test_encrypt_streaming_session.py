@@ -1,4 +1,4 @@
-import base64
+import os
 
 import pytest
 
@@ -63,3 +63,130 @@ def test_encrypt_stream_chunk_requires_cipherkey_for_first_chunk(mode):
     )
     assert plaintext == b"chunk"
     assert session_after.aes_key == session.aes_key
+
+
+def test_stream_session_normalises_inputs():
+    session = encrypt.StreamSession(
+        aes_key=bytearray(os.urandom(encrypt.AES_KEY_SIZE)),
+        cipher_mode="gcm",
+        associated_data=bytearray(b"meta"),
+    )
+
+    assert isinstance(session.aes_key, bytes)
+    assert session.cipher_mode == "GCM"
+    assert session.associated_data == b"meta"
+
+
+def test_encrypt_helpers_validate_bytes_like_inputs():
+    key = os.urandom(encrypt.AES_KEY_SIZE)
+
+    with pytest.raises(TypeError, match="plaintext must be bytes-like"):
+        encrypt._encrypt_with_key(  # type: ignore[arg-type]
+            "not-bytes", key, cipher_mode="CBC"
+        )
+
+    with pytest.raises(TypeError, match="associated_data must be bytes-like"):
+        encrypt._encrypt_with_key(
+            b"data", key, cipher_mode="GCM", associated_data="bad"  # type: ignore[arg-type]
+        )
+
+
+def test_encrypt_helpers_handle_gcm_round_trip():
+    key = os.urandom(encrypt.AES_KEY_SIZE)
+    payload = b"payload"
+    ad = b"context"
+
+    ciphertext_dict = encrypt._encrypt_with_key(
+        payload,
+        key,
+        cipher_mode="GCM",
+        associated_data=ad,
+    )
+
+    assert ciphertext_dict["mode"] == "GCM"
+
+    plaintext = encrypt._decrypt_with_key(
+        ciphertext_dict,
+        key,
+        cipher_mode="GCM",
+        associated_data=ad,
+    )
+    assert plaintext == payload
+
+
+def test_decrypt_with_key_rejects_invalid_inputs():
+    key = os.urandom(encrypt.AES_KEY_SIZE)
+
+    with pytest.raises(ValueError, match="Missing required field: iv"):
+        encrypt._decrypt_with_key({"ciphertext": b""}, key, cipher_mode="CBC")
+
+    with pytest.raises(TypeError, match="ciphertext must be bytes-like"):
+        encrypt._decrypt_with_key(
+            {"ciphertext": "abc", "iv": b"0" * encrypt.IV_SIZE},  # type: ignore[arg-type]
+            key,
+            cipher_mode="CBC",
+        )
+
+
+def test_stream_session_validations_require_consistency():
+    private_key, public_key = _generate_keys()
+
+    payload1, encrypted_key, session1 = encrypt.encrypt_stream_chunk(
+        b"hello",
+        public_key,
+        cipher_mode="GCM",
+        associated_data=b"ad",
+    )
+    plaintext1, session_for_decrypt = encrypt.decrypt_stream_chunk(
+        payload1,
+        private_key,
+        encrypted_key=encrypted_key,
+        cipher_mode="GCM",
+        associated_data=b"ad",
+    )
+    assert plaintext1 == b"hello"
+
+    payload2, _, session2 = encrypt.encrypt_stream_chunk(
+        b"world",
+        public_key,
+        session=session1,
+        cipher_mode=session1.cipher_mode,
+    )
+    assert session2 is session1
+
+    with pytest.raises(ValueError, match="associated_data mismatch"):
+        encrypt.decrypt_stream_chunk(
+            payload2,
+            private_key,
+            session=session_for_decrypt,
+            associated_data=b"other",
+        )
+
+    with pytest.raises(ValueError, match="encrypted_key should be omitted"):
+        encrypt.decrypt_stream_chunk(
+            payload2,
+            private_key,
+            session=session_for_decrypt,
+            encrypted_key=b"extra",
+        )
+
+
+def test_encrypt_stream_chunk_rejects_conflicting_modes():
+    _, public_key = _generate_keys()
+    session = encrypt.StreamSession(aes_key=os.urandom(encrypt.AES_KEY_SIZE), cipher_mode="CBC")
+
+    with pytest.raises(ValueError, match="cipher_mode mismatch"):
+        encrypt.encrypt_stream_chunk(
+            b"data",
+            public_key,
+            session=session,
+            cipher_mode="GCM",
+        )
+
+
+def test_mode_normalisation_and_validation():
+    assert encrypt._normalise_mode(None) == "CBC"
+    assert encrypt._normalise_mode("gcm") == "GCM"
+
+    with pytest.raises(ValueError, match="Unsupported cipher_mode: fake"):
+        encrypt._normalise_mode("fake")

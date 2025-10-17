@@ -133,6 +133,12 @@ OpenAI's chat API.
 
 Implement deeper integration tests with the [DSPACE project](https://github.com/democratizedspace/dspace) to verify token.place works as a drop-in replacement for OpenAI's API:
 
+- ✅ Added a TypeScript `TokenPlaceClient` harness (`clients/token_place_client.ts`) exercised by
+  `tests/test_token_place_client.ts`. The test starts the mock JS server, hits the OpenAI-compatible
+  `/v1` alias, and proves encrypted chat completions decrypt correctly. This gives us confidence
+  that DSPACE's browser bundler can rely on the documented client contract before wiring up the
+  full app.
+
 ### Setup:
 
 ```bash

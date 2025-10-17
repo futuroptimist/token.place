@@ -245,6 +245,34 @@ def test_stream_chat_completion_surfaces_http_status_errors(mock_post: MagicMock
 
 
 @patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_reports_fallback_request_failure(
+    mock_post: MagicMock,
+) -> None:
+    """Failed fallback requests should yield an error event with context."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    failing_response = _mock_stream_response([])
+    failing_response.status_code = 503
+
+    mock_post.side_effect = [
+        failing_response,
+        RequestException("fallback failed"),
+    ]
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    assert mock_post.call_count == 2
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {'reason': 'bad_status', 'fallback': 'request_failed'},
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
 def test_stream_chat_completion_handles_unicode_decode_failures(mock_post: MagicMock) -> None:
     """Undecodable byte chunks should be skipped without disrupting the stream."""
 
@@ -317,6 +345,27 @@ def test_stream_chat_completion_handles_plain_text_fallback(mock_post: MagicMock
         {
             'event': 'text',
             'data': 'temporarily unavailable',
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_handles_empty_non_stream_payload(
+    mock_post: MagicMock,
+) -> None:
+    """Non-SSE responses without JSON or text should emit an error event."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    mock_post.return_value = _mock_non_stream_response()
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {'reason': 'empty_response'},
         }
     ]
 

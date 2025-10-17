@@ -5,18 +5,19 @@ import os
 import base64
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from functools import lru_cache
+from typing import Dict, Optional, Tuple
+
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as asymmetric_padding
-from cryptography.hazmat.primitives.serialization import load_pem_public_key, load_pem_private_key
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import AES
 from cryptography.hazmat.primitives.ciphers.modes import CBC, GCM
 from cryptography.hazmat.primitives.hashes import SHA256
 import secrets
-from typing import Tuple, Dict, Optional
 
 # Import config, but use fallback values if import fails
 # This allows encrypt.py to work standalone but also in the larger application
@@ -48,6 +49,161 @@ def _load_private_key_cached(private_key_pem: bytes):
         password=None,
         backend=default_backend(),
     )
+
+
+def _ensure_bytes(value: Optional[bytes | bytearray], field_name: str) -> bytes:
+    """Validate that *value* is bytes-like and return it as ``bytes``."""
+
+    if not isinstance(value, (bytes, bytearray)):
+        raise TypeError(f"{field_name} must be bytes-like")
+    return bytes(value)
+
+
+def _normalise_mode(cipher_mode: Optional[str]) -> str:
+    """Return a canonical symmetric mode name."""
+
+    mode = (cipher_mode or "CBC").upper()
+    if mode not in {"CBC", "GCM"}:
+        raise ValueError(f"Unsupported cipher_mode: {cipher_mode}")
+    return mode
+
+
+def _encrypt_with_key(
+    plaintext: bytes,
+    aes_key: bytes,
+    *,
+    cipher_mode: str,
+    associated_data: Optional[bytes] = None,
+) -> Dict[str, bytes]:
+    """Encrypt *plaintext* using an existing AES session key."""
+
+    plaintext_bytes = _ensure_bytes(plaintext, "plaintext")
+    aes_bytes = _ensure_bytes(aes_key, "aes_key")
+    mode = _normalise_mode(cipher_mode)
+
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes-like when provided")
+
+    if mode == "CBC":
+        iv = secrets.token_bytes(IV_SIZE)
+        cipher = Cipher(AES(aes_bytes), CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        padded_data = pkcs7_pad(plaintext_bytes, 16)
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+        return {"ciphertext": ciphertext, "iv": iv}
+
+    iv = secrets.token_bytes(GCM_IV_SIZE)
+    encryptor = Cipher(AES(aes_bytes), GCM(iv), backend=default_backend()).encryptor()
+    if associated_data:
+        encryptor.authenticate_additional_data(bytes(associated_data))
+    ciphertext = encryptor.update(plaintext_bytes) + encryptor.finalize()
+    return {
+        "ciphertext": ciphertext,
+        "iv": iv,
+        "tag": encryptor.tag,
+        "mode": "GCM",
+    }
+
+
+def _decrypt_with_key(
+    ciphertext_dict: Mapping[str, bytes],
+    aes_key: bytes,
+    *,
+    cipher_mode: str,
+    associated_data: Optional[bytes] = None,
+) -> bytes:
+    """Decrypt a payload using an existing AES session key."""
+
+    aes_bytes = _ensure_bytes(aes_key, "aes_key")
+    mode = _normalise_mode(cipher_mode)
+
+    required_fields = ["ciphertext", "iv"]
+    if mode == "GCM":
+        required_fields.append("tag")
+
+    for field in required_fields:
+        if field not in ciphertext_dict:
+            raise ValueError(f"Missing required field: {field}")
+        if not isinstance(ciphertext_dict[field], (bytes, bytearray)):
+            raise TypeError(f"{field} must be bytes-like")
+
+    ciphertext = bytes(ciphertext_dict["ciphertext"])
+    iv = bytes(ciphertext_dict["iv"])
+
+    if mode == "CBC":
+        cipher = Cipher(AES(aes_bytes), CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        return pkcs7_unpad(padded_plaintext, 16)
+
+    tag = bytes(ciphertext_dict["tag"])
+    decryptor = Cipher(AES(aes_bytes), GCM(iv, tag), backend=default_backend()).decryptor()
+    if associated_data:
+        decryptor.authenticate_additional_data(bytes(associated_data))
+    return decryptor.update(ciphertext) + decryptor.finalize()
+
+
+def _encrypt_session_key(
+    aes_key: bytes,
+    public_key_pem: bytes,
+    *,
+    use_pkcs1v15: bool,
+) -> bytes:
+    """Encrypt the AES session key with the provided RSA public key."""
+
+    public_key = serialization.load_pem_public_key(bytes(public_key_pem), backend=default_backend())
+    aes_key_b64 = base64.b64encode(_ensure_bytes(aes_key, "aes_key"))
+
+    if use_pkcs1v15:
+        return public_key.encrypt(aes_key_b64, asymmetric_padding.PKCS1v15())
+
+    return public_key.encrypt(
+        aes_key_b64,
+        asymmetric_padding.OAEP(
+            mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None,
+        ),
+    )
+
+
+def _decrypt_session_key(encrypted_key: bytes, private_key_pem: bytes) -> bytes:
+    """Decrypt an RSA-wrapped AES session key."""
+
+    private_key = _load_private_key_cached(bytes(private_key_pem))
+
+    try:
+        aes_key_b64 = private_key.decrypt(
+            encrypted_key,
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
+                algorithm=SHA256(),
+                label=None,
+            ),
+        )
+    except Exception:
+        aes_key_b64 = private_key.decrypt(
+            encrypted_key,
+            asymmetric_padding.PKCS1v15(),
+        )
+
+    return base64.b64decode(aes_key_b64)
+
+
+@dataclass(slots=True)
+class StreamSession:
+    """Hold symmetric context for encrypted streaming payloads."""
+
+    aes_key: bytes
+    cipher_mode: str = "CBC"
+    associated_data: Optional[bytes] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "aes_key", _ensure_bytes(self.aes_key, "aes_key"))
+        mode = _normalise_mode(self.cipher_mode)
+        object.__setattr__(self, "cipher_mode", mode)
+        if self.associated_data is not None:
+            object.__setattr__(self, "associated_data", bytes(self.associated_data))
 
 def generate_keys() -> Tuple[bytes, bytes]:
     """
@@ -112,61 +268,114 @@ def encrypt(
         - encrypted_key: The AES key encrypted with RSA
         - iv: Initialization vector used for AES-CBC
     """
-    # Generate a random AES key
-    aes_key = secrets.token_bytes(AES_KEY_SIZE)  # 256-bit key
+    if not isinstance(public_key_pem, (bytes, bytearray)):
+        raise TypeError("public_key_pem must be bytes-like")
 
-    mode = cipher_mode.upper()
-
-    if mode == "CBC":
-        iv = secrets.token_bytes(IV_SIZE)  # 128-bit IV for AES-CBC
-        cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        padded_data = pkcs7_pad(plaintext, 16)
-        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-        ciphertext_dict: Dict[str, bytes] = {"ciphertext": ciphertext, "iv": iv}
-    elif mode == "GCM":
-        iv = secrets.token_bytes(GCM_IV_SIZE)
-        encryptor = Cipher(AES(aes_key), GCM(iv), backend=default_backend()).encryptor()
-        if associated_data:
-            if not isinstance(associated_data, (bytes, bytearray)):
-                raise TypeError("associated_data must be bytes-like when provided")
-            encryptor.authenticate_additional_data(bytes(associated_data))
-        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-        ciphertext_dict = {
-            "ciphertext": ciphertext,
-            "iv": iv,
-            "tag": encryptor.tag,
-            "mode": "GCM",
-        }
-    else:
-        raise ValueError(f"Unsupported cipher_mode: {cipher_mode}")
-
-    # Now encrypt the AES key with RSA
-    public_key = serialization.load_pem_public_key(
-        public_key_pem,
-        backend=default_backend()
+    mode = _normalise_mode(cipher_mode)
+    aes_key = secrets.token_bytes(AES_KEY_SIZE)
+    ciphertext_dict = _encrypt_with_key(
+        plaintext,
+        aes_key,
+        cipher_mode=mode,
+        associated_data=associated_data,
     )
+    encrypted_key = _encrypt_session_key(
+        aes_key,
+        bytes(public_key_pem),
+        use_pkcs1v15=use_pkcs1v15,
+    )
+    iv = ciphertext_dict.get("iv", b"")
+    return ciphertext_dict, encrypted_key, iv
 
-    # For compatibility with JSEncrypt, convert the AES key to Base64 first
-    aes_key_b64 = base64.b64encode(aes_key)
 
-    # Encrypt the Base64 representation of the key
-    if use_pkcs1v15:
-        encrypted_key = public_key.encrypt(
-            aes_key_b64,
-            asymmetric_padding.PKCS1v15()
+def encrypt_stream_chunk(
+    plaintext: bytes,
+    public_key_pem: bytes,
+    *,
+    session: Optional[StreamSession] = None,
+    use_pkcs1v15: bool = False,
+    cipher_mode: str = "CBC",
+    associated_data: Optional[bytes] = None,
+) -> Tuple[Dict[str, bytes], Optional[bytes], StreamSession]:
+    """Encrypt a streaming chunk while maintaining a reusable session key."""
+
+    if session is not None and not isinstance(session, StreamSession):
+        raise TypeError("session must be a StreamSession instance")
+    if not isinstance(public_key_pem, (bytes, bytearray)):
+        raise TypeError("public_key_pem must be bytes-like")
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes-like when provided")
+
+    if session is None:
+        mode = _normalise_mode(cipher_mode)
+        aes_key = secrets.token_bytes(AES_KEY_SIZE)
+        normalized_ad = bytes(associated_data) if isinstance(associated_data, bytearray) else associated_data
+        session = StreamSession(aes_key=aes_key, cipher_mode=mode, associated_data=normalized_ad)
+        encrypted_key: Optional[bytes] = _encrypt_session_key(
+            session.aes_key,
+            bytes(public_key_pem),
+            use_pkcs1v15=use_pkcs1v15,
         )
     else:
-        encrypted_key = public_key.encrypt(
-            aes_key_b64,
-            asymmetric_padding.OAEP(
-                mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
-                algorithm=SHA256(),
-                label=None,
-            )
-        )
+        mode = session.cipher_mode
+        normalized_ad = session.associated_data
+        if cipher_mode is not None and _normalise_mode(cipher_mode) != mode:
+            raise ValueError("cipher_mode mismatch for existing streaming session")
+        if associated_data is not None and bytes(associated_data) != (normalized_ad or b""):
+            raise ValueError("associated_data mismatch for existing streaming session")
+        encrypted_key = None
 
-    return ciphertext_dict, encrypted_key, iv
+    ciphertext_dict = _encrypt_with_key(
+        plaintext,
+        session.aes_key,
+        cipher_mode=mode,
+        associated_data=normalized_ad,
+    )
+    return ciphertext_dict, encrypted_key, session
+
+
+def decrypt_stream_chunk(
+    ciphertext_dict: Mapping[str, bytes],
+    private_key_pem: bytes,
+    *,
+    session: Optional[StreamSession] = None,
+    encrypted_key: Optional[bytes] = None,
+    cipher_mode: Optional[str] = None,
+    associated_data: Optional[bytes] = None,
+) -> Tuple[bytes, StreamSession]:
+    """Decrypt a streaming chunk while keeping the session key alive."""
+
+    if session is not None and not isinstance(session, StreamSession):
+        raise TypeError("session must be a StreamSession instance")
+    if not isinstance(private_key_pem, (bytes, bytearray)):
+        raise TypeError("private_key_pem must be bytes-like")
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes-like when provided")
+
+    if session is None:
+        if encrypted_key is None:
+            raise ValueError("encrypted_key is required for the first streaming chunk")
+        mode = _normalise_mode(cipher_mode or ciphertext_dict.get("mode"))
+        normalized_ad = bytes(associated_data) if isinstance(associated_data, bytearray) else associated_data
+        aes_key = _decrypt_session_key(bytes(encrypted_key), bytes(private_key_pem))
+        session = StreamSession(aes_key=aes_key, cipher_mode=mode, associated_data=normalized_ad)
+    else:
+        mode = session.cipher_mode
+        normalized_ad = session.associated_data
+        if cipher_mode is not None and _normalise_mode(cipher_mode) != mode:
+            raise ValueError("cipher_mode mismatch for existing streaming session")
+        if associated_data is not None and bytes(associated_data) != (normalized_ad or b""):
+            raise ValueError("associated_data mismatch for existing streaming session")
+        if encrypted_key is not None:
+            raise ValueError("encrypted_key should be omitted when reusing a streaming session")
+
+    plaintext = _decrypt_with_key(
+        ciphertext_dict,
+        session.aes_key,
+        cipher_mode=mode,
+        associated_data=normalized_ad,
+    )
+    return plaintext, session
 
 def decrypt(
     ciphertext_dict: Mapping[str, bytes],
@@ -195,11 +404,17 @@ def decrypt(
     """
     if not isinstance(ciphertext_dict, Mapping):
         raise TypeError("ciphertext_dict must be a mapping with ciphertext and iv entries")
+    if not isinstance(encrypted_key, (bytes, bytearray)):
+        raise TypeError("encrypted_key must be bytes-like")
+    if not isinstance(private_key_pem, (bytes, bytearray)):
+        raise TypeError("private_key_pem must be bytes-like")
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes-like when provided")
 
     mode_hint = cipher_mode or ciphertext_dict.get("mode")
     if mode_hint is None and "tag" in ciphertext_dict:
         mode_hint = "GCM"
-    mode = (mode_hint or "CBC").upper()
+    mode = _normalise_mode(mode_hint)
 
     required_fields = ["ciphertext", "iv"]
     if mode == "GCM":
@@ -207,59 +422,17 @@ def decrypt(
     for field in required_fields:
         if field not in ciphertext_dict:
             raise ValueError(f"Missing required field: {field}")
-        value = ciphertext_dict[field]
-        if not isinstance(value, (bytes, bytearray)):
+        if not isinstance(ciphertext_dict[field], (bytes, bytearray)):
             raise TypeError(f"{field} must be bytes-like")
 
-    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
-        raise TypeError("associated_data must be bytes-like when provided")
-
-    if not isinstance(encrypted_key, (bytes, bytearray)):
-        raise TypeError("encrypted_key must be bytes-like")
-    if not isinstance(private_key_pem, (bytes, bytearray)):
-        raise TypeError("private_key_pem must be bytes-like")
-
     try:
-        # First decrypt the AES key using RSA
-        private_key = _load_private_key_cached(bytes(private_key_pem))
-
-        # Decrypt the encrypted AES key. Try OAEP first, then fall back to PKCS1v15 for JS compatibility
-        try:
-            aes_key_b64 = private_key.decrypt(
-                encrypted_key,
-                asymmetric_padding.OAEP(
-                    mgf=asymmetric_padding.MGF1(algorithm=SHA256()),
-                    algorithm=SHA256(),
-                    label=None,
-                )
-            )
-        except Exception:
-            aes_key_b64 = private_key.decrypt(
-                encrypted_key,
-                asymmetric_padding.PKCS1v15()
-            )
-
-        # Decode the Base64 to get the actual AES key
-        aes_key = base64.b64decode(aes_key_b64)
-
-        ciphertext = bytes(ciphertext_dict['ciphertext'])
-        iv = bytes(ciphertext_dict['iv'])
-
-        if mode == "CBC":
-            cipher = Cipher(AES(aes_key), CBC(iv), backend=default_backend())
-            decryptor = cipher.decryptor()
-            padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-            plaintext = pkcs7_unpad(padded_plaintext, 16)
-            return plaintext
-
-        if mode != "GCM":
-            raise ValueError(f"Unsupported cipher_mode: {mode}")
-
-        tag = bytes(ciphertext_dict['tag'])
-        decryptor = Cipher(AES(aes_key), GCM(iv, tag), backend=default_backend()).decryptor()
-        if associated_data:
-            decryptor.authenticate_additional_data(bytes(associated_data))
-        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        aes_key = _decrypt_session_key(bytes(encrypted_key), bytes(private_key_pem))
+        plaintext = _decrypt_with_key(
+            ciphertext_dict,
+            aes_key,
+            cipher_mode=mode,
+            associated_data=bytes(associated_data) if isinstance(associated_data, bytearray) else associated_data,
+        )
         return plaintext
     except Exception:
         # Avoid leaking sensitive details in logs

@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional
 
 from unittest.mock import MagicMock, patch
 
-from requests.exceptions import ChunkedEncodingError
+from requests.exceptions import ChunkedEncodingError, RequestException
 
 from utils.crypto_helpers import CryptoClient
 
@@ -207,7 +207,7 @@ def test_stream_chat_completion_handles_decrypt_failures(mock_post: MagicMock) -
 
 @patch('utils.crypto_helpers.requests.post')
 def test_stream_chat_completion_surfaces_http_status_errors(mock_post: MagicMock) -> None:
-    """HTTP failures should produce an error event and end the stream."""
+    """HTTP failures should fall back to a non-streaming request."""
 
     client = CryptoClient('https://stream.test')
     messages = [{"role": "user", "content": "Hello"}]
@@ -215,15 +215,32 @@ def test_stream_chat_completion_surfaces_http_status_errors(mock_post: MagicMock
     failing_response = _mock_stream_response([])
     failing_response.status_code = 502
 
-    mock_post.return_value = failing_response
+    fallback_payload: Dict[str, Dict[str, str]] = {
+        'choices': [{'message': {'role': 'assistant', 'content': 'fallback'}}],
+    }
+
+    mock_post.side_effect = [
+        failing_response,
+        _mock_non_stream_response(json_payload=fallback_payload),
+    ]
 
     chunks = list(client.stream_chat_completion(messages))
 
+    assert mock_post.call_count == 2
+    first_kwargs = mock_post.call_args_list[0].kwargs
+    second_kwargs = mock_post.call_args_list[1].kwargs
+    assert first_kwargs['stream'] is True
+    assert second_kwargs['stream'] is False
+    assert second_kwargs['json']['stream'] is False
     assert chunks == [
         {
-            'event': 'error',
-            'data': {'status': 502},
-        }
+            'event': 'fallback',
+            'data': {'reason': 'bad_status'},
+        },
+        {
+            'event': 'response',
+            'data': fallback_payload,
+        },
     ]
 
 
@@ -455,3 +472,43 @@ def test_stream_chat_completion_waits_before_retry(
         'event': 'reconnect',
         'data': {'attempt': 1, 'reason': 'connection_lost'},
     }
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_falls_back_after_request_failure(
+    mock_post: MagicMock,
+) -> None:
+    """Request failures should fall back to a JSON response when retries are exhausted."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    fallback_payload: Dict[str, Dict[str, str]] = {
+        'choices': [{'message': {'role': 'assistant', 'content': 'fallback'}}],
+    }
+
+    mock_post.side_effect = [
+        RequestException("boom"),
+        _mock_non_stream_response(json_payload=fallback_payload),
+    ]
+
+    chunks = list(
+        client.stream_chat_completion(messages, max_retries=0, retry_delay=0),
+    )
+
+    assert mock_post.call_count == 2
+    first_kwargs = mock_post.call_args_list[0].kwargs
+    second_kwargs = mock_post.call_args_list[1].kwargs
+    assert first_kwargs['stream'] is True
+    assert second_kwargs['stream'] is False
+    assert second_kwargs['json']['stream'] is False
+    assert chunks == [
+        {
+            'event': 'fallback',
+            'data': {'reason': 'request_failed'},
+        },
+        {
+            'event': 'response',
+            'data': fallback_payload,
+        },
+    ]

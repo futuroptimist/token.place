@@ -74,13 +74,21 @@ async function startMockServer() {
 
     const server = http.createServer(async (req, res) => {
         try {
-            if (req.method === 'GET' && req.url === '/api/v1/public-key') {
+            const { pathname } = new URL(req.url, 'http://127.0.0.1');
+
+            if (
+                req.method === 'GET'
+                && (pathname === '/api/v1/public-key' || pathname === '/v1/public-key')
+            ) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ public_key: serverPublicKey }));
                 return;
             }
 
-            if (req.method === 'POST' && req.url === '/api/v1/chat/completions') {
+            if (
+                req.method === 'POST'
+                && (pathname === '/api/v1/chat/completions' || pathname === '/v1/chat/completions')
+            ) {
                 let bodyRaw = '';
                 req.on('data', chunk => {
                     bodyRaw += chunk;

@@ -22,7 +22,7 @@ def test_extract_message_content_for_usage_handles_various_payloads():
 
 
 def test_estimate_token_length_bounds_results_for_short_and_long_inputs():
-    """The estimator should guard against zero tokens and ignore whitespace.""" 
+    """The estimator should guard against zero tokens and ignore whitespace."""
 
     assert routes._estimate_token_length("") == 0
     assert routes._estimate_token_length("   \n  ") == 0

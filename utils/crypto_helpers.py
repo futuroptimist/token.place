@@ -563,6 +563,43 @@ class CryptoClient:
         def _iter_chunks() -> Iterator[Dict[str, Any]]:
             attempt = 0
             reconnect_count = 0
+
+            def _emit_non_stream_response(response: Any) -> Iterator[Dict[str, Any]]:
+                try:
+                    data = response.json()
+                except ValueError:
+                    body_text = getattr(response, 'text', '')
+                    if body_text:
+                        yield {'event': 'text', 'data': body_text}
+                    else:
+                        yield {'event': 'error', 'data': {'reason': 'empty_response'}}
+                    return
+                yield {'event': 'response', 'data': data}
+
+            def _fallback_to_non_stream(reason: str) -> Iterator[Dict[str, Any]]:
+                fallback_payload = dict(payload)
+                fallback_payload['stream'] = False
+                try:
+                    fallback_response = requests.post(
+                        full_url,
+                        json=fallback_payload,
+                        timeout=timeout,
+                        stream=False,
+                    )
+                except requests.RequestException as fallback_exc:
+                    logger.error(
+                        "Fallback request failed: %s",
+                        fallback_exc.__class__.__name__,
+                        exc_info=self.debug,
+                    )
+                    yield {
+                        'event': 'error',
+                        'data': {'reason': reason, 'fallback': 'request_failed'},
+                    }
+                    return
+                yield {'event': 'fallback', 'data': {'reason': reason}}
+                yield from _emit_non_stream_response(fallback_response)
+
             while True:
                 try:
                     response = requests.post(
@@ -578,10 +615,7 @@ class CryptoClient:
                         exc_info=self.debug,
                     )
                     if attempt >= max_retries:
-                        yield {
-                            'event': 'error',
-                            'data': {'reason': 'request_failed', 'error': exc.__class__.__name__},
-                        }
+                        yield from _fallback_to_non_stream('request_failed')
                         return
                     attempt += 1
                     reconnect_count += 1
@@ -604,10 +638,7 @@ class CryptoClient:
                             "Streaming request returned unexpected status: %s",
                             response.status_code,
                         )
-                        yield {
-                            'event': 'error',
-                            'data': {'status': response.status_code},
-                        }
+                        yield from _fallback_to_non_stream('bad_status')
                         return
 
                     if not is_event_stream:
@@ -615,13 +646,7 @@ class CryptoClient:
                             "Non-streaming response received with content-type %s",
                             content_type,
                         )
-                        try:
-                            data = response.json()
-                            yield {'event': 'response', 'data': data}
-                        except ValueError:
-                            body_text = getattr(response, 'text', '')
-                            if body_text:
-                                yield {'event': 'text', 'data': body_text}
+                        yield from _emit_non_stream_response(response)
                         return
 
                     for raw_line in response.iter_lines(decode_unicode=True):
@@ -692,10 +717,7 @@ class CryptoClient:
                         exc_info=self.debug,
                     )
                     if attempt >= max_retries:
-                        yield {
-                            'event': 'error',
-                            'data': {'reason': 'connection_lost'},
-                        }
+                        yield from _fallback_to_non_stream(retry_reason)
                         return
                     should_retry = True
                     retry_reason = 'connection_lost'

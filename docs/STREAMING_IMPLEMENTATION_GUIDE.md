@@ -165,6 +165,6 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 ## Fallback Mechanisms
 
 Implement graceful degradation when streaming fails:
-- Fall back to non-streaming mode
+- ✅ Fall back to non-streaming mode
 - Cache partial responses for resumption
 - Provide clear error messaging to users

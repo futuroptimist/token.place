@@ -90,6 +90,55 @@ def test_encrypt_stream_chunk_retries_on_iv_collision(monkeypatch):
     )
 
 
+def test_encrypt_stream_chunk_tracks_all_prior_ivs(monkeypatch):
+    """IV reuse should be prevented even when not consecutive."""
+
+    private_key, public_key = _generate_keys()
+
+    iv_sequence = collections.deque(
+        [
+            b"\x01" * encrypt.IV_SIZE,
+            b"\x02" * encrypt.IV_SIZE,
+            b"\x01" * encrypt.IV_SIZE,
+            b"\x03" * encrypt.IV_SIZE,
+            b"\x04" * encrypt.IV_SIZE,
+        ]
+    )
+
+    def fake_token_bytes(length: int) -> bytes:
+        if length == encrypt.IV_SIZE:
+            return iv_sequence.popleft()
+        return b"\xaa" * length
+
+    monkeypatch.setattr(encrypt.secrets, "token_bytes", fake_token_bytes)
+
+    payload1, encrypted_key, session = encrypt.encrypt_stream_chunk(b"chunk-1", public_key)
+    payload2, _, session = encrypt.encrypt_stream_chunk(b"chunk-2", public_key, session=session)
+    payload3, _, session = encrypt.encrypt_stream_chunk(b"chunk-3", public_key, session=session)
+
+    assert payload1["iv"] != payload2["iv"]
+    assert payload1["iv"] != payload3["iv"]
+    assert payload2["iv"] != payload3["iv"]
+
+    _, decrypt_session = encrypt.decrypt_stream_chunk(
+        payload1,
+        private_key,
+        encrypted_key=encrypted_key,
+    )
+    _, decrypt_session = encrypt.decrypt_stream_chunk(
+        payload2,
+        private_key,
+        session=decrypt_session,
+    )
+
+    with pytest.raises(ValueError, match="Repeated IV detected"):
+        encrypt.decrypt_stream_chunk(
+            payload1,
+            private_key,
+            session=decrypt_session,
+        )
+
+
 @pytest.mark.parametrize("mode", ["CBC", "GCM"])
 def test_encrypt_stream_chunk_requires_cipherkey_for_first_chunk(mode):
     private_key, public_key = _generate_keys()

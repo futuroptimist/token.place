@@ -420,30 +420,36 @@ new Vue({
             const shouldAnimate = typingFactory && typeof content === 'string' && content.trim().length > 0;
 
             if (!shouldAnimate) {
-                this.chatHistory.push(message);
+                const entry = Object.assign({}, message, { isTyping: false });
+                this.chatHistory.push(entry);
                 return;
             }
 
-            const entry = Object.assign({}, message);
-            entry.content = '';
-            entry.isTyping = true;
-
             const finalText = content;
+            const entry = Object.assign({}, message, {
+                content: finalText,
+                displayContent: '',
+                isTyping: true
+            });
             const chunkSize = this.calculateTypingChunkSize(finalText);
 
             const animator = ChatTypingEffect.createTypingAnimator({
                 fullText: finalText,
                 chunkSize,
                 onUpdate: (partial) => {
-                    entry.content = partial;
+                    entry.displayContent = partial;
                 },
                 onComplete: () => {
                     entry.isTyping = false;
-                    entry.content = finalText;
                     if (entry._animator && typeof entry._animator.cancel === 'function') {
                         entry._animator.cancel();
                     }
                     delete entry._animator;
+                    if (typeof this.$delete === 'function') {
+                        this.$delete(entry, 'displayContent');
+                    } else {
+                        delete entry.displayContent;
+                    }
                 },
                 schedule: (fn, delay) => {
                     if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
@@ -466,6 +472,18 @@ new Vue({
             this.$nextTick(() => {
                 animator.start();
             });
+        },
+
+        getDisplayContent(message) {
+            if (!message || typeof message !== 'object') {
+                return '';
+            }
+
+            if (typeof message.displayContent === 'string') {
+                return message.displayContent;
+            }
+
+            return message.content;
         },
 
 

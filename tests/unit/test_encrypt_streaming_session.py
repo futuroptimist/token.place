@@ -1,3 +1,4 @@
+import collections
 import os
 
 import pytest
@@ -42,6 +43,100 @@ def test_encrypt_stream_chunk_reuses_session_key():
     )
     assert plaintext2 == second_chunk
     assert session_after_second.aes_key == session_for_decrypt.aes_key
+
+
+def test_encrypt_stream_chunk_retries_on_iv_collision(monkeypatch):
+    """Encryption should retry when IV generation produces a duplicate."""
+
+    private_key, public_key = _generate_keys()
+
+    iv_sequence = collections.deque(
+        [
+            b"\x01" * encrypt.IV_SIZE,
+            b"\x01" * encrypt.IV_SIZE,
+            b"\x02" * encrypt.IV_SIZE,
+            b"\x02" * encrypt.IV_SIZE,
+        ]
+    )
+
+    def fake_token_bytes(length: int) -> bytes:
+        if length == encrypt.IV_SIZE:
+            return iv_sequence.popleft()
+        return b"\x99" * length
+
+    monkeypatch.setattr(encrypt.secrets, "token_bytes", fake_token_bytes)
+
+    first_payload, encrypted_key, session = encrypt.encrypt_stream_chunk(b"first", public_key)
+    assert encrypted_key is not None
+
+    second_payload, _, session = encrypt.encrypt_stream_chunk(
+        b"second",
+        public_key,
+        session=session,
+    )
+
+    assert first_payload["iv"] != second_payload["iv"], "IVs must differ between streaming chunks"
+
+    _, decrypt_session = encrypt.decrypt_stream_chunk(
+        first_payload,
+        private_key,
+        encrypted_key=encrypted_key,
+    )
+
+    _, _ = encrypt.decrypt_stream_chunk(
+        second_payload,
+        private_key,
+        session=decrypt_session,
+    )
+
+
+def test_encrypt_stream_chunk_tracks_all_prior_ivs(monkeypatch):
+    """IV reuse should be prevented even when not consecutive."""
+
+    private_key, public_key = _generate_keys()
+
+    iv_sequence = collections.deque(
+        [
+            b"\x01" * encrypt.IV_SIZE,
+            b"\x02" * encrypt.IV_SIZE,
+            b"\x01" * encrypt.IV_SIZE,
+            b"\x03" * encrypt.IV_SIZE,
+            b"\x04" * encrypt.IV_SIZE,
+        ]
+    )
+
+    def fake_token_bytes(length: int) -> bytes:
+        if length == encrypt.IV_SIZE:
+            return iv_sequence.popleft()
+        return b"\xaa" * length
+
+    monkeypatch.setattr(encrypt.secrets, "token_bytes", fake_token_bytes)
+
+    payload1, encrypted_key, session = encrypt.encrypt_stream_chunk(b"chunk-1", public_key)
+    payload2, _, session = encrypt.encrypt_stream_chunk(b"chunk-2", public_key, session=session)
+    payload3, _, session = encrypt.encrypt_stream_chunk(b"chunk-3", public_key, session=session)
+
+    assert payload1["iv"] != payload2["iv"]
+    assert payload1["iv"] != payload3["iv"]
+    assert payload2["iv"] != payload3["iv"]
+
+    _, decrypt_session = encrypt.decrypt_stream_chunk(
+        payload1,
+        private_key,
+        encrypted_key=encrypted_key,
+    )
+    _, decrypt_session = encrypt.decrypt_stream_chunk(
+        payload2,
+        private_key,
+        session=decrypt_session,
+    )
+
+    with pytest.raises(ValueError, match="Repeated IV detected"):
+        encrypt.decrypt_stream_chunk(
+            payload1,
+            private_key,
+            session=decrypt_session,
+        )
 
 
 @pytest.mark.parametrize("mode", ["CBC", "GCM"])

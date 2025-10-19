@@ -5,7 +5,7 @@ import os
 import base64
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
 
@@ -197,6 +197,9 @@ class StreamSession:
     aes_key: bytes
     cipher_mode: str = "CBC"
     associated_data: Optional[bytes] = None
+    last_iv: Optional[bytes] = None
+    chunk_index: int = 0
+    used_ivs: set[bytes] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "aes_key", _ensure_bytes(self.aes_key, "aes_key"))
@@ -204,6 +207,12 @@ class StreamSession:
         object.__setattr__(self, "cipher_mode", mode)
         if self.associated_data is not None:
             object.__setattr__(self, "associated_data", bytes(self.associated_data))
+        if self.last_iv is not None:
+            object.__setattr__(self, "last_iv", bytes(self.last_iv))
+            self.used_ivs.add(self.last_iv)
+        if self.used_ivs:
+            normalised_ivs = {bytes(iv) for iv in self.used_ivs}
+            object.__setattr__(self, "used_ivs", normalised_ivs)
 
 def generate_keys() -> Tuple[bytes, bytes]:
     """
@@ -325,12 +334,30 @@ def encrypt_stream_chunk(
             raise ValueError("associated_data mismatch for existing streaming session")
         encrypted_key = None
 
-    ciphertext_dict = _encrypt_with_key(
-        plaintext,
-        session.aes_key,
-        cipher_mode=mode,
-        associated_data=normalized_ad,
-    )
+    max_iv_attempts = 5
+    ciphertext_dict: Dict[str, bytes]
+    iv_bytes: bytes
+
+    for _ in range(max_iv_attempts):
+        ciphertext_dict = _encrypt_with_key(
+            plaintext,
+            session.aes_key,
+            cipher_mode=mode,
+            associated_data=normalized_ad,
+        )
+        iv_candidate = ciphertext_dict.get("iv")
+        if not isinstance(iv_candidate, (bytes, bytearray)):
+            raise ValueError("Streaming encryption must include an initialization vector")
+        iv_bytes = bytes(iv_candidate)
+        if iv_bytes not in session.used_ivs:
+            break
+    else:
+        raise RuntimeError("Failed to derive a unique IV for the streaming chunk")
+
+    session.used_ivs.add(iv_bytes)
+    object.__setattr__(session, "last_iv", iv_bytes)
+    object.__setattr__(session, "chunk_index", session.chunk_index + 1)
+
     return ciphertext_dict, encrypted_key, session
 
 
@@ -375,6 +402,15 @@ def decrypt_stream_chunk(
         cipher_mode=mode,
         associated_data=normalized_ad,
     )
+
+    iv_bytes = bytes(ciphertext_dict["iv"])
+    if iv_bytes in session.used_ivs:
+        raise ValueError("Repeated IV detected for streaming chunk")
+
+    session.used_ivs.add(iv_bytes)
+    object.__setattr__(session, "last_iv", iv_bytes)
+    object.__setattr__(session, "chunk_index", session.chunk_index + 1)
+
     return plaintext, session
 
 def decrypt(

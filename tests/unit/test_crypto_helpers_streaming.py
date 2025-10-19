@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from requests.exceptions import ChunkedEncodingError, RequestException
 
+import encrypt
 from utils.crypto_helpers import CryptoClient
 
 
@@ -200,6 +202,47 @@ def test_stream_chat_completion_handles_decrypt_failures(mock_post: MagicMock) -
         chunks = list(client.stream_chat_completion(messages))
 
     mock_decrypt.assert_called_once_with(encrypted_payload)
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_flags_tampered_encrypted_chunks(mock_post: MagicMock) -> None:
+    """Tampered encrypted chunks should emit a decrypt_failed error event."""
+
+    client = CryptoClient('https://stream.test')
+    assert client.client_public_key is not None
+    messages = [{"role": "user", "content": "Hello"}]
+
+    plaintext_chunk = {'choices': [{'delta': {'content': 'Hi there!'}}]}
+    ciphertext_dict, cipherkey, iv = encrypt.encrypt(
+        json.dumps(plaintext_chunk).encode('utf-8'),
+        client.client_public_key,
+    )
+
+    tampered_ciphertext = bytearray(ciphertext_dict['ciphertext'])
+    tampered_ciphertext[0] ^= 0x01
+
+    tampered_payload: Dict[str, str] = {
+        'ciphertext': base64.b64encode(bytes(tampered_ciphertext)).decode('utf-8'),
+        'cipherkey': base64.b64encode(cipherkey).decode('utf-8'),
+        'iv': base64.b64encode(iv).decode('utf-8'),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'event': 'delta', 'encrypted': True, 'data': tampered_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
     assert chunks == [
         {
             'event': 'error',

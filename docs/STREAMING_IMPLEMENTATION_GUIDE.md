@@ -155,7 +155,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 
 ## Security Considerations
 
-- Ensure each chunk is properly encrypted
+- ✅ Ensure each chunk is properly encrypted via StreamSession IV collision detection and retry logic
 - Implement reconnection logic that maintains encryption state
 - Verify that partial responses cannot be intercepted or modified
 - Consider rate limiting and denial-of-service protections

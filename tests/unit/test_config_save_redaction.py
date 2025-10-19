@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from config import Config
+from config import Config, SensitiveKey
 
 
 @pytest.fixture(name="config_tmp_file")
@@ -30,3 +30,23 @@ def test_save_user_config_redacts_registration_token(config_tmp_file: Path, monk
     assert config_tmp_file.exists()
     saved = json.loads(config_tmp_file.read_text())
     assert saved["relay"].get("server_registration_token") is None
+
+
+def test_redacted_config_copy_handles_non_dict_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redaction gracefully skips sensitive keys when structure changes."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    config = Config(env="testing")
+    # Force an unexpected structure so traversal encounters non-dict entries.
+    config.set("relay", ["unexpected-structure"])
+    monkeypatch.setattr(
+        "config.SENSITIVE_CONFIG_KEYS",
+        [SensitiveKey("relay.updated.server_registration_token")],
+        raising=False,
+    )
+
+    redacted = config._redacted_config_copy()
+
+    # The method should still return a deepcopy without mutating the list value.
+    assert redacted["relay"] == ["unexpected-structure"]
+    assert redacted is not config.config

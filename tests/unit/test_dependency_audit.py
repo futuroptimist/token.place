@@ -34,3 +34,15 @@ def test_validate_requirements_is_case_insensitive(tmp_path):
 
     assert issues, "Expected insecure cryptography version to be flagged"
     assert all("CRYPTOGRAPHY" in issue for issue in issues)
+
+
+@pytest.mark.security
+@pytest.mark.unit
+def test_validate_requirements_flags_recent_advisories(tmp_path):
+    sample = tmp_path / "req.txt"
+    sample.write_text("tqdm==4.66.1\nidna==3.6\n", encoding="utf-8")
+
+    issues = dependency_audit.validate_requirements(sample)
+
+    assert any("tqdm" in issue for issue in issues), "Expected tqdm advisory to be enforced"
+    assert any("idna" in issue for issue in issues), "Expected idna advisory to be enforced"

@@ -121,8 +121,10 @@ requirements baseline check.
   `httpx`, and `cryptography`.
 - Wired the helper into the pytest suite via `tests/unit/test_dependency_audit.py`,
   ensuring regressions are caught in CI.
+- Expanded the dependency baseline to include `tqdm` (GHSA-g7vv-2v7x-gj9p) and
+  `idna` (PYSEC-2024-60) so archive handling and punycode validation advisories stay
+  patched.
 
 **Recommendations**
-- Expand the baseline map as new advisories land or additional dependencies join the project.
 - Continue monitoring automated feeds (e.g., GitHub Security Advisories) for
   ecosystem-wide alerts beyond the covered packages.

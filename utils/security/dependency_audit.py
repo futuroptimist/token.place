@@ -21,6 +21,10 @@ MINIMUM_SECURE_VERSIONS: Dict[str, Tuple[str, str]] = {
     "httpx": ("0.27.0", "GHSA-288c-mx3g-f745"),
     # GHSA-hggm-jpg3-v476: cryptography < 41.0.4
     "cryptography": ("41.0.4", "GHSA-hggm-jpg3-v476"),
+    # GHSA-g7vv-2v7x-gj9p: tqdm < 4.66.3 allows symlink traversal when extracting archives
+    "tqdm": ("4.66.3", "GHSA-g7vv-2v7x-gj9p"),
+    # PYSEC-2024-60 / CVE-2024-3651: idna < 3.7 mishandles Punycode validation
+    "idna": ("3.7", "PYSEC-2024-60"),
 }
 
 _NORMALIZED_MINIMUM_SECURE_VERSIONS: Dict[str, Tuple[str, str]] = {

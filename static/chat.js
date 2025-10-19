@@ -390,6 +390,85 @@ new Vue({
         },
 
 
+        calculateTypingChunkSize(content) {
+            if (!content || typeof content !== 'string') {
+                return 1;
+            }
+            const length = content.length;
+            if (length <= 24) {
+                return 1;
+            }
+            if (length <= 96) {
+                return 2;
+            }
+            if (length <= 180) {
+                return 3;
+            }
+            return Math.min(6, Math.ceil(length / 48));
+        },
+
+        appendAssistantMessage(message) {
+            if (!message || typeof message !== 'object') {
+                return;
+            }
+
+            const content = message.content;
+            const typingFactory = typeof ChatTypingEffect !== 'undefined'
+                && ChatTypingEffect
+                && typeof ChatTypingEffect.createTypingAnimator === 'function';
+
+            const shouldAnimate = typingFactory && typeof content === 'string' && content.trim().length > 0;
+
+            if (!shouldAnimate) {
+                this.chatHistory.push(message);
+                return;
+            }
+
+            const entry = Object.assign({}, message);
+            entry.content = '';
+            entry.isTyping = true;
+
+            const finalText = content;
+            const chunkSize = this.calculateTypingChunkSize(finalText);
+
+            const animator = ChatTypingEffect.createTypingAnimator({
+                fullText: finalText,
+                chunkSize,
+                onUpdate: (partial) => {
+                    entry.content = partial;
+                },
+                onComplete: () => {
+                    entry.isTyping = false;
+                    entry.content = finalText;
+                    if (entry._animator && typeof entry._animator.cancel === 'function') {
+                        entry._animator.cancel();
+                    }
+                    delete entry._animator;
+                },
+                schedule: (fn, delay) => {
+                    if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+                        return window.setTimeout(fn, delay);
+                    }
+                    return setTimeout(fn, delay);
+                },
+                cancelScheduled: (id) => {
+                    if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function') {
+                        window.clearTimeout(id);
+                    } else {
+                        clearTimeout(id);
+                    }
+                }
+            });
+
+            entry._animator = animator;
+            this.chatHistory.push(entry);
+
+            this.$nextTick(() => {
+                animator.start();
+            });
+        },
+
+
 
         // Send a message to the server
         async sendMessage() {
@@ -414,11 +493,19 @@ new Vue({
                     // For API response, extract last message
                     if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
-                        this.chatHistory.push(assistantMessage);
+                        this.appendAssistantMessage(assistantMessage);
                     }
                     // For legacy response format (full chat history)
                     else if (Array.isArray(response)) {
-                        this.chatHistory = response;
+                        const history = response.slice();
+                        const candidate = history.length > 0 ? history[history.length - 1] : null;
+                        if (candidate && candidate.role === 'assistant' && typeof candidate.content === 'string') {
+                            history.pop();
+                            this.chatHistory = history;
+                            this.appendAssistantMessage(candidate);
+                        } else {
+                            this.chatHistory = response;
+                        }
                     }
                     else {
                         throw new Error('Unexpected response format');
@@ -440,6 +527,16 @@ new Vue({
                 this.isGeneratingResponse = false;
             }
         }
+    },
+    beforeDestroy() {
+        if (!Array.isArray(this.chatHistory)) {
+            return;
+        }
+        this.chatHistory.forEach((entry) => {
+            if (entry && entry._animator && typeof entry._animator.cancel === 'function') {
+                entry._animator.cancel();
+            }
+        });
     },
     updated() {
         this.$nextTick(() => {

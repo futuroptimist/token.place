@@ -244,6 +244,31 @@ def test_openai_alias_end_to_end_flow():
 
         assert "paris" in response_text.lower(), "Expected the mock response to mention Paris"
 
+
+@pytest.mark.e2e
+def test_streaming_chat_completion_end_to_end():
+    """Streamed chat completions should deliver role, content, and stop events over SSE."""
+
+    with start_relay(), start_server(use_mock_llm=USE_MOCK_LLM):
+        streaming_client = ClientSimulator(
+            base_url="http://localhost:5000",
+            api_prefix="/api/v2",
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a travel assistant."},
+            {"role": "user", "content": "Remind me of France's capital."},
+        ]
+
+        streamed = streaming_client.stream_chat_completion(messages)
+
+        assert streamed["role"] == "assistant"
+        assert "paris" in streamed["content"].lower()
+        assert streamed["finish_reason"] == "stop"
+        # Ensure multiple SSE events were observed (role + content + stop)
+        assert len(streamed["events"]) >= 3
+
+
 if __name__ == "__main__":
     # Run the tests directly if executed as a script
     test_complete_encrypted_conversation_flow()

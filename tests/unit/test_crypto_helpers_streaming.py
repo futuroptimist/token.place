@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from unittest.mock import MagicMock, patch
 
@@ -170,7 +170,10 @@ def test_stream_chat_completion_handles_invalid_encrypted_payload(mock_post: Mag
     assert chunks == [
         {
             'event': 'error',
-            'data': {'reason': 'invalid_encrypted_chunk'},
+            'data': {
+                'reason': 'invalid_encrypted_chunk',
+                'message': 'Received an encrypted streaming chunk without payload data.',
+            },
         }
     ]
 
@@ -200,7 +203,10 @@ def test_stream_chat_completion_handles_decrypt_failures(mock_post: MagicMock) -
     assert chunks == [
         {
             'event': 'error',
-            'data': {'reason': 'decrypt_failed'},
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
         }
     ]
 
@@ -235,7 +241,10 @@ def test_stream_chat_completion_surfaces_http_status_errors(mock_post: MagicMock
     assert chunks == [
         {
             'event': 'fallback',
-            'data': {'reason': 'bad_status'},
+            'data': {
+                'reason': 'bad_status',
+                'message': 'Streaming endpoint returned status 502; requesting full response instead.',
+            },
         },
         {
             'event': 'response',
@@ -267,9 +276,92 @@ def test_stream_chat_completion_reports_fallback_request_failure(
     assert chunks == [
         {
             'event': 'error',
-            'data': {'reason': 'bad_status', 'fallback': 'request_failed'},
+            'data': {
+                'reason': 'bad_status',
+                'fallback': 'request_failed',
+                'status_code': 503,
+                'message': 'Streaming request failed and fallback request could not complete.',
+            },
         }
     ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_includes_user_facing_error_messages(
+    mock_post: MagicMock,
+) -> None:
+    """Error events should expose a user-friendly message for UI consumption."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    failing_response = _mock_stream_response([])
+    failing_response.status_code = 503
+
+    mock_post.side_effect = [
+        failing_response,
+        RequestException("fallback failed"),
+    ]
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'bad_status',
+                'fallback': 'request_failed',
+                'status_code': 503,
+                'message': 'Streaming request failed and fallback request could not complete.',
+            },
+        }
+    ]
+
+
+def _extract_format_error(helper: Any) -> Any:
+    closure = helper.__closure__
+    assert closure is not None
+    for cell in closure:
+        candidate = cell.cell_contents
+        if callable(candidate) and getattr(candidate, '__name__', '') == '_format_error_message':
+            return candidate
+    raise AssertionError('Expected _format_error_message in closure')
+
+
+def test_stream_chat_completion_error_message_helpers_cover_all_reasons() -> None:
+    """Validate that helper formatting covers every error branch."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    generator = client.stream_chat_completion(messages)
+
+    try:
+        frame = generator.gi_frame
+        assert frame is not None
+
+        format_error = _extract_format_error(frame.f_locals['_build_error_data'])
+        fallback_message = frame.f_locals['_fallback_message']
+
+        assert format_error('bad_status') == 'Streaming request returned an unexpected status.'
+        assert format_error('bad_status', status_code=418) == (
+            'Streaming request returned an unexpected status (418).'
+        )
+        assert format_error('request_failed') == 'Unable to establish the streaming connection.'
+        assert format_error('connection_lost') == 'Streaming connection was interrupted.'
+        assert format_error('mystery') == 'Streaming request encountered an unexpected error.'
+
+        assert fallback_message('bad_status') == (
+            'Streaming endpoint returned an unexpected status; requesting full response.'
+        )
+        assert fallback_message('connection_lost') == (
+            'Streaming connection dropped; requesting full response instead.'
+        )
+        assert fallback_message('unknown') == (
+            'Switching to a standard response due to streaming issues.'
+        )
+    finally:
+        generator.close()
 
 
 @patch('utils.crypto_helpers.requests.post')
@@ -365,7 +457,10 @@ def test_stream_chat_completion_handles_empty_non_stream_payload(
     assert chunks == [
         {
             'event': 'error',
-            'data': {'reason': 'empty_response'},
+            'data': {
+                'reason': 'empty_response',
+                'message': 'Streaming response completed without returning any data.',
+            },
         }
     ]
 
@@ -554,7 +649,10 @@ def test_stream_chat_completion_falls_back_after_request_failure(
     assert chunks == [
         {
             'event': 'fallback',
-            'data': {'reason': 'request_failed'},
+            'data': {
+                'reason': 'request_failed',
+                'message': 'Streaming channel unavailable; retrying without streaming.',
+            },
         },
         {
             'event': 'response',

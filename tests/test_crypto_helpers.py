@@ -396,7 +396,10 @@ def test_stream_chat_completion_handles_invalid_encrypted_payload(mock_post):
     assert chunks == [
         {
             'event': 'error',
-            'data': {'reason': 'invalid_encrypted_chunk'},
+            'data': {
+                'reason': 'invalid_encrypted_chunk',
+                'message': 'Received an encrypted streaming chunk without payload data.',
+            },
         }
     ]
 
@@ -430,6 +433,9 @@ def test_stream_chat_completion_handles_decrypt_failures(mock_post):
     assert chunks == [
         {
             'event': 'error',
-            'data': {'reason': 'decrypt_failed'},
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
         }
     ]

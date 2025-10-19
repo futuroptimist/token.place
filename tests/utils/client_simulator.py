@@ -197,3 +197,88 @@ class ClientSimulator:
         # Send the request
         encrypted_payload = self.send_request(encrypted_data, model)
         return self.decrypt_response(encrypted_payload)
+
+    def stream_chat_completion(
+        self,
+        messages: Union[str, Dict, List[Dict[str, Any]]],
+        model: str = "llama-3-8b-instruct",
+        *,
+        timeout: float = 15.0,
+    ) -> Dict[str, Any]:
+        """Request a streaming chat completion and return the parsed SSE payloads."""
+
+        if isinstance(messages, str):
+            formatted_messages: List[Dict[str, Any]] = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict) and {"role", "content"}.issubset(messages):
+            formatted_messages = [messages]
+        elif (
+            isinstance(messages, list)
+            and all(isinstance(item, dict) and {"role", "content"}.issubset(item) for item in messages)
+        ):
+            formatted_messages = messages  # type: ignore[assignment]
+        else:
+            raise ValueError(
+                "Messages must be a string, a role/content dict, or a list of role/content dicts",
+            )
+
+        payload = {
+            "model": model,
+            "messages": formatted_messages,
+            "stream": True,
+        }
+
+        events: List[Dict[str, Any]] = []
+        role: Optional[str] = None
+        content_segments: List[str] = []
+        finish_reason: Optional[str] = None
+
+        with self.session.post(
+            self._url("/chat/completions"),
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+
+            content_type = response.headers.get("Content-Type", "")
+            if "text/event-stream" not in content_type:
+                raise ValueError(
+                    f"Expected text/event-stream response, received Content-Type: {content_type!r}",
+                )
+
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
+
+                data = line[len("data: "):]
+                if data == "[DONE]":
+                    break
+
+                event = json.loads(data)
+                events.append(event)
+
+                choices = event.get("choices")
+                if not choices:
+                    continue
+
+                delta = choices[0].get("delta", {})
+                if "role" in delta:
+                    role = delta["role"]
+                if "content" in delta:
+                    content_segments.append(delta["content"])
+
+                finish = choices[0].get("finish_reason")
+                if finish:
+                    finish_reason = finish
+
+        if finish_reason is None:
+            raise ValueError("Streaming response ended without a finish_reason chunk")
+
+        return {
+            "role": role,
+            "content": "".join(content_segments),
+            "finish_reason": finish_reason,
+            "events": events,
+        }

@@ -139,7 +139,10 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 - Verify encryption/decryption with streaming
 
 #### 4.2 Integration Tests
-- Create end-to-end tests for the streaming experience
+- ✅ Added end-to-end coverage for the streaming experience via
+  `tests/test_e2e_conversation_flow.py::test_streaming_chat_completion_end_to_end`,
+  which boots the relay + server stack and asserts the SSE role/content/stop
+  sequence emitted by `/api/v2/chat/completions`.
 - ✅ Test reconnection and error handling
 
 ## Implementation Phases

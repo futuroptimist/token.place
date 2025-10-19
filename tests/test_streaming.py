@@ -288,8 +288,8 @@ def test_v2_streaming_handles_varied_chunk_sizes_and_delays(client, monkeypatch)
         assert observed >= expected - 0.01
 
 
-def test_v1_streaming_chat_completion(client, monkeypatch):
-    """API v1 chat completions should emit SSE chunks when stream is requested."""
+def test_v1_chat_completion_stream_flag_returns_error(client, monkeypatch):
+    """API v1 chat completions should reject stream flags with an error."""
 
     monkeypatch.setattr(v1_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
     monkeypatch.setattr(v1_routes, "validate_model_name", lambda *a, **k: None)
@@ -315,30 +315,23 @@ def test_v1_streaming_chat_completion(client, monkeypatch):
 
     response = client.post("/api/v1/chat/completions", json=payload)
 
-    assert response.status_code == 200
-    assert response.headers["Content-Type"].startswith("text/event-stream")
-
-    events = []
-    for raw_chunk in response.iter_encoded():
-        text = raw_chunk.decode("utf-8")
-        if not text.strip():
-            continue
-        assert text.startswith("data: ")
-        events.append(text[len("data: "):].strip())
-
-    assert events[-1] == "[DONE]"
-
-    role_event = json.loads(events[0])
-    content_event = json.loads(events[1])
-    stop_event = json.loads(events[2])
-
-    assert role_event["choices"][0]["delta"] == {"role": "assistant"}
-    assert content_event["choices"][0]["delta"]["content"] == "Hello"
-    assert stop_event["choices"][0]["finish_reason"] == "stop"
+    assert response.status_code == 400
+    assert response.is_json
+    body = response.get_json()
+    assert body == {
+        "error": {
+            "message": (
+                "Streaming is not supported for API v1 chat completions. "
+                "Use /api/v2/chat/completions for Server-Sent Events."
+            ),
+            "type": "invalid_request_error",
+            "param": "stream",
+        }
+    }
 
 
-def test_v1_text_completion_stream_flag_is_ignored(client, monkeypatch):
-    """Legacy completions should ignore stream flags and return JSON."""
+def test_v1_text_completion_stream_flag_returns_error(client, monkeypatch):
+    """Legacy text completions should reject stream flags with an error."""
 
     monkeypatch.setattr(v1_routes, "get_models_info", lambda: [{"id": "text-davinci-003"}])
     monkeypatch.setattr(v1_routes, "validate_model_name", lambda *a, **k: None)
@@ -363,7 +356,16 @@ def test_v1_text_completion_stream_flag_is_ignored(client, monkeypatch):
 
     response = client.post("/api/v1/completions", json=payload)
 
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert response.is_json
     body = response.get_json()
-    assert body["choices"][0]["text"] == "Five syllables start"
+    assert body == {
+        "error": {
+            "message": (
+                "Streaming is not supported for API v1 completions. "
+                "Use /api/v2/chat/completions for Server-Sent Events."
+            ),
+            "type": "invalid_request_error",
+            "param": "stream",
+        }
+    }

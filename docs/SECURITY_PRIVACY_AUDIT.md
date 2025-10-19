@@ -41,10 +41,11 @@ Initial audit establishing baseline security and privacy posture.
 - Improved test reliability by explicitly passing mock LLM flags and fixing encoding issues.
 - Hardened chat completion validation to reject empty message arrays, closing the open
   input-validation recommendation.
+- Redacted relay registration tokens from saved configs and documented the
+  `TOKEN_PLACE_RELAY_SERVER_TOKEN` environment variable workflow.
 
 **Recommendations**
 - Add rate limiting to protect against DoS attacks.
-- Move sensitive configuration values to environment variables.
 - Streaming implementation delivered (2025-09-30); continue planning for key rotation and a dedicated cryptographic audit.
 - Consider zero-knowledge architecture, formal verification, and an external security review.
 

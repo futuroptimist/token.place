@@ -9,6 +9,7 @@ import platform
 import json
 import logging
 import copy
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, cast
 
 from utils.config_schema import (
@@ -36,6 +37,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('config')
+
+
+@dataclass(frozen=True)
+class SensitiveKey:
+    """Represents a dot-delimited config key that should never persist to disk."""
+
+    path: str
+
+    @property
+    def parts(self) -> List[str]:
+        """Return the split path segments for traversal."""
+
+        return self.path.split('.')
+
+
+SENSITIVE_CONFIG_KEYS: List[SensitiveKey] = [
+    SensitiveKey("relay.server_registration_token"),
+]
 
 class Config:
     """Configuration manager for token.place"""
@@ -352,6 +371,26 @@ class Config:
             config = config[k]
         config[keys[-1]] = value
 
+    def _redacted_config_copy(self) -> Dict[str, Any]:
+        """Return a deepcopy of the config with sensitive values removed."""
+
+        redacted = copy.deepcopy(self.config)
+        for key in SENSITIVE_CONFIG_KEYS:
+            cursor: Any = redacted
+            parts = key.parts
+            for segment in parts[:-1]:
+                if not isinstance(cursor, dict):
+                    cursor = None
+                    break
+                cursor = cursor.get(segment)
+                if cursor is None:
+                    break
+            else:
+                if isinstance(cursor, dict) and parts[-1] in cursor:
+                    cursor[parts[-1]] = None
+            # When the loop breaks early we continue to next key automatically.
+        return redacted
+
     def save_user_config(self, config_path: Optional[str] = None):
         """Save the current configuration to a user config file.
 
@@ -369,8 +408,9 @@ class Config:
         ensure_dir_exists(os.path.dirname(path))
 
         try:
+            redacted = self._redacted_config_copy()
             with open(path, 'w') as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(redacted, f, indent=2)
             logger.info(f"Configuration saved to {path}")
         except Exception as e:
             logger.error(f"Error saving configuration: {str(e)}")

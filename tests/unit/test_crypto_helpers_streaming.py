@@ -659,3 +659,73 @@ def test_stream_chat_completion_falls_back_after_request_failure(
             'data': fallback_payload,
         },
     ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_emits_partial_response_before_fallback(
+    mock_post: MagicMock,
+) -> None:
+    """Partial SSE payloads should surface before the fallback response."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    partial_chunk = json.dumps(
+        {
+            'event': 'chunk',
+            'data': {'delta': {'content': 'partial'}},
+        }
+    ).encode()
+
+    first_response = MagicMock()
+    first_response.status_code = 200
+    first_response.headers = {"Content-Type": "text/event-stream"}
+
+    def failing_iter_lines(*_: Any, **__: Any):
+        yield b'data: ' + partial_chunk + b'\n'
+        raise ChunkedEncodingError("connection lost")
+
+    first_response.iter_lines.side_effect = failing_iter_lines
+
+    fallback_payload: Dict[str, Dict[str, str]] = {
+        'choices': [{'message': {'role': 'assistant', 'content': 'recovered'}}],
+    }
+
+    mock_post.side_effect = [
+        first_response,
+        _mock_non_stream_response(json_payload=fallback_payload),
+    ]
+
+    chunks = list(
+        client.stream_chat_completion(messages, max_retries=0, retry_delay=0),
+    )
+
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
+        },
+        {
+            'event': 'partial_response',
+            'data': {
+                'chunks': [
+                    {
+                        'event': 'chunk',
+                        'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
+                    }
+                ],
+                'text': 'partial',
+            },
+        },
+        {
+            'event': 'fallback',
+            'data': {
+                'reason': 'connection_lost',
+                'message': 'Streaming connection dropped; requesting full response instead.',
+            },
+        },
+        {
+            'event': 'response',
+            'data': fallback_payload,
+        },
+    ]

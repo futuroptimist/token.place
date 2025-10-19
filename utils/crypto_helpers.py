@@ -30,6 +30,7 @@ import json
 import base64
 import requests
 import logging
+from copy import deepcopy
 from typing import Dict, Tuple, Any, List, Optional, Union, Iterator
 import time
 
@@ -610,6 +611,58 @@ class CryptoClient:
         def _iter_chunks() -> Iterator[Dict[str, Any]]:
             attempt = 0
             reconnect_count = 0
+            cached_events: List[Dict[str, Any]] = []
+
+            def _record_cached_event(event: str, data: Any) -> None:
+                try:
+                    cached_events.append({'event': event, 'data': deepcopy(data)})
+                except TypeError:  # pragma: no cover - defensive for non-copyable payloads
+                    cached_events.append({'event': event, 'data': data})
+
+            def _collect_text(value: Any, parts: List[str]) -> None:
+                if isinstance(value, str):
+                    parts.append(value)
+                    return
+                if isinstance(value, dict):
+                    content = value.get('content')
+                    if isinstance(content, str):
+                        parts.append(content)
+                    choices = value.get('choices')
+                    if isinstance(choices, list):
+                        for choice in choices:
+                            if isinstance(choice, dict):
+                                _collect_text(choice.get('delta'), parts)
+                                _collect_text(choice.get('message'), parts)
+                    delta = value.get('delta')
+                    if isinstance(delta, dict):
+                        _collect_text(delta, parts)
+                    data_field = value.get('data')
+                    if isinstance(data_field, (dict, list, str)):
+                        _collect_text(data_field, parts)
+                elif isinstance(value, list):
+                    for item in value:
+                        _collect_text(item, parts)
+
+            def _drain_partial_events() -> List[Dict[str, Any]]:
+                if not cached_events:
+                    return []
+
+                cached_copy = deepcopy(cached_events)
+                text_parts: List[str] = []
+                for entry in cached_copy:
+                    _collect_text(entry.get('data'), text_parts)
+
+                cached_events.clear()
+
+                return [
+                    {
+                        'event': 'partial_response',
+                        'data': {
+                            'chunks': cached_copy,
+                            'text': ''.join(text_parts),
+                        },
+                    }
+                ]
 
             def _emit_non_stream_response(response: Any) -> Iterator[Dict[str, Any]]:
                 try:
@@ -655,6 +708,8 @@ class CryptoClient:
                         ),
                     }
                     return
+                for partial in _drain_partial_events():
+                    yield partial
                 yield {
                     'event': 'fallback',
                     'data': {
@@ -768,13 +823,22 @@ class CryptoClient:
                                         }
                                         continue
 
-                                    yield {'event': event_name, 'data': decrypted_payload}
+                                    event_payload = {
+                                        'event': event_name,
+                                        'data': decrypted_payload,
+                                    }
+                                    _record_cached_event(event_payload['event'], event_payload['data'])
+                                    yield event_payload
                                     continue
 
-                            yield {'event': 'chunk', 'data': chunk}
+                            event_payload = {'event': 'chunk', 'data': chunk}
+                            _record_cached_event(event_payload['event'], event_payload['data'])
+                            yield event_payload
                         except json.JSONDecodeError:
                             logger.debug("Ignoring malformed streaming chunk: %s", data_str)
-                            yield {'event': 'text', 'data': data_str}
+                            event_payload = {'event': 'text', 'data': data_str}
+                            _record_cached_event(event_payload['event'], event_payload['data'])
+                            yield event_payload
                     return
                 except requests.RequestException as exc:  # pragma: no cover - defensive
                     logger.warning(

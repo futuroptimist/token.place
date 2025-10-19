@@ -50,3 +50,21 @@ def test_redacted_config_copy_handles_non_dict_branch(monkeypatch: pytest.Monkey
     # The method should still return a deepcopy without mutating the list value.
     assert redacted["relay"] == ["unexpected-structure"]
     assert redacted is not config.config
+
+
+def test_redacted_config_copy_handles_missing_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redaction should short-circuit when a path segment is absent."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    config = Config(env="testing")
+    config.set("relay", {})
+    monkeypatch.setattr(
+        "config.SENSITIVE_CONFIG_KEYS",
+        [SensitiveKey("relay.missing.server_registration_token")],
+        raising=False,
+    )
+
+    redacted = config._redacted_config_copy()
+
+    assert redacted["relay"] == {}
+    assert redacted is not config.config

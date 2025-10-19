@@ -759,7 +759,19 @@ class CryptoClient:
                                         }
                                         continue
 
-                                    decrypted_payload = self.decrypt_message(encrypted_body)
+                                    try:
+                                        decrypted_payload = self.decrypt_message(encrypted_body)
+                                    except Exception:
+                                        logger.error(
+                                            "Exception while decrypting streaming chunk",
+                                            exc_info=self.debug,
+                                        )
+                                        yield {
+                                            'event': 'error',
+                                            'data': _build_error_data('decrypt_failed'),
+                                        }
+                                        continue
+
                                     if decrypted_payload is None:
                                         logger.error("Failed to decrypt streaming chunk")
                                         yield {

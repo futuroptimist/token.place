@@ -157,7 +157,9 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 
 - Ensure each chunk is properly encrypted
 - Implement reconnection logic that maintains encryption state
-- Verify that partial responses cannot be intercepted or modified
+- ✅ Verify that partial responses cannot be intercepted or modified
+  - Covered by `tests/unit/test_crypto_helpers_streaming.py::test_stream_chat_completion_flags_tampered_encrypted_chunks`,
+    which simulates a tampered ciphertext chunk and asserts the streaming client emits a `decrypt_failed` error event.
 - Consider rate limiting and denial-of-service protections
 
 ## Technical Challenges

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from pathlib import Path
 
@@ -92,3 +93,46 @@ def test_redacted_config_copy_redacts_multiple_paths(monkeypatch: pytest.MonkeyP
     assert redacted["relay"]["server_registration_token"] is None
     assert redacted["relay"]["nested"]["sensitive"] is None
     assert redacted["relay"]["nested"]["safe"] == "keep"
+
+
+def test_save_user_config_uses_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """When no path is provided the config dir fallback should be used."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    config = Config(env="testing")
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config.config["paths"]["config_dir"] = str(config_dir)
+    config.config_path = None
+
+    config.set("relay.server_registration_token", "fallback-secret")
+
+    config.save_user_config()
+
+    expected_path = config_dir / "user_config.json"
+    saved = json.loads(expected_path.read_text())
+    assert saved["relay"]["server_registration_token"] is None
+
+
+def test_save_user_config_logs_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Failing writes should surface via the config logger."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    config = Config(env="testing")
+    config.set("relay.server_registration_token", "boom")
+
+    target_path = tmp_path / "broken" / "config.json"
+
+    class BoomError(Exception):
+        """Sentinel error to surface failed writes."""
+
+    def exploding_open(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise BoomError("write failed")
+
+    monkeypatch.setattr(builtins, "open", exploding_open)
+
+    with caplog.at_level("ERROR", logger="config"):
+        config.save_user_config(str(target_path))
+
+    assert any("Error saving configuration" in record.message for record in caplog.records)

@@ -734,3 +734,103 @@ def test_stream_chat_completion_emits_partial_response_before_fallback(
             'data': fallback_payload,
         },
     ]
+
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_partial_response_collects_nested_text(
+    mock_post: MagicMock,
+) -> None:
+    """Cached partial chunks should merge nested text fields before fallback."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    streaming_payloads = [
+        {
+            'event': 'chunk',
+            'data': {
+                'content': 'A',
+                'choices': [
+                    {
+                        'delta': {'content': 'B'},
+                        'message': {'content': 'C'},
+                    }
+                ],
+            },
+        },
+        {
+            'event': 'chunk',
+            'data': {
+                'delta': {'content': 'D'},
+                'data': {'content': 'E'},
+            },
+        },
+        {
+            'event': 'chunk',
+            'data': {'data': ['F', {'content': 'G'}]},
+        },
+        {
+            'event': 'chunk',
+            'data': {'data': 'H'},
+        },
+    ]
+
+    first_response = MagicMock()
+    first_response.status_code = 200
+    first_response.headers = {"Content-Type": "text/event-stream"}
+
+    def failing_iter_lines(*_: Any, **__: Any):
+        for payload in streaming_payloads:
+            yield f"data: {json.dumps(payload)}\n"
+        yield 'data: not-json\n'
+        raise ChunkedEncodingError("connection lost")
+
+    first_response.iter_lines.side_effect = failing_iter_lines
+
+    fallback_payload: Dict[str, Dict[str, str]] = {
+        'choices': [{'message': {'role': 'assistant', 'content': 'recovered'}}],
+    }
+
+    mock_post.side_effect = [
+        first_response,
+        _mock_non_stream_response(json_payload=fallback_payload),
+    ]
+
+    stream = client.stream_chat_completion(messages, max_retries=0, retry_delay=0)
+
+    emitted_events = [next(stream) for _ in range(len(streaming_payloads) + 1)]
+    assert [event['event'] for event in emitted_events] == [
+        'chunk',
+        'chunk',
+        'chunk',
+        'chunk',
+        'text',
+    ]
+    assert mock_post.call_count == 1
+
+    partial_event = next(stream)
+    assert partial_event == {
+        'event': 'partial_response',
+        'data': {
+            'chunks': emitted_events,
+            'text': 'ABCDEFGHnot-json',
+        },
+    }
+    assert mock_post.call_count == 1
+
+    remaining_chunks = list(stream)
+    assert remaining_chunks == [
+        {
+            'event': 'fallback',
+            'data': {
+                'reason': 'connection_lost',
+                'message': 'Streaming connection dropped; requesting full response instead.',
+            },
+        },
+        {
+            'event': 'response',
+            'data': fallback_payload,
+        },
+    ]
+
+    assert mock_post.call_count == 2

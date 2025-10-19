@@ -174,5 +174,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 
 Implement graceful degradation when streaming fails:
 - ✅ Fall back to non-streaming mode
-- Cache partial responses for resumption
+- ✅ Cache partial responses for resumption (CryptoClient now surfaces
+  `partial_response` events so UIs can render recovered text before
+  non-streaming fallbacks complete)
 - ✅ Provide clear error messaging to users (streaming helpers now expose user-facing messages)

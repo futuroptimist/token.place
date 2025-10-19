@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import config as config_module
 from config import Config, SensitiveKey
 
 
@@ -41,8 +42,12 @@ def test_redacted_config_copy_handles_non_dict_branch(monkeypatch: pytest.Monkey
     # Force an unexpected structure so traversal encounters non-dict entries.
     config.set("relay", ["unexpected-structure"])
     monkeypatch.setattr(
-        "config.SENSITIVE_CONFIG_KEYS",
-        [SensitiveKey("relay.updated.server_registration_token")],
+        config_module,
+        "SENSITIVE_CONFIG_KEYS",
+        [
+            *config_module.SENSITIVE_CONFIG_KEYS,
+            SensitiveKey("relay.updated.server_registration_token"),
+        ],
         raising=False,
     )
 
@@ -60,8 +65,12 @@ def test_redacted_config_copy_handles_missing_leaf(monkeypatch: pytest.MonkeyPat
     config = Config(env="testing")
     config.set("relay", {})
     monkeypatch.setattr(
-        "config.SENSITIVE_CONFIG_KEYS",
-        [SensitiveKey("relay.missing.server_registration_token")],
+        config_module,
+        "SENSITIVE_CONFIG_KEYS",
+        [
+            *config_module.SENSITIVE_CONFIG_KEYS,
+            SensitiveKey("relay.missing.server_registration_token"),
+        ],
         raising=False,
     )
 
@@ -79,9 +88,10 @@ def test_redacted_config_copy_redacts_multiple_paths(monkeypatch: pytest.MonkeyP
     config.set("relay.server_registration_token", "server-secret")
     config.set("relay.nested", {"sensitive": "nested-secret", "safe": "keep"})
     monkeypatch.setattr(
-        "config.SENSITIVE_CONFIG_KEYS",
+        config_module,
+        "SENSITIVE_CONFIG_KEYS",
         [
-            SensitiveKey("relay.server_registration_token"),
+            *config_module.SENSITIVE_CONFIG_KEYS,
             SensitiveKey("relay.nested.sensitive"),
         ],
         raising=False,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from unittest.mock import MagicMock, patch
 
@@ -316,6 +316,52 @@ def test_stream_chat_completion_includes_user_facing_error_messages(
             },
         }
     ]
+
+
+def _extract_format_error(helper: Any) -> Any:
+    closure = helper.__closure__
+    assert closure is not None
+    for cell in closure:
+        candidate = cell.cell_contents
+        if callable(candidate) and getattr(candidate, '__name__', '') == '_format_error_message':
+            return candidate
+    raise AssertionError('Expected _format_error_message in closure')
+
+
+def test_stream_chat_completion_error_message_helpers_cover_all_reasons() -> None:
+    """Validate that helper formatting covers every error branch."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    generator = client.stream_chat_completion(messages)
+
+    try:
+        frame = generator.gi_frame
+        assert frame is not None
+
+        format_error = _extract_format_error(frame.f_locals['_build_error_data'])
+        fallback_message = frame.f_locals['_fallback_message']
+
+        assert format_error('bad_status') == 'Streaming request returned an unexpected status.'
+        assert format_error('bad_status', status_code=418) == (
+            'Streaming request returned an unexpected status (418).'
+        )
+        assert format_error('request_failed') == 'Unable to establish the streaming connection.'
+        assert format_error('connection_lost') == 'Streaming connection was interrupted.'
+        assert format_error('mystery') == 'Streaming request encountered an unexpected error.'
+
+        assert fallback_message('bad_status') == (
+            'Streaming endpoint returned an unexpected status; requesting full response.'
+        )
+        assert fallback_message('connection_lost') == (
+            'Streaming connection dropped; requesting full response instead.'
+        )
+        assert fallback_message('unknown') == (
+            'Switching to a standard response due to streaming issues.'
+        )
+    finally:
+        generator.close()
 
 
 @patch('utils.crypto_helpers.requests.post')

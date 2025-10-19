@@ -686,6 +686,8 @@ class CryptoClient:
             ) -> Iterator[Dict[str, Any]]:
                 fallback_payload = dict(payload)
                 fallback_payload['stream'] = False
+                for partial in _drain_partial_events():
+                    yield partial
                 try:
                     fallback_response = requests.post(
                         full_url,
@@ -708,8 +710,6 @@ class CryptoClient:
                         ),
                     }
                     return
-                for partial in _drain_partial_events():
-                    yield partial
                 yield {
                     'event': 'fallback',
                     'data': {

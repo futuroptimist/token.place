@@ -696,27 +696,32 @@ def test_stream_chat_completion_emits_partial_response_before_fallback(
         _mock_non_stream_response(json_payload=fallback_payload),
     ]
 
-    chunks = list(
-        client.stream_chat_completion(messages, max_retries=0, retry_delay=0),
-    )
+    stream = client.stream_chat_completion(messages, max_retries=0, retry_delay=0)
 
-    assert chunks == [
-        {
-            'event': 'chunk',
-            'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
+    first_chunk = next(stream)
+    assert first_chunk == {
+        'event': 'chunk',
+        'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
+    }
+    assert mock_post.call_count == 1
+
+    second_chunk = next(stream)
+    assert second_chunk == {
+        'event': 'partial_response',
+        'data': {
+            'chunks': [
+                {
+                    'event': 'chunk',
+                    'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
+                }
+            ],
+            'text': 'partial',
         },
-        {
-            'event': 'partial_response',
-            'data': {
-                'chunks': [
-                    {
-                        'event': 'chunk',
-                        'data': {'event': 'chunk', 'data': {'delta': {'content': 'partial'}}},
-                    }
-                ],
-                'text': 'partial',
-            },
-        },
+    }
+    assert mock_post.call_count == 1
+
+    remaining_chunks = list(stream)
+    assert remaining_chunks == [
         {
             'event': 'fallback',
             'data': {

@@ -318,7 +318,7 @@
         <h2>Try it out:</h2>
         <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
-                <span v-html="renderMarkdown(message.content)"></span>
+                <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>
             <div class="input-container">
                 <textarea
@@ -501,6 +501,7 @@
         crossorigin="anonymous"
         referrerpolicy="no-referrer"
     ></script>
+    <script src="/static/chat_typing.js"></script>
     <script src="/static/chat.js"></script>
 
     <script>

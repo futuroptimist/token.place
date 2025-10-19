@@ -560,6 +560,53 @@ class CryptoClient:
         full_url = f"{self.base_url}{endpoint}"
         logger.debug("Starting streaming chat completion at %s", full_url)
 
+        def _format_error_message(
+            reason: str,
+            *,
+            fallback: Optional[str] = None,
+            status_code: Optional[int] = None,
+        ) -> str:
+            if reason == 'invalid_encrypted_chunk':
+                return 'Received an encrypted streaming chunk without payload data.'
+            if reason == 'decrypt_failed':
+                return 'Unable to decrypt the encrypted streaming update.'
+            if reason == 'empty_response':
+                return 'Streaming response completed without returning any data.'
+            if reason == 'bad_status':
+                if fallback == 'request_failed':
+                    return 'Streaming request failed and fallback request could not complete.'
+                if status_code is not None:
+                    return f'Streaming request returned an unexpected status ({status_code}).'
+                return 'Streaming request returned an unexpected status.'
+            if reason == 'request_failed':
+                return 'Unable to establish the streaming connection.'
+            if reason == 'connection_lost':
+                return 'Streaming connection was interrupted.'
+            return 'Streaming request encountered an unexpected error.'
+
+        def _build_error_data(reason: str, **extras: Any) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {'reason': reason, **extras}
+            payload['message'] = _format_error_message(
+                reason,
+                fallback=payload.get('fallback'),
+                status_code=payload.get('status_code'),
+            )
+            return payload
+
+        def _fallback_message(reason: str, *, status_code: Optional[int] = None) -> str:
+            if reason == 'bad_status':
+                if status_code is not None:
+                    return (
+                        'Streaming endpoint returned '
+                        f'status {status_code}; requesting full response instead.'
+                    )
+                return 'Streaming endpoint returned an unexpected status; requesting full response.'
+            if reason == 'request_failed':
+                return 'Streaming channel unavailable; retrying without streaming.'
+            if reason == 'connection_lost':
+                return 'Streaming connection dropped; requesting full response instead.'
+            return 'Switching to a standard response due to streaming issues.'
+
         def _iter_chunks() -> Iterator[Dict[str, Any]]:
             attempt = 0
             reconnect_count = 0
@@ -572,11 +619,18 @@ class CryptoClient:
                     if body_text:
                         yield {'event': 'text', 'data': body_text}
                     else:
-                        yield {'event': 'error', 'data': {'reason': 'empty_response'}}
+                        yield {
+                            'event': 'error',
+                            'data': _build_error_data('empty_response'),
+                        }
                     return
                 yield {'event': 'response', 'data': data}
 
-            def _fallback_to_non_stream(reason: str) -> Iterator[Dict[str, Any]]:
+            def _fallback_to_non_stream(
+                reason: str,
+                *,
+                status_code: Optional[int] = None,
+            ) -> Iterator[Dict[str, Any]]:
                 fallback_payload = dict(payload)
                 fallback_payload['stream'] = False
                 try:
@@ -594,10 +648,20 @@ class CryptoClient:
                     )
                     yield {
                         'event': 'error',
-                        'data': {'reason': reason, 'fallback': 'request_failed'},
+                        'data': _build_error_data(
+                            reason,
+                            fallback='request_failed',
+                            status_code=status_code,
+                        ),
                     }
                     return
-                yield {'event': 'fallback', 'data': {'reason': reason}}
+                yield {
+                    'event': 'fallback',
+                    'data': {
+                        'reason': reason,
+                        'message': _fallback_message(reason, status_code=status_code),
+                    },
+                }
                 yield from _emit_non_stream_response(fallback_response)
 
             while True:
@@ -638,7 +702,9 @@ class CryptoClient:
                             "Streaming request returned unexpected status: %s",
                             response.status_code,
                         )
-                        yield from _fallback_to_non_stream('bad_status')
+                        yield from _fallback_to_non_stream(
+                            'bad_status', status_code=response.status_code
+                        )
                         return
 
                     if not is_event_stream:
@@ -689,7 +755,7 @@ class CryptoClient:
                                         logger.error("Encrypted streaming chunk missing payload")
                                         yield {
                                             'event': 'error',
-                                            'data': {'reason': 'invalid_encrypted_chunk'},
+                                            'data': _build_error_data('invalid_encrypted_chunk'),
                                         }
                                         continue
 
@@ -698,7 +764,7 @@ class CryptoClient:
                                         logger.error("Failed to decrypt streaming chunk")
                                         yield {
                                             'event': 'error',
-                                            'data': {'reason': 'decrypt_failed'},
+                                            'data': _build_error_data('decrypt_failed'),
                                         }
                                         continue
 

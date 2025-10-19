@@ -170,4 +170,4 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 Implement graceful degradation when streaming fails:
 - ✅ Fall back to non-streaming mode
 - Cache partial responses for resumption
-- Provide clear error messaging to users
+- ✅ Provide clear error messaging to users (streaming helpers now expose user-facing messages)

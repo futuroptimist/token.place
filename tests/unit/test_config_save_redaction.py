@@ -68,3 +68,27 @@ def test_redacted_config_copy_handles_missing_leaf(monkeypatch: pytest.MonkeyPat
 
     assert redacted["relay"] == {}
     assert redacted is not config.config
+
+
+def test_redacted_config_copy_redacts_multiple_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All configured sensitive keys should be nulled in the redacted copy."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    config = Config(env="testing")
+    config.set("relay.server_registration_token", "server-secret")
+    config.set("relay.nested", {"sensitive": "nested-secret", "safe": "keep"})
+    monkeypatch.setattr(
+        "config.SENSITIVE_CONFIG_KEYS",
+        [
+            SensitiveKey("relay.server_registration_token"),
+            SensitiveKey("relay.nested.sensitive"),
+        ],
+        raising=False,
+    )
+
+    redacted = config._redacted_config_copy()
+
+    assert redacted is not config.config
+    assert redacted["relay"]["server_registration_token"] is None
+    assert redacted["relay"]["nested"]["sensitive"] is None
+    assert redacted["relay"]["nested"]["safe"] == "keep"

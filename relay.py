@@ -77,6 +77,78 @@ init_app(app)
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+streaming_sessions = {}
+streaming_sessions_by_client = {}
+stream_lock = threading.Lock()
+
+
+def _register_stream_session(server_public_key, client_public_key):
+    """Create or replace the streaming session for a client/server pair."""
+
+    if not client_public_key:
+        return None
+
+    session_id = secrets.token_urlsafe(16)
+    now = time.time()
+    session = {
+        'session_id': session_id,
+        'server_public_key': server_public_key,
+        'client_public_key': client_public_key,
+        'chunks': [],
+        'status': 'open',
+        'created_at': now,
+        'updated_at': now,
+    }
+
+    with stream_lock:
+        existing_session_id = streaming_sessions_by_client.get(client_public_key)
+        if existing_session_id:
+            streaming_sessions.pop(existing_session_id, None)
+        streaming_sessions[session_id] = session
+        streaming_sessions_by_client[client_public_key] = session_id
+
+    return session
+
+
+def _append_stream_chunk(session_id, chunk, final=False):
+    """Append a streaming chunk to the active session."""
+
+    with stream_lock:
+        session = streaming_sessions.get(session_id)
+        if not session:
+            return False
+
+        session['chunks'].append(chunk)
+        session['updated_at'] = time.time()
+        if final:
+            session['status'] = 'closed'
+
+    return True
+
+
+def _pop_stream_chunks_for_client(client_public_key):
+    """Retrieve queued streaming chunks for a client."""
+
+    with stream_lock:
+        session_id = streaming_sessions_by_client.get(client_public_key)
+        if not session_id:
+            return None
+
+        session = streaming_sessions.get(session_id)
+        if not session:
+            streaming_sessions_by_client.pop(client_public_key, None)
+            return None
+
+        chunks = list(session['chunks'])
+        session['chunks'].clear()
+        session['updated_at'] = time.time()
+        final = session['status'] == 'closed'
+
+        if final:
+            streaming_sessions.pop(session_id, None)
+            streaming_sessions_by_client.pop(client_public_key, None)
+
+    return session_id, chunks, final
 
 @app.route('/')
 def index():
@@ -169,6 +241,16 @@ def faucet():
     chat_history_ciphertext = data['chat_history']
     cipherkey = data['cipherkey']
     iv = data['iv']  # Extract the IV from the request data
+    stream_requested = bool(data.get('stream', False))
+    client_public_key = data.get('client_public_key', None)
+
+    if stream_requested and not client_public_key:
+        return jsonify({
+            'error': {
+                'message': 'Streaming requests require a client public key',
+                'code': 400,
+            }
+        }), 400
 
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
@@ -179,9 +261,10 @@ def faucet():
         client_inference_requests[server_public_key] = []
     client_inference_requests[server_public_key].append({
         'chat_history': chat_history_ciphertext,
-        'client_public_key': data.get('client_public_key', None),
+        'client_public_key': client_public_key,
         'cipherkey': cipherkey,
-        'iv': iv  # Include the IV in the saved client's request
+        'iv': iv,  # Include the IV in the saved client's request
+        'stream': stream_requested,
     })
     return jsonify({'message': 'Request received'}), 200
 
@@ -238,7 +321,15 @@ def sink():
     if queued_requests:
         batch = []
         while queued_requests and len(batch) < max_batch_size:
-            batch.append(queued_requests.pop(0))
+            request_payload = queued_requests.pop(0)
+            if request_payload.get('stream'):
+                session = _register_stream_session(
+                    public_key,
+                    request_payload.get('client_public_key'),
+                )
+                if session is not None:
+                    request_payload['stream_session_id'] = session['session_id']
+            batch.append(request_payload)
 
         first_request = batch[0]
         response_data.update({
@@ -247,6 +338,10 @@ def sink():
             'cipherkey': first_request['cipherkey'],
             'iv': first_request.get('iv', ''),
         })
+
+        if first_request.get('stream') and first_request.get('stream_session_id'):
+            response_data['stream'] = True
+            response_data['stream_session_id'] = first_request['stream_session_id']
 
         if max_batch_size > 1:
             response_data['batch'] = batch
@@ -279,6 +374,29 @@ def source():
     }
     return jsonify({'message': 'Response received and queued for client'}), 200
 
+
+@app.route('/stream/source', methods=['POST'])
+def stream_source():
+    """Accept streaming chunks emitted by compute nodes."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not data or 'session_id' not in data or 'chunk' not in data:
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    session_id = data['session_id']
+    chunk = data['chunk']
+    final = bool(data.get('final', False))
+
+    if not _append_stream_chunk(session_id, chunk, final=final):
+        return jsonify({'error': 'Unknown stream session'}), 404
+
+    return jsonify({'message': 'Chunk stored', 'final': final}), 200
+
+
 @app.route('/retrieve', methods=['POST'])
 def retrieve():
     """
@@ -296,6 +414,31 @@ def retrieve():
         return jsonify(response_data), 200
     else:
         return jsonify({'error': 'No response available for the given public key'}), 200
+
+
+@app.route('/stream/retrieve', methods=['POST'])
+def stream_retrieve():
+    """Return queued streaming chunks for the requesting client."""
+
+    data = request.get_json()
+    if not data or 'client_public_key' not in data:
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    client_public_key = data['client_public_key']
+    popped = _pop_stream_chunks_for_client(client_public_key)
+    if popped is None:
+        return jsonify({'error': 'No active stream for the given public key'}), 200
+
+    session_id, chunks, final = popped
+    response_payload = {
+        'stream': True,
+        'session_id': session_id,
+        'chunks': chunks,
+    }
+    if final:
+        response_payload['final'] = True
+
+    return jsonify(response_payload), 200
 
 if __name__ == '__main__':  # pragma: no cover
     app.run(host=args.host, port=args.port)

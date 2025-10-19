@@ -70,9 +70,12 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
   ```
 
 #### 1.3 Relay Communication
-- Implement a new endpoint `/stream-source` in the relay server
-- Modify the polling mechanism to handle streaming responses
-- Store streaming state to track active streams
+- ✅ Implemented a new `/stream/source` endpoint in the relay server to ingest streaming chunks
+  from compute nodes.
+- ✅ Modified the polling mechanism so `/sink` surfaces `stream_session_id` metadata for streaming
+  clients, letting servers bind chunk uploads to the correct session.
+- ✅ Store streaming state to track active streams using thread-safe registries exposed through the
+  `/stream/retrieve` client endpoint.
 
 ### 2. Client-side Changes
 

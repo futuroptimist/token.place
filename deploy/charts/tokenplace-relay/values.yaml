@@ -1,6 +1,7 @@
 image:
-  repository: ghcr.io/tokenplace/tokenplace-relay
-  tag: ""
+  repository: ghcr.io/${OWNER}/tokenplace-relay
+  tag: ""         # leave empty when using digest
+  digest: ""      # immutable digest preferred in prod
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -21,17 +22,21 @@ podAnnotations: {}
 podLabels: {}
 
 podSecurityContext:
+  runAsNonRoot: true
   runAsUser: 1000
   runAsGroup: 1000
   fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
   allowPrivilegeEscalation: false
   capabilities:
     drop:
       - ALL
   readOnlyRootFilesystem: true
-  runAsNonRoot: true
 
 resources:
   requests:
@@ -55,9 +60,9 @@ service:
 
 ingress:
   enabled: true
-  className: ""
+  className: traefik
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-production
+    cert-manager.io/cluster-issuer: letsencrypt-dns01
   hosts:
     - host: relay.example.com
       paths:
@@ -69,14 +74,15 @@ ingress:
         - relay.example.com
 
 gpuExternalName:
-  host: gpu-box.example.com
   useHeadless: false
-  ip: ""
-  port: 3000
-  egressCIDRs: []
+  host: gpu.example.com
+  port: 5015
+  headless:
+    enabled: false
+    addresses: []
 
 upstream:
-  url: http://gpu-server:3000
+  url: http://gpu-server:5015
 
 env: []
 
@@ -84,18 +90,27 @@ envFrom: []
 
 serviceMonitor:
   enabled: false
+  labels:
+    release: prometheus
+  namespaceSelector:
+    any: true
   interval: 30s
-  labels: {}
+  scrapeTimeout: 10s
+  path: /metrics
+  port: http
 
 networkPolicy:
   enabled: true
-  traefikNamespace: traefik
-  ingressNamespaceSelector: {}
-  additionalIngressSelectors: []
-  allowedEgressCIDRs: []
-  gpuFallbackCIDR: 0.0.0.0/0
   allowDNS: true
   dnsNamespace: kube-system
+  traefik:
+    namespace: traefik
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: traefik
+  externalNameCIDR: 0.0.0.0/0
+  extraIngress: []
+  extraEgress: []
 
 extraVolumes: []
 extraVolumeMounts: []

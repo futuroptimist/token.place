@@ -9,6 +9,11 @@ GRACEFUL_TIMEOUT="${RELAY_GRACEFUL_TIMEOUT:-30}"
 TIMEOUT="${RELAY_TIMEOUT:-60}"
 WORKER_TMP_DIR="${RELAY_WORKER_TMP_DIR:-/tmp}"
 
+# Ensure the worker scratch space exists when running with a read-only root filesystem.
+if [ ! -d "${WORKER_TMP_DIR}" ]; then
+  mkdir -p "${WORKER_TMP_DIR}"
+fi
+
 exec gunicorn \
   --bind "${HOST}:${PORT}" \
   --workers "${WORKERS}" \

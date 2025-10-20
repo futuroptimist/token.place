@@ -9,14 +9,20 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  {{- if .Values.serviceMonitor.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml .Values.serviceMonitor.namespaceSelector | nindent 4 }}
+  {{- else }}
   namespaceSelector:
     matchNames:
       - {{ .Release.Namespace }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "tokenplace-relay.selectorLabels" . | nindent 6 }}
   endpoints:
-    - port: http
-      path: /metrics
+    - port: {{ .Values.serviceMonitor.port }}
+      path: {{ .Values.serviceMonitor.path }}
       interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
 {{- end }}

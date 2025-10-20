@@ -1,4 +1,17 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- $gpu := .Values.gpuExternalName }}
+{{- $headless := $gpu.headless }}
+{{- $useHeadless := or $gpu.useHeadless $headless.enabled }}
+{{- $hasHeadlessAddresses := and $useHeadless (gt (len $headless.addresses) 0) }}
+{{- $hasExternal := and (not $useHeadless) (ne (default "" $gpu.host) "") }}
+{{- $allowDNS := $np.allowDNS }}
+{{- $hasExtraEgress := gt (len $np.extraEgress) 0 }}
+{{- $hasEgress := or $allowDNS (or $hasHeadlessAddresses (or $hasExternal $hasExtraEgress)) }}
+{{- $traefikPeer := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $np.traefik.namespace)) }}
+{{- with $np.traefik.podSelector }}
+{{- $_ := set $traefikPeer "podSelector" . }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -14,32 +27,20 @@ spec:
     - Egress
   ingress:
     - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.networkPolicy.traefikNamespace }}
+        - {{- toYaml $traefikPeer | nindent 8 }}
       ports:
         - protocol: TCP
           port: {{ .Values.service.port }}
-    {{- range .Values.networkPolicy.additionalIngressSelectors }}
-    - from:
-        {{- toYaml . | nindent 8 }}
-      ports:
-        - protocol: TCP
-          port: {{ .Values.service.port }}
+    {{- range $np.extraIngress }}
+    - {{- toYaml . | nindent 6 }}
     {{- end }}
-  {{- $allowDNS := .Values.networkPolicy.allowDNS }}
-  {{- $hasGPUIP := ne (default "" .Values.gpuExternalName.ip) "" }}
-  {{- $hasGPUHost := ne (default "" .Values.gpuExternalName.host) "" }}
-  {{- $gpuFallbackCIDR := default "" .Values.networkPolicy.gpuFallbackCIDR }}
-  {{- $hasGpuFallback := and $hasGPUHost (ne $gpuFallbackCIDR "") }}
-  {{- $extraCIDRs := .Values.networkPolicy.allowedEgressCIDRs }}
-  {{- if or $allowDNS (or $hasGPUIP (or $hasGpuFallback (gt (len $extraCIDRs) 0))) }}
+  {{- if $hasEgress }}
   egress:
     {{- if $allowDNS }}
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace }}
+              kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
           podSelector:
             matchLabels:
               k8s-app: kube-dns
@@ -49,28 +50,25 @@ spec:
         - protocol: TCP
           port: 53
     {{- end }}
-    {{- if $hasGPUIP }}
+    {{- if $hasHeadlessAddresses }}
+      {{- range $headless.addresses }}
     - to:
         - ipBlock:
-            cidr: {{ printf "%s/32" .Values.gpuExternalName.ip }}
+            cidr: {{ printf "%s/32" . }}
       ports:
         - protocol: TCP
-          port: {{ .Values.gpuExternalName.port }}
-    {{- else if $hasGpuFallback }}
+          port: {{ $gpu.port }}
+      {{- end }}
+    {{- else if $hasExternal }}
     - to:
         - ipBlock:
-            cidr: {{ $gpuFallbackCIDR }}
+            cidr: {{ $np.externalNameCIDR }}
       ports:
         - protocol: TCP
-          port: {{ .Values.gpuExternalName.port }}
+          port: {{ $gpu.port }}
     {{- end }}
-    {{- range $extraCIDRs }}
-    - to:
-        - ipBlock:
-            cidr: {{ . }}
-      ports:
-        - protocol: TCP
-          port: {{ $.Values.gpuExternalName.port }}
+    {{- range $np.extraEgress }}
+    - {{- toYaml . | nindent 6 }}
     {{- end }}
   {{- else }}
   egress: []

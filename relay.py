@@ -95,6 +95,42 @@ def setup_logging() -> logging.Logger:
 LOGGER = setup_logging()
 
 
+DRAINING = threading.Event()
+_ORIGINAL_SIGNAL_HANDLERS: dict[int, Any] = {}
+
+
+def _handle_shutdown_signal(signum: int, frame: Any) -> None:
+    """Mark the process as draining and defer to the original handler."""
+
+    if not DRAINING.is_set():
+        LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
+        DRAINING.set()
+
+    original = _ORIGINAL_SIGNAL_HANDLERS.get(signum)
+    if callable(original) and original not in (signal.SIG_DFL, signal.SIG_IGN, _handle_shutdown_signal):
+        original(signum, frame)
+        return
+
+    if original in (signal.SIG_DFL, None):
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+
+def _install_shutdown_handlers() -> None:
+    """Install signal handlers that record draining state for readiness probes."""
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous = signal.getsignal(sig)
+            _ORIGINAL_SIGNAL_HANDLERS[sig] = previous
+            signal.signal(sig, _handle_shutdown_signal)
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            LOGGER.debug("relay.signal_handler.install_failed", extra={"signal": sig})
+
+
+_install_shutdown_handlers()
+
+
 def configure_app_logging(flask_app: Flask) -> None:
     """Ensure Flask's logger shares the JSON formatter."""
 
@@ -301,6 +337,11 @@ def healthz():
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
     }
+
+    if DRAINING.is_set():
+        status["status"] = "draining"
+        status.setdefault("details", {})["shutdown"] = True
+        return jsonify(status), 503
 
     if gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"

@@ -43,9 +43,11 @@ spec:
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- $gpu := .Values.gpuExternalName }}
+      {{- $useHeadless := or $gpu.useHeadless $gpu.headless.enabled }}
       containers:
         - name: relay
-          image: "{{ .Values.image.repository }}{{ if .Values.image.tag }}:{{ .Values.image.tag }}{{ else }}:{{ .Chart.AppVersion }}{{ end }}"
+          image: {{ include "tokenplace-relay.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -56,10 +58,12 @@ spec:
               value: "0.0.0.0"
             - name: RELAY_PORT
               value: "{{ .Values.containerPort }}"
+            {{- if not $useHeadless }}
             - name: TOKENPLACE_GPU_HOST
-              value: gpu-server
+              value: {{ $gpu.host | quote }}
+            {{- end }}
             - name: TOKENPLACE_GPU_PORT
-              value: "{{ .Values.gpuExternalName.port }}"
+              value: "{{ $gpu.port }}"
             - name: TOKENPLACE_RELAY_UPSTREAM_URL
               value: "{{ .Values.upstream.url }}"
             {{- with .Values.env }}
@@ -82,10 +86,8 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 3
-          {{- with .Values.securityContext }}
           securityContext:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:

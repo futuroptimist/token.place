@@ -1,4 +1,5 @@
-{{- if not .Values.gpuExternalName.useHeadless }}
+{{- $gpu := .Values.gpuExternalName }}
+{{- if not (or $gpu.useHeadless $gpu.headless.enabled) }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,5 +8,5 @@ metadata:
     {{- include "tokenplace-relay.labels" . | nindent 4 }}
 spec:
   type: ExternalName
-  externalName: {{ .Values.gpuExternalName.host }}
+  externalName: {{ $gpu.host }}
 {{- end }}

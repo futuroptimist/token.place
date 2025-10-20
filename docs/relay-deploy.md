@@ -9,26 +9,40 @@ Multi-architecture images (linux/amd64 and linux/arm64) are published to GitHub 
 as `ghcr.io/<org-or-user>/tokenplace-relay`. Each build is tagged with both an immutable
 `sha-<shortsha>` and any matching semver tag.
 
+Prefer pinning releases by digest in production to guarantee immutability:
+
+```yaml
+image:
+  repository: ghcr.io/example/tokenplace-relay
+  digest: sha256:0123456789abcdef...
+  tag: ""  # leave empty when digest is provided
+```
+
 The container exposes port `5010` internally. Runtime environment variables:
 
 - `RELAY_HOST` (default `0.0.0.0`)
 - `RELAY_PORT` (default `5010`)
-- `TOKENPLACE_GPU_HOST` (defaults to the Kubernetes service name `gpu-server`)
-- `TOKENPLACE_GPU_PORT` (default `3000`)
-- `TOKENPLACE_RELAY_UPSTREAM_URL` (default `http://gpu-server:3000`)
+- `TOKENPLACE_GPU_HOST` is injected only when the chart targets an external GPU hostname.
+- `TOKENPLACE_GPU_PORT` defaults to the chart's configured GPU port (5015 by default).
+- `TOKENPLACE_RELAY_UPSTREAM_URL` defaults to `http://gpu-server:<port>`.
 
-## Configuring the GPU host DNS entry
+## GPU indirection options
 
-The relay contacts the GPU server through a stable DNS record. In Helm, set
-`values.gpuExternalName.host` to the DNS name that resolves to your Windows host. The chart will
-create a `Service` named `gpu-server` of type `ExternalName` pointing to that DNS entry. If you need
-an IP-based indirection (for example, when the upstream requires a static IP and DNS is not
-available), set `gpuExternalName.useHeadless: true` and provide `gpuExternalName.ip` to ship a
-headless `Service` with static `Endpoints`.
+The relay reaches the GPU host through an indirection layer that you can control per environment:
 
-The default upstream TCP port is `3000`. This must match the port where `server.py` listens on the
-Windows host. Update `gpuExternalName.port` (and `upstream.url`) in `values.yaml` if you expose the
-Windows service on a different port.
+- **ExternalName mode (default):** set `gpuExternalName.host` to the DNS name that resolves to your
+  Windows host. The chart renders a `Service` named `gpu-server` of type `ExternalName` and injects
+  `TOKENPLACE_GPU_HOST`/`TOKENPLACE_GPU_PORT` into the deployment so the relay connects directly to
+  that hostname and port.
+- **Headless Service + Endpoints:** set `gpuExternalName.useHeadless: true` (or
+  `gpuExternalName.headless.enabled: true`) and provide static addresses via
+  `gpuExternalName.headless.addresses`. The chart generates a headless `Service` with the supplied
+  `Endpoints`. In this mode the relay resolves `gpu-server` inside the cluster, so no
+  `TOKENPLACE_GPU_HOST` override is necessary.
+
+Whichever mode you choose, set `gpuExternalName.port` to the TCP port where `server.py` listens. The
+default is `5015`, and the chart also rewrites `TOKENPLACE_GPU_PORT` accordingly. You can override
+`upstream.url` when pointing at a different scheme or host.
 
 ## Helm deployment workflow
 
@@ -37,7 +51,7 @@ Windows service on a different port.
    ```yaml
    image:
      repository: ghcr.io/example/tokenplace-relay
-     tag: sha-<shortsha>
+     digest: sha256:0123456789abcdef...
    ingress:
      hosts:
        - host: relay.staging.example.com
@@ -50,12 +64,22 @@ Windows service on a different port.
            - relay.staging.example.com
    gpuExternalName:
      host: gpu-box.example.com
-     port: 3000
+     port: 5015
    upstream:
-     url: http://gpu-server:3000
+     url: http://gpu-server:5015
+   serviceMonitor:
+     enabled: true
+     namespaceSelector:
+       matchNames:
+         - monitoring
    networkPolicy:
-     allowedEgressCIDRs:
-       - 203.0.113.42/32  # optional when you know the GPU host address
+     extraEgress:
+       - to:
+           - ipBlock:
+               cidr: 203.0.113.42/32
+         ports:
+           - protocol: TCP
+             port: 5015
    ```
 3. Deploy with Helm:
    ```bash
@@ -68,8 +92,8 @@ Windows service on a different port.
    kubectl -n tokenplace get pods -l app.kubernetes.io/name=tokenplace-relay
    kubectl -n tokenplace get ingress relay-tokenplace-relay
    ```
-5. Optional: enable the `ServiceMonitor` by setting `serviceMonitor.enabled: true` when a Prometheus
-   operator is available in the cluster.
+5. Optional: enable the `ServiceMonitor` by setting `serviceMonitor.enabled: true`. Labels default to
+   `{ release: prometheus }` so the kube-prometheus-stack discovers the metrics endpoint.
 
 ## Running `server.py` on Windows 11 (RTX 4090 host)
 
@@ -103,13 +127,20 @@ Windows service on a different port.
 
 ## Network considerations
 
-- The chart ships with a `NetworkPolicy` that permits ingress only from the Traefik namespace (set
-  via `networkPolicy.traefikNamespace`). Adjust `additionalIngressSelectors` if other in-cluster
-  clients must reach the relay.
-- Egress is limited to DNS (when `networkPolicy.allowDNS` is true) and to the GPU host IPs provided
-  via `gpuExternalName.ip` or `networkPolicy.allowedEgressCIDRs`.
-- If you operate behind cert-manager, ensure the ingress annotations reference your issuer (for
-  example, `cert-manager.io/cluster-issuer: letsencrypt-production`).
+- The default `NetworkPolicy` denies all traffic except:
+  - Ingress from the Traefik controller (namespace + label selector configured via
+    `networkPolicy.traefik`).
+  - Egress to kube-dns (UDP/TCP 53) when `networkPolicy.allowDNS` is true.
+  - Egress to either the configured ExternalName host (via `networkPolicy.externalNameCIDR`) or the
+    explicit headless IPs in `gpuExternalName.headless.addresses`.
+  - Additional overrides supplied through `networkPolicy.extraIngress` / `networkPolicy.extraEgress`.
+- The pod and container run as an unprivileged user (`1000`), drop all Linux capabilities, enforce a
+  read-only root filesystem (an `emptyDir` is mounted at `/tmp`), disallow privilege escalation, and
+  opt into the `RuntimeDefault` seccomp profile.
+- Liveness and readiness probes target `/livez` and `/healthz` on the named `http` port. During
+  shutdown the readiness probe reports a 503 so Kubernetes drains the pod before termination.
+- If you operate behind cert-manager, ensure the ingress annotations reference your issuer (default
+  `cert-manager.io/cluster-issuer: letsencrypt-dns01`).
 
 With the Windows host advertising `server.py` on the expected port and the Helm release pointing to
 that DNS record, pods inside the cluster can reach the GPU-backed server transparently through the

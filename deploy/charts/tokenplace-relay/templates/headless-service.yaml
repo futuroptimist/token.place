@@ -1,4 +1,5 @@
-{{- if .Values.gpuExternalName.useHeadless }}
+{{- $gpu := .Values.gpuExternalName }}
+{{- if or $gpu.useHeadless $gpu.headless.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -10,6 +11,6 @@ spec:
   publishNotReadyAddresses: true
   ports:
     - name: http
-      port: {{ .Values.gpuExternalName.port }}
-      targetPort: {{ .Values.gpuExternalName.port }}
+      port: {{ $gpu.port }}
+      targetPort: {{ $gpu.port }}
 {{- end }}

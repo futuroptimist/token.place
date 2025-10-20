@@ -1,0 +1,111 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/example/tokenplace-relay
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+
+service:
+  type: ClusterIP
+  port: 5010
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+env: []
+envFrom: []
+
+relay:
+  serverToken:
+    existingSecret: ""
+    key: token
+
+upstream:
+  url: ""
+  host: gpu-server
+  port: 5010
+  scheme: http
+
+ingress:
+  enabled: true
+  className: ""
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+  hosts:
+    - host: relay.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+        - relay.example.com
+      secretName: relay-tls
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+networkPolicy:
+  enabled: true
+  traefikNamespace: traefik
+  allowDNS: true
+  gpuServerCIDRs: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 80
+
+gpuExternalName:
+  enabled: true
+  host: gpu-box.example.com
+  serviceName: gpu-server
+  headless:
+    enabled: false
+    annotations: {}
+    ports: []
+    addresses: []
+
+additionalLabels: {}

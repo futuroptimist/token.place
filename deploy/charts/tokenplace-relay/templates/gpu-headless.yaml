@@ -1,0 +1,41 @@
+{{- if and .Values.gpuExternalName.headless.enabled .Values.gpuExternalName.headless.ports }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-headless" (.Values.gpuExternalName.serviceName | default "gpu-server") }}
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+  {{- with .Values.gpuExternalName.headless.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    {{- range .Values.gpuExternalName.headless.ports }}
+    - name: {{ .name | default (printf "port-%d" .port) }}
+      port: {{ .port }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+{{- if .Values.gpuExternalName.headless.addresses }}
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: {{ printf "%s-headless" (.Values.gpuExternalName.serviceName | default "gpu-server") }}
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+subsets:
+  - addresses:
+      {{- range .Values.gpuExternalName.headless.addresses }}
+      - ip: {{ . }}
+      {{- end }}
+    ports:
+      {{- range .Values.gpuExternalName.headless.ports }}
+      - port: {{ .port }}
+        protocol: {{ .protocol | default "TCP" }}
+        name: {{ .name | default (printf "port-%d" .port) }}
+      {{- end }}
+{{- end }}
+{{- end }}

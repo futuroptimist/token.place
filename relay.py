@@ -141,36 +141,54 @@ def configure_app_logging(flask_app: Flask) -> None:
     flask_app.logger.propagate = False
 
 
-def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments when running the relay directly."""
-
-    parser = argparse.ArgumentParser(description="token.place relay server")
-    parser.add_argument("--port", type=int, default=5010,
-                        help="Port to run the relay server on")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="Host interface to bind the relay server")
-    parser.add_argument("--use_mock_llm", action="store_true",
-                        help="Use mock LLM for testing")
-    return parser.parse_args(argv)
-
-
 def _configure_mock_mode(enable_mock: bool) -> None:
-    if enable_mock or os.environ.get("USE_MOCK_LLM") == "1":
+    should_enable = enable_mock or os.environ.get("USE_MOCK_LLM") == "1"
+    if not should_enable:
+        return
+
+    if os.environ.get("USE_MOCK_LLM") != "1":
         os.environ["USE_MOCK_LLM"] = "1"
         LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
 
-def _bootstrap_mock_mode_from_cli(argv: list[str]) -> None:
-    """Ensure mock mode is configured before importing API modules."""
+def _build_cli_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="token.place relay server", add_help=add_help)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5010,
+        help="Port to run the relay server on",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host interface to bind the relay server",
+    )
+    parser.add_argument(
+        "--use_mock_llm",
+        action="store_true",
+        help="Use mock LLM for testing",
+    )
+    return parser
 
-    enable_mock = "--use_mock_llm" in argv
-    _configure_mock_mode(enable_mock)
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments when running the relay directly."""
+
+    parser = _build_cli_parser()
+    return parser.parse_args(argv)
 
 
-_bootstrap_mock_mode_from_cli(sys.argv[1:])
+def _detect_mock_flag(argv: list[str]) -> bool:
+    parser = _build_cli_parser(add_help=False)
+    try:
+        args, _ = parser.parse_known_args(argv)
+    except SystemExit:
+        return False
+    return bool(getattr(args, "use_mock_llm", False))
 
-from api import init_app
-from config import get_config
+
+_configure_mock_mode(_detect_mock_flag(sys.argv[1:]))
 
 
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
@@ -200,6 +218,26 @@ def _load_upstream_config() -> Dict[str, Any]:
 UPSTREAM_CONFIG = _load_upstream_config()
 
 
+def create_app() -> Flask:
+    """Instantiate and configure the Flask application."""
+
+    flask_app = Flask(__name__)
+    configure_app_logging(flask_app)
+    flask_app.config.update(UPSTREAM_CONFIG)
+
+    from api import init_app  # Imported lazily to honor mock-mode configuration
+
+    init_app(flask_app)
+    LOGGER.info(
+        "relay.app.initialized",
+        extra={"upstream": flask_app.config.get("upstream_url")},
+    )
+    return flask_app
+
+
+app = create_app()
+
+
 def _get_request_counter() -> Counter:
     metric_name = "tokenplace_relay_requests_total"
     existing = getattr(REGISTRY, "_names_to_collectors", {}).get(metric_name)
@@ -220,6 +258,8 @@ def _load_server_registration_token():
 
     token = None
     try:
+        from config import get_config
+
         token = get_config().get('relay.server_registration_token')
     except Exception:
         token = None
@@ -256,17 +296,6 @@ def _validate_server_registration():
         }
     }), 401
 
-
-app = Flask(__name__)
-configure_app_logging(app)
-app.config.update(UPSTREAM_CONFIG)
-
-# Initialize the API
-init_app(app)
-LOGGER.info(
-    "relay.app.initialized",
-    extra={"upstream": app.config.get("upstream_url")},
-)
 
 known_servers = {}
 client_inference_requests = {}

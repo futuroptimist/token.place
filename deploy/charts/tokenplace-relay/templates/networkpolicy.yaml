@@ -3,15 +3,8 @@
 {{- $gpu := .Values.gpuExternalName }}
 {{- $headless := $gpu.headless }}
 {{- $useHeadless := or $gpu.useHeadless $headless.enabled }}
-{{- $hasHeadlessAddresses := and $useHeadless (gt (len $headless.addresses) 0) }}
 {{- $hasExternal := and (not $useHeadless) (ne (default "" $gpu.host) "") }}
-{{- $allowDNS := $np.allowDNS }}
-{{- $hasExtraEgress := gt (len $np.extraEgress) 0 }}
-{{- $hasEgress := or $allowDNS (or $hasHeadlessAddresses (or $hasExternal $hasExtraEgress)) }}
-{{- $traefikPeer := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $np.traefik.namespace)) }}
-{{- with $np.traefik.podSelector }}
-{{- $_ := set $traefikPeer "podSelector" . }}
-{{- end }}
+{{- $dnsSelector := coalesce $np.kubeDNSSelector (dict "matchLabels" (dict "k8s-app" "kube-dns")) }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -26,51 +19,68 @@ spec:
     - Ingress
     - Egress
   ingress:
+  {{- $ingressState := dict "has" false }}
+  {{- if $np.traefik.namespace }}
     - from:
-        - {{- toYaml $traefikPeer | nindent 8 }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.traefik.namespace }}
+          {{- with $np.traefik.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.service.port }}
-    {{- range $np.extraIngress }}
+    {{- $_ := set $ingressState "has" true }}
+  {{- end }}
+  {{- range $np.extraIngress }}
     - {{- toYaml . | nindent 6 }}
-    {{- end }}
-  {{- if $hasEgress }}
+    {{- $_ := set $ingressState "has" true }}
+  {{- end }}
+  {{- if not $ingressState.has }}
+    []
+  {{- end }}
   egress:
-    {{- if $allowDNS }}
+  {{- $egressState := dict "has" false }}
+  {{- if $np.allowDNS }}
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
           podSelector:
-            matchLabels:
-              k8s-app: kube-dns
+            {{- toYaml $dnsSelector | nindent 12 }}
       ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
-    {{- end }}
-    {{- if $hasHeadlessAddresses }}
-      {{- range $headless.addresses }}
+    {{- $_ := set $egressState "has" true }}
+  {{- end }}
+  {{- if and $useHeadless (gt (len $headless.addresses) 0) }}
+    {{- range $headless.addresses }}
     - to:
         - ipBlock:
             cidr: {{ printf "%s/32" . }}
       ports:
         - protocol: TCP
           port: {{ $gpu.port }}
-      {{- end }}
-    {{- else if $hasExternal }}
+    {{- $_ := set $egressState "has" true }}
+    {{- end }}
+  {{- else if $hasExternal }}
     - to:
         - ipBlock:
             cidr: {{ $np.externalNameCIDR }}
       ports:
         - protocol: TCP
           port: {{ $gpu.port }}
-    {{- end }}
-    {{- range $np.extraEgress }}
+    {{- $_ := set $egressState "has" true }}
+  {{- end }}
+  {{- range $np.extraEgress }}
     - {{- toYaml . | nindent 6 }}
-    {{- end }}
-  {{- else }}
-  egress: []
+    {{- $_ := set $egressState "has" true }}
+  {{- end }}
+  {{- if not $egressState.has }}
+    []
   {{- end }}
 {{- end }}

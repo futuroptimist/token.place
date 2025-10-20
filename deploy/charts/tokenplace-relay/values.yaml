@@ -43,8 +43,8 @@ resources:
     cpu: 100m
     memory: 128Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 300m
+    memory: 256Mi
 
 autoscaling:
   enabled: false
@@ -91,7 +91,7 @@ envFrom: []
 serviceMonitor:
   enabled: false
   labels:
-    release: prometheus
+    release: kube-prometheus-stack
   namespaceSelector:
     any: true
   interval: 30s
@@ -103,6 +103,9 @@ networkPolicy:
   enabled: true
   allowDNS: true
   dnsNamespace: kube-system
+  kubeDNSSelector:
+    matchLabels:
+      k8s-app: kube-dns
   traefik:
     namespace: traefik
     podSelector:

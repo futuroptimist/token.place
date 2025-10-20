@@ -15,7 +15,7 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "tokenplace-relay.fullname" . }}
+  name: {{ include "tokenplace-relay.fullname" . }}-deny-all
   labels:
     {{- include "tokenplace-relay.labels" . | nindent 4 }}
 spec:
@@ -62,7 +62,7 @@ spec:
     {{- else if $hasExternal }}
     - to:
         - ipBlock:
-            cidr: {{ $np.externalNameCIDR }}
+            cidr: {{ default "0.0.0.0/32" $np.externalNameCIDR }}
       ports:
         - protocol: TCP
           port: {{ $gpu.port }}

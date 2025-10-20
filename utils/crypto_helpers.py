@@ -35,7 +35,13 @@ from typing import Dict, Tuple, Any, List, Optional, Union, Iterator
 import time
 
 # Import encryption functions
-from encrypt import generate_keys, encrypt, decrypt
+from encrypt import (
+    generate_keys,
+    encrypt,
+    decrypt,
+    decrypt_stream_chunk,
+    StreamSession,
+)
 
 # Set up module-level logger without configuring global logging
 logger = logging.getLogger("crypto_client")
@@ -612,6 +618,118 @@ class CryptoClient:
             attempt = 0
             reconnect_count = 0
             cached_events: List[Dict[str, Any]] = []
+            decrypt_sessions: Dict[str, StreamSession] = {}
+
+            def _decode_base64(value: str, field: str) -> Optional[bytes]:
+                try:
+                    return base64.b64decode(value)
+                except (TypeError, ValueError):
+                    logger.error("Failed to decode %s for encrypted stream chunk", field)
+                    return None
+
+            def _decode_associated_data(value: Any) -> Optional[bytes]:
+                if value is None:
+                    return None
+                if not isinstance(value, str):
+                    logger.error("associated_data must be a base64 string when provided")
+                    return None
+                return _decode_base64(value, "associated_data")
+
+            def _decrypt_stream_payload(
+                encrypted_payload: Dict[str, Any],
+                *,
+                session_id: Optional[str],
+            ) -> Optional[Any]:
+                ciphertext_b64 = encrypted_payload.get('ciphertext')
+                iv_b64 = encrypted_payload.get('iv')
+                if not isinstance(ciphertext_b64, str) or not isinstance(iv_b64, str):
+                    logger.error(
+                        "Encrypted streaming chunk missing ciphertext or iv",
+                    )
+                    return None
+
+                ciphertext_bytes = _decode_base64(ciphertext_b64, "ciphertext")
+                iv_bytes = _decode_base64(iv_b64, "iv")
+                if ciphertext_bytes is None or iv_bytes is None:
+                    return None
+
+                ciphertext_dict: Dict[str, bytes] = {
+                    'ciphertext': ciphertext_bytes,
+                    'iv': iv_bytes,
+                }
+
+                tag_b64 = encrypted_payload.get('tag')
+                if isinstance(tag_b64, str):
+                    tag_bytes = _decode_base64(tag_b64, "tag")
+                    if tag_bytes is None:
+                        return None
+                    ciphertext_dict['tag'] = tag_bytes
+
+                mode_value = encrypted_payload.get('mode')
+                if isinstance(mode_value, str):
+                    ciphertext_dict['mode'] = mode_value
+                else:
+                    mode_value = None
+
+                associated_data = _decode_associated_data(
+                    encrypted_payload.get('associated_data'),
+                )
+                if encrypted_payload.get('associated_data') is not None and associated_data is None:
+                    return None
+
+                encrypted_key_bytes: Optional[bytes] = None
+                cipherkey_b64 = encrypted_payload.get('cipherkey')
+                if cipherkey_b64 is not None:
+                    if not isinstance(cipherkey_b64, str):
+                        logger.error(
+                            "Encrypted streaming chunk has non-string cipherkey",
+                        )
+                        return None
+                    encrypted_key_bytes = _decode_base64(cipherkey_b64, "cipherkey")
+                    if encrypted_key_bytes is None:
+                        return None
+
+                session_obj: Optional[StreamSession] = None
+                if session_id:
+                    session_obj = decrypt_sessions.get(session_id)
+
+                if session_obj is None and encrypted_key_bytes is None:
+                    logger.error(
+                        "Encrypted streaming chunk missing cipherkey for new session",
+                    )
+                    return None
+
+                try:
+                    plaintext_bytes, new_session = decrypt_stream_chunk(
+                        ciphertext_dict,
+                        self.client_private_key,
+                        session=session_obj,
+                        encrypted_key=encrypted_key_bytes,
+                        cipher_mode=mode_value,
+                        associated_data=associated_data,
+                    )
+                except Exception:
+                    logger.error(
+                        "Exception while decrypting streaming chunk",
+                        exc_info=self.debug,
+                    )
+                    return None
+
+                if session_id:
+                    decrypt_sessions[session_id] = new_session
+
+                try:
+                    plaintext_text = plaintext_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    logger.error("Failed to decode decrypted streaming chunk as UTF-8")
+                    return None
+                try:
+                    return json.loads(plaintext_text)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "Could not parse decrypted streaming chunk as JSON",
+                    )
+                    return plaintext_text
 
             def _record_cached_event(event: str, data: Any) -> None:
                 try:
@@ -709,6 +827,7 @@ class CryptoClient:
                             status_code=status_code,
                         ),
                     }
+                    decrypt_sessions.clear()
                     return
                 yield {
                     'event': 'fallback',
@@ -717,6 +836,7 @@ class CryptoClient:
                         'message': _fallback_message(reason, status_code=status_code),
                     },
                 }
+                decrypt_sessions.clear()
                 yield from _emit_non_stream_response(fallback_response)
 
             while True:
@@ -767,6 +887,7 @@ class CryptoClient:
                             "Non-streaming response received with content-type %s",
                             content_type,
                         )
+                        decrypt_sessions.clear()
                         yield from _emit_non_stream_response(response)
                         return
 
@@ -795,6 +916,9 @@ class CryptoClient:
                                 event_name = chunk.get('event', 'chunk')
 
                                 encrypted_body = None
+                                session_id: Optional[str] = None
+                                if isinstance(chunk.get('stream_session_id'), str):
+                                    session_id = chunk['stream_session_id']
                                 if chunk.get('encrypted') is True:
                                     encrypted_body = chunk.get('data')
                                 else:
@@ -804,6 +928,14 @@ class CryptoClient:
                                         # `data` key depending on the server schema. Support both shapes.
                                         encrypted_body = data_field.get('data', data_field)
                                         event_name = chunk.get('event', event_name)
+                                        if isinstance(data_field.get('stream_session_id'), str):
+                                            session_id = data_field['stream_session_id']
+                                if (
+                                    session_id is None
+                                    and isinstance(chunk.get('data'), dict)
+                                    and isinstance(chunk['data'].get('stream_session_id'), str)
+                                ):
+                                    session_id = chunk['data']['stream_session_id']
 
                                 if encrypted_body is not None:
                                     if not isinstance(encrypted_body, dict):
@@ -814,21 +946,11 @@ class CryptoClient:
                                         }
                                         continue
 
-                                    try:
-                                        decrypted_payload = self.decrypt_message(encrypted_body)
-                                    except Exception:
-                                        logger.error(
-                                            "Exception while decrypting streaming chunk",
-                                            exc_info=self.debug,
-                                        )
-                                        yield {
-                                            'event': 'error',
-                                            'data': _build_error_data('decrypt_failed'),
-                                        }
-                                        continue
-
+                                    decrypted_payload = _decrypt_stream_payload(
+                                        encrypted_body,
+                                        session_id=session_id,
+                                    )
                                     if decrypted_payload is None:
-                                        logger.error("Failed to decrypt streaming chunk")
                                         yield {
                                             'event': 'error',
                                             'data': _build_error_data('decrypt_failed'),
@@ -851,6 +973,7 @@ class CryptoClient:
                             event_payload = {'event': 'text', 'data': data_str}
                             _record_cached_event(event_payload['event'], event_payload['data'])
                             yield event_payload
+                    decrypt_sessions.clear()
                     return
                 except requests.RequestException as exc:  # pragma: no cover - defensive
                     logger.warning(
@@ -877,6 +1000,7 @@ class CryptoClient:
                         time.sleep(retry_delay)
                     continue
 
+                decrypt_sessions.clear()
                 return  # pragma: no cover - loop exits after successful attempt
 
         return _iter_chunks()

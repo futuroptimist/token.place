@@ -3,19 +3,12 @@
 {{- $gpu := .Values.gpuExternalName }}
 {{- $headless := $gpu.headless }}
 {{- $useHeadless := or $gpu.useHeadless $headless.enabled }}
-{{- $hasHeadlessAddresses := and $useHeadless (gt (len $headless.addresses) 0) }}
+{{- $hasHeadless := and $useHeadless (gt (len $headless.addresses) 0) }}
 {{- $hasExternal := and (not $useHeadless) (ne (default "" $gpu.host) "") }}
-{{- $allowDNS := $np.allowDNS }}
-{{- $hasExtraEgress := gt (len $np.extraEgress) 0 }}
-{{- $hasEgress := or $allowDNS (or $hasHeadlessAddresses (or $hasExternal $hasExtraEgress)) }}
-{{- $traefikPeer := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $np.traefik.namespace)) }}
-{{- with $np.traefik.podSelector }}
-{{- $_ := set $traefikPeer "podSelector" . }}
-{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "tokenplace-relay.fullname" . }}
+  name: {{ include "tokenplace-relay.fullname" . }}-deny-all
   labels:
     {{- include "tokenplace-relay.labels" . | nindent 4 }}
 spec:
@@ -26,39 +19,30 @@ spec:
     - Ingress
     - Egress
   ingress:
-    - from:
-        - {{- toYaml $traefikPeer | nindent 8 }}
-      ports:
-        - protocol: TCP
-          port: {{ .Values.service.port }}
+    {{- if $np.extraIngress }}
     {{- range $np.extraIngress }}
     - {{- toYaml . | nindent 6 }}
     {{- end }}
-  {{- if $hasEgress }}
+    {{- else }}
+    []
+    {{- end }}
   egress:
-    {{- if $allowDNS }}
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
+        - namespaceSelector: {}
       ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
-    {{- end }}
-    {{- if $hasHeadlessAddresses }}
-      {{- range $headless.addresses }}
+    {{- if $hasHeadless }}
+    {{- range $headless.addresses }}
     - to:
         - ipBlock:
             cidr: {{ printf "%s/32" . }}
       ports:
         - protocol: TCP
           port: {{ $gpu.port }}
-      {{- end }}
+    {{- end }}
     {{- else if $hasExternal }}
     - to:
         - ipBlock:
@@ -70,7 +54,4 @@ spec:
     {{- range $np.extraEgress }}
     - {{- toYaml . | nindent 6 }}
     {{- end }}
-  {{- else }}
-  egress: []
-  {{- end }}
 {{- end }}

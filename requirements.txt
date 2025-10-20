@@ -31,7 +31,7 @@ psutil==5.9.8
 # pytest-benchmark 5.1.0+ requires pytest>=8.1
 # pytest-playwright 0.7.0+ supports pytest 8.x
 pytest>=8.1
-pytest-playwright==0.7.0  # Supports pytest 8.x, provides browser automation
+pytest-playwright==0.7.1  # Supports pytest 8.x, provides browser automation
 playwright>=1.40.0        # Required by pytest-playwright 0.7.0+
 pytest-cov                # Code coverage
 pytest-mock               # Mocking utilities

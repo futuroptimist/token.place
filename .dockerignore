@@ -1,0 +1,17 @@
+.git
+.github
+node_modules
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.log
+.tests_cache
+.DS_Store
+.vscode
+.idea
+*.sqlite3
+coverage*
+.env
+.env.*

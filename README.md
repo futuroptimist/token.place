@@ -257,7 +257,9 @@ openai's event format so existing clients can subscribe without code changes.
 
 > ⚠️ encrypted chat payloads currently fall back to the standard json response
 > while we continue hardening end-to-end encrypted streaming.
-> ⚠️ api v1 chat endpoints continue to return full json responses even when `stream=true`.
+> ❌ api v1 chat endpoints remain json-only; requests that include `stream=true`
+> return an error. use `/api/v2/chat/completions` (or `/v2/chat/completions`)
+> for server-sent events.
 
 ### example curl request
 

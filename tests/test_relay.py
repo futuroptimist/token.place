@@ -12,7 +12,13 @@ from relay import app
 
 # Import the global dictionaries from relay to inspect/manipulate state if needed
 # Be cautious with direct manipulation in tests, prefer using API endpoints
-from relay import known_servers, client_inference_requests, client_responses
+from relay import (
+    known_servers,
+    client_inference_requests,
+    client_responses,
+    streaming_sessions,
+    streaming_sessions_by_client,
+)
 
 # Generate dummy keys for testing
 # (You might want to use the generate_keys function from encrypt.py if needed)
@@ -28,6 +34,8 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_responses.clear()
+    streaming_sessions.clear()
+    streaming_sessions_by_client.clear()
 
     with app.test_client() as client:
         yield client
@@ -36,6 +44,8 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_responses.clear()
+    streaming_sessions.clear()
+    streaming_sessions_by_client.clear()
 
 
 def test_inference_endpoint_removed(client):
@@ -328,5 +338,74 @@ def test_full_relay_flow(client):
     assert retrieve_data['chat_history'] == "server_response_data"
     assert retrieve_data['cipherkey'] == "server_key_data"
     assert retrieve_data['iv'] == "server_iv_data"
+
+
+def test_streaming_state_lifecycle(client):
+    """Streaming sessions should store and release chunk state per client."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': time.time(),
+        'last_ping_duration': 10,
+    }
+
+    faucet_payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "server_public_key": DUMMY_SERVER_PUB_KEY,
+        "chat_history": "encrypted_chat_history_data",
+        "cipherkey": "encrypted_aes_key",
+        "iv": "initialization_vector",
+        "stream": True,
+    }
+    faucet_response = client.post("/faucet", json=faucet_payload)
+    assert faucet_response.status_code == 200
+
+    sink_response = client.post("/sink", json={"server_public_key": DUMMY_SERVER_PUB_KEY})
+    assert sink_response.status_code == 200
+    sink_data = sink_response.get_json()
+    assert sink_data.get('stream') is True
+    session_id = sink_data.get('stream_session_id')
+    assert session_id
+    assert session_id in streaming_sessions
+    session_state = streaming_sessions[session_id]
+    assert session_state['client_public_key'] == DUMMY_CLIENT_PUB_KEY
+    assert session_state['status'] == 'open'
+
+    chunk_payload = {
+        "session_id": session_id,
+        "chunk": {"content": "hello"},
+    }
+    chunk_response = client.post("/stream/source", json=chunk_payload)
+    assert chunk_response.status_code == 200
+
+    retrieve_response = client.post(
+        "/stream/retrieve", json={"client_public_key": DUMMY_CLIENT_PUB_KEY}
+    )
+    assert retrieve_response.status_code == 200
+    retrieved = retrieve_response.get_json()
+    assert retrieved["stream"] is True
+    assert retrieved["session_id"] == session_id
+    assert retrieved["chunks"] == [{"content": "hello"}]
+    assert "final" not in retrieved
+
+    final_payload = {
+        "session_id": session_id,
+        "chunk": {"content": "goodbye"},
+        "final": True,
+    }
+    final_response = client.post("/stream/source", json=final_payload)
+    assert final_response.status_code == 200
+
+    final_retrieve = client.post(
+        "/stream/retrieve", json={"client_public_key": DUMMY_CLIENT_PUB_KEY}
+    )
+    assert final_retrieve.status_code == 200
+    final_data = final_retrieve.get_json()
+    assert final_data["stream"] is True
+    assert final_data["session_id"] == session_id
+    assert final_data["chunks"] == [{"content": "goodbye"}]
+    assert final_data["final"] is True
+
+    assert session_id not in streaming_sessions
+    assert DUMMY_CLIENT_PUB_KEY not in streaming_sessions_by_client
     # Response should be removed from queue
     assert DUMMY_CLIENT_PUB_KEY not in client_responses

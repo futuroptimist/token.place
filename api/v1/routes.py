@@ -159,10 +159,17 @@ def _handle_chat_completion_request(data):
         validate_required_fields(data, ["model"])
 
         is_encrypted_request = bool(data.get("encrypted", False))
-        stream_requested = bool(data.get("stream", False))
+        stream_requested = data.get("stream")
         if stream_requested:
             log_warning(
-                "Streaming requested for API v1 chat completions; returning standard JSON response"
+                "Streaming requested for API v1 chat completions; returning validation error"
+            )
+            return format_error_response(
+                "Streaming is not supported for API v1 chat completions. "
+                "Use /api/v2/chat/completions for Server-Sent Events.",
+                error_type="invalid_request_error",
+                param="stream",
+                status_code=400,
             )
 
         models = get_models_info()
@@ -369,10 +376,17 @@ def _handle_text_completion_request(data):
         prompt = data.get("prompt", "")
         client_public_key = data.get("client_public_key")
         is_encrypted_request = data.get("encrypted", False)
-        stream_requested = bool(data.get("stream", False))
+        stream_requested = data.get("stream")
         if stream_requested:
             log_warning(
-                "Streaming requested for API v1 text completions; returning standard JSON response"
+                "Streaming requested for API v1 text completions; returning validation error"
+            )
+            return format_error_response(
+                "Streaming is not supported for API v1 completions. "
+                "Use /api/v2/chat/completions for Server-Sent Events.",
+                error_type="invalid_request_error",
+                param="stream",
+                status_code=400,
             )
 
         if not model_id:

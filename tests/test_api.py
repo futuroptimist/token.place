@@ -364,8 +364,8 @@ def test_public_key_rotation_updates_encryption_flow(client, client_keys, mock_l
     assert "Mock response" in decrypted_data["choices"][0]["message"]["content"]
 
 
-def test_v1_streaming_chat_completion(client, mock_llama):
-    """API v1 should ignore stream flags and return JSON chat responses."""
+def test_v1_chat_completion_rejects_stream_flag(client, mock_llama):
+    """API v1 chat completions should reject the stream flag with a clear error."""
 
     payload = {
         "model": "llama-3-8b-instruct",
@@ -373,75 +373,34 @@ def test_v1_streaming_chat_completion(client, mock_llama):
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Count from 1 to 5"}
         ],
-        "stream": True
-    }
-
-    response = client.post("/api/v1/chat/completions", json=payload)
-
-    assert response.status_code == 200
-    assert response.is_json
-
-    payload = response.get_json()
-    assert payload["choices"][0]["message"]["role"] == "assistant"
-    assert "Mock response" in payload["choices"][0]["message"]["content"]
-    assert payload["choices"][0]["finish_reason"] == "stop"
-
-
-def test_v1_streaming_chat_completion_with_tool_calls(client, mocker):
-    """JSON responses should still surface tool calls when stream is requested."""
-
-    payload = {
-        "model": "llama-3-8b-instruct",
-        "messages": [
-            {"role": "system", "content": "You are a function calling assistant."},
-            {"role": "user", "content": "Call the math function."},
-        ],
         "stream": True,
     }
 
-    assistant_message = {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            {
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "math.add", "arguments": "{\"a\": 1, \"b\": 2}"},
-            },
-            {
-                "id": "call_2",
-                "type": "function",
-                "function": "unexpected-structure",
-            },
-        ],
-    }
-
-    mocker.patch(
-        "api.v1.routes.generate_response",
-        return_value=payload["messages"] + [assistant_message],
-    )
-
     response = client.post("/api/v1/chat/completions", json=payload)
 
-    assert response.status_code == 200
-    assert response.is_json
+    assert response.status_code == 400
+    error = response.get_json()
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"].get("param") == "stream"
+    assert "Streaming is not supported for API v1" in error["error"]["message"]
 
-    body = response.get_json()
-    choice = body["choices"][0]
-    assert choice["message"]["role"] == "assistant"
-    assert choice["message"]["tool_calls"] == [
-        {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "math.add", "arguments": "{\"a\": 1, \"b\": 2}"},
-        },
-        {
-            "id": "call_2",
-            "type": "function",
-            "function": "unexpected-structure",
-        },
-    ]
-    assert choice["finish_reason"] == "tool_calls"
+
+def test_v1_completions_reject_stream_flag(client, mock_llama):
+    """Legacy completions endpoint should also reject streaming attempts."""
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "prompt": "Return a short response.",
+        "stream": True,
+    }
+
+    response = client.post("/api/v1/completions", json=payload)
+
+    assert response.status_code == 400
+    error = response.get_json()
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"].get("param") == "stream"
+    assert "Streaming is not supported for API v1" in error["error"]["message"]
 
 
 def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch):
@@ -517,8 +476,8 @@ def test_streaming_chat_completion(client, mock_llama):
     assert stop_event["choices"][0]["finish_reason"] == "stop"
 
 
-def test_encrypted_streaming_falls_back_to_single_response(client, client_keys, mock_llama):
-    """Encrypted streaming requests fall back to encrypted JSON responses."""
+def test_v1_encrypted_chat_completion_rejects_stream_flag(client, client_keys, mock_llama):
+    """Encrypted chat completions should also reject the stream flag in API v1."""
 
     response = client.get("/api/v2/public-key")
     assert response.status_code == 200
@@ -546,21 +505,11 @@ def test_encrypted_streaming_falls_back_to_single_response(client, client_keys, 
 
     response = client.post("/api/v1/chat/completions", json=payload)
 
-    assert response.status_code == 200
-    assert response.is_json
-
-    encrypted_payload = response.get_json()
-    assert encrypted_payload["encrypted"] is True
-
-    ciphertext = base64.b64decode(encrypted_payload['data']['ciphertext'])
-    encrypted_key = base64.b64decode(encrypted_payload['data']['cipherkey'])
-    iv_bytes = base64.b64decode(encrypted_payload['data']['iv'])
-
-    decrypted_bytes = decrypt({'ciphertext': ciphertext, 'iv': iv_bytes}, encrypted_key, client_keys['private_key'])
-    decrypted_data = json.loads(decrypted_bytes.decode('utf-8'))
-
-    assert decrypted_data['choices'][0]['message']['role'] == 'assistant'
-    assert "Mock response" in decrypted_data['choices'][0]['message']['content']
+    assert response.status_code == 400
+    error = response.get_json()
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"].get("param") == "stream"
+    assert "Streaming is not supported for API v1" in error["error"]["message"]
 
 def test_completions_endpoint(client, mock_llama):
     """Test the regular completions endpoint (redirects to chat)"""

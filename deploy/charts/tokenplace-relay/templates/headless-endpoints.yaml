@@ -1,0 +1,18 @@
+{{- $gpu := .Values.gpuExternalName }}
+{{- $headless := $gpu.headless }}
+{{- if and (or $gpu.useHeadless $headless.enabled) (gt (len $headless.addresses) 0) }}
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+subsets:
+  - addresses:
+      {{- range $headless.addresses }}
+      - ip: {{ . }}
+      {{- end }}
+    ports:
+      - name: http
+        port: {{ $gpu.port }}
+{{- end }}

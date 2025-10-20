@@ -23,8 +23,11 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 - ✅ `/api/v2/chat/completions` streams plaintext responses via SSE (role + content + stop markers) when `stream=true`.
 
 #### 1.1 LLM Integration
-- Modify `llama_cpp_get_response` to use the streaming mode of llama-cpp-python
-- Implement a generator function that yields tokens as they become available
+- ✅ `llama_cpp_get_response` now calls the llama-cpp streaming API and aggregates
+  token deltas into a single assistant message so downstream components can emit
+  chunks immediately.
+- ✅ Streaming helpers normalise chunk payloads and preserve incremental tool
+  call arguments while yielding decrypted content as it arrives.
 - Example:
   ```python
   def llama_cpp_stream_response(chat_history):

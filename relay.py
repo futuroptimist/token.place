@@ -123,6 +123,16 @@ def _configure_mock_mode(enable_mock: bool) -> None:
         os.environ["USE_MOCK_LLM"] = "1"
         LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
+
+def _bootstrap_mock_mode_from_cli(argv: list[str]) -> None:
+    """Ensure mock mode is configured before importing API modules."""
+
+    enable_mock = "--use_mock_llm" in argv
+    _configure_mock_mode(enable_mock)
+
+
+_bootstrap_mock_mode_from_cli(sys.argv[1:])
+
 from api import init_app
 from config import get_config
 
@@ -167,8 +177,6 @@ def _get_request_counter() -> Counter:
 
 
 REQUEST_COUNTER = _get_request_counter()
-
-_configure_mock_mode(False)
 
 
 def _load_server_registration_token():

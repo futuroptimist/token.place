@@ -29,8 +29,11 @@ spec:
     {{- end }}
   {{- $allowDNS := .Values.networkPolicy.allowDNS }}
   {{- $hasGPUIP := ne (default "" .Values.gpuExternalName.ip) "" }}
+  {{- $hasGPUHost := ne (default "" .Values.gpuExternalName.host) "" }}
+  {{- $gpuFallbackCIDR := default "" .Values.networkPolicy.gpuFallbackCIDR }}
+  {{- $hasGpuFallback := and $hasGPUHost (ne $gpuFallbackCIDR "") }}
   {{- $extraCIDRs := .Values.networkPolicy.allowedEgressCIDRs }}
-  {{- if or $allowDNS (or $hasGPUIP (gt (len $extraCIDRs) 0)) }}
+  {{- if or $allowDNS (or $hasGPUIP (or $hasGpuFallback (gt (len $extraCIDRs) 0))) }}
   egress:
     {{- if $allowDNS }}
     - to:
@@ -50,6 +53,13 @@ spec:
     - to:
         - ipBlock:
             cidr: {{ printf "%s/32" .Values.gpuExternalName.ip }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gpuExternalName.port }}
+    {{- else if $hasGpuFallback }}
+    - to:
+        - ipBlock:
+            cidr: {{ $gpuFallbackCIDR }}
       ports:
         - protocol: TCP
           port: {{ .Values.gpuExternalName.port }}

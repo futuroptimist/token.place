@@ -93,6 +93,7 @@ networkPolicy:
   ingressNamespaceSelector: {}
   additionalIngressSelectors: []
   allowedEgressCIDRs: []
+  gpuFallbackCIDR: 0.0.0.0/0
   allowDNS: true
   dnsNamespace: kube-system
 

@@ -257,6 +257,296 @@ def test_stream_chat_completion_handles_invalid_encrypted_payload(
 
 @patch('utils.crypto_helpers.decrypt_stream_chunk')
 @patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_missing_ciphertext(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Missing ciphertext metadata should surface a decrypt_failed event."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': 123,
+        'cipherkey': base64.b64encode(b'key').decode(),
+        'iv': base64.b64encode(b'iv').decode(),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_invalid_ciphertext_base64(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Ciphertext that fails base64 decoding should abort the decrypt attempt."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': 'not-base64!!!',
+        'cipherkey': base64.b64encode(b'key').decode(),
+        'iv': base64.b64encode(b'iv').decode(),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_non_string_associated_data(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Associated data must be a base64 string when provided."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': base64.b64encode(b'chunk').decode(),
+        'cipherkey': base64.b64encode(b'key').decode(),
+        'iv': base64.b64encode(b'iv').decode(),
+        'associated_data': {'bad': 'type'},
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_invalid_associated_data_base64(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Invalid associated data should be treated as a decryption failure."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': base64.b64encode(b'chunk').decode(),
+        'cipherkey': base64.b64encode(b'key').decode(),
+        'iv': base64.b64encode(b'iv').decode(),
+        'associated_data': '!!!not-base64!!!',
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_invalid_tag_base64(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Tags must decode from base64 to be accepted."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': base64.b64encode(b'chunk').decode(),
+        'cipherkey': base64.b64encode(b'key').decode(),
+        'iv': base64.b64encode(b'iv').decode(),
+        'tag': '!!!not-base64!!!',
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_non_string_cipherkey(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Cipherkeys must be strings to decode successfully."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': base64.b64encode(b'chunk').decode(),
+        'cipherkey': {'bad': 'type'},
+        'iv': base64.b64encode(b'iv').decode(),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_rejects_invalid_cipherkey_base64(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Cipherkeys that fail base64 decoding should abort the stream decrypt."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    malformed_payload = {
+        'ciphertext': base64.b64encode(b'chunk').decode(),
+        'cipherkey': '!!!not-base64!!!',
+        'iv': base64.b64encode(b'iv').decode(),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'data': malformed_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_requires_cipherkey_for_new_session(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """New encrypted sessions must include a cipherkey to initialize state."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    encrypted_payload = {
+        'ciphertext': base64.b64encode(b'chunk').decode(),
+        'iv': base64.b64encode(b'iv').decode(),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'encrypted': True, 'stream_session_id': 'sess', 'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_not_called()
+    assert chunks == [
+        {
+            'event': 'error',
+            'data': {
+                'reason': 'decrypt_failed',
+                'message': 'Unable to decrypt the encrypted streaming update.',
+            },
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
 def test_stream_chat_completion_handles_decrypt_failures(
     mock_post: MagicMock,
     mock_decrypt_chunk: MagicMock,
@@ -292,6 +582,159 @@ def test_stream_chat_completion_handles_decrypt_failures(
         }
     ]
 
+
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_extracts_session_id_from_plain_chunk(
+    mock_post: MagicMock,
+) -> None:
+    """Plain chunks should still surface session identifiers for telemetry."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+
+    plain_chunk = {
+        'event': 'chunk',
+        'data': {
+            'stream_session_id': 'plain-session',
+            'delta': {'content': 'hello'},
+        },
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps(plain_chunk)}\n",
+        b'data: [DONE]\n',
+    ])
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': plain_chunk,
+        }
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_extracts_nested_session_id(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """Nested encrypted payloads should expose their stream session ids."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+    session_id = 'nested-session'
+
+    first_payload = {
+        'ciphertext': base64.b64encode(b'first').decode(),
+        'cipherkey': base64.b64encode(b'cipher-key').decode(),
+        'iv': base64.b64encode(b'iv-1').decode(),
+    }
+    second_payload = {
+        'ciphertext': base64.b64encode(b'second').decode(),
+        'iv': base64.b64encode(b'iv-2').decode(),
+    }
+
+    stream_chunks = [
+        f"data: {json.dumps({'event': 'chunk', 'data': {'encrypted': True, 'stream_session_id': session_id, 'data': first_payload}})}\n",
+        f"data: {json.dumps({'event': 'chunk', 'data': {'encrypted': True, 'stream_session_id': session_id, 'data': second_payload}})}\n",
+        b'data: [DONE]\n',
+    ]
+
+    mock_post.return_value = _mock_stream_response(stream_chunks)
+
+    session_marker = encrypt.StreamSession(aes_key=b's' * encrypt.AES_KEY_SIZE)
+
+    def decrypt_side_effect(
+        ciphertext_dict,
+        *_args,
+        session=None,
+        encrypted_key=None,
+        cipher_mode=None,
+        associated_data=None,
+    ):
+        if session is None:
+            assert encrypted_key == base64.b64decode(first_payload['cipherkey'])
+            return json.dumps({'delta': 'first'}).encode(), session_marker
+        assert session is session_marker
+        assert encrypted_key is None
+        return json.dumps({'delta': 'second'}).encode(), session_marker
+
+    mock_decrypt_chunk.side_effect = decrypt_side_effect
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    assert mock_decrypt_chunk.call_count == 2
+    assert chunks == [
+        {
+            'event': 'chunk',
+            'data': {'delta': 'first'},
+        },
+        {
+            'event': 'chunk',
+            'data': {'delta': 'second'},
+        },
+    ]
+
+
+@patch('utils.crypto_helpers.decrypt_stream_chunk')
+@patch('utils.crypto_helpers.requests.post')
+def test_stream_chat_completion_decrypts_with_mode_tag_and_aad(
+    mock_post: MagicMock,
+    mock_decrypt_chunk: MagicMock,
+) -> None:
+    """The decrypt helper should pass through mode, tag, and associated data."""
+
+    client = CryptoClient('https://stream.test')
+    messages = [{"role": "user", "content": "Hello"}]
+    session_id = 'mode-session'
+    aad_bytes = b'context'
+
+    encrypted_payload = {
+        'ciphertext': base64.b64encode(b'plain-text').decode(),
+        'cipherkey': base64.b64encode(b'cipher-key').decode(),
+        'iv': base64.b64encode(b'iv-3').decode(),
+        'mode': 'gcm',
+        'tag': base64.b64encode(b'tag-bytes').decode(),
+        'associated_data': base64.b64encode(aad_bytes).decode(),
+    }
+
+    mock_post.return_value = _mock_stream_response([
+        f"data: {json.dumps({'event': 'delta', 'stream_session_id': session_id, 'encrypted': True, 'data': encrypted_payload})}\n".encode(),
+        b'data: [DONE]\n',
+    ])
+
+    session_marker = encrypt.StreamSession(aes_key=b'm' * encrypt.AES_KEY_SIZE)
+
+    def decrypt_side_effect(
+        ciphertext_dict,
+        *_args,
+        session=None,
+        encrypted_key=None,
+        cipher_mode=None,
+        associated_data=None,
+    ):
+        assert session is None
+        assert encrypted_key == base64.b64decode(encrypted_payload['cipherkey'])
+        assert ciphertext_dict['tag'] == base64.b64decode(encrypted_payload['tag'])
+        assert ciphertext_dict['mode'] == 'gcm'
+        assert cipher_mode == 'gcm'
+        assert associated_data == aad_bytes
+        return b'plain-text', session_marker
+
+    mock_decrypt_chunk.side_effect = decrypt_side_effect
+
+    chunks = list(client.stream_chat_completion(messages))
+
+    mock_decrypt_chunk.assert_called_once()
+    assert chunks == [
+        {
+            'event': 'delta',
+            'data': 'plain-text',
+        }
+    ]
 
 @patch('utils.crypto_helpers.requests.post')
 def test_stream_chat_completion_flags_tampered_encrypted_chunks(mock_post: MagicMock) -> None:

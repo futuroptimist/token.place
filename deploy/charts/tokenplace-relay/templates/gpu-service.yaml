@@ -1,0 +1,41 @@
+{{- if .Values.gpuExternalName.headless.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: {{ .Values.gpuExternalName.headless.port }}
+      targetPort: {{ .Values.gpuExternalName.headless.port }}
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+subsets:
+  - addresses:
+      - ip: {{ required "gpuExternalName.headless.ip is required when headless.enabled is true" .Values.gpuExternalName.headless.ip }}
+    ports:
+      - port: {{ .Values.gpuExternalName.headless.port }}
+{{- else if .Values.gpuExternalName.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: {{ required "gpuExternalName.host is required when gpuExternalName.enabled is true" .Values.gpuExternalName.host }}
+  {{- if .Values.gpuExternalName.port }}
+  ports:
+    - name: http
+      port: {{ .Values.gpuExternalName.port }}
+  {{- end }}
+{{- end }}

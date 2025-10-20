@@ -1,11 +1,57 @@
-from flask import Flask, send_from_directory, request, jsonify
-from datetime import datetime
+from flask import Flask, send_from_directory, request, jsonify, g
+from datetime import datetime, timezone
 import secrets
 import argparse
 import os
 import sys
 import threading
 import time
+import logging
+import json
+import signal
+from typing import Any, Dict
+
+from prometheus_client import Counter, REGISTRY
+
+
+class JsonFormatter(logging.Formatter):
+    """Format log records as structured JSON."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        base: Dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname.lower(),
+            "message": record.getMessage(),
+            "logger": record.name,
+        }
+
+        json_fields = getattr(record, "json_fields", None)
+        if isinstance(json_fields, dict):
+            base.update(json_fields)
+
+        if record.exc_info:
+            base["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(base, ensure_ascii=False)
+
+
+def _configure_logging() -> None:
+    """Configure application logging to emit structured JSON."""
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+
+    werkzeug_logger = logging.getLogger("werkzeug")
+    werkzeug_logger.setLevel(logging.WARNING)
+    werkzeug_logger.propagate = True
+
+
+_configure_logging()
 
 # Parse command line arguments early to set environment variables before imports
 parser = argparse.ArgumentParser(description="token.place relay server")
@@ -25,6 +71,40 @@ if args.use_mock_llm or os.environ.get("USE_MOCK_LLM") == "1":
 
 from api import init_app
 from config import get_config
+
+
+shutdown_event = threading.Event()
+
+
+def _handle_sigterm(signum, _frame):
+    logging.getLogger(__name__).info(
+        "Received termination signal",
+        extra={"json_fields": {"event": "shutdown", "signal": signum}},
+    )
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
+_REQUEST_METRIC_NAME = "tokenplace_relay_requests_total"
+
+
+def _get_request_counter() -> Counter:
+    try:
+        return Counter(
+            "tokenplace_relay_requests_total",
+            "Total HTTP requests processed by the relay",
+            ("method", "endpoint", "status"),
+        )
+    except ValueError:
+        existing = REGISTRY._names_to_collectors.get(_REQUEST_METRIC_NAME)
+        if existing:
+            return existing
+        raise
+
+
+REQUEST_COUNTER = _get_request_counter()
 
 
 def _load_server_registration_token():
@@ -70,6 +150,22 @@ def _validate_server_registration():
 
 
 app = Flask(__name__)
+app.logger.handlers = []
+app.logger.setLevel(logging.INFO)
+app.logger.propagate = True
+app.config['UPSTREAM_URL'] = os.environ.get('UPSTREAM_URL', 'http://gpu-server:8000')
+app.config['GPU_SERVER_HOST'] = os.environ.get('GPU_SERVER_HOST', 'gpu-server')
+
+logging.getLogger(__name__).info(
+    'Relay configuration loaded',
+    extra={
+        'json_fields': {
+            'event': 'config',
+            'upstream_url': app.config['UPSTREAM_URL'],
+            'gpu_server_host': app.config['GPU_SERVER_HOST'],
+        }
+    },
+)
 
 # Initialize the API
 init_app(app)
@@ -80,6 +176,70 @@ client_responses = {}
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
+
+
+@app.before_request
+def _track_request_start():
+    g.request_start_time = time.time()
+
+
+@app.after_request
+def _log_request(response):
+    duration_ms = None
+    start_time = getattr(g, "request_start_time", None)
+    if start_time is not None:
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+
+    endpoint = request.endpoint or request.path
+    REQUEST_COUNTER.labels(request.method, endpoint, str(response.status_code)).inc()
+
+    logging.getLogger("relay.http").info(
+        "request",
+        extra={
+            "json_fields": {
+                "event": "http_request",
+                "method": request.method,
+                "path": request.path,
+                "endpoint": endpoint,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+                "remote_addr": request.headers.get("X-Forwarded-For", request.remote_addr),
+            }
+        },
+    )
+    return response
+
+
+@app.route('/livez', methods=['GET'])
+def livez():
+    """Report basic liveness for Kubernetes probes."""
+
+    status = {
+        'status': 'ok' if not shutdown_event.is_set() else 'shutting_down',
+    }
+    http_status = 200 if not shutdown_event.is_set() else 503
+    return jsonify(status), http_status
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """Report readiness for Kubernetes probes."""
+
+    if shutdown_event.is_set():
+        return jsonify({'status': 'shutting_down'}), 503
+
+    try:
+        cfg = get_config()
+        config_loaded = bool(cfg)
+    except Exception as exc:  # pragma: no cover - defensive readiness logging
+        logging.getLogger(__name__).warning(
+            "Configuration unavailable during readiness check",
+            extra={'json_fields': {'event': 'readiness', 'error': str(exc)}},
+        )
+        config_loaded = False
+
+    status = {'status': 'ok' if config_loaded else 'config_unavailable'}
+    return jsonify(status), 200 if config_loaded else 503
 
 
 def _register_stream_session(server_public_key, client_public_key):
@@ -440,5 +600,33 @@ def stream_retrieve():
 
     return jsonify(response_payload), 200
 
+
+def create_app():
+    """Return the Flask application for WSGI servers."""
+
+    return app
+
+
 if __name__ == '__main__':  # pragma: no cover
-    app.run(host=args.host, port=args.port)
+    port_value = os.environ.get('RELAY_PORT', str(args.port))
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            'Invalid RELAY_PORT provided; falling back to default',
+            extra={'json_fields': {'event': 'startup', 'port': port_value}},
+        )
+        port = args.port
+
+    logging.getLogger(__name__).info(
+        'Starting relay in standalone mode',
+        extra={
+            'json_fields': {
+                'event': 'startup',
+                'host': args.host,
+                'port': port,
+                'use_mock_llm': os.environ.get('USE_MOCK_LLM') == '1',
+            }
+        },
+    )
+    app.run(host=args.host, port=port)

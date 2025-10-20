@@ -1,0 +1,12 @@
+# Common VCS dirs
+.git/
+.hg/
+.svn/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Node
+node_modules/

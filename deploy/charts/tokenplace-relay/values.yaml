@@ -31,20 +31,21 @@ podSecurityContext:
 
 securityContext:
   runAsNonRoot: true
-  runAsUser: 1000
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
   capabilities:
     drop:
       - ALL
-  readOnlyRootFilesystem: true
 
 resources:
   requests:
     cpu: 100m
     memory: 128Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 300m
+    memory: 256Mi
 
 autoscaling:
   enabled: false
@@ -91,7 +92,7 @@ envFrom: []
 serviceMonitor:
   enabled: false
   labels:
-    release: prometheus
+    release: kube-prometheus-stack
   namespaceSelector:
     any: true
   interval: 30s
@@ -102,13 +103,16 @@ serviceMonitor:
 networkPolicy:
   enabled: true
   allowDNS: true
-  dnsNamespace: kube-system
-  traefik:
-    namespace: traefik
-    podSelector:
-      matchLabels:
-        app.kubernetes.io/name: traefik
-  externalNameCIDR: 0.0.0.0/0
+  dnsNamespaceSelector: {}
+  dnsPodSelector:
+    matchLabels:
+      k8s-app: kube-dns
+  gpu:
+    enabled: true
+    cidrs: []          # e.g. ["203.0.113.5/32"] for direct GPU host access
+    namespaceSelector: {}
+    podSelector: {}
+    ports: []          # overrides gpuExternalName.port when provided
   extraIngress: []
   extraEgress: []
 

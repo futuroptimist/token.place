@@ -1,21 +1,10 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $np := .Values.networkPolicy }}
 {{- $gpu := .Values.gpuExternalName }}
-{{- $headless := $gpu.headless }}
-{{- $useHeadless := or $gpu.useHeadless $headless.enabled }}
-{{- $hasHeadlessAddresses := and $useHeadless (gt (len $headless.addresses) 0) }}
-{{- $hasExternal := and (not $useHeadless) (ne (default "" $gpu.host) "") }}
-{{- $allowDNS := $np.allowDNS }}
-{{- $hasExtraEgress := gt (len $np.extraEgress) 0 }}
-{{- $hasEgress := or $allowDNS (or $hasHeadlessAddresses (or $hasExternal $hasExtraEgress)) }}
-{{- $traefikPeer := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $np.traefik.namespace)) }}
-{{- with $np.traefik.podSelector }}
-{{- $_ := set $traefikPeer "podSelector" . }}
-{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "tokenplace-relay.fullname" . }}
+  name: {{ include "tokenplace-relay.fullname" . }}-deny-all
   labels:
     {{- include "tokenplace-relay.labels" . | nindent 4 }}
 spec:
@@ -26,51 +15,75 @@ spec:
     - Ingress
     - Egress
   ingress:
-    - from:
-        - {{- toYaml $traefikPeer | nindent 8 }}
-      ports:
-        - protocol: TCP
-          port: {{ .Values.service.port }}
-    {{- range $np.extraIngress }}
-    - {{- toYaml . | nindent 6 }}
+    {{- if $np.extraIngress }}
+    {{- toYaml $np.extraIngress | nindent 4 }}
+    {{- else }}
+    []
     {{- end }}
-  {{- if $hasEgress }}
   egress:
-    {{- if $allowDNS }}
+    {{- $hasEgress := false }}
+    {{- if $np.allowDNS }}
+    {{- $hasEgress = true }}
     - to:
         - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
+            {{- if $np.dnsNamespaceSelector }}
+            {{- toYaml $np.dnsNamespaceSelector | nindent 12 }}
+            {{- else }}
+            {}
+            {{- end }}
+          {{- if $np.dnsPodSelector }}
           podSelector:
-            matchLabels:
-              k8s-app: kube-dns
+            {{- toYaml $np.dnsPodSelector | nindent 12 }}
+          {{- end }}
       ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
     {{- end }}
-    {{- if $hasHeadlessAddresses }}
-      {{- range $headless.addresses }}
-    - to:
-        - ipBlock:
-            cidr: {{ printf "%s/32" . }}
-      ports:
-        - protocol: TCP
-          port: {{ $gpu.port }}
+    {{- if $np.gpu.enabled }}
+    {{- $hasEgress = true }}
+    {{- $gpuCidrs := list }}
+    {{- range $np.gpu.cidrs }}
+    {{- $gpuCidrs = append $gpuCidrs . }}
+    {{- end }}
+    {{- if and $gpu.useHeadless $gpu.headless.enabled }}
+      {{- range $gpu.headless.addresses }}
+    {{- $gpuCidrs = append $gpuCidrs (printf "%s/32" .) }}
       {{- end }}
-    {{- else if $hasExternal }}
+    {{- end }}
+    {{- if not $gpuCidrs }}
+    {{- $gpuCidrs = append $gpuCidrs "0.0.0.0/0" }}
+    {{- end }}
     - to:
+        {{- range $gpuCidrs }}
         - ipBlock:
-            cidr: {{ $np.externalNameCIDR }}
+            cidr: {{ . }}
+        {{- end }}
+        {{- if $np.gpu.namespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml $np.gpu.namespaceSelector | nindent 12 }}
+          {{- if $np.gpu.podSelector }}
+          podSelector:
+            {{- toYaml $np.gpu.podSelector | nindent 12 }}
+          {{- end }}
+        {{- end }}
       ports:
-        - protocol: TCP
-          port: {{ $gpu.port }}
+        {{- if $np.gpu.ports }}
+        {{- range $np.gpu.ports }}
+        - port: {{ .port }}
+          protocol: {{ default "TCP" .protocol }}
+        {{- end }}
+        {{- else }}
+        - port: {{ $gpu.port }}
+          protocol: TCP
+        {{- end }}
     {{- end }}
-    {{- range $np.extraEgress }}
-    - {{- toYaml . | nindent 6 }}
+    {{- if $np.extraEgress }}
+    {{- $hasEgress = true }}
+    {{- toYaml $np.extraEgress | nindent 4 }}
     {{- end }}
-  {{- else }}
-  egress: []
-  {{- end }}
+    {{- if not $hasEgress }}
+    []
+    {{- end }}
 {{- end }}

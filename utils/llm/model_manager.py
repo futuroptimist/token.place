@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
-from typing import Dict, List, Any, Optional, Union, Tuple
+from typing import Dict, List, Any, Optional, Union, Tuple, Iterable
 
 from utils.system import resource_monitor
 
@@ -273,17 +273,40 @@ class ModelManager:
             # Create a copy of the chat history to avoid modifying the original
             result = chat_history.copy()
 
-            # Generate the completion
+            # Generate the completion using streaming mode so callers receive
+            # incremental deltas when available from llama.cpp.
             completion = llm_instance.create_chat_completion(
                 messages=chat_history,
                 max_tokens=self.config.get('model.max_tokens', 512),
                 temperature=self.config.get('model.temperature', 0.7),
                 top_p=self.config.get('model.top_p', 0.9),
                 stop=self.config.get('model.stop_tokens', []),
+                stream=True,
             )
 
-            # Extract the assistant's response
-            assistant_message = completion['choices'][0]['message']
+            # Extract the assistant's response, supporting both streaming
+            # generators and non-streaming fallbacks returned by mocks.
+            if isinstance(completion, dict):
+                assistant_message = completion['choices'][0]['message']
+            else:
+                assistant_message = self._consume_streaming_completion(completion)
+
+                if not assistant_message.get('content') and not assistant_message.get('tool_calls'):
+                    # Some mocks (and older llama.cpp builds) ignore the stream
+                    # flag and yield empty deltas. Fall back to the traditional
+                    # non-streaming request so we still provide a reply.
+                    self.log_warning(
+                        "Streaming completion returned no content; falling back to non-streaming mode."
+                    )
+                    completion = llm_instance.create_chat_completion(
+                        messages=chat_history,
+                        max_tokens=self.config.get('model.max_tokens', 512),
+                        temperature=self.config.get('model.temperature', 0.7),
+                        top_p=self.config.get('model.top_p', 0.9),
+                        stop=self.config.get('model.stop_tokens', []),
+                        stream=False,
+                    )
+                    assistant_message = completion['choices'][0]['message']
             self.log_info("Generated assistant response")
 
             # Append the assistant's response to the chat history
@@ -299,6 +322,122 @@ class ModelManager:
                 "content": "I'm sorry, I encountered an error while processing your request."
             })
             return chat_history
+
+    @staticmethod
+    def _normalize_stream_chunk(chunk: Any) -> Dict[str, Any]:
+        """Normalise llama.cpp streaming chunk objects into dictionaries."""
+        if isinstance(chunk, dict):
+            return chunk
+
+        for attr in ('to_dict', 'model_dump', 'dict'):
+            handler = getattr(chunk, attr, None)
+            if callable(handler):
+                try:
+                    normalised = handler()
+                except TypeError:
+                    continue
+                if isinstance(normalised, dict):
+                    return normalised
+
+        if hasattr(chunk, '__dict__') and isinstance(chunk.__dict__, dict):
+            return chunk.__dict__
+
+        return {}
+
+    @staticmethod
+    def _merge_tool_call_deltas(existing: List[Dict[str, Any]], deltas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge streamed tool_call deltas into a stable structure."""
+        for delta in deltas or []:
+            index = delta.get('index')
+            if index is None:
+                index = len(existing)
+
+            while len(existing) <= index:
+                existing.append({
+                    'id': None,
+                    'type': None,
+                    'function': {
+                        'name': None,
+                        'arguments': '',
+                    },
+                })
+
+            target = existing[index]
+
+            if delta.get('id'):
+                target['id'] = delta['id']
+            if delta.get('type'):
+                target['type'] = delta['type']
+
+            function_delta = delta.get('function') or {}
+            if function_delta.get('name'):
+                target.setdefault('function', {})['name'] = function_delta['name']
+            if 'arguments' in function_delta and function_delta['arguments']:
+                target.setdefault('function', {}).setdefault('arguments', '')
+                target['function']['arguments'] += function_delta['arguments']
+
+        return existing
+
+    def _consume_streaming_completion(self, completion: Iterable[Any]) -> Dict[str, Any]:
+        """Aggregate streamed llama.cpp chunks into a single assistant message."""
+        role = 'assistant'
+        content_segments: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+
+        for raw_chunk in completion:
+            chunk = self._normalize_stream_chunk(raw_chunk)
+            if not chunk:
+                continue
+
+            choices = chunk.get('choices') or []
+            if not choices:
+                continue
+
+            choice = choices[0] or {}
+            delta = choice.get('delta') or {}
+            if not isinstance(delta, dict):
+                continue
+
+            role = delta.get('role') or role
+
+            content_piece = delta.get('content')
+            if content_piece:
+                content_segments.append(content_piece)
+
+            if delta.get('tool_calls'):
+                tool_calls = self._merge_tool_call_deltas(tool_calls, delta['tool_calls'])
+
+            finish_reason = choice.get('finish_reason')
+            if finish_reason:
+                break
+
+        message: Dict[str, Any] = {
+            'role': role,
+            'content': ''.join(content_segments),
+        }
+
+        cleaned_tool_calls = []
+        for call in tool_calls:
+            function_meta = call.get('function') or {}
+            cleaned_call = {
+                key: value for key, value in call.items() if key in {'id', 'type'} and value
+            }
+            if function_meta:
+                cleaned_function = {}
+                if function_meta.get('name'):
+                    cleaned_function['name'] = function_meta['name']
+                if function_meta.get('arguments'):
+                    cleaned_function['arguments'] = function_meta['arguments']
+                if cleaned_function:
+                    cleaned_call['function'] = cleaned_function
+
+            if cleaned_call:
+                cleaned_tool_calls.append(cleaned_call)
+
+        if cleaned_tool_calls:
+            message['tool_calls'] = cleaned_tool_calls
+
+        return message
 
 # Create a singleton instance
 # Delay instantiation to avoid circular imports

@@ -1,11 +1,16 @@
-from flask import Flask, send_from_directory, request, jsonify
-from datetime import datetime
+from flask import Flask, send_from_directory, request, jsonify, g, Response
+from datetime import datetime, timezone
 import secrets
 import argparse
 import os
 import sys
 import threading
 import time
+import logging
+import json
+import signal
+
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 # Parse command line arguments early to set environment variables before imports
 parser = argparse.ArgumentParser(description="token.place relay server")
@@ -21,7 +26,75 @@ else:
 # Set environment variable based on the command line argument or existing env
 if args.use_mock_llm or os.environ.get("USE_MOCK_LLM") == "1":
     os.environ["USE_MOCK_LLM"] = "1"
-    print("Running with USE_MOCK_LLM=1 (mock mode enabled)")
+
+LOG = logging.getLogger("tokenplace.relay")
+
+LOGGING_SKIP_FIELDS = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "module",
+    "msecs",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+}
+
+
+class JsonFormatter(logging.Formatter):
+    """Format log records as JSON objects."""
+
+    def format(self, record):  # noqa: D401 - standard logging signature
+        payload = {
+            "timestamp": datetime.now(timezone.utc)
+            .astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        for key, value in record.__dict__.items():
+            if key in LOGGING_SKIP_FIELDS:
+                continue
+            payload[key] = value
+
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, default=str)
+
+
+def _configure_logging():
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for existing in list(root_logger.handlers):
+        root_logger.removeHandler(existing)
+    root_logger.addHandler(handler)
+
+    # Silence werkzeug's default request logging as we emit structured logs ourselves.
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+
+_configure_logging()
+if os.environ.get("USE_MOCK_LLM") == "1":
+    LOG.info("relay.mock_mode.enabled")
 
 from api import init_app
 from config import get_config
@@ -74,12 +147,90 @@ app = Flask(__name__)
 # Initialize the API
 init_app(app)
 
+app.config.setdefault("RELAY_PORT", int(os.environ.get("RELAY_PORT", args.port)))
+app.config.setdefault("RELAY_HOST", os.environ.get("RELAY_HOST", args.host))
+app.config.setdefault("START_TIME", time.time())
+
+
+def _metrics_endpoint():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
+if 'metrics' in app.view_functions:
+    LOG.info("relay.metrics_endpoint.reused")
+else:
+    app.add_url_rule('/metrics', 'metrics', _metrics_endpoint, methods=['GET'])
+
+LOG.info(
+    "relay.startup",  # event name retained in message for compatibility
+    extra={
+        "port": app.config["RELAY_PORT"],
+        "host": app.config["RELAY_HOST"],
+    },
+)
+
+REQUEST_COUNTER = Counter(
+    "tokenplace_relay_http_requests_total",
+    "Total HTTP requests processed by the relay",
+    ["endpoint", "method", "status"],
+)
+
+
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
+shutdown_event = threading.Event()
+
+
+def _signal_handler(signum, _frame):
+    LOG.info("relay.shutdown.signal", extra={"signal": signum})
+    shutdown_event.set()
+
+
+for sig in (signal.SIGTERM, signal.SIGINT):
+    try:
+        signal.signal(sig, _signal_handler)
+    except ValueError:
+        # Signals can only be set in the main thread. Ignore if invoked elsewhere (e.g. reloader).
+        LOG.debug("relay.shutdown.signal_handler_skipped", extra={"signal": sig})
+
+
+@app.before_request
+def _before_request():
+    g.request_started = time.time()
+
+    if shutdown_event.is_set() and request.path not in {"/livez"}:
+        return jsonify({"error": {"message": "Relay shutting down", "code": 503}}), 503
+
+
+@app.after_request
+def _after_request(response):
+    try:
+        duration_ms = int((time.time() - getattr(g, "request_started", time.time())) * 1000)
+    except OverflowError:
+        duration_ms = 0
+
+    endpoint = request.endpoint or request.path
+    status = response.status_code
+
+    REQUEST_COUNTER.labels(endpoint=endpoint, method=request.method, status=str(status)).inc()
+
+    if request.path not in {"/metrics"}:
+        LOG.info(
+            "relay.request",
+            extra={
+                "method": request.method,
+                "path": request.path,
+                "status": status,
+                "duration_ms": duration_ms,
+                "remote_addr": request.headers.get("X-Forwarded-For", request.remote_addr),
+            },
+        )
+
+    return response
 
 
 def _register_stream_session(server_public_key, client_public_key):
@@ -153,6 +304,25 @@ def _pop_stream_chunks_for_client(client_public_key):
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
+
+# Health and metrics endpoints ------------------------------------------------
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    if shutdown_event.is_set():
+        return jsonify({'status': 'terminating'}), 503
+
+    return jsonify({'status': 'ok'}), 200
+
+
+@app.route('/livez', methods=['GET'])
+def livez():
+    return jsonify({
+        'status': 'ok',
+        'uptime_seconds': int(time.time() - app.config.get('START_TIME', time.time())),
+    }), 200
+
 
 # Generic route for serving static files
 @app.route('/static/<path:path>')
@@ -441,4 +611,8 @@ def stream_retrieve():
     return jsonify(response_payload), 200
 
 if __name__ == '__main__':  # pragma: no cover
-    app.run(host=args.host, port=args.port)
+    LOG.info(
+        "relay.dev_server.starting",
+        extra={"host": app.config["RELAY_HOST"], "port": app.config["RELAY_PORT"]},
+    )
+    app.run(host=app.config["RELAY_HOST"], port=app.config["RELAY_PORT"])

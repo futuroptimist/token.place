@@ -1,0 +1,28 @@
+{{- $svcMonitorEnabled := .Values.metrics.serviceMonitor.enabled -}}
+{{- $metricsApiAvailable := .Capabilities.APIVersions.Has "monitoring.coreos.com/v1" -}}
+{{- if and $svcMonitorEnabled $metricsApiAvailable }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "tokenplace-relay.fullname" . }}
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if .Values.metrics.serviceMonitor.namespace }}
+  namespace: {{ .Values.metrics.serviceMonitor.namespace }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tokenplace-relay.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}

@@ -11,9 +11,9 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
-from flask import Flask, Response, g, jsonify, request, send_from_directory
+from flask import Blueprint, Flask, Response, current_app, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
 from werkzeug.serving import make_server
 
@@ -160,17 +160,8 @@ def _configure_mock_mode(enable_mock: bool) -> None:
         LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
 
-def _bootstrap_mock_mode_from_cli(argv: list[str]) -> None:
-    """Ensure mock mode is configured before importing API modules."""
-
-    enable_mock = "--use_mock_llm" in argv
-    _configure_mock_mode(enable_mock)
-
-
-_bootstrap_mock_mode_from_cli(sys.argv[1:])
-
-from api import init_app
-from config import get_config
+_DEFAULT_ENABLE_MOCK = os.environ.get("USE_MOCK_LLM") == "1" or "--use_mock_llm" in sys.argv[1:]
+_configure_mock_mode(_DEFAULT_ENABLE_MOCK)
 
 
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
@@ -215,12 +206,12 @@ def _get_request_counter() -> Counter:
 REQUEST_COUNTER = _get_request_counter()
 
 
-def _load_server_registration_token():
+def _load_server_registration_token(config_loader: Callable[[], Any]):
     """Return the configured relay server token, if any."""
 
     token = None
     try:
-        token = get_config().get('relay.server_registration_token')
+        token = config_loader().get('relay.server_registration_token')
     except Exception:
         token = None
 
@@ -235,7 +226,7 @@ def _load_server_registration_token():
     return token
 
 
-SERVER_REGISTRATION_TOKEN = _load_server_registration_token()
+SERVER_REGISTRATION_TOKEN: str | None = None
 
 
 def _validate_server_registration():
@@ -256,18 +247,6 @@ def _validate_server_registration():
         }
     }), 401
 
-
-app = Flask(__name__)
-configure_app_logging(app)
-app.config.update(UPSTREAM_CONFIG)
-
-# Initialize the API
-init_app(app)
-LOGGER.info(
-    "relay.app.initialized",
-    extra={"upstream": app.config.get("upstream_url")},
-)
-
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
@@ -276,6 +255,8 @@ streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
 
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
+
+relay_bp = Blueprint("relay", __name__)
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -286,13 +267,40 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
         return False
 
 
-@app.before_request
+def create_app(enable_mock: bool | None = None) -> Flask:
+    """Construct and configure the relay Flask application."""
+
+    if enable_mock is not None:
+        _configure_mock_mode(enable_mock)
+
+    from api import init_app
+    from config import get_config
+
+    flask_app = Flask(__name__)
+    configure_app_logging(flask_app)
+    flask_app.config.update(UPSTREAM_CONFIG)
+
+    init_app(flask_app)
+    flask_app.register_blueprint(relay_bp)
+
+    global SERVER_REGISTRATION_TOKEN
+    SERVER_REGISTRATION_TOKEN = _load_server_registration_token(get_config)
+
+    LOGGER.info(
+        "relay.app.initialized",
+        extra={"upstream": flask_app.config.get("upstream_url")},
+    )
+
+    return flask_app
+
+
+@relay_bp.before_app_request
 def _record_request_start():
     g.request_start_time = time.time()
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
 
 
-@app.after_request
+@relay_bp.after_app_request
 def _log_request(response: Response):
     endpoint = request.endpoint or "unknown"
     status_code = str(response.status_code)
@@ -328,12 +336,12 @@ def _log_request(response: Response):
     return response
 
 
-@app.route("/healthz", methods=["GET"])
+@relay_bp.route("/healthz", methods=["GET"])
 def healthz():
-    gpu_host = app.config.get("gpu_host")
+    gpu_host = current_app.config.get("gpu_host")
     status = {
         "status": "ok",
-        "upstream": app.config.get("upstream_url"),
+        "upstream": current_app.config.get("upstream_url"),
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
     }
@@ -358,7 +366,7 @@ def healthz():
     return jsonify(status)
 
 
-@app.route("/livez", methods=["GET"])
+@relay_bp.route("/livez", methods=["GET"])
 def livez():
     return jsonify({"status": "alive"})
 
@@ -431,16 +439,16 @@ def _pop_stream_chunks_for_client(client_public_key):
 
     return session_id, chunks, final
 
-@app.route('/')
+@relay_bp.route('/')
 def index():
     return send_from_directory('static', 'index.html')
 
 # Generic route for serving static files
-@app.route('/static/<path:path>')
+@relay_bp.route('/static/<path:path>')
 def serve_static(path):
     return send_from_directory('static', path)
 
-@app.route('/next_server', methods=['GET'])
+@relay_bp.route('/next_server', methods=['GET'])
 def next_server():
     """
     Endpoint for clients to get the next server to send a request to.
@@ -464,7 +472,7 @@ def next_server():
         'server_public_key': known_servers[server_public_key]['public_key']
     })
 
-@app.route('/faucet', methods=['POST'])
+@relay_bp.route('/faucet', methods=['POST'])
 def faucet():
     """
     Endpoint for clients to request inference given a public key.
@@ -549,7 +557,7 @@ def faucet():
     })
     return jsonify({'message': 'Request received'}), 200
 
-@app.route('/sink', methods=['POST'])
+@relay_bp.route('/sink', methods=['POST'])
 def sink():
     """
     Endpoint for server instances to announce their availability (offering a compute sink).
@@ -629,7 +637,7 @@ def sink():
 
     return jsonify(response_data)
 
-@app.route('/source', methods=['POST'])
+@relay_bp.route('/source', methods=['POST'])
 def source():
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
@@ -656,7 +664,7 @@ def source():
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 
-@app.route('/stream/source', methods=['POST'])
+@relay_bp.route('/stream/source', methods=['POST'])
 def stream_source():
     """Accept streaming chunks emitted by compute nodes."""
 
@@ -678,7 +686,7 @@ def stream_source():
     return jsonify({'message': 'Chunk stored', 'final': final}), 200
 
 
-@app.route('/retrieve', methods=['POST'])
+@relay_bp.route('/retrieve', methods=['POST'])
 def retrieve():
     """
     Endpoint for clients to retrieve responses queued by the /source endpoint.
@@ -697,7 +705,7 @@ def retrieve():
         return jsonify({'error': 'No response available for the given public key'}), 200
 
 
-@app.route('/stream/retrieve', methods=['POST'])
+@relay_bp.route('/stream/retrieve', methods=['POST'])
 def stream_retrieve():
     """Return queued streaming chunks for the requesting client."""
 
@@ -722,11 +730,17 @@ def stream_retrieve():
     return jsonify(response_payload), 200
 
 
-def serve(host: str, port: int) -> None:
+if __name__ != "__main__":
+    app = create_app()
+else:  # pragma: no cover - CLI entrypoint configures the app lazily
+    app = None
+
+
+def serve(flask_app: Flask, host: str, port: int) -> None:
     """Run the relay application using Werkzeug's production server."""
 
-    server = make_server(host, port, app, threaded=True)
-    ctx = app.app_context()
+    server = make_server(host, port, flask_app, threaded=True)
+    ctx = flask_app.app_context()
     ctx.push()
 
     shutdown_requested = threading.Event()
@@ -744,7 +758,7 @@ def serve(host: str, port: int) -> None:
         extra={
             "host": host,
             "port": port,
-            "upstream": app.config.get("upstream_url"),
+            "upstream": flask_app.config.get("upstream_url"),
         },
     )
 
@@ -769,7 +783,8 @@ def main(argv: list[str] | None = None) -> None:
         port = args.port
 
     _configure_mock_mode(args.use_mock_llm)
-    serve(host, port)
+    flask_app = create_app(enable_mock=args.use_mock_llm)
+    serve(flask_app, host, port)
 
 
 if __name__ == '__main__':  # pragma: no cover

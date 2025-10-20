@@ -529,14 +529,7 @@ def create_chat_completion():
                 }
             }
 
-            # If client requested encryption and provided a public key, encrypt the response
-            if stream_requested and is_encrypted_request:
-                log_warning("Streaming requested for encrypted payload; falling back to encrypted single response")
-                stream_requested = False
-
             if stream_requested:
-                log_info("Returning streaming response")
-
                 stream_id = f"chatcmpl-{uuid.uuid4()}"
                 created_ts = int(time.time())
                 role = assistant_message.get("role", "assistant")
@@ -571,22 +564,70 @@ def create_chat_completion():
                         ]
                     }
 
+                chunk_payloads = []
+
+                role_chunk = build_chunk({"role": role}, None)
+                chunk_payloads.append(("delta", role_chunk))
+
+                if content_text:
+                    for content_segment in iter_stream_content_chunks(content_text):
+                        content_chunk = build_chunk({"content": content_segment}, None)
+                        chunk_payloads.append(("delta", content_chunk))
+
+                if tool_calls:
+                    for idx, call in enumerate(tool_calls):
+                        call_delta = {
+                            "tool_calls": [serialize_tool_call(call, idx)]
+                        }
+                        tool_chunk = build_chunk(call_delta, None)
+                        chunk_payloads.append(("delta", tool_chunk))
+
+                stop_chunk = build_chunk({}, finish_reason)
+                chunk_payloads.append(("delta", stop_chunk))
+
+                if is_encrypted_request:
+                    log_info("Returning encrypted streaming response")
+
+                    if not client_public_key:
+                        return format_error_response(
+                            "Client public key required for encrypted streaming",
+                            error_type="encryption_error",
+                            status_code=400,
+                        )
+
+                    encrypted_events = []
+                    for event_name, payload in chunk_payloads:
+                        encrypted_payload = encryption_manager.encrypt_message(payload, client_public_key)
+                        if encrypted_payload is None:
+                            log_error("Failed to encrypt streaming chunk")
+                            return format_error_response(
+                                "Failed to encrypt response",
+                                error_type="encryption_error",
+                                status_code=500,
+                            )
+                        encrypted_events.append({
+                            "event": event_name,
+                            "encrypted": True,
+                            "data": encrypted_payload,
+                        })
+
+                    def encrypted_event_stream():
+                        for envelope in encrypted_events:
+                            yield f"data: {json.dumps(envelope)}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                    response = Response(
+                        stream_with_context(encrypted_event_stream()),
+                        mimetype='text/event-stream',
+                    )
+                    response.headers['Cache-Control'] = 'no-cache'
+                    return response
+
+                log_info("Returning streaming response")
+
                 def event_stream():
-                    role_chunk = build_chunk({"role": role}, None)
-                    yield f"data: {json.dumps(role_chunk)}\n\n"
-                    if content_text:
-                        for content_segment in iter_stream_content_chunks(content_text):
-                            content_chunk = build_chunk({"content": content_segment}, None)
-                            yield f"data: {json.dumps(content_chunk)}\n\n"
-                    if tool_calls:
-                        for idx, call in enumerate(tool_calls):
-                            call_delta = {
-                                "tool_calls": [serialize_tool_call(call, idx)]
-                            }
-                            tool_chunk = build_chunk(call_delta, None)
-                            yield f"data: {json.dumps(tool_chunk)}\n\n"
-                    stop_chunk = build_chunk({}, finish_reason)
-                    yield f"data: {json.dumps(stop_chunk)}\n\n"
+                    for _, payload in chunk_payloads:
+                        yield f"data: {json.dumps(payload)}\n\n"
                     yield "data: [DONE]\n\n"
 
                 response = Response(stream_with_context(event_stream()), mimetype='text/event-stream')

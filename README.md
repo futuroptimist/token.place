@@ -255,11 +255,24 @@ chat completions endpoints. when the `stream` flag is set to `true`, the
 `/api/v2/chat/completions` and `/v2/chat/completions` routes emit incremental chunks that match
 openai's event format so existing clients can subscribe without code changes.
 
-> ⚠️ encrypted chat payloads currently fall back to the standard json response
-> while we continue hardening end-to-end encrypted streaming.
+> ✅ encrypted chat payloads now stream encrypted chunks when you call the
+> `/api/v2/chat/completions` endpoint with `encrypted=true` alongside
+> `stream=true`.
 > ❌ api v1 chat endpoints remain json-only; requests that include `stream=true`
 > return an error. use `/api/v2/chat/completions` (or `/v2/chat/completions`)
 > for server-sent events.
+
+Encrypted streaming events use the same OpenAI-style `chat.completion.chunk`
+payloads as plaintext responses, but each SSE data line contains an envelope
+shaped like:
+
+```json
+{"event": "delta", "encrypted": true, "data": {"ciphertext": "...", "cipherkey": "...", "iv": "..."}}
+```
+
+Clients can reuse `CryptoClient.decrypt_message` (or equivalent) to decrypt the
+payload before reading the inner `choices[0].delta` entries, preserving API
+compatibility with existing OpenAI SDKs.
 
 ### example curl request
 

@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 from itertools import accumulate
@@ -62,11 +63,14 @@ def test_v2_streaming_chat_completion(client, monkeypatch):
     assert stop_event["choices"][0]["finish_reason"] == "stop"
 
 
-def test_v2_encrypted_streaming_falls_back_to_single_response(client, monkeypatch):
-    """Encrypted streaming requests should fall back to encrypted single responses."""
+def test_v2_encrypted_streaming_emits_encrypted_chunks(client, monkeypatch):
+    """Encrypted streaming requests should emit encrypted Server-Sent Events chunks."""
 
     class DummyEncryptionManager:
         public_key_b64 = "server-public-key"
+
+        def __init__(self):
+            self.calls = []
 
         def decrypt_message(self, encrypted_payload, cipherkey):
             _ = encrypted_payload, cipherkey
@@ -78,7 +82,16 @@ def test_v2_encrypted_streaming_falls_back_to_single_response(client, monkeypatc
 
         def encrypt_message(self, response_data, client_public_key):
             assert client_public_key == "client-public-key"
-            return {"ciphertext": "encrypted", "iv": "iv", "cipherkey": "key"}
+            self.calls.append(response_data)
+            payload_bytes = json.dumps(response_data).encode("utf-8")
+            ciphertext = base64.b64encode(payload_bytes).decode("utf-8")
+            index = len(self.calls)
+            return {
+                "encrypted": True,
+                "ciphertext": ciphertext,
+                "iv": f"iv-{index}",
+                "cipherkey": f"key-{index}",
+            }
 
     payload = {
         "model": "llama-3-8b-instruct",
@@ -92,9 +105,11 @@ def test_v2_encrypted_streaming_falls_back_to_single_response(client, monkeypatc
         }
     }
 
+    dummy_manager = DummyEncryptionManager()
+
     monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
     monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
-    monkeypatch.setattr(v2_routes, "encryption_manager", DummyEncryptionManager())
+    monkeypatch.setattr(v2_routes, "encryption_manager", dummy_manager)
     monkeypatch.setattr(v2_routes, "validate_encrypted_request", lambda data: None)
 
     def fake_generate_response(model_id, messages, **model_options):
@@ -107,13 +122,34 @@ def test_v2_encrypted_streaming_falls_back_to_single_response(client, monkeypatc
     response = client.post("/api/v2/chat/completions", json=payload)
 
     assert response.status_code == 200
-    assert response.is_json
+    assert response.headers["Content-Type"].startswith("text/event-stream")
 
-    data = response.get_json()
-    assert data == {
-        "encrypted": True,
-        "data": {"ciphertext": "encrypted", "iv": "iv", "cipherkey": "key"}
-    }
+    events = []
+    for raw_chunk in response.iter_encoded():
+        text = raw_chunk.decode("utf-8").strip()
+        if not text:
+            continue
+        assert text.startswith("data: ")
+        events.append(text[len("data: "):].strip())
+
+    assert events[-1] == "[DONE]"
+
+    decrypted_chunks = []
+    for raw_event in events[:-1]:
+        envelope = json.loads(raw_event)
+        assert envelope["encrypted"] is True
+        assert envelope["event"] == "delta"
+        encoded_payload = envelope["data"]["ciphertext"]
+        payload_json = base64.b64decode(encoded_payload.encode("utf-8")).decode("utf-8")
+        decrypted_chunks.append(json.loads(payload_json))
+
+    assert len(decrypted_chunks) == 3
+    assert decrypted_chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert decrypted_chunks[1]["choices"][0]["delta"]["content"] == "Hello!"
+    assert decrypted_chunks[2]["choices"][0]["finish_reason"] == "stop"
+
+    # Ensure each chunk was encrypted independently
+    assert [call["choices"][0]["delta"].get("content") for call in dummy_manager.calls] == [None, "Hello!", None]
 
 
 def test_v2_streaming_with_tool_use(client, monkeypatch):

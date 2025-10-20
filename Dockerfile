@@ -1,14 +1,29 @@
-# Use an official Python runtime as a parent image
-FROM python:3.12.1
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim AS runtime
 
-# Set the working directory in the container
-WORKDIR /usr/src/app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    RELAY_PORT=5010 \
+    RELAY_WORKERS=2 \
+    RELAY_GRACEFUL_TIMEOUT=30 \
+    RELAY_TIMEOUT=120
 
-# Copy the current directory contents into the container at /usr/src/app
-COPY . .
+WORKDIR /app
 
-# Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN groupadd --gid 1000 relay \
+    && useradd --uid 1000 --gid 1000 --home-dir /app --create-home \
+       --shell /usr/sbin/nologin relay
 
-# Run server.py when the container launches
-CMD ["python", "./server.py"]
+COPY config/requirements_relay.txt ./config/requirements_relay.txt
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r config/requirements_relay.txt
+
+COPY --chown=relay:relay . .
+
+USER relay
+
+EXPOSE ${RELAY_PORT}
+
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["exec gunicorn --bind 0.0.0.0:${RELAY_PORT} --graceful-timeout ${RELAY_GRACEFUL_TIMEOUT} --timeout ${RELAY_TIMEOUT} --workers ${RELAY_WORKERS} --worker-tmp-dir /tmp relay:create_app()"]

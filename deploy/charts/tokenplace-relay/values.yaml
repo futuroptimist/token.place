@@ -1,0 +1,114 @@
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+partOf: tokenplace
+
+image:
+  repository: ghcr.io/tokenplace/tokenplace-relay
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+
+service:
+  type: ClusterIP
+  port: 5010
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+  hosts:
+    - host: relay.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: relay-tls
+      hosts:
+        - relay.example.com
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+affinity: {}
+nodeSelector: {}
+tolerations: []
+priorityClassName: ""
+
+terminationGracePeriodSeconds: 30
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    labels: {}
+    interval: 30s
+
+gpuExternalName:
+  enabled: true
+  name: gpu-server
+  host: gpu-box.example.com
+  port: 5010
+  headless:
+    enabled: false
+    endpoints: [] # - ip: 192.0.2.10
+                   #   hostname: gpu-box
+                   #   nodeName: ""
+
+upstream:
+  url: ""
+  scheme: http
+  host: gpu-server
+  port: 5010
+
+networkPolicy:
+  enabled: true
+  traefikNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: traefik
+  additionalIngress: []
+  allowDns: true
+  egressCidrs: []
+
+hpa:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 70

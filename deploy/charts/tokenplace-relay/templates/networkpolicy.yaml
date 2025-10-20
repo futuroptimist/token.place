@@ -1,0 +1,64 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tokenplace-relay.fullname" . }}
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tokenplace-relay.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.traefikNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+    {{- with .Values.networkPolicy.additionalIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $gpuPort := .Values.upstream.port }}
+  {{- $hasHeadlessTargets := and .Values.gpuExternalName.headless.enabled (gt (len .Values.gpuExternalName.headless.endpoints) 0) }}
+  {{- if or .Values.networkPolicy.allowDns (gt (len .Values.networkPolicy.egressCidrs) 0) $hasHeadlessTargets }}
+  egress:
+    {{- if .Values.networkPolicy.allowDns }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- range .Values.networkPolicy.egressCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . }}
+      ports:
+        - port: {{ $gpuPort }}
+          protocol: TCP
+    {{- end }}
+    {{- if $hasHeadlessTargets }}
+    {{- range .Values.gpuExternalName.headless.endpoints }}
+    - to:
+        - ipBlock:
+            cidr: {{ printf "%s/32" .ip }}
+      ports:
+        - port: {{ $gpuPort }}
+          protocol: TCP
+    {{- end }}
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
+{{- end }}

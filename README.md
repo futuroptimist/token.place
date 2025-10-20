@@ -525,12 +525,12 @@ list.
 #### Zero-trust relay verification
 
 `token.place` now ships with an opt-in challenge/response layer for compute
-nodes. Set `TOKEN_PLACE_RELAY_SERVER_TOKEN` (or
-`relay.server_registration_token` in `config.json`) before launching the relay
-and every `/sink` or `/source` call must include an `X-Relay-Server-Token`
+nodes. Set `TOKEN_PLACE_RELAY_SERVER_TOKEN` before launching the relay and
+every `/sink` or `/source` call must include an `X-Relay-Server-Token`
 header that matches the configured value. Requests missing the header are
 rejected with an HTTP 401 so unknown machines can no longer impersonate
-trusted servers.
+trusted servers. Sensitive tokens are stripped when saving config files, so
+store them in environment variables instead of `config.json`.
 
 The bundled `RelayClient` automatically reads the same configuration and sends
 the header, so volunteer operators only need to export the token once:

@@ -2,7 +2,7 @@
 
 This guide outlines the steps required to implement streaming inference in the token.place application, allowing users to see responses as they are generated.
 
-> **Status update (2025-09-30):** `/api/v2/chat/completions` now supports Server-Sent Events when the `stream` flag is provided. The Flask route sends role, content, and completion markers so plaintext clients receive incremental updates without waiting for the full JSON payload. **API v1 intentionally remains non-streaming** so we can stabilize the surface area before promoting API v2 to GA; ignore any TODOs suggesting `/api/v1/.../stream` routes.
+> **Status update (2025-10-20):** `/api/v2/chat/completions` now supports Server-Sent Events for both plaintext **and encrypted** requests when the `stream` flag is provided. The Flask route wraps each OpenAI-style chunk in an encrypted envelope so clients can continue using `CryptoClient.decrypt_message` to recover the delta payloads. **API v1 intentionally remains non-streaming** so we can stabilize the surface area before promoting API v2 to GA; ignore any TODOs suggesting `/api/v1/.../stream` routes.
 
 ## Architecture Overview
 
@@ -56,6 +56,9 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
   - Added `encrypt_stream_chunk`/`decrypt_stream_chunk` helpers in `encrypt.py` that reuse a
     negotiated AES session across sequential SSE payloads while still supporting optional
     associated data.
+- ✅ `api/v2/routes.py` now emits encrypted SSE envelopes when `encrypted=true`
+  requests ask for `stream=true`, allowing clients to decrypt each chunk without
+  changing their existing helpers.
 - Example:
   ```python
   def encrypt_stream(data_chunk, client_public_key, session_key=None):

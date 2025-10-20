@@ -65,6 +65,22 @@ def client_keys():
         'public_key_b64': public_key_b64
     }
 
+
+def _encrypt_messages_for_server(messages, server_public_key):
+    """Encrypt chat messages using the server public key for request payloads."""
+
+    server_public_key_bytes = base64.b64decode(server_public_key)
+    ciphertext_dict, cipherkey, iv = encrypt(
+        json.dumps(messages).encode('utf-8'),
+        server_public_key_bytes,
+    )
+
+    return {
+        'ciphertext': base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8'),
+        'cipherkey': base64.b64encode(cipherkey).decode('utf-8'),
+        'iv': base64.b64encode(iv).decode('utf-8'),
+    }
+
 def test_api_health(client):
     """Test the API health endpoint"""
     response = client.get("/api/v1/health")
@@ -246,6 +262,117 @@ def test_encrypted_chat_completion(client, client_keys, mock_llama):
     assert len(decrypted_data['choices'][0]['message']['content']) > 0
     assert 'Mock response' in decrypted_data['choices'][0]['message']['content']
 
+
+def test_encrypted_streaming_requires_client_key(client, mock_llama):
+    """Encrypted streaming must provide a client public key for SSE envelopes."""
+
+    public_key_resp = client.get("/api/v2/public-key")
+    assert public_key_resp.status_code == 200
+    server_public_key = public_key_resp.get_json()['public_key']
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Stream an encrypted response."},
+    ]
+
+    encrypted_messages = _encrypt_messages_for_server(messages, server_public_key)
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "encrypted": True,
+        "stream": True,
+        "client_public_key": "",
+        "messages": encrypted_messages,
+    }
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+    assert response.status_code == 400
+
+    error = response.get_json()
+    assert error["error"]["type"] == "encryption_error"
+    assert error["error"]["message"] == "Client public key required for encrypted streaming"
+
+
+def test_encrypted_streaming_chat_completion(client, client_keys, mock_llama):
+    """Encrypted streaming responses should emit encrypted SSE chunks."""
+
+    public_key_resp = client.get("/api/v2/public-key")
+    assert public_key_resp.status_code == 200
+    server_public_key = public_key_resp.get_json()['public_key']
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Stream an encrypted response."},
+    ]
+
+    encrypted_messages = _encrypt_messages_for_server(messages, server_public_key)
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "encrypted": True,
+        "stream": True,
+        "client_public_key": client_keys['public_key_b64'],
+        "messages": encrypted_messages,
+    }
+
+    response = client.post(
+        "/api/v2/chat/completions",
+        json=payload,
+        headers={"Accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    assert response.mimetype == "text/event-stream"
+    assert response.headers['Cache-Control'] == 'no-cache'
+
+    body = b"".join(response.response).decode("utf-8")
+    events = [chunk for chunk in body.split("\n\n") if chunk.strip()]
+
+    assert events, "expected streaming events to be returned"
+    assert events[-1].strip() == "data: [DONE]"
+
+    encrypted_chunks = events[:-1]
+    assert encrypted_chunks, "expected at least one encrypted data chunk"
+
+    decrypted_events = []
+    for chunk in encrypted_chunks:
+        assert chunk.startswith("data: ")
+        payload_json = chunk[len("data: ") :]
+        envelope = json.loads(payload_json)
+
+        assert envelope["event"] == "delta"
+        assert envelope["encrypted"] is True
+
+        encrypted_payload = envelope["data"]
+        decrypted_bytes = decrypt(
+            {
+                "ciphertext": base64.b64decode(encrypted_payload["ciphertext"]),
+                "iv": base64.b64decode(encrypted_payload["iv"]),
+            },
+            base64.b64decode(encrypted_payload["cipherkey"]),
+            client_keys['private_key'],
+        )
+
+        assert decrypted_bytes is not None
+        decrypted_events.append(json.loads(decrypted_bytes.decode("utf-8")))
+
+    assert all(event["object"] == "chat.completion.chunk" for event in decrypted_events)
+
+    role_chunks = [
+        event["choices"][0]["delta"].get("role")
+        for event in decrypted_events
+        if "role" in event["choices"][0]["delta"]
+    ]
+    assert role_chunks and role_chunks[0] == "assistant"
+
+    content_chunks = [
+        event["choices"][0]["delta"].get("content")
+        for event in decrypted_events
+        if "content" in event["choices"][0]["delta"]
+    ]
+    assert any("Mock response" in chunk for chunk in content_chunks)
+
+    assert decrypted_events[-1]["choices"][0]["finish_reason"] == "stop"
 
 def test_public_key_rotation_rejected_without_operator_token_config(client, monkeypatch):
     """Rotation should fail fast if operator authentication is not configured."""

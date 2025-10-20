@@ -160,19 +160,6 @@ def _configure_mock_mode(enable_mock: bool) -> None:
         LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
 
-def _bootstrap_mock_mode_from_cli(argv: list[str]) -> None:
-    """Ensure mock mode is configured before importing API modules."""
-
-    enable_mock = "--use_mock_llm" in argv
-    _configure_mock_mode(enable_mock)
-
-
-_bootstrap_mock_mode_from_cli(sys.argv[1:])
-
-from api import init_app
-from config import get_config
-
-
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
 GPU_PORT_ENV = "TOKENPLACE_GPU_PORT"
 UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
@@ -199,6 +186,32 @@ def _load_upstream_config() -> Dict[str, Any]:
 
 UPSTREAM_CONFIG = _load_upstream_config()
 
+_APP_INITIALIZED = False
+_APP_INIT_LOCK = threading.Lock()
+
+
+def _initialize_app() -> Flask:
+    """Import and initialize the relay API exactly once."""
+
+    global _APP_INITIALIZED
+    if _APP_INITIALIZED:
+        return app
+
+    with _APP_INIT_LOCK:
+        if _APP_INITIALIZED:
+            return app
+
+        from api import init_app  # imported lazily to respect USE_MOCK_LLM
+
+        init_app(app)
+        LOGGER.info(
+            "relay.app.initialized",
+            extra={"upstream": app.config.get("upstream_url")},
+        )
+        _APP_INITIALIZED = True
+
+    return app
+
 
 def _get_request_counter() -> Counter:
     metric_name = "tokenplace_relay_requests_total"
@@ -220,6 +233,8 @@ def _load_server_registration_token():
 
     token = None
     try:
+        from config import get_config  # imported lazily
+
         token = get_config().get('relay.server_registration_token')
     except Exception:
         token = None
@@ -260,13 +275,6 @@ def _validate_server_registration():
 app = Flask(__name__)
 configure_app_logging(app)
 app.config.update(UPSTREAM_CONFIG)
-
-# Initialize the API
-init_app(app)
-LOGGER.info(
-    "relay.app.initialized",
-    extra={"upstream": app.config.get("upstream_url")},
-)
 
 known_servers = {}
 client_inference_requests = {}
@@ -725,6 +733,8 @@ def stream_retrieve():
 def serve(host: str, port: int) -> None:
     """Run the relay application using Werkzeug's production server."""
 
+    _initialize_app()
+
     server = make_server(host, port, app, threaded=True)
     ctx = app.app_context()
     ctx.push()
@@ -769,7 +779,12 @@ def main(argv: list[str] | None = None) -> None:
         port = args.port
 
     _configure_mock_mode(args.use_mock_llm)
+    _initialize_app()
     serve(host, port)
+
+
+if __name__ != '__main__':
+    _initialize_app()
 
 
 if __name__ == '__main__':  # pragma: no cover

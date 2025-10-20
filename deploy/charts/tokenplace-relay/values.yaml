@@ -37,14 +37,16 @@ securityContext:
     drop:
       - ALL
   readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
 
 resources:
   requests:
     cpu: 100m
     memory: 128Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 300m
+    memory: 256Mi
 
 autoscaling:
   enabled: false
@@ -91,9 +93,7 @@ envFrom: []
 serviceMonitor:
   enabled: false
   labels:
-    release: prometheus
-  namespaceSelector:
-    any: true
+    release: kube-prometheus-stack
   interval: 30s
   scrapeTimeout: 10s
   path: /metrics
@@ -101,13 +101,6 @@ serviceMonitor:
 
 networkPolicy:
   enabled: true
-  allowDNS: true
-  dnsNamespace: kube-system
-  traefik:
-    namespace: traefik
-    podSelector:
-      matchLabels:
-        app.kubernetes.io/name: traefik
   externalNameCIDR: 0.0.0.0/0
   extraIngress: []
   extraEgress: []

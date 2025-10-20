@@ -1,0 +1,105 @@
+image:
+  repository: ghcr.io/tokenplace/tokenplace-relay
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+containerPort: 5010
+
+serviceAccount:
+  create: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 70
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: http
+
+ingress:
+  enabled: true
+  className: ""
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+  hosts:
+    - host: relay.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: relay-tls
+      hosts:
+        - relay.example.com
+
+gpuExternalName:
+  host: gpu-box.example.com
+  useHeadless: false
+  ip: ""
+  port: 3000
+  egressCIDRs: []
+
+upstream:
+  url: http://gpu-server:3000
+
+env: []
+
+envFrom: []
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+networkPolicy:
+  enabled: true
+  traefikNamespace: traefik
+  ingressNamespaceSelector: {}
+  additionalIngressSelectors: []
+  allowedEgressCIDRs: []
+  allowDNS: true
+  dnsNamespace: kube-system
+
+extraVolumes: []
+extraVolumeMounts: []
+
+tolerations: []
+affinity: {}
+nodeSelector: {}
+topologySpreadConstraints: []

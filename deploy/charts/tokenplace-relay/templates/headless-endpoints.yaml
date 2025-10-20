@@ -1,0 +1,14 @@
+{{- if and .Values.gpuExternalName.useHeadless .Values.gpuExternalName.ip }}
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+subsets:
+  - addresses:
+      - ip: {{ .Values.gpuExternalName.ip }}
+    ports:
+      - name: http
+        port: {{ .Values.gpuExternalName.port }}
+{{- end }}

@@ -1,0 +1,15 @@
+{{- if .Values.gpuExternalName.useHeadless }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.gpuExternalName.port }}
+      targetPort: {{ .Values.gpuExternalName.port }}
+{{- end }}

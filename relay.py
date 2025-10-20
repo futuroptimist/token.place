@@ -1,30 +1,174 @@
-from flask import Flask, send_from_directory, request, jsonify
-from datetime import datetime
-import secrets
+from __future__ import annotations
+
 import argparse
+import json
+import logging
 import os
+import secrets
+import signal
+import socket
 import sys
 import threading
 import time
+from datetime import datetime
+from typing import Any, Dict
 
-# Parse command line arguments early to set environment variables before imports
-parser = argparse.ArgumentParser(description="token.place relay server")
-parser.add_argument("--port", type=int, default=5010, help="Port to run the relay server on")
-parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind the relay server")
-parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
+from flask import Flask, Response, g, jsonify, request, send_from_directory
+from prometheus_client import Counter, REGISTRY
+from werkzeug.serving import make_server
 
-if __name__ == "__main__":  # pragma: no cover
-    args = parser.parse_args()
-else:
-    args = parser.parse_args([])
+# Logging --------------------------------------------------------------------
 
-# Set environment variable based on the command line argument or existing env
-if args.use_mock_llm or os.environ.get("USE_MOCK_LLM") == "1":
-    os.environ["USE_MOCK_LLM"] = "1"
-    print("Running with USE_MOCK_LLM=1 (mock mode enabled)")
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+class JsonFormatter(logging.Formatter):
+    """Render log records as structured JSON."""
+
+    _RESERVED = {
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "module",
+        "msecs",
+        "message",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "thread",
+        "threadName",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: D401 - logging API
+        payload: Dict[str, Any] = {
+            "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+
+        for key, value in record.__dict__.items():
+            if key in self._RESERVED or key.startswith("_"):
+                continue
+            payload[key] = value
+
+        return json.dumps(payload, default=_json_default)
+
+
+def setup_logging() -> logging.Logger:
+    """Configure application logging with JSON formatting."""
+
+    logger = logging.getLogger("tokenplace.relay")
+    if logger.handlers:
+        return logger
+
+    log_level = os.environ.get("TOKENPLACE_LOG_LEVEL", "INFO").upper()
+    logger.setLevel(log_level)
+    handler = logging.StreamHandler(stream=sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    logging.captureWarnings(True)
+
+    return logger
+
+
+LOGGER = setup_logging()
+
+
+def configure_app_logging(flask_app: Flask) -> None:
+    """Ensure Flask's logger shares the JSON formatter."""
+
+    flask_app.logger.handlers = []
+    for handler in LOGGER.handlers:
+        flask_app.logger.addHandler(handler)
+    flask_app.logger.setLevel(LOGGER.level)
+    flask_app.logger.propagate = False
+
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments when running the relay directly."""
+
+    parser = argparse.ArgumentParser(description="token.place relay server")
+    parser.add_argument("--port", type=int, default=5010,
+                        help="Port to run the relay server on")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Host interface to bind the relay server")
+    parser.add_argument("--use_mock_llm", action="store_true",
+                        help="Use mock LLM for testing")
+    return parser.parse_args(argv)
+
+
+def _configure_mock_mode(enable_mock: bool) -> None:
+    if enable_mock or os.environ.get("USE_MOCK_LLM") == "1":
+        os.environ["USE_MOCK_LLM"] = "1"
+        LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
 from api import init_app
 from config import get_config
+
+
+GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
+GPU_PORT_ENV = "TOKENPLACE_GPU_PORT"
+UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
+
+
+def _load_upstream_config() -> Dict[str, Any]:
+    host = (
+        os.environ.get(GPU_HOST_ENV)
+        or os.environ.get("GPU_SERVER_HOST")
+        or "gpu-server"
+    )
+    port = int(
+        os.environ.get(GPU_PORT_ENV)
+        or os.environ.get("GPU_SERVER_PORT")
+        or "3000"
+    )
+    upstream_url = os.environ.get(UPSTREAM_URL_ENV) or f"http://{host}:{port}"
+    return {
+        "gpu_host": host,
+        "gpu_port": port,
+        "upstream_url": upstream_url,
+    }
+
+
+UPSTREAM_CONFIG = _load_upstream_config()
+
+
+def _get_request_counter() -> Counter:
+    metric_name = "tokenplace_relay_requests_total"
+    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(metric_name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Counter(
+        metric_name,
+        "Total HTTP requests processed by token.place relay",
+        ["method", "endpoint", "status"],
+    )
+
+
+REQUEST_COUNTER = _get_request_counter()
+
+_configure_mock_mode(False)
 
 
 def _load_server_registration_token():
@@ -70,9 +214,15 @@ def _validate_server_registration():
 
 
 app = Flask(__name__)
+configure_app_logging(app)
+app.config.update(UPSTREAM_CONFIG)
 
 # Initialize the API
 init_app(app)
+LOGGER.info(
+    "relay.app.initialized",
+    extra={"upstream": app.config.get("upstream_url")},
+)
 
 known_servers = {}
 client_inference_requests = {}
@@ -80,6 +230,88 @@ client_responses = {}
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
+
+IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
+
+
+def _can_resolve_gpu_host(hostname: str) -> bool:
+    try:
+        socket.getaddrinfo(hostname, None)
+        return True
+    except socket.gaierror:
+        return False
+
+
+@app.before_request
+def _record_request_start():
+    g.request_start_time = time.time()
+    g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
+
+
+@app.after_request
+def _log_request(response: Response):
+    endpoint = request.endpoint or "unknown"
+    status_code = str(response.status_code)
+
+    try:
+        REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
+    except Exception:  # pragma: no cover - defensive metric increment
+        LOGGER.debug(
+            "metrics.increment_failed",
+            extra={"endpoint": endpoint, "status": status_code},
+        )
+
+    duration = None
+    if hasattr(g, "request_start_time"):
+        duration = max(time.time() - g.request_start_time, 0)
+
+    if endpoint not in IGNORED_LOG_ENDPOINTS:
+        LOGGER.info(
+            "http.request",
+            extra={
+                "http_method": request.method,
+                "http_path": request.path,
+                "http_status": int(status_code),
+                "duration_ms": round((duration or 0) * 1000, 2),
+                "request_id": getattr(g, "request_id", None),
+                "user_agent": request.headers.get("User-Agent"),
+            },
+        )
+
+    if getattr(g, "request_id", None):
+        response.headers.setdefault("X-Request-Id", g.request_id)
+
+    return response
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    gpu_host = app.config.get("gpu_host")
+    status = {
+        "status": "ok",
+        "upstream": app.config.get("upstream_url"),
+        "gpuHost": gpu_host,
+        "knownServers": len(known_servers),
+    }
+
+    if gpu_host and not _can_resolve_gpu_host(gpu_host):
+        status["status"] = "degraded"
+        status.setdefault("details", {})["gpuHostResolution"] = "failed"
+        LOGGER.warning(
+            "healthz.resolution_failed",
+            extra={"gpu_host": gpu_host},
+        )
+        return jsonify(status), 503
+
+    if not known_servers:
+        status.setdefault("details", {})["knownServers"] = "empty"
+
+    return jsonify(status)
+
+
+@app.route("/livez", methods=["GET"])
+def livez():
+    return jsonify({"status": "alive"})
 
 
 def _register_stream_session(server_public_key, client_public_key):
@@ -440,5 +672,56 @@ def stream_retrieve():
 
     return jsonify(response_payload), 200
 
+
+def serve(host: str, port: int) -> None:
+    """Run the relay application using Werkzeug's production server."""
+
+    server = make_server(host, port, app, threaded=True)
+    ctx = app.app_context()
+    ctx.push()
+
+    shutdown_requested = threading.Event()
+
+    def _handle_signal(signum, _frame):
+        LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
+        shutdown_requested.set()
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    LOGGER.info(
+        "relay.startup",
+        extra={
+            "host": host,
+            "port": port,
+            "upstream": app.config.get("upstream_url"),
+        },
+    )
+
+    try:
+        server.serve_forever()
+    finally:
+        ctx.pop()
+        LOGGER.info(
+            "relay.shutdown",
+            extra={"requested": shutdown_requested.is_set()},
+        )
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_cli_args(argv)
+    host = os.environ.get("RELAY_HOST") or args.host
+    port_value = os.environ.get("RELAY_PORT") or str(args.port)
+    try:
+        port = int(port_value)
+    except ValueError:
+        LOGGER.warning("relay.invalid_port", extra={"port": port_value})
+        port = args.port
+
+    _configure_mock_mode(args.use_mock_llm)
+    serve(host, port)
+
+
 if __name__ == '__main__':  # pragma: no cover
-    app.run(host=args.host, port=args.port)
+    main()

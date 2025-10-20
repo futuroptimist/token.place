@@ -1,0 +1,11 @@
+{{- if not .Values.gpuExternalName.useHeadless }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-server
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: {{ .Values.gpuExternalName.host }}
+{{- end }}

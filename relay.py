@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
@@ -155,22 +155,26 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _configure_mock_mode(enable_mock: bool) -> None:
+    """Enable mock LLM mode when requested or already set via env."""
+
     if enable_mock or os.environ.get("USE_MOCK_LLM") == "1":
         os.environ["USE_MOCK_LLM"] = "1"
         LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
 
-def _bootstrap_mock_mode_from_cli(argv: list[str]) -> None:
-    """Ensure mock mode is configured before importing API modules."""
+def _parse_mock_mode_flag(argv: Sequence[str]) -> bool:
+    """Return True when the CLI arguments request mock LLM mode."""
 
-    enable_mock = "--use_mock_llm" in argv
-    _configure_mock_mode(enable_mock)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--use_mock_llm", action="store_true")
+    try:
+        args, _ = parser.parse_known_args(list(argv))
+    except SystemExit:
+        return False
+    return bool(getattr(args, "use_mock_llm", False))
 
 
-_bootstrap_mock_mode_from_cli(sys.argv[1:])
-
-from api import init_app
-from config import get_config
+_configure_mock_mode(_parse_mock_mode_flag(sys.argv[1:]))
 
 
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
@@ -200,6 +204,14 @@ def _load_upstream_config() -> Dict[str, Any]:
 UPSTREAM_CONFIG = _load_upstream_config()
 
 
+def _initialize_api(flask_app: Flask) -> None:
+    """Import and attach the API blueprint once mock mode is configured."""
+
+    from api import init_app as _init_app  # Local import honors USE_MOCK_LLM
+
+    _init_app(flask_app)
+
+
 def _get_request_counter() -> Counter:
     metric_name = "tokenplace_relay_requests_total"
     existing = getattr(REGISTRY, "_names_to_collectors", {}).get(metric_name)
@@ -220,7 +232,9 @@ def _load_server_registration_token():
 
     token = None
     try:
-        token = get_config().get('relay.server_registration_token')
+        from config import get_config as _get_config  # Local import honors USE_MOCK_LLM
+
+        token = _get_config().get('relay.server_registration_token')
     except Exception:
         token = None
 
@@ -262,7 +276,7 @@ configure_app_logging(app)
 app.config.update(UPSTREAM_CONFIG)
 
 # Initialize the API
-init_app(app)
+_initialize_api(app)
 LOGGER.info(
     "relay.app.initialized",
     extra={"upstream": app.config.get("upstream_url")},

@@ -137,7 +137,9 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 ### 4. Testing Infrastructure
 
 #### 4.1 Streaming Tests
-- Implement tests for streaming functionality
+- ✅ Implement tests for streaming functionality
+  - `tests/unit/test_crypto_helpers_streaming.py::test_stream_chat_completion_reconnects_with_stream_session`
+    verifies the client reuses encrypted sessions when reconnecting mid-stream.
 - ✅ Test different chunk sizes and timing scenarios (`tests/test_streaming.py::test_v2_streaming_handles_varied_chunk_sizes_and_delays`)
 - Verify encryption/decryption with streaming
 
@@ -159,7 +161,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 ## Security Considerations
 
 - ✅ Ensure each chunk is properly encrypted via StreamSession IV collision detection and retry logic
-- Implement reconnection logic that maintains encryption state
+- ✅ Implement reconnection logic that maintains encryption state
 - ✅ Verify that partial responses cannot be intercepted or modified
   - Covered by `tests/unit/test_crypto_helpers_streaming.py::test_stream_chat_completion_flags_tampered_encrypted_chunks`,
     which simulates a tampered ciphertext chunk and asserts the streaming client emits a `decrypt_failed` error event.

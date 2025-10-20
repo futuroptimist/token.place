@@ -35,6 +35,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- else if .Values.image.tag -}}
 {{ printf "%s:%s" $repo .Values.image.tag }}
 {{- else -}}
-{{ $repo }}
+{{ printf "%s:%s" $repo .Chart.AppVersion }}
 {{- end -}}
 {{- end -}}

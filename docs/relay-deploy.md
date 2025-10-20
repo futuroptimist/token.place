@@ -9,14 +9,19 @@ Multi-architecture images (linux/amd64 and linux/arm64) are published to GitHub 
 as `ghcr.io/<org-or-user>/tokenplace-relay`. Each build is tagged with both an immutable
 `sha-<shortsha>` and any matching semver tag.
 
-Prefer pinning releases by digest in production to guarantee immutability:
+Prefer pinning releases by digest in production to guarantee immutability and eliminate the risk of
+tag reuse:
 
 ```yaml
 image:
   repository: ghcr.io/example/tokenplace-relay
   digest: sha256:0123456789abcdef...
-  tag: ""  # leave empty when digest is provided
+  tag: ""  # leave empty when digest is provided so the chart renders `repo@digest`
 ```
+
+When `image.digest` is supplied the Helm helper emits `repository@digest`. Falling back to
+`image.tag` renders `repository:tag`, and leaving both empty resolves to the chart `appVersion`.
+Digest pinning avoids supply-chain surprises and should be the default for production releases.
 
 The container exposes port `5010` internally. Runtime environment variables:
 
@@ -25,6 +30,21 @@ The container exposes port `5010` internally. Runtime environment variables:
 - `TOKENPLACE_GPU_HOST` is injected only when the chart targets an external GPU hostname.
 - `TOKENPLACE_GPU_PORT` defaults to the chart's configured GPU port (5015 by default).
 - `TOKENPLACE_RELAY_UPSTREAM_URL` defaults to `http://gpu-server:<port>`.
+
+## Ingress, TLS, and certificates
+
+The chart ships with Traefik defaults so a cluster using cert-manager can issue Let’s Encrypt
+certificates automatically:
+
+- `ingress.className` defaults to `traefik`.
+- `ingress.annotations` already includes
+  `cert-manager.io/cluster-issuer: letsencrypt-dns01`.
+- Each environment must set `ingress.hosts[].host` for its FQDN and
+  `ingress.tls[].secretName` for the certificate secret. The same host list should appear under both
+  keys so cert-manager can provision the secret bound to the ingress.
+
+Override these values in your environment-specific `values.yaml` files so staging, production, and
+other clusters receive the expected routes and TLS secrets.
 
 ## GPU indirection options
 
@@ -42,7 +62,20 @@ The relay reaches the GPU host through an indirection layer that you can control
 
 Whichever mode you choose, set `gpuExternalName.port` to the TCP port where `server.py` listens. The
 default is `5015`, and the chart also rewrites `TOKENPLACE_GPU_PORT` accordingly. You can override
-`upstream.url` when pointing at a different scheme or host.
+`upstream.url` when pointing at a different scheme or host. For ExternalName deployments, tighten
+`networkPolicy.externalNameCIDR` to the GPU host’s public IP (or CIDR) so only that address is
+reachable from the relay pods.
+
+## Probes and graceful shutdown
+
+Kubernetes continuously verifies the relay’s health:
+
+- The readiness probe hits `GET /healthz` on the named `http` port every 10s after an initial 5s
+  delay. During shutdown the probe fails, signalling Kubernetes to drain active connections.
+- The liveness probe checks `GET /livez` on the same port starting 20s after startup, repeating every
+  20s to ensure the process remains responsive.
+- Pods define `terminationGracePeriodSeconds: 30` and a `preStop` hook that sends SIGTERM then sleeps
+  briefly so connections can close cleanly before the container exits.
 
 ## Helm deployment workflow
 
@@ -93,7 +126,8 @@ default is `5015`, and the chart also rewrites `TOKENPLACE_GPU_PORT` accordingly
    kubectl -n tokenplace get ingress relay-tokenplace-relay
    ```
 5. Optional: enable the `ServiceMonitor` by setting `serviceMonitor.enabled: true`. Labels default to
-   `{ release: prometheus }` so the kube-prometheus-stack discovers the metrics endpoint.
+   `{ release: kube-prometheus-stack }`, interval `30s`, and path `/metrics` on the `http` port so the
+   kube-prometheus-stack discovers the metrics endpoint without extra overrides.
 
 ## Running `server.py` on Windows 11 (RTX 4090 host)
 

@@ -16,6 +16,37 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Import the module to test
 from utils.llm.model_manager import ModelManager
 
+
+class _ToDictOnly:
+    """Helper class that provides a working to_dict implementation."""
+
+    def to_dict(self):
+        return {'origin': 'to_dict'}
+
+
+class _TypeErrorToDict:
+    """Helper class whose to_dict requires an argument, forcing a TypeError."""
+
+    def to_dict(self, unused):  # pragma: no cover - exercised indirectly
+        raise AssertionError("This should not be called with an argument")
+
+    def model_dump(self):
+        return {'origin': 'model_dump'}
+
+
+class _DictMethodOnly:
+    """Helper class exposing a dict() method for normalization."""
+
+    def dict(self):
+        return {'origin': 'dict'}
+
+
+class _DictAttributeOnly:
+    """Helper class that is normalized via its __dict__ attribute."""
+
+    def __init__(self):
+        self.origin = 'dunder_dict'
+
 class TestModelManager:
     """Test class for ModelManager."""
 
@@ -540,3 +571,161 @@ class TestModelManager:
                 assert inst1 is inst2
             finally:
                 mm.model_manager = original
+
+    def test_normalize_stream_chunk_variants(self):
+        """_normalize_stream_chunk should handle several helper patterns."""
+        assert ModelManager._normalize_stream_chunk({'sentinel': True}) == {'sentinel': True}
+
+        assert ModelManager._normalize_stream_chunk(_ToDictOnly()) == {'origin': 'to_dict'}
+
+        # Objects whose to_dict signature is incompatible should fall back to model_dump.
+        assert ModelManager._normalize_stream_chunk(_TypeErrorToDict()) == {'origin': 'model_dump'}
+
+        assert ModelManager._normalize_stream_chunk(_DictMethodOnly()) == {'origin': 'dict'}
+
+        assert ModelManager._normalize_stream_chunk(_DictAttributeOnly()) == {'origin': 'dunder_dict'}
+
+        class Unknown:
+            pass
+
+        assert ModelManager._normalize_stream_chunk(Unknown()) == {}
+
+    def test_merge_tool_call_deltas_extends_structure(self):
+        """_merge_tool_call_deltas should allocate slots and concatenate arguments."""
+        existing = [
+            {
+                'id': 'call-0',
+                'type': 'function',
+                'function': {
+                    'name': 'alpha',
+                    'arguments': '{"value":',
+                },
+            }
+        ]
+
+        deltas = [
+            {
+                # No index means append to the end of the list.
+                'id': 'call-1',
+                'type': 'function',
+                'function': {'name': 'beta', 'arguments': '{"count":'},
+            },
+            {
+                'index': 0,
+                'function': {'arguments': '42}'},
+            },
+            {
+                'index': 2,
+                'function': {'arguments': 'true}', 'name': 'gamma'},
+            },
+        ]
+
+        merged = ModelManager._merge_tool_call_deltas(existing, deltas)
+
+        assert len(merged) == 3
+        assert merged[0]['function']['arguments'] == '{"value":42}'
+        assert merged[1]['id'] == 'call-1'
+        assert merged[1]['function']['name'] == 'beta'
+        assert merged[1]['function']['arguments'] == '{"count":'
+        assert merged[2]['function']['arguments'] == 'true}'
+        assert merged[2]['function']['name'] == 'gamma'
+
+    def test_consume_streaming_completion_aggregates_deltas(self, model_manager):
+        """Streaming completions should merge content, roles, and tool calls."""
+
+        def streaming_completion():
+            yield None  # skipped entirely
+            yield {'choices': []}  # skipped due to empty choices
+            yield {'choices': [{'delta': 'not-a-dict'}]}  # skipped due to non-dict delta
+            yield {
+                'choices': [
+                    {
+                        'delta': {
+                            'role': 'assistant',
+                            'content': 'Hello',
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'id': 'tool-0',
+                                    'type': 'function',
+                                    'function': {'name': 'math', 'arguments': '{"number":'},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+            yield {
+                'choices': [
+                    {
+                        'delta': {
+                            'content': ' world!',
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'function': {'arguments': '42}'},
+                                },
+                                {
+                                    'index': 1,
+                                    'function': {'arguments': '1', 'name': 'second'},
+                                },
+                            ],
+                        }
+                    }
+                ]
+            }
+            yield {
+                'choices': [
+                    {
+                        'delta': {},
+                        'finish_reason': 'stop',
+                    }
+                ]
+            }
+
+        message = model_manager._consume_streaming_completion(streaming_completion())
+
+        assert message['role'] == 'assistant'
+        assert message['content'] == 'Hello world!'
+        assert message['tool_calls'] == [
+            {
+                'id': 'tool-0',
+                'type': 'function',
+                'function': {'name': 'math', 'arguments': '{"number":42}'},
+            },
+            {
+                'function': {'name': 'second', 'arguments': '1'},
+            },
+        ]
+
+    def test_llama_cpp_get_response_streaming_fallback(self, model_manager):
+        """Empty streaming responses should trigger a non-streaming retry."""
+        chat_history = [{'role': 'user', 'content': 'ping'}]
+
+        def empty_stream():
+            yield {'choices': [{'delta': {}, 'finish_reason': 'stop'}]}
+
+        mock_llm = MagicMock()
+        mock_llm.create_chat_completion.side_effect = [
+            empty_stream(),
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'fallback reply',
+                        }
+                    }
+                ]
+            },
+        ]
+
+        model_manager.get_llm_instance = MagicMock(return_value=mock_llm)
+
+        result = model_manager.llama_cpp_get_response(chat_history)
+
+        assert result[-1]['content'] == 'fallback reply'
+
+        stream_call, non_stream_call = mock_llm.create_chat_completion.call_args_list
+        assert stream_call.kwargs['stream'] is True
+        assert non_stream_call.kwargs['stream'] is False

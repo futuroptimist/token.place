@@ -119,7 +119,27 @@
             }
           },
           "else": {
-            "required": ["host"]
+            "if": {
+              "properties": {
+                "headless": {
+                  "properties": {
+                    "enabled": {
+                      "const": true
+                    }
+                  },
+                  "required": ["enabled"]
+                }
+              },
+              "required": ["headless"]
+            },
+            "then": {
+              "not": {
+                "required": ["host"]
+              }
+            },
+            "else": {
+              "required": ["host"]
+            }
           }
         }
       ]

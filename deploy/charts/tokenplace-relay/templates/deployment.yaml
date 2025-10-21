@@ -53,6 +53,13 @@ spec:
             - name: http
               containerPort: {{ .Values.containerPort }}
               protocol: TCP
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "kill -s TERM 1 || true; sleep 5"
           env:
             - name: RELAY_HOST
               value: "0.0.0.0"
@@ -77,15 +84,18 @@ spec:
             httpGet:
               path: /livez
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 10
+            initialDelaySeconds: 5
             periodSeconds: 10
-            failureThreshold: 3
+            timeoutSeconds: 2
+            failureThreshold: 6
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:

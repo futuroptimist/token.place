@@ -68,9 +68,9 @@ spec:
             {{- if not $useHeadless }}
             - name: TOKENPLACE_GPU_HOST
               value: {{ $gpu.host | quote }}
-            {{- end }}
             - name: TOKENPLACE_GPU_PORT
               value: "{{ $gpu.port }}"
+            {{- end }}
             - name: TOKENPLACE_RELAY_UPSTREAM_URL
               value: "{{ .Values.upstream.url }}"
             {{- with .Values.env }}

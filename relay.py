@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
@@ -197,17 +198,33 @@ UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
 
 
 def _load_upstream_config() -> Dict[str, Any]:
+    upstream_override = os.environ.get(UPSTREAM_URL_ENV)
+    parsed_host = None
+    parsed_port: int | None = None
+
+    if upstream_override:
+        try:
+            parsed = urlparse(upstream_override)
+        except ValueError:
+            parsed = None
+        if parsed and parsed.hostname:
+            parsed_host = parsed.hostname
+            parsed_port = parsed.port
+
     host = (
         os.environ.get(GPU_HOST_ENV)
         or os.environ.get("GPU_SERVER_HOST")
+        or parsed_host
         or "gpu-server"
     )
-    port = int(
+    port_source = (
         os.environ.get(GPU_PORT_ENV)
         or os.environ.get("GPU_SERVER_PORT")
+        or (str(parsed_port) if parsed_port is not None else None)
         or "3000"
     )
-    upstream_url = os.environ.get(UPSTREAM_URL_ENV) or f"http://{host}:{port}"
+    port = int(port_source)
+    upstream_url = upstream_override or f"http://{host}:{port}"
     return {
         "gpu_host": host,
         "gpu_port": port,

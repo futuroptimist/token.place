@@ -9,4 +9,3 @@ spec:
   selector:
     matchLabels:
       {{- include "tokenplace-relay.selectorLabels" . | nindent 6 }}
-

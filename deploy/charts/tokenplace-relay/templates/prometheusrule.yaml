@@ -27,4 +27,3 @@ spec:
           annotations:
             summary: "Relay 5xx rate > 0 rps (5m)"
 {{- end }}
-

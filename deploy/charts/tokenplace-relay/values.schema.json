@@ -200,4 +200,3 @@
   },
   "required": ["image", "ingress", "gpuExternalName", "service", "resources"]
 }
-

@@ -27,7 +27,7 @@ class _ToDictOnly:
 class _TypeErrorToDict:
     """Helper class whose to_dict requires an argument, forcing a TypeError."""
 
-    def to_dict(self, unused):  # pragma: no cover - exercised indirectly
+    def to_dict(self, _unused):  # pragma: no cover - exercised indirectly
         raise AssertionError("This should not be called with an argument")
 
     def model_dump(self):

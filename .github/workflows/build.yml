@@ -58,6 +58,7 @@ jobs:
             org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/docs/relay-deploy.md
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created={{ timestamp }}
+            org.opencontainers.image.licenses=MIT
 
       - name: Login to GHCR
         if: env.PUSH_IMAGE == 'true'

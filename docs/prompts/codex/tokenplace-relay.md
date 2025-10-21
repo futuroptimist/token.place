@@ -37,7 +37,9 @@ One-click repo task: containerize relay.py, ship multi-arch images, helm-ize, an
 
 ## Acceptance checklist
 
-- [ ] Image builds for **arm64+amd64** on push; publishes to GHCR with immutable SHA tag(s) and OCI labels.
+- [x] Image builds for **arm64+amd64** on push and publishes to GHCR
+      with immutable SHA tag(s) and OCI labels
+      (sha-* tags plus MIT license metadata enforced by tests).
 - [ ] Values support digest pinning and render the helper-based image reference.
 - [ ] Deployment becomes **Ready** with `/livez` + `/healthz` probes; readiness fails while draining on shutdown.
 - [ ] Ingress reachable at `relay.<env-domain>` with a valid cert (cert‑manager).

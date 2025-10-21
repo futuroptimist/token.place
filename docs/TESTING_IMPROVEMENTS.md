@@ -458,6 +458,8 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 ## Notes for Implementation
 
 - Integrate with CI/CD to run tests automatically
-- Consider using docker containers for browser and integration tests
+- ✅ Containerized test runner covers browser/integration suites via
+  `scripts/run_tests_in_container.py`; the Docker image preinstalls Playwright Chromium so
+  CI-equivalent runs work offline.
 - Implement stress tests for production readiness
 - Add documentation for each test type

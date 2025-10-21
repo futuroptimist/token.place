@@ -99,6 +99,9 @@ serviceMonitor:
   path: /metrics
   port: http
 
+alerts:
+  enabled: false
+
 networkPolicy:
   enabled: true
   allowDNS: true

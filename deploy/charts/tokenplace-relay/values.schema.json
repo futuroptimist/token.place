@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {"type": "null"}
+          ]
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^sha256:[A-Fa-f0-9]{64}$"
+            },
+            {"type": "null"}
+          ]
+        },
+        "pullPolicy": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["repository"],
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": ["tag"],
+              "properties": {
+                "tag": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            {
+              "required": ["digest"],
+              "properties": {
+                "digest": {
+                  "type": "string",
+                  "pattern": "^sha256:[A-Fa-f0-9]{64}$"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "required": ["port"]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {"type": "string", "minLength": 1},
+            "memory": {"type": "string", "minLength": 1}
+          },
+          "required": ["cpu", "memory"]
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {"type": "string", "minLength": 1},
+            "memory": {"type": "string", "minLength": 1}
+          },
+          "required": ["cpu", "memory"]
+        }
+      },
+      "required": ["requests", "limits"]
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "hosts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["host"],
+            "properties": {
+              "host": {
+                "type": "string",
+                "pattern": "^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,}$"
+              }
+            }
+          }
+        }
+      },
+      "required": ["enabled", "hosts"]
+    },
+    "gpuExternalName": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "useHeadless": {"type": "boolean"},
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "headless": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": ["useHeadless"],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "useHeadless": {"const": true}
+            }
+          },
+          "then": {
+            "not": {"required": ["host"]}
+          },
+          "else": {
+            "required": ["host"]
+          }
+        }
+      ]
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    },
+    "alerts": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    }
+  },
+  "required": [
+    "image",
+    "service",
+    "resources",
+    "ingress",
+    "gpuExternalName"
+  ]
+}

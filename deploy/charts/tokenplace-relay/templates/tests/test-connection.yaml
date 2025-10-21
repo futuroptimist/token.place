@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "tokenplace-relay.fullname" . }}-test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: curl
+      image: registry.k8s.io/e2e-test-images/agnhost:2.45
+      args:
+        - curl
+        - -sfS
+        - http://{{ include "tokenplace-relay.fullname" . }}:{{ .Values.service.port }}/healthz

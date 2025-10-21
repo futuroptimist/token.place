@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/${OWNER}/tokenplace-relay
-  tag: ""         # leave empty when using digest
+  tag: "0.1.0"     # defaults to chart appVersion when digest is unset
   digest: ""      # immutable digest preferred in prod
   pullPolicy: IfNotPresent
 
@@ -98,6 +98,9 @@ serviceMonitor:
   scrapeTimeout: 10s
   path: /metrics
   port: http
+
+alerts:
+  enabled: false
 
 networkPolicy:
   enabled: true

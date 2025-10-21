@@ -1,0 +1,30 @@
+{{- if .Values.alerts.enabled }}
+{{- $fn := include "tokenplace-relay.fullname" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "tokenplace-relay.fullname" . }}-alerts
+  labels:
+    {{- include "tokenplace-relay.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: relay-availability
+      rules:
+        - alert: RelayTargetDown
+          expr: |
+            max_over_time(up{job=~".*{{$fn}}.*"}[5m]) < 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Relay scrape target down"
+        - alert: RelayHigh5xx
+          expr: |
+            sum(rate(http_server_requests_seconds_count{status=~"5..",job=~".*{{$fn}}.*"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Relay 5xx rate > 0 rps (5m)"
+{{- end }}
+

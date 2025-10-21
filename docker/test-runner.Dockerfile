@@ -23,7 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -r config/requirements_relay.txt
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=optional
+RUN npm ci --omit=optional \
+    && npx playwright install --with-deps chromium
 
 COPY . .
 

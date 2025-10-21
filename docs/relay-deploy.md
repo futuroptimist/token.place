@@ -27,8 +27,9 @@ The container exposes port `5010` internally. Runtime environment variables:
 
 - `RELAY_HOST` (default `0.0.0.0`)
 - `RELAY_PORT` (default `5010`)
-- `TOKENPLACE_GPU_HOST` is injected only when the chart targets an external GPU hostname.
-- `TOKENPLACE_GPU_PORT` defaults to the chart's configured GPU port (5015 by default).
+- `TOKENPLACE_GPU_HOST`/`TOKENPLACE_GPU_PORT` are injected only when the chart targets an external
+  GPU hostname. Headless releases rely on the in-cluster DNS entry and derive their port from
+  `TOKENPLACE_RELAY_UPSTREAM_URL`.
 - `TOKENPLACE_RELAY_UPSTREAM_URL` defaults to `http://gpu-server:<port>`.
 
 ## Ingress, TLS, and certificates
@@ -57,12 +58,12 @@ The relay reaches the GPU host through an indirection layer that you can control
 - **Headless Service + Endpoints:** set `gpuExternalName.useHeadless: true` (or
   `gpuExternalName.headless.enabled: true`) and provide static addresses via
   `gpuExternalName.headless.addresses`. The chart generates a headless `Service` with the supplied
-  `Endpoints`. In this mode the relay resolves `gpu-server` inside the cluster, so no
-  `TOKENPLACE_GPU_HOST` override is necessary.
+  `Endpoints`. In this mode the relay resolves `gpu-server` inside the cluster and reuses the port
+  from `TOKENPLACE_RELAY_UPSTREAM_URL`, so no GPU-specific environment overrides are required.
 
 Whichever mode you choose, set `gpuExternalName.port` to the TCP port where `server.py` listens. The
-default is `5015`, and the chart also rewrites `TOKENPLACE_GPU_PORT` accordingly. You can override
-`upstream.url` when pointing at a different scheme or host. For ExternalName deployments, tighten
+default is `5015`, and the chart rewrites the upstream URL accordingly. You can override `upstream.url`
+when pointing at a different scheme or host. For ExternalName deployments, tighten
 `networkPolicy.externalNameCIDR` to the GPU host’s public IP (or CIDR) so only that address is
 reachable from the relay pods.
 

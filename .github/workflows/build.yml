@@ -77,9 +77,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          provenance: mode=max
+          provenance: "mode=max"
           sbom: true
 
       - name: Image digest
         if: env.PUSH_IMAGE == 'true'
-        run: echo "Digest: ${{ steps.build.outputs.digest }}"
+        run: |
+          echo "Digest: ${{ steps.build.outputs.digest }}"

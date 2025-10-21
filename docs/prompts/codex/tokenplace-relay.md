@@ -41,6 +41,6 @@ One-click repo task: containerize relay.py, ship multi-arch images, helm-ize, an
 - [ ] Values support digest pinning and render the helper-based image reference.
 - [ ] Deployment becomes **Ready** with `/livez` + `/healthz` probes; readiness fails while draining on shutdown.
 - [ ] Ingress reachable at `relay.<env-domain>` with a valid cert (cert‑manager).
-- [ ] GPU indirection works for both ExternalName and headless+Endpoints modes; environment variables are set only when required.
+- [x] GPU indirection works for both ExternalName and headless+Endpoints modes; environment variables are set only when required (covered by `tests/unit/test_relay_gpu_indirection.py`).
 - [ ] Structured JSON logs visible; optional `/metrics` scraped by Prometheus when the `ServiceMonitor` toggle is enabled.
 - [ ] Security: container runs as UID 1000, drops capabilities, disallows privilege escalation, enforces RuntimeDefault seccomp & read-only root; NetworkPolicy default-denies except DNS + GPU target (overridable via values).

@@ -10,4 +10,3 @@ spec:
     - name: curl
       image: registry.k8s.io/e2e-test-images/agnhost:2.45
       args: ["curl", "-sfS", "http://{{ include "tokenplace-relay.fullname" . }}:{{ .Values.service.port }}/healthz"]
-

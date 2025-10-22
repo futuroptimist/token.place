@@ -371,6 +371,9 @@ def _log_request(response: Response):
     if getattr(g, "request_id", None):
         response.headers.setdefault("X-Request-Id", g.request_id)
 
+    if endpoint == "metrics":
+        response.headers.setdefault("Cache-Control", "no-store")
+
     return response
 
 
@@ -411,8 +414,6 @@ def healthz():
 @app.route("/livez", methods=["GET"])
 def livez():
     return jsonify({"status": "alive"})
-
-
 def _register_stream_session(server_public_key, client_public_key):
     """Create or replace the streaming session for a client/server pair."""
 

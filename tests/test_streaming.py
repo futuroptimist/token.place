@@ -8,6 +8,9 @@ import pytest
 from relay import app as relay_app
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
+from api.v1.encryption import encryption_manager
+
+import encrypt
 
 
 @pytest.fixture
@@ -64,53 +67,10 @@ def test_v2_streaming_chat_completion(client, monkeypatch):
 
 
 def test_v2_encrypted_streaming_emits_encrypted_chunks(client, monkeypatch):
-    """Encrypted streaming requests should emit encrypted Server-Sent Events chunks."""
-
-    class DummyEncryptionManager:
-        public_key_b64 = "server-public-key"
-
-        def __init__(self):
-            self.calls = []
-
-        def decrypt_message(self, encrypted_payload, cipherkey):
-            _ = encrypted_payload, cipherkey
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Say hello."}
-            ]
-            return json.dumps(messages).encode("utf-8")
-
-        def encrypt_message(self, response_data, client_public_key):
-            assert client_public_key == "client-public-key"
-            self.calls.append(response_data)
-            payload_bytes = json.dumps(response_data).encode("utf-8")
-            ciphertext = base64.b64encode(payload_bytes).decode("utf-8")
-            index = len(self.calls)
-            return {
-                "encrypted": True,
-                "ciphertext": ciphertext,
-                "iv": f"iv-{index}",
-                "cipherkey": f"key-{index}",
-            }
-
-    payload = {
-        "model": "llama-3-8b-instruct",
-        "stream": True,
-        "encrypted": True,
-        "client_public_key": "client-public-key",
-        "messages": {
-            "ciphertext": "Y2lwaGVydGV4dA==",
-            "cipherkey": "Y2lwaGVya2V5",
-            "iv": "aXY="
-        }
-    }
-
-    dummy_manager = DummyEncryptionManager()
+    """Encrypted streaming requests should emit decryptable streaming chunks."""
 
     monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
     monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
-    monkeypatch.setattr(v2_routes, "encryption_manager", dummy_manager)
-    monkeypatch.setattr(v2_routes, "validate_encrypted_request", lambda data: None)
 
     def fake_generate_response(model_id, messages, **model_options):
         assert messages[-1]["content"] == "Say hello."
@@ -118,6 +78,31 @@ def test_v2_encrypted_streaming_emits_encrypted_chunks(client, monkeypatch):
         return messages + [{"role": "assistant", "content": "Hello!"}]
 
     monkeypatch.setattr(v2_routes, "generate_response", fake_generate_response)
+
+    plaintext_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Say hello."},
+    ]
+
+    server_public_key = base64.b64decode(encryption_manager.public_key_b64)
+    ciphertext_dict, cipherkey, iv = encrypt.encrypt(
+        json.dumps(plaintext_messages).encode("utf-8"),
+        server_public_key,
+    )
+
+    client_private_key, client_public_key = encrypt.generate_keys()
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "stream": True,
+        "encrypted": True,
+        "client_public_key": base64.b64encode(client_public_key).decode("ascii"),
+        "messages": {
+            "ciphertext": base64.b64encode(ciphertext_dict["ciphertext"]).decode("ascii"),
+            "cipherkey": base64.b64encode(cipherkey).decode("ascii"),
+            "iv": base64.b64encode(iv).decode("ascii"),
+        },
+    }
 
     response = client.post("/api/v2/chat/completions", json=payload)
 
@@ -134,22 +119,63 @@ def test_v2_encrypted_streaming_emits_encrypted_chunks(client, monkeypatch):
 
     assert events[-1] == "[DONE]"
 
+    stream_session_id = None
+    session = None
     decrypted_chunks = []
-    for raw_event in events[:-1]:
+
+    for index, raw_event in enumerate(events[:-1]):
         envelope = json.loads(raw_event)
         assert envelope["encrypted"] is True
         assert envelope["event"] == "delta"
-        encoded_payload = envelope["data"]["ciphertext"]
-        payload_json = base64.b64decode(encoded_payload.encode("utf-8")).decode("utf-8")
-        decrypted_chunks.append(json.loads(payload_json))
+
+        if stream_session_id is None:
+            stream_session_id = envelope.get("stream_session_id")
+            assert isinstance(stream_session_id, str)
+        else:
+            assert envelope.get("stream_session_id") == stream_session_id
+
+        payload_body = envelope["data"]
+        assert payload_body["encrypted"] is True
+        assert payload_body.get("stream_session_id") == stream_session_id
+
+        ciphertext_payload = {
+            "ciphertext": base64.b64decode(payload_body["ciphertext"]),
+            "iv": base64.b64decode(payload_body["iv"]),
+        }
+
+        if "tag" in payload_body:
+            ciphertext_payload["tag"] = base64.b64decode(payload_body["tag"])
+
+        mode = payload_body.get("mode")
+        associated_data_field = payload_body.get("associated_data")
+        associated_data = (
+            base64.b64decode(associated_data_field)
+            if isinstance(associated_data_field, str)
+            else None
+        )
+
+        if index == 0:
+            assert "cipherkey" in payload_body
+            encrypted_key_bytes = base64.b64decode(payload_body["cipherkey"])
+        else:
+            assert "cipherkey" not in payload_body
+            encrypted_key_bytes = None
+
+        plaintext_bytes, session = encrypt.decrypt_stream_chunk(
+            ciphertext_payload,
+            client_private_key,
+            session=session,
+            encrypted_key=encrypted_key_bytes,
+            cipher_mode=mode,
+            associated_data=associated_data,
+        )
+
+        decrypted_chunks.append(json.loads(plaintext_bytes.decode("utf-8")))
 
     assert len(decrypted_chunks) == 3
     assert decrypted_chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
     assert decrypted_chunks[1]["choices"][0]["delta"]["content"] == "Hello!"
     assert decrypted_chunks[2]["choices"][0]["finish_reason"] == "stop"
-
-    # Ensure each chunk was encrypted independently
-    assert [call["choices"][0]["delta"].get("content") for call in dummy_manager.calls] == [None, "Hello!", None]
 
 
 def test_v2_streaming_with_tool_use(client, monkeypatch):

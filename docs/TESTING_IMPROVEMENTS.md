@@ -461,5 +461,9 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 - ✅ Containerized test runner covers browser/integration suites via
   `scripts/run_tests_in_container.py`; the Docker image preinstalls Playwright Chromium so
   CI-equivalent runs work offline.
-- Implement stress tests for production readiness
+- ✅ Implement stress tests for production readiness
+  - Added `tests/test_stress_streaming.py::test_stream_encryption_stress_handles_high_iteration_volume`
+    exercising the streaming encryption helpers through 64 sequential chunk encrypt/decrypt cycles.
+  - Introduced `utils/testing/stress.py::run_stream_encryption_stress_test` so maintainers can
+    reuse the stress harness when tuning performance thresholds.
 - Add documentation for each test type

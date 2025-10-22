@@ -4,7 +4,7 @@ import json
 import base64
 import time
 import logging
-from encrypt import encrypt, decrypt, generate_keys
+from encrypt import encrypt, decrypt, generate_keys, decrypt_stream_chunk
 import sys
 import os
 
@@ -334,8 +334,10 @@ def test_encrypted_streaming_chat_completion(client, client_keys, mock_llama):
     encrypted_chunks = events[:-1]
     assert encrypted_chunks, "expected at least one encrypted data chunk"
 
+    stream_session_id = None
+    decrypt_session = None
     decrypted_events = []
-    for chunk in encrypted_chunks:
+    for index, chunk in enumerate(encrypted_chunks):
         assert chunk.startswith("data: ")
         payload_json = chunk[len("data: ") :]
         envelope = json.loads(payload_json)
@@ -343,17 +345,48 @@ def test_encrypted_streaming_chat_completion(client, client_keys, mock_llama):
         assert envelope["event"] == "delta"
         assert envelope["encrypted"] is True
 
+        if stream_session_id is None:
+            stream_session_id = envelope.get("stream_session_id")
+            assert isinstance(stream_session_id, str)
+        else:
+            assert envelope.get("stream_session_id") == stream_session_id
+
         encrypted_payload = envelope["data"]
-        decrypted_bytes = decrypt(
-            {
-                "ciphertext": base64.b64decode(encrypted_payload["ciphertext"]),
-                "iv": base64.b64decode(encrypted_payload["iv"]),
-            },
-            base64.b64decode(encrypted_payload["cipherkey"]),
-            client_keys['private_key'],
+        assert encrypted_payload["encrypted"] is True
+        assert encrypted_payload.get("stream_session_id") == stream_session_id
+
+        ciphertext_dict = {
+            "ciphertext": base64.b64decode(encrypted_payload["ciphertext"]),
+            "iv": base64.b64decode(encrypted_payload["iv"]),
+        }
+
+        if "tag" in encrypted_payload:
+            ciphertext_dict["tag"] = base64.b64decode(encrypted_payload["tag"])
+
+        mode = encrypted_payload.get("mode")
+        associated_data_value = encrypted_payload.get("associated_data")
+        associated_data = (
+            base64.b64decode(associated_data_value)
+            if isinstance(associated_data_value, str)
+            else None
         )
 
-        assert decrypted_bytes is not None
+        if index == 0:
+            assert "cipherkey" in encrypted_payload
+            encrypted_key_bytes = base64.b64decode(encrypted_payload["cipherkey"])
+        else:
+            assert "cipherkey" not in encrypted_payload
+            encrypted_key_bytes = None
+
+        decrypted_bytes, decrypt_session = decrypt_stream_chunk(
+            ciphertext_dict,
+            client_keys['private_key'],
+            session=decrypt_session,
+            encrypted_key=encrypted_key_bytes,
+            cipher_mode=mode,
+            associated_data=associated_data,
+        )
+
         decrypted_events.append(json.loads(decrypted_bytes.decode("utf-8")))
 
     assert all(event["object"] == "chat.completion.chunk" for event in decrypted_events)

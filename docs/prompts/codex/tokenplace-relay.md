@@ -41,7 +41,8 @@ One-click repo task: containerize relay.py, ship multi-arch images, helm-ize, an
       with immutable SHA tag(s) and OCI labels
       (sha-* tags plus MIT license metadata enforced by tests).
 - [ ] Values support digest pinning and render the helper-based image reference.
-- [ ] Deployment becomes **Ready** with `/livez` + `/healthz` probes; readiness fails while draining on shutdown.
+- [x] Deployment becomes **Ready** with `/livez` + `/healthz` probes; readiness fails while draining on shutdown.
+  - Readiness responses now include a `Retry-After: 0` header during drain.
 - [ ] Ingress reachable at `relay.<env-domain>` with a valid cert (cert‑manager).
 - [x] GPU indirection works for both ExternalName and headless+Endpoints modes; environment variables are set only when required (covered by `tests/unit/test_relay_gpu_indirection.py`).
 - [ ] Structured JSON logs visible; optional `/metrics` scraped by Prometheus when the `ServiceMonitor` toggle is enabled.

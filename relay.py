@@ -15,7 +15,7 @@ from typing import Any, Dict
 from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, REGISTRY, generate_latest
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -411,6 +411,16 @@ def healthz():
 @app.route("/livez", methods=["GET"])
 def livez():
     return jsonify({"status": "alive"})
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics() -> Response:
+    """Expose Prometheus-formatted metrics for scraping."""
+
+    payload = generate_latest(REGISTRY)
+    response = Response(payload, mimetype=CONTENT_TYPE_LATEST)
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 def _register_stream_session(server_public_key, client_public_key):

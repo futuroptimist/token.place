@@ -387,7 +387,11 @@ def healthz():
     if DRAINING.is_set():
         status["status"] = "draining"
         status.setdefault("details", {})["shutdown"] = True
-        return jsonify(status), 503
+        response = jsonify(status)
+        response.status_code = 503
+        response.headers["Retry-After"] = "0"
+        response.headers.setdefault("Cache-Control", "no-store")
+        return response
 
     if gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"

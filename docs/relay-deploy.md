@@ -65,7 +65,8 @@ Whichever mode you choose, set `gpuExternalName.port` to the TCP port where `ser
 default is `5015`, and the chart rewrites the upstream URL accordingly. You can override `upstream.url`
 when pointing at a different scheme or host. For ExternalName deployments, tighten
 `networkPolicy.externalNameCIDR` to the GPU host’s public IP (or CIDR) so only that address is
-reachable from the relay pods.
+reachable from the relay pods. The packaged defaults ship with the reserved test-net placeholder
+`192.0.2.42/32`, keeping the relay egress-locked until you provide the real destination.
 
 ## Probes and graceful shutdown
 
@@ -166,7 +167,8 @@ Kubernetes continuously verifies the relay’s health:
   - Ingress from the Traefik controller (namespace + label selector configured via
     `networkPolicy.traefik`).
   - Egress to kube-dns (UDP/TCP 53) when `networkPolicy.allowDNS` is true.
-  - Egress to either the configured ExternalName host (via `networkPolicy.externalNameCIDR`) or the
+  - Egress to either the configured ExternalName host (via `networkPolicy.externalNameCIDR`, which
+    defaults to the non-routable `192.0.2.42/32` placeholder) or the
     explicit headless IPs in `gpuExternalName.headless.addresses`.
   - Additional overrides supplied through `networkPolicy.extraIngress` / `networkPolicy.extraEgress`.
 - The pod and container run as an unprivileged user (`1000`), drop all Linux capabilities, enforce a

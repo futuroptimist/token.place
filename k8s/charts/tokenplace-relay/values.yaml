@@ -3,6 +3,7 @@ replicaCount: 1
 image:
   repository: tokenplace-relay
   tag: latest
+  digest: ""      # set to an immutable sha256 digest (and clear tag) to pin releases
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

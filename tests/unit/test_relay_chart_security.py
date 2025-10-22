@@ -62,4 +62,3 @@ def test_schema_requires_security_hardening_fields():
     assert container_schema["properties"]["runAsNonRoot"]["const"] is True
     assert container_schema["properties"]["runAsUser"]["const"] == 1000
     assert container_schema["properties"]["capabilities"]["properties"]["drop"]["items"]["const"] == "ALL"
-

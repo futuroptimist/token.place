@@ -24,7 +24,7 @@ spec:
       {{- end }}
       containers:
         - name: relay
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "tokenplace-relay.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - python

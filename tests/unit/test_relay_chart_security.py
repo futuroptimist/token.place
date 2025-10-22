@@ -63,3 +63,35 @@ def test_schema_requires_security_hardening_fields():
     assert container_schema["properties"]["runAsUser"]["const"] == 1000
     assert container_schema["properties"]["capabilities"]["properties"]["drop"]["items"]["const"] == "ALL"
 
+
+def test_schema_requires_tls_when_ingress_enabled():
+    """Ingress must mandate TLS hosts so cert-manager can issue relay.<env> certs."""
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    ingress_schema = schema["properties"]["ingress"]
+
+    tls_schema = ingress_schema["properties"].get("tls")
+    assert tls_schema is not None, "TLS configuration must be described in the schema"
+    assert tls_schema["type"] == "array"
+    assert tls_schema.get("minItems", 0) >= 1
+
+    tls_items = tls_schema["items"]
+    assert set(tls_items["required"]) == {"secretName", "hosts"}
+
+    hosts_schema = tls_items["properties"]["hosts"]
+    assert hosts_schema["type"] == "array"
+    assert hosts_schema.get("minItems", 0) >= 1
+
+    host_item_schema = hosts_schema["items"]
+    assert host_item_schema["type"] == "string"
+    assert "pattern" in host_item_schema, "Ingress hosts should match relay.<env-domain>"
+
+    enforcement_rules = ingress_schema.get("allOf", [])
+    requires_tls = any(
+        clause.get("if", {}).get("properties", {}).get("enabled", {}).get("const") is True
+        and "then" in clause
+        and "required" in clause["then"]
+        and "tls" in clause["then"]["required"]
+        for clause in enforcement_rules
+    )
+    assert requires_tls, "Enabling ingress should enforce TLS hosts via the schema"

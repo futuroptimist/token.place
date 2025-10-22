@@ -76,7 +76,7 @@
             "properties": {
               "host": {
                 "type": "string",
-                "pattern": "^([A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$"
+                "pattern": "^([A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?\\.)+[A-Za-z]{2,}$"
               }
             },
             "required": ["host"],
@@ -94,7 +94,7 @@
         },
         "host": {
           "type": "string",
-          "pattern": "^([A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?)(\.[A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?)*$"
+          "pattern": "^([A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?)(\\.[A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?)*$"
         },
         "port": {
           "type": "integer",
@@ -196,7 +196,132 @@
           "type": "boolean"
         }
       }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "properties": {
+        "runAsNonRoot": {
+          "type": "boolean",
+          "const": true
+        },
+        "runAsUser": {
+          "type": "integer",
+          "const": 1000
+        },
+        "runAsGroup": {
+          "type": "integer",
+          "const": 1000
+        },
+        "fsGroup": {
+          "type": "integer",
+          "const": 1000
+        },
+        "seccompProfile": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "RuntimeDefault"
+            }
+          },
+          "required": ["type"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "runAsNonRoot",
+        "runAsUser",
+        "runAsGroup",
+        "fsGroup",
+        "seccompProfile"
+      ],
+      "additionalProperties": false
+    },
+    "securityContext": {
+      "type": "object",
+      "properties": {
+        "runAsNonRoot": {
+          "type": "boolean",
+          "const": true
+        },
+        "runAsUser": {
+          "type": "integer",
+          "const": 1000
+        },
+        "allowPrivilegeEscalation": {
+          "type": "boolean",
+          "const": false
+        },
+        "readOnlyRootFilesystem": {
+          "type": "boolean",
+          "const": true
+        },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "drop": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "const": "ALL"
+              },
+              "minItems": 1
+            }
+          },
+          "required": ["drop"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "runAsNonRoot",
+        "runAsUser",
+        "allowPrivilegeEscalation",
+        "readOnlyRootFilesystem",
+        "capabilities"
+      ],
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "allowDNS": {
+          "type": "boolean"
+        },
+        "extraIngress": {
+          "type": "array"
+        },
+        "extraEgress": {
+          "type": "array"
+        },
+        "externalNameCIDR": {
+          "type": "string",
+          "pattern": "^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(3[0-2]|[12]?[0-9])$",
+          "not": {
+            "const": "0.0.0.0/0"
+          }
+        }
+      },
+      "required": [
+        "enabled",
+        "allowDNS",
+        "extraIngress",
+        "extraEgress",
+        "externalNameCIDR"
+      ],
+      "additionalProperties": true
     }
   },
-  "required": ["image", "ingress", "gpuExternalName", "service", "resources"]
+  "required": [
+    "image",
+    "ingress",
+    "gpuExternalName",
+    "service",
+    "resources",
+    "podSecurityContext",
+    "securityContext",
+    "networkPolicy"
+  ]
 }

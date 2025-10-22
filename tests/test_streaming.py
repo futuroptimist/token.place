@@ -2,6 +2,7 @@ import base64
 import json
 import time
 from itertools import accumulate
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,39 @@ def client():
     relay_app.config["TESTING"] = True
     with relay_app.test_client() as test_client:
         yield test_client
+
+
+def _build_encrypted_payload(message_content="Say hello.", *, include_client_public_key=True):
+    """Construct a minimal encrypted streaming payload for the v2 chat endpoint."""
+
+    plaintext_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": message_content},
+    ]
+
+    server_public_key = base64.b64decode(encryption_manager.public_key_b64)
+    ciphertext_dict, cipherkey, iv = encrypt.encrypt(
+        json.dumps(plaintext_messages).encode("utf-8"),
+        server_public_key,
+    )
+
+    client_private_key, client_public_key = encrypt.generate_keys()
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "stream": True,
+        "encrypted": True,
+        "messages": {
+            "ciphertext": base64.b64encode(ciphertext_dict["ciphertext"]).decode("ascii"),
+            "cipherkey": base64.b64encode(cipherkey).decode("ascii"),
+            "iv": base64.b64encode(iv).decode("ascii"),
+        },
+    }
+
+    if include_client_public_key:
+        payload["client_public_key"] = base64.b64encode(client_public_key).decode("ascii")
+
+    return payload, client_private_key, client_public_key
 
 
 def test_v2_streaming_chat_completion(client, monkeypatch):
@@ -177,6 +211,160 @@ def test_v2_encrypted_streaming_emits_encrypted_chunks(client, monkeypatch):
     assert decrypted_chunks[1]["choices"][0]["delta"]["content"] == "Hello!"
     assert decrypted_chunks[2]["choices"][0]["finish_reason"] == "stop"
 
+
+def test_v2_encrypted_streaming_requires_client_public_key(client, monkeypatch):
+    """Encrypted streaming requests should validate the presence of a client key."""
+
+    payload, _, _ = _build_encrypted_payload()
+    payload["client_public_key"] = ""
+
+    monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
+    monkeypatch.setattr(v2_routes, "generate_response", lambda *args, **kwargs: [
+        {"role": "assistant", "content": "Hello!"}
+    ])
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"]["type"] == "encryption_error"
+    assert body["error"]["message"] == "Client public key required for encrypted streaming"
+
+
+def test_v2_encrypted_streaming_rejects_invalid_client_public_key_base64(client, monkeypatch):
+    """The endpoint should reject malformed base64 client public keys."""
+
+    payload, _, _ = _build_encrypted_payload()
+    payload["client_public_key"] = "!!!not-base64!!!"
+
+    monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
+    monkeypatch.setattr(v2_routes, "generate_response", lambda *args, **kwargs: [
+        {"role": "assistant", "content": "Hello!"}
+    ])
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"]["type"] == "encryption_error"
+    assert body["error"]["message"] == "Client public key is not valid base64"
+
+
+def test_v2_encrypted_streaming_yields_error_event_on_serialization_failure(client, monkeypatch):
+    """Serialization failures should emit an explicit error envelope."""
+
+    payload, _, _ = _build_encrypted_payload()
+
+    monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
+    monkeypatch.setattr(v2_routes, "generate_response", lambda *args, **kwargs: [
+        {"role": "assistant", "content": "Hello!"}
+    ])
+
+    original_dumps = v2_routes.json.dumps
+    triggered = {"value": False}
+
+    def failing_dumps(payload, **kwargs):
+        if kwargs:
+            return original_dumps(payload, **kwargs)
+        if not triggered["value"]:
+            triggered["value"] = True
+            raise TypeError("boom")
+        return original_dumps(payload, **kwargs)
+
+    monkeypatch.setattr(v2_routes.json, "dumps", failing_dumps)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    chunks = [chunk.decode("utf-8").strip() for chunk in response.iter_encoded() if chunk.strip()]
+    assert chunks, "Expected at least one SSE chunk"
+
+    first_chunk = chunks[0]
+    assert first_chunk.startswith("data: ")
+    event_payload = json.loads(first_chunk[len("data: "):])
+    assert event_payload == {"event": "error", "reason": "serialization_failed"}
+
+
+def test_v2_encrypted_streaming_yields_error_event_on_encryption_failure(client, monkeypatch):
+    """Encryption failures should surface an informative SSE error event."""
+
+    payload, _, _ = _build_encrypted_payload()
+
+    monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
+    monkeypatch.setattr(v2_routes, "generate_response", lambda *args, **kwargs: [
+        {"role": "assistant", "content": "Hello!"}
+    ])
+
+    def failing_encrypt(*args, **kwargs):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(encrypt, "encrypt_stream_chunk", failing_encrypt)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    chunks = [chunk.decode("utf-8").strip() for chunk in response.iter_encoded() if chunk.strip()]
+    assert chunks, "Expected at least one SSE chunk"
+
+    first_chunk = chunks[0]
+    assert first_chunk.startswith("data: ")
+    event_payload = json.loads(first_chunk[len("data: "):])
+    assert event_payload == {"event": "error", "reason": "encryption_failed"}
+
+
+def test_v2_encrypted_streaming_includes_optional_envelope_fields(client, monkeypatch):
+    """Optional encryption metadata should be surfaced when provided by the cipher."""
+
+    payload, _, _ = _build_encrypted_payload()
+
+    monkeypatch.setattr(v2_routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(v2_routes, "get_model_instance", lambda model_id: object())
+    monkeypatch.setattr(v2_routes, "generate_response", lambda *args, **kwargs: [
+        {"role": "assistant", "content": "Hello!"}
+    ])
+
+    def stub_encrypt_stream_chunk(plaintext, public_key, *, session=None, **kwargs):
+        if session is None:
+            session = SimpleNamespace(associated_data=b"bound-ad")
+            return (
+                {"ciphertext": b"alpha", "iv": b"iv-1", "tag": b"tag-1", "mode": "GCM"},
+                b"key-1",
+                session,
+            )
+        return (
+            {"ciphertext": b"beta", "iv": b"iv-2", "tag": b"tag-2", "mode": "GCM"},
+            None,
+            session,
+        )
+
+    monkeypatch.setattr(encrypt, "encrypt_stream_chunk", stub_encrypt_stream_chunk)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    events = [chunk.decode("utf-8").strip() for chunk in response.iter_encoded() if chunk.strip()]
+    assert events[-1] == "data: [DONE]"
+
+    first_event = events[0]
+    assert first_event.startswith("data: ")
+    envelope = json.loads(first_event[len("data: "):])
+
+    assert envelope["encrypted"] is True
+    payload_body = envelope["data"]
+    assert payload_body["encrypted"] is True
+    assert payload_body["mode"] == "GCM"
+    assert payload_body["tag"] == base64.b64encode(b"tag-1").decode("ascii")
+    assert payload_body["associated_data"] == base64.b64encode(b"bound-ad").decode("ascii")
 
 def test_v2_streaming_with_tool_use(client, monkeypatch):
     """Streaming responses should surface tool call deltas when tools are requested."""

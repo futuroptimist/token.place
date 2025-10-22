@@ -45,7 +45,9 @@ certificates automatically:
   keys so cert-manager can provision the secret bound to the ingress.
 
 Override these values in your environment-specific `values.yaml` files so staging, production, and
-other clusters receive the expected routes and TLS secrets.
+other clusters receive the expected routes and TLS secrets. The Helm values schema now enforces that
+each host begins with `relay.` and that TLS entries include a `cert-manager.io/cluster-issuer`
+annotation plus a non-empty secret so cert-manager can mint the certificate automatically.
 
 ## GPU indirection options
 

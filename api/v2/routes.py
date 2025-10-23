@@ -11,6 +11,10 @@ import uuid
 import logging
 import os
 
+from typing import Any, Dict, Iterable, Optional
+
+import encrypt
+
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
 from api.v1.moderation import evaluate_messages_for_policy
@@ -564,26 +568,21 @@ def create_chat_completion():
                         ]
                     }
 
-                chunk_payloads = []
+                def iter_chunk_payloads() -> Iterable[tuple[str, Dict[str, Any]]]:
+                    yield "delta", build_chunk({"role": role}, None)
 
-                role_chunk = build_chunk({"role": role}, None)
-                chunk_payloads.append(("delta", role_chunk))
+                    if content_text:
+                        for content_segment in iter_stream_content_chunks(content_text):
+                            yield "delta", build_chunk({"content": content_segment}, None)
 
-                if content_text:
-                    for content_segment in iter_stream_content_chunks(content_text):
-                        content_chunk = build_chunk({"content": content_segment}, None)
-                        chunk_payloads.append(("delta", content_chunk))
+                    if tool_calls:
+                        for idx, call in enumerate(tool_calls):
+                            call_delta = {
+                                "tool_calls": [serialize_tool_call(call, idx)]
+                            }
+                            yield "delta", build_chunk(call_delta, None)
 
-                if tool_calls:
-                    for idx, call in enumerate(tool_calls):
-                        call_delta = {
-                            "tool_calls": [serialize_tool_call(call, idx)]
-                        }
-                        tool_chunk = build_chunk(call_delta, None)
-                        chunk_payloads.append(("delta", tool_chunk))
-
-                stop_chunk = build_chunk({}, finish_reason)
-                chunk_payloads.append(("delta", stop_chunk))
+                    yield "delta", build_chunk({}, finish_reason)
 
                 if is_encrypted_request:
                     log_info("Returning encrypted streaming response")
@@ -595,25 +594,68 @@ def create_chat_completion():
                             status_code=400,
                         )
 
-                    encrypted_events = []
-                    for event_name, payload in chunk_payloads:
-                        encrypted_payload = encryption_manager.encrypt_message(payload, client_public_key)
-                        if encrypted_payload is None:
-                            log_error("Failed to encrypt streaming chunk")
-                            return format_error_response(
-                                "Failed to encrypt response",
-                                error_type="encryption_error",
-                                status_code=500,
-                            )
-                        encrypted_events.append({
-                            "event": event_name,
-                            "encrypted": True,
-                            "data": encrypted_payload,
-                        })
+                    try:
+                        client_public_key_bytes = base64.b64decode(client_public_key)
+                    except (TypeError, ValueError):
+                        return format_error_response(
+                            "Client public key is not valid base64",
+                            error_type="encryption_error",
+                            status_code=400,
+                        )
+
+                    stream_session_id = f"stream-{uuid.uuid4()}"
 
                     def encrypted_event_stream():
-                        for envelope in encrypted_events:
+                        stream_session: Optional[encrypt.StreamSession] = None
+
+                        for event_name, payload in iter_chunk_payloads():
+                            try:
+                                plaintext_bytes = json.dumps(payload).encode('utf-8')
+                            except (TypeError, ValueError):
+                                log_error("Failed to serialise streaming chunk for encryption", exc_info=True)
+                                yield "data: {\"event\": \"error\", \"reason\": \"serialization_failed\"}\n\n"
+                                return
+
+                            try:
+                                ciphertext_dict, encrypted_key, stream_session = encrypt.encrypt_stream_chunk(
+                                    plaintext_bytes,
+                                    client_public_key_bytes,
+                                    session=stream_session,
+                                )
+                            except Exception:
+                                log_error("Failed to encrypt streaming chunk", exc_info=True)
+                                yield "data: {\"event\": \"error\", \"reason\": \"encryption_failed\"}\n\n"
+                                return
+
+                            payload_dict = {
+                                "encrypted": True,
+                                "ciphertext": base64.b64encode(ciphertext_dict["ciphertext"]).decode('utf-8'),
+                                "iv": base64.b64encode(ciphertext_dict["iv"]).decode('utf-8'),
+                                "stream_session_id": stream_session_id,
+                            }
+
+                            if 'tag' in ciphertext_dict:
+                                payload_dict['tag'] = base64.b64encode(ciphertext_dict['tag']).decode('utf-8')
+
+                            mode_value = ciphertext_dict.get('mode')
+                            if isinstance(mode_value, str):
+                                payload_dict['mode'] = mode_value
+
+                            session_ad = getattr(stream_session, 'associated_data', None)
+                            if session_ad:
+                                payload_dict['associated_data'] = base64.b64encode(session_ad).decode('utf-8')
+
+                            if encrypted_key is not None:
+                                payload_dict['cipherkey'] = base64.b64encode(encrypted_key).decode('utf-8')
+
+                            envelope = {
+                                "event": event_name,
+                                "encrypted": True,
+                                "stream_session_id": stream_session_id,
+                                "data": payload_dict,
+                            }
                             yield f"data: {json.dumps(envelope)}\n\n"
+
                         yield "data: [DONE]\n\n"
 
                     response = Response(
@@ -626,7 +668,7 @@ def create_chat_completion():
                 log_info("Returning streaming response")
 
                 def event_stream():
-                    for _, payload in chunk_payloads:
+                    for _, payload in iter_chunk_payloads():
                         yield f"data: {json.dumps(payload)}\n\n"
                     yield "data: [DONE]\n\n"
 

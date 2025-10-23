@@ -147,7 +147,8 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
   - `tests/unit/test_crypto_helpers_streaming.py::test_stream_chat_completion_reconnects_with_stream_session`
     verifies the client reuses encrypted sessions when reconnecting mid-stream.
 - ✅ Test different chunk sizes and timing scenarios (`tests/test_streaming.py::test_v2_streaming_handles_varied_chunk_sizes_and_delays`)
-- Verify encryption/decryption with streaming
+- ✅ Verify encryption/decryption with streaming (`tests/test_streaming.py::test_v2_encrypted_streaming_emits_encrypted_chunks`
+  asserts the `/api/v2/chat/completions` SSE envelope reuses a single stream session id and decrypts end-to-end.)
 
 #### 4.2 Integration Tests
 - ✅ Added end-to-end coverage for the streaming experience via

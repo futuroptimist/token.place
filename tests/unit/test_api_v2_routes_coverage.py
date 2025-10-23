@@ -1,11 +1,14 @@
 import importlib.util
 import json
 import sys
+import base64
+import json
 import types
 from pathlib import Path
 
 import pytest
 
+import encrypt
 from api.v1.models import ModelError
 from api.v1.validation import ValidationError
 from api.v2 import routes as v2_routes
@@ -198,6 +201,196 @@ def _allow_policy(monkeypatch):
         "evaluate_messages_for_policy",
         lambda messages: types.SimpleNamespace(allowed=True, matched_term=None, reason=None),
     )
+
+
+def _streaming_encrypted_payload():
+    return {
+        "model": "alpha",
+        "encrypted": True,
+        "stream": True,
+        "client_public_key": base64.b64encode(b"client-key").decode("ascii"),
+        "messages": {
+            "ciphertext": base64.b64encode(b"ciphertext").decode("ascii"),
+            "cipherkey": base64.b64encode(b"cipherkey").decode("ascii"),
+            "iv": base64.b64encode(b"iv").decode("ascii"),
+        },
+    }
+
+
+def _configure_encrypted_streaming(monkeypatch, *, assistant_content="Hello!"):
+    _setup_model_stubs(monkeypatch)
+    _allow_policy(monkeypatch)
+    monkeypatch.setattr(v2_routes, "validate_encrypted_request", lambda data: None)
+
+    class DummyEncryption:
+        public_key_b64 = base64.b64encode(b"server-key").decode("ascii")
+
+        def decrypt_message(self, payload, cipherkey):
+            return json.dumps(
+                [
+                    {"role": "system", "content": "You are a unit test."},
+                    {"role": "user", "content": "Say hello."},
+                ]
+            ).encode("utf-8")
+
+        def encrypt_message(self, response, client_public_key):
+            return {"ciphertext": "unused"}
+
+    monkeypatch.setattr(v2_routes, "encryption_manager", DummyEncryption())
+    monkeypatch.setattr(
+        v2_routes,
+        "generate_response",
+        lambda model_id, messages, **options: messages
+        + [{"role": "assistant", "content": assistant_content}],
+    )
+
+
+def test_chat_completion_encrypted_streaming_requires_client_key_unit(client, monkeypatch):
+    _configure_encrypted_streaming(monkeypatch)
+    payload = _streaming_encrypted_payload()
+    payload["client_public_key"] = ""
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"]["type"] == "encryption_error"
+    assert body["error"]["message"] == "Client public key required for encrypted streaming"
+
+
+def test_chat_completion_encrypted_streaming_rejects_invalid_client_key_base64(client, monkeypatch):
+    _configure_encrypted_streaming(monkeypatch)
+    payload = _streaming_encrypted_payload()
+    payload["client_public_key"] = "!!!not-base64!!!"
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"]["type"] == "encryption_error"
+    assert body["error"]["message"] == "Client public key is not valid base64"
+
+
+def test_chat_completion_encrypted_streaming_emits_encrypted_chunks_unit(client, monkeypatch):
+    _configure_encrypted_streaming(monkeypatch)
+    payload = _streaming_encrypted_payload()
+
+    calls = []
+
+    def stub_encrypt_stream_chunk(plaintext, client_key_bytes, *, session=None, **kwargs):
+        calls.append(plaintext)
+        if session is None:
+            session = types.SimpleNamespace(associated_data=b"meta-ad")
+            return (
+                {"ciphertext": b"chunk-1", "iv": b"iv-1", "tag": b"tag-1", "mode": "GCM"},
+                b"cipherkey-1",
+                session,
+            )
+        return (
+            {"ciphertext": b"chunk-2", "iv": b"iv-2"},
+            None,
+            session,
+        )
+
+    monkeypatch.setattr(encrypt, "encrypt_stream_chunk", stub_encrypt_stream_chunk)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+
+    events = [chunk.decode("utf-8").strip() for chunk in response.iter_encoded() if chunk.strip()]
+    assert events[-1] == "data: [DONE]"
+
+    first_event = events[0]
+    assert first_event.startswith("data: ")
+    envelope = json.loads(first_event[len("data: "):])
+
+    assert envelope["event"] == "delta"
+    assert envelope["encrypted"] is True
+    payload_dict = envelope["data"]
+    assert payload_dict["encrypted"] is True
+    assert base64.b64decode(payload_dict["ciphertext"]) == b"chunk-1"
+    assert base64.b64decode(payload_dict["iv"]) == b"iv-1"
+    assert base64.b64decode(payload_dict["cipherkey"]) == b"cipherkey-1"
+    assert payload_dict["mode"] == "GCM"
+    assert base64.b64decode(payload_dict["tag"]) == b"tag-1"
+    assert base64.b64decode(payload_dict["associated_data"]) == b"meta-ad"
+    assert envelope["stream_session_id"] == payload_dict["stream_session_id"]
+    assert calls, "Expected encrypt_stream_chunk to be invoked"
+
+
+def test_chat_completion_encrypted_streaming_serialization_failure_unit(client, monkeypatch):
+    _configure_encrypted_streaming(monkeypatch)
+    payload = _streaming_encrypted_payload()
+
+    standard_dumps = json.dumps
+    triggered = {"value": False}
+
+    def failing_dumps(obj, **kwargs):
+        if kwargs:
+            return standard_dumps(obj, **kwargs)
+        if not triggered["value"]:
+            triggered["value"] = True
+            raise TypeError("boom")
+        return standard_dumps(obj, **kwargs)
+
+    monkeypatch.setattr(v2_routes.json, "dumps", failing_dumps)
+
+    monkeypatch.setattr(
+        v2_routes,
+        "encryption_manager",
+        types.SimpleNamespace(
+            public_key_b64=base64.b64encode(b"server-key").decode("ascii"),
+            decrypt_message=lambda payload, cipherkey: standard_dumps(
+                [
+                    {"role": "system", "content": "You are a unit test."},
+                    {"role": "user", "content": "Say hello."},
+                ]
+            ).encode("utf-8"),
+            encrypt_message=lambda response, client_public_key: {"ciphertext": "unused"},
+        ),
+    )
+
+    def passthrough_encrypt_stream_chunk(*args, **kwargs):
+        session = kwargs.get("session")
+        if session is None:
+            session = types.SimpleNamespace(associated_data=b"")
+        return ({"ciphertext": b"chunk", "iv": b"iv"}, None, session)
+
+    monkeypatch.setattr(encrypt, "encrypt_stream_chunk", passthrough_encrypt_stream_chunk)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    chunks = [chunk.decode("utf-8").strip() for chunk in response.iter_encoded() if chunk.strip()]
+    assert chunks, "Expected at least one chunk"
+
+    first_chunk = chunks[0]
+    assert first_chunk.startswith("data: ")
+    error_payload = json.loads(first_chunk[len("data: "):])
+    assert error_payload == {"event": "error", "reason": "serialization_failed"}
+
+
+def test_chat_completion_encrypted_streaming_encryption_failure_unit(client, monkeypatch):
+    _configure_encrypted_streaming(monkeypatch)
+    payload = _streaming_encrypted_payload()
+
+    def failing_encrypt(*args, **kwargs):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(encrypt, "encrypt_stream_chunk", failing_encrypt)
+
+    response = client.post("/api/v2/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    chunks = [chunk.decode("utf-8").strip() for chunk in response.iter_encoded() if chunk.strip()]
+    assert chunks, "Expected an error chunk"
+
+    first_chunk = chunks[0]
+    assert first_chunk.startswith("data: ")
+    error_payload = json.loads(first_chunk[len("data: "):])
+    assert error_payload == {"event": "error", "reason": "encryption_failed"}
 
 
 def test_chat_completion_decrypt_failure(client, monkeypatch):

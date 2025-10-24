@@ -15,7 +15,6 @@
 
 ### Maintenance
 - Bump Playwright dev dependency to v1.55.0
-- Update pre-commit hooks: codespell to v2.4.1 and vulture to v2.14
 
 ## Version 1.0.0 (March 2025)
 

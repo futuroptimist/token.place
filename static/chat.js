@@ -446,8 +446,11 @@ new Vue({
                 combined.set(new Uint8Array(tagBuffer), ciphertextBuffer.byteLength);
 
                 let additionalData;
-                if (payload.associated_data) {
-                    const buffer = decodeBase64Buffer(payload.associated_data, 'associated_data');
+                const associatedDataB64 = typeof payload.associated_data === 'string'
+                    ? payload.associated_data
+                    : state.associatedDataB64;
+                if (typeof associatedDataB64 === 'string') {
+                    const buffer = decodeBase64Buffer(associatedDataB64, 'associated_data');
                     if (!buffer) {
                         return null;
                     }

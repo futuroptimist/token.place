@@ -96,3 +96,55 @@ def test_multiple_turns_conversation(page, base_url, setup_servers):
     print(f"Screenshot saved to {screenshot_path}")
 
     print("✓ API encryption and response verified")
+
+
+def test_chat_ui_streaming_updates_incrementally(page: Page, base_url: str, setup_servers):
+    """Verify the chat UI surfaces incremental streaming updates before completion."""
+
+    response = page.goto(base_url)
+    assert response.status == 200, f"Expected 200 OK, got {response.status}"
+
+    page.wait_for_load_state("networkidle")
+
+    recorder_script = """
+        window.__tokenPlaceStreamingRecorder = {
+            events: [],
+            done: false,
+            record(value) {
+                this.events.push(String(value));
+            },
+            complete(value) {
+                this.events.push(String(value));
+                this.done = true;
+            },
+            error(reason) {
+                this.error = String(reason);
+            }
+        };
+        true;
+    """
+    page.evaluate(recorder_script)
+
+    page.fill('textarea[aria-label="Message"]', 'Share a quick fact about Paris.')
+    page.click('button:has-text("Send")')
+
+    page.wait_for_function(
+        "() => Array.isArray(window.__tokenPlaceStreamingRecorder?.events) && window.__tokenPlaceStreamingRecorder.events.length > 0",
+        timeout=20000,
+    )
+
+    page.wait_for_function(
+        "() => window.__tokenPlaceStreamingRecorder?.done === true",
+        timeout=20000,
+    )
+
+    events = page.evaluate("window.__tokenPlaceStreamingRecorder.events.slice()");
+    assert isinstance(events, list) and len(events) >= 2
+
+    lengths = [len(str(entry)) for entry in events]
+    assert any(lengths[i] < lengths[-1] for i in range(len(lengths) - 1)), (
+        "Expected at least one intermediate streaming chunk before completion"
+    )
+
+    final_text = page.locator('.assistant-message').last.text_content()
+    assert final_text is not None and 'Mock response' in final_text

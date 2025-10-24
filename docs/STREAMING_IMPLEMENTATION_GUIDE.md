@@ -126,7 +126,7 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
   ```
 
 #### 2.2 UI Updates
-- Modify the UI to handle incremental updates
+- ✅ Modify the UI to handle incremental updates
 - ✅ Implemented a typing effect for a better user experience (`static/chat.js` + `static/chat_typing.js`)
 - ✅ Added support for rendering markdown/formatting as it arrives via a sanitized renderer in the chat UI
 

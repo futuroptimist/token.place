@@ -7,7 +7,8 @@ new Vue({
         clientPrivateKey: null,
         clientPublicKey: null,
         isGeneratingResponse: false,
-        isTouchInput: false
+        isTouchInput: false,
+        activeStreamController: null
     },
     mounted() {
         this.detectTouchInput();
@@ -94,6 +95,48 @@ new Vue({
                 binary += String.fromCharCode(bytes[i]);
             }
             return btoa(binary);
+        },
+
+        wordArrayToUint8Array(wordArray) {
+            if (!wordArray || typeof wordArray.sigBytes !== 'number') {
+                return new Uint8Array();
+            }
+            const { words, sigBytes } = wordArray;
+            const buffer = new Uint8Array(sigBytes);
+            for (let i = 0; i < sigBytes; i++) {
+                buffer[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff;
+            }
+            return buffer;
+        },
+
+        notifyStreamingRecorder(payload, options = {}) {
+            if (typeof window === 'undefined') {
+                return;
+            }
+            const hook = window.__tokenPlaceStreamingRecorder;
+            if (!hook || typeof hook !== 'object') {
+                return;
+            }
+            try {
+                if (options.error && typeof hook.error === 'function') {
+                    hook.error(String(options.error));
+                }
+                if (options.done && typeof hook.complete === 'function') {
+                    hook.complete(payload ?? '');
+                    if (Array.isArray(hook.events)) {
+                        hook.events.push(payload ?? '');
+                    }
+                    hook.done = true;
+                    return;
+                }
+                if (typeof hook.record === 'function') {
+                    hook.record(payload ?? '');
+                } else if (Array.isArray(hook.events)) {
+                    hook.events.push(payload ?? '');
+                }
+            } catch (error) {
+                console.warn('Streaming recorder hook failed:', error);
+            }
         },
 
         // Extract the Base64 content from PEM format
@@ -324,6 +367,205 @@ new Vue({
             }
         },
 
+        createStreamDecryptor() {
+            const jsEncrypt = new JSEncrypt();
+            jsEncrypt.setPrivateKey(this.clientPrivateKey);
+
+            const state = {
+                mode: null,
+                aesKey: null,
+                associatedDataB64: null,
+                usedIvs: new Set(),
+                gcmKeyPromise: null
+            };
+
+            const decodeBase64Buffer = (value, fieldName) => {
+                if (typeof value !== 'string' || !value) {
+                    console.error(`Streaming chunk missing ${fieldName}`);
+                    return null;
+                }
+                const buffer = this.base64ToArrayBuffer(value);
+                if (!buffer) {
+                    console.error(`Failed to decode ${fieldName} for streaming chunk`);
+                    return null;
+                }
+                return buffer;
+            };
+
+            const ensureGcmKey = async () => {
+                if (state.mode !== 'GCM') {
+                    return null;
+                }
+                if (!state.gcmKeyPromise) {
+                    if (typeof window === 'undefined' || !window.crypto || !window.crypto.subtle) {
+                        throw new Error('Web Crypto API not available for AES-GCM');
+                    }
+                    const rawKey = this.wordArrayToUint8Array(state.aesKey);
+                    state.gcmKeyPromise = window.crypto.subtle.importKey(
+                        'raw',
+                        rawKey,
+                        { name: 'AES-GCM' },
+                        false,
+                        ['decrypt']
+                    );
+                }
+                return state.gcmKeyPromise;
+            };
+
+            const parseDecryptedText = (text) => {
+                if (typeof text !== 'string') {
+                    return text;
+                }
+                try {
+                    return JSON.parse(text);
+                } catch (_) {
+                    return text;
+                }
+            };
+
+            const normaliseMode = (value) => {
+                if (typeof value === 'string' && value.trim()) {
+                    return value.trim().toUpperCase();
+                }
+                return 'CBC';
+            };
+
+            const decryptGcmChunk = async (payload) => {
+                const ciphertextBuffer = decodeBase64Buffer(payload.ciphertext, 'ciphertext');
+                const ivBuffer = decodeBase64Buffer(payload.iv, 'iv');
+                const tagBuffer = decodeBase64Buffer(payload.tag, 'tag');
+                if (!ciphertextBuffer || !ivBuffer || !tagBuffer) {
+                    return null;
+                }
+                const cryptoKey = await ensureGcmKey();
+                if (!cryptoKey) {
+                    return null;
+                }
+                const combined = new Uint8Array(ciphertextBuffer.byteLength + tagBuffer.byteLength);
+                combined.set(new Uint8Array(ciphertextBuffer), 0);
+                combined.set(new Uint8Array(tagBuffer), ciphertextBuffer.byteLength);
+
+                let additionalData;
+                if (payload.associated_data) {
+                    const buffer = decodeBase64Buffer(payload.associated_data, 'associated_data');
+                    if (!buffer) {
+                        return null;
+                    }
+                    additionalData = new Uint8Array(buffer);
+                }
+
+                try {
+                    const decryptedBuffer = await window.crypto.subtle.decrypt(
+                        {
+                            name: 'AES-GCM',
+                            iv: new Uint8Array(ivBuffer),
+                            additionalData: additionalData,
+                            tagLength: 128
+                        },
+                        cryptoKey,
+                        combined
+                    );
+                    const decoded = new TextDecoder().decode(decryptedBuffer);
+                    return parseDecryptedText(decoded);
+                } catch (error) {
+                    console.error('AES-GCM decryption failed', error);
+                    return null;
+                }
+            };
+
+            const decryptCbcChunk = (payload) => {
+                const ciphertextWordArray = CryptoJS.enc.Base64.parse(payload.ciphertext);
+                const ivWordArray = CryptoJS.enc.Base64.parse(payload.iv);
+                const decrypted = CryptoJS.AES.decrypt(
+                    { ciphertext: ciphertextWordArray },
+                    state.aesKey,
+                    {
+                        iv: ivWordArray,
+                        mode: CryptoJS.mode.CBC,
+                        padding: CryptoJS.pad.Pkcs7
+                    }
+                );
+                const text = CryptoJS.enc.Utf8.stringify(decrypted);
+                return parseDecryptedText(text);
+            };
+
+            return {
+                async decrypt(payload) {
+                    if (!payload || typeof payload !== 'object') {
+                        return null;
+                    }
+
+                    const mode = normaliseMode(payload.mode || (payload.tag ? 'GCM' : state.mode));
+                    const isFirstChunk = !state.aesKey;
+
+                    if (isFirstChunk) {
+                        if (typeof payload.cipherkey !== 'string' || !payload.cipherkey) {
+                            console.error('Streaming chunk missing cipherkey for first payload');
+                            return null;
+                        }
+                        const decryptedKeyBase64 = jsEncrypt.decrypt(payload.cipherkey);
+                        if (!decryptedKeyBase64) {
+                            console.error('Failed to decrypt streaming cipher key');
+                            return null;
+                        }
+                        state.aesKey = CryptoJS.enc.Base64.parse(decryptedKeyBase64);
+                        state.mode = mode;
+                        state.usedIvs.clear();
+                        state.associatedDataB64 = typeof payload.associated_data === 'string'
+                            ? payload.associated_data
+                            : null;
+                        state.gcmKeyPromise = null;
+                    } else {
+                        if (typeof payload.cipherkey === 'string' && payload.cipherkey) {
+                            console.warn('Ignoring unexpected cipherkey on subsequent streaming chunk');
+                        }
+                        if (mode !== state.mode) {
+                            console.error('Streaming cipher mode mismatch');
+                            return null;
+                        }
+                        if (state.associatedDataB64 !== null) {
+                            const incoming = typeof payload.associated_data === 'string'
+                                ? payload.associated_data
+                                : null;
+                            if (incoming !== null && incoming !== state.associatedDataB64) {
+                                console.error('Streaming associated_data mismatch');
+                                return null;
+                            }
+                        }
+                    }
+
+                    if (typeof payload.iv !== 'string' || typeof payload.ciphertext !== 'string') {
+                        console.error('Streaming chunk missing ciphertext or iv');
+                        return null;
+                    }
+
+                    if (state.usedIvs.has(payload.iv)) {
+                        console.error('Repeated IV detected in streaming payload');
+                        return null;
+                    }
+                    state.usedIvs.add(payload.iv);
+
+                    if (state.mode === 'GCM') {
+                        if (typeof payload.tag !== 'string') {
+                            console.error('AES-GCM streaming chunk missing authentication tag');
+                            return null;
+                        }
+                        return decryptGcmChunk(payload);
+                    }
+
+                    return decryptCbcChunk(payload);
+                },
+
+                reset() {
+                    state.mode = null;
+                    state.aesKey = null;
+                    state.associatedDataB64 = null;
+                    state.usedIvs.clear();
+                    state.gcmKeyPromise = null;
+                }
+            };
+        },
+
         // Send a message to the server using the new API
         async sendMessageApi() {
             if (!this.serverPublicKey) {
@@ -486,6 +728,357 @@ new Vue({
             return message.content;
         },
 
+        extractTextFromChunk(data) {
+            const parts = [];
+            const visit = (value) => {
+                if (value === null || value === undefined) {
+                    return;
+                }
+                if (typeof value === 'string') {
+                    if (value.length > 0) {
+                        parts.push(value);
+                    }
+                    return;
+                }
+                if (Array.isArray(value)) {
+                    value.forEach(visit);
+                    return;
+                }
+                if (typeof value === 'object') {
+                    if (typeof value.content === 'string') {
+                        visit(value.content);
+                    }
+                    if (typeof value.text === 'string') {
+                        visit(value.text);
+                    }
+                    if (typeof value.delta === 'object') {
+                        visit(value.delta);
+                    }
+                    if (typeof value.message === 'object') {
+                        visit(value.message);
+                    }
+                    if (value.data !== undefined) {
+                        visit(value.data);
+                    }
+                    if (Array.isArray(value.choices)) {
+                        value.choices.forEach(visit);
+                    }
+                }
+            };
+            visit(data);
+            return parts.join('');
+        },
+
+        extractFinishReason(data) {
+            if (!data || typeof data !== 'object') {
+                return null;
+            }
+            if (typeof data.finish_reason === 'string') {
+                return data.finish_reason;
+            }
+            const choices = Array.isArray(data.choices) ? data.choices : [];
+            for (const choice of choices) {
+                if (!choice || typeof choice !== 'object') {
+                    continue;
+                }
+                if (typeof choice.finish_reason === 'string') {
+                    return choice.finish_reason;
+                }
+                if (choice.delta && typeof choice.delta.finish_reason === 'string') {
+                    return choice.delta.finish_reason;
+                }
+            }
+            return null;
+        },
+
+        applyStreamingDelta(entry, eventName, payload) {
+            if (!entry) {
+                return { appended: false, finished: false };
+            }
+
+            if (eventName === 'error') {
+                const reason = typeof payload === 'string'
+                    ? payload
+                    : (payload && payload.message) || 'Unknown streaming error';
+                throw new Error(reason);
+            }
+
+            let appended = false;
+            const current = typeof entry.displayContent === 'string'
+                ? entry.displayContent
+                : (entry.content || '');
+
+            if (typeof payload === 'string') {
+                if (payload.length > 0) {
+                    const nextText = current + payload;
+                    entry.displayContent = nextText;
+                    entry.content = nextText;
+                    this.notifyStreamingRecorder(nextText);
+                    appended = true;
+                }
+            } else if (payload && typeof payload === 'object') {
+                const text = this.extractTextFromChunk(payload);
+                if (text) {
+                    const nextText = current + text;
+                    entry.displayContent = nextText;
+                    entry.content = nextText;
+                    this.notifyStreamingRecorder(nextText);
+                    appended = true;
+                }
+            }
+
+            if (appended) {
+                this.$nextTick(() => {
+                    if (!this.$el || typeof this.$el.querySelector !== 'function') {
+                        return;
+                    }
+                    const container = this.$el.querySelector('.chat-container');
+                    if (container) {
+                        container.scrollTop = container.scrollHeight;
+                    }
+                });
+            }
+
+            const finishReason = this.extractFinishReason(payload);
+            if (finishReason && !entry.finish_reason) {
+                entry.finish_reason = finishReason;
+            }
+
+            return { appended, finished: Boolean(finishReason) };
+        },
+
+        async processStreamingResponse(historySnapshot, entry, controller) {
+            if (!Array.isArray(historySnapshot) || historySnapshot.length === 0) {
+                return false;
+            }
+            if (!this.serverPublicKey || !this.clientPublicKey) {
+                return false;
+            }
+
+            try {
+                const encryptedHistory = await this.encrypt(
+                    JSON.stringify(historySnapshot),
+                    this.serverPublicKey
+                );
+
+                if (!encryptedHistory) {
+                    throw new Error('Failed to encrypt chat history for streaming request');
+                }
+
+                const payload = {
+                    model: 'llama-3-8b-instruct',
+                    encrypted: true,
+                    stream: true,
+                    client_public_key: this.extractBase64(this.clientPublicKey),
+                    messages: encryptedHistory
+                };
+
+                const fetchOptions = {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                };
+
+                if (controller && controller.signal) {
+                    fetchOptions.signal = controller.signal;
+                }
+
+                const response = await fetch('/api/v2/chat/completions', fetchOptions);
+
+                if (!response.ok) {
+                    let errorMessage = `Streaming request failed with status ${response.status}`;
+                    try {
+                        const errorPayload = await response.json();
+                        if (errorPayload && errorPayload.error && errorPayload.error.message) {
+                            errorMessage = errorPayload.error.message;
+                        }
+                    } catch (_) {
+                        // ignore JSON parse failures
+                    }
+                    throw new Error(errorMessage);
+                }
+
+                const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
+                if (!contentType.includes('text/event-stream')) {
+                    try {
+                        const fallbackData = await response.json();
+                        if (
+                            fallbackData &&
+                            fallbackData.choices &&
+                            fallbackData.choices.length > 0 &&
+                            fallbackData.choices[0].message &&
+                            typeof fallbackData.choices[0].message.content === 'string'
+                        ) {
+                            entry.isStreaming = false;
+                            entry.displayContent = fallbackData.choices[0].message.content;
+                            entry.content = entry.displayContent;
+                            this.notifyStreamingRecorder(entry.content, { done: true });
+                            if (typeof this.$delete === 'function') {
+                                this.$delete(entry, 'displayContent');
+                            } else {
+                                delete entry.displayContent;
+                            }
+                            return true;
+                        }
+                    } catch (error) {
+                        console.warn('Failed to parse non-streaming response:', error);
+                    }
+                    return false;
+                }
+
+                if (!response.body || typeof response.body.getReader !== 'function') {
+                    throw new Error('Streaming response body unavailable');
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                const decryptor = this.createStreamDecryptor();
+                let buffer = '';
+                let sawContent = false;
+                let streamComplete = false;
+
+                const consumeDataString = async (dataStr, eventHint) => {
+                    if (!dataStr) {
+                        return;
+                    }
+                    if (dataStr === '[DONE]') {
+                        streamComplete = true;
+                        return;
+                    }
+
+                    let payload;
+                    try {
+                        payload = JSON.parse(dataStr);
+                    } catch (_) {
+                        const nextText = (entry.displayContent || entry.content || '') + dataStr;
+                        entry.displayContent = nextText;
+                        entry.content = nextText;
+                        this.notifyStreamingRecorder(nextText);
+                        sawContent = true;
+                        return;
+                    }
+
+                    const eventName = (payload && typeof payload.event === 'string' && payload.event)
+                        ? payload.event
+                        : (eventHint || 'chunk');
+
+                    let decryptedPayload = null;
+                    if (payload && payload.encrypted === true) {
+                        decryptedPayload = await decryptor.decrypt(payload.data || {});
+                    } else if (
+                        payload &&
+                        payload.data &&
+                        payload.data.encrypted === true
+                    ) {
+                        const encryptedBody = payload.data.data || payload.data;
+                        decryptedPayload = await decryptor.decrypt(encryptedBody || {});
+                    }
+
+                    if (decryptedPayload !== null) {
+                        const { appended } = this.applyStreamingDelta(entry, eventName, decryptedPayload);
+                        sawContent = sawContent || appended;
+                        return;
+                    }
+
+                    const payloadData = payload && payload.data !== undefined
+                        ? payload.data
+                        : payload;
+                    const { appended } = this.applyStreamingDelta(entry, eventName, payloadData);
+                    sawContent = sawContent || appended;
+                };
+
+                while (!streamComplete) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    buffer += decoder.decode(value, { stream: true });
+
+                    let boundary = buffer.indexOf('\n\n');
+                    while (boundary !== -1) {
+                        const rawEvent = buffer.slice(0, boundary);
+                        buffer = buffer.slice(boundary + 2);
+
+                        const lines = rawEvent.split('\n');
+                        const dataLines = [];
+                        let eventHint = null;
+                        for (const line of lines) {
+                            if (line.startsWith('data:')) {
+                                dataLines.push(line.slice(5).trim());
+                            } else if (line.startsWith('event:')) {
+                                eventHint = line.slice(6).trim();
+                            }
+                        }
+
+                        const dataStr = dataLines.join('\n');
+                        if (dataStr) {
+                            await consumeDataString(dataStr, eventHint);
+                        }
+
+                        if (streamComplete) {
+                            break;
+                        }
+
+                        boundary = buffer.indexOf('\n\n');
+                    }
+                }
+
+                entry.isStreaming = false;
+                if (typeof entry.displayContent === 'string') {
+                    entry.content = entry.displayContent;
+                }
+                this.notifyStreamingRecorder(entry.content || '', { done: true });
+                if (typeof this.$delete === 'function' && entry.displayContent !== undefined) {
+                    this.$delete(entry, 'displayContent');
+                } else {
+                    delete entry.displayContent;
+                }
+                return sawContent;
+            } catch (error) {
+                console.error('Streaming chat completion failed:', error);
+                this.notifyStreamingRecorder('', { error: error });
+                return false;
+            }
+        },
+
+        async sendStreamingMessage(historySnapshot) {
+            const assistantEntry = {
+                role: 'assistant',
+                content: '',
+                displayContent: '',
+                isStreaming: true
+            };
+
+            this.chatHistory.push(assistantEntry);
+
+            const controller = typeof AbortController !== 'undefined'
+                ? new AbortController()
+                : null;
+            this.activeStreamController = controller;
+
+            try {
+                const streamed = await this.processStreamingResponse(
+                    historySnapshot,
+                    assistantEntry,
+                    controller
+                );
+
+                if (!streamed) {
+                    const index = this.chatHistory.indexOf(assistantEntry);
+                    if (index !== -1) {
+                        this.chatHistory.splice(index, 1);
+                    }
+                    return false;
+                }
+
+                return true;
+            } finally {
+                if (this.activeStreamController === controller) {
+                    this.activeStreamController = null;
+                }
+            }
+        },
+
 
 
         // Send a message to the server
@@ -503,6 +1096,12 @@ new Vue({
             });
 
             try {
+                const historySnapshot = this.chatHistory.slice();
+                const streamed = await this.sendStreamingMessage(historySnapshot);
+                if (streamed) {
+                    return;
+                }
+
                 // Send the message via the API
                 let response = await this.sendMessageApi();
 

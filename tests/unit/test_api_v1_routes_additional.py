@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 import pytest
 
@@ -111,3 +112,33 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
         and "Routing alias model 'gpt-5-chat-latest'" in str(call.args[0])
         for call in mock_log_info.call_args_list
     )
+
+
+def test_chat_completion_echoes_request_metadata(client, monkeypatch):
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'Hello'}],
+        'metadata': {'client': 'dspace', 'conversation_id': 'conv-99'},
+    }
+
+    monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr(routes, 'validate_model_name', lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, 'get_model_instance', lambda model_id: object())
+    monkeypatch.setattr(routes, 'resolve_model_alias', lambda model_id: None)
+    monkeypatch.setattr(
+        routes,
+        'evaluate_messages_for_policy',
+        lambda messages: SimpleNamespace(allowed=True),
+    )
+
+    def _generate(model_id, messages):
+        assert model_id == 'llama-3-8b-instruct'
+        return messages + [{'role': 'assistant', 'content': 'Mock reply'}]
+
+    monkeypatch.setattr(routes, 'generate_response', _generate)
+
+    response = client.post('/api/v1/chat/completions', json=payload)
+    assert response.status_code == 200
+
+    body = response.get_json()
+    assert body['metadata'] == payload['metadata']

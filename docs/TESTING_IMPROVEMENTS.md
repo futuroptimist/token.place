@@ -124,6 +124,8 @@ python -m pytest --cov=. --cov-report=term-missing
 - `test_dspace_can_request_gpt5_alias` to ensure the compatibility alias resolves correctly.
 - `test_dspace_receives_usage_metrics` to assert that chat completion responses surface non-negative
   token usage counters required by DSPACE's UI telemetry.
+- ✅ `test_dspace_metadata_round_trip` ensures chat completions echo request metadata so DSPACE
+  can correlate responses with active conversations.
 
 These tests run automatically inside `run_all_tests.sh`, exercising the mock relay path that DSPACE
 uses in production and giving us confidence that token.place remains a drop-in replacement for
@@ -454,7 +456,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 3. ✅ Failure and Recovery Testing - To ensure the system is robust
 4. ✅ Parameterized Tests - To verify functionality across different configurations
 5. ✅ Security Tests - To identify potential vulnerabilities
-6. Real-World Integration Testing - To validate practical usability and API compatibility
+6. ✅ Real-World Integration Testing - To validate practical usability and API compatibility
 
 ## Notes for Implementation
 

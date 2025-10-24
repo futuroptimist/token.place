@@ -98,3 +98,20 @@ def test_dspace_receives_usage_metrics():
         assert isinstance(prompt_tokens, int) and prompt_tokens >= 0
         assert isinstance(completion_tokens, int) and completion_tokens >= 0
         assert isinstance(total_tokens, int) and total_tokens == prompt_tokens + completion_tokens
+
+
+def test_dspace_metadata_round_trip():
+    """Metadata should round-trip so DSPACE can track the active conversation."""
+
+    with start_relay_with_mock():
+        payload = _base_dspace_payload()
+        payload["metadata"] = {"client": "dspace", "conversation_id": "conv-42"}
+
+        response = _post_dspace_chat(payload)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+        assert body.get("metadata") == payload["metadata"], (
+            "Chat completion should echo request metadata for caller correlation"
+        )

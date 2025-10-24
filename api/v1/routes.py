@@ -321,6 +321,10 @@ def _handle_chat_completion_request(data):
             },
         }
 
+        request_metadata = data.get("metadata")
+        if isinstance(request_metadata, dict) and request_metadata:
+            response_data["metadata"] = request_metadata
+
         if is_encrypted_request and client_public_key:
             log_info("Encrypting response for client")
             encrypted_response = encryption_manager.encrypt_message(response_data, client_public_key)

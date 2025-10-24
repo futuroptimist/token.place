@@ -178,7 +178,9 @@ All unit tests pass successfully on all platforms.
 
 **Notes**:
 - UI tests require a running server on localhost:5010
-- Streaming tests are skipped as that feature is still in development
+- Streaming tests now run across supported platforms via `tests/test_streaming.py` and the
+  Playwright coverage in `tests/test_e2e_conversation_flow.py` (see
+  `test_streaming_chat_completion_end_to_end` for the full relay/server stack).
 - End-to-end network tests require multiple components to be running
 
 ## Simplified Encryption with CryptoClient

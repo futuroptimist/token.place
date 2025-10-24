@@ -22,6 +22,8 @@ token.place uses several types of tests to ensure functionality, security, and p
 
 ### Unit Tests
 
+**Pytest marker**: `unit`
+
 Unit tests verify individual components in isolation. Run with:
 
 ```sh
@@ -34,6 +36,8 @@ cryptography remains robust.
 
 ### Integration Tests
 
+**Pytest marker**: `integration`
+
 Integration tests verify that components work together correctly:
 
 ```sh
@@ -41,6 +45,8 @@ python -m pytest tests/integration/
 ```
 
 ### End-to-End (E2E) Tests
+
+**Pytest marker**: `e2e`
 
 E2E tests validate complete user workflows:
 
@@ -50,6 +56,8 @@ python -m pytest tests/test_e2e_*.py
 
 ### Visual Verification Tests
 
+**Pytest marker**: `visual`
+
 Visual verification tests ensure UI consistency:
 
 ```sh
@@ -58,11 +66,91 @@ python -m pytest tests/visual_verification/ -m visual
 
 ### Real LLM Tests
 
+**Pytest marker**: `real_llm`
+
 Tests using actual LLM models:
+
+```sh
+python -m pytest -m real_llm
+```
+
+These suites download and run large models. They are disabled in CI by default and
+should only be exercised when the necessary hardware and network bandwidth are
+available. To run just the dedicated files, execute:
 
 ```sh
 python -m pytest tests/test_real_llm.py tests/test_real_llm_validation.py -v
 ```
+
+### API Tests
+
+**Pytest marker**: `api`
+
+API tests validate the OpenAI-compatible HTTP surface.
+
+```sh
+python -m pytest -m api
+```
+
+`tests/test_api.py` and `tests/test_server.py` cover routing, schema validation, and
+error responses. The marker allows you to focus on HTTP behaviour without running the
+broader suites.
+
+### Crypto Tests
+
+**Pytest marker**: `crypto`
+
+Crypto tests exercise encryption, decryption, and streaming helpers across Python and
+JavaScript implementations.
+
+```sh
+python -m pytest -m crypto
+```
+
+Representative files include `tests/test_crypto_compatibility.py`,
+`tests/test_crypto_browser_matrix.py`, and `tests/test_streaming.py`.
+
+### Browser Tests
+
+**Pytest marker**: `browser`
+
+Browser tests rely on Playwright to validate encryption flows inside Chromium, Firefox,
+and WebKit.
+
+```sh
+python -m pytest -m browser
+```
+
+Ensure `playwright install --with-deps chromium` has been run so the browsers and
+system libraries are available locally.
+
+### JavaScript Tests
+
+**Pytest marker**: `js`
+
+JavaScript compatibility tests run via Node.js to exercise the reference crypto client
+and mock server.
+
+```sh
+npm run test:js
+```
+
+This script executes `tests/test_js_crypto.js`, `tests/test_js_mock_server.js`,
+`tests/test_chat_typing_effect.js`, and the TypeScript harness at
+`tests/test_token_place_client.ts`.
+
+### Slow Tests
+
+**Pytest marker**: `slow`
+
+Slow tests cover stress scenarios that take noticeably longer than the default suites.
+
+```sh
+python -m pytest -m slow
+```
+
+`tests/test_stress_streaming.py` is the primary example, iterating through dozens of
+encrypted stream cycles to catch performance regressions.
 
 ## User Journeys and E2E Testing
 
@@ -232,6 +320,8 @@ token.place uses pytest markers to categorize tests:
 - `failure`: Failure recovery tests
 - `e2e`: End-to-end tests
 - `parametrize`: Parameterized tests
+- `real_llm`: Real-model integration tests that download and run large checkpoints
+- `security`: Security automation such as dependency audits and Bandit scans
 
 To run tests with a specific marker:
 
@@ -241,29 +331,42 @@ python -m pytest -m marker_name
 
 ## Specialized Test Suites
 
-### Performance Benchmarks
+### Performance Benchmarks (`benchmark`)
 
 ```sh
-python -m pytest tests/test_performance_benchmarks.py
+python -m pytest -m benchmark
 ```
 
-### Failure Recovery Tests
+Use this marker to focus on throughput and latency measurements in
+`tests/test_performance_benchmarks.py`.
+
+### Failure Recovery Tests (`failure`)
 
 ```sh
-python -m pytest tests/test_failure_recovery.py
+python -m pytest -m failure
 ```
 
-### Parameterized Tests
+These suites in `tests/test_failure_recovery.py` validate graceful handling of
+disconnected relays, corrupted ciphertext, and other operational hazards.
+
+### Parameterized Tests (`parametrize`)
 
 ```sh
-python -m pytest tests/test_parameterized.py
+python -m pytest -m parametrize
 ```
 
-### Security Tests
+The marker isolates combinatorial suites such as `tests/test_parameterized.py`, which
+exercise multiple payload shapes, encodings, and key sizes.
+
+### Security Tests (`security`)
 
 ```sh
-python -m pytest tests/test_security.py
+python -m pytest -m security
 ```
+
+This targets tooling-backed security coverage including
+`tests/unit/test_dependency_audit.py` and `tests/test_security_bandit.py`. They enforce
+dependency baselines and static-analysis gates.
 
 ### Running all tests
 

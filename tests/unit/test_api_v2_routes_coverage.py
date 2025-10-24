@@ -279,7 +279,7 @@ def test_chat_completion_encrypted_streaming_emits_encrypted_chunks_unit(client,
 
     def stub_encrypt_stream_chunk(plaintext, client_key_bytes, *, session=None, **kwargs):
         assert isinstance(client_key_bytes, (bytes, bytearray))
-        calls.append(plaintext)
+        calls.append((plaintext, client_key_bytes))
         if session is None:
             session = types.SimpleNamespace(associated_data=b"meta-ad")
             return (

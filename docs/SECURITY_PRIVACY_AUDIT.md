@@ -111,7 +111,7 @@ review signal during CI runs.
 - Periodically supplement automated scans with human-led reviews to capture logic flaws
   beyond static analysis.
 
-### [2025-10-30] - commit TBD
+### [2025-10-30] - commit 2e8eb08c8d58febf7946fffb1c646743ab35471e
 
 **Summary**
 Closed the outstanding dependency-audit action item by introducing a lightweight

@@ -466,4 +466,6 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
     exercising the streaming encryption helpers through 64 sequential chunk encrypt/decrypt cycles.
   - Introduced `utils/testing/stress.py::run_stream_encryption_stress_test` so maintainers can
     reuse the stress harness when tuning performance thresholds.
-- Add documentation for each test type
+- ✅ Documented each pytest marker in `docs/TESTING.md`, adding run commands for every
+  test category (`unit`, `api`, `crypto`, `browser`, `js`, `slow`, `benchmark`,
+  `failure`, `parametrize`, `visual`, `e2e`, `real_llm`, and `security`).

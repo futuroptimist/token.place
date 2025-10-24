@@ -383,8 +383,9 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
      echo "Setting up Python virtual environment..."
      python -m venv env
      source env/bin/activate
+     pip install -r config/requirements_server.txt
+     pip install -r config/requirements_relay.txt
      pip install -r requirements.txt
-     pip install -r requirements-dev.txt
    else
      source env/bin/activate
    fi

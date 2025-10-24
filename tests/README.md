@@ -84,8 +84,9 @@ Some tests (particularly Playwright tests) require additional setup or running s
    ```
 4. All Python dependencies installed:
    ```bash
+   pip install -r config/requirements_server.txt
+   pip install -r config/requirements_relay.txt
    pip install -r requirements.txt
-   pip install -r requirements-dev.txt
    ```
 5. All Node.js dependencies installed:
    ```bash

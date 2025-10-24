@@ -45,7 +45,8 @@ Initial audit establishing baseline security and privacy posture.
   `TOKEN_PLACE_RELAY_SERVER_TOKEN` environment variable workflow.
 
 **Recommendations**
-- Add rate limiting to protect against DoS attacks.
+- ✅ (2025-10-23) Added OpenAI-style JSON rate limit responses with `Retry-After` headers,
+  verified by `tests/unit/test_rate_limit.py::test_rate_limit_uses_openai_style_error_payload`.
 - Streaming implementation delivered (2025-09-30); continue planning for key rotation and a dedicated cryptographic audit.
 - Consider zero-knowledge architecture, formal verification, and an external security review.
 

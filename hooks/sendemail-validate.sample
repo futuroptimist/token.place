@@ -62,7 +62,7 @@ then
         then
                 remote=$(git config --default origin --get sendemail.validateRemote) &&
                 ref=$(git config --default HEAD --get sendemail.validateRemoteRef) &&
-                worktree=$(mktemp --tmpdir -d sendemail-validate.XXXXXXX) &&
+                worktree=$(mktemp -d "${TMPDIR:-/tmp}/sendemail-validate.XXXXXXX") &&
                 git worktree add -fd --checkout "$worktree" "refs/remotes/$remote/$ref" &&
                 git config --replace-all sendemail.validateWorktree "$worktree"
         else

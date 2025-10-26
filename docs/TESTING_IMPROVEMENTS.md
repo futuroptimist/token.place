@@ -140,6 +140,9 @@ Implement deeper integration tests with the [DSPACE project](https://github.com/
   `/v1` alias, and proves encrypted chat completions decrypt correctly. This gives us confidence
   that DSPACE's browser bundler can rely on the documented client contract before wiring up the
   full app.
+- ✅ Exercised the official OpenAI JavaScript SDK via `tests/integration/test_dspace_openai_sdk.py`
+  and `tests/test_openai_js_sdk.ts`, booting the relay in mock mode and verifying the SDK can
+  call token.place's `/v1` alias without code changes.
 
 ### Setup:
 

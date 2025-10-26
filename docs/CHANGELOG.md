@@ -9,7 +9,8 @@
 
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input
-- Remove unused imports from simplified CLI client to avoid unnecessary dependencies
+- Remove unused imports from simplified CLI client to avoid unnecessary dependencies,
+  enforced by `tests/unit/test_client_simplified_imports.py`
 - Handle EOF in simplified CLI client to end sessions cleanly
 - Deep copy default configuration to prevent cross-test mutations
 

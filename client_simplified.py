@@ -5,7 +5,6 @@ Uses the CryptoClient helper to handle encryption and API communication
 
 import argparse
 import sys
-from typing import List, Dict
 
 # Import our CryptoClient
 from utils.crypto_helpers import CryptoClient
@@ -26,13 +25,13 @@ ROLE_COLORS = {
 }
 
 
-def format_message(message: Dict) -> str:
+def format_message(message: dict[str, str]) -> str:
     """Format a message for display."""
     role = message["role"].capitalize()
     color = ROLE_COLORS.get(role, "1;33")
     return f"\033[{color}m{role}: \033[0m{message['content']}"
 
-def display_conversation(messages: List[Dict]):
+def display_conversation(messages: list[dict[str, str]]) -> None:
     """Display the conversation history"""
     clear_screen()
     print("\033[1;36m=== token.place Chat ===\033[0m\n")
@@ -42,7 +41,7 @@ def display_conversation(messages: List[Dict]):
 
 def chat_loop(client: CryptoClient):
     """Main chat loop for interactive conversation"""
-    conversation = []
+    conversation: list[dict[str, str]] = []
 
     # Fetch server public key
     print("Connecting to server...")

@@ -172,7 +172,8 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
 - ✅ Verify that partial responses cannot be intercepted or modified
   - Covered by `tests/unit/test_crypto_helpers_streaming.py::test_stream_chat_completion_flags_tampered_encrypted_chunks`,
     which simulates a tampered ciphertext chunk and asserts the streaming client emits a `decrypt_failed` error event.
-- Consider rate limiting and denial-of-service protections
+- ✅ Enforce dedicated rate limiting and denial-of-service protections via
+  the `API_STREAM_RATE_LIMIT` guard on `/api/v2/chat/completions`
 
 ## Technical Challenges
 

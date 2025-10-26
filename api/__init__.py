@@ -1,7 +1,7 @@
 """token.place API package."""
 
 import os
-from flask import jsonify
+from flask import jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
@@ -58,5 +58,33 @@ def init_app(app):
     app.register_blueprint(v1_routes.openai_v1_bp)
     app.register_blueprint(v2_routes.v2_bp)
     app.register_blueprint(v2_routes.openai_v2_bp)
+
+    stream_limit_value = os.environ.get("API_STREAM_RATE_LIMIT", "30/minute").strip()
+
+    if stream_limit_value:
+        def _stream_limit_exempt() -> bool:
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return True
+            return not bool(data.get("stream"))
+
+        shared_stream_limit = limiter.shared_limit(
+            stream_limit_value,
+            scope="chat-completions-stream",
+            methods=["POST"],
+            per_method=True,
+            exempt_when=_stream_limit_exempt,
+            override_defaults=False,
+        )
+
+        for endpoint in (
+            "v2.create_chat_completion",
+            "openai_v2.create_chat_completion_openai",
+        ):
+            view_func = app.view_functions.get(endpoint)
+            if view_func and not getattr(view_func, "_stream_rate_limit_attached", False):
+                decorated = shared_stream_limit(view_func)
+                setattr(decorated, "_stream_rate_limit_attached", True)
+                app.view_functions[endpoint] = decorated
 
     return limiter

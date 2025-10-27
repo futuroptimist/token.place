@@ -71,6 +71,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | Variable        | Default      | Description                                                        |
 |-----------------|--------------|--------------------------------------------------------------------|
 | API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
+| API_STREAM_RATE_LIMIT | 30/minute   | Per-IP rate limit applied only to streaming chat completions          |
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |

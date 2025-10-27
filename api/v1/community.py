@@ -63,6 +63,32 @@ def _load_raw_directory() -> Dict[str, Any]:
         raise CommunityDirectoryError("Invalid community provider directory JSON") from exc
 
 
+def _normalise_endpoints(endpoints: Any) -> List[Dict[str, str]]:
+    """Coerce endpoint payloads into ``{"type", "url"}`` dictionaries."""
+
+    if not isinstance(endpoints, list):
+        return []
+
+    normalised: List[Dict[str, str]] = []
+    for entry in endpoints:
+        if not isinstance(entry, dict):
+            continue
+        endpoint_type = entry.get("type")
+        endpoint_url = entry.get("url")
+        if not isinstance(endpoint_type, str) or not endpoint_type.strip():
+            continue
+        if not isinstance(endpoint_url, str) or not endpoint_url.strip():
+            continue
+        normalised.append(
+            {
+                "type": endpoint_type.strip(),
+                "url": endpoint_url.strip(),
+            }
+        )
+
+    return normalised
+
+
 def _normalise_provider(provider: Dict[str, Any]) -> Dict[str, Any]:
     """Normalise a single provider entry and filter required fields."""
 
@@ -81,6 +107,7 @@ def _normalise_provider(provider: Dict[str, Any]) -> Dict[str, Any]:
         "contact": provider.get("contact", {}),
         "capabilities": provider.get("capabilities", []),
         "notes": provider.get("notes"),
+        "endpoints": _normalise_endpoints(provider.get("endpoints")),
     }
 
 

@@ -14,7 +14,11 @@
         "openai-compatible",
         "mock-llm"
       ],
-      "notes": "Reference node used for integration tests and community demos."
+      "notes": "Reference node used for integration tests and community demos.",
+      "endpoints": [
+        {"type": "relay", "url": "http://localhost:5010"},
+        {"type": "server", "url": "http://localhost:3000"}
+      ]
     },
     {
       "id": "community-eu-testnet",
@@ -29,7 +33,10 @@
         "chat-completions",
         "encryption"
       ],
-      "notes": "Volunteer-operated relay currently upgrading GPUs."
+      "notes": "Volunteer-operated relay currently upgrading GPUs.",
+      "endpoints": [
+        {"type": "relay", "url": "https://eu-relay.token.place"}
+      ]
     }
   ]
 }

@@ -7,6 +7,8 @@
 - Include `service` field in `/api/v1/health` responses
 - Allow `CryptoManager.decrypt_message` to accept JSON string input
 - Enforce streaming chat completion rate limiting via `API_STREAM_RATE_LIMIT`
+- Surface provider `endpoints` and a `metadata.updated_at` field from
+  `/api/v1/community/providers`
 
 ### Fixes
 - Validate PKCS#7 unpadding length to reject improperly padded input

@@ -40,8 +40,15 @@ def test_community_provider_directory_endpoint(client):
         "latency_ms",
         "status",
         "contact",
+        "capabilities",
+        "notes",
+        "endpoints",
     }
     assert expected_keys.issubset(provider.keys())
+    assert isinstance(provider["endpoints"], list)
+
+    metadata = payload.get("metadata")
+    assert metadata and metadata["updated_at"]
 
 
 def test_get_provider_directory_missing_file(monkeypatch, tmp_path):
@@ -95,6 +102,40 @@ def test_get_provider_directory_applies_optional_defaults(monkeypatch, tmp_path)
     assert provider["contact"] == {}
     assert provider["capabilities"] == []
     assert provider["notes"] is None
+    assert provider["endpoints"] == []
+
+
+def test_get_provider_directory_normalises_endpoint_payload(monkeypatch, tmp_path):
+    """Provider endpoints should be filtered to valid type/url dictionaries."""
+
+    payload_path = tmp_path / "providers.json"
+    payload = {
+        "providers": [
+            {
+                "id": "endpoints-test",
+                "name": "Endpoints Test",
+                "region": "test-region",
+                "endpoints": [
+                    {"type": "relay", "url": " http://relay.example.com "},
+                    {"type": "", "url": "http://invalid.example.com"},
+                    "not-a-dict",
+                    {"type": "server"},
+                ],
+            }
+        ],
+        "updated": "2025-03-04T00:00:00Z",
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(community, "COMMUNITY_DIRECTORY_PATH", payload_path)
+    _reset_directory_cache()
+
+    directory = community.get_provider_directory()
+    provider = directory["providers"][0]
+
+    assert provider["endpoints"] == [
+        {"type": "relay", "url": "http://relay.example.com"}
+    ]
 
 
 def test_list_community_providers_handles_directory_error(client, monkeypatch):
@@ -143,3 +184,4 @@ def test_list_community_providers_omits_updated_when_missing(client, monkeypatch
         "object": "list",
         "data": _return_directory()["providers"],
     }
+    assert "metadata" not in payload

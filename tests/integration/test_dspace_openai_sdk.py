@@ -11,7 +11,7 @@ import pytest
 import requests
 
 API_PORT = 5056
-BASE_URL = f"http://localhost:{API_PORT}"
+BASE_URL = f"http://127.0.0.1:{API_PORT}"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TS_NODE_CMD = ["npx", "ts-node", "--project", str(REPO_ROOT / "tsconfig.json")]
 

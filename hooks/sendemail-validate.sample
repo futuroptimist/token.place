@@ -19,8 +19,9 @@
 #   sendemail.validateRemote (default: origin)
 #   sendemail.validateRemoteRef (default: HEAD)
 #
-# Replace the TODO placeholders with appropriate checks according to your
-# needs.
+# The default configuration ensures every patch includes a Signed-off-by
+# trailer and that no added lines or subjects contain placeholder tokens.
+# Adjust or extend the checks below to suit your workflow.
 
 validate_cover_letter () {
         file="$1"
@@ -39,19 +40,57 @@ validate_cover_letter () {
         true
 }
 
+TOKEN_PLACE_PATCH_FILES=""
+
 validate_patch () {
-	file="$1"
-	# Ensure that the patch applies without conflicts.
-	git am -3 "$file" || return
-	# TODO: Replace with appropriate checks for this patch
-	# (e.g. checkpatch.pl).
-	true
+        file="$1"
+
+        if test -z "$file" || test ! -f "$file"
+        then
+                echo "sendemail-validate: patch file missing" >&2
+                return 1
+        fi
+
+        # Ensure that the patch applies without conflicts unless we're running
+        # in import-only mode for unit tests.
+        if test "${TOKEN_PLACE_VALIDATE_IMPORT_ONLY:-0}" != 1
+        then
+                git am -3 "$file" || return
+        fi
+
+        TOKEN_PLACE_PATCH_FILES="${TOKEN_PLACE_PATCH_FILES}${TOKEN_PLACE_PATCH_FILES:+ }$file"
+
+        if ! grep -Eq '^Signed-off-by:' "$file"
+        then
+                echo "sendemail-validate: missing Signed-off-by trailer" >&2
+                return 1
+        fi
+
+        if grep -Eq '^\+.*(TODO|FIXME|WIP|TBD)' "$file"
+        then
+                echo "sendemail-validate: placeholder token detected in patch" >&2
+                return 1
+        fi
+
+        true
 }
 
 validate_series () {
-	# TODO: Replace with appropriate checks for the whole series
-	# (e.g. quick build, coding style checks, etc.).
-	true
+        status=0
+
+        for patch in $TOKEN_PLACE_PATCH_FILES
+        do
+                test -f "$patch" || continue
+
+                subject=$(sed -n 's/^Subject: //p' "$patch" | head -n 1)
+                if printf '%s' "$subject" | grep -Eiq '\b(WIP|TODO|FIXME|TBD)\b'
+                then
+                        echo "sendemail-validate: placeholder token detected in series subject" >&2
+                        status=1
+                fi
+        done
+
+        return $status
 }
 
 # main -------------------------------------------------------------------------

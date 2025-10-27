@@ -148,14 +148,17 @@ def test_validate_series_rejects_wip_subjects():
         patch_path = Path(tmpdir) / 'patch.patch'
         patch_path.write_text(patch, encoding='utf-8')
 
+        subjects_file = Path(tmpdir) / 'subjects.txt'
+
         env = os.environ.copy()
         env['TOKEN_PLACE_VALIDATE_IMPORT_ONLY'] = '1'
+        env['TOKEN_PLACE_SUBJECTS_FILE'] = str(subjects_file)
 
-        result = subprocess.run(
+        patch_result = subprocess.run(
             [
                 'bash',
                 '-c',
-                f". '{SCRIPT_PATH}' && validate_patch '{patch_path}' && validate_series",
+                f". '{SCRIPT_PATH}' && validate_patch '{patch_path}'",
             ],
             check=False,
             capture_output=True,
@@ -163,5 +166,21 @@ def test_validate_series_rejects_wip_subjects():
             env=env,
         )
 
-    assert result.returncode != 0
-    assert 'series subject' in result.stderr
+        assert (
+            patch_result.returncode == 0
+        ), f"validate_patch failed unexpectedly: stderr={patch_result.stderr!r}"
+
+        series_result = subprocess.run(
+            [
+                'bash',
+                '-c',
+                f". '{SCRIPT_PATH}' && validate_series",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    assert series_result.returncode != 0
+    assert 'series subject' in series_result.stderr

@@ -305,9 +305,13 @@ def list_community_providers():
         "data": directory.get("providers", []),
     }
 
+    metadata = {}
     updated = directory.get("updated")
     if updated:
-        response_payload["updated"] = updated
+        metadata["updated_at"] = updated
+
+    if metadata:
+        response_payload["metadata"] = metadata
 
     return jsonify(response_payload)
 

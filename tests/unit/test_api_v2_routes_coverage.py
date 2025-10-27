@@ -121,7 +121,7 @@ def test_list_community_providers_success(client, monkeypatch):
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["data"] == directory["providers"]
-    assert payload["updated"] == "2024-01-01"
+    assert payload["metadata"] == {"updated_at": "2024-01-01"}
 
 
 def test_list_community_providers_error(client, monkeypatch):

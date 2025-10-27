@@ -56,11 +56,36 @@ def start_relay_with_mock() -> Iterator[None]:
             proc.kill()
 
 
+def ensure_js_sdk_dependencies_installed() -> None:
+    """Install the JavaScript dependencies needed for the SDK test if missing."""
+
+    # The OpenAI package is the critical dependency that signals `npm install` ran.
+    openai_package = REPO_ROOT / "node_modules" / "openai"
+    if openai_package.exists():
+        return
+
+    install_result = subprocess.run(
+        ["npm", "install"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if install_result.returncode != 0:
+        pytest.fail(
+            "Failed to install JavaScript dependencies for the OpenAI SDK test.\n"
+            f"STDOUT:\n{install_result.stdout}\nSTDERR:\n{install_result.stderr}"
+        )
+
+
 @pytest.mark.integration
 @pytest.mark.js
 def test_openai_javascript_sdk_can_call_token_place(tmp_path: Path) -> None:
     """Run the TypeScript OpenAI SDK test against the local relay."""
     with start_relay_with_mock():
+        ensure_js_sdk_dependencies_installed()
+
         env = os.environ.copy()
         env.setdefault("TOKEN_PLACE_BASE_URL", f"{BASE_URL}/v1")
         env.setdefault("TOKEN_PLACE_API_KEY", "test")

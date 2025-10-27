@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "test": "pytest tests/",
-    "test:js": "node tests/test_js_crypto.js && node tests/test_js_mock_server.js && node tests/test_chat_typing_effect.js && npx ts-node --project tsconfig.json tests/test_token_place_client.ts",
+    "test:js": "node tests/test_js_crypto.js && node tests/test_js_mock_server.js && node tests/test_chat_typing_effect.js && npx ts-node --project tsconfig.json tests/test_token_place_client.ts && npx ts-node --project tsconfig.json tests/test_token_place_client_package.ts",
     "test:crypto-compat": "python tests/test_crypto_compatibility.py",
     "test:e2e": "pytest tests/test_e2e_chat.py",
     "test:all": "npm run test && npm run test:js && npm run test:crypto-compat && npm run test:e2e",

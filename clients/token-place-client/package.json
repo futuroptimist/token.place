@@ -1,0 +1,27 @@
+{
+  "name": "token.place-client",
+  "version": "0.1.0",
+  "description": "TypeScript client for token.place APIs with optional end-to-end encryption",
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "require": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "jsencrypt": "^3.5.4"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  }
+}

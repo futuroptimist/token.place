@@ -158,56 +158,20 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 
 ### Implementation steps:
 
-1. **Create NPM Client Package**:
-   ```javascript
-   // token.place-client/index.js
+1. **Create NPM Client Package (IMPLEMENTED)**:
 
-   class TokenPlaceClient {
-     constructor(config = {}) {
-      // token.place exposes both `/api/v1` and `/v1` for OpenAI compatibility
-      this.baseUrl = config.baseUrl || 'http://localhost:5000/v1';
-       this.clientKeys = null;
-       this.serverPublicKey = null;
-     }
-
-     async initialize() {
-       // Generate client keys
-       this.clientKeys = await window.crypto.subtle.generateKey(
-         { name: 'RSA-OAEP', modulusLength: 2048, ...keyParams },
-         true,
-         ['encrypt', 'decrypt']
-       );
-
-       // Fetch server public key
-       const response = await fetch(`${this.baseUrl}/public-key`);
-       const data = await response.json();
-       this.serverPublicKey = data.public_key;
-
-       return true;
-     }
-
-     // Implement OpenAI-compatible methods
-     async createChatCompletion(params) {
-       // Encrypt messages if encryption is enabled
-       const encryptedParams = await this.encryptParams(params);
-
-       // Send to token.place server
-       const response = await fetch(`${this.baseUrl}/chat/completions`, {
-         method: 'POST',
-         headers: { 'Content-Type': 'application/json' },
-         body: JSON.stringify(encryptedParams)
-       });
-
-       // Handle response (decrypt if necessary)
-       const data = await response.json();
-       return this.encrypted ? await this.decryptResponse(data) : data;
-     }
-
-     // Additional methods as needed
-   }
-
-   module.exports = TokenPlaceClient;
-   ```
+   - Added a publish-ready package manifest at
+     `clients/token-place-client/package.json` exposing the `TokenPlaceClient`
+     TypeScript entry point with CommonJS-compatible defaults.
+   - Introduced `clients/token-place-client/tsconfig.build.json` so
+     maintainers can emit `dist/` artifacts with `npm run build` before
+     publishing.
+   - Relocated the implementation to `clients/token-place-client/src/index.ts`
+     while keeping `clients/token_place_client.ts` as a compatibility re-export
+     for existing tests and tooling.
+   - Added `tests/test_token_place_client_package.ts`, which reads the package
+     metadata and imports the module through the package boundary to guard
+     against regressions.
 
 2. **Create Test Configuration Script**:
    ```javascript

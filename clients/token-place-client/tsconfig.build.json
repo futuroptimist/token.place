@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "declaration": true,
+    "emitDeclarationOnly": false,
+    "module": "ES2015",
+    "target": "ES2019",
+    "moduleResolution": "Node",
+    "rootDir": "./src",
+    "declarationDir": "./dist",
+    "sourceMap": false,
+    "noEmit": false
+  },
+  "include": ["./src/**/*.ts"],
+  "exclude": ["./dist", "**/*.test.ts"]
+}

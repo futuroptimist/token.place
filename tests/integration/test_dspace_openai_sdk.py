@@ -64,19 +64,40 @@ def ensure_js_sdk_dependencies_installed() -> None:
     if openai_package.exists():
         return
 
-    install_result = subprocess.run(
-        ["npm", "install"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    env = os.environ.copy()
+    env.setdefault("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+    env.setdefault("npm_config_audit", "false")
+    env.setdefault("npm_config_fund", "false")
 
-    if install_result.returncode != 0:
-        pytest.fail(
-            "Failed to install JavaScript dependencies for the OpenAI SDK test.\n"
-            f"STDOUT:\n{install_result.stdout}\nSTDERR:\n{install_result.stderr}"
+    commands = [["npm", "ci"], ["npm", "install"]]
+    errors: list[str] = []
+
+    for command in commands:
+        install_result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
         )
+
+        if install_result.returncode == 0:
+            return
+
+        errors.append(
+            "Failed command: "
+            + " ".join(command)
+            + "\nSTDOUT:\n"
+            + install_result.stdout
+            + "\nSTDERR:\n"
+            + install_result.stderr
+        )
+
+    pytest.fail(
+        "Failed to install JavaScript dependencies for the OpenAI SDK test.\n"
+        + "\n\n".join(errors)
+    )
 
 
 @pytest.mark.integration

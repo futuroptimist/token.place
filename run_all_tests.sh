@@ -37,10 +37,50 @@ fi
 # Get Node.js version
 node -v
 
-# Ensure Playwright browsers and system dependencies are installed
-if command -v playwright >/dev/null 2>&1; then
-    playwright install --with-deps chromium >/dev/null
-fi
+# Ensure Playwright browsers are installed. We prefer to detect whether a
+# Chromium download already exists before attempting to install to avoid
+# repeated downloads on subsequent runs. If no browser binaries are available,
+# try installing with system dependencies first and fall back to a browser-only
+# install when that fails (as happens in GitHub Actions where apt is
+# unavailable).
+ensure_playwright_browsers() {
+    if ! command -v playwright >/dev/null 2>&1; then
+        return
+    fi
+
+    local cache_dir
+    local chromium_binary
+
+    cache_dir="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+
+    if [ -d "$cache_dir" ]; then
+        chromium_binary=$(find "$cache_dir" -maxdepth 2 -path "*/chrome-linux/headless_shell" -type f 2>/dev/null | head -n 1 || true)
+    else
+        chromium_binary=""
+    fi
+
+    if [ -z "$chromium_binary" ]; then
+        echo "Installing Playwright Chromium browser binaries..."
+        if ! playwright install --with-deps chromium; then
+            echo "Warning: playwright install --with-deps failed; retrying without system deps"
+            if ! playwright install chromium; then
+                echo "Warning: playwright browser installation failed"
+            fi
+        fi
+
+        if [ -d "$cache_dir" ]; then
+            chromium_binary=$(find "$cache_dir" -maxdepth 2 -path "*/chrome-linux/headless_shell" -type f 2>/dev/null | head -n 1 || true)
+        else
+            chromium_binary=""
+        fi
+
+        if [ -z "$chromium_binary" ]; then
+            echo "Warning: Playwright Chromium browser binaries are still missing after installation attempts"
+        fi
+    fi
+}
+
+ensure_playwright_browsers
 
 # Array to track test failures
 FAILED_TESTS=()

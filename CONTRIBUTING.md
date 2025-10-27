@@ -242,6 +242,16 @@ When adding new features or fixing bugs, please include appropriate tests:
 - Follow the style guidelines in [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md)
 - Make sure your changes are reflected in both code comments and external documentation
 
+### Git send-email hook
+
+If you submit patches via `git send-email`, the sample hook at
+`hooks/sendemail-validate.sample` performs basic hygiene checks. Copy it into
+`.git/hooks/sendemail-validate` to enable the guardrails. Cover
+letters containing placeholder tokens such as `TODO`, `FIXME`, `WIP`, or `TBD`
+are rejected so unfinished drafts are not mailed accidentally. Automation that
+sources the script directly can set `TOKEN_PLACE_VALIDATE_IMPORT_ONLY=1` to
+import the helper functions without running the full worktree validation flow.
+
 ## Pull Request Process
 
 1. Create a new branch for your feature or bugfix (`git checkout -b feature/my-feature` or `git checkout -b fix/my-bugfix`)

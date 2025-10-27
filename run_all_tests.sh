@@ -37,9 +37,15 @@ fi
 # Get Node.js version
 node -v
 
-# Ensure Playwright browsers and system dependencies are installed
+# Ensure Playwright browsers are installed. The --with-deps flag attempts to
+# install system packages via apt, which is not available in GitHub Actions.
+# Fallback to a plain browser install if system dependency installation fails.
 if command -v playwright >/dev/null 2>&1; then
-    playwright install --with-deps chromium >/dev/null
+    if ! playwright install --with-deps chromium >/dev/null 2>&1; then
+        echo "Warning: playwright install --with-deps failed; retrying without system deps"
+        PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium >/dev/null 2>&1 || \
+            echo "Warning: playwright browser installation failed"
+    fi
 fi
 
 # Array to track test failures

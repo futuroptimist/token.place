@@ -1,0 +1,12 @@
+{
+  "name": "token.place-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "jsencrypt": "^3.5.4",
+    "node-fetch": "^2.6.7"
+  }
+}

@@ -163,6 +163,33 @@ def test_list_server_providers_error(client, monkeypatch):
     assert payload["error"]["code"] == "provider_registry_unavailable"
 
 
+def test_get_service_name_defaults_to_module_constant(monkeypatch):
+    """When no override is configured the module constant should be returned."""
+
+    monkeypatch.delenv("SERVICE_NAME", raising=False)
+    monkeypatch.setattr(v2_routes, "SERVICE_NAME", "token.place")
+
+    assert v2_routes._get_service_name() == "token.place"
+
+
+def test_get_service_name_strips_override(monkeypatch):
+    """Whitespace around SERVICE_NAME overrides should be ignored."""
+
+    monkeypatch.setattr(v2_routes, "SERVICE_NAME", "token.place")
+    monkeypatch.setenv("SERVICE_NAME", "  relay.alpha  ")
+
+    assert v2_routes._get_service_name() == "relay.alpha"
+
+
+def test_get_service_name_falls_back_for_blank_override(monkeypatch):
+    """Blank overrides should fall back to the module constant."""
+
+    monkeypatch.setattr(v2_routes, "SERVICE_NAME", "token.place")
+    monkeypatch.setenv("SERVICE_NAME", "   ")
+
+    assert v2_routes._get_service_name() == "token.place"
+
+
 def test_chat_completion_missing_body(client):
     response = client.post(
         "/api/v2/chat/completions",

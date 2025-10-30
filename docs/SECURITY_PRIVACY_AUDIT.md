@@ -87,6 +87,9 @@ Refined logging helpers to avoid swallowing system interrupt exceptions.
 - Updated `log_info` and `log_error` to catch only standard exceptions, allowing
   `KeyboardInterrupt` and `SystemExit` to propagate.
 - Ensured `log_error` always logs messages even in production.
+- Added regression coverage for `utils.networking.relay_client.log_error`
+  (`tests/unit/test_relay_client_logging.py`) to ensure production runs still
+  emit sanitized error logs without stack traces.
 - Enforced a minimum 2048-bit RSA key size guard to block insecure configurations.
 - Added configurable content moderation hooks that reject disallowed prompts before inference.
 

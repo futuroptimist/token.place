@@ -77,12 +77,19 @@ setup_client_package() {
     if [[ $DRY_RUN -eq 0 ]]; then
       run_cmd mkdir -p "$CLIENT_DIR"
       run_cmd cp "$CLIENT_TEMPLATE_DIR/package.json" "$CLIENT_DIR/package.json"
+      if [[ -f "$CLIENT_TEMPLATE_DIR/package-lock.json" ]]; then
+        run_cmd cp "$CLIENT_TEMPLATE_DIR/package-lock.json" "$CLIENT_DIR/package-lock.json"
+      fi
       run_cmd cp "$CLIENT_TEMPLATE_DIR/index.js" "$CLIENT_DIR/index.js"
       run_cmd npm --prefix "$CLIENT_DIR" ci
     else
       printf 'DRY-RUN: mkdir -p %s\n' "$CLIENT_DIR"
       printf 'DRY-RUN: cp %s/package.json %s/package.json\n' \
         "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"
+      if [[ -f "$CLIENT_TEMPLATE_DIR/package-lock.json" ]]; then
+        printf 'DRY-RUN: cp %s/package-lock.json %s/package-lock.json\n' \
+          "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"
+      fi
       printf 'DRY-RUN: npm --prefix %s ci\n' "$CLIENT_DIR"
       printf 'DRY-RUN: cp %s/index.js %s/index.js\n' \
         "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"

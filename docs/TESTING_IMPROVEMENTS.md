@@ -262,140 +262,31 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    };
    ```
 
-3. **Create Integration Test**:
-   ```javascript
-   // integration_tests/test_dspace_integration.js
+3. ✅ **Create Integration Test**
 
-   const { startTokenPlace, startDspace, cleanup, DSPACE_PORT } = require('./setup');
-   const { Builder, By } = require('selenium-webdriver');
-   const assert = require('assert');
+   - Added `tests/integration/test_dspace_browser_stub.py`, a Playwright-driven
+     regression that boots the relay in mock mode, opens a lightweight
+     DSPACE-style chat stub, and verifies encrypted chat requests complete
+     successfully.
+   - The accompanying HTML harness lives at
+     `static/tests/dspace_integration_stub.html` so the relay can serve it from
+     the same origin, avoiding CORS issues while mimicking the DSPACE UI flow.
+   - The test asserts that the assistant reply propagates the mocked "Paris is
+     the capital of France" message and that request metadata is echoed back to
+     the browser, matching DSPACE's expectations.
 
-   describe('DSPACE Integration Test', function() {
-     this.timeout(60000); // Set longer timeout
+4. ✅ **Create a Comprehensive Shell Script (IMPLEMENTED 2025-11-07)**
 
-     let tokenPlaceServer;
-     let dspaceServer;
-     let driver;
-
-     before(async function() {
-       // Start both servers
-       tokenPlaceServer = await startTokenPlace();
-       dspaceServer = await startDspace();
-
-       // Wait for servers to initialize
-       await new Promise(resolve => setTimeout(resolve, 10000));
-
-       // Initialize Selenium WebDriver
-       driver = await new Builder().forBrowser('chrome').build();
-     });
-
-     after(async function() {
-       // Clean up
-       if (driver) await driver.quit();
-       cleanup([tokenPlaceServer, dspaceServer]);
-     });
-
-     it('should load DSPACE and send chat messages through token.place', async function() {
-       // Navigate to DSPACE
-       await driver.get(`http://localhost:${DSPACE_PORT}`);
-
-       // Wait for page to load
-       await driver.sleep(2000);
-
-       // Find chat input and send a message
-       const chatInput = await driver.findElement(By.id('chat-input'));
-       await chatInput.sendKeys('Tell me about space exploration');
-       await chatInput.submit();
-
-       // Wait for response
-       await driver.sleep(5000);
-
-       // Verify response exists
-       const chatMessages = await driver.findElements(By.className('chat-message'));
-       assert(chatMessages.length >= 2, 'Expected at least a request and response message');
-
-       // Verify response content
-       const responseText = await chatMessages[chatMessages.length - 1].getText();
-       assert(responseText.length > 0, 'Expected non-empty response');
-       assert(responseText.toLowerCase().includes('space') ||
-              responseText.toLowerCase().includes('exploration'),
-              'Expected response to be relevant to the prompt');
-     });
-   });
-   ```
-
-4. **Create a Comprehensive Shell Script**:
-   ```bash
-   #!/bin/bash
-   # integration_tests/run_dspace_integration.sh
-
-   # Current directory
-   DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
-   # Check if directories exist, clone if not
-   if [ ! -d "$DIR/token.place" ]; then
-     echo "Cloning token.place repository..."
-     git clone https://github.com/futuroptimist/token.place.git "$DIR/token.place"
-   fi
-
-   if [ ! -d "$DIR/dspace" ]; then
-     echo "Cloning DSPACE repository..."
-     git clone https://github.com/democratizedspace/dspace.git -b v3 "$DIR/dspace"
-   fi
-
-   # Setup Python environment for token.place
-   cd "$DIR/token.place"
-   if [ ! -d "env" ]; then
-     echo "Setting up Python virtual environment..."
-     python -m venv env
-     source env/bin/activate
-     pip install -r config/requirements_server.txt
-     pip install -r config/requirements_relay.txt
-     pip install -r requirements.txt
-   else
-     source env/bin/activate
-   fi
-
-   # Setup Node environment for DSPACE
-   cd "$DIR/dspace"
-   if [ ! -d "node_modules" ]; then
-     echo "Installing DSPACE dependencies..."
-      npm ci
-   fi
-
-   # Setup token.place client package
-   cd "$DIR"
-   if [ ! -d "token.place-client" ]; then
-     echo "Creating token.place client package..."
-     mkdir -p token.place-client
-     # Create package.json
-     echo '{
-       "name": "token.place-client",
-       "version": "0.1.0",
-       "main": "index.js",
-       "dependencies": {
-         "node-fetch": "^2.6.7"
-       }
-     }' > token.place-client/package.json
-
-     # Install dependencies
-     cd token.place-client
-      npm ci
-
-     # Create the client library (implementation details in the JavaScript example above)
-     echo "// token.place client implementation..." > index.js
-   fi
-
-   # Run the integration tests
-   cd "$DIR"
-   echo "Running integration tests..."
-   mocha test_dspace_integration.js
-
-   # Deactivate virtual environment
-   deactivate
-
-   echo "Integration tests completed."
-   ```
+   - Added `integration_tests/run_dspace_integration.sh`, which automates cloning token.place and
+     the DSPACE app, provisioning a Python virtual environment, and installing Node dependencies.
+   - The helper bootstraps a sibling `token.place-client` package and, when a
+   `test_dspace_integration.js` file is present, runs it through `npx mocha` to validate the
+    round-trip flow.
+   - Passing `--dry-run` prints every step without touching the network, enabling the accompanying
+     pytest regression to verify that the workflow stays in sync with the documented plan.
+   - A lightweight `integration_tests/run_integration_test.sh` wrapper keeps `run_all_tests.sh`
+     green by default while still allowing maintainers to export
+     `RUN_DSPACE_INTEGRATION=1` to run the full harness locally.
 
 ### Benefits:
 

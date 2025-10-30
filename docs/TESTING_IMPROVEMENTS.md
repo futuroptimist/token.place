@@ -158,56 +158,17 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 
 ### Implementation steps:
 
-1. **Create NPM Client Package**:
-   ```javascript
-   // token.place-client/index.js
+1. ✅ **Create NPM Client Package (IMPLEMENTED 2025-10-31)**
 
-   class TokenPlaceClient {
-     constructor(config = {}) {
-      // token.place exposes both `/api/v1` and `/v1` for OpenAI compatibility
-      this.baseUrl = config.baseUrl || 'http://localhost:5000/v1';
-       this.clientKeys = null;
-       this.serverPublicKey = null;
-     }
-
-     async initialize() {
-       // Generate client keys
-       this.clientKeys = await window.crypto.subtle.generateKey(
-         { name: 'RSA-OAEP', modulusLength: 2048, ...keyParams },
-         true,
-         ['encrypt', 'decrypt']
-       );
-
-       // Fetch server public key
-       const response = await fetch(`${this.baseUrl}/public-key`);
-       const data = await response.json();
-       this.serverPublicKey = data.public_key;
-
-       return true;
-     }
-
-     // Implement OpenAI-compatible methods
-     async createChatCompletion(params) {
-       // Encrypt messages if encryption is enabled
-       const encryptedParams = await this.encryptParams(params);
-
-       // Send to token.place server
-       const response = await fetch(`${this.baseUrl}/chat/completions`, {
-         method: 'POST',
-         headers: { 'Content-Type': 'application/json' },
-         body: JSON.stringify(encryptedParams)
-       });
-
-       // Handle response (decrypt if necessary)
-       const data = await response.json();
-       return this.encrypted ? await this.decryptResponse(data) : data;
-     }
-
-     // Additional methods as needed
-   }
-
-   module.exports = TokenPlaceClient;
-   ```
+   - Added `clients/package.json` describing the private `@tokenplace/client` bundle with a CommonJS
+     entrypoint and generated type declarations.
+   - Created `clients/index.ts` so the package re-exports `TokenPlaceClient` plus supporting types and
+     supplies a default export for convenience.
+   - Introduced `npm run build:client`, which compiles the TypeScript sources into `clients/dist/`
+     using `tsconfig.client.json`.
+   - Extended the JavaScript test suite with
+     `tests/test_token_place_client_package.ts`, which builds the package, loads it via `require('../clients')`,
+     and proves the exported client can complete an encrypted chat round-trip against the mock server.
 
 2. **Create Test Configuration Script**:
    ```javascript

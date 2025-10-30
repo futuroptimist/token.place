@@ -16,6 +16,7 @@ f2clipboard.py
 build/
 develop-eggs/
 dist/
+clients/dist/
 downloads/
 eggs/
 .eggs/

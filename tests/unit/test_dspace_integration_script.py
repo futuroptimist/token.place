@@ -5,6 +5,12 @@ from pathlib import Path
 import pytest
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "integration_tests" / "run_dspace_integration.sh"
+CLIENT_TEMPLATE = (
+    Path(__file__).resolve().parents[2]
+    / "integration_tests"
+    / "token_place_client_template"
+    / "index.js"
+)
 
 
 @pytest.mark.unit
@@ -36,3 +42,19 @@ def test_run_dspace_integration_script_dry_run():
         assert any(marker in line for line in output_lines), (
             f"Expected dry run output to include step marker: {marker}"
         )
+
+
+@pytest.mark.unit
+def test_token_place_client_template_exists_and_is_not_placeholder():
+    assert CLIENT_TEMPLATE.exists(), (
+        "Expected integration token.place client template to exist for setup script"
+    )
+
+    contents = CLIENT_TEMPLATE.read_text(encoding="utf-8")
+    assert "module.exports" in contents, "Template should export a module"
+    assert "createTokenPlaceClient" in contents, (
+        "Template should expose createTokenPlaceClient helper"
+    )
+    assert "placeholder" not in contents.lower(), (
+        "Template should not contain placeholder text"
+    )

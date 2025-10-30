@@ -6,6 +6,7 @@ WORK_DIR="${TOKEN_PLACE_DSPACE_WORKDIR:-$SCRIPT_DIR}"
 TOKEN_PLACE_DIR="$WORK_DIR/token.place"
 DSPACE_DIR="$WORK_DIR/dspace"
 CLIENT_DIR="$WORK_DIR/token.place-client"
+CLIENT_TEMPLATE_DIR="$SCRIPT_DIR/token_place_client_template"
 PY_ENV_DIR="$TOKEN_PLACE_DIR/env"
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -69,28 +70,22 @@ setup_dspace_env() {
 setup_client_package() {
   log_step "Creating token.place client package..."
   if [[ ! -d "$CLIENT_DIR" ]]; then
+    if [[ ! -f "$CLIENT_TEMPLATE_DIR/index.js" ]]; then
+      echo "Client template missing at $CLIENT_TEMPLATE_DIR" >&2
+      exit 1
+    fi
     if [[ $DRY_RUN -eq 0 ]]; then
       run_cmd mkdir -p "$CLIENT_DIR"
-      cat <<'PKG' | tee "$CLIENT_DIR/package.json" >/dev/null
-{
-  "name": "token.place-client",
-  "version": "0.1.0",
-  "main": "index.js",
-  "dependencies": {
-    "node-fetch": "^2.6.7"
-  }
-}
-PKG
+      run_cmd cp "$CLIENT_TEMPLATE_DIR/package.json" "$CLIENT_DIR/package.json"
+      run_cmd cp "$CLIENT_TEMPLATE_DIR/index.js" "$CLIENT_DIR/index.js"
       run_cmd npm --prefix "$CLIENT_DIR" ci
-      cat <<'CLIENT' >"$CLIENT_DIR/index.js"
-// token.place client implementation placeholder
-module.exports = {};
-CLIENT
     else
       printf 'DRY-RUN: mkdir -p %s\n' "$CLIENT_DIR"
-      printf 'DRY-RUN: write %s/package.json\n' "$CLIENT_DIR"
+      printf 'DRY-RUN: cp %s/package.json %s/package.json\n' \
+        "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"
       printf 'DRY-RUN: npm --prefix %s ci\n' "$CLIENT_DIR"
-      printf 'DRY-RUN: write %s/index.js placeholder\n' "$CLIENT_DIR"
+      printf 'DRY-RUN: cp %s/index.js %s/index.js\n' \
+        "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"
     fi
   else
     log_step "token.place client package already exists. Skipping creation."

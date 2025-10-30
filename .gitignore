@@ -58,3 +58,7 @@ Thumbs.db
 integration_tests/*
 !integration_tests/run_dspace_integration.sh
 !integration_tests/run_integration_test.sh
+!integration_tests/token_place_client_template/
+!integration_tests/token_place_client_template/index.js
+!integration_tests/token_place_client_template/package.json
+!integration_tests/token_place_client_template/package-lock.json

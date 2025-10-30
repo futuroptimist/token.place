@@ -170,98 +170,17 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
      `tests/test_token_place_client_package.ts`, which builds the package, loads it via `require('../clients')`,
      and proves the exported client can complete an encrypted chat round-trip against the mock server.
 
-2. **Create Test Configuration Script**:
-   ```javascript
-   // integration_tests/setup.js
+2. ✅ **Create Test Configuration Script**
 
-   const { spawn } = require('child_process');
-   const path = require('path');
-   const fs = require('fs');
-
-   // Custom ports to avoid conflicts
-   const TOKEN_PLACE_PORT = 5555;
-   const DSPACE_PORT = 4444;
-
-   async function startTokenPlace() {
-     console.log('Starting token.place server...');
-     const tokenPlaceServer = spawn('python', ['server.py', `--port=${TOKEN_PLACE_PORT}`], {
-       cwd: path.join(__dirname, 'token.place'),
-       env: { ...process.env, USE_MOCK_LLM: '1' },
-     });
-
-     // Log output
-     tokenPlaceServer.stdout.on('data', (data) => console.log(`token.place: ${data}`));
-     tokenPlaceServer.stderr.on('data', (data) => console.error(`token.place error: ${data}`));
-
-     return tokenPlaceServer;
-   }
-
-   async function startDspace() {
-     console.log('Starting DSPACE app...');
-
-     // Replace OpenAI client with token.place client
-     const openaiPath = path.join(__dirname, 'dspace/src/lib/openai.js');
-     const openaiContent = fs.readFileSync(openaiPath, 'utf8');
-
-     // Backup original file
-     fs.writeFileSync(`${openaiPath}.bak`, openaiContent);
-
-     // Replace with token.place client
-     const tokenPlaceCode = `
-       import TokenPlaceClient from '../../../token.place-client';
-
-      const client = new TokenPlaceClient({
-        // use /v1 so the OpenAI client works with token.place directly
-        baseUrl: 'http://localhost:${TOKEN_PLACE_PORT}/v1',
-        // Add any other configuration options
-      });
-
-       // Initialize the client
-       await client.initialize();
-
-       export default client;
-     `;
-
-     fs.writeFileSync(openaiPath, tokenPlaceCode);
-
-     // Start DSPACE
-     const dspaceServer = spawn('npm', ['run', 'dev', '--', `--port=${DSPACE_PORT}`], {
-       cwd: path.join(__dirname, 'dspace'),
-     });
-
-     // Log output
-     dspaceServer.stdout.on('data', (data) => console.log(`DSPACE: ${data}`));
-     dspaceServer.stderr.on('data', (data) => console.error(`DSPACE error: ${data}`));
-
-     return dspaceServer;
-   }
-
-   // Cleanup function
-   function cleanup(servers) {
-     servers.forEach(server => {
-       if (server && server.pid) {
-         process.kill(server.pid);
-       }
-     });
-
-     // Restore original OpenAI file
-     const openaiPath = path.join(__dirname, 'dspace/src/lib/openai.js');
-     if (fs.existsSync(`${openaiPath}.bak`)) {
-       fs.copyFileSync(`${openaiPath}.bak`, openaiPath);
-       fs.unlinkSync(`${openaiPath}.bak`);
-     }
-   }
-
-   // Export setup and teardown functions
-   module.exports = {
-     startTokenPlace,
-     startDspace,
-     cleanup,
-     TOKEN_PLACE_PORT,
-     DSPACE_PORT
-   };
-   ```
-
+   - Added `integration_tests/setup.js`, which exports `startTokenPlace`, `startDspace`,
+     and `cleanup` helpers plus shared port constants so end-to-end harnesses can boot the
+     mocked token.place stack alongside a DSPACE checkout without hand-written scripts.
+   - The module rewrites `dspace/src/lib/openai.js` to import the published
+     `TokenPlaceClient`, backs up and restores the original source during cleanup, and
+     exposes dependency-injection hooks so tests can stub `child_process.spawn`.
+   - Paired with the new regression `tests/test_integration_setup.ts`, which proves the
+     helpers spawn the expected commands, patch the DSPACE client, and reliably restore the
+     backup during teardown.
 3. ✅ **Create Integration Test**
 
    - Added `tests/integration/test_dspace_browser_stub.py`, a Playwright-driven

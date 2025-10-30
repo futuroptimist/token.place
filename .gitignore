@@ -58,3 +58,5 @@ Thumbs.db
 integration_tests/*
 !integration_tests/run_dspace_integration.sh
 !integration_tests/run_integration_test.sh
+!integration_tests/setup.js
+!integration_tests/setup.d.ts

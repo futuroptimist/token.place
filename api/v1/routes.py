@@ -57,6 +57,17 @@ get_provider_directory = get_registry_provider_directory
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
 SERVICE_NAME = os.getenv('SERVICE_NAME', 'token.place')
 
+
+def _get_service_name() -> str:
+    """Return the configured service identifier for health responses."""
+
+    override = os.getenv('SERVICE_NAME')
+    if override is None:
+        return SERVICE_NAME
+
+    stripped = override.strip()
+    return stripped or SERVICE_NAME
+
 # Configure logging based on environment
 if ENVIRONMENT != 'prod':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -897,7 +908,7 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'version': 'v1',
-            'service': SERVICE_NAME,
+            'service': _get_service_name(),
             'timestamp': int(time.time())
         })
     except Exception as e:

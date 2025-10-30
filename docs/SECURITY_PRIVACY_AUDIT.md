@@ -78,7 +78,7 @@ Project structure reorganization and documentation updates.
 **Recommendations**
 - Continue to monitor for broken links or outdated paths after large refactors.
 
-### [2025-08-09] - commit TBD
+### [2025-08-09] - commit 12d42dc59b9b95d05496cdce7e63e4dc6c9710cc
 
 **Summary**
 Refined logging helpers to avoid swallowing system interrupt exceptions.

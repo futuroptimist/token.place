@@ -36,3 +36,18 @@ def test_2025_10_10_entry_has_commit_hash():
     )
 
     assert 'commit TBD' not in section, 'Stale placeholder `commit TBD` found in audit entry.'
+
+
+def test_2025_08_09_entry_has_commit_hash():
+    """The August 9, 2025 audit entry should include the reviewed commit hash."""
+    section = _get_audit_section('2025-08-09')
+    assert section, 'Expected to find the 2025-08-09 audit entry in docs/SECURITY_PRIVACY_AUDIT.md.'
+
+    heading_line = section.splitlines()[0]
+    match = re.match(r"^### \[2025-08-09\] - commit ([0-9a-f]{7,40})$", heading_line)
+    assert match, (
+        'The 2025-08-09 audit heading must record a concrete commit hash '
+        '(e.g. `commit 0123456789abcdef`).'
+    )
+
+    assert 'commit TBD' not in section, 'Stale placeholder `commit TBD` found in audit entry.'

@@ -117,6 +117,23 @@ def test_validate_patch_rejects_placeholder_tokens():
     assert 'placeholder token' in stderr
 
 
+def test_validate_patch_rejects_placeholder_subjects():
+    """Patch subjects with placeholder tokens should fail immediately."""
+
+    patch = (
+        PATCH_TEMPLATE_HEADER.format(
+            subject='[PATCH] TODO: update docs',
+            body='Add docs update.\n\nSigned-off-by: Hook Tester <hooks@token.place>\n',
+        )
+        + PATCH_DIFF_SECTION.format(hunk_line='+Example addition\n')
+    )
+
+    code, _stdout, stderr = _run_patch(patch)
+
+    assert code != 0
+    assert 'placeholder token' in stderr
+
+
 def test_validate_patch_accepts_clean_patch():
     """A well-formed patch should pass validation."""
 
@@ -138,7 +155,7 @@ def test_validate_series_rejects_wip_subjects():
 
     patch = (
         PATCH_TEMPLATE_HEADER.format(
-            subject='[PATCH] WIP: experimental change',
+            subject='[PATCH] Document new behaviour',
             body='Prototype change.\n\nSigned-off-by: Hook Tester <hooks@token.place>\n',
         )
         + PATCH_DIFF_SECTION.format(hunk_line='+Example addition\n')
@@ -169,6 +186,8 @@ def test_validate_series_rejects_wip_subjects():
         assert (
             patch_result.returncode == 0
         ), f"validate_patch failed unexpectedly: stderr={patch_result.stderr!r}"
+
+        subjects_file.write_text('WIP: experimental change\n', encoding='utf-8')
 
         series_result = subprocess.run(
             [

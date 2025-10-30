@@ -4,7 +4,8 @@
 
 ### Added
 - Provide `get_temp_dir()` utility for temporary token.place files
-- Include `service` field in `/api/v1/health` responses
+- Include `service` field in `/api/v1/health` responses and honour `SERVICE_NAME`
+  overrides
 - Allow `CryptoManager.decrypt_message` to accept JSON string input
 - Enforce streaming chat completion rate limiting via `API_STREAM_RATE_LIMIT`
 - Surface provider `endpoints` and a `metadata.updated_at` field from

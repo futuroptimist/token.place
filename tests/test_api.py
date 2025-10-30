@@ -91,6 +91,18 @@ def test_api_health(client):
     assert data['service'] == 'token.place'
     assert 'timestamp' in data
 
+
+def test_api_health_reflects_service_env(monkeypatch, client):
+    """Health endpoint should include the configured service identifier."""
+
+    monkeypatch.setenv("SERVICE_NAME", "token.place-ci")
+
+    response = client.get("/api/v1/health")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["service"] == "token.place-ci"
+
 def test_list_models(client):
     """Test the models list endpoint"""
     response = client.get("/api/v1/models")

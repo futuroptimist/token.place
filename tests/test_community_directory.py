@@ -189,139 +189,139 @@ def test_list_community_providers_omits_updated_when_missing(client, monkeypatch
 
 def test_normalise_provider_missing_id():
     """Test that missing id field raises CommunityDirectoryError."""
-    
+
     provider = {
         "name": "Test Provider",
         "region": "test-region"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_missing_name():
     """Test that missing name field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "test-id",
         "region": "test-region"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_missing_region():
     """Test that missing region field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "test-id",
         "name": "Test Provider"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_empty_id():
     """Test that empty id field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "",
         "name": "Test Provider",
         "region": "test-region"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_empty_name():
     """Test that empty name field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "test-id",
         "name": "",
         "region": "test-region"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_empty_region():
     """Test that empty region field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "test-id",
         "name": "Test Provider",
         "region": ""
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_none_id():
     """Test that None id field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": None,
         "name": "Test Provider",
         "region": "test-region"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_none_name():
     """Test that None name field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "test-id",
         "name": None,
         "region": "test-region"
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_none_region():
     """Test that None region field raises CommunityDirectoryError."""
-    
+
     provider = {
         "id": "test-id",
         "name": "Test Provider",
         "region": None
     }
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
-    
+
     assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
 
 
 def test_normalise_provider_with_all_optional_fields():
     """Test normalisation with all optional fields provided."""
-    
+
     provider = {
         "id": "test-id",
         "name": "Test Provider",
@@ -332,9 +332,9 @@ def test_normalise_provider_with_all_optional_fields():
         "capabilities": ["chat", "completion"],
         "notes": "Test notes"
     }
-    
+
     result = community._normalise_provider(provider)
-    
+
     expected = {
         "id": "test-id",
         "name": "Test Provider",
@@ -345,36 +345,36 @@ def test_normalise_provider_with_all_optional_fields():
         "capabilities": ["chat", "completion"],
         "notes": "Test notes"
     }
-    
+
     assert result == expected
 
 
 def test_load_raw_directory_invalid_json(monkeypatch, tmp_path):
     """Test that invalid JSON raises CommunityDirectoryError."""
-    
+
     payload_path = tmp_path / "providers.json"
     payload_path.write_text("invalid json content", encoding="utf-8")
-    
+
     monkeypatch.setattr(community, "COMMUNITY_DIRECTORY_PATH", payload_path)
     _reset_directory_cache()
-    
+
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._load_raw_directory()
-    
+
     assert "Invalid community provider directory JSON" in str(exc_info.value)
 
 
 def test_normalise_provider_successful_path():
     """Test the successful path through _normalise_provider function."""
-    
+
     provider = {
         "id": "test-id",
         "name": "Test Provider",
         "region": "test-region"
     }
-    
+
     result = community._normalise_provider(provider)
-    
+
     expected = {
         "id": "test-id",
         "name": "Test Provider",
@@ -385,7 +385,7 @@ def test_normalise_provider_successful_path():
         "capabilities": [],
         "notes": None
     }
-    
+
     assert result == expected
 
 

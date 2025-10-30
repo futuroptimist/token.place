@@ -160,6 +160,45 @@ def test_encrypt_stream_chunk_requires_cipherkey_for_first_chunk(mode):
     assert session_after.aes_key == session.aes_key
 
 
+def test_encrypt_stream_chunk_reuses_gcm_session_without_mode_hint():
+    """Subsequent chunks should inherit the initial GCM session without restating the mode."""
+
+    private_key, public_key = _generate_keys()
+
+    first_payload, encrypted_key, encrypt_session = encrypt.encrypt_stream_chunk(
+        b"chunk-1",
+        public_key,
+        cipher_mode="GCM",
+    )
+
+    assert encrypted_key is not None
+
+    first_plaintext, decrypt_session = encrypt.decrypt_stream_chunk(
+        first_payload,
+        private_key,
+        encrypted_key=encrypted_key,
+        cipher_mode="GCM",
+    )
+
+    assert first_plaintext == b"chunk-1"
+
+    second_payload, subsequent_key, encrypt_session = encrypt.encrypt_stream_chunk(
+        b"chunk-2",
+        public_key,
+        session=encrypt_session,
+    )
+
+    assert subsequent_key is None
+
+    second_plaintext, decrypt_session = encrypt.decrypt_stream_chunk(
+        second_payload,
+        private_key,
+        session=decrypt_session,
+    )
+
+    assert second_plaintext == b"chunk-2"
+
+
 def test_stream_session_normalises_inputs():
     session = encrypt.StreamSession(
         aes_key=bytearray(os.urandom(encrypt.AES_KEY_SIZE)),

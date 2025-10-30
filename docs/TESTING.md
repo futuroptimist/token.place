@@ -212,6 +212,8 @@ during tests or `https://token.place/api/v1` in production.
 **Key Scenarios Tested**:
 - Correct path resolution across Windows, macOS, and Linux
 - Configuration loading from platform-specific locations
+- Resetting mutated configuration state via `Config.reset()` to keep tests
+  isolated when they patch runtime settings
 - Platform-specific behavior adaptations
 - Support for XDG environment variables like `XDG_CONFIG_HOME` and `XDG_STATE_HOME`
 

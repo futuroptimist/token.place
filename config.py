@@ -90,6 +90,16 @@ class Config:
         # Detect platform if not already set
         self.platform = os.environ.get('PLATFORM', platform.system().lower())
 
+        self.config_path = config_path or os.environ.get('TOKEN_PLACE_CONFIG')
+
+        # Build the working configuration tree.
+        self._initialise_config_tree()
+
+        logger.info(f"Configuration initialized for environment: {self.env}, platform: {self.platform}")
+
+    def _initialise_config_tree(self) -> None:
+        """Initialise ``self.config`` from the immutable ``DEFAULT_CONFIG`` template."""
+
         # Load base configuration using a deep copy to avoid mutating DEFAULT_CONFIG
         self.config: AppConfig = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -106,14 +116,11 @@ class Config:
         self._configure_platform_paths()
 
         # Load user configuration if it exists
-        self.config_path = config_path or os.environ.get('TOKEN_PLACE_CONFIG')
         if self.config_path:
             self._load_user_config()
 
         # Apply late-binding environment overrides such as deployment-specific hosts.
         self._apply_runtime_env_overrides()
-
-        logger.info(f"Configuration initialized for environment: {self.env}, platform: {self.platform}")
 
     def _configure_platform_paths(self):
         """Configure paths based on the detected platform"""
@@ -370,6 +377,11 @@ class Config:
                 config[k] = {}
             config = config[k]
         config[keys[-1]] = value
+
+    def reset(self) -> None:
+        """Rebuild the working config from defaults to undo caller mutations."""
+
+        self._initialise_config_tree()
 
     def _redacted_config_copy(self) -> Dict[str, Any]:
         """Return a deepcopy of the config with sensitive values removed."""

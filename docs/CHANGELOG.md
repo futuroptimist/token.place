@@ -16,7 +16,9 @@
 - Remove unused imports from simplified CLI client to avoid unnecessary dependencies,
   enforced by `tests/unit/test_client_simplified_imports.py`
 - Handle EOF in simplified CLI client to end sessions cleanly
-- Deep copy default configuration to prevent cross-test mutations
+- Deep copy default configuration to prevent cross-test mutations via the new
+  `Config.reset()` helper, ensuring tests and runtime callers can restore a
+  pristine config snapshot on demand
 
 ### Maintenance
 - Bump Playwright dev dependency to v1.55.0

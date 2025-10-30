@@ -303,7 +303,7 @@ def encrypt_stream_chunk(
     *,
     session: Optional[StreamSession] = None,
     use_pkcs1v15: bool = False,
-    cipher_mode: str = "CBC",
+    cipher_mode: Optional[str] = None,
     associated_data: Optional[bytes] = None,
 ) -> Tuple[Dict[str, bytes], Optional[bytes], StreamSession]:
     """Encrypt a streaming chunk while maintaining a reusable session key."""

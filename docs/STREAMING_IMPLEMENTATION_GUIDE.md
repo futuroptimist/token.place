@@ -51,7 +51,8 @@ Client → Encrypted Request → Relay → Server → LLM → Streaming Chunks �
   ```
 
 #### 1.2 Encryption for Streaming
-- Modify the encryption system to handle small chunks
+- ✅ Modify the encryption system to handle small chunks by letting `encrypt.encrypt_stream_chunk`
+  inherit an existing session's cipher mode when streaming successive updates.
 - ✅ Create a new encryption function for streams that maintains session keys
   - Added `encrypt_stream_chunk`/`decrypt_stream_chunk` helpers in `encrypt.py` that reuse a
     negotiated AES session across sequential SSE payloads while still supporting optional

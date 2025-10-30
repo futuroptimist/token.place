@@ -79,16 +79,29 @@ def _coerce_optional_bool(value: Optional[Any]) -> Optional[bool]:
     return None
 
 def _log(level: str, message: str, *args, exc_info: Optional[bool] = None) -> None:
-    """Log a message if not in production; fallback to always logging on error"""
+    """Log a message with environment-aware behaviour.
+
+    Info-level messages are suppressed in production, while errors always emit.
+    When logging in production, stack traces are hidden even if ``exc_info`` is
+    requested so sensitive details are not leaked.
+    """
+
     try:
         config = get_config_lazy()
-        if config.is_production:
-            return
+        is_production = bool(getattr(config, "is_production", False))
     except Exception:
-        pass
+        is_production = False
+
+    if is_production and level != "error":
+        return
+
     log_func = getattr(logger, level)
     formatted = message.format(*args) if args else message
-    kwargs = {"exc_info": exc_info} if exc_info is not None else {}
+
+    kwargs: Dict[str, Any] = {}
+    if exc_info is not None:
+        kwargs["exc_info"] = exc_info if not is_production else False
+
     log_func(formatted, **kwargs)
 
 

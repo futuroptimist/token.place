@@ -1,8 +1,8 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 import utils.networking.relay_client as rc
-import pytest
 
 
 def test_log_info_non_production():
@@ -36,12 +36,12 @@ def test_log_error_non_production():
     logger.error.assert_called_with("err msg", exc_info=True)
 
 
-def test_log_error_production():
+def test_log_error_production_logs_without_traceback():
     logger = MagicMock()
     cfg = MagicMock(is_production=True)
     with patch.object(rc, 'logger', logger), patch.object(rc, 'get_config_lazy', return_value=cfg):
-        rc.log_error("ignored")
-    logger.error.assert_not_called()
+        rc.log_error("err {}", "msg", exc_info=True)
+    logger.error.assert_called_with("err msg", exc_info=False)
 
 
 def test_log_error_fallback():

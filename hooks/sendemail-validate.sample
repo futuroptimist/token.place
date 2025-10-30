@@ -52,6 +52,14 @@ validate_patch () {
                 return 1
         fi
 
+        subject=$(sed -n 's/^Subject: //p' "$file" | head -n 1)
+
+        if printf '%s' "$subject" | grep -Eiq '\b(WIP|TODO|FIXME|TBD)\b'
+        then
+                echo "sendemail-validate: placeholder token detected in patch subject" >&2
+                return 1
+        fi
+
         # Ensure that the patch applies without conflicts unless we're running
         # in import-only mode for unit tests.
         if test "${TOKEN_PLACE_VALIDATE_IMPORT_ONLY:-0}" != 1
@@ -73,7 +81,6 @@ validate_patch () {
 
         if test -n "$TOKEN_PLACE_SUBJECTS_FILE"
         then
-                subject=$(sed -n 's/^Subject: //p' "$file" | head -n 1)
                 printf '%s\n' "$subject" >>"$TOKEN_PLACE_SUBJECTS_FILE"
         fi
 

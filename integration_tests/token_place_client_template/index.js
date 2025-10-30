@@ -11,9 +11,44 @@ if (!JSEncryptCtor) {
   throw new Error('Unable to resolve JSEncrypt constructor from jsencrypt module');
 }
 
+function stripTrailingSlashes(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return '';
+  }
+
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+
+  return value.slice(0, end);
+}
+
+function stripLeadingSlashes(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return '';
+  }
+
+  let start = 0;
+  while (start < value.length && value.charCodeAt(start) === 47) {
+    start += 1;
+  }
+
+  return value.slice(start);
+}
+
 function resolveUrl(baseUrl, path) {
-  const trimmedBase = baseUrl.replace(/\/+$/, '');
-  const trimmedPath = path.replace(/^\/+/, '');
+  const trimmedBase = stripTrailingSlashes(baseUrl);
+  const trimmedPath = stripLeadingSlashes(path);
+
+  if (!trimmedBase) {
+    return `/${trimmedPath}`;
+  }
+
+  if (!trimmedPath) {
+    return `${trimmedBase}/`;
+  }
+
   return `${trimmedBase}/${trimmedPath}`;
 }
 
@@ -112,7 +147,7 @@ function createTokenPlaceClient(config = {}) {
   };
 
   const options = {
-    baseUrl: config.baseUrl.replace(/\/?$/, ''),
+    baseUrl: stripTrailingSlashes(config.baseUrl),
     publicKeyPath: config.publicKeyPath ?? 'api/v1/public-key',
     chatCompletionsPath: config.chatCompletionsPath ?? 'api/v1/chat/completions',
     model: config.model ?? 'mock-llm',

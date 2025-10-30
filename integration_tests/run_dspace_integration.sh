@@ -90,9 +90,9 @@ setup_client_package() {
         printf 'DRY-RUN: cp %s/package-lock.json %s/package-lock.json\n' \
           "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"
       fi
-      printf 'DRY-RUN: npm --prefix %s ci\n' "$CLIENT_DIR"
       printf 'DRY-RUN: cp %s/index.js %s/index.js\n' \
         "$CLIENT_TEMPLATE_DIR" "$CLIENT_DIR"
+      printf 'DRY-RUN: npm --prefix %s ci\n' "$CLIENT_DIR"
     fi
   else
     log_step "token.place client package already exists. Skipping creation."

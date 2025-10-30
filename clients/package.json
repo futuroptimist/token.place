@@ -14,5 +14,9 @@
   },
   "files": [
     "dist"
-  ]
+  ],
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "jsencrypt": "^3.5.4"
+  }
 }

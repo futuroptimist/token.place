@@ -12,11 +12,11 @@ def testing_config() -> Config:
     return Config(env="testing")
 
 
-def test_config_initialization_does_not_mutate_default_config(testing_config: Config):
+def test_config_initialization_does_not_mutate_default_config():
     """Config initialization should not modify DEFAULT_CONFIG."""
     snapshot = copy.deepcopy(DEFAULT_CONFIG)
-    # Access fixture to ensure construction completes without touching defaults.
-    _ = testing_config
+    # Construct Config after snapshot so initialization mutations are detected.
+    _ = Config(env="testing")
     assert DEFAULT_CONFIG == snapshot
 
 

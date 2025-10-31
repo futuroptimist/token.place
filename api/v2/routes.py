@@ -43,7 +43,8 @@ get_provider_directory = get_registry_provider_directory
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
-SERVICE_NAME = os.getenv('SERVICE_NAME', 'token.place')
+DEFAULT_SERVICE_NAME = 'token.place'
+SERVICE_NAME = os.getenv('SERVICE_NAME', DEFAULT_SERVICE_NAME)
 
 
 def _get_service_name() -> str:
@@ -54,7 +55,10 @@ def _get_service_name() -> str:
         return SERVICE_NAME
 
     stripped = override.strip()
-    return stripped or SERVICE_NAME
+    if stripped:
+        return stripped
+
+    return DEFAULT_SERVICE_NAME
 
 # Configure logging based on environment
 if ENVIRONMENT != 'prod':

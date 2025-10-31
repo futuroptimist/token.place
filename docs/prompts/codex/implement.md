@@ -62,6 +62,9 @@ CONTEXT:
 REQUEST:
 1. Inventory documented-but-unimplemented work and select one candidate at random; justify why it
    still delivers value now.
+   - If the TODO/FIXME/future-work pool is empty, call that out in your notes and treat this
+     prompt's "Upgrade instructions" block (or the Unreleased changelog entries) as the fallback
+     source of promised work before proceeding.
 2. Add a failing automated test (pytest, Playwright, or equivalent scripted check) that captures
    the promised behavior, then make it pass with the minimal viable change.
 3. Update docs, comments, and TODOs to reflect the shipped functionality; remove stale promises.

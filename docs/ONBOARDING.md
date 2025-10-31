@@ -58,4 +58,7 @@ pre-commit run --all-files
 
 Development dependencies live in [requirements.txt](../requirements.txt).
 
+`npm run lint` executes ESLint over the TypeScript client sources and their test harnesses, so
+static analysis failures surface before the broader CI workflow runs.
+
 Happy hacking!

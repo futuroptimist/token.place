@@ -76,7 +76,8 @@ Project structure reorganization and documentation updates.
 - Updated test references to reflect new paths.
 
 **Recommendations**
-- Continue to monitor for broken links or outdated paths after large refactors.
+- ✅ (2025-10-31) Added `tests/unit/test_docs_links.py` to fail fast when documentation links
+  drift during large refactors, keeping the docs navigation accurate.
 
 ### [2025-08-09] - commit 12d42dc59b9b95d05496cdce7e63e4dc6c9710cc
 

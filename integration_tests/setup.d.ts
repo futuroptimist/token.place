@@ -18,10 +18,15 @@ export interface StartDspaceOptions {
   fsImpl?: typeof import('node:fs');
 }
 
-export const TOKEN_PLACE_PORT: number;
-export const DSPACE_PORT: number;
+export const DEFAULT_TOKEN_PLACE_PORT: number;
+export const DEFAULT_DSPACE_PORT: number;
 
-export function startTokenPlace(options?: StartTokenPlaceOptions): Promise<ChildProcess>;
-export function startDspace(options?: StartDspaceOptions): Promise<ChildProcess>;
+export interface StartedProcess {
+  process: ChildProcess;
+  port: number;
+}
+
+export function startTokenPlace(options?: StartTokenPlaceOptions): Promise<StartedProcess>;
+export function startDspace(options?: StartDspaceOptions): Promise<StartedProcess>;
 export function cleanup(processes?: Array<ChildProcess | null | undefined>): Promise<void>;
 export function buildTokenPlaceClientSource(port: number, clientImportPath: string): string;

@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -55,7 +56,17 @@ function createSpawnStub(): { fn: SpawnImpl; calls: SpawnCall[] } {
   return { fn, calls };
 }
 
-async function runIntegrationSetupTest(): Promise<void> {
+interface IntegrationSandbox {
+  tempDir: string;
+  integrationRoot: string;
+  tokenPlaceRoot: string;
+  dspaceRoot: string;
+  openaiPath: string;
+}
+
+const ORIGINAL_OPENAI_SOURCE = "export default function originalOpenAI() { return 'openai'; }\n";
+
+function createIntegrationSandbox(): IntegrationSandbox {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-place-integration-'));
   const integrationRoot = path.join(tempDir, 'integration_tests');
   const tokenPlaceRoot = path.join(integrationRoot, 'token.place');
@@ -65,45 +76,71 @@ async function runIntegrationSetupTest(): Promise<void> {
   fs.mkdirSync(tokenPlaceRoot, { recursive: true });
 
   const openaiPath = path.join(dspaceLibDir, 'openai.js');
-  const originalOpenAiSource = "export default function originalOpenAI() { return 'openai'; }\n";
-  fs.writeFileSync(openaiPath, originalOpenAiSource, 'utf8');
+  fs.writeFileSync(openaiPath, ORIGINAL_OPENAI_SOURCE, 'utf8');
 
-  const { fn: spawnStub, calls } = createSpawnStub();
+  return { tempDir, integrationRoot, tokenPlaceRoot, dspaceRoot, openaiPath };
+}
 
-  process.env.TOKEN_PLACE_INTEGRATION_ROOT = integrationRoot;
+async function listenOn(port: number): Promise<net.Server> {
+  return await new Promise<net.Server>((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
+}
+
+async function closeServer(server: net.Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close(error => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function runIntegrationSetupTest(): Promise<void> {
+  const sandbox = createIntegrationSandbox();
+  process.env.TOKEN_PLACE_INTEGRATION_ROOT = sandbox.integrationRoot;
 
   const setup = await import('../integration_tests/setup.js');
 
-  assert.strictEqual(setup.TOKEN_PLACE_PORT, 5555, 'Expected default token.place port');
-  assert.strictEqual(setup.DSPACE_PORT, 4444, 'Expected default DSPACE port');
+  assert.strictEqual(setup.DEFAULT_TOKEN_PLACE_PORT, 5555, 'Expected default token.place port');
+  assert.strictEqual(setup.DEFAULT_DSPACE_PORT, 4444, 'Expected default DSPACE port');
 
-  const tokenPlaceProcess = await setup.startTokenPlace({
-    spawn: spawnStub,
-    projectRoot: tokenPlaceRoot
+const { fn: defaultSpawn, calls: defaultCalls } = createSpawnStub();
+
+  const { process: tokenPlaceProcess, port: tokenPlacePort } = await setup.startTokenPlace({
+    spawn: defaultSpawn,
+    projectRoot: sandbox.tokenPlaceRoot
   });
 
-  const dspaceProcess = await setup.startDspace({
-    spawn: spawnStub,
-    dspaceRoot
+  const { process: dspaceProcess, port: dspacePort } = await setup.startDspace({
+    spawn: defaultSpawn,
+    dspaceRoot: sandbox.dspaceRoot
   });
 
-  assert.strictEqual(calls.length, 2, 'Expected two spawn calls');
+  assert.strictEqual(defaultCalls.length, 2, 'Expected two spawn calls for default startup');
 
-  const tokenPlaceCall = calls[0];
+  const tokenPlaceCall = defaultCalls[0];
   assert.strictEqual(tokenPlaceCall.command, 'python');
   assert.deepStrictEqual(tokenPlaceCall.args, ['server.py', '--port=5555']);
   assert.ok(tokenPlaceCall.options);
-  assert.strictEqual(tokenPlaceCall.options?.cwd, tokenPlaceRoot);
+  assert.strictEqual(tokenPlaceCall.options?.cwd, sandbox.tokenPlaceRoot);
   assert.strictEqual(tokenPlaceCall.options?.env?.USE_MOCK_LLM, '1');
+  assert.strictEqual(tokenPlacePort, setup.DEFAULT_TOKEN_PLACE_PORT, 'Expected default token.place port when free');
 
-  const dspaceCall = calls[1];
+  const dspaceCall = defaultCalls[1];
   assert.strictEqual(dspaceCall.command, 'npm');
   assert.deepStrictEqual(dspaceCall.args, ['run', 'dev', '--', '--port=4444']);
-  assert.strictEqual(dspaceCall.options?.cwd, dspaceRoot);
+  assert.strictEqual(dspaceCall.options?.cwd, sandbox.dspaceRoot);
+  assert.strictEqual(dspacePort, setup.DEFAULT_DSPACE_PORT, 'Expected default DSPACE port when free');
 
-  const backupPath = `${openaiPath}.bak`;
+  const backupPath = `${sandbox.openaiPath}.bak`;
   assert.ok(fs.existsSync(backupPath), 'Expected OpenAI file to be backed up');
-  const rewrittenSource = fs.readFileSync(openaiPath, 'utf8');
+  const rewrittenSource = fs.readFileSync(sandbox.openaiPath, 'utf8');
   assert.ok(
     rewrittenSource.includes('TokenPlaceClient'),
     'Expected rewritten OpenAI client to reference TokenPlaceClient'
@@ -114,11 +151,61 @@ async function runIntegrationSetupTest(): Promise<void> {
   assert.ok((tokenPlaceCall.process as StubChildProcess).killed, 'token.place process should be terminated');
   assert.ok((dspaceCall.process as StubChildProcess).killed, 'DSPACE process should be terminated');
 
-  const restoredSource = fs.readFileSync(openaiPath, 'utf8');
-  assert.strictEqual(restoredSource, originalOpenAiSource, 'OpenAI file should be restored after cleanup');
+  const restoredSource = fs.readFileSync(sandbox.openaiPath, 'utf8');
+  assert.strictEqual(restoredSource, ORIGINAL_OPENAI_SOURCE, 'OpenAI file should be restored after cleanup');
   assert.ok(!fs.existsSync(backupPath), 'Backup file should be removed during cleanup');
 
-  fs.rmSync(tempDir, { recursive: true, force: true });
+  const tokenPlaceBlocker = await listenOn(setup.DEFAULT_TOKEN_PLACE_PORT);
+  try {
+    const { fn: fallbackSpawn, calls: fallbackCalls } = createSpawnStub();
+    const { process: fallbackProcess, port: fallbackPort } = await setup.startTokenPlace({
+      spawn: fallbackSpawn,
+      projectRoot: sandbox.tokenPlaceRoot
+    });
+
+    assert.notStrictEqual(
+      fallbackPort,
+      setup.DEFAULT_TOKEN_PLACE_PORT,
+      'Expected fallback to a new token.place port when default is busy'
+    );
+
+    const fallbackCall = fallbackCalls[0];
+    assert.deepStrictEqual(fallbackCall.args, ['server.py', `--port=${fallbackPort}`]);
+
+    await setup.cleanup([fallbackProcess]);
+  } finally {
+    await closeServer(tokenPlaceBlocker);
+  }
+
+  const dspaceBlocker = await listenOn(setup.DEFAULT_DSPACE_PORT);
+  try {
+    const { fn: dspaceFallbackSpawn, calls: dspaceFallbackCalls } = createSpawnStub();
+    const { process: fallbackDspaceProcess, port: fallbackDspacePort } = await setup.startDspace({
+      spawn: dspaceFallbackSpawn,
+      dspaceRoot: sandbox.dspaceRoot
+    });
+
+    assert.notStrictEqual(
+      fallbackDspacePort,
+      setup.DEFAULT_DSPACE_PORT,
+      'Expected fallback to a new DSPACE port when default is busy'
+    );
+
+    const dspaceFallbackCall = dspaceFallbackCalls[0];
+    assert.deepStrictEqual(dspaceFallbackCall.args, ['run', 'dev', '--', `--port=${fallbackDspacePort}`]);
+
+    const rewrittenFallbackSource = fs.readFileSync(sandbox.openaiPath, 'utf8');
+    assert.ok(
+      rewrittenFallbackSource.includes(`http://localhost:${fallbackDspacePort}/v1`),
+      'Rewritten OpenAI client should reference the fallback port'
+    );
+
+    await setup.cleanup([fallbackDspaceProcess]);
+  } finally {
+    await closeServer(dspaceBlocker);
+  }
+
+  fs.rmSync(sandbox.tempDir, { recursive: true, force: true });
 }
 
 if (require.main === module) {

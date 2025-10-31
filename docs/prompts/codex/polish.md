@@ -52,8 +52,9 @@ DIRECTORY HYGIENE:
   three clicks; keep prompt docs indexed from `docs/README.md`.
 
 QUALITY & SAFETY:
-- Draft a security review checklist for relay failovers, Cloudflare fallback, and key management;
-  document secrets boundaries, logging redaction, and audit steps.
+- ✅ Drafted a security review checklist for relay failovers, Cloudflare fallback, and key
+  management; documented secrets boundaries, logging redaction, and audit steps in
+  [docs/SECURITY_REVIEW_CHECKLIST.md](../../SECURITY_REVIEW_CHECKLIST.md).
 - Add typed config validation, consistent error handling, and guardrails for environment overrides.
 
 TESTING TARGETS:

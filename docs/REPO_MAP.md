@@ -57,6 +57,8 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 - [docs/ARCHITECTURE.md](ARCHITECTURE.md) &rarr; architectural deep dive.
 - [docs/TESTING.md](TESTING.md) &rarr; detailed coverage of automated suites.
 - [docs/STYLE_GUIDE.md](STYLE_GUIDE.md) &rarr; branding and writing guidance.
+- [docs/SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) &rarr; release-time security
+  walkthrough covering relay failovers, Cloudflare fallback, and key management checks.
 
 Contributions that move files should update this map so future maintainers always
 have an accurate snapshot of the workspace layout.

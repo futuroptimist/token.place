@@ -34,7 +34,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
 
 - **Testing:** [TESTING.md](TESTING.md) summarises the suites executed by `run_all_tests.sh`.
 - **Security:** [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md) contains the rolling
-  hardening checklist and threat model.
+  hardening checklist and threat model; use
+  [SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) during release sign-off.
 - **Release notes:** Track changes in [CHANGELOG.md](CHANGELOG.md) and stepwise updates in
   [CHANGELOG_STEP.md](CHANGELOG_STEP.md).
 

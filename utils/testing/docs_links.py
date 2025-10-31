@@ -64,4 +64,3 @@ def find_broken_markdown_links(targets: Sequence[Path]) -> List[Tuple[Path, str]
                 broken.append((md_file.relative_to(repo_root), raw_link))
 
     return broken
-

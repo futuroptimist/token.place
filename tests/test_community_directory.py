@@ -198,7 +198,8 @@ def test_normalise_provider_missing_id():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'id' must be a non-empty string" in message
 
 
 def test_normalise_provider_missing_name():
@@ -212,7 +213,8 @@ def test_normalise_provider_missing_name():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'name' must be a non-empty string" in message
 
 
 def test_normalise_provider_missing_region():
@@ -226,7 +228,8 @@ def test_normalise_provider_missing_region():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'region' must be a non-empty string" in message
 
 
 def test_normalise_provider_empty_id():
@@ -241,7 +244,8 @@ def test_normalise_provider_empty_id():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'id' must be a non-empty string" in message
 
 
 def test_normalise_provider_empty_name():
@@ -256,7 +260,8 @@ def test_normalise_provider_empty_name():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'name' must be a non-empty string" in message
 
 
 def test_normalise_provider_empty_region():
@@ -271,7 +276,8 @@ def test_normalise_provider_empty_region():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'region' must be a non-empty string" in message
 
 
 def test_normalise_provider_none_id():
@@ -286,7 +292,8 @@ def test_normalise_provider_none_id():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'id' must be a non-empty string" in message
 
 
 def test_normalise_provider_none_name():
@@ -301,7 +308,8 @@ def test_normalise_provider_none_name():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'name' must be a non-empty string" in message
 
 
 def test_normalise_provider_none_region():
@@ -316,7 +324,27 @@ def test_normalise_provider_none_region():
     with pytest.raises(community.CommunityDirectoryError) as exc_info:
         community._normalise_provider(provider)
 
-    assert "Provider entry missing required fields: ('id', 'name', 'region')" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "Provider field 'region' must be a non-empty string" in message
+
+
+@pytest.mark.parametrize("field", ["id", "name", "region"])
+def test_normalise_provider_whitespace_only_required_fields(field):
+    """Whitespace-only required fields should be rejected."""
+
+    provider = {
+        "id": "provider-one",
+        "name": "Provider One",
+        "region": "moon-base",
+    }
+    provider[field] = "  \t \n  "
+
+    with pytest.raises(community.CommunityDirectoryError) as exc_info:
+        community._normalise_provider(provider)
+
+    message = str(exc_info.value)
+    assert f"{field}" in message
+    assert "non-empty string" in message
 
 
 def test_normalise_provider_with_all_optional_fields():

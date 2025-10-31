@@ -877,6 +877,9 @@ Example response snippet:
 }
 ```
 
+Directory entries with blank or whitespace-only identifiers, names, or regions are rejected when
+the registry loads so clients never receive placeholder records.
+
 #### Community Model Leaderboard
 ```
 GET /api/v1/community/leaderboard

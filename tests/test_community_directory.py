@@ -138,6 +138,36 @@ def test_get_provider_directory_normalises_endpoint_payload(monkeypatch, tmp_pat
     ]
 
 
+def test_get_provider_directory_skips_whitespace_identifier(monkeypatch, tmp_path):
+    """Whitespace-only provider identifiers should be ignored when loading the directory."""
+
+    payload_path = tmp_path / "providers.json"
+    payload = {
+        "providers": [
+            {
+                "id": "  ",
+                "name": "Whitespace Provider",
+                "region": "test-region",
+            },
+            {
+                "id": "valid-provider",
+                "name": "Valid Provider",
+                "region": "moon-base",
+            },
+        ],
+        "updated": "2025-05-01T00:00:00Z",
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(community, "COMMUNITY_DIRECTORY_PATH", payload_path)
+    _reset_directory_cache()
+
+    directory = community.get_provider_directory()
+
+    assert [provider["id"] for provider in directory["providers"]] == ["valid-provider"]
+    assert directory["updated"] == "2025-05-01T00:00:00Z"
+
+
 def test_list_community_providers_handles_directory_error(client, monkeypatch):
     """The HTTP endpoint should convert directory errors into API responses."""
 

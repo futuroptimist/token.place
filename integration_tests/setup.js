@@ -6,6 +6,9 @@ const path = require('node:path');
 const DEFAULT_TOKEN_PLACE_PORT = 5555;
 const DEFAULT_DSPACE_PORT = 4444;
 
+let resolvedTokenPlacePort = DEFAULT_TOKEN_PLACE_PORT;
+let resolvedDspacePort = DEFAULT_DSPACE_PORT;
+
 const integrationRoot = process.env.TOKEN_PLACE_INTEGRATION_ROOT || __dirname;
 
 const backupRecords = new Map();
@@ -131,6 +134,7 @@ async function startTokenPlace(options = {}) {
   });
 
   const readyProcess = await waitForSpawn(child);
+  resolvedTokenPlacePort = resolvedPort;
   return { process: readyProcess, port: resolvedPort };
 }
 
@@ -176,6 +180,7 @@ async function startDspace(options = {}) {
   });
 
   const readyProcess = await waitForSpawn(child);
+  resolvedDspacePort = resolvedPort;
   return { process: readyProcess, port: resolvedPort };
 }
 
@@ -205,15 +210,33 @@ async function cleanup(processes = []) {
   }
 
   backupRecords.clear();
+
+  resolvedTokenPlacePort = DEFAULT_TOKEN_PLACE_PORT;
+  resolvedDspacePort = DEFAULT_DSPACE_PORT;
 }
 
-module.exports = {
+const exported = {
   DEFAULT_TOKEN_PLACE_PORT,
   DEFAULT_DSPACE_PORT,
-  TOKEN_PLACE_PORT: DEFAULT_TOKEN_PLACE_PORT,
-  DSPACE_PORT: DEFAULT_DSPACE_PORT,
   startTokenPlace,
   startDspace,
   cleanup,
   buildTokenPlaceClientSource,
 };
+
+Object.defineProperties(exported, {
+  TOKEN_PLACE_PORT: {
+    enumerable: true,
+    get() {
+      return resolvedTokenPlacePort;
+    },
+  },
+  DSPACE_PORT: {
+    enumerable: true,
+    get() {
+      return resolvedDspacePort;
+    },
+  },
+});
+
+module.exports = exported;

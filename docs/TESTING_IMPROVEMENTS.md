@@ -173,7 +173,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 2. ✅ **Create Test Configuration Script**
 
    - Added `integration_tests/setup.js`, which exports `startTokenPlace`, `startDspace`,
-     and `cleanup` helpers plus shared port constants so end-to-end harnesses can boot the
+     and `cleanup` helpers plus shared port accessors so end-to-end harnesses can boot the
      mocked token.place stack alongside a DSPACE checkout without hand-written scripts.
    - The module rewrites `dspace/src/lib/openai.js` to import the published
      `TokenPlaceClient`, backs up and restores the original source during cleanup, and

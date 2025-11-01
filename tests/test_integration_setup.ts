@@ -131,12 +131,22 @@ const { fn: defaultSpawn, calls: defaultCalls } = createSpawnStub();
   assert.strictEqual(tokenPlaceCall.options?.cwd, sandbox.tokenPlaceRoot);
   assert.strictEqual(tokenPlaceCall.options?.env?.USE_MOCK_LLM, '1');
   assert.strictEqual(tokenPlacePort, setup.DEFAULT_TOKEN_PLACE_PORT, 'Expected default token.place port when free');
+  assert.strictEqual(
+    setup.TOKEN_PLACE_PORT,
+    tokenPlacePort,
+    'Exported token.place port should reflect the resolved port'
+  );
 
   const dspaceCall = defaultCalls[1];
   assert.strictEqual(dspaceCall.command, 'npm');
   assert.deepStrictEqual(dspaceCall.args, ['run', 'dev', '--', '--port=4444']);
   assert.strictEqual(dspaceCall.options?.cwd, sandbox.dspaceRoot);
   assert.strictEqual(dspacePort, setup.DEFAULT_DSPACE_PORT, 'Expected default DSPACE port when free');
+  assert.strictEqual(
+    setup.DSPACE_PORT,
+    dspacePort,
+    'Exported DSPACE port should reflect the resolved port'
+  );
 
   const backupPath = `${sandbox.openaiPath}.bak`;
   assert.ok(fs.existsSync(backupPath), 'Expected OpenAI file to be backed up');
@@ -150,6 +160,17 @@ const { fn: defaultSpawn, calls: defaultCalls } = createSpawnStub();
 
   assert.ok((tokenPlaceCall.process as StubChildProcess).killed, 'token.place process should be terminated');
   assert.ok((dspaceCall.process as StubChildProcess).killed, 'DSPACE process should be terminated');
+
+  assert.strictEqual(
+    setup.TOKEN_PLACE_PORT,
+    setup.DEFAULT_TOKEN_PLACE_PORT,
+    'Token.place port export should reset after cleanup'
+  );
+  assert.strictEqual(
+    setup.DSPACE_PORT,
+    setup.DEFAULT_DSPACE_PORT,
+    'DSPACE port export should reset after cleanup'
+  );
 
   const restoredSource = fs.readFileSync(sandbox.openaiPath, 'utf8');
   assert.strictEqual(restoredSource, ORIGINAL_OPENAI_SOURCE, 'OpenAI file should be restored after cleanup');
@@ -167,6 +188,12 @@ const { fn: defaultSpawn, calls: defaultCalls } = createSpawnStub();
       fallbackPort,
       setup.DEFAULT_TOKEN_PLACE_PORT,
       'Expected fallback to a new token.place port when default is busy'
+    );
+
+    assert.strictEqual(
+      setup.TOKEN_PLACE_PORT,
+      fallbackPort,
+      'Token.place port export should update when fallback port is selected'
     );
 
     const fallbackCall = fallbackCalls[0];
@@ -189,6 +216,12 @@ const { fn: defaultSpawn, calls: defaultCalls } = createSpawnStub();
       fallbackDspacePort,
       setup.DEFAULT_DSPACE_PORT,
       'Expected fallback to a new DSPACE port when default is busy'
+    );
+
+    assert.strictEqual(
+      setup.DSPACE_PORT,
+      fallbackDspacePort,
+      'DSPACE port export should update when fallback port is selected'
     );
 
     const dspaceFallbackCall = dspaceFallbackCalls[0];

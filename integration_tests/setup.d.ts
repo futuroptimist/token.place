@@ -20,6 +20,8 @@ export interface StartDspaceOptions {
 
 export const DEFAULT_TOKEN_PLACE_PORT: number;
 export const DEFAULT_DSPACE_PORT: number;
+export const TOKEN_PLACE_PORT: number;
+export const DSPACE_PORT: number;
 
 export interface StartedProcess {
   process: ChildProcess;

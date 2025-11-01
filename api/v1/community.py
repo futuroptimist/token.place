@@ -92,21 +92,50 @@ def _normalise_endpoints(endpoints: Any) -> List[Dict[str, str]]:
 def _normalise_provider(provider: Dict[str, Any]) -> Dict[str, Any]:
     """Normalise a single provider entry and filter required fields."""
 
+    def _require_str_field(field: str) -> str:
+        value = provider.get(field)
+        if not isinstance(value, str):
+            raise CommunityDirectoryError(
+                f"Provider field '{field}' must be a non-empty string"
+            )
+
+        trimmed = value.strip()
+        if not trimmed:
+            raise CommunityDirectoryError(
+                f"Provider field '{field}' must be a non-empty string"
+            )
+
+        return trimmed
+
     required_fields = ("id", "name", "region")
-    if not all(provider.get(field) for field in required_fields):
-        raise CommunityDirectoryError(
-            f"Provider entry missing required fields: {required_fields}"
-        )
+    cleaned_required = {field: _require_str_field(field) for field in required_fields}
+
+    status_value = provider.get("status", "unknown")
+    if isinstance(status_value, str):
+        status = status_value.strip() or "unknown"
+    else:
+        status = "unknown"
+
+    notes = None
+    notes_value = provider.get("notes")
+    if isinstance(notes_value, str):
+        stripped_note = notes_value.strip()
+        if stripped_note:
+            notes = stripped_note
+
+    contact_value = provider.get("contact", {})
+    contact = contact_value if isinstance(contact_value, dict) else {}
+
+    capabilities_value = provider.get("capabilities", [])
+    capabilities = capabilities_value if isinstance(capabilities_value, list) else []
 
     return {
-        "id": provider["id"],
-        "name": provider["name"],
-        "region": provider["region"],
+        **cleaned_required,
         "latency_ms": provider.get("latency_ms"),
-        "status": provider.get("status", "unknown"),
-        "contact": provider.get("contact", {}),
-        "capabilities": provider.get("capabilities", []),
-        "notes": provider.get("notes"),
+        "status": status,
+        "contact": contact,
+        "capabilities": capabilities,
+        "notes": notes,
         "endpoints": _normalise_endpoints(provider.get("endpoints")),
     }
 

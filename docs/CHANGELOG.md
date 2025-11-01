@@ -19,6 +19,9 @@
 - Deep copy default configuration to prevent cross-test mutations via the new
   `Config.reset()` helper, ensuring tests and runtime callers can restore a
   pristine config snapshot on demand
+- Reject whitespace-only provider identifiers when loading
+  `/api/v1/community/providers` so API responses always include meaningful
+  metadata
 
 ### Maintenance
 - Bump Playwright dev dependency to v1.55.0

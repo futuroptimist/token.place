@@ -371,7 +371,8 @@ def test_normalise_provider_with_all_optional_fields():
         "status": "online",
         "contact": {"email": "test@example.com"},
         "capabilities": ["chat", "completion"],
-        "notes": "Test notes"
+        "notes": "Test notes",
+        "endpoints": [],
     }
 
     assert result == expected
@@ -411,10 +412,70 @@ def test_normalise_provider_successful_path():
         "status": "unknown",
         "contact": {},
         "capabilities": [],
-        "notes": None
+        "notes": None,
+        "endpoints": [],
     }
 
     assert result == expected
+
+
+def test_normalise_provider_trims_required_fields():
+    """Required string fields should be trimmed before returning."""
+
+    provider = {
+        "id": "  test-id  ",
+        "name": "\n Test Provider \t",
+        "region": "  test-region ",
+    }
+
+    result = community._normalise_provider(provider)
+
+    assert result["id"] == "test-id"
+    assert result["name"] == "Test Provider"
+    assert result["region"] == "test-region"
+    assert result["status"] == "unknown"
+    assert result["endpoints"] == []
+
+
+def test_normalise_provider_status_whitespace_defaults_to_unknown():
+    """Whitespace-only status values should fall back to the default."""
+
+    provider = {
+        "id": "test-id",
+        "name": "Test Provider",
+        "region": "test-region",
+        "status": "   ",
+    }
+
+    result = community._normalise_provider(provider)
+
+    assert result["status"] == "unknown"
+
+
+def test_normalise_provider_trims_optional_notes():
+    """Optional notes should be stripped and omitted when blank."""
+
+    provider = {
+        "id": "test-id",
+        "name": "Test Provider",
+        "region": "test-region",
+        "notes": "  helpful context  ",
+    }
+
+    result = community._normalise_provider(provider)
+
+    assert result["notes"] == "helpful context"
+
+    provider_blank_notes = {
+        "id": "test-id",
+        "name": "Test Provider",
+        "region": "test-region",
+        "notes": "   ",
+    }
+
+    blank_result = community._normalise_provider(provider_blank_notes)
+
+    assert blank_result["notes"] is None
 
 
 def test_list_community_providers_includes_updated_when_present(client, monkeypatch):
@@ -446,5 +507,5 @@ def test_list_community_providers_includes_updated_when_present(client, monkeypa
     assert payload == {
         "object": "list",
         "data": _return_directory()["providers"],
-        "updated": "2025-03-04T00:00:00Z",
+        "metadata": {"updated_at": "2025-03-04T00:00:00Z"},
     }

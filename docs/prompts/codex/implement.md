@@ -30,7 +30,8 @@ USAGE NOTES:
 - Always stylize the project name as `token.place`.
 - Treat TODO/FIXME/future-work notes, roadmap bullets, and docs callouts as the source
   pool. Use a reproducible method (e.g., shuffle with `shuf`, pick by index) to choose
-  one candidate at random and explain the selection.
+  one candidate at random and explain the selection. Record the command used for the
+  random selection in your notes so reviewers can replay it.
 - Keep changes narrowly scoped and prefer test-guided iterations.
 
 PRE-FLIGHT CHECKLIST:
@@ -61,7 +62,8 @@ CONTEXT:
 
 REQUEST:
 1. Inventory documented-but-unimplemented work and select one candidate at random; justify why it
-   still delivers value now.
+   still delivers value now. Remember to record the command used for the random selection in your
+   notes or PR description so others can reproduce the draw.
    - If the TODO/FIXME/future-work pool is empty, call that out in your notes and treat this
      prompt's "Upgrade instructions" block (or the Unreleased changelog entries) as the fallback
      source of promised work before proceeding.

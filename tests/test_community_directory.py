@@ -452,6 +452,21 @@ def test_normalise_provider_status_whitespace_defaults_to_unknown():
     assert result["status"] == "unknown"
 
 
+def test_normalise_provider_non_string_status_defaults_to_unknown():
+    """Non-string status values should fall back to the default."""
+
+    provider = {
+        "id": "test-id",
+        "name": "Test Provider",
+        "region": "test-region",
+        "status": None,
+    }
+
+    result = community._normalise_provider(provider)
+
+    assert result["status"] == "unknown"
+
+
 def test_normalise_provider_trims_optional_notes():
     """Optional notes should be stripped and omitted when blank."""
 

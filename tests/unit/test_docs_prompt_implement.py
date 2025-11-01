@@ -24,3 +24,16 @@ def test_implement_prompt_requires_logging_random_method() -> None:
     assert needle in text.lower(), (
         "docs/prompts/codex/implement.md must tell contributors to record the command used for the random selection"
     )
+
+
+def test_implement_prompt_offers_random_selection_walkthrough() -> None:
+    """Prompt should spell out a concrete, reproducible selection workflow."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text = prompt_path.read_text(encoding="utf-8")
+
+    assert "random selection checklist" in text.lower(), (
+        "docs/prompts/codex/implement.md must label a random selection checklist to clarify the workflow"
+    )
+    assert "python - <<'py'" in text.lower(), (
+        "docs/prompts/codex/implement.md must include an example python snippet for deterministic random selection"
+    )

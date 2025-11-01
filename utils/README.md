@@ -5,7 +5,7 @@ This directory contains utility modules for token.place that provide reusable fu
 The package's top level re-exports a few commonly used helpers, so you can import them directly:
 
 ```python
-from utils import get_model_manager, get_crypto_manager, RelayClient
+from utils import get_model_manager, get_crypto_manager, get_temp_dir, RelayClient
 ```
 
 ## Available Utilities
@@ -29,7 +29,7 @@ Environment variable values are stripped of surrounding whitespace before use.
 - `get_app_data_dir()`: Returns the platform-specific application data directory and ensures it exists.
 - `get_logs_dir()`: Returns the platform-specific logs directory, creating it if missing.
 - `get_temp_dir()`: Returns a token.place subdirectory inside the system temporary
-  directory and ensures it exists.
+  directory and ensures it exists. Available directly via `from utils import get_temp_dir`.
 - `is_subpath(path, parent)`: Returns `True` when `path` is the same as or within `parent`.
 - `get_relative_path(path, base_path)`: Returns `path` relative to `base_path`, using `..` segments when the
   two locations do not share a common ancestor. If the paths are on different drives

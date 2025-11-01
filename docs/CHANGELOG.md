@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- Provide `get_temp_dir()` utility for temporary token.place files
+- Added a `get_temp_dir()` utility (and top-level import) for temporary token.place files
 - Include `service` field in `/api/v1/health` responses and honour `SERVICE_NAME`
   overrides
 - Allow `CryptoManager.decrypt_message` to accept JSON string input

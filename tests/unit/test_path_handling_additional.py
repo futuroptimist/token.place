@@ -231,6 +231,25 @@ def test_get_temp_dir_uses_system_temp(tmp_path, monkeypatch):
     assert result.exists()
 
 
+def test_get_temp_dir_is_reexported(tmp_path, monkeypatch):
+    """The utils package should expose get_temp_dir for convenience."""
+    import importlib
+    import utils
+
+    monkeypatch.setattr(
+        ph.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path / "sys_tmp"),
+    )
+    importlib.reload(utils)
+
+    from utils import get_temp_dir  # noqa: WPS433 (import within test)
+
+    temp_dir = get_temp_dir()
+    assert temp_dir == tmp_path / "sys_tmp" / "token.place"
+    assert temp_dir.exists()
+
+
 def test_ensure_dir_exists_invalid_type():
     """ensure_dir_exists should reject non-path-like values"""
     with pytest.raises(TypeError):

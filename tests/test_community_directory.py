@@ -138,6 +138,36 @@ def test_get_provider_directory_normalises_endpoint_payload(monkeypatch, tmp_pat
     ]
 
 
+def test_get_provider_directory_skips_whitespace_identifier(monkeypatch, tmp_path):
+    """Whitespace-only provider identifiers should be ignored when loading the directory."""
+
+    payload_path = tmp_path / "providers.json"
+    payload = {
+        "providers": [
+            {
+                "id": "  ",
+                "name": "Whitespace Provider",
+                "region": "test-region",
+            },
+            {
+                "id": "valid-provider",
+                "name": "Valid Provider",
+                "region": "moon-base",
+            },
+        ],
+        "updated": "2025-05-01T00:00:00Z",
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(community, "COMMUNITY_DIRECTORY_PATH", payload_path)
+    _reset_directory_cache()
+
+    directory = community.get_provider_directory()
+
+    assert [provider["id"] for provider in directory["providers"]] == ["valid-provider"]
+    assert directory["updated"] == "2025-05-01T00:00:00Z"
+
+
 def test_list_community_providers_handles_directory_error(client, monkeypatch):
     """The HTTP endpoint should convert directory errors into API responses."""
 
@@ -327,6 +357,27 @@ def test_normalise_provider_none_region():
     message = str(exc_info.value)
     assert "Provider field 'region' must be a non-empty string" in message
 
+
+def test_has_blank_identifier_false_for_non_dict():
+    """Non-dictionary entries should never be treated as blank providers."""
+
+    assert community._has_blank_identifier(["not", "a", "dict"]) is False
+
+
+def test_has_blank_identifier_false_for_non_string_ids():
+    """Provider identifiers that are not strings should not be skipped."""
+
+    entry = {"id": 123, "name": "Numeric", "region": "moon"}
+
+    assert community._has_blank_identifier(entry) is False
+
+
+def test_has_blank_identifier_true_for_whitespace_only():
+    """Whitespace-only identifiers should be treated as blank values."""
+
+    entry = {"id": "   "}
+
+    assert community._has_blank_identifier(entry) is True
 
 @pytest.mark.parametrize("field", ["id", "name", "region"])
 def test_normalise_provider_whitespace_only_required_fields(field):

@@ -50,6 +50,30 @@ PRE-FLIGHT CHECKLIST:
   `detect-secrets scan $(git diff --cached --name-only)` (install via
   `pip install detect-secrets` if needed) prior to committing.
 
+### Random selection checklist
+
+1. Build the candidate list with
+   `rg --line-number "TODO|FIXME|future-work" -g"*" > /tmp/todo_list.txt`, filtering out
+   generated/vendor paths as needed.
+2. Confirm the remaining entry is still actionable (e.g., not already shipped or obsolete).
+3. Use a deterministic randomizer so reviewers can replay the draw. For example:
+
+   ```bash
+   python - <<'PY'
+   from pathlib import Path
+   import random
+
+   random.seed(20241024)
+   tasks = Path("/tmp/todo_list.txt").read_text().splitlines()
+   print(random.choice(tasks))
+   PY
+   ```
+
+4. Record the exact command(s) you ran alongside the winning candidate in your notes or PR
+   description.
+5. If the pool is empty, explicitly note that outcome, then fall back to the "Upgrade
+   instructions" block or the Unreleased changelog for a substitute commitment.
+
 CONTEXT:
 - Follow `AGENTS.md` and `docs/AGENTS.md`.
 - Consult `llms.txt`, `docs/DEVELOPMENT.md`, `docs/TESTING.md`, and nearby code for background.

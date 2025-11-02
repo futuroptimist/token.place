@@ -43,14 +43,10 @@ def chat_loop(client: CryptoClient):
     """Main chat loop for interactive conversation"""
     conversation: list[dict[str, str]] = []
 
-    # Fetch server public key
-    print("Connecting to server...")
-    if not client.fetch_server_public_key():
-        print("Failed to connect to server. Make sure the relay is running.")
-        sys.exit(1)
-
-    print("Connected! Starting chat session.\n")
     display_conversation(conversation)
+
+    # Defer handshake until we actually have user input so EOF on stdin exits silently.
+    has_key = client.has_server_public_key()
 
     try:
         while True:
@@ -59,6 +55,14 @@ def chat_loop(client: CryptoClient):
             if user_message.lower() in ['exit', 'quit', 'bye']:
                 print("Ending chat session.")
                 break
+
+            if not has_key:
+                print("Connecting to server...")
+                if not client.fetch_server_public_key():
+                    print("Failed to connect to server. Make sure the relay is running.")
+                    sys.exit(1)
+                print("Connected! Starting chat session.\n")
+                has_key = True
 
             # Add to local conversation
             conversation.append({"role": "user", "content": user_message})

@@ -59,6 +59,7 @@ def test_clear_screen_skips_when_not_tty(monkeypatch):
 def test_chat_loop_single_iteration(monkeypatch, capsys):
     mock_client = MagicMock()
     mock_client.fetch_server_public_key.return_value = True
+    mock_client.has_server_public_key.return_value = False
     mock_client.send_chat_message.return_value = [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "ok"},
@@ -72,12 +73,14 @@ def test_chat_loop_single_iteration(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Assistant is thinking" in out
     assert "ok" in out
+    mock_client.fetch_server_public_key.assert_called_once()
 
 
 def test_chat_loop_eof(monkeypatch, capsys):
     """Gracefully exit when stdin closes."""
     mock_client = MagicMock()
     mock_client.fetch_server_public_key.return_value = True
+    mock_client.has_server_public_key.return_value = False
 
     def raise_eof(_):
         raise EOFError
@@ -90,3 +93,4 @@ def test_chat_loop_eof(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Chat session ended" in out
     mock_client.send_chat_message.assert_not_called()
+    mock_client.fetch_server_public_key.assert_not_called()

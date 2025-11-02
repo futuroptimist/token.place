@@ -140,6 +140,16 @@ def _normalise_provider(provider: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _has_blank_identifier(entry: Any) -> bool:
+    """Return True when a provider entry lacks a meaningful identifier."""
+
+    if not isinstance(entry, dict):
+        return False
+
+    provider_id = entry.get("id")
+    return isinstance(provider_id, str) and not provider_id.strip()
+
+
 @lru_cache(maxsize=1)
 def get_provider_directory() -> Dict[str, Any]:
     """Return the cached community provider directory."""
@@ -147,7 +157,12 @@ def get_provider_directory() -> Dict[str, Any]:
     raw_directory = _load_raw_directory()
     providers: List[Dict[str, Any]] = []
     for entry in raw_directory.get("providers", []):
-        providers.append(_normalise_provider(entry))
+        try:
+            providers.append(_normalise_provider(entry))
+        except CommunityDirectoryError:
+            if _has_blank_identifier(entry):
+                continue
+            raise
 
     return {
         "providers": providers,

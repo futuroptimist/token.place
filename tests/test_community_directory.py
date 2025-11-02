@@ -358,6 +358,27 @@ def test_normalise_provider_none_region():
     assert "Provider field 'region' must be a non-empty string" in message
 
 
+def test_has_blank_identifier_false_for_non_dict():
+    """Non-dictionary entries should never be treated as blank providers."""
+
+    assert community._has_blank_identifier(["not", "a", "dict"]) is False
+
+
+def test_has_blank_identifier_false_for_non_string_ids():
+    """Provider identifiers that are not strings should not be skipped."""
+
+    entry = {"id": 123, "name": "Numeric", "region": "moon"}
+
+    assert community._has_blank_identifier(entry) is False
+
+
+def test_has_blank_identifier_true_for_whitespace_only():
+    """Whitespace-only identifiers should be treated as blank values."""
+
+    entry = {"id": "   "}
+
+    assert community._has_blank_identifier(entry) is True
+
 @pytest.mark.parametrize("field", ["id", "name", "region"])
 def test_normalise_provider_whitespace_only_required_fields(field):
     """Whitespace-only required fields should be rejected."""

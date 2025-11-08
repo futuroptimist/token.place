@@ -38,7 +38,10 @@ async function stopProcess(child: ChildProcess): Promise<void> {
   child.kill('SIGTERM');
 
   try {
-    await once(child, 'close');
+    const timeout = delay(5000).then(() => {
+      throw new Error('Process close timeout');
+    });
+    await Promise.race([once(child, 'close'), timeout]);
   } catch {
     child.kill('SIGKILL');
   }
@@ -57,6 +60,9 @@ async function runTokenPlaceRelayClientTest(): Promise<void> {
   });
 
   const relayLogs: string[] = [];
+  relay.stdout?.on('data', chunk => {
+    relayLogs.push(chunk.toString());
+  });
   relay.stderr?.on('data', chunk => {
     relayLogs.push(chunk.toString());
   });

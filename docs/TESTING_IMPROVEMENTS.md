@@ -222,7 +222,10 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    defaults are occupied, with regression coverage in
    `tests/test_integration_setup.ts`.
 3. Automate the test setup to make it reproducible
-4. The test should validate both successful encryption/decryption and proper API compatibility
+4. ✅ The test validates both successful encryption/decryption and proper API compatibility
+   - Added `tests/test_token_place_client_relay.ts`, which drives the relay's `/v1` alias with
+     `TokenPlaceClient` to prove encrypted chat completions decrypt cleanly while preserving the
+     OpenAI-compatible response format.
 
 ## Implementation Priority
 

@@ -18,10 +18,14 @@ async function waitForRelayReady(): Promise<void> {
     try {
       const response = await fetch(HEALTH_ENDPOINT, { method: 'GET' });
       if (response.ok) {
+        console.log(`✓ Relay health check succeeded on attempt ${attempt + 1}`);
         return;
       }
-    } catch {
-      // Ignore network errors until we exhaust retries.
+      console.log(`✗ Health check attempt ${attempt + 1}: HTTP ${response.status}`);
+    } catch (error) {
+      if (attempt === 0 || attempt % 10 === 9) {
+        console.log(`✗ Health check attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
 
     await delay(1000);
@@ -38,10 +42,18 @@ async function stopProcess(child: ChildProcess): Promise<void> {
   child.kill('SIGTERM');
 
   try {
-    const timeout = delay(5000).then(() => {
-      throw new Error('Process close timeout');
+    let timeoutHandle: NodeJS.Timeout;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error('Process close timeout'));
+      }, 5000);
     });
-    await Promise.race([once(child, 'close'), timeout]);
+    await Promise.race([
+      once(child, 'close').then(() => {
+        clearTimeout(timeoutHandle);
+      }),
+      timeoutPromise,
+    ]);
   } catch {
     child.kill('SIGKILL');
   }
@@ -67,9 +79,19 @@ async function runTokenPlaceRelayClientTest(): Promise<void> {
     relayLogs.push(chunk.toString());
   });
 
+  let relayExited = false;
+  relay.on('exit', (code, signal) => {
+    relayExited = true;
+    relayLogs.push(`\n[Process exited with code ${code}, signal ${signal}]\n`);
+  });
+
   try {
     await once(relay, 'spawn');
     await waitForRelayReady();
+
+    if (relayExited) {
+      throw new Error('Relay process exited unexpectedly during startup');
+    }
 
     const client = new TokenPlaceClient({
       baseUrl: BASE_URL,

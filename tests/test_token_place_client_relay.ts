@@ -14,6 +14,11 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const PYTHON_EXECUTABLE = process.env.PYTHON ?? 'python';
 
 async function waitForRelayReady(): Promise<void> {
+  // Wait for the server to start accepting connections after spawn
+  // The relay logs "relay.startup" before serve_forever() is called,
+  // so we need to give it time to actually start listening
+  await delay(2000);
+  
   for (let attempt = 0; attempt < 30; attempt += 1) {
     try {
       const response = await fetch(HEALTH_ENDPOINT, { method: 'GET' });
@@ -65,11 +70,15 @@ async function runTokenPlaceRelayClientTest(): Promise<void> {
     USE_MOCK_LLM: '1',
   };
 
-  const relay = spawn(PYTHON_EXECUTABLE, ['relay.py', '--port', String(RELAY_PORT)], {
-    cwd: PROJECT_ROOT,
-    env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const relay = spawn(
+    PYTHON_EXECUTABLE,
+    ['relay.py', '--host', '127.0.0.1', '--port', String(RELAY_PORT)],
+    {
+      cwd: PROJECT_ROOT,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
 
   const relayLogs: string[] = [];
   relay.stdout?.on('data', chunk => {

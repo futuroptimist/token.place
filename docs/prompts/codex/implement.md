@@ -53,7 +53,6 @@ PRE-FLIGHT CHECKLIST:
 ### Random selection checklist
 
 1. Build the candidate list with
-
    ```bash
    rg --line-number "TODO|FIXME|future-work" \
       --glob '!**/node_modules/**' \
@@ -64,8 +63,12 @@ PRE-FLIGHT CHECKLIST:
 
    Adjust the `--glob` filters if other vendor directories or sample fixtures introduce
    noise, then confirm the remaining paths still reflect real, actionable promises.
-2. Confirm the remaining entry is still actionable (e.g., not already shipped or obsolete).
-3. Use a deterministic randomizer so reviewers can replay the draw. For example:
+2. Trim the list to genuine promises: drop lines that only mention TODO tokens in
+   tests/docs, weed out duplicates that describe the same work item, and note any
+   removals so reviewers understand the filtering.
+3. Confirm every surviving entry is still actionable (e.g., not already shipped or
+   obsolete, scoped to a single verifiable improvement).
+4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash
    python - <<'PY'
@@ -78,10 +81,11 @@ PRE-FLIGHT CHECKLIST:
    PY
    ```
 
-4. Record the exact command(s) you ran alongside the winning candidate in your notes or PR
+5. Record the exact command(s) you ran alongside the winning candidate in your notes or PR
    description.
-5. If the pool is empty, explicitly note that outcome, then fall back to the "Upgrade
-   instructions" block or the Unreleased changelog for a substitute commitment.
+6. If the pool is empty, explicitly note that outcome. Treat each bullet under the
+   "Upgrade instructions" request (or each Unreleased changelog bullet) as its own candidate,
+   rerun the deterministic draw against that fallback list, and document both selections.
 
 CONTEXT:
 - Follow `AGENTS.md` and `docs/AGENTS.md`.
@@ -99,7 +103,10 @@ REQUEST:
    notes or PR description so others can reproduce the draw.
    - If the TODO/FIXME/future-work pool is empty, call that out in your notes and treat this
      prompt's "Upgrade instructions" block (or the Unreleased changelog entries) as the fallback
-     source of promised work before proceeding.
+     source of promised work before proceeding. Treat each fallback bullet as an individual
+     candidate, apply the same deterministic selection process, and keep both selection commands.
+   - When a TODO references multiple follow-ups, ship only the minimal slice that satisfies one
+     verifiable promise and leave fresh TODOs for remaining scope.
 2. Add a failing automated test (pytest, Playwright, or equivalent scripted check) that captures
    the promised behavior, then make it pass with the minimal viable change.
 3. Update docs, comments, and TODOs to reflect the shipped functionality; remove stale promises.

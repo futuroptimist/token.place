@@ -42,8 +42,10 @@ PRE-FLIGHT CHECKLIST:
   neighboring modules before editing security-sensitive paths.
 - Use `rg` to enumerate TODO/FIXME/future-work markers across code, docs, and tests—pick
   one at random that still matters and has clear acceptance criteria.
-- Install dependencies via `npm ci` and `pip install -r requirements.txt` (plus any
-  scoped requirements under `config/`) before running checks.
+- Install dependencies via `npm ci`, `pip install -r requirements.txt`,
+  `pip install -r config/requirements_server.txt`, and
+  `pip install -r config/requirements_relay.txt` before running checks.
+- Run `playwright install` so browser binaries are ready for Playwright-powered tests.
 - Plan to run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
   `./run_all_tests.sh` when applicable.
 - Scan staged changes for credentials with

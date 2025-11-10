@@ -61,3 +61,14 @@ def test_implement_prompt_filters_out_generated_noise() -> None:
     assert "!**/node_modules/**" in text, (
         "docs/prompts/codex/implement.md must show how to ignore vendor directories when hunting TODO markers"
     )
+
+
+def test_implement_prompt_calls_out_config_requirements() -> None:
+    """Prompt should reference the scoped Python requirement files explicitly."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text = prompt_path.read_text(encoding="utf-8")
+
+    for requirement in ("config/requirements_server.txt", "config/requirements_relay.txt"):
+        assert requirement in text, (
+            "docs/prompts/codex/implement.md must remind contributors to install scoped requirements"
+        )

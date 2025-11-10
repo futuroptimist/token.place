@@ -52,6 +52,14 @@ def chat_loop(client: CryptoClient):
         while True:
             # Get user input
             user_message = input("You: ")
+
+            if not user_message.strip():
+                if not sys.stdin.isatty():
+                    print("No input detected. Ending chat session.")
+                    break
+                print("Please enter a message or type 'exit' to quit.")
+                continue
+
             if user_message.lower() in ['exit', 'quit', 'bye']:
                 print("Ending chat session.")
                 break

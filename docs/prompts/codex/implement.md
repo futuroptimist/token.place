@@ -53,8 +53,16 @@ PRE-FLIGHT CHECKLIST:
 ### Random selection checklist
 
 1. Build the candidate list with
-   `rg --line-number "TODO|FIXME|future-work" -g"*" > /tmp/todo_list.txt`, filtering out
-   generated/vendor paths as needed.
+   ```bash
+   rg --line-number "TODO|FIXME|future-work" \
+      --glob '!**/node_modules/**' \
+      --glob '!.git/**' \
+      --glob '!hooks/**' \
+      > /tmp/todo_list.txt
+   ```
+
+   Adjust the `--glob` filters if other vendor directories or sample fixtures introduce
+   noise, then confirm the remaining paths still reflect real, actionable promises.
 2. Trim the list to genuine promises: drop lines that only mention TODO tokens in
    tests/docs, weed out duplicates that describe the same work item, and note any
    removals so reviewers understand the filtering.

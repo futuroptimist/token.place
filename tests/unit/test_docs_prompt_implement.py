@@ -37,3 +37,13 @@ def test_implement_prompt_offers_random_selection_walkthrough() -> None:
     assert "python - <<'py'" in text.lower(), (
         "docs/prompts/codex/implement.md must include an example python snippet for deterministic random selection"
     )
+
+
+def test_implement_prompt_filters_out_generated_noise() -> None:
+    """Prompt should remind contributors to exclude vendor and sample directories."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text = prompt_path.read_text(encoding="utf-8")
+
+    assert "!**/node_modules/**" in text, (
+        "docs/prompts/codex/implement.md must show how to ignore vendor directories when hunting TODO markers"
+    )

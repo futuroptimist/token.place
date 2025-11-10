@@ -42,11 +42,12 @@ def test_implement_prompt_offers_random_selection_walkthrough() -> None:
 def test_implement_prompt_details_todo_cleanup_search() -> None:
     """Prompt should teach contributors how to confirm stale TODOs are gone."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
-    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+    text = prompt_path.read_text(encoding="utf-8")
+    text_lower = text.lower()
 
     assert "search for the original todo" in text_lower or "confirm the original todo" in text_lower, (
         "docs/prompts/codex/implement.md must remind contributors to search for the original TODO text after cleanup"
     )
-    assert "rg -f" in text_lower, (
+    assert "rg -F" in text, (
         "docs/prompts/codex/implement.md must provide an example ripgrep command for verifying TODO removal"
     )

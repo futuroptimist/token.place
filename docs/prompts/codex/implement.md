@@ -68,8 +68,15 @@ PRE-FLIGHT CHECKLIST:
 2. Trim the list to genuine promises: drop lines that only mention TODO tokens in
    tests/docs, weed out duplicates that describe the same work item, and note any
    removals so reviewers understand the filtering.
+   - While pruning, identify what "done" means for each entry and jot down the
+     smallest verifiable slice you could ship. This keeps future you honest about
+     scope creep when you circle back to implement the fix.
 3. Confirm every surviving entry is still actionable (e.g., not already shipped or
    obsolete, scoped to a single verifiable improvement).
+   - Write down a one-sentence acceptance criterion for the selected promise so the
+     failing test you add later stays tightly scoped. Before moving on, record a
+     one-line summary of the smallest verifiable slice you intend to ship now and
+     explicitly defer the rest as follow-up TODOs.
 4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash
@@ -111,7 +118,8 @@ REQUEST:
      improves when the promise ships now. Call out affected tests or docs so reviewers can see the
      continued relevance at a glance.
    - When a TODO references multiple follow-ups, ship only the minimal slice that satisfies one
-     verifiable promise and leave fresh TODOs for remaining scope.
+     verifiable promise and leave fresh TODOs for remaining scope. Call out the smallest verifiable
+     slice in your notes so reviewers understand the intended boundary.
 2. Add a failing automated test (pytest, Playwright, or equivalent scripted check) that captures
    the promised behavior, then make it pass with the minimal viable change.
 3. Update docs, comments, and TODOs to reflect the shipped functionality; remove stale promises.
@@ -157,5 +165,6 @@ REQUEST:
 3. Confirm all commands and references remain valid, then summarize changes in the PR description.
 
 OUTPUT:
-A pull request updating `docs/prompts/codex/implement.md` with passing checks and documented impacts.
+A pull request updating `docs/prompts/codex/implement.md` with passing checks and
+documented impacts.
 ```

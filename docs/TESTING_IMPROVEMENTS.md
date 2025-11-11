@@ -238,9 +238,9 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
 ## Notes for Implementation
 
 - ✅ **Integrate with CI/CD to run tests automatically** (2025-11-11)
-  - Added `RUN_STRESS_TESTS` environment variable to `run_all_tests.sh` and `run_all_tests.ps1`
+  - Added `RUN_STRESS_TESTS` environment variable to both `run_all_tests.sh` and `run_all_tests.ps1` scripts
   - Stress tests (`tests/test_stress_streaming.py`) and performance benchmarks
-    (`tests/test_performance_benchmarks.py`) now run conditionally when `RUN_STRESS_TESTS=1`
+    (`tests/test_performance_benchmarks.py`) now run conditionally when `RUN_STRESS_TESTS=1` is set
   - Updated `docs/TESTING.md` with instructions on enabling stress tests
   - Tests remain opt-in by default to keep CI build times reasonable
 - ✅ Containerized test runner covers browser/integration suites via

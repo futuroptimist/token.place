@@ -70,6 +70,9 @@ PRE-FLIGHT CHECKLIST:
    removals so reviewers understand the filtering.
 3. Confirm every surviving entry is still actionable (e.g., not already shipped or
    obsolete, scoped to a single verifiable improvement).
+   - Write down a one-sentence acceptance criterion for the selected promise so the
+     failing test you add later stays tightly scoped. If a TODO bundles multiple
+     behaviors, pick one slice to ship now and leave fresh TODOs for the remainder.
 4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash

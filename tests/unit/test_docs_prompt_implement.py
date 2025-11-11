@@ -72,3 +72,13 @@ def test_implement_prompt_calls_out_config_requirements() -> None:
         assert requirement in text, (
             "docs/prompts/codex/implement.md must remind contributors to install scoped requirements"
         )
+
+
+def test_implement_prompt_requires_acceptance_criteria_notes() -> None:
+    """Prompt should tell contributors to capture the acceptance criteria before coding."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "one-sentence acceptance criterion" in text, (
+        "docs/prompts/codex/implement.md must instruct contributors to note the acceptance criteria"
+    )

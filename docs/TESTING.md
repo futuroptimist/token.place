@@ -152,6 +152,32 @@ python -m pytest -m slow
 `tests/test_stress_streaming.py` is the primary example, iterating through dozens of
 encrypted stream cycles to catch performance regressions.
 
+### Stress Tests
+
+Stress tests validate system performance under sustained load and can be run as part of
+the full test suite by setting an environment variable:
+
+```sh
+# Unix/Linux/macOS
+export RUN_STRESS_TESTS=1
+./run_all_tests.sh
+
+# Windows PowerShell
+$env:RUN_STRESS_TESTS=1
+.\run_all_tests.ps1
+
+# Or run directly
+python -m pytest tests/test_stress_streaming.py -v
+python -m pytest tests/test_performance_benchmarks.py -v
+```
+
+Stress tests include:
+- **Streaming encryption stress**: Tests sustained chunk encryption/decryption cycles
+- **Performance benchmarks**: Measures encryption/decryption throughput and latency
+
+These tests are skipped by default in CI to keep build times reasonable, but can be
+enabled for release validation or when investigating performance regressions.
+
 ## User Journeys and E2E Testing
 
 token.place tests are organized around key user journeys that represent how users interact with the system:

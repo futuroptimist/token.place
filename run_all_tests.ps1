@@ -76,6 +76,14 @@ RunTest -TestName "End-to-End Tests" -Command "python -m pytest tests/test_e2e_*
 # 9. Run failure recovery tests
 RunTest -TestName "Failure Recovery Tests" -Command "python -m pytest tests/test_failure_recovery.py -v" -Description "Testing system resilience against errors"
 
+# 9b. Run stress tests (optional via environment variable)
+if ($env:RUN_STRESS_TESTS -eq "1") {
+    RunTest -TestName "Stress Tests" -Command "python -m pytest tests/test_stress_streaming.py -v" -Description "Testing system performance under sustained load"
+    RunTest -TestName "Performance Benchmarks" -Command "python -m pytest tests/test_performance_benchmarks.py -v" -Description "Benchmarking encryption and decryption performance"
+} else {
+    Write-Host "Skipping Stress Tests (set `$env:RUN_STRESS_TESTS=1 to enable)"
+}
+
 # 10. Run DSPACE integration tests
 if (Test-Path "integration_tests/") {
     Write-Host ""

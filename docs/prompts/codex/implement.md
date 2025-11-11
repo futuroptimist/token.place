@@ -114,6 +114,9 @@ REQUEST:
      prompt's "Upgrade instructions" block (or the Unreleased changelog entries) as the fallback
      source of promised work before proceeding. Treat each fallback bullet as an individual
      candidate, apply the same deterministic selection process, and keep both selection commands.
+   - Add a succinct value statement to your PR summary explaining which user workflow or guardrail
+     improves when the promise ships now. Call out affected tests or docs so reviewers can see the
+     continued relevance at a glance.
    - When a TODO references multiple follow-ups, ship only the minimal slice that satisfies one
      verifiable promise and leave fresh TODOs for remaining scope. Call out the smallest verifiable
      slice in your notes so reviewers understand the intended boundary.

@@ -84,11 +84,18 @@ def test_implement_prompt_calls_out_config_requirements() -> None:
         )
 
 
-def test_implement_prompt_requires_acceptance_criteria_notes() -> None:
-    """Prompt should tell contributors to capture the acceptance criteria before coding."""
+def test_implement_prompt_demands_value_statement() -> None:
+    """Prompt should insist on documenting why the chosen task still matters and capture acceptance criteria."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
-    text = prompt_path.read_text(encoding="utf-8").lower()
+    text = prompt_path.read_text(encoding="utf-8")
+    text_lower = text.lower()
 
-    assert "one-sentence acceptance criterion" in text, (
-        "docs/prompts/codex/implement.md must instruct contributors to note the acceptance criteria"
+    assert "value statement" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to include a value statement for the chosen task"
+    )
+    assert "pr summary" in text_lower, (
+        "docs/prompts/codex/implement.md must mention the PR summary as the place to capture that value statement"
+    )
+    assert "one-sentence acceptance criterion" in text_lower, (
+        "docs/prompts/codex/implement.md must instruct contributors to note the acceptance criteria before coding"
     )

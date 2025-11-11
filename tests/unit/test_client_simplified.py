@@ -124,3 +124,34 @@ def test_chat_loop_empty_input_from_pipe(monkeypatch, capsys):
     assert "No input detected" in out
     mock_client.fetch_server_public_key.assert_not_called()
     mock_client.send_chat_message.assert_not_called()
+
+
+def test_chat_loop_exit_with_trailing_whitespace(monkeypatch, capsys):
+    """Exit commands with extra spaces should not trigger a handshake."""
+
+    mock_client = MagicMock()
+    mock_client.fetch_server_public_key.return_value = True
+    mock_client.has_server_public_key.return_value = False
+
+    responses = iter(["exit   "])
+
+    def fake_input(_: str) -> str:
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    class FakePipe(io.StringIO):
+        def isatty(self) -> bool:  # pragma: no cover - trivial
+            return False
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    monkeypatch.setattr(cs, "clear_screen", lambda: None)
+    monkeypatch.setattr(cs.sys, "stdin", FakePipe())
+
+    cs.chat_loop(mock_client)
+
+    out = capsys.readouterr().out
+    assert "Ending chat session." in out
+    mock_client.fetch_server_public_key.assert_not_called()
+    mock_client.send_chat_message.assert_not_called()

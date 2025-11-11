@@ -45,11 +45,11 @@ def test_implement_prompt_details_todo_cleanup_search() -> None:
     text = prompt_path.read_text(encoding="utf-8")
     text_lower = text.lower()
 
-    assert "search for the original todo" in text_lower or "confirm the original todo" in text_lower, (
-        "docs/prompts/codex/implement.md must remind contributors to search for the original TODO text after cleanup"
+    assert "after cleanup" in text_lower, (
+        "docs/prompts/codex/implement.md must explicitly tie the TODO search to the post-cleanup step"
     )
-    assert "rg -F" in text, (
-        "docs/prompts/codex/implement.md must provide an example ripgrep command for verifying TODO removal"
+    assert 'rg -F "TODO: refresh prompt-implement guide" -n' in text, (
+        "docs/prompts/codex/implement.md must provide a concrete ripgrep command for verifying TODO removal"
     )
 
 

@@ -73,8 +73,10 @@ PRE-FLIGHT CHECKLIST:
      scope creep when you circle back to implement the fix.
 3. Confirm every surviving entry is still actionable (e.g., not already shipped or
    obsolete, scoped to a single verifiable improvement).
-   - Before moving on, write a one-line summary of the smallest verifiable slice you
-     intend to ship now and explicitly defer the rest as follow-up TODOs.
+   - Write down a one-sentence acceptance criterion for the selected promise so the
+     failing test you add later stays tightly scoped. Before moving on, record a
+     one-line summary of the smallest verifiable slice you intend to ship now and
+     explicitly defer the rest as follow-up TODOs.
 4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash

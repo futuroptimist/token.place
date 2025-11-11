@@ -149,6 +149,14 @@ else
     echo "Skipping Failure Recovery Tests (set RUN_E2E=1 to enable)"
 fi
 
+# 9b. Run stress tests
+if [ "${RUN_STRESS_TESTS:-0}" = "1" ]; then
+    run_test "Stress Tests" "$PYTHON_CMD -m pytest tests/test_stress_streaming.py -v $COVERAGE_ARGS" "Testing system performance under sustained load"
+    run_test "Performance Benchmarks" "$PYTHON_CMD -m pytest tests/test_performance_benchmarks.py -v $COVERAGE_ARGS" "Benchmarking encryption and decryption performance"
+else
+    echo "Skipping Stress Tests (set RUN_STRESS_TESTS=1 to enable)"
+fi
+
 # 10. Run DSPACE integration tests
 if [ -d "integration_tests/" ]; then
     echo ""

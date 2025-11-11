@@ -72,3 +72,17 @@ def test_implement_prompt_calls_out_config_requirements() -> None:
         assert requirement in text, (
             "docs/prompts/codex/implement.md must remind contributors to install scoped requirements"
         )
+
+
+def test_implement_prompt_demands_value_statement() -> None:
+    """Prompt should insist on documenting why the chosen task still matters."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text = prompt_path.read_text(encoding="utf-8")
+    text_lower = text.lower()
+
+    assert "value statement" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to include a value statement for the chosen task"
+    )
+    assert "pr summary" in text_lower, (
+        "docs/prompts/codex/implement.md must mention the PR summary as the place to capture that value statement"
+    )

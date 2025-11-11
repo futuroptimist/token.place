@@ -63,6 +63,16 @@ def test_implement_prompt_filters_out_generated_noise() -> None:
     )
 
 
+def test_implement_prompt_reinforces_minimal_scope() -> None:
+    """Prompt should clarify how to keep the work scoped to a single verifiable slice."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text = prompt_path.read_text(encoding="utf-8")
+
+    assert "smallest verifiable slice" in text.lower(), (
+        "docs/prompts/codex/implement.md must explicitly tell contributors to ship the smallest verifiable slice"
+    )
+
+
 def test_implement_prompt_calls_out_config_requirements() -> None:
     """Prompt should reference the scoped Python requirement files explicitly."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

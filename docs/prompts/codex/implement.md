@@ -113,8 +113,11 @@ REQUEST:
    the promised behavior, then make it pass with the minimal viable change.
 3. Update docs, comments, and TODOs to reflect the shipped functionality; remove stale promises.
    - Replace or delete the original TODO marker instead of leaving it in a "done" state.
-   - Search for the original TODO text (for example, `rg -F "TODO: refresh prompt-implement guide"`)
-     to confirm the stale promise is gone before shipping.
+   - After cleanup, search for the original TODO text to confirm it is gone. For example, run:
+     ```bash
+     rg -F "TODO: refresh prompt-implement guide" -n
+     ```
+     and expect no matches before shipping.
    - Update any README or changelog references that mentioned the outstanding work.
 4. Run the commands above and record their results in the PR description, noting any additional
    manual verification.

@@ -81,7 +81,7 @@ async function testMetadataRoundTrip(baseUrl) {
   assert.ok(response.ok, 'Metadata request should succeed');
 
   const result = await response.json();
-  
+
   // The response structure should be OpenAI-compatible
   assert.ok(result.choices, 'Response should have choices');
   assert.ok(result.id, 'Response should have an id');
@@ -197,7 +197,7 @@ async function testModelAlias(baseUrl) {
   assert.ok(result.data, 'Should return models data array');
 
   const hasGpt5Alias = result.data.some(model => model.id === 'gpt-5-chat-latest');
-  
+
   // Note: In mock mode, gpt-5-chat-latest might not be listed but still works at chat completions
   if (hasGpt5Alias) {
     console.log('✅ Model alias test passed (alias found in models list)');
@@ -254,7 +254,7 @@ async function runDspaceIntegrationTest() {
 
     assert.ok(chatResponse.ok, 'Chat completion request should succeed');
     const chatResult = await chatResponse.json();
-    
+
     assert.strictEqual(chatResult.model, 'gpt-5-chat-latest', 'Response should echo the model alias');
     assert.ok(chatResult.choices && chatResult.choices.length > 0, 'Should have at least one choice');
     assert.strictEqual(chatResult.choices[0].message.role, 'assistant', 'Message role should be assistant');
@@ -263,7 +263,7 @@ async function runDspaceIntegrationTest() {
       chatResult.choices[0].message.content.length > 0,
       'Message should have non-empty content'
     );
-    
+
     console.log('✅ Chat completion test passed');
     console.log(`   Model: ${chatResult.model}`);
     console.log(`   Response: ${chatResult.choices[0].message.content.substring(0, 80)}...`);

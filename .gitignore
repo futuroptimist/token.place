@@ -60,3 +60,4 @@ integration_tests/*
 !integration_tests/run_integration_test.sh
 !integration_tests/setup.js
 !integration_tests/setup.d.ts
+!integration_tests/test_dspace_integration.js

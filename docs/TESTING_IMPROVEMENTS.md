@@ -221,7 +221,14 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    `integration_tests/setup.js` now selects free ports automatically when the
    defaults are occupied, with regression coverage in
    `tests/test_integration_setup.ts`.
-3. Automate the test setup to make it reproducible
+3. ✅ **Automate the test setup to make it reproducible** (IMPLEMENTED 2025-11-12)
+   - Added `integration_tests/test_dspace_integration.js`, which automates the complete DSPACE
+     integration testing workflow by spawning relay.py in mock mode, then validating OpenAI API
+     compatibility, model aliases, metadata round-trip, and usage metrics.
+   - The test runs through the `run_dspace_integration.sh` script when a maintainer exports
+     `RUN_DSPACE_INTEGRATION=1`, allowing automated verification of the DSPACE integration.
+   - Uses Node.js built-in fetch (v20+) to minimize dependencies and ensure reproducibility.
+   - Polls the `/v1/health` endpoint to ensure the relay is fully ready before running tests.
 4. The test should validate both successful encryption/decryption and proper API compatibility
 
 ## Implementation Priority

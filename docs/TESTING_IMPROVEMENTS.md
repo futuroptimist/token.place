@@ -228,7 +228,7 @@ git clone https://github.com/democratizedspace/dspace.git -b v3
    - The test runs through the `run_dspace_integration.sh` script when a maintainer exports
      `RUN_DSPACE_INTEGRATION=1`, allowing automated verification of the DSPACE integration.
    - Uses Node.js built-in fetch (v20+) to minimize dependencies and ensure reproducibility.
-   - Polls the `/v1/health` endpoint to ensure the relay is fully ready before running tests.
+   - Polls the `/v1/health` endpoint to ensure the API is fully ready before running tests (consistent with other integration tests).
 4. The test should validate both successful encryption/decryption and proper API compatibility
 
 ## Implementation Priority

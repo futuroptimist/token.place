@@ -2,60 +2,19 @@
  * DSPACE Integration Test
  *
  * This test validates that token.place works as a drop-in replacement for OpenAI's API
- * in the DSPACE application. It exercises the full integration workflow using the
- * helpers from setup.js.
+ * in the DSPACE application. It exercises the full integration workflow.
  *
  * The test:
- * 1. Starts a token.place server with mock LLM
- * 2. Creates a client using the token.place-client template
- * 3. Validates encryption/decryption works end-to-end
- * 4. Verifies API compatibility with OpenAI's chat completions format
+ * 1. Starts a token.place relay with mock LLM
+ * 2. Validates API compatibility with OpenAI's chat completions format
+ * 3. Tests unencrypted requests (encryption is tested in other test suites)
+ * 4. Verifies metadata round-trip and usage metrics
  */
 
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { createTokenPlaceClient } = require('./token_place_client_template/index.js');
-
-/**
- * Test encrypted chat completion flow matching DSPACE's expected behavior
- */
-async function testEncryptedChatCompletion(client) {
-  const messages = [
-    {
-      role: 'system',
-      content: 'You are a helpful assistant embedded in DSPACE.',
-    },
-    {
-      role: 'user',
-      content: 'What is the capital of France?',
-    },
-  ];
-
-  const completion = await client.createChatCompletion({
-    messages,
-    model: 'gpt-5-chat-latest', // DSPACE uses this alias
-  });
-
-  // Verify OpenAI-compatible response structure
-  assert.ok(completion, 'Should return a completion object');
-  assert.ok(completion.choices, 'Should have choices array');
-  assert.ok(completion.choices.length > 0, 'Should have at least one choice');
-
-  const choice = completion.choices[0];
-  assert.ok(choice.message, 'Choice should have a message');
-  assert.strictEqual(choice.message.role, 'assistant', 'Message role should be assistant');
-  assert.ok(
-    typeof choice.message.content === 'string' && choice.message.content.length > 0,
-    'Message should have non-empty content'
-  );
-
-  console.log('✅ Encrypted chat completion test passed');
-  console.log(`   Response: ${choice.message.content.substring(0, 80)}...`);
-
-  return completion;
-}
+const net = require('node:net');
 
 /**
  * Test metadata round-trip to verify DSPACE can correlate responses
@@ -86,6 +45,7 @@ async function testMetadataRoundTrip(baseUrl) {
   assert.ok(result.choices, 'Response should have choices');
   assert.ok(result.id, 'Response should have an id');
   assert.ok(result.object, 'Response should have an object type');
+  assert.deepStrictEqual(result.metadata, requestPayload.metadata, 'Response should echo request metadata');
 
   console.log('✅ Metadata round-trip test passed');
 
@@ -110,24 +70,56 @@ async function testUsageMetrics(baseUrl) {
   const result = await response.json();
 
   // OpenAI responses include usage statistics
-  if (result.usage) {
-    assert.ok(
-      typeof result.usage.prompt_tokens === 'number' && result.usage.prompt_tokens >= 0,
-      'Should have non-negative prompt_tokens'
-    );
-    assert.ok(
-      typeof result.usage.completion_tokens === 'number' && result.usage.completion_tokens >= 0,
-      'Should have non-negative completion_tokens'
-    );
-    assert.ok(
-      typeof result.usage.total_tokens === 'number' && result.usage.total_tokens >= 0,
-      'Should have non-negative total_tokens'
-    );
-  }
+  assert.ok(
+    result.usage && typeof result.usage === 'object',
+    'Usage payload missing from chat completion response'
+  );
+  assert.ok(
+    typeof result.usage.prompt_tokens === 'number' && result.usage.prompt_tokens >= 0,
+    'Should have non-negative prompt_tokens'
+  );
+  assert.ok(
+    typeof result.usage.completion_tokens === 'number' && result.usage.completion_tokens >= 0,
+    'Should have non-negative completion_tokens'
+  );
+  assert.ok(
+    typeof result.usage.total_tokens === 'number' && result.usage.total_tokens >= 0,
+    'Should have non-negative total_tokens'
+  );
 
   console.log('✅ Usage metrics test passed');
 
   return result;
+}
+
+/**
+ * Find an available port by letting the OS assign one
+ */
+async function findAvailablePort() {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+
+    server.once('error', reject);
+
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : undefined;
+
+      server.close(error => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        if (typeof port !== 'number') {
+          reject(new Error('Unable to determine available port'));
+          return;
+        }
+
+        resolve(port);
+      });
+    });
+  });
 }
 
 /**
@@ -149,6 +141,15 @@ async function startRelayServer(port = 5555) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
+  // Consume stdout to prevent buffer from filling up
+  relayProcess.stdout.on('data', (data) => {
+    const message = data.toString().trim();
+    if (message) {
+      // Optionally log, or just consume
+      // console.log(`  relay stdout: ${message}`);
+    }
+  });
+
   // Log stderr for debugging
   relayProcess.stderr.on('data', (data) => {
     const message = data.toString().trim();
@@ -166,6 +167,8 @@ async function startRelayServer(port = 5555) {
 async function waitForServerReady(baseUrl, maxAttempts = 30, delayMs = 1000) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      // Use /v1/health which returns 200 even when relay is degraded (no upstream servers)
+      // This is consistent with other integration tests that check API availability
       const response = await fetch(`${baseUrl}/v1/health`, {
         signal: AbortSignal.timeout(2000),
       });
@@ -218,9 +221,9 @@ async function runDspaceIntegrationTest() {
   let tokenPlaceProcess = null;
 
   try {
-    // Start relay server with mock LLM on a random available port
+    // Start relay server with mock LLM on an available port
     console.log('Starting token.place relay...');
-    const port = 5555 + Math.floor(Math.random() * 100);
+    const port = await findAvailablePort();
     const { process: relayProcess } = await startRelayServer(port);
 
     tokenPlaceProcess = relayProcess;
@@ -288,7 +291,18 @@ async function runDspaceIntegrationTest() {
     // Cleanup
     if (tokenPlaceProcess) {
       console.log('Cleaning up...');
+      // Gracefully terminate the process, wait for exit, force kill if needed
       tokenPlaceProcess.kill('SIGTERM');
+      const timeoutMs = 5000;
+      const exited = await Promise.race([
+        new Promise(resolve => tokenPlaceProcess.once('exit', () => resolve('exited'))),
+        new Promise(resolve => setTimeout(resolve, timeoutMs, 'timeout')),
+      ]);
+      if (exited === 'timeout') {
+        console.warn(`Process did not exit after ${timeoutMs}ms, sending SIGKILL...`);
+        tokenPlaceProcess.kill('SIGKILL');
+        await new Promise(resolve => tokenPlaceProcess.once('exit', resolve));
+      }
       console.log('✅ Cleanup complete');
     }
   }

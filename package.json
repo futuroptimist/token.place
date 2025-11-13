@@ -41,7 +41,7 @@
     "jsencrypt": "^3.5.4",
     "mocha": "^11.7.4",
     "openai": "^3.2.1",
-    "selenium-webdriver": "^4.35.0"
+    "selenium-webdriver": "^4.38.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",

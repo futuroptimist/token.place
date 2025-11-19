@@ -73,6 +73,19 @@ def test_implement_prompt_reinforces_minimal_scope() -> None:
     )
 
 
+def test_implement_prompt_preserves_trimmed_todo_list() -> None:
+    """Prompt should require saving the filtered TODO list and its rationale."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "trimmed todo list" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to keep the trimmed TODO list for the random draw"
+    )
+    assert "why each entry was removed" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to note why entries were filtered out"
+    )
+
+
 def test_implement_prompt_calls_out_config_requirements() -> None:
     """Prompt should reference the scoped Python requirement files explicitly."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

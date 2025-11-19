@@ -71,6 +71,9 @@ PRE-FLIGHT CHECKLIST:
    - While pruning, identify what "done" means for each entry and jot down the
      smallest verifiable slice you could ship. This keeps future you honest about
      scope creep when you circle back to implement the fix.
+   - Save the trimmed TODO list (for example, `/tmp/todo_filtered.txt`) and jot down
+     why each entry was removed before running the randomizer so the narrowed pool is
+     reproducible and auditable.
 3. Confirm every surviving entry is still actionable (e.g., not already shipped or
    obsolete, scoped to a single verifiable improvement).
    - Write down a one-sentence acceptance criterion for the selected promise so the

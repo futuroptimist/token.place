@@ -68,6 +68,8 @@ PRE-FLIGHT CHECKLIST:
 2. Trim the list to genuine promises: drop lines that only mention TODO tokens in
    tests/docs, weed out duplicates that describe the same work item, and note any
    removals so reviewers understand the filtering.
+   - Ignore prompt text or other instructional references that only cite TODO/FIXME as
+     examples—they are noise, not promises you can ship.
    - While pruning, identify what "done" means for each entry and jot down the
      smallest verifiable slice you could ship. This keeps future you honest about
      scope creep when you circle back to implement the fix.
@@ -79,7 +81,8 @@ PRE-FLIGHT CHECKLIST:
    - Write down a one-sentence acceptance criterion for the selected promise so the
      failing test you add later stays tightly scoped. Before moving on, record a
      one-line summary of the smallest verifiable slice you intend to ship now and
-     explicitly defer the rest as follow-up TODOs.
+     explicitly defer the rest as follow-up TODOs. Keep a short non-goals list so
+     reviewers understand what you're intentionally leaving for later.
 4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash

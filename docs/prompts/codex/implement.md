@@ -98,7 +98,9 @@ PRE-FLIGHT CHECKLIST:
 
 5. Record the exact command(s) you ran alongside the winning candidate in your notes or PR
    description.
-6. If the pool is empty, explicitly note that outcome. Treat each bullet under the
+6. Include the filtered TODO list (or fallback candidate list) and the random selection command
+   in your PR summary so reviewers can replay the draw even after temporary files are cleaned up.
+7. If the pool is empty, explicitly note that outcome. Treat each bullet under the
    "Upgrade instructions" request (or each Unreleased changelog bullet) as its own candidate,
    rerun the deterministic draw against that fallback list, and document both selections.
 

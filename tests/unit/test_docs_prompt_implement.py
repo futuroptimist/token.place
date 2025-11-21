@@ -73,6 +73,19 @@ def test_implement_prompt_reinforces_minimal_scope() -> None:
     )
 
 
+def test_implement_prompt_ignores_instructional_noise() -> None:
+    """Prompt should avoid treating instructional TODO mentions as actionable work and set non-goals."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "instructional references" in text_lower, (
+        "docs/prompts/codex/implement.md must warn against counting instructional TODO mentions as candidates"
+    )
+    assert "non-goal" in text_lower, (
+        "docs/prompts/codex/implement.md must ask contributors to note non-goals to prevent scope creep"
+    )
+
+
 def test_implement_prompt_preserves_trimmed_todo_list() -> None:
     """Prompt should require saving the filtered TODO list and its rationale."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

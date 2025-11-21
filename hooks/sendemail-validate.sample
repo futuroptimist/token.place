@@ -23,6 +23,39 @@
 # trailer and that no added lines or subjects contain placeholder tokens.
 # Adjust or extend the checks below to suit your workflow.
 
+PLACEHOLDER_TOKEN_PATTERN="TODO|FIXME|WIP|TBD"
+PLACEHOLDER_REGEX="\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b"
+
+print_placeholder_error () {
+        scope="$1"
+        token="$2"
+        detail="$3"
+        echo "sendemail-validate: placeholder token (${token}) detected in ${scope}${detail}" >&2
+}
+
+extract_placeholder_token () {
+        line="$1"
+        echo "$line" | sed -E "s/.*\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b.*/\\1/I"
+}
+
+find_placeholder_in_file () {
+        file="$1"
+        scope="$2"
+        pattern="$3"
+
+        match=$(grep -En "$pattern" "$file" | head -n 1 || true)
+
+        if test -n "$match"
+        then
+                line_number=${match%%:*}
+                token=$(extract_placeholder_token "$match")
+                print_placeholder_error "$scope" "$token" " at line ${line_number}"
+                return 0
+        fi
+
+        return 1
+}
+
 validate_cover_letter () {
         file="$1"
         if test ! -s "$file"
@@ -31,9 +64,8 @@ validate_cover_letter () {
                 return 1
         fi
 
-        if grep -Eiq '(TODO|FIXME|WIP|TBD)' "$file"
+        if find_placeholder_in_file "$file" "cover letter" "${PLACEHOLDER_REGEX}"
         then
-                echo "sendemail-validate: placeholder token detected in cover letter" >&2
                 return 1
         fi
 
@@ -54,9 +86,10 @@ validate_patch () {
 
         subject=$(sed -n 's/^Subject: //p' "$file" | head -n 1)
 
-        if printf '%s' "$subject" | grep -Eiq '\b(WIP|TODO|FIXME|TBD)\b'
+        if printf '%s' "$subject" | grep -Eiq "$PLACEHOLDER_REGEX"
         then
-                echo "sendemail-validate: placeholder token detected in patch subject" >&2
+                token=$(extract_placeholder_token "$subject")
+                print_placeholder_error "patch subject" "$token" ""
                 return 1
         fi
 
@@ -73,9 +106,8 @@ validate_patch () {
                 return 1
         fi
 
-        if grep -Eq '^\+.*(TODO|FIXME|WIP|TBD)' "$file"
+        if find_placeholder_in_file "$file" "patch body" "^\+.*${PLACEHOLDER_REGEX}"
         then
-                echo "sendemail-validate: placeholder token detected in patch" >&2
                 return 1
         fi
 

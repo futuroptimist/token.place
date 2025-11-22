@@ -164,3 +164,16 @@ def test_implement_prompt_ties_acceptance_to_failing_test() -> None:
     assert "defer any extra assertions to follow-up todos" in text_lower, (
         "docs/prompts/codex/implement.md must remind contributors to park extra scope as follow-ups"
     )
+
+
+def test_implement_prompt_confirms_commands_and_links() -> None:
+    """Prompt should require checking referenced commands and links still work."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "verify each referenced command still runs" in text_lower, (
+        "docs/prompts/codex/implement.md must ask contributors to validate the commands it cites"
+    )
+    assert "link updates in the pr description" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to note link changes for reviewers"
+    )

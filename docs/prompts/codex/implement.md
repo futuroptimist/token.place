@@ -126,6 +126,8 @@ REQUEST:
      prompt's "Upgrade instructions" block (or the Unreleased changelog entries) as the fallback
      source of promised work before proceeding. Treat each fallback bullet as an individual
      candidate, apply the same deterministic selection process, and keep both selection commands.
+   - After the draw, freeze the scope: do not bundle opportunistic fixes or nearby TODOs into the
+     same change. Instead, log follow-ups so the chosen slice remains small and auditable.
    - Add a succinct value statement to your PR summary explaining which user workflow or guardrail
      improves when the promise ships now. Call out affected tests or docs so reviewers can see the
      continued relevance at a glance.

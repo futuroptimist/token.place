@@ -151,3 +151,16 @@ def test_implement_prompt_demands_value_statement() -> None:
     assert "one-sentence acceptance criterion" in text_lower, (
         "docs/prompts/codex/implement.md must instruct contributors to note the acceptance criteria before coding"
     )
+
+
+def test_implement_prompt_ties_acceptance_to_failing_test() -> None:
+    """Prompt should connect the acceptance criterion to a failing test and scoping guardrails."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "translate that acceptance criterion into a failing test" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to codify the acceptance criterion as a failing test"
+    )
+    assert "defer any extra assertions to follow-up todos" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to park extra scope as follow-ups"
+    )

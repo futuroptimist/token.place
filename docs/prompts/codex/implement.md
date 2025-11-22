@@ -86,7 +86,8 @@ PRE-FLIGHT CHECKLIST:
      the rest as follow-up TODOs. Translate that acceptance criterion into a failing test name or
      assertion before writing any code, and defer any extra assertions to follow-up TODOs to prevent
      scope creep. Keep a short non-goals list so reviewers understand what you're intentionally
-     leaving for later.
+     leaving for later. Include the non-goals list in the PR summary next to the smallest verifiable
+     slice so reviewers can see what stays out of scope this round.
 4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash
@@ -146,6 +147,8 @@ REQUEST:
    - Update any README or changelog references that mentioned the outstanding work.
 4. Run the commands above and record their results in the PR description, noting any additional
    manual verification.
+   - Verify each referenced command still runs and linked docs remain valid; call out any
+     link updates in the PR description so reviewers can replay the workflow without surprises.
 5. Package the change as a small, green commit and open a pull request with a concise summary and
    follow-up ideas.
 

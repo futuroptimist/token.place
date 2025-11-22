@@ -86,6 +86,19 @@ def test_implement_prompt_ignores_instructional_noise() -> None:
     )
 
 
+def test_implement_prompt_surfaces_non_goals_in_summary() -> None:
+    """Prompt should direct contributors to log non-goals alongside the smallest slice in the PR summary."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "non-goals list in the pr summary" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to surface the non-goals list in the PR summary"
+    )
+    assert "smallest verifiable slice" in text_lower, (
+        "docs/prompts/codex/implement.md must tie the PR summary back to the smallest verifiable slice"
+    )
+
+
 def test_implement_prompt_preserves_trimmed_todo_list() -> None:
     """Prompt should require saving the filtered TODO list and its rationale."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
@@ -176,4 +189,17 @@ def test_implement_prompt_freezes_scope_after_draw() -> None:
     )
     assert "log follow-ups" in text_lower, (
         "docs/prompts/codex/implement.md must direct contributors to log follow-ups instead of expanding the active change"
+    )
+      
+      
+def test_implement_prompt_confirms_commands_and_links() -> None:
+    """Prompt should require checking referenced commands and links still work."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "verify each referenced command still runs" in text_lower, (
+        "docs/prompts/codex/implement.md must ask contributors to validate the commands it cites"
+    )
+    assert "link updates in the pr description" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to note link changes for reviewers"
     )

@@ -112,6 +112,19 @@ def test_implement_prompt_requires_context_check() -> None:
     )
 
 
+def test_implement_prompt_shares_randomization_artifacts() -> None:
+    """Prompt should ask contributors to share reproducibility artifacts with reviewers."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "filtered todo list" in text_lower and "pr summary" in text_lower, (
+        "docs/prompts/codex/implement.md must direct contributors to surface the filtered TODO list in the PR summary"
+    )
+    assert "random selection command" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to share the random selection command output"
+    )
+
+
 def test_implement_prompt_calls_out_config_requirements() -> None:
     """Prompt should reference the scoped Python requirement files explicitly."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

@@ -99,6 +99,19 @@ def test_implement_prompt_preserves_trimmed_todo_list() -> None:
     )
 
 
+def test_implement_prompt_requires_context_check() -> None:
+    """Prompt should tell contributors to read nearby context before locking in a TODO."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "surrounding context" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to skim the surrounding context for each candidate"
+    )
+    assert "sed -n" in text_lower, (
+        "docs/prompts/codex/implement.md must provide a concrete command for reading that nearby context"
+    )
+
+
 def test_implement_prompt_shares_randomization_artifacts() -> None:
     """Prompt should ask contributors to share reproducibility artifacts with reviewers."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

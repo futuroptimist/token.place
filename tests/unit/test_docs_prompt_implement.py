@@ -179,6 +179,19 @@ def test_implement_prompt_ties_acceptance_to_failing_test() -> None:
     )
 
 
+def test_implement_prompt_freezes_scope_after_draw() -> None:
+    """Prompt should warn against growing scope after locking in a candidate."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "freeze the scope" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to freeze the scope once a candidate is chosen"
+    )
+    assert "log follow-ups" in text_lower, (
+        "docs/prompts/codex/implement.md must direct contributors to log follow-ups instead of expanding the active change"
+    )
+      
+      
 def test_implement_prompt_confirms_commands_and_links() -> None:
     """Prompt should require checking referenced commands and links still work."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

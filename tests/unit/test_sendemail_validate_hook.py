@@ -65,7 +65,7 @@ def test_validate_cover_letter_rejects_placeholders():
 
     code, _stdout, stderr = _run_hook(
         'validate_cover_letter',
-        "Subject: Test\n\nPlease review this change. TODO before sending.",
+        "Subject: Test\n\nPlease review this change. todo before sending.",
     )
 
     assert code != 0, "Expected validate_cover_letter to fail for placeholder tokens"
@@ -114,7 +114,7 @@ def test_validate_patch_rejects_placeholder_tokens():
     code, _stdout, stderr = _run_patch(patch)
 
     assert code != 0
-    assert 'placeholder token (TODO) detected in patch body' in stderr
+    assert 'placeholder token (TODO) detected in patch body at line 21' in stderr
 
 
 def test_validate_patch_rejects_placeholder_subjects():

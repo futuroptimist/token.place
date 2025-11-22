@@ -35,7 +35,7 @@ print_placeholder_error () {
 
 extract_placeholder_token () {
         line="$1"
-        echo "$line" | sed -E "s/.*\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b.*/\\1/I"
+        echo "$line" | grep -ioE "\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b" | head -n 1 | tr '[:lower:]' '[:upper:]'
 }
 
 find_placeholder_in_file () {
@@ -43,7 +43,7 @@ find_placeholder_in_file () {
         scope="$2"
         pattern="$3"
 
-        match=$(grep -En "$pattern" "$file" | head -n 1 || true)
+        match=$(grep -Ein "$pattern" "$file" | head -n 1 || true)
 
         if test -n "$match"
         then
@@ -133,9 +133,10 @@ validate_series () {
                 do
                         test -n "$subject" || continue
 
-                        if printf '%s' "$subject" | grep -Eiq '\b(WIP|TODO|FIXME|TBD)\b'
+                        token=$(extract_placeholder_token "$subject")
+                        if test -n "$token"
                         then
-                                echo "sendemail-validate: placeholder token detected in series subject" >&2
+                                print_placeholder_error "series subject" "$token" ""
                                 status=1
                         fi
                 done <"$TOKEN_PLACE_SUBJECTS_FILE"

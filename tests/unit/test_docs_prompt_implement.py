@@ -73,6 +73,19 @@ def test_implement_prompt_reinforces_minimal_scope() -> None:
     )
 
 
+def test_implement_prompt_drops_ambiguous_candidates() -> None:
+    """Prompt should direct contributors to drop TODOs with unclear acceptance criteria."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "can't state the acceptance criterion" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to skip TODOs with unclear acceptance criteria"
+    )
+    assert "drop the entry and log why" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to document why an ambiguous TODO was skipped"
+    )
+
+
 def test_implement_prompt_ignores_instructional_noise() -> None:
     """Prompt should avoid treating instructional TODO mentions as actionable work and set non-goals."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
@@ -190,8 +203,8 @@ def test_implement_prompt_freezes_scope_after_draw() -> None:
     assert "log follow-ups" in text_lower, (
         "docs/prompts/codex/implement.md must direct contributors to log follow-ups instead of expanding the active change"
     )
-      
-      
+
+
 def test_implement_prompt_confirms_commands_and_links() -> None:
     """Prompt should require checking referenced commands and links still work."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

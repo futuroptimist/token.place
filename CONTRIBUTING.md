@@ -250,7 +250,7 @@ If you submit patches via `git send-email`, the sample hook at
 letters containing placeholder tokens such as `TODO`, `FIXME`, `WIP`, or `TBD`
 are rejected so unfinished drafts are not mailed accidentally. Patch commit
 messages with the same placeholder tokens will also fail validation so patches
-do not leave reminders in mailed cover letters. Automation that
+do not leave reminders in the git history. Automation that
 sources the script directly can set `TOKEN_PLACE_VALIDATE_IMPORT_ONLY=1` to
 import the helper functions without running the full worktree validation flow.
 

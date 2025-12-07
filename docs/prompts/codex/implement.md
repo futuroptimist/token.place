@@ -70,9 +70,9 @@ PRE-FLIGHT CHECKLIST:
    removals so reviewers understand the filtering.
    - Ignore prompt text or other instructional references that only cite TODO/FIXME as
      examples—they are noise, not promises you can ship.
-   - If you can't state the acceptance criterion or smallest slice for a candidate after
-     skimming the context, drop the entry and log why in your filtered list so the pool
-     stays actionable.
+   - If you can't state the acceptance criterion or smallest slice for a candidate (even after
+     reviewing its context), drop the entry and log why in your filtered list so the pool stays
+     actionable.
    - Skim 3–5 lines of surrounding context (for example, `sed -n '120,125p path/to/file'`)
      around each candidate so you understand the promised behavior before keeping it.
    - While pruning, identify what "done" means for each entry and jot down the

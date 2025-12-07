@@ -117,6 +117,24 @@ def test_validate_patch_rejects_placeholder_tokens():
     assert 'placeholder token (TODO) detected in patch body at line 21' in stderr
 
 
+def test_validate_patch_rejects_placeholder_commit_messages():
+    """Commit messages with TODO markers should fail validation."""
+
+    patch = (
+        PATCH_TEMPLATE_HEADER.format(
+            subject='[PATCH] Add reminder comment',
+            body='TODO: fill this in later.\n\n'
+            'Signed-off-by: Hook Tester <hooks@token.place>\n',
+        )
+        + PATCH_DIFF_SECTION.format(hunk_line='+Example addition\n')
+    )
+
+    code, _stdout, stderr = _run_patch(patch)
+
+    assert code != 0
+    assert 'placeholder token (TODO) detected in patch message at line 6' in stderr
+
+
 def test_validate_patch_rejects_placeholder_subjects():
     """Patch subjects with placeholder tokens should fail immediately."""
 

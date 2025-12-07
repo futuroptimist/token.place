@@ -27,160 +27,192 @@ PLACEHOLDER_TOKEN_PATTERN="TODO|FIXME|WIP|TBD"
 PLACEHOLDER_REGEX="\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b"
 
 print_placeholder_error () {
-        scope="$1"
-        token="$2"
-        detail="$3"
-        echo "sendemail-validate: placeholder token (${token}) detected in ${scope}${detail}" >&2
+    scope="$1"
+    token="$2"
+    detail="$3"
+    echo "sendemail-validate: placeholder token (${token}) detected in ${scope}${detail}" >&2
 }
 
 extract_placeholder_token () {
-        line="$1"
-        echo "$line" | grep -ioE "\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b" | head -n 1 | tr '[:lower:]' '[:upper:]'
+    line="$1"
+    echo "$line" | grep -ioE "\\b(${PLACEHOLDER_TOKEN_PATTERN})\\b" | head -n 1 | tr '[:lower:]' '[:upper:]'
 }
 
 find_placeholder_in_file () {
-        file="$1"
-        scope="$2"
-        pattern="$3"
+    file="$1"
+    scope="$2"
+    pattern="$3"
 
-        match=$(grep -Ein "$pattern" "$file" | head -n 1 || true)
+    match=$(grep -Ein "$pattern" "$file" | head -n 1 || true)
 
-        if test -n "$match"
-        then
-                line_number=${match%%:*}
-                token=$(extract_placeholder_token "$match")
-                print_placeholder_error "$scope" "$token" " at line ${line_number}"
-                return 0
-        fi
+    if test -n "$match"
+    then
+        line_number=${match%%:*}
+        token=$(extract_placeholder_token "$match")
+        print_placeholder_error "$scope" "$token" " at line ${line_number}"
+        return 0
+    fi
 
+    return 1
+}
+
+find_placeholder_in_patch_message () {
+    file="$1"
+
+    header_end=$(grep -n -m1 '^$' "$file" | head -n 1 || true)
+
+    if test -z "$header_end"
+    then
         return 1
+    fi
+
+    header_end=${header_end%%:*}
+
+    message_start=$((header_end + 1))
+    message_block=$(tail -n +"${message_start}" "$file" | sed '/^diff --git /{q}' | sed '/^--- /{q}')
+
+    message_match=$(printf '%s\n' "$message_block" | nl -ba | grep -Ein "${PLACEHOLDER_REGEX}" | head -n 1 || true)
+
+    if test -n "$message_match"
+    then
+        relative_line=${message_match%%:*}
+        line_number=$((message_start + relative_line - 1))
+        token=$(extract_placeholder_token "$message_match")
+        print_placeholder_error "patch message" "$token" " at line ${line_number}"
+        return 0
+    fi
+
+    return 1
 }
 
 validate_cover_letter () {
-        file="$1"
-        if test ! -s "$file"
-        then
-                echo "sendemail-validate: cover letter appears to be empty" >&2
-                return 1
-        fi
+    file="$1"
+    if test ! -s "$file"
+    then
+        echo "sendemail-validate: cover letter appears to be empty" >&2
+        return 1
+    fi
 
-        if find_placeholder_in_file "$file" "cover letter" "${PLACEHOLDER_REGEX}"
-        then
-                return 1
-        fi
+    if find_placeholder_in_file "$file" "cover letter" "${PLACEHOLDER_REGEX}"
+    then
+        return 1
+    fi
 
-        true
+    true
 }
 
 TOKEN_PLACE_SUBJECTS_FILE="${TOKEN_PLACE_SUBJECTS_FILE:-}"
 TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY="sendemail.validateSubjectsFile"
 
 validate_patch () {
-        file="$1"
+    file="$1"
 
-        if test -z "$file" || test ! -f "$file"
-        then
-                echo "sendemail-validate: patch file missing" >&2
-                return 1
-        fi
+    if test -z "$file" || test ! -f "$file"
+    then
+        echo "sendemail-validate: patch file missing" >&2
+        return 1
+    fi
 
-        subject=$(sed -n 's/^Subject: //p' "$file" | head -n 1)
+    subject=$(sed -n 's/^Subject: //p' "$file" | head -n 1)
 
-        if printf '%s' "$subject" | grep -Eiq "$PLACEHOLDER_REGEX"
-        then
-                token=$(extract_placeholder_token "$subject")
-                print_placeholder_error "patch subject" "$token" ""
-                return 1
-        fi
+    if printf '%s' "$subject" | grep -Eiq "$PLACEHOLDER_REGEX"
+    then
+        token=$(extract_placeholder_token "$subject")
+        print_placeholder_error "patch subject" "$token" ""
+        return 1
+    fi
 
-        # Ensure that the patch applies without conflicts unless we're running
-        # in import-only mode for unit tests.
-        if test "${TOKEN_PLACE_VALIDATE_IMPORT_ONLY:-0}" != 1
-        then
-                git am -3 "$file" || return
-        fi
+    if find_placeholder_in_patch_message "$file"
+    then
+        return 1
+    fi
 
-        if ! grep -Eq '^Signed-off-by:' "$file"
-        then
-                echo "sendemail-validate: missing Signed-off-by trailer" >&2
-                return 1
-        fi
+    # Ensure that the patch applies without conflicts unless we're running
+    # in import-only mode for unit tests.
+    if test "${TOKEN_PLACE_VALIDATE_IMPORT_ONLY:-0}" != 1; then
+        git am -3 "$file" || return
+    fi
 
-        if find_placeholder_in_file "$file" "patch body" "^\+.*${PLACEHOLDER_REGEX}"
-        then
-                return 1
-        fi
+    if ! grep -Eq '^Signed-off-by:' "$file"
+    then
+        echo "sendemail-validate: missing Signed-off-by trailer" >&2
+        return 1
+    fi
 
-        if test -n "$TOKEN_PLACE_SUBJECTS_FILE"
-        then
-                printf '%s\n' "$subject" >>"$TOKEN_PLACE_SUBJECTS_FILE"
-        fi
+    if find_placeholder_in_file "$file" "patch body" "^\+.*${PLACEHOLDER_REGEX}"
+    then
+        return 1
+    fi
 
-        true
+    if test -n "$TOKEN_PLACE_SUBJECTS_FILE"
+    then
+        printf '%s\n' "$subject" >>"$TOKEN_PLACE_SUBJECTS_FILE"
+    fi
+
+    true
 }
 
 validate_series () {
-        status=0
+    status=0
 
-        if test -z "$TOKEN_PLACE_SUBJECTS_FILE"
-        then
-                TOKEN_PLACE_SUBJECTS_FILE=$(git config --get "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY" 2>/dev/null || printf '')
-        fi
+    if test -z "$TOKEN_PLACE_SUBJECTS_FILE"
+    then
+        TOKEN_PLACE_SUBJECTS_FILE=$(git config --get "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY" 2>/dev/null || printf '')
+    fi
 
-        if test -n "$TOKEN_PLACE_SUBJECTS_FILE" && test -f "$TOKEN_PLACE_SUBJECTS_FILE"
-        then
-                while IFS= read -r subject
-                do
-                        test -n "$subject" || continue
+    if test -n "$TOKEN_PLACE_SUBJECTS_FILE" && test -f "$TOKEN_PLACE_SUBJECTS_FILE"
+    then
+        while IFS= read -r subject
+        do
+            test -n "$subject" || continue
 
-                        token=$(extract_placeholder_token "$subject")
-                        if test -n "$token"
-                        then
-                                print_placeholder_error "series subject" "$token" ""
-                                status=1
-                        fi
-                done <"$TOKEN_PLACE_SUBJECTS_FILE"
-        fi
+            token=$(extract_placeholder_token "$subject")
+            if test -n "$token"
+            then
+                print_placeholder_error "series subject" "$token" ""
+                status=1
+            fi
+        done <"$TOKEN_PLACE_SUBJECTS_FILE"
+    fi
 
-        return $status
+    return $status
 }
 
 # main -------------------------------------------------------------------------
 
-if test "${TOKEN_PLACE_VALIDATE_IMPORT_ONLY:-0}" != 1
-then
-        if test "$GIT_SENDEMAIL_FILE_COUNTER" = 1
-        then
-                remote=$(git config --default origin --get sendemail.validateRemote) &&
-                ref=$(git config --default HEAD --get sendemail.validateRemoteRef) &&
-                worktree=$(mktemp -d "${TMPDIR:-/tmp}/sendemail-validate.XXXXXXX") &&
-                git worktree add -fd --checkout "$worktree" "refs/remotes/$remote/$ref" &&
-                git config --replace-all sendemail.validateWorktree "$worktree" &&
-                TOKEN_PLACE_SUBJECTS_FILE=$(mktemp "${TMPDIR:-/tmp}/sendemail-validate-subjects.XXXXXXX") &&
-                git config --replace-all "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY" "$TOKEN_PLACE_SUBJECTS_FILE"
-        else
-                worktree=$(git config --get sendemail.validateWorktree) &&
-                TOKEN_PLACE_SUBJECTS_FILE=$(git config --get "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY")
-        fi || {
-                echo "sendemail-validate: error: failed to prepare worktree" >&2
-                exit 1
-        }
+if test "${TOKEN_PLACE_VALIDATE_IMPORT_ONLY:-0}" != 1; then
+    if test "$GIT_SENDEMAIL_FILE_COUNTER" = 1
+    then
+        remote=$(git config --default origin --get sendemail.validateRemote) &&
+        ref=$(git config --default HEAD --get sendemail.validateRemoteRef) &&
+        worktree=$(mktemp -d "${TMPDIR:-/tmp}/sendemail-validate.XXXXXXX") &&
+        git worktree add -fd --checkout "$worktree" "refs/remotes/$remote/$ref" &&
+        git config --replace-all sendemail.validateWorktree "$worktree" &&
+        TOKEN_PLACE_SUBJECTS_FILE=$(mktemp "${TMPDIR:-/tmp}/sendemail-validate-subjects.XXXXXXX") &&
+        git config --replace-all "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY" "$TOKEN_PLACE_SUBJECTS_FILE"
+    else
+        worktree=$(git config --get sendemail.validateWorktree) &&
+        TOKEN_PLACE_SUBJECTS_FILE=$(git config --get "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY")
+    fi || {
+        echo "sendemail-validate: error: failed to prepare worktree" >&2
+        exit 1
+    }
 
-        unset GIT_DIR GIT_WORK_TREE
-        cd "$worktree" &&
+    unset GIT_DIR GIT_WORK_TREE
+    cd "$worktree" &&
 
-        if grep -q "^diff --git " "$1"
-        then
-                validate_patch "$1"
-        else
-                validate_cover_letter "$1"
-        fi &&
+    if grep -q "^diff --git " "$1"
+    then
+        validate_patch "$1"
+    else
+        validate_cover_letter "$1"
+    fi &&
 
-        if test "$GIT_SENDEMAIL_FILE_COUNTER" = "$GIT_SENDEMAIL_FILE_TOTAL"
-        then
-                git config --unset-all sendemail.validateWorktree &&
-                git config --unset-all "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY" &&
-                trap 'git worktree remove -ff "$worktree"; test -n "$TOKEN_PLACE_SUBJECTS_FILE" && rm -f "$TOKEN_PLACE_SUBJECTS_FILE"' EXIT &&
-                validate_series
-        fi
+    if test "$GIT_SENDEMAIL_FILE_COUNTER" = "$GIT_SENDEMAIL_FILE_TOTAL"
+    then
+        git config --unset-all sendemail.validateWorktree &&
+        git config --unset-all "$TOKEN_PLACE_SUBJECTS_FILE_CONFIG_KEY" &&
+        trap 'git worktree remove -ff "$worktree"; test -n "$TOKEN_PLACE_SUBJECTS_FILE" && rm -f "$TOKEN_PLACE_SUBJECTS_FILE"' EXIT &&
+        validate_series
+    fi
 fi

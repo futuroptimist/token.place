@@ -190,8 +190,8 @@ def test_implement_prompt_freezes_scope_after_draw() -> None:
     assert "log follow-ups" in text_lower, (
         "docs/prompts/codex/implement.md must direct contributors to log follow-ups instead of expanding the active change"
     )
-      
-      
+
+
 def test_implement_prompt_confirms_commands_and_links() -> None:
     """Prompt should require checking referenced commands and links still work."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

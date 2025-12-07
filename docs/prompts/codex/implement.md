@@ -88,6 +88,10 @@ PRE-FLIGHT CHECKLIST:
      scope creep. Keep a short non-goals list so reviewers understand what you're intentionally
      leaving for later. Include the non-goals list in the PR summary next to the smallest verifiable
      slice so reviewers can see what stays out of scope this round.
+   - For multi-part TODOs, pick one user-visible behavior to verify, park the remaining bullets
+     as new TODOs or issue follow-ups, and reference them in the PR summary under "Non-goals". Only
+     code toward the chosen slice and update docs/tests strictly tied to that promise so the change
+     set stays auditable.
 4. Use a deterministic randomizer so reviewers can replay the draw. For example:
 
    ```bash

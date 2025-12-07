@@ -108,6 +108,8 @@ PRE-FLIGHT CHECKLIST:
 7. If the pool is empty, explicitly note that outcome. Treat each bullet under the
    "Upgrade instructions" request (or each Unreleased changelog bullet) as its own candidate,
    rerun the deterministic draw against that fallback list, and document both selections.
+   - Explain why the primary pool was empty before switching lists, and keep the fallback draw separate
+     from the trimmed TODO list instead of mixing the candidate sets.
 
 CONTEXT:
 - Follow `AGENTS.md` and `docs/AGENTS.md`.

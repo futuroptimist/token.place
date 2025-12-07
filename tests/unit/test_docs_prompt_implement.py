@@ -151,6 +151,19 @@ def test_implement_prompt_shares_randomization_artifacts() -> None:
     )
 
 
+def test_implement_prompt_keeps_fallback_draw_separate() -> None:
+    """Prompt should clarify how to handle fallback draws without mixing scopes."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "primary pool was empty" in text_lower, (
+        "docs/prompts/codex/implement.md must ask contributors to explain why the primary pool was empty"
+    )
+    assert "fallback draw separate" in text_lower, (
+        "docs/prompts/codex/implement.md must keep the fallback draw separate from the trimmed TODO list"
+    )
+
+
 def test_implement_prompt_calls_out_config_requirements() -> None:
     """Prompt should reference the scoped Python requirement files explicitly."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

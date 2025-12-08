@@ -164,6 +164,16 @@ def test_implement_prompt_keeps_fallback_draw_separate() -> None:
     )
 
 
+def test_implement_prompt_documents_pool_origin() -> None:
+    """Prompt should require noting whether the selection came from the primary or fallback pool."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "primary or fallback" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to document whether the winning candidate came from the primary or fallback pool"
+    )
+
+
 def test_implement_prompt_calls_out_config_requirements() -> None:
     """Prompt should reference the scoped Python requirement files explicitly."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

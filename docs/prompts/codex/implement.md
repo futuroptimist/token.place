@@ -121,6 +121,8 @@ PRE-FLIGHT CHECKLIST:
    rerun the deterministic draw against that fallback list, and document both selections.
    - Explain why the primary pool was empty before switching lists, and keep the fallback draw separate
      from the trimmed TODO list instead of mixing the candidate sets.
+   - Note in your notes or PR summary whether the winner came from the primary or fallback pool;
+     call out when you shifted lists.
 
 CONTEXT:
 - Follow `AGENTS.md` and `docs/AGENTS.md`.

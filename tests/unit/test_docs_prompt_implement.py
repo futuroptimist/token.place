@@ -205,6 +205,19 @@ def test_implement_prompt_ties_acceptance_to_failing_test() -> None:
     )
 
 
+def test_implement_prompt_logs_named_failing_test() -> None:
+    """Prompt should ask contributors to record the failing test name for traceability."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "failing test name" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to capture the failing test name"
+    )
+    assert "pr summary" in text_lower, (
+        "docs/prompts/codex/implement.md must tie the recorded failing test to the PR summary"
+    )
+
+
 def test_implement_prompt_freezes_scope_after_draw() -> None:
     """Prompt should warn against growing scope after locking in a candidate."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

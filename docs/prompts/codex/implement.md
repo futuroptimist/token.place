@@ -90,7 +90,8 @@ PRE-FLIGHT CHECKLIST:
      assertion before writing any code, and defer any extra assertions to follow-up TODOs to prevent
      scope creep. Keep a short non-goals list so reviewers understand what you're intentionally
      leaving for later. Include the non-goals list in the PR summary next to the smallest verifiable
-     slice so reviewers can see what stays out of scope this round.
+     slice so reviewers can see what stays out of scope this round. Note the failing test name in the
+     PR summary alongside the value statement so reviewers can quickly replay your acceptance check.
    - For multi-part TODOs, pick one user-visible behavior to verify, park the remaining bullets
      as new TODOs or issue follow-ups, and reference them in the PR summary under "Non-goals". Only
      code toward the chosen slice and update docs/tests strictly tied to that promise so the change

@@ -45,7 +45,8 @@ PRE-FLIGHT CHECKLIST:
 - Install dependencies via `npm ci`, `pip install -r requirements.txt`,
   `pip install -r config/requirements_server.txt`, and
   `pip install -r config/requirements_relay.txt` before running checks.
-- Run `playwright install` so browser binaries are ready for Playwright-powered tests.
+- Run `playwright install --with-deps chromium` so browser binaries are ready for
+  Playwright-powered tests.
 - Plan to run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
   `./run_all_tests.sh` when applicable.
 - Scan staged changes for credentials with
@@ -111,8 +112,10 @@ PRE-FLIGHT CHECKLIST:
 
 5. Record the exact command(s) you ran alongside the winning candidate in your notes or PR
    description.
-6. Include the filtered TODO list (or fallback candidate list) and the random selection command
+6. Include the filtered TODO list (or fallback candidate list) and the random selection command(s)
    in your PR summary so reviewers can replay the draw even after temporary files are cleaned up.
+   Note which file(s) held the candidate lists so the selection is still reproducible after
+   `/tmp` cleanup.
 7. If the pool is empty, explicitly note that outcome. Treat each bullet under the
    "Upgrade instructions" request (or each Unreleased changelog bullet) as its own candidate,
    rerun the deterministic draw against that fallback list, and document both selections.
@@ -181,6 +184,8 @@ CONTEXT:
 - Review `.github/workflows/` to anticipate CI checks invoked by prompt instructions.
 - Run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
   `./run_all_tests.sh` (when applicable) before committing prompt changes.
+- Run `playwright install --with-deps chromium` so Playwright-powered checks have browsers
+  available locally.
 - Perform the standard secret scan via
   `detect-secrets scan $(git diff --cached --name-only)` (install via
   `pip install detect-secrets` if needed).

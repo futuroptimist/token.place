@@ -241,6 +241,25 @@ def test_implement_prompt_freezes_scope_after_draw() -> None:
     )
 
 
+def test_implement_prompt_sets_post_selection_checklist() -> None:
+    """Prompt should clarify the concrete steps to implement the chosen promise."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "implementation checklist" in text_lower, (
+        "docs/prompts/codex/implement.md must include a named implementation checklist after the draw"
+    )
+    assert "add one failing test for the promise" in text_lower, (
+        "docs/prompts/codex/implement.md must call out adding a single failing test before coding"
+    )
+    assert "patch only the code needed to make that test pass" in text_lower, (
+        "docs/prompts/codex/implement.md must warn contributors to keep implementation changes minimal"
+    )
+    assert "update docs and non-goals alongside the passing test" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to pair doc/non-goal updates with the passing test"
+    )
+
+
 def test_implement_prompt_confirms_commands_and_links() -> None:
     """Prompt should require checking referenced commands and links still work."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

@@ -152,6 +152,12 @@ REQUEST:
      slice in your notes so reviewers understand the intended boundary.
 2. Add a failing automated test (pytest, Playwright, or equivalent scripted check) that captures
    the promised behavior, then make it pass with the minimal viable change.
+   After the draw, follow this implementation checklist to keep the work unambiguous:
+   - Add one failing test for the promise before touching production code; call out the test name in
+     your notes or PR summary.
+   - Patch only the code needed to make that test pass; stop once the acceptance criterion is
+     satisfied.
+   - Update docs and non-goals alongside the passing test so reviewers see what stayed out of scope.
 3. Update docs, comments, and TODOs to reflect the shipped functionality; remove stale promises.
    - Replace or delete the original TODO marker instead of leaving it in a "done" state.
    - After cleanup, search for the original TODO text to confirm it is gone. For example, run:

@@ -241,6 +241,19 @@ def test_implement_prompt_freezes_scope_after_draw() -> None:
     )
 
 
+def test_implement_prompt_requires_scope_lock_note() -> None:
+    """Prompt should ask contributors to write down a scope lock before coding."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "scope lock" in text_lower, (
+        "docs/prompts/codex/implement.md must instruct contributors to write a scope lock note"
+    )
+    assert "in-scope" in text_lower and "out-of-scope" in text_lower, (
+        "docs/prompts/codex/implement.md must call for in-scope and out-of-scope bullets to prevent scope creep"
+    )
+
+
 def test_implement_prompt_confirms_commands_and_links() -> None:
     """Prompt should require checking referenced commands and links still work."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

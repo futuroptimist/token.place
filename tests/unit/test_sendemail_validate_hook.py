@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Tuple
 
+import pytest
 PATCH_TEMPLATE_HEADER = """From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: token.place Hook Tester <hooks@token.place>
 Date: Thu, 10 Feb 2025 12:00:00 +0000
@@ -117,13 +118,14 @@ def test_validate_patch_rejects_placeholder_tokens():
     assert 'placeholder token (TODO) detected in patch body at line 21' in stderr
 
 
-def test_validate_patch_rejects_placeholder_commit_messages():
-    """Commit messages with TODO markers should fail validation."""
+@pytest.mark.parametrize('placeholder_token', ['TODO', 'FIXME', 'WIP', 'TBD'])
+def test_validate_patch_rejects_placeholder_commit_messages(placeholder_token: str):
+    """Commit messages with placeholder markers should fail validation."""
 
     patch = (
         PATCH_TEMPLATE_HEADER.format(
             subject='[PATCH] Add reminder comment',
-            body='TODO: fill this in later.\n\n'
+            body=f'{placeholder_token}: replace with details.\n\n'
             'Signed-off-by: Hook Tester <hooks@token.place>\n',
         )
         + PATCH_DIFF_SECTION.format(hunk_line='+Example addition\n')
@@ -132,7 +134,7 @@ def test_validate_patch_rejects_placeholder_commit_messages():
     code, _stdout, stderr = _run_patch(patch)
 
     assert code != 0
-    assert 'placeholder token (TODO) detected in patch message at line 6' in stderr
+    assert f'placeholder token ({placeholder_token}) detected in patch message at line 6' in stderr
 
 
 def test_validate_patch_rejects_placeholder_subjects():

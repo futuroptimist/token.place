@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Tuple
 
+import pytest
+
 PATCH_TEMPLATE_HEADER = """From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: token.place Hook Tester <hooks@token.place>
 Date: Thu, 10 Feb 2025 12:00:00 +0000
@@ -60,16 +62,23 @@ def _run_patch(content: str) -> Tuple[int, str, str]:
     return _run_hook('validate_patch', content)
 
 
-def test_validate_cover_letter_rejects_placeholders():
+@pytest.mark.parametrize('placeholder_token', ['TODO', 'FIXME', 'WIP', 'TBD'])
+def test_validate_cover_letter_rejects_placeholders(placeholder_token: str):
     """Cover letters with placeholder tokens should be rejected."""
 
     code, _stdout, stderr = _run_hook(
         'validate_cover_letter',
-        "Subject: Test\n\nPlease review this change. todo before sending.",
+        (
+            'Subject: Test\n\nPlease review this change. '
+            f'{placeholder_token.lower()} before sending.'
+        ),
     )
 
     assert code != 0, "Expected validate_cover_letter to fail for placeholder tokens"
-    assert 'placeholder token (TODO) detected in cover letter at line 3' in stderr
+    assert (
+        f'placeholder token ({placeholder_token}) detected in cover letter at line 3'
+        in stderr
+    )
 
 
 def test_validate_cover_letter_accepts_clean_content():
@@ -100,7 +109,8 @@ def test_validate_patch_requires_signed_off_by_trailer():
     assert 'Signed-off-by' in stderr
 
 
-def test_validate_patch_rejects_placeholder_tokens():
+@pytest.mark.parametrize('placeholder_token', ['TODO', 'FIXME', 'WIP', 'TBD'])
+def test_validate_patch_rejects_placeholder_tokens(placeholder_token: str):
     """Added TODO-style tokens should be rejected."""
 
     patch = (
@@ -108,22 +118,28 @@ def test_validate_patch_rejects_placeholder_tokens():
             subject='[PATCH] Add reminder comment',
             body='Add reminder comment.\n\nSigned-off-by: Hook Tester <hooks@token.place>\n',
         )
-        + PATCH_DIFF_SECTION.format(hunk_line='+TODO: fill this in later\n')
+        + PATCH_DIFF_SECTION.format(
+            hunk_line=f'+{placeholder_token}: fill this in later\n',
+        )
     )
 
     code, _stdout, stderr = _run_patch(patch)
 
     assert code != 0
-    assert 'placeholder token (TODO) detected in patch body at line 21' in stderr
+    assert (
+        f'placeholder token ({placeholder_token}) detected in patch body at line 21'
+        in stderr
+    )
 
 
-def test_validate_patch_rejects_placeholder_commit_messages():
-    """Commit messages with TODO markers should fail validation."""
+@pytest.mark.parametrize('placeholder_token', ['TODO', 'FIXME', 'WIP', 'TBD'])
+def test_validate_patch_rejects_placeholder_commit_messages(placeholder_token: str):
+    """Commit messages with placeholder markers should fail validation."""
 
     patch = (
         PATCH_TEMPLATE_HEADER.format(
             subject='[PATCH] Add reminder comment',
-            body='TODO: fill this in later.\n\n'
+            body=f'{placeholder_token}: replace with details.\n\n'
             'Signed-off-by: Hook Tester <hooks@token.place>\n',
         )
         + PATCH_DIFF_SECTION.format(hunk_line='+Example addition\n')
@@ -132,15 +148,16 @@ def test_validate_patch_rejects_placeholder_commit_messages():
     code, _stdout, stderr = _run_patch(patch)
 
     assert code != 0
-    assert 'placeholder token (TODO) detected in patch message at line 6' in stderr
+    assert f'placeholder token ({placeholder_token}) detected in patch message at line 6' in stderr
 
 
-def test_validate_patch_rejects_placeholder_subjects():
+@pytest.mark.parametrize('placeholder_token', ['TODO', 'FIXME', 'WIP', 'TBD'])
+def test_validate_patch_rejects_placeholder_subjects(placeholder_token: str):
     """Patch subjects with placeholder tokens should fail immediately."""
 
     patch = (
         PATCH_TEMPLATE_HEADER.format(
-            subject='[PATCH] TODO: update docs',
+            subject=f'[PATCH] {placeholder_token}: update docs',
             body='Add docs update.\n\nSigned-off-by: Hook Tester <hooks@token.place>\n',
         )
         + PATCH_DIFF_SECTION.format(hunk_line='+Example addition\n')
@@ -149,7 +166,7 @@ def test_validate_patch_rejects_placeholder_subjects():
     code, _stdout, stderr = _run_patch(patch)
 
     assert code != 0
-    assert 'placeholder token (TODO) detected in patch subject' in stderr
+    assert f'placeholder token ({placeholder_token}) detected in patch subject' in stderr
 
 
 def test_validate_patch_accepts_clean_patch():

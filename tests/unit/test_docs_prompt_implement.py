@@ -73,6 +73,19 @@ def test_implement_prompt_reinforces_minimal_scope() -> None:
     )
 
 
+def test_implement_prompt_disambiguates_execution_steps() -> None:
+    """Prompt should ask contributors to untangle fuzzy steps before coding."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "spell out any ambiguous steps" in text_lower, (
+        "docs/prompts/codex/implement.md must tell contributors to resolve ambiguous steps before writing code"
+    )
+    assert "write a 2-3 step plan" in text_lower, (
+        "docs/prompts/codex/implement.md must ask contributors to commit to a short execution plan to avoid scope creep"
+    )
+
+
 def test_implement_prompt_drops_ambiguous_candidates() -> None:
     """Prompt should direct contributors to drop TODOs with unclear acceptance criteria."""
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"

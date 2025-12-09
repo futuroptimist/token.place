@@ -79,6 +79,9 @@ PRE-FLIGHT CHECKLIST:
    - While pruning, identify what "done" means for each entry and jot down the
      smallest verifiable slice you could ship. This keeps future you honest about
      scope creep when you circle back to implement the fix.
+   - Spell out any ambiguous steps, dependencies, or assumptions before coding. Write a 2-3 step plan
+     you will execute for the chosen candidate so reviewers can see how you will deliver the
+     smallest verifiable slice without expanding scope mid-flight.
    - Save the trimmed TODO list (for example, `/tmp/todo_filtered.txt`) and jot down
      why each entry was removed before running the randomizer so the narrowed pool is
      reproducible and auditable.

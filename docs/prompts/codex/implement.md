@@ -93,6 +93,10 @@ PRE-FLIGHT CHECKLIST:
      leaving for later. Include the non-goals list in the PR summary next to the smallest verifiable
      slice so reviewers can see what stays out of scope this round. Note the failing test name in the
      PR summary alongside the value statement so reviewers can quickly replay your acceptance check.
+   - Draft a short "scope lock" note before coding: restate the selected candidate, the acceptance
+     criterion, and the smallest verifiable slice, plus two bullets labelled "In-scope" and
+     "Out-of-scope". Keep that scope lock visible while coding so the diff stays inside the agreed
+     boundaries and reviewers can see how you avoided scope creep.
    - For multi-part TODOs, pick one user-visible behavior to verify, park the remaining bullets
      as new TODOs or issue follow-ups, and reference them in the PR summary under "Non-goals". Only
      code toward the chosen slice and update docs/tests strictly tied to that promise so the change

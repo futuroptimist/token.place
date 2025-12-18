@@ -39,7 +39,7 @@ PRE-FLIGHT CHECKLIST:
   [docs/AGENTS.md](../../AGENTS.md).
 - Skim [.github/workflows/](../../../.github/workflows/) so local runs mirror CI expectations;
   `ci.yml` runs `./run_all_tests.sh` with coverage after installing Python/Node deps and
-  Playwright browsers.
+  Playwright browsers via `playwright install`.
 - Read [README.md](../../../README.md), [DEVELOPMENT.md](../../DEVELOPMENT.md), and
   neighboring modules before editing security-sensitive paths.
 - Use `rg` to enumerate TODO/FIXME/future-work markers across code, docs, and tests—pick
@@ -47,8 +47,8 @@ PRE-FLIGHT CHECKLIST:
 - Install dependencies via `npm ci`, `pip install -r requirements.txt`,
   `pip install -r config/requirements_server.txt`, and
   `pip install -r config/requirements_relay.txt` before running checks.
-- Run `playwright install --with-deps chromium` so browser binaries are ready for
-  Playwright-powered tests.
+- Run `playwright install` so browser binaries are ready for Playwright-powered tests
+  (mirrors CI setup).
 - Plan to run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
   `./run_all_tests.sh` when applicable; include command outputs in your PR summary.
 - Scan staged changes for credentials with
@@ -74,8 +74,8 @@ PRE-FLIGHT CHECKLIST:
    - Ignore prompt text or other instructional references that only cite TODO/FIXME as
      examples—they are noise, not promises you can ship.
    - If you can't state the acceptance criterion or smallest slice for a candidate after reading
-     3–5 lines of surrounding context (e.g., `sed -n '120,125p path/to/file'`).
-     Drop the entry and log why in the filtered list so the pool stays actionable.
+     3–5 lines of surrounding context (e.g., `sed -n '120,125p path/to/file'`), then drop the entry and log why
+     in the filtered list so the pool stays actionable.
    - While pruning, write a one-sentence "done" statement for each surviving entry plus the smallest
      verifiable slice you could ship. Note any assumptions or dependencies that would block that
      slice so they can be resolved before the draw.
@@ -102,9 +102,6 @@ PRE-FLIGHT CHECKLIST:
      criterion, and the smallest verifiable slice, plus two bullets labelled "In-scope" and
      "Out-of-scope". Keep that scope lock visible while coding so the diff stays inside the agreed
      boundaries and reviewers can see how you avoided scope creep.
-   - After selecting, map each acceptance criterion to one failing test name or assertion. Keep a
-     non-goals list nearby so you can explicitly defer adjacent TODOs instead of silently dropping
-     them.
    - For multi-part TODOs, pick one user-visible behavior to verify, park the remaining bullets
      as new TODOs or issue follow-ups, and reference them in the PR summary under "Non-goals". Only
      code toward the chosen slice and update docs/tests strictly tied to that promise so the change
@@ -202,8 +199,7 @@ CONTEXT:
 - Review `.github/workflows/` to anticipate CI checks invoked by prompt instructions.
 - Run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
   `./run_all_tests.sh` (when applicable) before committing prompt changes.
-- Run `playwright install --with-deps chromium` so Playwright-powered checks have browsers
-  available locally.
+- Run `playwright install` so Playwright-powered checks have browsers available locally.
 - Perform the standard secret scan via
   `detect-secrets scan $(git diff --cached --name-only)` (install via
   `pip install detect-secrets` if needed).

@@ -37,7 +37,9 @@ USAGE NOTES:
 PRE-FLIGHT CHECKLIST:
 - Review repository instructions in [AGENTS.md](../../../AGENTS.md) and
   [docs/AGENTS.md](../../AGENTS.md).
-- Skim [.github/workflows/](../../../.github/workflows/) so local runs mirror CI expectations.
+- Skim [.github/workflows/](../../../.github/workflows/) so local runs mirror CI expectations;
+  `ci.yml` runs `./run_all_tests.sh` with coverage after installing Python/Node deps and
+  Playwright browsers via `playwright install`.
 - Read [README.md](../../../README.md), [DEVELOPMENT.md](../../DEVELOPMENT.md), and
   neighboring modules before editing security-sensitive paths.
 - Use `rg` to enumerate TODO/FIXME/future-work markers across code, docs, and tests—pick
@@ -45,10 +47,10 @@ PRE-FLIGHT CHECKLIST:
 - Install dependencies via `npm ci`, `pip install -r requirements.txt`,
   `pip install -r config/requirements_server.txt`, and
   `pip install -r config/requirements_relay.txt` before running checks.
-- Run `playwright install --with-deps chromium` so browser binaries are ready for
-  Playwright-powered tests.
+- Run `playwright install` so browser binaries are ready for Playwright-powered tests
+  (mirrors CI setup).
 - Plan to run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
-  `./run_all_tests.sh` when applicable.
+  `./run_all_tests.sh` when applicable; include command outputs in your PR summary.
 - Scan staged changes for credentials with
   `detect-secrets scan $(git diff --cached --name-only)` (install via
   `pip install detect-secrets` if needed) prior to committing.
@@ -71,20 +73,19 @@ PRE-FLIGHT CHECKLIST:
    removals so reviewers understand the filtering.
    - Ignore prompt text or other instructional references that only cite TODO/FIXME as
      examples—they are noise, not promises you can ship.
-   - If you can't state the acceptance criterion or smallest slice for a candidate (even after
-     reviewing its context), drop the entry and log why in your filtered list so the pool stays
-     actionable.
-   - Skim 3–5 lines of surrounding context (for example, `sed -n '120,125p path/to/file'`)
-     around each candidate so you understand the promised behavior before keeping it.
-   - While pruning, identify what "done" means for each entry and jot down the
-     smallest verifiable slice you could ship. This keeps future you honest about
-     scope creep when you circle back to implement the fix.
-   - Spell out any ambiguous steps, dependencies, or assumptions before coding. Write a 2-3 step plan
-     you will execute for the chosen candidate so reviewers can see how you will deliver the
-     smallest verifiable slice without expanding scope mid-flight.
-   - Save the trimmed TODO list (for example, `/tmp/todo_filtered.txt`) and jot down
-     why each entry was removed before running the randomizer so the narrowed pool is
-     reproducible and auditable.
+   - If you can't state the acceptance criterion or smallest slice for a candidate after reading
+     3–5 lines of surrounding context (e.g., `sed -n '120,125p path/to/file'`), then drop the entry and log why
+     in the filtered list so the pool stays actionable.
+   - While pruning, write a one-sentence "done" statement for each surviving entry plus the smallest
+     verifiable slice you could ship. Note any assumptions or dependencies that would block that
+     slice so they can be resolved before the draw.
+   - Spell out any ambiguous steps, dependencies, or assumptions before coding.
+     Write a 2-3 step plan you will execute for the chosen candidate.
+     Show reviewers how you will deliver the smallest verifiable slice without expanding scope
+     mid-flight.
+   - Save the trimmed TODO list (for example, `/tmp/todo_filtered.txt`) with inline notes explaining
+     why each entry was removed before running the randomizer so the narrowed pool is reproducible
+     and auditable.
 3. Confirm every surviving entry is still actionable (e.g., not already shipped or
    obsolete, scoped to a single verifiable improvement).
    - Write down a one-sentence acceptance criterion for the selected promise so the
@@ -93,9 +94,10 @@ PRE-FLIGHT CHECKLIST:
      the rest as follow-up TODOs. Translate that acceptance criterion into a failing test name or
      assertion before writing any code, and defer any extra assertions to follow-up TODOs to prevent
      scope creep. Keep a short non-goals list so reviewers understand what you're intentionally
-     leaving for later. Include the non-goals list in the PR summary next to the smallest verifiable
-     slice so reviewers can see what stays out of scope this round. Note the failing test name in the
-     PR summary alongside the value statement so reviewers can quickly replay your acceptance check.
+     leaving for later. Include the non-goals list in the PR summary next to the smallest
+     verifiable slice so reviewers can see what stays out of scope this round. Note the failing test
+     name in the PR summary alongside the value statement so reviewers can quickly replay your
+     acceptance check.
    - Draft a short "scope lock" note before coding: restate the selected candidate, the acceptance
      criterion, and the smallest verifiable slice, plus two bullets labelled "In-scope" and
      "Out-of-scope". Keep that scope lock visible while coding so the diff stays inside the agreed
@@ -126,8 +128,9 @@ PRE-FLIGHT CHECKLIST:
 7. If the pool is empty, explicitly note that outcome. Treat each bullet under the
    "Upgrade instructions" request (or each Unreleased changelog bullet) as its own candidate,
    rerun the deterministic draw against that fallback list, and document both selections.
-   - Explain why the primary pool was empty before switching lists, and keep the fallback draw separate
-     from the trimmed TODO list instead of mixing the candidate sets.
+   - Explain why the primary pool was empty before switching lists.
+     Keep the fallback draw separate from the trimmed TODO list instead of mixing
+     the candidate sets.
    - Note in your notes or PR summary whether the winner came from the primary or fallback pool;
      call out when you shifted lists.
 
@@ -136,7 +139,8 @@ CONTEXT:
 - Consult `llms.txt`, `docs/DEVELOPMENT.md`, `docs/TESTING.md`, and nearby code for background.
 - New JavaScript should be TypeScript with React hooks; styling belongs in Tailwind CSS.
 - Ensure `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
-  `./run_all_tests.sh` succeed locally.
+  `./run_all_tests.sh` succeed locally. Run `python scripts/validate_dependencies.py` if
+  dependencies change so CI's compatibility check mirrors local state.
 - Scan staged changes for secrets with
   `detect-secrets scan $(git diff --cached --name-only)` (install via
   `pip install detect-secrets` if needed) before committing.
@@ -173,6 +177,8 @@ REQUEST:
      link updates in the PR description so reviewers can replay the workflow without surprises.
 5. Package the change as a small, green commit and open a pull request with a concise summary and
    follow-up ideas.
+6. Summarize the deterministic draw details (candidate list path, filtering notes, random-selection
+   command), scope lock, and command outputs in the PR body so reviewers can replay your steps.
 
 OUTPUT:
 A pull request URL summarizing the shipped improvement, new or updated tests,
@@ -193,8 +199,7 @@ CONTEXT:
 - Review `.github/workflows/` to anticipate CI checks invoked by prompt instructions.
 - Run `pre-commit run --all-files`, `npm run lint`, `npm run test:ci`, and
   `./run_all_tests.sh` (when applicable) before committing prompt changes.
-- Run `playwright install --with-deps chromium` so Playwright-powered checks have browsers
-  available locally.
+- Run `playwright install` so Playwright-powered checks have browsers available locally.
 - Perform the standard secret scan via
   `detect-secrets scan $(git diff --cached --name-only)` (install via
   `pip install detect-secrets` if needed).

@@ -272,9 +272,22 @@ def test_implement_prompt_confirms_commands_and_links() -> None:
     prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
     text_lower = prompt_path.read_text(encoding="utf-8").lower()
 
-    assert "verify each referenced command still runs" in text_lower, (
+    assert "confirm all commands still run" in text_lower, (
         "docs/prompts/codex/implement.md must ask contributors to validate the commands it cites"
     )
-    assert "link updates in the pr description" in text_lower, (
+    assert "referenced docs/links remain valid" in text_lower, (
+        "docs/prompts/codex/implement.md must remind contributors to note link changes for reviewers"
+    )
+
+
+def test_implement_prompt_summarizes_command_results() -> None:
+    """Prompt should ask contributors to share command validation results with reviewers."""
+    prompt_path = pathlib.Path(__file__).resolve().parents[2] / "docs" / "prompts" / "codex" / "implement.md"
+    text_lower = prompt_path.read_text(encoding="utf-8").lower()
+
+    assert "summarize command outputs" in text_lower, (
+        "docs/prompts/codex/implement.md must ask contributors to capture command outputs in the PR description"
+    )
+    assert "call out any link updates in the pr description" in text_lower, (
         "docs/prompts/codex/implement.md must remind contributors to note link changes for reviewers"
     )

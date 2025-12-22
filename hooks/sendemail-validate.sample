@@ -43,7 +43,7 @@ find_placeholder_in_file () {
     scope="$2"
     pattern="$3"
 
-    match=$(grep -Ein "$pattern" "$file" | head -n 1 || true)
+    match=$(grep -Eini "$pattern" "$file" | head -n 1 || true)
 
     if test -n "$match"
     then
@@ -71,7 +71,7 @@ find_placeholder_in_patch_message () {
     message_start=$((header_end + 1))
     message_block=$(tail -n +"${message_start}" "$file" | sed '/^diff --git /{q}' | sed '/^--- /{q}')
 
-    message_match=$(printf '%s\n' "$message_block" | nl -ba | grep -Ein "${PLACEHOLDER_REGEX}" | head -n 1 || true)
+    message_match=$(printf '%s\n' "$message_block" | nl -ba | grep -Eini "${PLACEHOLDER_REGEX}" | head -n 1 || true)
 
     if test -n "$message_match"
     then

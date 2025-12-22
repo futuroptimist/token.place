@@ -173,10 +173,9 @@ REQUEST:
    - Update any README or changelog references that mentioned the outstanding work.
 4. Run the commands above and record their results in the PR description, noting any additional
    manual verification.
-   - Confirm all commands and references remain valid; summarize command outputs in the PR description
-     so reviewers can replay the workflow without surprises.
-   - Verify each referenced command still runs and linked docs remain valid; call out any
-     link updates in the PR description so reviewers can replay the workflow without surprises.
+   - Confirm all commands still run and all referenced docs/links remain valid; summarize command outputs
+     and call out any link updates in the PR description so reviewers can replay the workflow without
+     surprises.
 5. Package the change as a small, green commit and open a pull request with a concise summary and
    follow-up ideas.
 6. Summarize the deterministic draw details (candidate list path, filtering notes, random-selection

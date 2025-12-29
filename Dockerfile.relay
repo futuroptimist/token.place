@@ -1,0 +1,50 @@
+FROM python:3.12-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN groupadd --system relay \
+    && useradd --system --create-home --home /home/relay --gid relay --uid 1000 relay
+
+COPY config/requirements_relay.txt /tmp/requirements.txt
+
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
+
+ENV PATH="/opt/venv/bin:${PATH}"
+
+COPY --chown=relay:relay api /app/api
+COPY --chown=relay:relay config /app/config
+COPY --chown=relay:relay utils /app/utils
+COPY --chown=relay:relay static /app/static
+COPY --chown=relay:relay relay.py config.py encrypt.py /app/
+COPY --chown=relay:relay docker/relay/entrypoint.sh /usr/local/bin/relay-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/relay-entrypoint.sh
+
+USER relay
+
+ENV RELAY_HOST=0.0.0.0 \
+    RELAY_PORT=5010
+
+EXPOSE 5010
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD python - <<'PY' || exit 1
+import os
+import urllib.request
+
+port = os.environ.get("RELAY_PORT", "5010")
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=4) as resp:
+        exit(0 if resp.status == 200 else 1)
+except Exception:
+    exit(1)
+PY
+
+ENTRYPOINT ["/usr/local/bin/relay-entrypoint.sh"]

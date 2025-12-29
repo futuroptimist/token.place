@@ -31,6 +31,7 @@ logging.basicConfig(level=logging.INFO if not config.is_production else logging.
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('server_app')
 
+
 def log_info(message):
     """Log info only in non-production environments"""
     if not config.is_production:
@@ -41,16 +42,35 @@ def log_error(message, exc_info=False):
     if not config.is_production:
         logger.error(message, exc_info=exc_info)
 
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer environment variable with a safe fallback."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log_error(f"Invalid integer for {name}: {raw!r}")
+        return default
+
+
+DEFAULT_SERVER_PORT = _env_int("TOKEN_PLACE_SERVER_PORT", 3000)
+DEFAULT_RELAY_PORT = _env_int("TOKEN_PLACE_RELAY_PORT", 5000)
+DEFAULT_SERVER_HOST = os.environ.get("TOKEN_PLACE_SERVER_HOST", "127.0.0.1")
+DEFAULT_RELAY_URL = os.environ.get("TOKEN_PLACE_RELAY_URL", "http://localhost")
+
 class ServerApp:
     """
     Main server application that integrates all components.
     """
     def __init__(
         self,
-        server_port: int = 3000,
-        relay_port: int = 5000,
-        relay_url: str = "http://localhost",
-        server_host: str = "127.0.0.1",
+        server_port: int = DEFAULT_SERVER_PORT,
+        relay_port: int = DEFAULT_RELAY_PORT,
+        relay_url: str = DEFAULT_RELAY_URL,
+        server_host: str = DEFAULT_SERVER_HOST,
     ):
         """
         Initialize the server application.
@@ -144,10 +164,29 @@ class ServerApp:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="token.place server")
-    parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
-    parser.add_argument("--server_host", default="127.0.0.1", help="Host interface to bind the server")
-    parser.add_argument("--relay_port", type=int, default=5000, help="Port the relay server is running on")
-    parser.add_argument("--relay_url", type=str, default="http://localhost", help="URL of the relay server")
+    parser.add_argument(
+        "--server_port",
+        type=int,
+        default=DEFAULT_SERVER_PORT,
+        help="Port to run the server on",
+    )
+    parser.add_argument(
+        "--server_host",
+        default=DEFAULT_SERVER_HOST,
+        help="Host interface to bind the server",
+    )
+    parser.add_argument(
+        "--relay_port",
+        type=int,
+        default=DEFAULT_RELAY_PORT,
+        help="Port the relay server is running on",
+    )
+    parser.add_argument(
+        "--relay_url",
+        type=str,
+        default=DEFAULT_RELAY_URL,
+        help="URL of the relay server",
+    )
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
     return parser.parse_args()
 

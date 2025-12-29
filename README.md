@@ -601,6 +601,9 @@ For a complete walkthrough of the Raspberry Pi 5 setup—including hardware reco
 
 If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, copy the Helm bundle from [`k8s/sugarkube/`](k8s/sugarkube/) into `/etc/sugarkube/helm-bundles.d/` so the relay deploys automatically once k3s is ready.
 
+For staging deployments of the relay to `staging.token.place` on sugarkube, follow the dedicated
+runbook in [docs/k3s-sugarkube-staging.md](docs/k3s-sugarkube-staging.md).
+
 ## Testing
 
 The project includes a comprehensive test suite to ensure functionality and prevent regressions.

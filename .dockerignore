@@ -9,6 +9,14 @@ tests/
 clients/
 server/
 server.py
+.pytest_cache/
+.mypy_cache/
+.venv/
+*.egg-info
+dist/
+build/
+coverage*
+htmlcov/
 __pycache__/
 *.pyc
 *.pyo

@@ -16,7 +16,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - **Run or deploy the services**
   - Start here: [README.md](../README.md#quickstart)
   - Also see: [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md),
-    [docker-compose.yml](../docker-compose.yml), [k8s/](../k8s/)
+    [docker-compose.yml](../docker-compose.yml), [k8s/](../k8s/),
+    [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md)
 - **Learn the encryption model**
   - Start here: [encrypt.py](../encrypt.py)
   - Also see: [SECURITY_PRIVACY_AUDIT.md](SECURITY_PRIVACY_AUDIT.md),

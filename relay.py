@@ -195,6 +195,8 @@ _configure_mock_mode(_detect_mock_flag(sys.argv[1:]))
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
 GPU_PORT_ENV = "TOKENPLACE_GPU_PORT"
 UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
+PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
+PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -235,19 +237,40 @@ def _load_upstream_config() -> Dict[str, Any]:
 UPSTREAM_CONFIG = _load_upstream_config()
 
 
+def _load_public_base_url() -> str | None:
+    """Return the externally reachable relay URL when configured."""
+
+    for env_var in (PUBLIC_BASE_URL_ENV, PUBLIC_BASE_URL_FALLBACK_ENV):
+        candidate = os.environ.get(env_var, "")
+        if not candidate:
+            continue
+
+        trimmed = candidate.strip().rstrip("/")
+        if trimmed:
+            return trimmed
+
+    return None
+
+
 def create_app() -> Flask:
     """Instantiate and configure the Flask application."""
 
     flask_app = Flask(__name__)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
+    public_base_url = _load_public_base_url()
+    if public_base_url:
+        flask_app.config["public_base_url"] = public_base_url
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
     init_app(flask_app)
     LOGGER.info(
         "relay.app.initialized",
-        extra={"upstream": flask_app.config.get("upstream_url")},
+        extra={
+            "upstream": flask_app.config.get("upstream_url"),
+            "public_base_url": public_base_url,
+        },
     )
     return flask_app
 
@@ -386,6 +409,8 @@ def healthz():
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
     }
+    if app.config.get("public_base_url"):
+        status["publicBaseUrl"] = app.config["public_base_url"]
 
     if DRAINING.is_set():
         status["status"] = "draining"

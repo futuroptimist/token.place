@@ -8,6 +8,7 @@ import threading
 import argparse
 import logging
 import sys
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List, Optional
 
@@ -40,6 +41,54 @@ def log_error(message, exc_info=False):
     """Log errors only in non-production environments"""
     if not config.is_production:
         logger.error(message, exc_info=exc_info)
+
+
+def _first_env(keys: List[str]) -> Optional[str]:
+    """Return the first non-empty environment variable in ``keys``."""
+
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            stripped = value.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def _resolve_relay_url(cli_default: str) -> str:
+    """Resolve the relay base URL from CLI, env, or config."""
+
+    env_override = _first_env(
+        [
+            "TOKENPLACE_RELAY_URL",
+            "TOKENPLACE_RELAY_BASE_URL",
+            "TOKENPLACE_RELAY_UPSTREAM_URL",
+            "RELAY_URL",
+        ]
+    )
+    config_default = config.get("relay.server_url", cli_default)
+    return env_override or cli_default or config_default
+
+
+def _resolve_relay_port(cli_default: int, relay_url: str) -> int:
+    """Resolve the relay port from CLI, env, config, or the relay URL."""
+
+    env_port = _first_env(["TOKENPLACE_RELAY_PORT", "RELAY_PORT"])
+    config_default = config.get("relay.port", cli_default)
+
+    if env_port is not None:
+        try:
+            return int(env_port)
+        except ValueError:
+            log_error(f"Invalid relay port override: {env_port}")
+            return config_default
+
+    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
+    if parsed.port:
+        return parsed.port
+
+    return config_default
+
 
 class ServerApp:
     """
@@ -146,8 +195,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="token.place server")
     parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
     parser.add_argument("--server_host", default="127.0.0.1", help="Host interface to bind the server")
-    parser.add_argument("--relay_port", type=int, default=5000, help="Port the relay server is running on")
-    parser.add_argument("--relay_url", type=str, default="http://localhost", help="URL of the relay server")
+    parser.add_argument(
+        "--relay_port",
+        type=int,
+        default=config.get("relay.port", 5000),
+        help="Port the relay server is running on",
+    )
+    parser.add_argument(
+        "--relay_url",
+        type=str,
+        default=config.get("relay.server_url", "http://localhost"),
+        help="URL of the relay server",
+    )
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
     return parser.parse_args()
 
@@ -160,12 +219,15 @@ def main():
         os.environ['USE_MOCK_LLM'] = '1'
         print("Running in mock LLM mode")
 
+    relay_url = _resolve_relay_url(args.relay_url)
+    relay_port = _resolve_relay_port(args.relay_port, relay_url)
+
     # Create and run the server
     server = ServerApp(
         server_port=args.server_port,
         server_host=args.server_host,
-        relay_port=args.relay_port,
-        relay_url=args.relay_url
+        relay_port=relay_port,
+        relay_url=relay_url
     )
     server.run()
 

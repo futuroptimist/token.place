@@ -195,6 +195,14 @@ class Config:
         if cf_env is not None:
             self.set('relay.cloudflare_fallback_urls', cf_env)
 
+        public_url_env = os.environ.get('TOKEN_PLACE_RELAY_PUBLIC_URL') or os.environ.get(
+            'TOKENPLACE_RELAY_PUBLIC_URL'
+        )
+        if public_url_env:
+            normalised_public = self._normalise_url(public_url_env)
+            if normalised_public:
+                self.set('relay.public_base_url', normalised_public)
+
         cluster_only_env = os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY')
         if cluster_only_env is not None:
             parsed_cluster_only = self._parse_bool(cluster_only_env)

@@ -170,6 +170,12 @@ def _build_cli_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         action="store_true",
         help="Use mock LLM for testing",
     )
+    parser.add_argument(
+        "--public-base-url",
+        dest="public_base_url",
+        default=None,
+        help="Externally reachable base URL for this relay (advertised in health responses)",
+    )
     return parser
 
 
@@ -195,6 +201,7 @@ _configure_mock_mode(_detect_mock_flag(sys.argv[1:]))
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
 GPU_PORT_ENV = "TOKENPLACE_GPU_PORT"
 UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
+PUBLIC_BASE_URL_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -235,12 +242,36 @@ def _load_upstream_config() -> Dict[str, Any]:
 UPSTREAM_CONFIG = _load_upstream_config()
 
 
+def _load_public_base_url() -> str | None:
+    """Return the externally reachable relay URL when configured."""
+
+    candidate = os.environ.get(PUBLIC_BASE_URL_ENV) or os.environ.get("TOKENPLACE_RELAY_PUBLIC_URL")
+    if not candidate:
+        try:
+            from config import get_config
+
+            candidate = get_config().get("relay.public_base_url")
+        except Exception:
+            candidate = None
+
+    if isinstance(candidate, str):
+        cleaned = candidate.strip().rstrip("/")
+        return cleaned or None
+
+    return None
+
+
+PUBLIC_BASE_URL = _load_public_base_url()
+
+
 def create_app() -> Flask:
     """Instantiate and configure the Flask application."""
 
     flask_app = Flask(__name__)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
+    if PUBLIC_BASE_URL:
+        flask_app.config["public_base_url"] = PUBLIC_BASE_URL
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
@@ -386,6 +417,8 @@ def healthz():
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
     }
+    if app.config.get("public_base_url"):
+        status["publicBaseUrl"] = app.config["public_base_url"]
 
     if DRAINING.is_set():
         status["status"] = "draining"
@@ -818,6 +851,9 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError:
         LOGGER.warning("relay.invalid_port", extra={"port": port_value})
         port = args.port
+
+    if args.public_base_url:
+        app.config["public_base_url"] = args.public_base_url.strip().rstrip("/") or None
 
     _configure_mock_mode(args.use_mock_llm)
     serve(host, port)

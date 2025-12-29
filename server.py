@@ -56,7 +56,7 @@ def _first_env(keys: List[str]) -> Optional[str]:
 
 
 def _resolve_relay_url(cli_default: str) -> str:
-    """Resolve the relay base URL from CLI, env, or config."""
+    """Resolve the relay base URL from CLI or env."""
 
     env_override = _first_env(
         [
@@ -66,28 +66,26 @@ def _resolve_relay_url(cli_default: str) -> str:
             "RELAY_URL",
         ]
     )
-    config_default = config.get("relay.server_url", cli_default)
-    return env_override or cli_default or config_default
+    return env_override or cli_default
 
 
 def _resolve_relay_port(cli_default: int, relay_url: str) -> int:
-    """Resolve the relay port from CLI, env, config, or the relay URL."""
+    """Resolve the relay port from CLI, env, or the relay URL."""
 
     env_port = _first_env(["TOKENPLACE_RELAY_PORT", "RELAY_PORT"])
-    config_default = config.get("relay.port", cli_default)
 
     if env_port is not None:
         try:
             return int(env_port)
         except ValueError:
             log_error(f"Invalid relay port override: {env_port}")
-            return config_default
+            return cli_default
 
     parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
     if parsed.port:
         return parsed.port
 
-    return config_default
+    return cli_default
 
 
 class ServerApp:

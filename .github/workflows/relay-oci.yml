@@ -1,0 +1,65 @@
+name: Build and publish relay image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  relay-image:
+    name: Build and push relay image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          short_sha="$(git rev-parse --short HEAD)"
+          repository="ghcr.io/democratizedspace/tokenplace-relay"
+          echo "sha_tag=${repository}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "branch_tag=${repository}:main-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${repository}:main-latest" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.branch_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=token.place relay
+            org.opencontainers.image.description=Lightweight relay for token.place traffic
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+          cache-from: type=gha,scope=relay-oci
+          cache-to: type=gha,mode=max,scope=relay-oci

@@ -1,8 +1,10 @@
+## Canonical relay image used for GHCR builds; keep relay-specific tweaks here to avoid duplicated Dockerfiles.
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
@@ -27,7 +29,8 @@ RUN chmod +x /usr/local/bin/relay-entrypoint.sh
 USER relay
 
 ENV RELAY_HOST=0.0.0.0 \
-    RELAY_PORT=5010
+    RELAY_PORT=5010 \
+    PROMETHEUS_MULTIPROC_DIR=/tmp
 
 EXPOSE 5010
 

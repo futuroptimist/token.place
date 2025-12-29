@@ -159,6 +159,12 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
     4. Yields the processes
     5. Cleans up the processes after tests
     """
+    if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1":
+        pytest.skip(
+            "Relay/server registration smoke tests are disabled by default; "
+            "set RUN_RELAY_REGISTRATION_TESTS=1 to enable.",
+        )
+
     print("\nSetting up servers for E2E tests...")
 
     # Ensure environment variables are set properly

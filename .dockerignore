@@ -1,6 +1,10 @@
 .git
 .gitignore
 .github/
+.pytest_cache/
+.mypy_cache/
+.venv/
+.DS_Store
 desktop/
 docs/
 outages/
@@ -14,5 +18,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+dist/
+build/
 .vscode/
 docker-compose.yml

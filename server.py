@@ -8,6 +8,7 @@ import threading
 import argparse
 import logging
 import sys
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List, Optional
 
@@ -41,6 +42,40 @@ def log_error(message, exc_info=False):
     if not config.is_production:
         logger.error(message, exc_info=exc_info)
 
+
+def _default_relay_url() -> str:
+    """Resolve the relay base URL from environment overrides or defaults."""
+
+    env_candidates = [
+        os.environ.get("TOKENPLACE_RELAY_URL"),
+        os.environ.get("RELAY_URL"),
+    ]
+    for candidate in env_candidates:
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return "http://localhost"
+
+
+def _default_relay_port() -> int:
+    """Resolve the relay port, preferring environment hints and URL metadata."""
+
+    env_candidates = [
+        os.environ.get("TOKENPLACE_RELAY_PORT"),
+        os.environ.get("RELAY_PORT"),
+    ]
+    for candidate in env_candidates:
+        if candidate:
+            try:
+                return int(candidate)
+            except (TypeError, ValueError):
+                continue
+
+    parsed = urlparse(os.environ.get("TOKENPLACE_RELAY_URL") or os.environ.get("RELAY_URL") or "")
+    if parsed.port:
+        return parsed.port
+
+    return 5000
+
 class ServerApp:
     """
     Main server application that integrates all components.
@@ -48,8 +83,8 @@ class ServerApp:
     def __init__(
         self,
         server_port: int = 3000,
-        relay_port: int = 5000,
-        relay_url: str = "http://localhost",
+        relay_port: Optional[int] = None,
+        relay_url: Optional[str] = None,
         server_host: str = "127.0.0.1",
     ):
         """
@@ -62,8 +97,8 @@ class ServerApp:
         """
         self.server_port = server_port
         self.server_host = server_host
-        self.relay_port = relay_port
-        self.relay_url = relay_url
+        self.relay_port = relay_port if relay_port is not None else _default_relay_port()
+        self.relay_url = relay_url or _default_relay_url()
 
         # Create Flask app
         self.app = Flask(__name__)
@@ -146,8 +181,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="token.place server")
     parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
     parser.add_argument("--server_host", default="127.0.0.1", help="Host interface to bind the server")
-    parser.add_argument("--relay_port", type=int, default=5000, help="Port the relay server is running on")
-    parser.add_argument("--relay_url", type=str, default="http://localhost", help="URL of the relay server")
+    parser.add_argument(
+        "--relay_port",
+        type=int,
+        default=_default_relay_port(),
+        help="Port the relay server is running on",
+    )
+    parser.add_argument(
+        "--relay_url",
+        type=str,
+        default=_default_relay_url(),
+        help="URL of the relay server",
+    )
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
     return parser.parse_args()
 

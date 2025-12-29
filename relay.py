@@ -166,6 +166,12 @@ def _build_cli_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         help="Host interface to bind the relay server",
     )
     parser.add_argument(
+        "--public-url",
+        dest="public_url",
+        default=None,
+        help="Public base URL for this relay (used in diagnostics)",
+    )
+    parser.add_argument(
         "--use_mock_llm",
         action="store_true",
         help="Use mock LLM for testing",
@@ -189,12 +195,28 @@ def _detect_mock_flag(argv: list[str]) -> bool:
     return bool(getattr(args, "use_mock_llm", False))
 
 
+def _detect_public_url(argv: list[str]) -> str | None:
+    parser = _build_cli_parser(add_help=False)
+    try:
+        args, _ = parser.parse_known_args(argv)
+    except SystemExit:
+        return None
+    candidate = getattr(args, "public_url", None)
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if stripped:
+            return stripped
+    return None
+
+
 _configure_mock_mode(_detect_mock_flag(sys.argv[1:]))
 
 
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
 GPU_PORT_ENV = "TOKENPLACE_GPU_PORT"
 UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
+PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
+PUBLIC_BASE_URL_FALLBACKS = ("RELAY_PUBLIC_URL", "TOKENPLACE_PUBLIC_BASE_URL")
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -235,19 +257,61 @@ def _load_upstream_config() -> Dict[str, Any]:
 UPSTREAM_CONFIG = _load_upstream_config()
 
 
+def _load_public_base_url() -> str | None:
+    """Return the externally reachable base URL, if configured."""
+
+    cli_value = _detect_public_url(sys.argv[1:])
+    if cli_value and os.environ.get(PUBLIC_BASE_URL_ENV) is None:
+        os.environ[PUBLIC_BASE_URL_ENV] = cli_value
+
+    candidates = [os.environ.get(PUBLIC_BASE_URL_ENV, "")]
+    for env_var in PUBLIC_BASE_URL_FALLBACKS:
+        candidates.append(os.environ.get(env_var, ""))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        stripped = candidate.strip()
+        if not stripped:
+            continue
+
+        try:
+            parsed = urlparse(stripped if "://" in stripped else f"https://{stripped}")
+        except ValueError:
+            continue
+
+        netloc = parsed.netloc or parsed.path
+        if not netloc:
+            continue
+
+        scheme = parsed.scheme or "https"
+        public_url = f"{scheme}://{netloc}"
+        return public_url.rstrip("/")
+
+    return None
+
+
+PUBLIC_BASE_URL = _load_public_base_url()
+
+
 def create_app() -> Flask:
     """Instantiate and configure the Flask application."""
 
     flask_app = Flask(__name__)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
+    if PUBLIC_BASE_URL:
+        flask_app.config["public_base_url"] = PUBLIC_BASE_URL
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
     init_app(flask_app)
     LOGGER.info(
         "relay.app.initialized",
-        extra={"upstream": flask_app.config.get("upstream_url")},
+        extra={
+            "upstream": flask_app.config.get("upstream_url"),
+            "public_url": flask_app.config.get("public_base_url"),
+        },
     )
     return flask_app
 
@@ -380,12 +444,15 @@ def _log_request(response: Response):
 @app.route("/healthz", methods=["GET"])
 def healthz():
     gpu_host = app.config.get("gpu_host")
+    public_url = app.config.get("public_base_url")
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
     }
+    if public_url:
+        status["publicUrl"] = public_url
 
     if DRAINING.is_set():
         status["status"] = "draining"

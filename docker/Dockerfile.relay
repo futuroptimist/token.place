@@ -1,37 +1,41 @@
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc g++ python3-dev && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
+RUN groupadd --system relay \
+    && useradd --system --create-home --home /home/relay --gid relay --uid 1000 relay
 
-# Final stage
-FROM python:3.11-slim
+COPY config/requirements_relay.txt /tmp/requirements.txt
 
-WORKDIR /app
+RUN python -m pip install --upgrade pip \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
 
-# Copy installed packages from builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+COPY --chown=relay:relay api /app/api
+COPY --chown=relay:relay config /app/config
+COPY --chown=relay:relay utils /app/utils
+COPY --chown=relay:relay static /app/static
+COPY --chown=relay:relay relay.py config.py encrypt.py /app/
+COPY --chown=relay:relay docker/relay/entrypoint.sh /usr/local/bin/relay-entrypoint.sh
 
-# Copy application code
-COPY . .
+RUN chmod +x /usr/local/bin/relay-entrypoint.sh
 
-# Run with a non-root user
-RUN useradd -m appuser
-USER appuser
+USER relay
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
+ENV RELAY_HOST=0.0.0.0 \
+    RELAY_PORT=5010
 
-# Expose the port the relay runs on
-EXPOSE 5000
+EXPOSE 5010
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=5s \
+  CMD curl -fsS "http://127.0.0.1:${RELAY_PORT:-5010}/healthz" || exit 1
 
-# Command to run the relay
-CMD ["python", "-m", "relay.main"]
+ENTRYPOINT ["/usr/local/bin/relay-entrypoint.sh"]

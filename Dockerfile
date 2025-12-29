@@ -6,6 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system relay \
     && useradd --system --create-home --home /home/relay --gid relay --uid 1000 relay
 
@@ -30,5 +34,8 @@ ENV RELAY_HOST=0.0.0.0 \
     RELAY_PORT=5010
 
 EXPOSE 5010
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=5s \
+  CMD curl -fsS "http://127.0.0.1:${RELAY_PORT:-5010}/healthz" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/relay-entrypoint.sh"]

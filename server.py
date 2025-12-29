@@ -145,9 +145,31 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="token.place server")
     parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
-    parser.add_argument("--server_host", default="127.0.0.1", help="Host interface to bind the server")
-    parser.add_argument("--relay_port", type=int, default=5000, help="Port the relay server is running on")
-    parser.add_argument("--relay_url", type=str, default="http://localhost", help="URL of the relay server")
+    parser.add_argument(
+        "--server_host",
+        default="127.0.0.1",
+        help="Host interface to bind the server",
+    )
+    parser.add_argument(
+        "--relay_port",
+        type=int,
+        default=int(
+            os.environ.get(
+                "TOKENPLACE_RELAY_PORT",
+                os.environ.get("TOKEN_PLACE_RELAY_PORT", 5000),
+            )
+        ),
+        help="Port the relay server is running on",
+    )
+    parser.add_argument(
+        "--relay_url",
+        type=str,
+        default=os.environ.get(
+            "TOKENPLACE_RELAY_URL",
+            os.environ.get("TOKEN_PLACE_RELAY_URL", "http://localhost"),
+        ),
+        help="URL of the relay server",
+    )
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
     return parser.parse_args()
 

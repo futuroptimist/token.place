@@ -32,6 +32,7 @@ class RelaySettings(TypedDict, total=False):
     server_registration_token: Optional[str]
     cluster_only: bool
     cloudflare_fallback_urls: List[str]
+    public_base_url: Optional[str]
 
 
 class APISettings(TypedDict, total=False):
@@ -116,6 +117,7 @@ DEFAULT_CONFIG: AppConfig = {
         "server_registration_token": None,
         "cluster_only": False,
         "cloudflare_fallback_urls": [],
+        "public_base_url": None,
     },
     "api": {
         "host": "127.0.0.1",

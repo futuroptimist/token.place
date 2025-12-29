@@ -61,8 +61,11 @@ def _resolve_relay_url(cli_default: str) -> str:
     env_override = _first_env(
         [
             "TOKENPLACE_RELAY_URL",
+            "TOKEN_PLACE_RELAY_URL",
             "TOKENPLACE_RELAY_BASE_URL",
+            "TOKEN_PLACE_RELAY_BASE_URL",
             "TOKENPLACE_RELAY_UPSTREAM_URL",
+            "TOKEN_PLACE_RELAY_UPSTREAM_URL",
             "RELAY_URL",
         ]
     )
@@ -72,7 +75,7 @@ def _resolve_relay_url(cli_default: str) -> str:
 def _resolve_relay_port(cli_default: int, relay_url: str) -> int:
     """Resolve the relay port from CLI, env, or the relay URL."""
 
-    env_port = _first_env(["TOKENPLACE_RELAY_PORT", "RELAY_PORT"])
+    env_port = _first_env(["TOKENPLACE_RELAY_PORT", "TOKEN_PLACE_RELAY_PORT", "RELAY_PORT"])
 
     if env_port is not None:
         try:

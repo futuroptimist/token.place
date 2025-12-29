@@ -38,6 +38,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -52,6 +57,8 @@ jobs:
             ${{ steps.tags.outputs.latest_tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=token.place relay
+            org.opencontainers.image.description=Lightweight relay for token.place traffic
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
           cache-from: type=gha,scope=relay-oci

@@ -196,6 +196,7 @@ GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"
 GPU_PORT_ENV = "TOKENPLACE_GPU_PORT"
 UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
 PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
+PUBLIC_BASE_URL_COMPAT_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
 
 
@@ -240,7 +241,7 @@ UPSTREAM_CONFIG = _load_upstream_config()
 def _load_public_base_url() -> str | None:
     """Return the externally reachable relay URL when configured."""
 
-    for env_var in (PUBLIC_BASE_URL_ENV, PUBLIC_BASE_URL_FALLBACK_ENV):
+    for env_var in (PUBLIC_BASE_URL_ENV, PUBLIC_BASE_URL_COMPAT_ENV, PUBLIC_BASE_URL_FALLBACK_ENV):
         candidate = os.environ.get(env_var, "")
         if not candidate:
             continue

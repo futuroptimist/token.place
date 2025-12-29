@@ -1,6 +1,6 @@
 image:
-  repository: ghcr.io/${OWNER}/tokenplace-relay
-  tag: "0.1.0"     # defaults to chart appVersion when digest is unset
+  repository: ghcr.io/democratizedspace/tokenplace-relay
+  tag: "main-latest"     # defaults to chart appVersion when digest is unset
   digest: ""      # immutable digest preferred in prod
   pullPolicy: IfNotPresent
 

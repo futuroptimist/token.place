@@ -1,0 +1,71 @@
+name: Build and publish relay image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to build from
+        required: false
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || '' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Define image tags
+        id: meta
+        run: |
+          branch="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref_name }}"
+          short_sha="$(git rev-parse --short HEAD)"
+          tag_prefix="${branch//\//-}"
+          image="ghcr.io/democratizedspace/tokenplace-relay"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "branch=${tag_prefix}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${image}:${tag_prefix}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${image}:${tag_prefix}-latest" >> "$GITHUB_OUTPUT"
+          echo "branch_tag=${image}:${tag_prefix}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.relay
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.latest_tag }}
+            ${{ steps.meta.outputs.branch_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

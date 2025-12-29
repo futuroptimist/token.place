@@ -56,6 +56,8 @@ pre-commit run --all-files
   and Bandit just like CI.
 - **Deploy Kubernetes manifests** — `make k8s-deploy` applies everything under `k8s/` to the active
   cluster context.
+- **Sugarkube staging relay** — follow [docs/k3s-sugarkube-staging.md](docs/k3s-sugarkube-staging.md)
+  to onboard `staging.token.place` on the sugarkube cluster.
 
 Make targets surface the same workflows in shorthand:
 
@@ -83,6 +85,9 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | PROD_API_HOST   | 127.0.0.1    | IP address for production API host                                |
 | API_FALLBACK_URLS | (empty)   | Comma-separated Cloudflare or other relay fallbacks tried in order |
 | TOKEN_PLACE_RELAY_CLOUDFLARE_URLS | (empty) | Optional Cloudflare relay URLs appended to the server's relay pool |
+| TOKENPLACE_RELAY_PUBLIC_URL | (empty) | Public relay base URL echoed by `/healthz` for ingress checks |
+| TOKENPLACE_RELAY_URL / RELAY_URL | http://localhost | Relay base URL used by `server.py` (supports hosted HTTPS relays) |
+| TOKENPLACE_RELAY_PORT / RELAY_PORT | 5000 | Relay port used by `server.py`; parsed from the URL when set |
 
 Set `API_FALLBACK_URLS=https://relay.cloudflare.workers.dev/api/v1` to let the bundled clients
 retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable.

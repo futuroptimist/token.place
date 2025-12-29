@@ -39,12 +39,41 @@ def test_parse_args_custom(monkeypatch):
     assert args.use_mock_llm is True
 
 
+def test_parse_args_env_overrides(monkeypatch):
+    import sys
+
+    monkeypatch.setenv("TOKENPLACE_RELAY_URL", "https://staging.token.place")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PORT", "8080")
+    monkeypatch.setattr(sys, "argv", ["server.py"])
+
+    args = sa.parse_args()
+
+    assert args.relay_url == "https://staging.token.place"
+    assert args.relay_port == 8080
+
+
 def test_initialize_llm_mock():
     with patch("server.server_app.get_model_manager") as gm:
         gm.return_value.use_mock_llm = True
         app = sa.ServerApp()
         # initialize_llm called in __init__; ensure method executed
         gm.assert_called()
+
+
+def test_server_app_uses_env_defaults(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELAY_URL", "https://relay.env.example")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PORT", "6100")
+
+    with patch("server.server_app.get_model_manager") as gm, patch(
+        "server.server_app.get_crypto_manager"
+    ) as gcm, patch("server.server_app.RelayClient") as rc:
+        gm.return_value.use_mock_llm = True
+        gm.return_value.download_model_if_needed.return_value = True
+        gcm.return_value = object()
+        app = sa.ServerApp()
+
+    assert app.relay_url == "https://relay.env.example"
+    assert app.relay_port == 6100
 
 
 def test_initialize_llm_download():

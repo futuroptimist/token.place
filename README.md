@@ -1057,9 +1057,12 @@ token.place now has full cross-platform support for Windows, macOS, and Linux. T
 - Native launcher scripts for each platform
 - Docker containerization for consistent deployment
 - Cross-platform testing framework
-- Automated desktop installers for Windows (.exe) and macOS (.dmg) built via GitHub Actions
+- Legacy Electron desktop installers existed historically; desktop direction is now Tauri design-first
 
 For detailed information on cross-platform features and containerization, see [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md).
+
+Desktop note: `desktop/` currently contains a deprecated Electron prototype. New desktop work
+should follow the Tauri design document at `docs/design/tauri_desktop_client.md`.
 
 ### Quick Start on Different Platforms
 

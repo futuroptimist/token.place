@@ -19,8 +19,8 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 
 - `static/` — Browser assets (HTML, JS, CSS) that exercise the encrypted chat flow.
   - `static/chat.js` provides the reference JavaScript crypto client.
-- `desktop/` — Electron desktop application with the same encrypted UX.
-  - Uses `npm` scripts defined in the workspace `package.json`.
+- `desktop/` — Legacy Electron desktop prototype (deprecated; do not extend).
+  - Forward-looking desktop direction is Tauri; see `docs/design/tauri_desktop_client.md`.
 - `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
   - `client_simplified.py` offers a minimal variant for demos.
 

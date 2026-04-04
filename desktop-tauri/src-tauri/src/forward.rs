@@ -29,15 +29,14 @@ pub async fn encrypt_and_forward(relay_base_url: &str, final_output: &str) -> an
         .json::<NextServerResponse>()
         .await?;
 
-    let (pub_pem, private_pem) = crate::keygen::generate_rsa_keypair_pem()?;
+    let (pub_key_b64, _private_key_b64) = crate::keygen::generate_rsa_keypair_b64()?;
     let payload = serde_json::to_string(&vec![serde_json::json!({
         "role": "assistant",
         "content": final_output,
     })])?;
 
     let envelope =
-        assemble_relay_envelope(&server.server_public_key, &pub_pem, payload.as_bytes())?;
-    let _ = private_pem;
+        assemble_relay_envelope(&server.server_public_key, &pub_key_b64, payload.as_bytes())?;
 
     let response = reqwest::Client::new()
         .post(format!("{relay}/faucet"))

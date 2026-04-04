@@ -17,11 +17,16 @@ pub struct BackendInfo {
 }
 
 pub fn detect_backend_for(target_os: &str, target_arch: &str) -> BackendInfo {
-    if target_os == "macos" && target_arch == "aarch64" {
+    if target_os == "macos" {
+        let display_label = if target_arch == "aarch64" {
+            "Metal / Apple Silicon"
+        } else {
+            "Metal / Apple"
+        };
         return BackendInfo {
-            platform_label: "macOS arm64".into(),
+            platform_label: format!("macOS {target_arch}"),
             preferred_mode: ComputeMode::Metal,
-            display_label: "Metal / Apple Silicon".into(),
+            display_label: display_label.into(),
         };
     }
 
@@ -49,6 +54,13 @@ mod tests {
         let info = detect_backend_for("macos", "aarch64");
         assert_eq!(info.preferred_mode, ComputeMode::Metal);
         assert_eq!(info.display_label, "Metal / Apple Silicon");
+    }
+
+    #[test]
+    fn selects_metal_for_macos_intel() {
+        let info = detect_backend_for("macos", "x86_64");
+        assert_eq!(info.preferred_mode, ComputeMode::Metal);
+        assert_eq!(info.display_label, "Metal / Apple");
     }
 
     #[test]

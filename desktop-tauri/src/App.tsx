@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'metal' | 'cuda' | 'cpu';
@@ -37,13 +37,23 @@ export function App() {
   const [requestId, setRequestId] = useState<string>('');
   const [status, setStatus] = useState<UiState>('idle');
   const [error, setError] = useState('');
+  const [isForwarding, setIsForwarding] = useState(false);
+  const saveTimerRef = useRef<number | null>(null);
+  const requestIdRef = useRef('');
 
   useEffect(() => {
-    invoke<BackendInfo>('detect_backend').then(setBackend);
-    invoke<DesktopConfig>('load_config').then(setConfig);
+    invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
+    invoke<DesktopConfig>('load_config').then(setConfig).catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    requestIdRef.current = requestId;
+  }, [requestId]);
+
+  useEffect(() => {
     const unlisten = listen<SidecarEvent>('inference_event', (evt) => {
       const payload = evt.payload;
-      if (payload.request_id !== requestId) {
+      if (payload.request_id !== requestIdRef.current) {
         return;
       }
       if (payload.type === 'started') {
@@ -62,16 +72,34 @@ export function App() {
     return () => {
       unlisten.then((f) => f());
     };
-  }, [requestId]);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, []);
 
   const canStart = useMemo(
     () => Boolean(config.model_path.trim()) && Boolean(prompt.trim()) && status !== 'starting' && status !== 'streaming',
     [config.model_path, prompt, status]
   );
 
-  const saveConfig = async (next: DesktopConfig) => {
+  const scheduleConfigSave = (next: DesktopConfig) => {
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = window.setTimeout(() => {
+      invoke('save_config', { config: next }).catch((e) => setError(String(e)));
+      saveTimerRef.current = null;
+    }, 300);
+  };
+
+  const updateConfig = (next: DesktopConfig) => {
     setConfig(next);
-    await invoke('save_config', { config: next });
+    scheduleConfigSave(next);
   };
 
   const startInference = async () => {
@@ -79,6 +107,7 @@ export function App() {
     setError('');
     setStatus('starting');
     const nextRequestId = crypto.randomUUID();
+    requestIdRef.current = nextRequestId;
     setRequestId(nextRequestId);
     await invoke('start_inference', {
       request: {
@@ -91,15 +120,23 @@ export function App() {
   };
 
   const cancelInference = async () => {
-    if (!requestId) return;
-    await invoke('cancel_inference', { requestId });
+    if (!requestIdRef.current) return;
+    await invoke('cancel_inference', { request_id: requestIdRef.current });
   };
 
   const forwardEncrypted = async () => {
-    await invoke('encrypt_and_forward', {
-      relayBaseUrl: config.relay_base_url,
-      finalOutput: output,
-    });
+    try {
+      setIsForwarding(true);
+      setError('');
+      await invoke('encrypt_and_forward', {
+        relay_base_url: config.relay_base_url,
+        final_output: output,
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIsForwarding(false);
+    }
   };
 
   return (
@@ -107,10 +144,10 @@ export function App() {
       <h1>token.place desktop (Tauri MVP)</h1>
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
-      <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => saveConfig({ ...config, model_path: e.target.value })} />
+      <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
-      <select value={config.preferred_mode} onChange={(e) => saveConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>
+      <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
         <option value="cpu">CPU fallback</option>
       </select>
@@ -121,7 +158,7 @@ export function App() {
       <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
         <button disabled={!canStart} onClick={startInference}>Start inference</button>
         <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
-        <button disabled={!output} onClick={forwardEncrypted}>Encrypt + forward output</button>
+        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Encrypt + forward output</button>
       </div>
 
       <p>Status: <strong>{status}</strong></p>
@@ -129,7 +166,7 @@ export function App() {
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
-      <input value={config.relay_base_url} style={{ width: '100%' }} onChange={(e) => saveConfig({ ...config, relay_base_url: e.target.value })} />
+      <input value={config.relay_base_url} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })} />
     </main>
   );
 }

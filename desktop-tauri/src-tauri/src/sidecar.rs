@@ -1,7 +1,9 @@
 use crate::backend::ComputeMode;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -60,16 +62,45 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     Ok(events)
 }
 
+fn build_sidecar_command(sidecar_path: &str) -> Command {
+    let path = Path::new(sidecar_path);
+    let is_python = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
+
+    if is_python {
+        let python_bin =
+            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python".into());
+        let mut cmd = Command::new(python_bin);
+        cmd.arg(sidecar_path);
+        return cmd;
+    }
+
+    Command::new(sidecar_path)
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
     request: InferenceRequest,
 ) -> anyhow::Result<()> {
+    {
+        let mut child_slot = state.child.lock().await;
+        if child_slot
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
+        {
+            anyhow::bail!("inference already running; cancel before starting a new request");
+        }
+        *child_slot = None;
+        *state.stdin.lock().await = None;
+    }
+
     let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR")
         .unwrap_or_else(|_| "../sidecar/fake_llama_sidecar.py".into());
 
-    let mut child = Command::new("python3")
-        .arg(sidecar_script)
+    let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")
         .arg(&request.model_path)
         .arg("--mode")
@@ -78,7 +109,7 @@ pub async fn start_sidecar(
         .arg(&request.prompt)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
 
     let stdout = child
@@ -111,22 +142,39 @@ pub async fn start_sidecar(
         }
     }
 
+    *state.child.lock().await = None;
+    *state.stdin.lock().await = None;
     Ok(())
 }
 
 pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
     if let Some(stdin) = state.stdin.lock().await.as_mut() {
         stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
+        stdin.flush().await?;
     }
-    if let Some(child) = state.child.lock().await.as_mut() {
+
+    let mut child_lock = state.child.lock().await;
+    if let Some(child) = child_lock.as_mut() {
+        for _ in 0..10 {
+            if child.try_wait()?.is_some() {
+                *child_lock = None;
+                *state.stdin.lock().await = None;
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let _ = child.kill().await;
     }
+
+    *child_lock = None;
+    *state.stdin.lock().await = None;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
     use tokio::process::Command;
 
     #[test]
@@ -150,10 +198,11 @@ mod tests {
 
     #[tokio::test]
     async fn fake_sidecar_happy_path() {
+        let model = NamedTempFile::new().expect("tempfile");
         let mut child = Command::new("python3")
             .arg("../sidecar/fake_llama_sidecar.py")
             .arg("--model")
-            .arg("/tmp/model.gguf")
+            .arg(model.path())
             .arg("--mode")
             .arg("cpu")
             .arg("--prompt")

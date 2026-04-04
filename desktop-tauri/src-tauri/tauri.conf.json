@@ -9,9 +9,15 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "title": "token.place desktop", "width": 960, "height": 760 }],
+    "windows": [
+      {
+        "title": "token.place desktop",
+        "width": 960,
+        "height": 760
+      }
+    ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://localhost:1420; font-src 'self' data:; connect-src 'self' http://localhost:1420 ws://localhost:1420; media-src 'self' blob: asset:; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self'"
     }
   },
   "bundle": {

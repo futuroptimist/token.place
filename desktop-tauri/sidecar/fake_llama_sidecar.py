@@ -4,9 +4,31 @@
 import argparse
 import json
 import os
-import select
+import queue
 import sys
+import threading
 import time
+
+_stdin_lines: queue.Queue[str] = queue.Queue()
+_stdin_reader_started = False
+_stdin_reader_lock = threading.Lock()
+
+
+def _start_stdin_reader() -> None:
+    global _stdin_reader_started
+    with _stdin_reader_lock:
+        if _stdin_reader_started:
+            return
+
+        def _reader() -> None:
+            while True:
+                line = sys.stdin.readline()
+                if line == "":
+                    break
+                _stdin_lines.put(line)
+
+        threading.Thread(target=_reader, daemon=True).start()
+        _stdin_reader_started = True
 
 
 def emit(payload):
@@ -15,17 +37,20 @@ def emit(payload):
 
 
 def canceled_requested() -> bool:
-    ready, _, _ = select.select([sys.stdin], [], [], 0)
-    if not ready:
-        return False
-    line = sys.stdin.readline().strip()
-    if not line:
-        return False
-    try:
-        msg = json.loads(line)
-    except json.JSONDecodeError:
-        return False
-    return msg.get("type") == "cancel"
+    _start_stdin_reader()
+    while True:
+        try:
+            line = _stdin_lines.get_nowait().strip()
+        except queue.Empty:
+            return False
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("type") == "cancel":
+            return True
 
 
 def main() -> int:

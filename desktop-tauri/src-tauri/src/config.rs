@@ -1,6 +1,6 @@
 use crate::backend::ComputeMode;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopConfig {
@@ -19,6 +19,6 @@ impl Default for DesktopConfig {
     }
 }
 
-pub fn config_path(base_dir: &PathBuf) -> PathBuf {
+pub fn config_path(base_dir: &Path) -> PathBuf {
     base_dir.join("desktop_tauri_config.json")
 }

@@ -89,6 +89,7 @@ async fn cancel_inference(
     state: tauri::State<'_, AppState>,
     request_id: String,
 ) -> Result<(), String> {
+    // TODO: validate request_id against active session when multi-session inference is supported.
     println!("inference.cancel request_id={request_id}");
     sidecar::cancel_sidecar(state.sidecar.clone())
         .await

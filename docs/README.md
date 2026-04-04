@@ -12,7 +12,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - **Understand architecture choices**
   - Start here: [ARCHITECTURE.md](ARCHITECTURE.md)
   - Also see: [STREAMING_IMPLEMENTATION_GUIDE.md](STREAMING_IMPLEMENTATION_GUIDE.md),
-    [CROSS_PLATFORM.md](CROSS_PLATFORM.md)
+    [CROSS_PLATFORM.md](CROSS_PLATFORM.md),
+    [design/tauri_desktop_client.md](design/tauri_desktop_client.md) (forward-looking desktop direction; `desktop/` is a deprecated legacy Electron prototype)
 - **Run or deploy the services**
   - Start here: [README.md](../README.md#quickstart)
   - Also see: [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md),

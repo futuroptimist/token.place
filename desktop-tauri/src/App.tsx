@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open } from '@tauri-apps/plugin-dialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
@@ -23,6 +24,16 @@ interface SidecarEvent {
   text?: string;
   code?: string;
   message?: string;
+}
+
+export function selectedModelPath(selection: string | string[] | null): string {
+  if (typeof selection === 'string') {
+    return selection;
+  }
+  if (Array.isArray(selection) && selection.length > 0 && typeof selection[0] === 'string') {
+    return selection[0];
+  }
+  return '';
 }
 
 export function App() {
@@ -102,6 +113,22 @@ export function App() {
     scheduleConfigSave(next);
   };
 
+  const chooseModelPath = async () => {
+    try {
+      const selection = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: 'GGUF models', extensions: ['gguf'] }],
+      });
+      const path = selectedModelPath(selection);
+      if (path) {
+        updateConfig({ ...config, model_path: path });
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const startInference = async () => {
     setOutput('');
     setError('');
@@ -144,7 +171,10 @@ export function App() {
       <h1>token.place desktop (Tauri MVP)</h1>
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
-      <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
+        <button type="button" onClick={chooseModelPath}>Choose GGUF</button>
+      </div>
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
       <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>

@@ -111,6 +111,7 @@ async fn encrypt_and_forward(relay_base_url: String, final_output: String) -> Re
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             detect_backend,

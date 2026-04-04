@@ -99,7 +99,7 @@ Relationship to existing abstractions:
 
 Options considered:
 
-1. **`llama.cpp` sidecar binary (recommended baseline)**
+1. **`llama.cpp` sidecar binary (baseline sidecar pattern)**
    - Pros: clear process boundary, crash isolation, easier replacement/upgrades, straightforward stderr/stdout capture.
    - Cons: extra packaging complexity and protocol surface between app and sidecar.
 

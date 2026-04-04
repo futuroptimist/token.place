@@ -2,6 +2,17 @@
 
 ## 1) Summary
 
+## Status note (2026-04-04)
+
+Phase 1 MVP has landed in `desktop-tauri/` with:
+- runtime backend preference detection (`Metal / Apple Silicon`, `CUDA / NVIDIA`, CPU fallback),
+- sidecar-based streaming/cancellation via NDJSON events,
+- optional encrypt-and-forward action using existing token.place encrypted request envelope fields.
+
+The MVP is intentionally narrow and does not yet include model download UX, keychain integration,
+or installer/signing work.
+
+
 token.place should adopt a Tauri-based desktop client as the forward-looking desktop runtime for local-first LLM usage: run inference on-device via a llama.cpp-backed sidecar, encrypt outputs locally with token.place-compatible cryptography, and forward encrypted payloads into the existing `relay.py` flow without redesigning the network contract. This direction gives token.place a native desktop shell with tighter permission boundaries, a smaller install footprint than Electron-first packaging, and better alignment with a "UI shell + native inference runtime + encrypted forwarding" architecture.
 
 ## 2) Problem statement

@@ -1,0 +1,19 @@
+{
+  "name": "token-place-desktop-tauri",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "test": "npm run test:rust",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  }
+}

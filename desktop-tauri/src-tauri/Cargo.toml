@@ -1,0 +1,37 @@
+[package]
+name = "token_place_desktop_tauri"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "token_place_desktop_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+app = ["dep:tauri", "dep:tauri-plugin-opener"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+cbc = "0.1"
+aes = "0.8"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tauri = { version = "2.0.0", optional = true , features = [] }
+tauri-plugin-opener = { version = "2", optional = true }
+tokio = { version = "1", features = ["process", "io-util", "sync", "rt-multi-thread", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+
+[[bin]]
+name = "token_place_desktop_tauri"
+path = "src/main.rs"
+required-features = ["app"]

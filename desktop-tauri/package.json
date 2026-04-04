@@ -1,0 +1,9 @@
+{
+  "name": "desktop-tauri",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "tauri:dev": "cd src-tauri && cargo tauri dev",
+    "tauri:test": "cd src-tauri && cargo test"
+  }
+}

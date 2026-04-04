@@ -4,6 +4,9 @@
 
 token.place should adopt a Tauri-based desktop client as the forward-looking desktop runtime for local-first LLM usage: run inference on-device via a llama.cpp-backed sidecar, encrypt outputs locally with token.place-compatible cryptography, and forward encrypted payloads into the existing `relay.py` flow without redesigning the network contract. This direction gives token.place a native desktop shell with tighter permission boundaries, a smaller install footprint than Electron-first packaging, and better alignment with a "UI shell + native inference runtime + encrypted forwarding" architecture.
 
+**Status (April 4, 2026):** a phase-1 MVP landed under `desktop-tauri/` for macOS Apple
+Silicon (`Metal / Apple Silicon`) and Windows 11 NVIDIA (`CUDA / NVIDIA`) with CPU fallback.
+
 ## 2) Problem statement
 
 The browser experience is useful for portability, but it is not sufficient as the primary environment for local-model desktop workflows that need robust process lifecycle management, local model discovery, platform-native key storage, and predictable GPU/CPU inference orchestration.

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>token.place desktop</title>
+    <style>
+      body { font-family: sans-serif; max-width: 900px; margin: 0 auto; padding: 24px; }
+      textarea, input, select { width: 100%; margin-top: 6px; margin-bottom: 12px; }
+      button { margin-right: 8px; }
+      pre { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; min-height: 180px; }
+    </style>
+  </head>
+  <body>
+    <h1>token.place desktop MVP</h1>
+    <label>Model path (GGUF)</label>
+    <input id="modelPath" placeholder="/path/to/model.gguf" />
+    <button id="pickModel">Choose model file</button>
+
+    <label>Compute mode override</label>
+    <select id="computeMode">
+      <option value="auto">auto</option>
+      <option value="cpu">cpu</option>
+    </select>
+
+    <p>Detected backend: <strong id="backend">loading...</strong></p>
+
+    <label>Prompt</label>
+    <textarea id="prompt" rows="5"></textarea>
+
+    <button id="startBtn">Start inference</button>
+    <button id="cancelBtn">Cancel</button>
+    <button id="forwardBtn">Encrypt + forward final output</button>
+    <p>State: <strong id="state">idle</strong></p>
+    <pre id="output"></pre>
+
+    <label>Relay base URL</label>
+    <input id="relayUrl" placeholder="http://127.0.0.1:5000" />
+    <label>Server public key (base64 PEM)</label>
+    <textarea id="serverKey" rows="4"></textarea>
+
+    <script src="./main.js"></script>
+  </body>
+</html>

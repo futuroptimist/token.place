@@ -25,6 +25,7 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - **Explore client experiences**
   - Start here: [static/](../static)
   - Also see: [CROSS_PLATFORM.md](CROSS_PLATFORM.md),
+    [design/tauri_desktop_client.md](design/tauri_desktop_client.md),
     [api_v2_model_catalog.md](api_v2_model_catalog.md)
 - **Contribute code confidently**
   - Start here: [CONTRIBUTING.md](../CONTRIBUTING.md)

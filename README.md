@@ -1057,7 +1057,7 @@ token.place now has full cross-platform support for Windows, macOS, and Linux. T
 - Native launcher scripts for each platform
 - Docker containerization for consistent deployment
 - Cross-platform testing framework
-- Automated desktop installers for Windows (.exe) and macOS (.dmg) built via GitHub Actions
+- Desktop roadmap now targets a Tauri client for local inference + encrypted relay forwarding
 
 For detailed information on cross-platform features and containerization, see [docs/CROSS_PLATFORM.md](docs/CROSS_PLATFORM.md).
 

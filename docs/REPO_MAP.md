@@ -21,6 +21,8 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
   - `static/chat.js` provides the reference JavaScript crypto client.
 - `desktop/` — **Deprecated legacy Electron prototype** (not the forward-looking desktop path).
   - See `docs/design/tauri_desktop_client.md` for the recommended Tauri direction.
+- `desktop-tauri/` — Tauri MVP desktop client scaffold for local inference sidecar flows.
+  - Includes backend detection, sidecar streaming/cancel wiring, and encrypted relay forwarding.
 - `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
   - `client_simplified.py` offers a minimal variant for demos.
 

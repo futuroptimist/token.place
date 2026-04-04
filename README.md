@@ -156,6 +156,7 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 The existing `desktop/` code is a deprecated Electron prototype retained for historical context.
 The forward-looking desktop architecture for token.place is Tauri-based local inference + local encryption + encrypted relay forwarding, documented in
 [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md).
+The MVP scaffold now lives in [`desktop-tauri/`](desktop-tauri/README.md).
 
 ## Contents
 

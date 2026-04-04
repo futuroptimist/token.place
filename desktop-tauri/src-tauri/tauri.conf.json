@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "token.place desktop MVP",
+  "version": "0.1.0",
+  "identifier": "place.token.desktop.mvp",
+  "build": {
+    "beforeDevCommand": "npm run ui:dev -- --host",
+    "beforeBuildCommand": "npm run ui:build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "token.place desktop MVP",
+        "width": 960,
+        "height": 780
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all"
+  }
+}

@@ -151,6 +151,12 @@ There are tons of personal computers and homelabs out there with lots of compute
 For a quick orientation to the repository layout and key docs, see [docs/ONBOARDING.md](docs/ONBOARDING.md).
 For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 
+## Desktop direction
+
+The existing `desktop/` code is a deprecated Electron prototype retained for historical context.
+The forward-looking desktop architecture for token.place is Tauri-based local inference + local encryption + encrypted relay forwarding, documented in
+[`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md).
+
 ## Contents
 
 - End-to-end encryption powered by RSA and AES

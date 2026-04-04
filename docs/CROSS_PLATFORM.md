@@ -219,15 +219,16 @@ The `CryptoClient` utility significantly reduces the amount of boilerplate code 
 
 See the detailed documentation in `utils/README.md` for more information on using the CryptoClient.
 
-## Desktop distribution improvements
+## Desktop distribution note (legacy)
 
-token.place now ships electron-builder targets for truly cross-platform installers:
+The repository currently includes legacy Electron packaging config under `desktop/`,
+but that path is deprecated and retained for historical reference only.
 
-- Windows `.msi` and `.exe` packages (via NSIS and MSI targets)
-- macOS `.dmg` and `.pkg` artifacts
-- Linux `.AppImage`, `.deb`, and `.rpm` bundles for x64 and arm64
+The forward-looking desktop direction is a Tauri-based client documented in
+[`docs/design/tauri_desktop_client.md`](design/tauri_desktop_client.md).
 
-See `desktop/electron-builder.json` for the authoritative configuration that powers these builds.
+Future packaging guidance in this document should target the Tauri implementation
+once that client is introduced in a dedicated implementation PR.
 
 ## Resource usage metrics
 
@@ -273,7 +274,8 @@ Recent cross-platform improvements now cover:
 2. **CI/CD Pipeline**:
    - ✅ Matrix testing across all supported platforms via `utils/testing/platform_matrix.py`
      and the accompanying regression in `tests/unit/test_platform_matrix.py`
-   - ✅ Automated builds for all platforms through the `desktop/package:all` script
+   - ⚠️ Legacy desktop automation previously used `desktop/package:all` for Electron builds;
+     Tauri packaging automation will be introduced in a follow-up implementation PR
    - ✅ Containerized testing environments with `scripts/run_tests_in_container.py`
      orchestrating the Docker-based test runner defined in
      `docker/test-runner.Dockerfile`

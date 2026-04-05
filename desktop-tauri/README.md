@@ -43,3 +43,17 @@ npm run tauri dev
 - The app only persists non-plaintext settings (model path, relay URL,
   preferred mode) in app-local config.
 - Log lines are redacted to metadata (byte counts, request ids).
+
+## Cutting a desktop release
+
+Desktop release builds are tag-driven and only trigger for tags matching
+`desktop-v*`.
+
+```bash
+git tag desktop-v0.1.0 <commit-sha>
+git push origin desktop-v0.1.0
+```
+
+That tag runs `.github/workflows/desktop-release.yml`, which builds unsigned
+Windows and macOS desktop-tauri bundles and uploads them to the matching GitHub
+Release.

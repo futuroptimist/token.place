@@ -1,0 +1,107 @@
+name: Desktop Tauri Release
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Desktop release tag (e.g., desktop-v0.1.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: desktop-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build and publish (${{ matrix.platform_name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform_name: macos
+            bundle_path: desktop-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle
+            tauri_args: --target aarch64-apple-darwin
+            checksum_name: checksums-macos-aarch64.txt
+          - os: windows-latest
+            platform_name: windows
+            bundle_path: desktop-tauri/src-tauri/target/release/bundle
+            tauri_args: ''
+            checksum_name: checksums-windows-x64.txt
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS Apple Silicon target
+        if: matrix.os == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: desktop-tauri
+        run: npm ci
+
+      - name: Build and upload desktop bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop-tauri
+          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          releaseName: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          releaseBody: 'Automated desktop release artifacts.'
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: false
+          args: ${{ matrix.tauri_args }}
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_PATH="${{ matrix.bundle_path }}"
+          if [ ! -d "$BUNDLE_PATH" ]; then
+            echo "Bundle directory not found: $BUNDLE_PATH"
+            exit 1
+          fi
+
+          : > "${{ matrix.checksum_name }}"
+          while IFS= read -r -d '' file; do
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$file" >> "${{ matrix.checksum_name }}"
+            else
+              sha256sum "$file" >> "${{ matrix.checksum_name }}"
+            fi
+          done < <(find "$BUNDLE_PATH" -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \) -print0)
+
+          if [ ! -s "${{ matrix.checksum_name }}" ]; then
+            echo "No release bundle files found in $BUNDLE_PATH"
+            exit 1
+          fi
+
+      - name: Upload checksums to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          files: ${{ matrix.checksum_name }}
+          append_body: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

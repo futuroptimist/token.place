@@ -29,9 +29,11 @@ jobs:
           - os: macos-latest
             artifact_name: macos-arm64-bundles
             tauri_target: aarch64-apple-darwin
+            checksum_file: SHA256SUMS-macos.txt
           - os: windows-latest
             artifact_name: windows-x64-bundles
             tauri_target: ''
+            checksum_file: SHA256SUMS-windows.txt
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -39,6 +41,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name != '' && inputs.tag_name || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -58,36 +62,13 @@ jobs:
         run: npm ci
 
       - name: Build Tauri bundles
+        shell: bash
         run: |
           if [ -n "${{ matrix.tauri_target }}" ]; then
             npm run tauri build -- --target ${{ matrix.tauri_target }}
           else
             npm run tauri build
           fi
-
-      - name: Generate SHA256 checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-artifacts
-          python - <<'PY'
-          import hashlib
-          from pathlib import Path
-
-          bundle_root = Path('src-tauri/target')
-          files = sorted(
-              p for p in bundle_root.rglob('*')
-              if p.is_file() and p.suffix.lower() in {'.dmg', '.app', '.zip', '.exe', '.msi'}
-          )
-          if not files:
-              raise SystemExit('No bundle artifacts found in src-tauri/target/**/bundle')
-
-          checksums = Path('release-artifacts/SHA256SUMS.txt')
-          with checksums.open('w', encoding='utf-8') as fh:
-              for path in files:
-                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                  fh.write(f"{digest}  {path.as_posix()}\n")
-          PY
 
       - name: Stage bundle artifacts
         shell: bash
@@ -98,6 +79,29 @@ jobs:
             cp "$file" release-artifacts/
           done < <(find src-tauri/target -type f \
             \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \) -print0)
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          artifact_root = Path('release-artifacts')
+          files = sorted(
+              p for p in artifact_root.iterdir()
+              if p.is_file() and p.name != '${{ matrix.checksum_file }}'
+          )
+          if not files:
+              raise SystemExit('No staged bundle artifacts found in release-artifacts')
+
+          checksums = artifact_root / '${{ matrix.checksum_file }}'
+          with checksums.open('w', encoding='utf-8') as fh:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  fh.write(f"{digest}  {path.name}\n")
+          PY
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4

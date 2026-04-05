@@ -29,11 +29,11 @@ jobs:
           - os: macos-latest
             artifact_name: macos-arm64-bundles
             tauri_target: aarch64-apple-darwin
-            checksum_file: SHA256SUMS-macos.txt
+            checksum_file: SHA256SUMS-macos-arm64.txt
           - os: windows-latest
             artifact_name: windows-x64-bundles
             tauri_target: ''
-            checksum_file: SHA256SUMS-windows.txt
+            checksum_file: SHA256SUMS-windows-x64.txt
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -122,6 +122,13 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           elif [ -n "${{ inputs.tag_name }}" ]; then
+            case "${{ inputs.tag_name }}" in
+              desktop-v*) ;;
+              *)
+                echo "workflow_dispatch input 'tag_name' must match desktop-v*" >&2
+                exit 1
+                ;;
+            esac
             echo "tag=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
           else
             echo "workflow_dispatch requires inputs.tag_name unless inputs.dry_run=true" >&2

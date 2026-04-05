@@ -31,6 +31,20 @@ npm ci
 npm run tauri dev
 ```
 
+## Cutting a desktop release
+
+Desktop release builds are triggered by pushing a tag that matches
+`desktop-v*` (for example `desktop-v0.1.0`).
+
+```bash
+git tag desktop-v0.1.0 <commit-sha>
+git push origin desktop-v0.1.0
+```
+
+This triggers `.github/workflows/desktop-tauri-release.yml`, which builds and
+publishes macOS + Windows Tauri installer artifacts to the matching GitHub
+Release.
+
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
 - **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.

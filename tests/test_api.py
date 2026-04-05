@@ -4,6 +4,7 @@ import json
 import base64
 import time
 import logging
+from unittest.mock import MagicMock, patch
 from encrypt import encrypt, decrypt, generate_keys, decrypt_stream_chunk
 import sys
 import os
@@ -35,17 +36,17 @@ app.config['TESTING'] = True
 # --- BEGIN NEW MOCK SETUP ---
 # Mock the Llama class before it's used by api.v1.models
 @pytest.fixture(autouse=True)
-def mock_llama(mocker):
-    """Mocks the llama_cpp.Llama class for all tests."""
+def mock_llama():
+    """Mock the ``api.v1.models.Llama`` class for all tests."""
     mock_response = {
         'choices': [{
             'message': {'role': 'assistant', 'content': 'Mock response: The capital of France is Paris.'}
         }]
     }
-    mock_instance = mocker.Mock()
+    mock_instance = MagicMock()
     mock_instance.create_chat_completion.return_value = mock_response
-    mocker.patch('api.v1.models.Llama', return_value=mock_instance, autospec=True)
-    return mock_instance
+    with patch('api.v1.models.Llama', return_value=mock_instance, autospec=True):
+        yield mock_instance
 # --- END NEW MOCK SETUP ---
 
 @pytest.fixture

@@ -43,3 +43,19 @@ npm run tauri dev
 - The app only persists non-plaintext settings (model path, relay URL,
   preferred mode) in app-local config.
 - Log lines are redacted to metadata (byte counts, request ids).
+
+## Cutting a desktop release
+
+Desktop binaries are published by the GitHub Actions workflow
+`.github/workflows/desktop-release.yml`.
+
+1. Create an explicit desktop tag on the commit you want to release:
+   ```bash
+   git tag desktop-v0.1.0 <commit-sha>
+   git push origin desktop-v0.1.0
+   ```
+2. GitHub Actions builds `desktop-tauri/` artifacts on macOS and Windows and
+   uploads them to the GitHub Release named `desktop-v0.1.0`.
+
+You can also run the workflow manually with `workflow_dispatch` and provide
+`tag_name` to rebuild/re-publish an existing desktop tag.

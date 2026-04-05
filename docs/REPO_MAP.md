@@ -23,6 +23,7 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
   - See `docs/design/tauri_desktop_client.md` for the recommended Tauri direction.
 - `desktop-tauri/` — Tauri desktop MVP for local sidecar inference, streaming UI, and encrypted relay forwarding.
   - Uses a replaceable sidecar contract and keeps plaintext local until explicit forwarding.
+  - Release automation is tag-driven via `desktop-v*` tags in `.github/workflows/desktop-release.yml`.
 - `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
   - `client_simplified.py` offers a minimal variant for demos.
 

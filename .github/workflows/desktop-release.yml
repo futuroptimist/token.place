@@ -1,0 +1,148 @@
+name: Desktop Tauri Release
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Existing desktop-v* tag to rebuild/re-publish (required unless dry_run=true)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Build only (skip GitHub Release create/update and upload)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build desktop artifacts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact_name: macos-arm64-bundles
+            tauri_target: aarch64-apple-darwin
+          - os: windows-latest
+            artifact_name: windows-x64-bundles
+            tauri_target: ''
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop-tauri
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS arm64 Rust target
+        if: matrix.tauri_target != ''
+        run: rustup target add ${{ matrix.tauri_target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri bundles
+        run: |
+          if [ -n "${{ matrix.tauri_target }}" ]; then
+            npm run tauri build -- --target ${{ matrix.tauri_target }}
+          else
+            npm run tauri build
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          bundle_root = Path('src-tauri/target')
+          files = sorted(
+              p for p in bundle_root.rglob('*')
+              if p.is_file() and p.suffix.lower() in {'.dmg', '.app', '.zip', '.exe', '.msi'}
+          )
+          if not files:
+              raise SystemExit('No bundle artifacts found in src-tauri/target/**/bundle')
+
+          checksums = Path('release-artifacts/SHA256SUMS.txt')
+          with checksums.open('w', encoding='utf-8') as fh:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  fh.write(f"{digest}  {path.as_posix()}\n")
+          PY
+
+      - name: Stage bundle artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          while IFS= read -r -d '' file; do
+            cp "$file" release-artifacts/
+          done < <(find src-tauri/target -type f \
+            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \) -print0)
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: desktop-tauri/release-artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            echo "tag=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflow_dispatch requires inputs.tag_name unless inputs.dry_run=true" >&2
+            exit 1
+          fi
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-bundles
+          path: release-assets/macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-bundles
+          path: release-assets/windows
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/macos/*
+            release-assets/windows/*

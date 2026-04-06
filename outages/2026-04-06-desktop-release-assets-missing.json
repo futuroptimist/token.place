@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-06",
+  "slug": "desktop-release-assets-missing",
+  "summary": "Desktop release workflow created a tag release without uploading platform binaries, leaving only GitHub source archives visible on the release page.",
+  "impact": "Users could not download Windows .exe or macOS .dmg installers directly from the release assets list.",
+  "fix": "Updated .github/workflows/desktop-release.yml to fail fast when expected .dmg/.exe bundles are missing and to publish assets with gh release upload --clobber so binaries are attached to existing or newly created releases.",
+  "lessons": "Add explicit asset validation and deterministic release upload steps so CI failures are obvious and release pages always include installer artifacts."
+}

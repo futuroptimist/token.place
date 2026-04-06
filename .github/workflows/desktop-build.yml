@@ -3,7 +3,12 @@ name: Build Desktop App
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'desktop-v*'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -43,3 +48,37 @@ jobs:
             desktop/dist/**/*.dmg
             desktop/dist/**/*.zip
             desktop/dist/**/*.pkg
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Desktop Release Assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: token-place-desktop-win
+          path: release-assets/windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: token-place-desktop-mac
+          path: release-assets/macos
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/windows/**/*.exe
+            release-assets/windows/**/*.zip
+            release-assets/windows/**/*.msi
+            release-assets/macos/**/*.dmg
+            release-assets/macos/**/*.zip
+            release-assets/macos/**/*.pkg

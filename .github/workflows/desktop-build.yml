@@ -6,6 +6,11 @@ on:
     tags:
       - 'desktop-v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing desktop-v* tag to publish assets for
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -28,9 +33,9 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '18'
           cache: 'npm'
@@ -42,7 +47,7 @@ jobs:
       - name: Package application
         run: npm run ${{ matrix.build_script }}
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.required_artifact_glob }}
@@ -51,19 +56,32 @@ jobs:
   publish-release:
     name: Publish Desktop Release Assets
     needs: build
-    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    if: startsWith(github.ref, 'refs/tags/desktop-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Resolve release tag
+        id: release_tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/desktop-v* ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.tag_name }}" ]]; then
+            echo "value=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No desktop-v* tag available for release publishing" >&2
+            exit 1
+          fi
+
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: token-place-desktop-win
           path: release-assets/windows
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: token-place-desktop-mac
           path: release-assets/macos
@@ -71,8 +89,8 @@ jobs:
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@c062e08bd532815e2082a7e09a9927dc4bc7a32c
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.release_tag.outputs.value }}
+          name: ${{ steps.release_tag.outputs.value }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

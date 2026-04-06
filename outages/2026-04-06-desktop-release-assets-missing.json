@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-06",
+  "slug": "desktop-release-assets-missing",
+  "summary": "Desktop tags produced releases without Windows/macOS binaries.",
+  "impact": "Users saw only source archives, not downloadable .exe/.dmg installers.",
+  "fix": "desktop-build now runs on desktop-v* tags and publishes release assets.",
+  "lessons": "Tag workflows need explicit release-asset publishing, not artifacts alone."
+}

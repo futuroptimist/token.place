@@ -3,6 +3,6 @@
   "slug": "desktop-release-assets-missing",
   "summary": "Desktop release workflow built installers but did not attach platform binaries to GitHub Release assets.",
   "impact": "Release page for desktop-v0.1.0 only showed source archives, so users could not directly download Windows .exe or macOS .dmg installers.",
-  "fix": "Updated .github/workflows/desktop-build.yml to trigger on desktop-v* tags and publish downloaded matrix artifacts to the release as binary assets.",
-  "lessons": "Tag-driven desktop release flows must include an explicit release upload step and fail when expected installer files are missing."
+  "fix": "Updated .github/workflows/desktop-build.yml to trigger on desktop-v* tags and publish required Windows .exe and macOS .dmg artifacts to the release.",
+  "lessons": "Tag-driven desktop release flows must explicitly upload required installer assets (.exe/.dmg) and fail when those files are missing."
 }

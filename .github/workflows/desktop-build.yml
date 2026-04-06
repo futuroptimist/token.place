@@ -19,9 +19,11 @@ jobs:
           - os: windows-latest
             build_script: package:win
             artifact_name: token-place-desktop-win
+            required_artifact_glob: desktop/dist/**/*.exe
           - os: macos-latest
             build_script: package:mac
             artifact_name: token-place-desktop-mac
+            required_artifact_glob: desktop/dist/**/*.dmg
     defaults:
       run:
         working-directory: desktop
@@ -43,11 +45,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            desktop/dist/**/*.exe
-            desktop/dist/**/*.dmg
-            desktop/dist/**/*.msi
-            desktop/dist/**/*.pkg
+          path: ${{ matrix.required_artifact_glob }}
           if-no-files-found: error
 
   publish-release:
@@ -79,6 +77,4 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/windows/**/*.exe
-            release-assets/windows/**/*.msi
             release-assets/macos/**/*.dmg
-            release-assets/macos/**/*.pkg

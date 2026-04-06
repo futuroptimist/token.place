@@ -6,12 +6,56 @@ on:
     tags:
       - 'desktop-v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional desktop-v* tag to publish artifacts to'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  resolve-release-context:
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+      should_publish: ${{ steps.resolve.outputs.should_publish }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+    steps:
+      - name: Resolve checkout ref and publish tag
+        id: resolve
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          checkout_ref="${GITHUB_REF}"
+          should_publish="false"
+          tag_name=""
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${INPUT_RELEASE_TAG}" ]; then
+            case "${INPUT_RELEASE_TAG}" in
+              desktop-v*) ;;
+              *)
+                echo "release_tag must start with desktop-v" >&2
+                exit 1
+                ;;
+            esac
+
+            checkout_ref="refs/tags/${INPUT_RELEASE_TAG}"
+            should_publish="true"
+            tag_name="${INPUT_RELEASE_TAG}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" == desktop-v* ]]; then
+            should_publish="true"
+            tag_name="${GITHUB_REF_NAME}"
+          fi
+
+          echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
+          echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve-release-context
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -28,11 +72,13 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
         with:
-          node-version: '18'
+          ref: ${{ needs.resolve-release-context.outputs.checkout_ref }}
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
           cache: 'npm'
           cache-dependency-path: desktop/package-lock.json
       - name: Install dependencies
@@ -42,7 +88,7 @@ jobs:
       - name: Package application
         run: npm run ${{ matrix.build_script }}
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.required_artifact_glob }}
@@ -50,20 +96,20 @@ jobs:
 
   publish-release:
     name: Publish Desktop Release Assets
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: [resolve-release-context, build]
+    if: needs.resolve-release-context.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: token-place-desktop-win
           path: release-assets/windows
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: token-place-desktop-mac
           path: release-assets/macos
@@ -71,8 +117,8 @@ jobs:
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@c062e08bd532815e2082a7e09a9927dc4bc7a32c
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ needs.resolve-release-context.outputs.tag_name }}
+          name: ${{ needs.resolve-release-context.outputs.tag_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-06",
+  "slug": "desktop-release-assets-missing",
+  "summary": "Desktop CI built macOS and Windows packages as workflow artifacts but never attached them to the tagged GitHub release.",
+  "impact": "The desktop-v0.1.0 release page only showed GitHub source archives, so users could not download .dmg/.exe installers directly.",
+  "fix": "Updated .github/workflows/desktop-build.yml to trigger on desktop-v* tags and publish downloaded matrix artifacts as release assets.",
+  "lessons": "For release tags, verify workflows include an explicit release upload step instead of relying on Actions artifact retention."
+}

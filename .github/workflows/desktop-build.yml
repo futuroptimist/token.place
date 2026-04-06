@@ -2,10 +2,18 @@ name: Build Desktop App
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
     tags:
       - 'desktop-v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'desktop-v* tag to publish assets to (required for manual runs)'
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 permissions:
   contents: read
@@ -28,12 +36,12 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '18'
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: desktop/package-lock.json
       - name: Install dependencies
         run: npm ci
@@ -42,7 +50,7 @@ jobs:
       - name: Package application
         run: npm run ${{ matrix.build_script }}
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.required_artifact_glob }}
@@ -51,19 +59,34 @@ jobs:
   publish-release:
     name: Publish Desktop Release Assets
     needs: build
-    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    if: |
+      startsWith(github.ref, 'refs/tags/desktop-v') ||
+      (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag_name, 'desktop-v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
     steps:
+      - name: Validate manual tag input
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          case "${RELEASE_TAG}" in
+            desktop-v*) ;;
+            *)
+              echo "workflow_dispatch input 'tag_name' must match desktop-v*" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: token-place-desktop-win
           path: release-assets/windows
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: token-place-desktop-mac
           path: release-assets/macos
@@ -71,8 +94,8 @@ jobs:
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@c062e08bd532815e2082a7e09a9927dc4bc7a32c
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

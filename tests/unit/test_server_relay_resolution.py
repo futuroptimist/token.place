@@ -33,4 +33,6 @@ def test_resolve_relay_port_uses_explicit_loopback_url_port():
 
 def test_resolve_relay_port_respects_cli_port_override_for_https():
     server = _load_server_script()
-    assert server._resolve_relay_port(7443, "https://token.place") == 7443
+    relay_port = server._resolve_relay_port(7443, "https://token.place")
+    assert relay_port == 7443
+    assert server.RelayClient._compose_relay_url("https://token.place", relay_port) == "https://token.place:7443"

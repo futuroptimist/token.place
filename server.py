@@ -91,10 +91,16 @@ def _resolve_relay_port(cli_default: Optional[int], relay_url: str) -> Optional[
     if cli_default is not None:
         return cli_default
 
-    if parsed.scheme == "https":
-        return None
+    return None
 
-    return cli_default
+
+def _format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
+    """Create a display-ready relay target without duplicating explicit URL ports."""
+
+    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
+    if relay_port is None or parsed.port is not None:
+        return relay_url
+    return f"{relay_url}:{relay_port}"
 
 
 class ServerApp:
@@ -104,7 +110,7 @@ class ServerApp:
     def __init__(
         self,
         server_port: int = 3000,
-        relay_port: Optional[int] = 5000,
+        relay_port: Optional[int] = None,
         relay_url: str = "https://token.place",
         server_host: str = "127.0.0.1",
     ):
@@ -180,7 +186,7 @@ class ServerApp:
             daemon=True
         )
         relay_thread.start()
-        relay_target = self.relay_url if self.relay_port is None else f"{self.relay_url}:{self.relay_port}"
+        relay_target = _format_relay_target(self.relay_url, self.relay_port)
         log_info(f"Started relay polling thread for {relay_target}")
 
     def run(self):

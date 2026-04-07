@@ -5,6 +5,7 @@ import os
 import threading
 import argparse
 import logging
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List, Optional
 
@@ -35,6 +36,15 @@ def log_error(message, exc_info=False):
     if not config.is_production:
         logger.error(message, exc_info=exc_info)
 
+
+def _format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
+    """Create a display-ready relay target without duplicating explicit URL ports."""
+
+    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
+    if relay_port is None or parsed.port is not None:
+        return relay_url
+    return f"{relay_url}:{relay_port}"
+
 class ServerApp:
     """
     Main server application that integrates all components.
@@ -42,7 +52,7 @@ class ServerApp:
     def __init__(
         self,
         server_port: int = 3000,
-        relay_port: Optional[int] = 5000,
+        relay_port: Optional[int] = None,
         relay_url: str = "https://token.place",
     ):
         """
@@ -123,7 +133,7 @@ class ServerApp:
             daemon=True
         )
         relay_thread.start()
-        relay_target = self.relay_url if self.relay_port is None else f"{self.relay_url}:{self.relay_port}"
+        relay_target = _format_relay_target(self.relay_url, self.relay_port)
         log_info(f"Started relay polling thread for {relay_target}")
 
     def run(self):  # pragma: no cover

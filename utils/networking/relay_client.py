@@ -259,8 +259,6 @@ class RelayClient:
         path = parsed.path if parsed.netloc else ''
 
         should_inject_port = parsed.port is None and port is not None
-        if should_inject_port and parsed.scheme == "https":
-            should_inject_port = False
 
         if should_inject_port:
             hostname = parsed.hostname or ''
@@ -283,7 +281,7 @@ class RelayClient:
     def _build_relay_targets(
         cls,
         primary_base: str,
-        primary_port: int,
+        primary_port: Optional[int],
         additional: Union[List[Any], Tuple[Any, ...]],
         *,
         cluster_only: bool = False,

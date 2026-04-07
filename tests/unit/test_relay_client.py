@@ -83,8 +83,13 @@ def test_compose_relay_url_preserves_ipv6_brackets():
 
 
 def test_compose_relay_url_keeps_https_without_injected_port():
-    result = RelayClient._compose_relay_url('https://token.place', 5000)
+    result = RelayClient._compose_relay_url('https://token.place', None)
     assert result == 'https://token.place'
+
+
+def test_compose_relay_url_honors_explicit_https_port_override():
+    result = RelayClient._compose_relay_url('https://token.place', 7443)
+    assert result == 'https://token.place:7443'
 
 
 def test_compose_relay_url_keeps_explicit_localhost_port():

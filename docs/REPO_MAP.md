@@ -1,66 +1,47 @@
 # token.place repository map
 
-This guide orients new contributors to the key directories and configuration
-files. It complements the high-level tour in [docs/README.md](README.md) and the
-hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
+This guide orients contributors to key directories and the docs that define current,
+near-term, and target architecture.
+
+## Canonical migration and architecture docs
+
+- [Roadmap: desktop compute-node migration](roadmap/desktop_compute_node_migration.md)
+  - Canonical 7-step plan and phase exit criteria.
+- [Tauri desktop design](design/tauri_desktop_client.md)
+  - Forward-looking desktop strategy; desktop-tauri is currently MVP, not parity.
+- [Architecture](ARCHITECTURE.md)
+  - Current and target architecture boundaries.
+- [Relay on sugarkube onboarding](relay_sugarkube_onboarding.md)
+  - Practical relay deployment guidance and links to environment runbooks.
 
 ## Applications
 
-- `server/` — Flask app exposing the OpenAI-compatible API v1 and v2 endpoints.
-  - Pulls shared helpers from `utils/` and configuration from `config.py`.
-- `api/` — FastAPI implementation of the modern API surfaces.
-  - Mirrors the v1 routes while hosting experimental adapters under `api/v2/`.
-- `relay.py` / `relay/` — Lightweight relay that forwards encrypted traffic.
-  - Reads relay settings from `config/requirements_relay.txt` and `.env` files.
-- `server.py` — Convenience entrypoint that wires the relay and model runtime.
-  - Honours feature toggles such as `CONTENT_MODERATION_MODE`.
+- `server/` and `server.py`
+  - Current compute-node baseline.
+- `relay.py`
+  - Lightweight relay handling legacy sink/source and multi-node registration.
+  - First deployment candidate for sugarkube.
+- `api/`
+  - FastAPI implementation and experimental API surface for contributors evaluating API-facing
+    runtime paths.
+- `desktop-tauri/`
+  - Forward-looking desktop client path.
+  - Must reach feature parity with `server.py` via shared compute-node runtime before API v1
+    distributed migration.
+- `desktop/`
+  - Deprecated Electron prototype retained as historical context.
 
-## Client experiences
+## Contracts and evolution boundaries
 
-- `static/` — Browser assets (HTML, JS, CSS) that exercise the encrypted chat flow.
-  - `static/chat.js` provides the reference JavaScript crypto client.
-- `desktop/` — **Deprecated legacy Electron prototype** (not the forward-looking desktop path).
-  - See `docs/design/tauri_desktop_client.md` for the recommended Tauri direction.
-- `desktop-tauri/` — Tauri desktop MVP for local sidecar inference, streaming UI, and encrypted relay forwarding.
-  - Uses a replaceable sidecar contract and keeps plaintext local until explicit forwarding.
-- `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
-  - `client_simplified.py` offers a minimal variant for demos.
+- **Current contract:** legacy relay sink/source flows used by `server.py` and relay nodes.
+- **Planned runtime alignment:** shared compute-node runtime co-used by `server.py` and desktop-tauri.
+- **Future contract:** API v1-aligned distributed compute after parity and operations readiness.
 
-## Shared libraries
+## Deployment and operations docs
 
-- `utils/` — Reusable Python helpers for crypto, rate limiting, and config loading.
-- `dict/` — Data files and blocklists referenced by moderation and routing logic.
-  - Keep sensitive allow or block lists encrypted when stored outside this repo.
+- [k3s sugarkube (dev)](k3s-sugarkube-dev.md)
+- [k3s sugarkube (staging)](k3s-sugarkube-staging.md)
+- [k3s sugarkube (prod)](k3s-sugarkube-prod.md)
+- [relay deploy notes](relay-deploy.md)
 
-## Configuration and operations
-
-- `config/` — Environment-specific configuration and dependency pins.
-  - `requirements_server.txt` and `requirements_relay.txt` split dependencies.
-- `config.py` — Central configuration loader for relay and server processes.
-  - Reads `.env`, `.env.local`, and CLI overrides.
-- `docker/`, `docker-compose.yml` — Container images and compose definitions.
-  - `infra` consolidation is tracked in the polish roadmap.
-- `k8s/` — Kubernetes manifests for cluster deployments.
-  - Aligns with Raspberry Pi notes in `RPI_DEPLOYMENT_GUIDE.md`.
-- `scripts/` — Operational helpers covering setup, testing, and doc sync.
-  - `run_all_tests.sh` is called by CI and pre-commit hooks.
-
-## Testing
-
-- `tests/` — Python and Playwright suites covering crypto compatibility and API flows.
-  - See [TESTING.md](TESTING.md) for markers and execution guidance.
-- `run_all_tests.sh` — Aggregated runner invoked locally and in CI.
-  - Wraps pytest, Playwright, npm checks, and Bandit.
-
-## Documentation resources
-
-- [README.md](../README.md) &rarr; top-level quickstart and CI requirements.
-- [docs/ONBOARDING.md](ONBOARDING.md) &rarr; guided setup narrative.
-- [docs/ARCHITECTURE.md](ARCHITECTURE.md) &rarr; architectural deep dive.
-- [docs/TESTING.md](TESTING.md) &rarr; detailed coverage of automated suites.
-- [docs/STYLE_GUIDE.md](STYLE_GUIDE.md) &rarr; branding and writing guidance.
-- [docs/SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) &rarr; release-time security
-  walkthrough covering relay failovers, Cloudflare fallback, and key management checks.
-
-Contributions that move files should update this map so future maintainers always
-have an accurate snapshot of the workspace layout.
+Use these together with the roadmap doc when planning implementation prompts 1–7.

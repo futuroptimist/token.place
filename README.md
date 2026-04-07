@@ -153,9 +153,34 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 
 ## Desktop direction
 
-The existing `desktop/` code is a deprecated Electron prototype retained for historical context.
-The forward-looking desktop architecture for token.place is Tauri-based local inference + local encryption + encrypted relay forwarding, documented in
-[`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md).
+The `desktop-tauri/` app is the forward-looking desktop path, but it is currently an MVP and does
+**not** yet replace `server.py`. The canonical migration sequence is documented in
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+
+See also:
+
+- [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+
+## Deployment topology
+
+- **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
+  legacy sink/source contract.
+- **Near-term multi-node legacy flow:** multiple compute nodes (including desktop-tauri after
+  parity) register through `relay.py` using the same legacy contract.
+- **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
+  contracts after parity and operational readiness gates are complete.
+
+## sugarkube deployment
+
+`relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
+operationally separate from GPU-heavy compute nodes.
+
+- Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
+- Environment runbooks:
+  - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)
+  - [`docs/k3s-sugarkube-staging.md`](docs/k3s-sugarkube-staging.md)
+  - [`docs/k3s-sugarkube-prod.md`](docs/k3s-sugarkube-prod.md)
 
 ## Contents
 
@@ -168,6 +193,8 @@ The forward-looking desktop architecture for token.place is Tauri-based local in
 - [CLAUDE.md](CLAUDE.md) summarizes Claude integration tips
 
 ## roadmap
+
+> Canonical migration plan: [docs/roadmap/desktop_compute_node_migration.md](docs/roadmap/desktop_compute_node_migration.md).
 
 - [x] hello world: it literally just echoes your message param back to you
 - [x] find an initial model to support (llama 2 7b chat gguf)

@@ -3,6 +3,14 @@
 This guide describes how to deploy the `token.place` relay in a k3s cluster and connect it to the
 GPU-backed `server.py` process running on a dedicated Windows 11 host with an RTX 4090.
 
+> **Status note (April 2026):** Canonical migration sequencing now lives in
+> [docs/roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md).
+> For relay-on-sugarkube operator workflows, start with
+> [docs/relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md) and the environment runbooks:
+> [docs/k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
+> [docs/k3s-sugarkube-staging.md](k3s-sugarkube-staging.md), and
+> [docs/k3s-sugarkube-prod.md](k3s-sugarkube-prod.md).
+
 ## Container image
 
 Multi-architecture images (linux/amd64 and linux/arm64) are published to GitHub Container Registry

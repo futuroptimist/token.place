@@ -292,6 +292,41 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
     assert payload["registered_compute_nodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
 
+
+def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
+    """Healthz should separate configured upstream URLs from live registered nodes."""
+    configured_servers = [
+        "https://configured-one.example.com:8000",
+        "https://configured-two.example.com:8000",
+    ]
+    app.config["relay_configured_servers"] = configured_servers
+    live_server_key = base64.b64encode(b"live_server_key").decode("utf-8")
+    known_servers[live_server_key] = {
+        "public_key": live_server_key,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[live_server_key] = [
+        {
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "chat_history": "pending-work",
+            "cipherkey": "cipher",
+            "iv": "iv",
+        }
+    ]
+
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert payload["configuredUpstreamServers"] == configured_servers
+    assert payload["registeredServers"][0]["server_public_key"] == live_server_key
+    assert payload["registeredServers"][0]["age_seconds"] >= 0
+    assert payload["registeredServers"][0]["queue_depth"] == 1
+    assert "https://configured-one.example.com:8000" not in {
+        node["server_public_key"] for node in payload["registeredServers"]
+    }
+
 # --- Test /source ---
 
 def test_source_submit_response(client):

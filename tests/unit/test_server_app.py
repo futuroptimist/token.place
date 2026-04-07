@@ -10,8 +10,8 @@ def test_parse_args_defaults(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["server.py"])
     args = sa.parse_args()
     assert args.server_port == 3000
-    assert args.relay_port == 5000
-    assert args.relay_url == "http://localhost"
+    assert args.relay_port is None
+    assert args.relay_url == "https://token.place"
     assert args.use_mock_llm is False
 
 
@@ -87,3 +87,7 @@ def test_main_invocation(monkeypatch):
     )
     mock_app.run.assert_called_once()
     assert os.environ["USE_MOCK_LLM"] == "1"
+
+
+def test_format_relay_target_avoids_duplicate_port():
+    assert sa._format_relay_target("http://localhost:5000", 5000) == "http://localhost:5000"

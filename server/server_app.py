@@ -5,6 +5,7 @@ import os
 import threading
 import argparse
 import logging
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List, Optional
 
@@ -35,11 +36,25 @@ def log_error(message, exc_info=False):
     if not config.is_production:
         logger.error(message, exc_info=exc_info)
 
+
+def _format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
+    """Create a display-ready relay target without duplicating explicit URL ports."""
+
+    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
+    if relay_port is None or parsed.port is not None:
+        return relay_url
+    return f"{relay_url}:{relay_port}"
+
 class ServerApp:
     """
     Main server application that integrates all components.
     """
-    def __init__(self, server_port: int = 3000, relay_port: int = 5000, relay_url: str = "http://localhost"):
+    def __init__(
+        self,
+        server_port: int = 3000,
+        relay_port: Optional[int] = None,
+        relay_url: str = "https://token.place",
+    ):
         """
         Initialize the server application.
 
@@ -118,7 +133,8 @@ class ServerApp:
             daemon=True
         )
         relay_thread.start()
-        log_info(f"Started relay polling thread for {self.relay_url}:{self.relay_port}")
+        relay_target = _format_relay_target(self.relay_url, self.relay_port)
+        log_info(f"Started relay polling thread for {relay_target}")
 
     def run(self):  # pragma: no cover
         """Run the server application."""
@@ -141,8 +157,8 @@ def parse_args():  # pragma: no cover
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="token.place server")
     parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
-    parser.add_argument("--relay_port", type=int, default=5000, help="Port the relay server is running on")
-    parser.add_argument("--relay_url", type=str, default="http://localhost", help="URL of the relay server")
+    parser.add_argument("--relay_port", type=int, default=None, help="Port the relay server is running on")
+    parser.add_argument("--relay_url", type=str, default="https://token.place", help="URL of the relay server")
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
     return parser.parse_args()
 

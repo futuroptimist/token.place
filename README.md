@@ -542,6 +542,10 @@ In a separate terminal, launch the server, which binds to `0.0.0.0` on port 3000
 python server.py
 ```
 
+Compute-node entrypoints now default their relay target to `https://token.place`.
+For local development, pass an explicit override such as
+`--relay_url http://127.0.0.1:5010` or `--relay_url http://localhost:5000`.
+
 For testing with mock LLM (faster startup):
 
 ```sh

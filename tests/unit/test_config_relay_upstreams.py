@@ -113,7 +113,7 @@ def test_server_pool_defaults_when_empty(monkeypatch: pytest.MonkeyPatch) -> Non
     config = Config()
 
     assert config.get("relay.server_pool") == [
-        "http://localhost:5000",
+        config.get("relay.server_url"),
     ]
     assert config.get("relay.server_pool_secondary") == []
 

@@ -140,13 +140,14 @@ class RelayClient:
         polling_thread.join(timeout=15)  # Wait for thread to finish
         ```
     """
-    def __init__(self, base_url: str, port: int, crypto_manager, model_manager):
+    def __init__(self, base_url: str, port: Optional[int], crypto_manager, model_manager):
         """
         Initialize the RelayClient.
 
         Args:
-            base_url: The base URL of the relay server (e.g., 'http://localhost')
-            port: The port number of the relay server
+            base_url: The base URL of the relay server
+                (e.g., 'https://token.place' or 'http://localhost:5000')
+            port: Optional relay port injected only for non-HTTPS URLs without an explicit port
             crypto_manager: Instance of CryptoManager for encryption/decryption
             model_manager: Instance of ModelManager for LLM interaction
         """
@@ -257,7 +258,9 @@ class RelayClient:
         netloc = parsed.netloc or parsed.path
         path = parsed.path if parsed.netloc else ''
 
-        if parsed.port is None and port is not None:
+        should_inject_port = parsed.port is None and port is not None
+
+        if should_inject_port:
             hostname = parsed.hostname or ''
             host_for_netloc = hostname or (parsed.netloc or parsed.path or netloc)
             if host_for_netloc and ':' in host_for_netloc and not host_for_netloc.startswith('['):
@@ -278,7 +281,7 @@ class RelayClient:
     def _build_relay_targets(
         cls,
         primary_base: str,
-        primary_port: int,
+        primary_port: Optional[int],
         additional: Union[List[Any], Tuple[Any, ...]],
         *,
         cluster_only: bool = False,

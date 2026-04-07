@@ -40,7 +40,7 @@ export function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
     model_path: '',
-    relay_base_url: 'http://127.0.0.1:5010',
+    relay_base_url: 'https://token.place',
     preferred_mode: 'auto',
   });
   const [prompt, setPrompt] = useState('');

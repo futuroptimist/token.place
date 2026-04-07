@@ -82,6 +82,20 @@ def test_compose_relay_url_preserves_ipv6_brackets():
     assert result == 'http://[2001:db8::1]:8080'
 
 
+def test_compose_relay_url_uses_https_host_without_adding_port():
+    """Hosted relay defaults should not force an explicit default port."""
+
+    result = RelayClient._compose_relay_url('https://token.place', None)
+    assert result == 'https://token.place'
+
+
+def test_compose_relay_url_keeps_explicit_local_port():
+    """Local relay overrides with explicit ports must remain unchanged."""
+
+    result = RelayClient._compose_relay_url('http://127.0.0.1:5010', None)
+    assert result == 'http://127.0.0.1:5010'
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

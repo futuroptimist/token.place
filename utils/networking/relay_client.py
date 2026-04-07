@@ -58,6 +58,19 @@ def _normalise_registration_token(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _first_registration_token_from_env() -> Optional[str]:
+    """Read registration token using plural-then-singular compatibility."""
+
+    raw_plural = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS', '').strip()
+    if raw_plural:
+        for token in raw_plural.replace('\n', ',').split(','):
+            candidate = token.strip()
+            if candidate:
+                return candidate
+
+    return _normalise_registration_token(os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN'))
+
+
 def _coerce_optional_bool(value: Optional[Any]) -> Optional[bool]:
     """Interpret truthy values from config/environment settings."""
 
@@ -189,7 +202,7 @@ class RelayClient:
 
             token_value = config.get('relay.server_registration_token', None)
             if not token_value:
-                token_value = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                token_value = _first_registration_token_from_env()
             self._registration_token = _normalise_registration_token(token_value)
 
         except Exception:
@@ -232,7 +245,7 @@ class RelayClient:
                         configured_servers.append(entry)
 
             self._registration_token = _normalise_registration_token(
-                os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                _first_registration_token_from_env()
             )
 
         self._relay_urls = self._build_relay_targets(

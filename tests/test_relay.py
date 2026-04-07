@@ -80,6 +80,22 @@ def test_next_server_one_server(client):
     assert 'server_public_key' in data
     assert data['server_public_key'] == DUMMY_SERVER_PUB_KEY
 
+
+def test_next_server_evicts_stale_servers(client):
+    """Stale servers are evicted before selection."""
+
+    known_servers["stale"] = {
+        "public_key": "stale",
+        "last_ping": datetime.now() - timedelta(seconds=120),
+        "last_ping_duration": 10,
+    }
+
+    response = client.get("/next_server")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["error"]["message"] == "No servers available"
+    assert "stale" not in known_servers
+
 # --- Test /sink ---
 
 def test_sink_register_new_server(client):
@@ -158,6 +174,63 @@ def test_sink_returns_batch_when_requested(client):
     remaining_queue = client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
     assert len(remaining_queue) == 1
     assert remaining_queue[0]['chat_history'] == "encrypted_payload_2"
+
+
+def test_two_registered_servers_only_receive_their_own_work(client):
+    """Each registered server should only drain work addressed to its own key."""
+
+    server_a = base64.b64encode(b"server_a").decode("utf-8")
+    server_b = base64.b64encode(b"server_b").decode("utf-8")
+    client.post("/sink", json={"server_public_key": server_a})
+    client.post("/sink", json={"server_public_key": server_b})
+
+    request_a = {
+        "client_public_key": base64.b64encode(b"client_a").decode("utf-8"),
+        "server_public_key": server_a,
+        "chat_history": "payload-a",
+        "cipherkey": "key-a",
+        "iv": "iv-a",
+    }
+    request_b = {
+        "client_public_key": base64.b64encode(b"client_b").decode("utf-8"),
+        "server_public_key": server_b,
+        "chat_history": "payload-b",
+        "cipherkey": "key-b",
+        "iv": "iv-b",
+    }
+
+    assert client.post("/faucet", json=request_a).status_code == 200
+    assert client.post("/faucet", json=request_b).status_code == 200
+
+    sink_a = client.post("/sink", json={"server_public_key": server_a}).get_json()
+    sink_b = client.post("/sink", json={"server_public_key": server_b}).get_json()
+    assert sink_a["chat_history"] == "payload-a"
+    assert sink_b["chat_history"] == "payload-b"
+    assert sink_a["client_public_key"] != sink_b["client_public_key"]
+
+
+def test_relay_nodes_diagnostics_exposes_live_registered_nodes(client):
+    """Diagnostics should separate upstream config from live registrations."""
+
+    client.post("/sink", json={"server_public_key": DUMMY_SERVER_PUB_KEY})
+    client.post(
+        "/faucet",
+        json={
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "server_public_key": DUMMY_SERVER_PUB_KEY,
+            "chat_history": "queued-payload",
+            "cipherkey": "queued-key",
+            "iv": "queued-iv",
+        },
+    )
+
+    response = client.get("/diagnostics/relay_nodes")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert "configuredUpstreamUrls" in payload
+    assert "registeredNodes" in payload
+    assert payload["registeredNodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
+    assert payload["registeredNodes"][0]["queue_depth"] == 1
 
 # --- Test /faucet ---
 

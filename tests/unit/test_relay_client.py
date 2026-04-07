@@ -243,6 +243,46 @@ class TestRelayClient:
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_ping_relay_uses_plural_registration_tokens_env(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+        monkeypatch,
+    ):
+        """Plural token env should still provide auth headers."""
+
+        monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", "first-token,second-token")
+        monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.server_registration_token': '',
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://localhost",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = TEST_NO_REQUEST_RESPONSE
+        mock_post.return_value = mock_response
+
+        client.ping_relay()
+
+        assert mock_post.call_args.kwargs['headers'] == {'X-Relay-Server-Token': 'first-token'}
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_http_error(self, mock_post, relay_client):
         """Test ping to relay with HTTP error."""
         # Setup mock response

@@ -187,9 +187,9 @@ class Config:
             self.set('relay.server_pool', relay_upstreams)
             self.set('relay.server_url', relay_upstreams[0])
 
-        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+        token = self._first_registration_token_from_env()
         if token:
-            self.set('relay.server_registration_token', token.strip())
+            self.set('relay.server_registration_token', token)
 
         cf_env = self._gather_cloudflare_fallbacks()
         if cf_env is not None:
@@ -207,6 +207,25 @@ class Config:
                 )
 
         self._normalise_relay_server_pool()
+
+    @staticmethod
+    def _first_registration_token_from_env() -> Optional[str]:
+        """Return the first configured relay registration token from env vars."""
+
+        raw_plural = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS', '').strip()
+        if raw_plural:
+            candidates = raw_plural.replace('\n', ',').split(',')
+            for token in candidates:
+                candidate = token.strip()
+                if candidate:
+                    return candidate
+
+        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+        if token:
+            stripped = token.strip()
+            if stripped:
+                return stripped
+        return None
 
     def _apply_production_defaults(self, overrides: Dict[str, Any]) -> None:
         """Populate production overrides with environment aware defaults."""

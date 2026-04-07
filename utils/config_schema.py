@@ -108,7 +108,7 @@ DEFAULT_CONFIG: AppConfig = {
     "relay": {
         "host": "127.0.0.1",
         "port": 5000,
-        "server_url": "http://localhost:5000",
+        "server_url": "https://token.place",
         "server_pool": [],
         "server_pool_secondary": [],
         "workers": 2,
@@ -120,7 +120,7 @@ DEFAULT_CONFIG: AppConfig = {
     "api": {
         "host": "127.0.0.1",
         "port": 3000,
-        "relay_url": "http://localhost:5000",
+        "relay_url": "https://token.place",
         "cors_origins": ["*"],
     },
     "security": {

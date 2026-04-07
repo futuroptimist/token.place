@@ -10,8 +10,8 @@ def test_parse_args_defaults(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["server.py"])
     args = sa.parse_args()
     assert args.server_port == 3000
-    assert args.relay_port == 5000
-    assert args.relay_url == "http://localhost"
+    assert args.relay_port is None
+    assert args.relay_url == "https://token.place"
     assert args.use_mock_llm is False
 
 

@@ -13,9 +13,20 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             model_path: String::new(),
-            relay_base_url: "http://127.0.0.1:5010".into(),
+            relay_base_url: "https://token.place".into(),
             preferred_mode: ComputeMode::Auto,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DesktopConfig;
+
+    #[test]
+    fn desktop_config_defaults_to_token_place_relay() {
+        let config = DesktopConfig::default();
+        assert_eq!(config.relay_base_url, "https://token.place");
     }
 }
 

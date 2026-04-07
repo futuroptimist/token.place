@@ -82,6 +82,16 @@ def test_compose_relay_url_preserves_ipv6_brackets():
     assert result == 'http://[2001:db8::1]:8080'
 
 
+def test_compose_relay_url_keeps_https_without_injected_port():
+    result = RelayClient._compose_relay_url('https://token.place', 5000)
+    assert result == 'https://token.place'
+
+
+def test_compose_relay_url_keeps_explicit_localhost_port():
+    result = RelayClient._compose_relay_url('http://localhost:5000', 1234)
+    assert result == 'http://localhost:5000'
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

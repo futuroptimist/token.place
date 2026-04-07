@@ -130,6 +130,9 @@ Open `http://localhost:5000` or run `python client.py`. For a minimal client use
 `python client_simplified.py`; it clears the screen when running interactively using ANSI codes
 with flushed output. Metrics are exposed at `/metrics`.
 
+Default relay intent for hosted environments is `https://token.place`, while local development
+keeps relay URL overrides fully supported via configuration/environment variables.
+
 ## CI pass criteria
 
 All pull requests must:
@@ -154,8 +157,37 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 ## Desktop direction
 
 The existing `desktop/` code is a deprecated Electron prototype retained for historical context.
-The forward-looking desktop architecture for token.place is Tauri-based local inference + local encryption + encrypted relay forwarding, documented in
+`desktop-tauri/` is the forward-looking desktop path, but it is currently MVP status and **not yet**
+`server.py` parity.
+
+Canonical migration plan (prompt 0 source of truth):
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+
+Design details:
 [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md).
+
+## Deployment topology
+
+- **Current / legacy local flow**: local `relay.py` + `server.py` for development and direct
+  troubleshooting.
+- **Near-term legacy multi-node flow**: relay can coordinate multiple legacy-style compute nodes
+  (`server.py` and, once parity is reached, desktop compute nodes).
+- **Future distributed API v1 flow**: post-parity migration where distributed compute paths align on
+  API v1 semantics.
+
+The roadmap and phase gates for these transitions are documented in
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+
+## sugarkube deployment
+
+token.place is incrementally moving relay operations onto sugarkube first, while compute nodes stay
+external during parity phases.
+
+- Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
+- Environment runbooks:
+  - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)
+  - [`docs/k3s-sugarkube-staging.md`](docs/k3s-sugarkube-staging.md)
+  - [`docs/k3s-sugarkube-prod.md`](docs/k3s-sugarkube-prod.md)
 
 ## Contents
 

@@ -15,14 +15,20 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 - `server.py` — Convenience entrypoint that wires the relay and model runtime.
   - Honours feature toggles such as `CONTENT_MODERATION_MODE`.
 
+Architecture timing note:
+
+- `relay.py` currently orchestrates legacy sink/source style node flows and multi-node registration.
+- A shared compute-node runtime between `server.py` and desktop is planned for parity work.
+- API v1 distributed compute migration is future work after parity gates are complete.
+
 ## Client experiences
 
 - `static/` — Browser assets (HTML, JS, CSS) that exercise the encrypted chat flow.
   - `static/chat.js` provides the reference JavaScript crypto client.
 - `desktop/` — **Deprecated legacy Electron prototype** (not the forward-looking desktop path).
   - See `docs/design/tauri_desktop_client.md` for the recommended Tauri direction.
-- `desktop-tauri/` — Tauri desktop MVP for local sidecar inference, streaming UI, and encrypted relay forwarding.
-  - Uses a replaceable sidecar contract and keeps plaintext local until explicit forwarding.
+- `desktop-tauri/` — Tauri desktop MVP and forward-looking compute-node path.
+  - Important: MVP only today; not yet full `server.py` parity. See the canonical roadmap.
 - `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
   - `client_simplified.py` offers a minimal variant for demos.
 
@@ -57,6 +63,9 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 - [README.md](../README.md) &rarr; top-level quickstart and CI requirements.
 - [docs/ONBOARDING.md](ONBOARDING.md) &rarr; guided setup narrative.
 - [docs/ARCHITECTURE.md](ARCHITECTURE.md) &rarr; architectural deep dive.
+- [docs/roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md) &rarr; canonical 7-step migration sequence, parity definition, and phase exits.
+- [docs/relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md) &rarr; relay-first sugarkube onboarding and operational constraints.
+- [docs/k3s-sugarkube-dev.md](k3s-sugarkube-dev.md), [docs/k3s-sugarkube-staging.md](k3s-sugarkube-staging.md), [docs/k3s-sugarkube-prod.md](k3s-sugarkube-prod.md) &rarr; environment runbooks.
 - [docs/TESTING.md](TESTING.md) &rarr; detailed coverage of automated suites.
 - [docs/STYLE_GUIDE.md](STYLE_GUIDE.md) &rarr; branding and writing guidance.
 - [docs/SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) &rarr; release-time security

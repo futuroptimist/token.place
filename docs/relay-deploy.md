@@ -1,5 +1,10 @@
 # token.place relay deployment
 
+> Status note: this guide contains low-level deployment details and chart notes. For the
+> current migration sequence and environment runbooks, start with
+> [roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md) and
+> [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md).
+
 This guide describes how to deploy the `token.place` relay in a k3s cluster and connect it to the
 GPU-backed `server.py` process running on a dedicated Windows 11 host with an RTX 4090.
 

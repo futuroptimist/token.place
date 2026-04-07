@@ -2,6 +2,21 @@
 
 This document provides an overview of the token.place architecture, explaining how the system's components interact to provide secure, end-to-end encrypted communication with AI services.
 
+
+## Migration status and sequencing
+
+For the canonical migration sequence, see
+[roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md).
+
+Current vs target framing:
+
+- **Current state:** `server.py` is the reference compute node; `desktop-tauri/` is MVP; `relay.py`
+  handles legacy sink/source contracts and multi-node registration.
+- **Near-term:** desktop and `server.py` converge via a shared compute-node runtime contract, and
+  relay operations move onto sugarkube runbooks.
+- **Target state:** desktop becomes the replacement path for `server.py` compute-node duties, then
+  distributed compute migrates to API v1-aligned contracts.
+
 ## System Overview
 
 token.place is an end-to-end encrypted proxy service that sits between clients and AI service providers (like OpenAI, Anthropic, etc.). It ensures that the plaintext content of prompts and responses never reaches the token.place servers, while maintaining API compatibility with the original services.

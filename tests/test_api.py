@@ -4,6 +4,8 @@ import json
 import base64
 import time
 import logging
+import importlib
+import inspect
 from unittest.mock import MagicMock, patch
 from encrypt import encrypt, decrypt, generate_keys, decrypt_stream_chunk
 import sys
@@ -36,6 +38,34 @@ app.config['TESTING'] = True
 # --- BEGIN NEW MOCK SETUP ---
 # Mock the Llama class before it's used by api.v1.models
 @pytest.fixture(autouse=True)
+def sync_api_module_references():
+    """Point ``sys.modules`` at the same API module objects bound to ``app`` views."""
+
+    routes_module = None
+    for view_fn in app.view_functions.values():
+        if getattr(view_fn, "__module__", "") == "api.v1.routes":
+            routes_module = inspect.getmodule(view_fn)
+            break
+
+    if routes_module is None:
+        yield
+        return
+
+    models_module = inspect.getmodule(routes_module.get_model_instance)
+
+    import api.v1 as api_v1_pkg
+
+    sys.modules["api.v1.routes"] = routes_module
+    setattr(api_v1_pkg, "routes", routes_module)
+
+    if models_module is not None:
+        sys.modules["api.v1.models"] = models_module
+        setattr(api_v1_pkg, "models", models_module)
+
+    yield
+
+
+@pytest.fixture(autouse=True)
 def mock_llama():
     """Mock the ``api.v1.models.Llama`` class for all tests."""
     mock_response = {
@@ -45,7 +75,8 @@ def mock_llama():
     }
     mock_instance = MagicMock()
     mock_instance.create_chat_completion.return_value = mock_response
-    with patch('api.v1.models.Llama', return_value=mock_instance, autospec=True):
+    models_module = importlib.import_module("api.v1.models")
+    with patch.object(models_module, "Llama", return_value=mock_instance, autospec=True):
         yield mock_instance
 # --- END NEW MOCK SETUP ---
 

@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+          if [ "${{ runner.os }}" = "macOS" ]; then
             dmg_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/dmg"
             dmg_files=("${dmg_dir}"/*.dmg)
             if [ ! -e "${dmg_files[0]}" ]; then
@@ -88,7 +88,7 @@ jobs:
               exit 1
             fi
             cp "${dmg_files[@]}" release-artifacts/
-          elif [ "${{ matrix.os }}" = "windows-latest" ]; then
+          elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"
 
@@ -106,7 +106,7 @@ jobs:
             fi
             cp "${msi_files[@]}" release-artifacts/
           else
-            echo "Unsupported matrix.os: ${{ matrix.os }}" >&2
+            echo "Unsupported runner.os: ${{ runner.os }}" >&2
             exit 1
           fi
 

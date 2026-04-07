@@ -28,15 +28,18 @@ compute nodes still using legacy sink/source contract.
 
 ## Deployment workflow (template)
 
+Run from the repository root so the chart path resolves (`./deploy/charts/tokenplace-relay`).
 Use agreed sugarkube wrapper once available; until then:
 
 ```bash
 helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
   --namespace tokenplace --create-namespace \
-  --set ingress.enabled=true
+  --set ingress.hosts[0].host=staging.token.place \
+  --set gpuExternalName.host=<staging-gpu-hostname>
 ```
 
-> Replace chart values/flags with token.place environment values as those are finalized.
+> Replace placeholder values with finalized staging values (or a staging values file) before
+> rollout.
 
 ## Validation checklist
 

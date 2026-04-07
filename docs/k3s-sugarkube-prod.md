@@ -32,6 +32,7 @@ until parity and later API v1 migration phases are complete.
 
 ```bash
 # TODO: replace with production-approved sugarkube command wrapper when finalized.
+# Run from the repository root so ./deploy/charts/tokenplace-relay resolves.
 helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
   --namespace tokenplace --create-namespace
 ```

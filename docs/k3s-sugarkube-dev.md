@@ -34,6 +34,7 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 
 ```bash
 # TODO: replace with token.place-specific sugarkube wrapper once finalized.
+# Run from the repository root so ./deploy/charts/tokenplace-relay resolves.
 helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
   --namespace tokenplace --create-namespace
 ```

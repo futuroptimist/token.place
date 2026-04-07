@@ -62,6 +62,8 @@ jobs:
         run: npm ci
 
       - name: Build frontend assets
+        # Keep this explicit pre-build. Some CI failures reported frontendDist validation
+        # before Tauri's internal beforeBuildCommand hook on clean runners.
         run: npm run build
 
       - name: Build Tauri bundles

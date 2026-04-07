@@ -136,6 +136,24 @@ The system is tested at multiple levels:
 3. **Cross-Language Tests**: Ensures Python and JavaScript implementations remain compatible
 4. **API Compatibility Tests**: Verifies functionality with various AI providers
 
+
+## Migration alignment (current vs target)
+
+Canonical sequencing lives in [roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md).
+
+- **Current state:** `server.py` is the primary compute-node runtime; `relay.py` handles legacy
+  sink/source and multi-node registration; desktop-tauri is MVP only.
+- **Near-term:** `server.py` and desktop-tauri co-evolve through a shared compute-node runtime while
+  relay operations move onto sugarkube.
+- **Target state (later):** post-parity migration to API v1-aligned distributed compute contracts.
+
+Related operations docs:
+
+- [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md)
+- [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md)
+- [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md)
+- [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
+
 ## Deployment Architecture
 
 token.place is designed to be deployed in various configurations:

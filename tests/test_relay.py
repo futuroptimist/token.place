@@ -295,6 +295,7 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
 
 def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
     """Healthz should separate configured upstream URLs from live registered nodes."""
+    app.config["gpu_host"] = None
     configured_servers = [
         "https://configured-one.example.com:8000",
         "https://configured-two.example.com:8000",

@@ -154,8 +154,35 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 ## Desktop direction
 
 The existing `desktop/` code is a deprecated Electron prototype retained for historical context.
-The forward-looking desktop architecture for token.place is Tauri-based local inference + local encryption + encrypted relay forwarding, documented in
+The forward-looking desktop architecture for token.place is `desktop-tauri/`, but it is still an
+MVP and has **not** reached `server.py` feature parity yet. The canonical migration sequence,
+phase exit criteria, and rationale live in
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+Detailed design context lives in
 [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md).
+
+## Deployment topology
+
+- **Current / legacy (today)**: local or externally hosted `relay.py` forwards the legacy
+  sink/source contract to `server.py`, which remains the production compute node runtime.
+- **Near-term target (pre-API-v1 migration)**: multi-node relay registration remains on the legacy
+  sink/source flow, while `server.py` and `desktop-tauri/` converge toward parity via a shared
+  compute-node runtime.
+- **Future target (post-parity)**: distributed compute moves to API v1 contracts after desktop
+  parity is complete and validated.
+
+See the canonical roadmap for exact ordering and readiness checklists:
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+
+## sugarkube deployment
+
+token.place deployment runbooks now separate relay operations from future compute migration:
+
+- Relay onboarding guide: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
+- Environment runbooks:
+  - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)
+  - [`docs/k3s-sugarkube-staging.md`](docs/k3s-sugarkube-staging.md)
+  - [`docs/k3s-sugarkube-prod.md`](docs/k3s-sugarkube-prod.md)
 
 ## Contents
 
@@ -169,93 +196,10 @@ The forward-looking desktop architecture for token.place is Tauri-based local in
 
 ## roadmap
 
-- [x] hello world: it literally just echoes your message param back to you
-- [x] find an initial model to support (llama 2 7b chat gguf)
-- [x] download model programmatically on device
-- [x] load the model and successfully run it
-- [x] do inference over HTTP
-- [x] multi-step dialogue
-- [x] relay.py, which passes plaintext requests from client to a server (hardcoded URL, run locally for now) and the response back to the client.
-- [x] end-to-end encrypt communication between server and client with public key cryptography (server generates public/private key pair on init and gives public key to relay, which passes it on to the server [but does not reveal server's IP address])
-  - [x] IP obfuscation
-  - [x] end-to-end encryption (short responses, under 256 bytes of utf-8 encoded text) for client.py
-  - [x] end-to-end encryption for longer responses for client.py
-  - [x] integration test demonstrating the above
-  - [x] Llama 2 -> 3 (7B -> 8B)
-  - [x] end-to-end encryption on landing page (relay.py / GET)
-  - [x] automated browser testing of landing page, preventing regressions of the chat ui
-  - [x] delete old /inference endpoint and everything upstream and downstream that's now unused 💯
-  - [x] simplified crypto utility (CryptoClient) for easy encrypted communication
-- [x] distribute relay.py across multiple machines
-  - [x] Multi-relay failover via `relay.additional_servers` configuration (server auto-rotates backups)
-  - [x] personal gaming PC
-  - [x] raspi k3s pod 💯
-  - [x] once k3s pod is stable, run relay.py only on the cluster
-    - `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1` (or `relay.cluster_only` in `config.json`) disables the
-      localhost fallback and requires at least one upstream from `relay.additional_servers` or
-      the normalised `relay.server_pool`.
-  - [x] optional cloud fallback via Cloudflare
-  - [x] Round-robin sink polling to balance traffic across configured relays
-- [x] OpenAI-compatible API with end-to-end encryption
-  - [x] Models listing endpoint
-  - [x] Chat completions endpoint
-  - [x] Text completions endpoint
-  - [x] Compatibility with standard OpenAI client libraries
-  - [x] Optional encryption for enhanced privacy
-- [x] Comprehensive test suite
-  - [x] Unit tests for core components
-  - [x] API integration tests
-  - [x] End-to-end tests with mock LLM
-  - [x] Support for testing with real LLM models
-  - [x] GitHub Actions CI for automated tests
-  - [x] CI caching for faster dependency installs
-- [x] API v1 with at least 1 model supported and available
-- [x] landing page chat UI integrated with API v1
-- [x] use best available llama family model that can run on an RTX 4090
-- [x] [DSPACE](https://github.com/democratizedspace/dspace) (first 1st party integration) uses API v1 for dChat
-  - [x] Added compatibility aliases (including `gpt-5-chat-latest`) so dChat can target
-        token.place without code changes
-  - [x] Integration test verifies the OpenAI client flow through `/api/v1/chat/completions`
-- [x] set up production k3s raspberry pi pod running relay.py
-  - [x] server.py stays on personal gaming PC
-  - [x] potential cloud fallback node via Cloudflare
-- [x] allow participation from other server.pys
-  - [x] Relay enforces invitation tokens so community-run `server.py` nodes can authenticate `/sink` and `/source`
-  - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
-- [x] API v2 with at least 10 models supported and available
-  - [x] Catalogue exposes Llama 3, Mixtral, Phi-3, Mistral Nemo, and Qwen2.5 variants
-  - [x] Dedicated Flask blueprint in `api/v2/routes.py`
-  - [x] Streaming response support for faster UI feedback (`api/v2/routes.py`)
-  - [x] Function/tool calling support via Machine Conversation Protocol (MCP) (`api/v2/routes.py`)
-  - [x] Multi-modal support (text + images input)
-    - [x] Structured chat content is flattened for llama.cpp compatibility while inline images
-      continue to receive automatic analysis summaries.
-  - [x] Local image generation support (deterministic placeholder renderer via Pillow)
-    - [x] `/api/v1/images/generations` endpoint for offline-friendly PNG output
-  - [x] Vision model support (inline analysis for base64-encoded images)
-  - [x] Fine-tuned models and model adapter support
-- [x] Performance optimizations
-  - [x] Token streaming between client/server for faster responses
-  - [x] GPU memory guardrails for multi-model hosting (auto CPU fallback when VRAM is tight)
-  - [x] Cached decoded client public keys to avoid repeated base64 work during encryption
-  - [x] Batched inference for relay servers with multiple connected clients
-  - [x] Cached RSA private key deserialization to eliminate redundant parsing during decrypt
-- [x] Advanced security features
-  - [x] Zero-trust relay challenge/response hardening
-  - [x] Rate limiting and quota enforcement 💯
-- [x] Enhanced encryption options for model weights and inference data
-  - [x] Optional AES-GCM mode with associated data for protecting weights and inference payloads
-  - [x] Key rotation for relay and server certificates
-- [x] Signed relay binaries for client verification
-- [x] Optional content moderation hooks
-- [x] External security review of protocol and code
-  - [x] Automated Bandit security scanning integrated into the pytest suite to block medium/high severity regressions
-  - [x] Enforced a minimum 2048-bit RSA key size for server key generation
-- [x] Community features
-  - [x] Server provider directory/registry
-  - [x] Model leaderboard based on community feedback
-  - [x] Contribution system for donating compute resources
-  - [x] Contribution summary endpoint for maintainers
+Historical milestones remain in git history and changelog entries. The canonical forward migration
+plan (prompt 0 + implementation prompts 1-7) is now documented in
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+Use that document as the source of truth for sequencing, parity definitions, and deployment targets.
 
 ## streaming usage
 

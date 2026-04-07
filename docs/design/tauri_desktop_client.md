@@ -2,9 +2,19 @@
 
 ## 1) Summary
 
-## Status note (2026-04-04)
+## Status note (2026-04-07)
 
-Phase 1 MVP is now scaffolded in `desktop-tauri/` with platform preference detection (`Metal / Apple Silicon` on macOS arm64, `CUDA / NVIDIA` on Windows x64, CPU fallback otherwise), a replaceable NDJSON sidecar seam for streaming and cancellation, and optional encrypted relay forwarding via `/next_server` + `/faucet`.
+`desktop-tauri/` is currently an MVP scaffold: platform preference detection
+(`Metal / Apple Silicon` on macOS arm64, `CUDA / NVIDIA` on Windows x64, CPU fallback otherwise),
+a replaceable NDJSON sidecar seam for streaming/cancellation, and optional encrypted relay
+forwarding via `/next_server` + `/faucet`.
+
+Important status constraints:
+
+- It is not yet a full replacement for `server.py`.
+- It must evolve into a real compute node, not remain a local prompt tester.
+- API v1 distributed-compute migration remains a post-parity phase.
+- `relay.py` deployment on sugarkube is an operational target state, independent from desktop parity.
 
 token.place should adopt a Tauri-based desktop client as the forward-looking desktop runtime for local-first LLM usage: run inference on-device via a llama.cpp-backed sidecar, encrypt outputs locally with token.place-compatible cryptography, and forward encrypted payloads into the existing `relay.py` flow without redesigning the network contract. This direction gives token.place a native desktop shell with tighter permission boundaries, a smaller install footprint than Electron-first packaging, and better alignment with a "UI shell + native inference runtime + encrypted forwarding" architecture.
 
@@ -21,6 +31,7 @@ The current Electron direction in `desktop/` is not the right long-term default 
 - Provide a local-first desktop shell for token.place local LLM workloads.
 - Run local GPU/CPU inference through a native llama.cpp-backed runtime.
 - Encrypt outputs locally before network transit and forward ciphertext through existing `relay.py` routes.
+- Reach functional parity with `server.py` through a shared compute-node runtime used by both paths.
 - Keep install size and runtime memory overhead small.
 - Enforce explicit capability boundaries (filesystem, process, and network).
 - Support macOS, Linux, and Windows with a clear supported/experimental policy.
@@ -34,6 +45,7 @@ The current Electron direction in `desktop/` is not the right long-term default 
 - Inventing a brand-new wire protocol where existing token.place API contracts are sufficient.
 - Building a full operator/marketplace desktop surface in v1.
 - Solving every packaging/signing/backend-GPU edge case in phase one.
+- Migrating distributed compute to API v1 before desktop parity is complete.
 
 ## 5) Why Tauri instead of Electron
 
@@ -131,6 +143,20 @@ Recommendation:
 - Fallback behavior:
   - if GPU backend unavailable, automatically downgrade to CPU with visible warning;
   - if model missing/incompatible, surface remediation actions (select/import/download another model).
+
+### Model-management parity requirements (near-term)
+
+Desktop parity requires model UX that reflects the actual runtime artifact, not just a model label.
+
+- Show canonical model-family reference:
+  - Meta Llama collection: <https://www.llama.com/llama-downloads/>
+- Show the concrete GGUF artifact used by runtime for the default API v1 base model:
+  - `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`
+- Support **browse + download + select** flows in desktop for runtime-compatible GGUF files.
+- Relay defaults should point to `https://token.place` but remain user-overrideable for local/dev
+  clusters.
+- The fake sidecar (`sidecar/fake_llama_sidecar.py`) is transitional and should be replaced by the
+  real runtime integration as parity work lands.
 
 ## 8) Security and privacy model
 
@@ -291,12 +317,13 @@ Risk if stale Electron references remain:
 
 ## 15) Phased implementation plan
 
-- **Phase 0 (this stage)**: design finalized, Electron direction explicitly deprecated.
-- **Phase 1**: Tauri shell scaffold, settings UI, placeholder sidecar, smoke tests.
-- **Phase 2**: local llama.cpp inference with streaming and cancellation.
-- **Phase 3**: local encryption + relay.py forwarding integration.
-- **Phase 4**: packaging/signing hardening across target platforms.
-- **Phase 5**: model management polish, resilience features, advanced UX.
+- Canonical sequencing now lives in
+  [`../roadmap/desktop_compute_node_migration.md`](../roadmap/desktop_compute_node_migration.md).
+- Near-term execution principle: `server.py` and `desktop-tauri/` co-evolve in lockstep through a
+  shared compute-node runtime until parity is achieved.
+- API v1 distributed compute migration is explicitly post-parity and should not be pulled forward.
+- Relay-on-sugarkube rollout proceeds in parallel as an ops track because `relay.py` is lightweight
+  and separable from compute-node migration.
 
 ## 16) Test strategy
 

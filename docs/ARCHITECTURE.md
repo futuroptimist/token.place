@@ -143,3 +143,24 @@ token.place is designed to be deployed in various configurations:
 1. **Self-Hosted**: Run on your own infrastructure
 2. **Cloud Services**: Deploy to standard cloud providers
 3. **Development Mode**: Local setup for testing and development
+
+## Current vs target architecture (migration framing)
+
+- **Current state**
+  - `server.py` is the active compute runtime.
+  - `desktop-tauri/` is an MVP and not yet parity-complete.
+  - `relay.py` supports legacy sink/source and multi-node registration.
+- **Near-term**
+  - `server.py` and `desktop-tauri/` co-evolve through a planned shared compute-node runtime.
+  - `relay.py` moves to sugarkube as a lightweight operational service while compute stays external.
+- **Target (future)**
+  - After parity gates, distributed compute migration aligns components on API v1 contracts.
+
+Canonical migration sequencing and exit criteria:
+[roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md).
+
+Relay deployment runbooks:
+[relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
+[k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
+[k3s-sugarkube-staging.md](k3s-sugarkube-staging.md), and
+[k3s-sugarkube-prod.md](k3s-sugarkube-prod.md).

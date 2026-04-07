@@ -22,6 +22,7 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 - `desktop/` — **Deprecated legacy Electron prototype** (not the forward-looking desktop path).
   - See `docs/design/tauri_desktop_client.md` for the recommended Tauri direction.
 - `desktop-tauri/` — Tauri desktop MVP for local sidecar inference, streaming UI, and encrypted relay forwarding.
+  - Forward-looking compute-node path, but not yet `server.py` parity.
   - Uses a replaceable sidecar contract and keeps plaintext local until explicit forwarding.
 - `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
   - `client_simplified.py` offers a minimal variant for demos.
@@ -57,6 +58,13 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 - [README.md](../README.md) &rarr; top-level quickstart and CI requirements.
 - [docs/ONBOARDING.md](ONBOARDING.md) &rarr; guided setup narrative.
 - [docs/ARCHITECTURE.md](ARCHITECTURE.md) &rarr; architectural deep dive.
+- [docs/roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md)
+  &rarr; canonical 7-step migration sequence and phase exit criteria.
+- [docs/relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md) &rarr; relay-first sugarkube
+  onboarding and readiness checks.
+- [docs/k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
+  [docs/k3s-sugarkube-staging.md](k3s-sugarkube-staging.md),
+  [docs/k3s-sugarkube-prod.md](k3s-sugarkube-prod.md) &rarr; environment-specific runbooks.
 - [docs/TESTING.md](TESTING.md) &rarr; detailed coverage of automated suites.
 - [docs/STYLE_GUIDE.md](STYLE_GUIDE.md) &rarr; branding and writing guidance.
 - [docs/SECURITY_REVIEW_CHECKLIST.md](SECURITY_REVIEW_CHECKLIST.md) &rarr; release-time security
@@ -64,3 +72,12 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
 
 Contributions that move files should update this map so future maintainers always
 have an accurate snapshot of the workspace layout.
+
+## Runtime role glossary (current vs target)
+
+- **Current compute runtime:** `server.py` (production path today).
+- **Current relay runtime:** `relay.py` (legacy sink/source contract, multi-node capable).
+- **Planned shared runtime:** compute-node runtime used by both `server.py` and `desktop-tauri/` for
+  parity work.
+- **Future distributed runtime target:** API v1-aligned distributed compute, scheduled only after
+  parity and relay operational readiness are complete.

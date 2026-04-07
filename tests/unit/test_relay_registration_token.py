@@ -87,3 +87,31 @@ def test_source_requires_registration_token(relay_module) -> None:
 
     queued = authorised.get_json()
     assert queued == {"message": "Response received and queued for client"}
+
+
+def test_plural_registration_tokens_are_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Relay accepts TOKEN_PLACE_RELAY_SERVER_TOKENS while keeping singular support."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", "token-a, token-b")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+
+    for name in MODULES_TO_CLEAR:
+        sys.modules.pop(name, None)
+
+    relay = importlib.import_module("relay")
+    relay.app.config["TESTING"] = True
+    client = relay.app.test_client()
+
+    unauthorised = client.post("/sink", json={"server_public_key": "abc"})
+    assert unauthorised.status_code == 401
+
+    authorised = client.post(
+        "/sink",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "token-b"},
+    )
+    assert authorised.status_code == 200
+
+    for name in MODULES_TO_CLEAR:
+        sys.modules.pop(name, None)

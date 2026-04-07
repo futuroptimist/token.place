@@ -182,6 +182,20 @@ def test_cluster_only_env_true_and_registration_token(monkeypatch: pytest.Monkey
     assert config.get("relay.server_registration_token") == "secret-token"
 
 
+def test_registration_tokens_plural_env_supported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plural token env should populate registration token without breaking singular support."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", '["tok-a", "tok-b"]')
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+
+    from config import Config
+
+    config = Config()
+
+    assert config.get("relay.server_registration_token") == "tok-a"
+
+
 def test_cluster_only_env_invalid_logs_warning(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

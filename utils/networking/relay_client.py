@@ -58,6 +58,41 @@ def _normalise_registration_token(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _parse_registration_tokens(value: Optional[Any]) -> List[str]:
+    """Parse configured registration tokens from JSON/list/comma-separated forms."""
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, str):
+            raw_tokens = [parsed]
+        elif isinstance(parsed, (list, tuple)):
+            raw_tokens = [entry for entry in parsed if isinstance(entry, str)]
+        else:
+            raw_tokens = stripped.replace('\n', ',').split(',')
+    elif isinstance(value, (list, tuple)):
+        raw_tokens = [entry for entry in value if isinstance(entry, str)]
+    else:
+        raw_tokens = [str(value)]
+
+    tokens: List[str] = []
+    seen = set()
+    for raw_token in raw_tokens:
+        token = raw_token.strip()
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return tokens
+
+
 def _coerce_optional_bool(value: Optional[Any]) -> Optional[bool]:
     """Interpret truthy values from config/environment settings."""
 
@@ -188,9 +223,18 @@ class RelayClient:
                 self._cluster_only = cluster_only_value
 
             token_value = config.get('relay.server_registration_token', None)
-            if not token_value:
-                token_value = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
-            self._registration_token = _normalise_registration_token(token_value)
+            token_candidates = _parse_registration_tokens(token_value)
+            if not token_candidates:
+                token_candidates = _parse_registration_tokens(
+                    os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS')
+                )
+            if not token_candidates:
+                token_candidates = _parse_registration_tokens(
+                    os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                )
+            self._registration_token = _normalise_registration_token(
+                token_candidates[0] if token_candidates else None
+            )
 
         except Exception:
             self._request_timeout = 10  # Fallback default
@@ -231,8 +275,15 @@ class RelayClient:
                     if entry and entry not in configured_servers:
                         configured_servers.append(entry)
 
+            token_candidates = _parse_registration_tokens(
+                os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS')
+            )
+            if not token_candidates:
+                token_candidates = _parse_registration_tokens(
+                    os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                )
             self._registration_token = _normalise_registration_token(
-                os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+                token_candidates[0] if token_candidates else None
             )
 
         self._relay_urls = self._build_relay_targets(

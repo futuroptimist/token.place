@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
@@ -294,41 +294,102 @@ def _get_request_counter() -> Counter:
 REQUEST_COUNTER = _get_request_counter()
 
 
-def _load_server_registration_token():
-    """Return the configured relay server token, if any."""
+SERVER_TOKENS_ENV = "TOKEN_PLACE_RELAY_SERVER_TOKENS"
+SERVER_TOKEN_ENV = "TOKEN_PLACE_RELAY_SERVER_TOKEN"
+SERVER_STALE_TTL_ENV = "TOKEN_PLACE_RELAY_NODE_TTL_SECONDS"
+DEFAULT_SERVER_STALE_TTL_SECONDS = 30
 
-    token = None
+
+def _parse_registration_tokens(raw_value: Any) -> List[str]:
+    """Parse registration tokens from JSON, comma-separated, or newline-separated values."""
+
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        stripped = raw_value.strip()
+        if not stripped:
+            return []
+
+        parsed_values: List[str] = []
+        try:
+            loaded = json.loads(stripped)
+        except json.JSONDecodeError:
+            loaded = None
+
+        if isinstance(loaded, str):
+            parsed_values = [loaded]
+        elif isinstance(loaded, (list, tuple)):
+            parsed_values = [item for item in loaded if isinstance(item, str)]
+        else:
+            normalised = stripped.replace("\n", ",")
+            parsed_values = [segment for segment in normalised.split(",")]
+    elif isinstance(raw_value, (list, tuple)):
+        parsed_values = [item for item in raw_value if isinstance(item, str)]
+    else:
+        parsed_values = [str(raw_value)]
+
+    deduped: List[str] = []
+    seen = set()
+    for candidate in parsed_values:
+        token = candidate.strip()
+        if token and token not in seen:
+            seen.add(token)
+            deduped.append(token)
+
+    return deduped
+
+
+def _load_server_registration_tokens() -> List[str]:
+    """Return the configured relay server tokens, if any."""
+
+    configured_token = None
     try:
         from config import get_config
 
-        token = get_config().get('relay.server_registration_token')
+        configured_token = get_config().get('relay.server_registration_token')
     except Exception:
-        token = None
+        configured_token = None
 
-    if not token:
-        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+    env_tokens = _parse_registration_tokens(os.environ.get(SERVER_TOKENS_ENV))
+    singular_token = _parse_registration_tokens(os.environ.get(SERVER_TOKEN_ENV))
+    config_tokens = _parse_registration_tokens(configured_token)
 
-    if isinstance(token, str):
-        token = token.strip()
-        if not token:
-            return None
+    combined = config_tokens + env_tokens + singular_token
+    deduped: List[str] = []
+    seen = set()
+    for token in combined:
+        if token not in seen:
+            seen.add(token)
+            deduped.append(token)
+    return deduped
 
-    return token
+
+def _load_server_stale_ttl_seconds() -> int:
+    raw_ttl = os.environ.get(SERVER_STALE_TTL_ENV, str(DEFAULT_SERVER_STALE_TTL_SECONDS))
+    try:
+        ttl = int(raw_ttl)
+    except (TypeError, ValueError):
+        return DEFAULT_SERVER_STALE_TTL_SECONDS
+    return max(ttl, 1)
 
 
-SERVER_REGISTRATION_TOKEN = _load_server_registration_token()
+SERVER_REGISTRATION_TOKENS = _load_server_registration_tokens()
+SERVER_STALE_TTL_SECONDS = _load_server_stale_ttl_seconds()
 
 
 def _validate_server_registration():
     """Ensure relay compute nodes present the expected token when configured."""
 
-    if not SERVER_REGISTRATION_TOKEN:
+    if not SERVER_REGISTRATION_TOKENS:
         return None
 
     provided = request.headers.get('X-Relay-Server-Token', '')
     candidate = provided.strip()
-    if candidate and secrets.compare_digest(candidate, SERVER_REGISTRATION_TOKEN):
-        return None
+    if candidate:
+        for expected in SERVER_REGISTRATION_TOKENS:
+            if secrets.compare_digest(candidate, expected):
+                return None
 
     return jsonify({
         'error': {
@@ -354,6 +415,47 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
         return True
     except socket.gaierror:
         return False
+
+
+def _ping_timestamp(record: Dict[str, Any]) -> float:
+    last_ping = record.get('last_ping')
+    if isinstance(last_ping, datetime):
+        return last_ping.timestamp()
+    if isinstance(last_ping, (int, float)):
+        return float(last_ping)
+    return 0.0
+
+
+def _evict_stale_servers() -> List[str]:
+    now = time.time()
+    removed: List[str] = []
+
+    for public_key, record in list(known_servers.items()):
+        last_seen = _ping_timestamp(record)
+        if not last_seen or (now - last_seen) > SERVER_STALE_TTL_SECONDS:
+            removed.append(public_key)
+            known_servers.pop(public_key, None)
+            client_inference_requests.pop(public_key, None)
+
+    return removed
+
+
+def _registered_node_diagnostics() -> List[Dict[str, Any]]:
+    now = time.time()
+    diagnostics: List[Dict[str, Any]] = []
+    for public_key, record in known_servers.items():
+        last_seen = _ping_timestamp(record)
+        age = max(now - last_seen, 0.0) if last_seen else None
+        diagnostics.append(
+            {
+                "server_public_key": public_key,
+                "age_seconds": round(age, 3) if age is not None else None,
+                "queue_depth": len(client_inference_requests.get(public_key, [])),
+                "last_ping_duration": record.get("last_ping_duration"),
+            }
+        )
+    diagnostics.sort(key=lambda item: item["server_public_key"])
+    return diagnostics
 
 
 @app.before_request
@@ -403,13 +505,19 @@ def _log_request(response: Response):
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
+    evicted = _evict_stale_servers()
     gpu_host = app.config.get("gpu_host")
     status = {
         "status": "ok",
-        "upstream": app.config.get("upstream_url"),
+        "configured_upstream_url": app.config.get("upstream_url"),
         "gpuHost": gpu_host,
+        "live_registered_nodes": _registered_node_diagnostics(),
         "knownServers": len(known_servers),
+        "registeredServerCount": len(known_servers),
+        "serverTtlSeconds": SERVER_STALE_TTL_SECONDS,
     }
+    if evicted:
+        status["evicted_stale_servers"] = evicted
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -527,6 +635,7 @@ def next_server():
         - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
+    _evict_stale_servers()
     if not known_servers:
         return jsonify({
             'error': {
@@ -640,6 +749,7 @@ def sink():
             Conforms to the same JSON format as the request body.
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
+    _evict_stale_servers()
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
@@ -661,12 +771,13 @@ def sink():
         return jsonify({'error': 'Invalid public key'}), 400
 
     # Update or add the server to known_servers
+    now = datetime.now()
     if public_key in known_servers:
-        known_servers[public_key]['last_ping'] = datetime.now()
+        known_servers[public_key]['last_ping'] = now
     else:
         known_servers[public_key] = {
             'public_key': public_key,
-            'last_ping': datetime.now(),
+            'last_ping': now,
             'last_ping_duration': 10
         }
 
@@ -705,6 +816,22 @@ def sink():
             response_data['batch'] = batch
 
     return jsonify(response_data)
+
+
+@app.route('/diagnostics/registered_nodes', methods=['GET'])
+def diagnostics_registered_nodes():
+    """Expose live registered compute node diagnostics for legacy relay contract."""
+
+    evicted = _evict_stale_servers()
+    return jsonify(
+        {
+            "configured_upstream_url": app.config.get("upstream_url"),
+            "registered_server_count": len(known_servers),
+            "server_ttl_seconds": SERVER_STALE_TTL_SECONDS,
+            "evicted_stale_servers": evicted,
+            "registered_nodes": _registered_node_diagnostics(),
+        }
+    )
 
 @app.route('/source', methods=['POST'])
 def source():

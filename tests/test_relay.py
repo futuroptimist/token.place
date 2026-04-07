@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import relay as relay_module
 from relay import app
 
 # Import the global dictionaries from relay to inspect/manipulate state if needed
@@ -23,6 +24,7 @@ from relay import (
 # Generate dummy keys for testing
 # (You might want to use the generate_keys function from encrypt.py if needed)
 DUMMY_SERVER_PUB_KEY = base64.b64encode(b"server_public_key_123").decode('utf-8')
+DUMMY_SERVER_PUB_KEY_TWO = base64.b64encode(b"server_public_key_789").decode('utf-8')
 DUMMY_CLIENT_PUB_KEY = base64.b64encode(b"client_public_key_456").decode('utf-8')
 
 
@@ -30,6 +32,8 @@ DUMMY_CLIENT_PUB_KEY = base64.b64encode(b"client_public_key_456").decode('utf-8'
 def client():
     """Create a Flask test client fixture"""
     app.config['TESTING'] = True
+    original_ttl = relay_module.SERVER_STALE_TTL_SECONDS
+    original_upstream = app.config.get("upstream_url")
     # Reset state before each test
     known_servers.clear()
     client_inference_requests.clear()
@@ -46,6 +50,8 @@ def client():
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
+    relay_module.SERVER_STALE_TTL_SECONDS = original_ttl
+    app.config["upstream_url"] = original_upstream
 
 
 def test_inference_endpoint_removed(client):
@@ -215,6 +221,89 @@ def test_faucet_unknown_server(client):
     data = response.get_json()
     assert 'error' in data
     assert data['error'] == 'Server with the specified public key not found'
+
+
+def test_multinode_work_is_routed_only_to_addressed_public_key(client):
+    """Two registered nodes can coexist without cross-queue request leakage."""
+    for server_public_key in (DUMMY_SERVER_PUB_KEY, DUMMY_SERVER_PUB_KEY_TWO):
+        response = client.post("/sink", json={"server_public_key": server_public_key})
+        assert response.status_code == 200
+
+    faucet_one = {
+        "client_public_key": base64.b64encode(b"client_one").decode(),
+        "server_public_key": DUMMY_SERVER_PUB_KEY,
+        "chat_history": "cipher_for_one",
+        "cipherkey": "key_one",
+        "iv": "iv_one",
+    }
+    faucet_two = {
+        "client_public_key": base64.b64encode(b"client_two").decode(),
+        "server_public_key": DUMMY_SERVER_PUB_KEY_TWO,
+        "chat_history": "cipher_for_two",
+        "cipherkey": "key_two",
+        "iv": "iv_two",
+    }
+    assert client.post("/faucet", json=faucet_one).status_code == 200
+    assert client.post("/faucet", json=faucet_two).status_code == 200
+
+    sink_one = client.post("/sink", json={"server_public_key": DUMMY_SERVER_PUB_KEY})
+    sink_two = client.post("/sink", json={"server_public_key": DUMMY_SERVER_PUB_KEY_TWO})
+    assert sink_one.status_code == 200
+    assert sink_two.status_code == 200
+
+    one_payload = sink_one.get_json()
+    two_payload = sink_two.get_json()
+    assert one_payload["chat_history"] == "cipher_for_one"
+    assert two_payload["chat_history"] == "cipher_for_two"
+    assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) == []
+    assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY_TWO, []) == []
+
+
+def test_next_server_excludes_stale_nodes_after_ttl_expiry(client):
+    """next_server should evict stale registrations before selection."""
+    relay_module.SERVER_STALE_TTL_SECONDS = 5
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now() - timedelta(seconds=30),
+        "last_ping_duration": 10,
+    }
+    known_servers[DUMMY_SERVER_PUB_KEY_TWO] = {
+        "public_key": DUMMY_SERVER_PUB_KEY_TWO,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    response = client.get("/next_server")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["server_public_key"] == DUMMY_SERVER_PUB_KEY_TWO
+    assert DUMMY_SERVER_PUB_KEY not in known_servers
+
+
+def test_registered_node_diagnostics_distinguish_live_nodes_from_upstream(client):
+    """Diagnostics should include configured upstream and live node status details."""
+    relay_module.app.config["upstream_url"] = "http://configured-upstream:3000"
+    relay_module.SERVER_STALE_TTL_SECONDS = 30
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {"chat_history": "pending", "client_public_key": "c1", "cipherkey": "k", "iv": "i"}
+    ]
+
+    response = client.get("/diagnostics/registered_nodes")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["configured_upstream_url"] == "http://configured-upstream:3000"
+    assert payload["registered_server_count"] == 1
+    assert payload["server_ttl_seconds"] == 30
+    assert len(payload["registered_nodes"]) == 1
+    node = payload["registered_nodes"][0]
+    assert node["server_public_key"] == DUMMY_SERVER_PUB_KEY
+    assert node["queue_depth"] == 1
+    assert node["age_seconds"] is not None
 
 # --- Test /source ---
 

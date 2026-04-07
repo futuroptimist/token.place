@@ -97,6 +97,20 @@ def test_compose_relay_url_keeps_explicit_localhost_port():
     assert result == 'http://localhost:5000'
 
 
+def test_init_uses_plural_registration_token_env(monkeypatch):
+    """RelayClient should accept TOKEN_PLACE_RELAY_SERVER_TOKENS in fallback mode."""
+
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", "token-a, token-b")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+    monkeypatch.setattr(
+        'utils.networking.relay_client.get_config_lazy',
+        MagicMock(side_effect=RuntimeError("config unavailable")),
+    )
+
+    client = RelayClient('http://localhost', 5000, MagicMock(public_key_b64="key"), MagicMock())
+    assert client._registration_token == "token-a"
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

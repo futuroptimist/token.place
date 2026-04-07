@@ -39,6 +39,42 @@ logging.basicConfig(
 logger = logging.getLogger('config')
 
 
+def _parse_registration_tokens(raw_value: Any) -> List[str]:
+    """Parse registration tokens from JSON arrays or delimited strings."""
+
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        stripped = raw_value.strip()
+        if not stripped:
+            return []
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            decoded = None
+
+        if isinstance(decoded, str):
+            values = [decoded]
+        elif isinstance(decoded, (list, tuple)):
+            values = [item for item in decoded if isinstance(item, str)]
+        else:
+            values = stripped.replace('\n', ',').split(',')
+    elif isinstance(raw_value, (list, tuple)):
+        values = [item for item in raw_value if isinstance(item, str)]
+    else:
+        values = [str(raw_value)]
+
+    parsed: List[str] = []
+    seen = set()
+    for token in values:
+        clean = token.strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            parsed.append(clean)
+    return parsed
+
+
 @dataclass(frozen=True)
 class SensitiveKey:
     """Represents a dot-delimited config key that should never persist to disk."""
@@ -187,9 +223,12 @@ class Config:
             self.set('relay.server_pool', relay_upstreams)
             self.set('relay.server_url', relay_upstreams[0])
 
-        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
-        if token:
-            self.set('relay.server_registration_token', token.strip())
+        token_candidates = (
+            _parse_registration_tokens(os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS'))
+            + _parse_registration_tokens(os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN'))
+        )
+        if token_candidates:
+            self.set('relay.server_registration_token', token_candidates[0])
 
         cf_env = self._gather_cloudflare_fallbacks()
         if cf_env is not None:

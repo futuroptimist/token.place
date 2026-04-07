@@ -8,6 +8,14 @@ Phase 1 MVP is now scaffolded in `desktop-tauri/` with platform preference detec
 
 token.place should adopt a Tauri-based desktop client as the forward-looking desktop runtime for local-first LLM usage: run inference on-device via a llama.cpp-backed sidecar, encrypt outputs locally with token.place-compatible cryptography, and forward encrypted payloads into the existing `relay.py` flow without redesigning the network contract. This direction gives token.place a native desktop shell with tighter permission boundaries, a smaller install footprint than Electron-first packaging, and better alignment with a "UI shell + native inference runtime + encrypted forwarding" architecture.
 
+## 1.1) Current vs near-term strategy (2026-04-07)
+
+- **Current state:** `desktop-tauri/` is an MVP scaffold and local prompt/runtime shell. It is not yet a full replacement for `server.py`.
+- **Near-term requirement:** desktop must become a real compute node that can participate in relay registration and request handling, not only a local tester.
+- **Co-evolution rule:** `server.py` and desktop-tauri must evolve in lockstep through a shared compute-node runtime contract so parity can be measured and maintained.
+- **Ordering rule:** API v1 distributed-compute migration is explicitly **post-parity**; do not migrate protocols first.
+- **Ops alignment:** `relay.py` is lightweight and can be deployed on sugarkube before desktop parity is complete.
+
 ## 2) Problem statement
 
 The browser experience is useful for portability, but it is not sufficient as the primary environment for local-model desktop workflows that need robust process lifecycle management, local model discovery, platform-native key storage, and predictable GPU/CPU inference orchestration.
@@ -122,6 +130,7 @@ Options considered:
 Recommendation:
 
 - Start with a sidecar boundary and prefer either `llama-server` plus a thin adapter or a minimal custom wrapper that emits structured NDJSON/JSON events.
+- Treat any fake/mock sidecar used for UI development as transitional scaffolding only; it must be removed or gated once real compute-node flows are integrated.
 - GPU acceleration is provided by llama.cpp backend builds (Metal/CUDA/Vulkan/ROCm), not by Tauri itself.
 - Require explicit handling for:
   - token streaming events,
@@ -210,6 +219,13 @@ Backend notes:
    - privacy summary, permission summary, choose model folder, optional telemetry toggle.
 2. **Model selection/import**
    - detect existing GGUF files, validate compatibility, display backend capabilities.
+   - expose canonical model-family source links (for example Meta Llama family landing page: https://www.llama.com/models/).
+   - show the exact runtime artifact path/name selected by the app (for example `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`).
+   - support both browse-local and guided-download flows before inference starts.
+
+Relay defaults for desktop configuration:
+- Default relay URL should be `https://token.place`.
+- Users/operators must be able to override the relay URL per environment (dev/staging/prod/custom).
 3. **Compute mode selection**
    - Auto / CPU-only / GPU-preferred with fallback explanation.
 4. **Start inference task**
@@ -291,12 +307,15 @@ Risk if stale Electron references remain:
 
 ## 15) Phased implementation plan
 
-- **Phase 0 (this stage)**: design finalized, Electron direction explicitly deprecated.
-- **Phase 1**: Tauri shell scaffold, settings UI, placeholder sidecar, smoke tests.
-- **Phase 2**: local llama.cpp inference with streaming and cancellation.
-- **Phase 3**: local encryption + relay.py forwarding integration.
-- **Phase 4**: packaging/signing hardening across target platforms.
-- **Phase 5**: model management polish, resilience features, advanced UX.
+Canonical sequencing is maintained in [`docs/roadmap/desktop_compute_node_migration.md`](../roadmap/desktop_compute_node_migration.md).
+This design doc intentionally mirrors that order:
+
+- **Phase 0 (current):** MVP scaffold exists (`desktop-tauri/`), not parity.
+- **Phase 1-4:** converge on shared compute-node runtime and parity with `server.py` via legacy relay contract.
+- **Phase 5:** move relay operations onto sugarkube as the default operator topology while compute remains external.
+- **Phase 6-7 (post-parity):** API v1 distributed migration and retirement path for legacy coupling.
+
+Do not collapse these phases: API v1 migration is downstream of parity sign-off.
 
 ## 16) Test strategy
 

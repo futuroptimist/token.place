@@ -154,8 +154,29 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 ## Desktop direction
 
 The existing `desktop/` code is a deprecated Electron prototype retained for historical context.
-The forward-looking desktop architecture for token.place is Tauri-based local inference + local encryption + encrypted relay forwarding, documented in
-[`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md).
+The forward-looking desktop architecture is the Tauri MVP in `desktop-tauri/`, but it is **not yet** at `server.py` feature parity.
+
+- Design doc: [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
+- Canonical migration plan (prompt 0 roadmap): [`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md)
+
+The migration plan explicitly requires desktop parity first, then API v1 distributed-compute migration.
+
+## Deployment topology
+
+- **Current state (legacy local flow):** `relay.py` and `server.py` commonly run together in local/dev setups; relay speaks the legacy `/sink` + `/source` contract.
+- **Near-term target (legacy multi-node relay flow):** `relay.py` runs as a lightweight shared entrypoint (including sugarkube), while one or more external compute nodes (`server.py` now, desktop later) register over the same legacy contract.
+- **Future target (post-parity, post-API-v1 migration):** compute nodes and relay move to a secure API v1-aligned distributed model described in the migration roadmap.
+
+## Sugarkube deployment
+
+Relay-first sugarkube onboarding and environment runbooks live in docs:
+
+- [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
+- [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)
+- [`docs/k3s-sugarkube-staging.md`](docs/k3s-sugarkube-staging.md)
+- [`docs/k3s-sugarkube-prod.md`](docs/k3s-sugarkube-prod.md)
+
+Operational details are intentionally kept there so this README stays concise and truthful about current status.
 
 ## Contents
 
@@ -168,6 +189,9 @@ The forward-looking desktop architecture for token.place is Tauri-based local in
 - [CLAUDE.md](CLAUDE.md) summarizes Claude integration tips
 
 ## roadmap
+
+Canonical migration sequencing for the desktop compute-node transition is tracked in
+[`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
 
 - [x] hello world: it literally just echoes your message param back to you
 - [x] find an initial model to support (llama 2 7b chat gguf)

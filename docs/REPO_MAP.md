@@ -10,10 +10,10 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
   - Pulls shared helpers from `utils/` and configuration from `config.py`.
 - `api/` — FastAPI implementation of the modern API surfaces.
   - Mirrors the v1 routes while hosting experimental adapters under `api/v2/`.
-- `relay.py` / `relay/` — Lightweight relay that forwards encrypted traffic.
-  - Reads relay settings from `config/requirements_relay.txt` and `.env` files.
-- `server.py` — Convenience entrypoint that wires the relay and model runtime.
-  - Honours feature toggles such as `CONTENT_MODERATION_MODE`.
+- `relay.py` / `relay/` — Lightweight relay that forwards encrypted traffic via legacy `/sink` + `/source` contract today.
+  - Reads relay settings from `config/requirements_relay.txt` and `.env` files; relay-on-sugarkube is a near-term ops target.
+- `server.py` — Current mature compute-node entrypoint.
+  - Honours feature toggles such as `CONTENT_MODERATION_MODE`; desktop parity is required before API v1 distributed migration.
 
 ## Client experiences
 
@@ -21,8 +21,8 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
   - `static/chat.js` provides the reference JavaScript crypto client.
 - `desktop/` — **Deprecated legacy Electron prototype** (not the forward-looking desktop path).
   - See `docs/design/tauri_desktop_client.md` for the recommended Tauri direction.
-- `desktop-tauri/` — Tauri desktop MVP for local sidecar inference, streaming UI, and encrypted relay forwarding.
-  - Uses a replaceable sidecar contract and keeps plaintext local until explicit forwarding.
+- `desktop-tauri/` — Tauri desktop MVP and forward-looking desktop path (not yet `server.py` parity).
+  - Planned to become a real compute node via shared runtime evolution with `server.py`; see roadmap doc.
 - `client.py` — Rich terminal client with logging, streaming, and fallback behaviour.
   - `client_simplified.py` offers a minimal variant for demos.
 
@@ -53,6 +53,11 @@ hands-on walkthrough in [ONBOARDING.md](ONBOARDING.md).
   - Wraps pytest, Playwright, npm checks, and Bandit.
 
 ## Documentation resources
+
+- [docs/roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md) &rarr; canonical 7-step migration sequence, parity definition, and phase exit criteria.
+- [docs/relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md) &rarr; relay-first sugarkube onboarding and constraints.
+- [docs/k3s-sugarkube-dev.md](k3s-sugarkube-dev.md), [docs/k3s-sugarkube-staging.md](k3s-sugarkube-staging.md), [docs/k3s-sugarkube-prod.md](k3s-sugarkube-prod.md) &rarr; environment runbooks for relay operations.
+
 
 - [README.md](../README.md) &rarr; top-level quickstart and CI requirements.
 - [docs/ONBOARDING.md](ONBOARDING.md) &rarr; guided setup narrative.

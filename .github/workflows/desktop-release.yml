@@ -80,10 +80,37 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
-          while IFS= read -r -d '' file; do
-            cp "$file" release-artifacts/
-          done < <(find src-tauri/target -type f \
-            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \) -print0)
+          case "${{ matrix.os }}" in
+            macos-latest)
+              bundle_root="src-tauri/target/${{ matrix.tauri_target }}/release/bundle"
+              allowed_patterns=(
+                "$bundle_root/dmg/token.place desktop_*.dmg"
+              )
+              ;;
+            windows-latest)
+              bundle_root="src-tauri/target/release/bundle"
+              allowed_patterns=(
+                "$bundle_root/nsis/token.place desktop_*_x64-setup.exe"
+                "$bundle_root/msi/token.place desktop_*_x64_*.msi"
+              )
+              ;;
+            *)
+              echo "Unsupported matrix.os: ${{ matrix.os }}" >&2
+              exit 1
+              ;;
+          esac
+
+          shopt -s nullglob
+          for pattern in "${allowed_patterns[@]}"; do
+            matches=( $pattern )
+            if [ "${#matches[@]}" -eq 0 ]; then
+              echo "No artifacts matched: $pattern" >&2
+              exit 1
+            fi
+            for file in "${matches[@]}"; do
+              cp "$file" release-artifacts/
+            done
+          done
 
       - name: Generate SHA256 checksums
         shell: bash

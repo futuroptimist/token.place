@@ -28,6 +28,7 @@ def relay_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
         sys.modules.pop(name, None)
 
     monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", raising=False)
 
 
 def test_sink_rejects_missing_registration_token(relay_module) -> None:
@@ -87,3 +88,32 @@ def test_source_requires_registration_token(relay_module) -> None:
 
     queued = authorised.get_json()
     assert queued == {"message": "Response received and queued for client"}
+
+
+def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plural env var should allow any listed registration token."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", "alpha-token, beta-token")
+
+    for name in MODULES_TO_CLEAR:
+        sys.modules.pop(name, None)
+
+    relay = importlib.import_module("relay")
+    relay.app.config["TESTING"] = True
+    client = relay.app.test_client()
+
+    accepted = client.post(
+        "/sink",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "beta-token"},
+    )
+    assert accepted.status_code == 200
+
+    rejected = client.post(
+        "/sink",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "wrong-token"},
+    )
+    assert rejected.status_code == 401

@@ -80,6 +80,23 @@ def test_next_server_one_server(client):
     assert 'server_public_key' in data
     assert data['server_public_key'] == DUMMY_SERVER_PUB_KEY
 
+
+def test_next_server_evicts_stale_nodes(client):
+    """Stale servers should be removed before /next_server selection."""
+    stale_time = datetime.now() - timedelta(seconds=120)
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": stale_time,
+        "last_ping_duration": 10,
+    }
+
+    response = client.get("/next_server")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["error"]["message"] == "No servers available"
+    assert DUMMY_SERVER_PUB_KEY not in known_servers
+
 # --- Test /sink ---
 
 def test_sink_register_new_server(client):
@@ -159,6 +176,40 @@ def test_sink_returns_batch_when_requested(client):
     assert len(remaining_queue) == 1
     assert remaining_queue[0]['chat_history'] == "encrypted_payload_2"
 
+
+def test_two_servers_receive_only_addressed_work(client):
+    """Queued work should remain isolated by server public key."""
+    server_one = base64.b64encode(b"server_public_key_1").decode("utf-8")
+    server_two = base64.b64encode(b"server_public_key_2").decode("utf-8")
+
+    assert client.post("/sink", json={"server_public_key": server_one}).status_code == 200
+    assert client.post("/sink", json={"server_public_key": server_two}).status_code == 200
+
+    first_payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "server_public_key": server_one,
+        "chat_history": "work-for-server-one",
+        "cipherkey": "cipher-one",
+        "iv": "iv-one",
+    }
+    second_payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "server_public_key": server_two,
+        "chat_history": "work-for-server-two",
+        "cipherkey": "cipher-two",
+        "iv": "iv-two",
+    }
+    assert client.post("/faucet", json=first_payload).status_code == 200
+    assert client.post("/faucet", json=second_payload).status_code == 200
+
+    server_two_work = client.post("/sink", json={"server_public_key": server_two})
+    assert server_two_work.status_code == 200
+    assert server_two_work.get_json()["chat_history"] == "work-for-server-two"
+
+    server_one_work = client.post("/sink", json={"server_public_key": server_one})
+    assert server_one_work.status_code == 200
+    assert server_one_work.get_json()["chat_history"] == "work-for-server-one"
+
 # --- Test /faucet ---
 
 def test_faucet_submit_request(client):
@@ -215,6 +266,31 @@ def test_faucet_unknown_server(client):
     data = response.get_json()
     assert 'error' in data
     assert data['error'] == 'Server with the specified public key not found'
+
+
+def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
+    """Diagnostics should expose configured URLs and live compute registrations."""
+    app.config["relay_configured_servers"] = [
+        "https://configured-one.example.com:8000",
+        "https://configured-two.example.com:8000",
+    ]
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {"chat_history": "pending", "client_public_key": "c", "cipherkey": "k", "iv": "i"}
+    ]
+
+    response = client.get("/relay/diagnostics")
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert payload["configured_upstream_servers"] == app.config["relay_configured_servers"]
+    assert payload["total_registered_compute_nodes"] == 1
+    assert payload["registered_compute_nodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
+    assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
 
 # --- Test /source ---
 

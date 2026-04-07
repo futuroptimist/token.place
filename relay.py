@@ -259,6 +259,13 @@ def create_app() -> Flask:
     flask_app = Flask(__name__)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
+    try:
+        from config import get_config
+
+        configured_servers = get_config().get("relay.server_pool", []) or []
+    except Exception:
+        configured_servers = []
+    flask_app.config["relay_configured_servers"] = list(configured_servers)
     public_base_url = _load_public_base_url()
     if public_base_url:
         flask_app.config["public_base_url"] = public_base_url
@@ -295,40 +302,44 @@ REQUEST_COUNTER = _get_request_counter()
 
 
 def _load_server_registration_token():
-    """Return the configured relay server token, if any."""
+    """Return configured relay server registration tokens."""
 
-    token = None
+    tokens: list[str] = []
     try:
         from config import get_config
 
-        token = get_config().get('relay.server_registration_token')
+        configured = get_config().get('relay.server_registration_token')
+        if isinstance(configured, str):
+            tokens.extend(configured.split(','))
     except Exception:
-        token = None
+        tokens = []
 
-    if not token:
-        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+    plural_tokens = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS', '')
+    if plural_tokens:
+        tokens.extend(plural_tokens.split(','))
+    singular_token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN', '')
+    if singular_token:
+        tokens.append(singular_token)
 
-    if isinstance(token, str):
-        token = token.strip()
-        if not token:
-            return None
-
-    return token
+    normalized = [candidate.strip() for candidate in tokens if isinstance(candidate, str)]
+    return [token for token in normalized if token]
 
 
-SERVER_REGISTRATION_TOKEN = _load_server_registration_token()
+SERVER_REGISTRATION_TOKENS = _load_server_registration_token()
 
 
 def _validate_server_registration():
     """Ensure relay compute nodes present the expected token when configured."""
 
-    if not SERVER_REGISTRATION_TOKEN:
+    if not SERVER_REGISTRATION_TOKENS:
         return None
 
     provided = request.headers.get('X-Relay-Server-Token', '')
     candidate = provided.strip()
-    if candidate and secrets.compare_digest(candidate, SERVER_REGISTRATION_TOKEN):
-        return None
+    if candidate:
+        for token in SERVER_REGISTRATION_TOKENS:
+            if secrets.compare_digest(candidate, token):
+                return None
 
     return jsonify({
         'error': {
@@ -346,6 +357,51 @@ streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
 
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
+SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
+DEFAULT_SERVER_STALE_SECONDS = 30
+
+
+def _server_ping_age_seconds(last_ping: Any) -> float:
+    if isinstance(last_ping, datetime):
+        age = (datetime.now() - last_ping).total_seconds()
+        return max(age, 0.0)
+    if isinstance(last_ping, (int, float)):
+        return max(time.time() - float(last_ping), 0.0)
+    return float("inf")
+
+
+def _server_stale_seconds() -> int:
+    raw = os.environ.get(SERVER_STALE_SECONDS_ENV, str(DEFAULT_SERVER_STALE_SECONDS))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_SERVER_STALE_SECONDS
+    return max(value, 1)
+
+
+def _evict_stale_servers() -> list[str]:
+    stale_after = _server_stale_seconds()
+    evicted: list[str] = []
+    for server_public_key, payload in list(known_servers.items()):
+        if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
+            continue
+        known_servers.pop(server_public_key, None)
+        client_inference_requests.pop(server_public_key, None)
+        evicted.append(server_public_key)
+    return evicted
+
+
+def _live_server_diagnostics() -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for server_public_key, payload in known_servers.items():
+        diagnostics.append({
+            "server_public_key": server_public_key,
+            "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
+            "next_ping_in_x_seconds": payload.get("last_ping_duration"),
+            "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+        })
+    diagnostics.sort(key=lambda node: node["server_public_key"])
+    return diagnostics
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -403,12 +459,16 @@ def _log_request(response: Response):
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
+    _evict_stale_servers()
     gpu_host = app.config.get("gpu_host")
+    configured_servers = app.config.get("relay_configured_servers", [])
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
+        "configuredUpstreamServers": configured_servers,
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
+        "registeredServers": _live_server_diagnostics(),
     }
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
@@ -527,6 +587,7 @@ def next_server():
         - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
+    _evict_stale_servers()
     if not known_servers:
         return jsonify({
             'error': {
@@ -539,6 +600,17 @@ def next_server():
     server_public_key = secrets.choice(list(known_servers.keys()))
     return jsonify({
         'server_public_key': known_servers[server_public_key]['public_key']
+    })
+
+
+@app.route('/relay/diagnostics', methods=['GET'])
+def relay_diagnostics():
+    """Live diagnostics for legacy relay registered compute nodes."""
+    _evict_stale_servers()
+    return jsonify({
+        "configured_upstream_servers": app.config.get("relay_configured_servers", []),
+        "registered_compute_nodes": _live_server_diagnostics(),
+        "total_registered_compute_nodes": len(known_servers),
     })
 
 @app.route('/faucet', methods=['POST'])
@@ -584,6 +656,7 @@ def faucet():
         "iv": "yUR11oNkM/ZQeGuRF6JHAw=="
     }
     """
+    _evict_stale_servers()
     # Parse the request data
     data = request.get_json()
 
@@ -640,6 +713,7 @@ def sink():
             Conforms to the same JSON format as the request body.
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
+    _evict_stale_servers()
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error

@@ -25,20 +25,9 @@ The order is designed to reduce migration risk:
 
 This avoids changing compute runtime, deployment topology, and network contract all at once.
 
-## 7-step implementation sequence
+## 7-step implementation sequence (prompts 1–7)
 
-### Step 1 — Baseline and contract freeze (current)
-
-Define and freeze the legacy relay contract used by `server.py` (`/sink`, `/source`,
-registration/auth expectations) and document current topology as the source of truth.
-
-**Exit criteria**
-
-- Contract and known edge-cases documented.
-- Test coverage identified for parity-critical paths.
-- No API v1 distributed compute assumptions introduced.
-
-### Step 2 — Shared compute-node runtime extraction
+### Prompt 1 — Shared compute-node runtime extraction
 
 Extract compute-node concerns from `server.py` into a shared runtime usable by both
 `server.py` and desktop-tauri.
@@ -49,7 +38,7 @@ Extract compute-node concerns from `server.py` into a shared runtime usable by b
 - `server.py` continues to pass existing tests using shared runtime.
 - Desktop-tauri can invoke the same runtime abstraction (even if incomplete).
 
-### Step 3 — Desktop parity on legacy contract
+### Prompt 2 — Desktop parity on legacy contract
 
 Promote desktop-tauri from MVP/local prompt tester to a real compute node that can
 participate on the legacy relay contract.
@@ -60,7 +49,7 @@ participate on the legacy relay contract.
 - Desktop participates in relay flow with legacy sink/source semantics.
 - Desktop parity checklist (below) is satisfied.
 
-### Step 4 — Legacy multi-node relay hardening
+### Prompt 3 — Legacy multi-node relay hardening
 
 Use existing relay multi-node registration and forwarding to support mixed compute-node
 fleets (`server.py` and desktop nodes) on the legacy contract.
@@ -71,7 +60,7 @@ fleets (`server.py` and desktop nodes) on the legacy contract.
 - Failover/load-balancing behavior validated on legacy contract.
 - Operational runbooks updated for mixed-node operation.
 
-### Step 5 — Relay-on-sugarkube rollout (legacy contract)
+### Prompt 4 — Relay-on-sugarkube rollout (legacy contract)
 
 Deploy `relay.py` to sugarkube as lightweight control-plane infrastructure while compute
 nodes remain external.
@@ -82,7 +71,18 @@ nodes remain external.
 - Health checks, ingress, and rollback procedures documented.
 - Relay-on-sugarkube readiness checklist (below) is satisfied.
 
-### Step 6 — Post-parity API v1 distributed migration
+### Prompt 5 — Model-management parity completion
+
+Complete desktop model-management parity requirements so desktop compute nodes match
+`server.py` operational expectations.
+
+**Exit criteria**
+
+- Canonical model-family references are surfaced in desktop flows.
+- GGUF artifact selection/state is explicit and operator-visible.
+- Model browse + download flows are implemented with clear status/error handling.
+
+### Prompt 6 — Post-parity API v1 distributed migration
 
 After parity and stable operations, migrate distributed compute from legacy sink/source
 assumptions toward API v1-aligned distributed contracts.
@@ -93,7 +93,7 @@ assumptions toward API v1-aligned distributed contracts.
 - API v1 distributed compute path validated in staging.
 - Legacy contract deprecation plan documented.
 
-### Step 7 — Legacy retirement and steady-state operations
+### Prompt 7 — Legacy pathway retirement and steady-state ops
 
 Retire legacy-only pathways once API v1 distributed compute is production ready.
 

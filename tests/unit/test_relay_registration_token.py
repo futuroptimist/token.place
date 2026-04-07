@@ -100,20 +100,24 @@ def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch
     for name in MODULES_TO_CLEAR:
         sys.modules.pop(name, None)
 
-    relay = importlib.import_module("relay")
-    relay.app.config["TESTING"] = True
-    client = relay.app.test_client()
+    try:
+        relay = importlib.import_module("relay")
+        relay.app.config["TESTING"] = True
+        client = relay.app.test_client()
 
-    accepted = client.post(
-        "/sink",
-        json={"server_public_key": "abc"},
-        headers={"X-Relay-Server-Token": "beta-token"},
-    )
-    assert accepted.status_code == 200
+        accepted = client.post(
+            "/sink",
+            json={"server_public_key": "abc"},
+            headers={"X-Relay-Server-Token": "beta-token"},
+        )
+        assert accepted.status_code == 200
 
-    rejected = client.post(
-        "/sink",
-        json={"server_public_key": "abc"},
-        headers={"X-Relay-Server-Token": "wrong-token"},
-    )
-    assert rejected.status_code == 401
+        rejected = client.post(
+            "/sink",
+            json={"server_public_key": "abc"},
+            headers={"X-Relay-Server-Token": "wrong-token"},
+        )
+        assert rejected.status_code == 401
+    finally:
+        for name in MODULES_TO_CLEAR:
+            sys.modules.pop(name, None)

@@ -263,7 +263,8 @@ def create_app() -> Flask:
         from config import get_config
 
         configured_servers = get_config().get("relay.server_pool", []) or []
-    except Exception:
+    except (ImportError, AttributeError, KeyError, TypeError) as exc:
+        LOGGER.debug("relay.config.load_failed", exc_info=exc)
         configured_servers = []
     flask_app.config["relay_configured_servers"] = list(configured_servers)
     public_base_url = _load_public_base_url()
@@ -301,7 +302,7 @@ def _get_request_counter() -> Counter:
 REQUEST_COUNTER = _get_request_counter()
 
 
-def _load_server_registration_token():
+def _load_server_registration_tokens():
     """Return configured relay server registration tokens."""
 
     tokens: list[str] = []
@@ -311,12 +312,12 @@ def _load_server_registration_token():
         configured = get_config().get('relay.server_registration_token')
         if isinstance(configured, str):
             tokens.extend(configured.split(','))
-    except Exception:
+    except (ImportError, AttributeError, KeyError, TypeError):
         tokens = []
 
     plural_tokens = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS', '')
     if plural_tokens:
-        tokens.extend(plural_tokens.split(','))
+        tokens.extend(plural_tokens.replace("\n", ",").split(','))
     singular_token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN', '')
     if singular_token:
         tokens.append(singular_token)
@@ -325,7 +326,7 @@ def _load_server_registration_token():
     return [token for token in normalized if token]
 
 
-SERVER_REGISTRATION_TOKENS = _load_server_registration_token()
+SERVER_REGISTRATION_TOKENS = _load_server_registration_tokens()
 
 
 def _validate_server_registration():
@@ -337,9 +338,12 @@ def _validate_server_registration():
     provided = request.headers.get('X-Relay-Server-Token', '')
     candidate = provided.strip()
     if candidate:
+        matched = False
         for token in SERVER_REGISTRATION_TOKENS:
             if secrets.compare_digest(candidate, token):
-                return None
+                matched = True
+        if matched:
+            return None
 
     return jsonify({
         'error': {
@@ -386,14 +390,13 @@ def _evict_stale_servers() -> list[str]:
         if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
             continue
         known_servers.pop(server_public_key, None)
-        client_inference_requests.pop(server_public_key, None)
         evicted.append(server_public_key)
     return evicted
 
 
 def _live_server_diagnostics() -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
-    for server_public_key, payload in known_servers.items():
+    for server_public_key, payload in list(known_servers.items()):
         diagnostics.append({
             "server_public_key": server_public_key,
             "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
@@ -607,10 +610,11 @@ def next_server():
 def relay_diagnostics():
     """Live diagnostics for legacy relay registered compute nodes."""
     _evict_stale_servers()
+    live_nodes = _live_server_diagnostics()
     return jsonify({
         "configured_upstream_servers": app.config.get("relay_configured_servers", []),
-        "registered_compute_nodes": _live_server_diagnostics(),
-        "total_registered_compute_nodes": len(known_servers),
+        "registered_compute_nodes": live_nodes,
+        "total_registered_compute_nodes": len(live_nodes),
     })
 
 @app.route('/faucet', methods=['POST'])
@@ -719,6 +723,8 @@ def sink():
         return auth_error
 
     data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
     public_key = data.get('server_public_key', None)
 
     raw_batch_size = data.get('max_batch_size') if isinstance(data, dict) else None

@@ -87,3 +87,54 @@ def test_source_requires_registration_token(relay_module) -> None:
 
     queued = authorised.get_json()
     assert queued == {"message": "Response received and queued for client"}
+
+
+def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TOKEN_PLACE_RELAY_SERVER_TOKENS should authorize matching node tokens."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", "alpha-token,beta-token")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+
+    for name in MODULES_TO_CLEAR:
+        sys.modules.pop(name, None)
+
+    relay = importlib.import_module("relay")
+    relay.app.config["TESTING"] = True
+    client = relay.app.test_client()
+
+    denied = client.post(
+        "/sink",
+        json={"server_public_key": "alpha"},
+        headers={"X-Relay-Server-Token": "wrong-token"},
+    )
+    assert denied.status_code == 401
+
+    accepted = client.post(
+        "/sink",
+        json={"server_public_key": "alpha"},
+        headers={"X-Relay-Server-Token": "beta-token"},
+    )
+    assert accepted.status_code == 200
+
+
+def test_sink_keeps_singular_token_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TOKEN_PLACE_RELAY_SERVER_TOKEN should continue to work."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", "legacy-token")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", raising=False)
+
+    for name in MODULES_TO_CLEAR:
+        sys.modules.pop(name, None)
+
+    relay = importlib.import_module("relay")
+    relay.app.config["TESTING"] = True
+    client = relay.app.test_client()
+
+    accepted = client.post(
+        "/sink",
+        json={"server_public_key": "legacy"},
+        headers={"X-Relay-Server-Token": "legacy-token"},
+    )
+    assert accepted.status_code == 200

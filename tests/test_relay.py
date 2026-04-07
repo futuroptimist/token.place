@@ -319,6 +319,94 @@ def test_full_relay_flow(client):
     # Request should be removed from queue
     assert not client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
 
+
+def test_multi_node_routing_keeps_work_on_target_server(client):
+    """Two registered nodes should only receive work for their own public keys."""
+    server_one = base64.b64encode(b"server_one_pub").decode("utf-8")
+    server_two = base64.b64encode(b"server_two_pub").decode("utf-8")
+
+    assert client.post("/sink", json={"server_public_key": server_one}).status_code == 200
+    assert client.post("/sink", json={"server_public_key": server_two}).status_code == 200
+
+    payload_one = {
+        "client_public_key": base64.b64encode(b"client_one").decode("utf-8"),
+        "server_public_key": server_one,
+        "chat_history": "payload-one",
+        "cipherkey": "key-one",
+        "iv": "iv-one",
+    }
+    payload_two = {
+        "client_public_key": base64.b64encode(b"client_two").decode("utf-8"),
+        "server_public_key": server_two,
+        "chat_history": "payload-two",
+        "cipherkey": "key-two",
+        "iv": "iv-two",
+    }
+    assert client.post("/faucet", json=payload_one).status_code == 200
+    assert client.post("/faucet", json=payload_two).status_code == 200
+
+    first = client.post("/sink", json={"server_public_key": server_one}).get_json()
+    second = client.post("/sink", json={"server_public_key": server_two}).get_json()
+
+    assert first["chat_history"] == "payload-one"
+    assert first["cipherkey"] == "key-one"
+    assert second["chat_history"] == "payload-two"
+    assert second["cipherkey"] == "key-two"
+
+
+def test_next_server_evicts_stale_nodes(client):
+    """/next_server should never return servers whose pings exceeded TTL."""
+    stale_server = base64.b64encode(b"stale_server").decode("utf-8")
+    fresh_server = base64.b64encode(b"fresh_server").decode("utf-8")
+    known_servers[stale_server] = {
+        "public_key": stale_server,
+        "last_ping": datetime.now() - timedelta(seconds=120),
+        "last_ping_duration": 10,
+    }
+    known_servers[fresh_server] = {
+        "public_key": fresh_server,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    response = client.get("/next_server")
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert payload["server_public_key"] == fresh_server
+    assert stale_server not in known_servers
+
+
+def test_registered_nodes_diagnostics_reports_live_state(client):
+    """Diagnostics should separate configured upstreams from live registrations."""
+    server_key = base64.b64encode(b"diag_server").decode("utf-8")
+    known_servers[server_key] = {
+        "public_key": server_key,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[server_key] = [
+        {
+            "chat_history": "pending",
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "cipherkey": "ck",
+            "iv": "iv",
+        }
+    ]
+
+    response = client.get("/relay/registered-nodes")
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert "configured_upstreams" in payload
+    assert payload["registered_total"] == 1
+    assert payload["stale_evicted"] == []
+    assert len(payload["registered_nodes"]) == 1
+    node = payload["registered_nodes"][0]
+    assert node["server_public_key"] == server_key
+    assert node["queue_depth"] == 1
+    assert isinstance(node["age_seconds"], float)
+
     # 4. Server processes and submits response via /source
     source_payload = {
         "client_public_key": DUMMY_CLIENT_PUB_KEY,

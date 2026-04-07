@@ -295,40 +295,55 @@ REQUEST_COUNTER = _get_request_counter()
 
 
 def _load_server_registration_token():
-    """Return the configured relay server token, if any."""
+    """Return configured relay server registration tokens."""
 
-    token = None
+    tokens: list[str] = []
     try:
         from config import get_config
 
-        token = get_config().get('relay.server_registration_token')
+        config_token = get_config().get('relay.server_registration_token')
+        if isinstance(config_token, str) and config_token.strip():
+            tokens.append(config_token.strip())
     except Exception:
-        token = None
+        pass
 
-    if not token:
-        token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
+    plural_raw = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKENS', '')
+    if plural_raw.strip():
+        normalized = plural_raw.replace('\n', ',')
+        for token in normalized.split(','):
+            stripped = token.strip()
+            if stripped:
+                tokens.append(stripped)
 
-    if isinstance(token, str):
-        token = token.strip()
-        if not token:
-            return None
+    singular_token = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN', '')
+    if singular_token.strip():
+        tokens.append(singular_token.strip())
 
-    return token
+    deduped: list[str] = []
+    seen = set()
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            deduped.append(token)
+
+    return deduped
 
 
-SERVER_REGISTRATION_TOKEN = _load_server_registration_token()
+SERVER_REGISTRATION_TOKENS = _load_server_registration_token()
 
 
 def _validate_server_registration():
     """Ensure relay compute nodes present the expected token when configured."""
 
-    if not SERVER_REGISTRATION_TOKEN:
+    if not SERVER_REGISTRATION_TOKENS:
         return None
 
     provided = request.headers.get('X-Relay-Server-Token', '')
     candidate = provided.strip()
-    if candidate and secrets.compare_digest(candidate, SERVER_REGISTRATION_TOKEN):
-        return None
+    if candidate:
+        for token in SERVER_REGISTRATION_TOKENS:
+            if secrets.compare_digest(candidate, token):
+                return None
 
     return jsonify({
         'error': {
@@ -346,6 +361,65 @@ streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
 
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
+
+
+def _load_server_stale_ttl_seconds() -> int:
+    raw_ttl = os.environ.get("TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS", "30")
+    try:
+        return max(1, int(raw_ttl))
+    except (TypeError, ValueError):
+        LOGGER.warning("relay.invalid_server_ttl", extra={"ttl": raw_ttl})
+        return 30
+
+
+SERVER_STALE_TTL_SECONDS = _load_server_stale_ttl_seconds()
+
+
+def _prune_stale_servers() -> list[str]:
+    """Remove dead servers from the in-memory pool."""
+
+    now = datetime.now()
+    stale_public_keys = []
+    for public_key, metadata in known_servers.items():
+        last_ping = metadata.get("last_ping", now)
+        age_seconds = 0.0
+        if isinstance(last_ping, datetime):
+            age_seconds = (now - last_ping).total_seconds()
+        elif isinstance(last_ping, (int, float)):
+            age_seconds = max(time.time() - float(last_ping), 0.0)
+
+        if age_seconds > SERVER_STALE_TTL_SECONDS:
+            stale_public_keys.append(public_key)
+    for public_key in stale_public_keys:
+        known_servers.pop(public_key, None)
+
+    return stale_public_keys
+
+
+def _live_server_diagnostics() -> list[dict[str, Any]]:
+    """Build live diagnostics for registered compute nodes."""
+
+    now = datetime.now()
+    diagnostics = []
+    for public_key, metadata in known_servers.items():
+        last_ping = metadata.get("last_ping")
+        age_seconds = None
+        if isinstance(last_ping, datetime):
+            age_seconds = max((now - last_ping).total_seconds(), 0.0)
+        elif isinstance(last_ping, (int, float)):
+            age_seconds = max(time.time() - float(last_ping), 0.0)
+
+        diagnostics.append(
+            {
+                "server_public_key": public_key,
+                "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+                "queue_depth": len(client_inference_requests.get(public_key, [])),
+                "next_ping_in_x_seconds": metadata.get("last_ping_duration"),
+            }
+        )
+
+    diagnostics.sort(key=lambda item: item["server_public_key"])
+    return diagnostics
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -403,11 +477,14 @@ def _log_request(response: Response):
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
+    _prune_stale_servers()
     gpu_host = app.config.get("gpu_host")
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
         "gpuHost": gpu_host,
+        "configuredUpstreams": app.config.get("relay.server_pool", []),
+        "registeredServers": _live_server_diagnostics(),
         "knownServers": len(known_servers),
     }
     if app.config.get("public_base_url"):
@@ -527,6 +604,7 @@ def next_server():
         - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
+    _prune_stale_servers()
     if not known_servers:
         return jsonify({
             'error': {
@@ -706,6 +784,20 @@ def sink():
 
     return jsonify(response_data)
 
+
+@app.route('/relay/registered-nodes', methods=['GET'])
+def relay_registered_nodes():
+    """Expose live registered compute-node diagnostics."""
+
+    stale_public_keys = _prune_stale_servers()
+    payload = {
+        "configured_upstreams": app.config.get("relay.server_pool", []),
+        "registered_nodes": _live_server_diagnostics(),
+        "registered_total": len(known_servers),
+        "stale_evicted": stale_public_keys,
+    }
+    return jsonify(payload)
+
 @app.route('/source', methods=['POST'])
 def source():
     """
@@ -851,3 +943,5 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == '__main__':  # pragma: no cover
     main()
+    _prune_stale_servers()
+    _prune_stale_servers()

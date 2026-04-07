@@ -140,13 +140,14 @@ class RelayClient:
         polling_thread.join(timeout=15)  # Wait for thread to finish
         ```
     """
-    def __init__(self, base_url: str, port: int, crypto_manager, model_manager):
+    def __init__(self, base_url: str, port: Optional[int], crypto_manager, model_manager):
         """
         Initialize the RelayClient.
 
         Args:
             base_url: The base URL of the relay server (e.g., 'http://localhost')
-            port: The port number of the relay server
+            port: Optional relay server port. When ``None``, the URL port (or
+                scheme default) is used as-is.
             crypto_manager: Instance of CryptoManager for encryption/decryption
             model_manager: Instance of ModelManager for LLM interaction
         """
@@ -278,7 +279,7 @@ class RelayClient:
     def _build_relay_targets(
         cls,
         primary_base: str,
-        primary_port: int,
+        primary_port: Optional[int],
         additional: Union[List[Any], Tuple[Any, ...]],
         *,
         cluster_only: bool = False,

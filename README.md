@@ -591,6 +591,10 @@ python relay.py --host 0.0.0.0
 python server.py --relay_url http://relay.example.com --relay_port 5010
 ```
 
+By default, `python server.py` targets `https://token.place` as its relay base
+URL. For local development, pass an explicit override such as
+`--relay_url http://127.0.0.1:5010`.
+
 Clients remain zero-auth: they never see or transmit the relay token. This
 keeps the network open for end users while letting operators quarantine
 suspicious server nodes using cryptography instead of static passwords.

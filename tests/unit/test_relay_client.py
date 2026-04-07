@@ -82,6 +82,13 @@ def test_compose_relay_url_preserves_ipv6_brackets():
     assert result == 'http://[2001:db8::1]:8080'
 
 
+def test_compose_relay_url_keeps_https_host_without_forced_port():
+    """HTTPS relay targets without explicit ports should remain portless."""
+
+    result = RelayClient._compose_relay_url('https://token.place', None)
+    assert result == 'https://token.place'
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

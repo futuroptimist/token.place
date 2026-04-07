@@ -80,10 +80,35 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
-          while IFS= read -r -d '' file; do
-            cp "$file" release-artifacts/
-          done < <(find src-tauri/target -type f \
-            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \) -print0)
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            dmg_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/dmg"
+            dmg_files=("${dmg_dir}"/*.dmg)
+            if [ ! -e "${dmg_files[0]}" ]; then
+              echo "No DMG found in ${dmg_dir}" >&2
+              exit 1
+            fi
+            cp "${dmg_files[@]}" release-artifacts/
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            nsis_dir="src-tauri/target/release/bundle/nsis"
+            msi_dir="src-tauri/target/release/bundle/msi"
+
+            setup_files=("${nsis_dir}"/*-setup.exe)
+            if [ ! -e "${setup_files[0]}" ]; then
+              echo "No setup EXE found in ${nsis_dir}" >&2
+              exit 1
+            fi
+            cp "${setup_files[@]}" release-artifacts/
+
+            msi_files=("${msi_dir}"/*.msi)
+            if [ ! -e "${msi_files[0]}" ]; then
+              echo "No MSI found in ${msi_dir}" >&2
+              exit 1
+            fi
+            cp "${msi_files[@]}" release-artifacts/
+          else
+            echo "Unsupported runner.os: ${{ runner.os }}" >&2
+            exit 1
+          fi
 
       - name: Generate SHA256 checksums
         shell: bash

@@ -80,10 +80,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
-          while IFS= read -r -d '' file; do
-            cp "$file" release-artifacts/
-          done < <(find src-tauri/target -type f \
-            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \) -print0)
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            find src-tauri/target/${{ matrix.tauri_target }}/release/bundle/dmg -maxdepth 1 -type f \
+              -name 'token.place desktop_*.dmg' -exec cp {} release-artifacts/ \;
+          elif [ "${{ matrix.os }}" = "windows-latest" ]; then
+            find src-tauri/target/release/bundle/nsis -maxdepth 1 -type f \
+              -name 'token.place desktop_*_x64-setup.exe' -exec cp {} release-artifacts/ \;
+            find src-tauri/target/release/bundle/msi -maxdepth 1 -type f \
+              -name 'token.place desktop_*_x64_*.msi' -exec cp {} release-artifacts/ \;
+          fi
 
       - name: Generate SHA256 checksums
         shell: bash

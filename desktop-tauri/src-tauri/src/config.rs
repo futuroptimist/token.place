@@ -13,7 +13,7 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             model_path: String::new(),
-            relay_base_url: "http://127.0.0.1:5010".into(),
+            relay_base_url: "https://token.place".into(),
             preferred_mode: ComputeMode::Auto,
         }
     }
@@ -21,4 +21,15 @@ impl Default for DesktopConfig {
 
 pub fn config_path(base_dir: &Path) -> PathBuf {
     base_dir.join("desktop_tauri_config.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DesktopConfig;
+
+    #[test]
+    fn default_relay_base_url_points_to_token_place() {
+        let config = DesktopConfig::default();
+        assert_eq!(config.relay_base_url, "https://token.place");
+    }
 }

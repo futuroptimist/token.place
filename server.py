@@ -72,8 +72,8 @@ def _resolve_relay_url(cli_default: str) -> str:
     return env_override or cli_default
 
 
-def _resolve_relay_port(cli_default: int, relay_url: str) -> int:
-    """Resolve the relay port from CLI, env, or the relay URL."""
+def _resolve_relay_port(cli_default: int, relay_url: str) -> Optional[int]:
+    """Resolve the relay port from CLI/env/URL, skipping implicit HTTPS ports."""
 
     env_port = _first_env(["TOKENPLACE_RELAY_PORT", "TOKEN_PLACE_RELAY_PORT", "RELAY_PORT"])
 
@@ -88,6 +88,9 @@ def _resolve_relay_port(cli_default: int, relay_url: str) -> int:
     if parsed.port:
         return parsed.port
 
+    if parsed.scheme.lower() == "https":
+        return None
+
     return cli_default
 
 
@@ -98,8 +101,8 @@ class ServerApp:
     def __init__(
         self,
         server_port: int = 3000,
-        relay_port: int = 5000,
-        relay_url: str = "http://localhost",
+        relay_port: Optional[int] = 5000,
+        relay_url: str = "https://token.place",
         server_host: str = "127.0.0.1",
     ):
         """
@@ -107,7 +110,8 @@ class ServerApp:
 
         Args:
             server_port: Port to run the server on
-            relay_port: Port the relay server is running on
+            relay_port: Port the relay server is running on. Set to ``None`` to
+                use the scheme default from ``relay_url``.
             relay_url: URL of the relay server
         """
         self.server_port = server_port
@@ -174,7 +178,10 @@ class ServerApp:
             daemon=True
         )
         relay_thread.start()
-        log_info(f"Started relay polling thread for {self.relay_url}:{self.relay_port}")
+        relay_target = self.relay_url
+        if self.relay_port is not None:
+            relay_target = f"{relay_target}:{self.relay_port}"
+        log_info(f"Started relay polling thread for {relay_target}")
 
     def run(self):
         """Run the server application."""
@@ -205,7 +212,7 @@ def parse_args():
     parser.add_argument(
         "--relay_url",
         type=str,
-        default=config.get("relay.server_url", "http://localhost"),
+        default=config.get("relay.server_url", "https://token.place"),
         help="URL of the relay server",
     )
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")

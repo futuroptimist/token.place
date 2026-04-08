@@ -7,9 +7,11 @@ mod sidecar;
 
 use backend::{detect_backend_for, BackendInfo};
 use config::{config_path, DesktopConfig};
+use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use tauri::Manager;
 use tokio::sync::Mutex;
 
@@ -17,6 +19,51 @@ use tokio::sync::Mutex;
 struct AppState {
     sidecar: SidecarState,
     config_dir: Mutex<Option<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelArtifactInfo {
+    canonical_family_url: String,
+    filename: String,
+    url: String,
+    models_dir: String,
+    resolved_model_path: String,
+    exists: bool,
+    size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgeResponse {
+    ok: bool,
+    payload: Option<ModelArtifactInfo>,
+    error: Option<String>,
+}
+
+fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
+    let python_bin = std::env::var("TOKEN_PLACE_PYTHON").unwrap_or_else(|_| "python3".into());
+    let output = Command::new(python_bin)
+        .arg("desktop-tauri/src-tauri/python/model_bridge.py")
+        .arg(action)
+        .output()
+        .map_err(|e| format!("unable to run model bridge: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: BridgeResponse = serde_json::from_str(&stdout)
+        .map_err(|e| format!("invalid model bridge response: {e}; stderr: {stderr}"))?;
+    if parsed.ok {
+        return parsed
+            .payload
+            .ok_or_else(|| "model bridge returned success without payload".into());
+    }
+    let bridge_error = parsed
+        .error
+        .unwrap_or_else(|| "model bridge returned an unknown error".into());
+    if stderr.trim().is_empty() {
+        Err(bridge_error)
+    } else {
+        Err(format!("{bridge_error} ({stderr})"))
+    }
 }
 
 fn resolve_config_dir(app: &tauri::AppHandle, state: &AppState) -> anyhow::Result<PathBuf> {
@@ -108,6 +155,16 @@ async fn encrypt_and_forward(relay_base_url: String, final_output: String) -> Re
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
+    run_model_bridge("inspect")
+}
+
+#[tauri::command]
+fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
+    run_model_bridge("download")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -119,7 +176,9 @@ pub fn run() {
             save_config,
             start_inference,
             cancel_inference,
-            encrypt_and_forward
+            encrypt_and_forward,
+            inspect_model_artifact,
+            download_model_artifact
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

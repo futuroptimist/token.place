@@ -40,6 +40,10 @@ class ModelManager:
                 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf'
             ),
         )
+        self.canonical_family_url = config.get(
+            'model.canonical_family_url',
+            'https://huggingface.co/meta-llama/Meta-Llama-3-8B',
+        )
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
         # Network timeout for model downloads (seconds)
         self.download_timeout = config.get('model.download_timeout', 30)
@@ -55,6 +59,19 @@ class ModelManager:
         self.default_n_gpu_layers = config.get('model.n_gpu_layers', -1)
         self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
+
+    def get_model_artifact_metadata(self) -> Dict[str, Any]:
+        """Return runtime model metadata used by server and desktop bridges."""
+        file_exists = os.path.exists(self.model_path)
+        return {
+            'canonical_family_url': self.canonical_family_url,
+            'filename': self.file_name,
+            'url': self.url,
+            'models_dir': self.models_dir,
+            'resolved_model_path': self.model_path,
+            'exists': file_exists,
+            'size_bytes': os.path.getsize(self.model_path) if file_exists else None,
+        }
 
     def _log(self, level: int, message: str, **kwargs) -> None:
         """Log a message when not in production."""

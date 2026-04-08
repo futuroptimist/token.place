@@ -66,20 +66,28 @@ export function App() {
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
-    invoke<DesktopConfig>('load_config').then(setConfig).catch((e) => setError(String(e)));
-    invoke<ModelArtifactInfo>('inspect_model_artifact')
-      .then((info) => {
+
+    const initializeConfigAndArtifact = async () => {
+      try {
+        const loadedConfig = await invoke<DesktopConfig>('load_config');
+        setConfig(loadedConfig);
+
+        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
-        setConfig((existing) => {
-          if (existing.model_path.trim()) {
-            return existing;
-          }
-          const next = { ...existing, model_path: info.resolved_model_path };
-          invoke('save_config', { config: next }).catch((e) => setError(String(e)));
-          return next;
-        });
-      })
-      .catch((e) => setError(String(e)));
+
+        if (loadedConfig.model_path.trim()) {
+          return;
+        }
+
+        const next = { ...loadedConfig, model_path: info.resolved_model_path };
+        await invoke('save_config', { config: next });
+        setConfig(next);
+      } catch (e) {
+        setError(String(e));
+      }
+    };
+
+    initializeConfigAndArtifact();
   }, []);
 
   useEffect(() => {
@@ -160,7 +168,11 @@ export function App() {
       setError('');
       const info = await invoke<ModelArtifactInfo>('download_model_artifact');
       setArtifact(info);
-      updateConfig({ ...config, model_path: info.resolved_model_path });
+      setConfig((prev) => {
+        const next = { ...prev, model_path: info.resolved_model_path };
+        scheduleConfigSave(next);
+        return next;
+      });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -240,7 +252,7 @@ export function App() {
           <div>Runtime resolved path: <code>{artifact.resolved_model_path}</code></div>
           <div>
             Downloaded: <strong>{artifact.exists ? 'yes' : 'no'}</strong>
-            {artifact.size_bytes ? ` (${artifact.size_bytes.toLocaleString()} bytes)` : ''}
+            {artifact.size_bytes != null ? ` (${artifact.size_bytes.toLocaleString()} bytes)` : ''}
           </div>
         </section>
       )}

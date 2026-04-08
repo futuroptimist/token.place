@@ -103,6 +103,23 @@ class TestModelManager:
         assert model_manager.llm is None
         assert model_manager.use_mock_llm is False
 
+    def test_get_model_artifact_metadata(self, model_manager):
+        """Test runtime model metadata includes expected keys and file state."""
+        metadata = model_manager.get_model_artifact_metadata()
+
+        assert metadata['canonical_family_url'] == 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+        assert metadata['filename'] == 'test_model.gguf'
+        assert metadata['url'] == 'https://example.com/model.gguf'
+        assert metadata['models_dir'] == self._temp_dir
+        assert metadata['resolved_model_path'] == os.path.join(self._temp_dir, 'test_model.gguf')
+        assert metadata['exists'] is True
+        assert metadata['size_bytes'] == len(b'fake model data')
+
+        os.remove(metadata['resolved_model_path'])
+        missing_metadata = model_manager.get_model_artifact_metadata()
+        assert missing_metadata['exists'] is False
+        assert missing_metadata['size_bytes'] is None
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist

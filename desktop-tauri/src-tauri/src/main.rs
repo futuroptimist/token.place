@@ -10,7 +10,7 @@ use config::{config_path, DesktopConfig};
 use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::Manager;
 use tokio::sync::Mutex;
@@ -39,18 +39,70 @@ struct BridgeResponse {
     error: Option<String>,
 }
 
+fn find_existing_bridge_script_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            candidates.push(exe_dir.join("python").join("model_bridge.py"));
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("model_bridge.py"),
+            );
+            candidates.push(
+                exe_dir
+                    .join("..")
+                    .join("Resources")
+                    .join("python")
+                    .join("model_bridge.py"),
+            );
+        }
+    }
+
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("model_bridge.py"),
+    );
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
+    find_existing_bridge_script_path().ok_or_else(|| {
+        "unable to locate model bridge script relative to executable/resources or development source tree".into()
+    })
+}
+
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
-    let python_bin = std::env::var("TOKEN_PLACE_PYTHON").unwrap_or_else(|_| "python3".into());
+    let python_bin = std::env::var("TOKEN_PLACE_PYTHON").unwrap_or_else(|_| "python".into());
+    let bridge_script = resolve_model_bridge_script_path()?;
     let output = Command::new(python_bin)
-        .arg("desktop-tauri/src-tauri/python/model_bridge.py")
+        .arg(&bridge_script)
         .arg(action)
         .output()
         .map_err(|e| format!("unable to run model bridge: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let parsed: BridgeResponse = serde_json::from_str(&stdout)
-        .map_err(|e| format!("invalid model bridge response: {e}; stderr: {stderr}"))?;
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| {
+            if stderr.trim().is_empty() {
+                "model bridge produced no JSON response on stdout".to_string()
+            } else {
+                format!("model bridge produced no JSON response on stdout; stderr: {stderr}")
+            }
+        })?;
+    let parsed: BridgeResponse = serde_json::from_str(json_line).map_err(|e| {
+        format!(
+            "invalid model bridge response: {e}; json line: {json_line}; stdout: {stdout}; stderr: {stderr}"
+        )
+    })?;
     if parsed.ok {
         return parsed
             .payload
@@ -161,8 +213,10 @@ fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
 }
 
 #[tauri::command]
-fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
-    run_model_bridge("download")
+async fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
+    tokio::task::spawn_blocking(|| run_model_bridge("download"))
+        .await
+        .map_err(|e| format!("download bridge task failed: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

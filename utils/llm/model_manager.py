@@ -6,6 +6,7 @@ import time
 import logging
 import requests
 import json
+import sys
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -157,6 +158,7 @@ class ModelManager:
                         print(
                             f'\r[{"=" * done}{" " * (50-done)}] {progress * 100 / total_size_in_bytes:.2f}% ({downloaded_mb:.2f}/{total_size_in_mb:.2f} MB) ETA: {eta:.2f}s',
                             end='\r',
+                            file=sys.stderr,
                         )  # pragma: no cover
         except Exception as e:
             self.log_error(f"Error during file download: {e}")

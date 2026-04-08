@@ -4,13 +4,11 @@ token.place LLM server.
 Main server application module that integrates all components.
 """
 import os
-import threading
 import argparse
 import logging
 import sys
-from urllib.parse import urlparse
-from flask import Flask, request, jsonify
-from typing import Dict, Any, List, Optional
+from flask import Flask, jsonify
+from typing import Optional
 
 # Enable mock LLM mode early if flag is present
 if "--use_mock_llm" in sys.argv:
@@ -18,8 +16,14 @@ if "--use_mock_llm" in sys.argv:
 
 # Import our refactored modules
 from utils.llm.model_manager import get_model_manager
-from utils.crypto.crypto_manager import get_crypto_manager
 from utils.networking.relay_client import RelayClient
+from utils.runtime.compute_node import (
+    ComputeNodeRuntime,
+    ComputeNodeRuntimeConfig,
+    format_relay_target,
+    resolve_relay_port,
+    resolve_relay_url,
+)
 
 # Import config
 from config import get_config
@@ -43,64 +47,22 @@ def log_error(message, exc_info=False):
         logger.error(message, exc_info=exc_info)
 
 
-def _first_env(keys: List[str]) -> Optional[str]:
-    """Return the first non-empty environment variable in ``keys``."""
-
-    for key in keys:
-        value = os.environ.get(key)
-        if value:
-            stripped = value.strip()
-            if stripped:
-                return stripped
-    return None
-
-
 def _resolve_relay_url(cli_default: str) -> str:
-    """Resolve the relay base URL from CLI or env."""
+    """Back-compat wrapper for relay URL resolution."""
 
-    env_override = _first_env(
-        [
-            "TOKENPLACE_RELAY_URL",
-            "TOKEN_PLACE_RELAY_URL",
-            "TOKENPLACE_RELAY_BASE_URL",
-            "TOKEN_PLACE_RELAY_BASE_URL",
-            "TOKENPLACE_RELAY_UPSTREAM_URL",
-            "TOKEN_PLACE_RELAY_UPSTREAM_URL",
-            "RELAY_URL",
-        ]
-    )
-    return env_override or cli_default
+    return resolve_relay_url(cli_default)
 
 
 def _resolve_relay_port(cli_default: Optional[int], relay_url: str) -> Optional[int]:
-    """Resolve the relay port from CLI, env, or the relay URL."""
+    """Back-compat wrapper for relay port resolution."""
 
-    env_port = _first_env(["TOKENPLACE_RELAY_PORT", "TOKEN_PLACE_RELAY_PORT", "RELAY_PORT"])
-
-    if env_port is not None:
-        try:
-            return int(env_port)
-        except ValueError:
-            log_error(f"Invalid relay port override: {env_port}")
-            return cli_default
-
-    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
-    if parsed.port:
-        return parsed.port
-
-    if cli_default is not None:
-        return cli_default
-
-    return None
+    return resolve_relay_port(cli_default, relay_url, log_error=log_error)
 
 
 def _format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
-    """Create a display-ready relay target without duplicating explicit URL ports."""
+    """Back-compat wrapper for relay target formatting."""
 
-    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
-    if relay_port is None or parsed.port is not None:
-        return relay_url
-    return f"{relay_url}:{relay_port}"
+    return format_relay_target(relay_url, relay_port)
 
 
 class ServerApp:
@@ -133,29 +95,25 @@ class ServerApp:
         # Set up endpoints
         self.setup_routes()
 
-        # Create relay client
-        self.relay_client = RelayClient(
-            base_url=relay_url,
-            port=relay_port,
-            crypto_manager=get_crypto_manager(),
-            model_manager=get_model_manager()
+        runtime_config = ComputeNodeRuntimeConfig(
+            relay_url=relay_url,
+            relay_port=relay_port,
+            server_host=server_host,
+            server_port=server_port,
         )
+        self.compute_runtime = ComputeNodeRuntime(
+            runtime_config,
+            log_info=log_info,
+            log_error=log_error,
+        )
+        self.relay_client = self.compute_runtime.relay_client
 
         # Initialize LLM by downloading model if needed
         self.initialize_llm()
 
     def initialize_llm(self):
         """Initialize the LLM by downloading the model if needed."""
-        log_info("Initializing LLM...")
-        model_mgr = get_model_manager()
-        if model_mgr.use_mock_llm:
-            log_info("Using mock LLM based on configuration")
-        else:
-            # Download model if needed
-            if model_mgr.download_model_if_needed():
-                log_info("Model ready for inference")
-            else:
-                log_error("Failed to download or verify model")
+        self.compute_runtime.initialize_model()
 
     def setup_routes(self):
         """Set up Flask routes for the server."""
@@ -181,13 +139,7 @@ class ServerApp:
 
     def start_relay_polling(self):
         """Start polling the relay in a background thread."""
-        relay_thread = threading.Thread(
-            target=self.relay_client.poll_relay_continuously,
-            daemon=True
-        )
-        relay_thread.start()
-        relay_target = _format_relay_target(self.relay_url, self.relay_port)
-        log_info(f"Started relay polling thread for {relay_target}")
+        self.compute_runtime.start_relay_polling()
 
     def run(self):
         """Run the server application."""

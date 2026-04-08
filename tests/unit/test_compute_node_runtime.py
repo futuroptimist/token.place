@@ -14,11 +14,13 @@ def test_compute_node_runtime_ensure_model_ready_download_success():
     model_manager.use_mock_llm = False
     model_manager.download_model_if_needed.return_value = True
     relay_client = MagicMock()
+    crypto_manager = MagicMock()
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
         relay_client=relay_client,
+        crypto_manager=crypto_manager,
     )
 
     assert runtime.ensure_model_ready() is True
@@ -30,6 +32,7 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client.poll_relay_continuously = MagicMock()
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
 
     thread = MagicMock()
 
@@ -42,6 +45,7 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
         relay_client=relay_client,
+        crypto_manager=crypto_manager,
         thread_factory=fake_thread_factory,
     )
 
@@ -56,11 +60,13 @@ def test_compute_node_runtime_request_flow_delegates_to_relay_client():
     relay_client.process_client_request.return_value = True
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
         model_manager=model_manager,
         relay_client=relay_client,
+        crypto_manager=crypto_manager,
     )
 
     payload = {
@@ -84,3 +90,24 @@ def test_compute_node_runtime_relay_resolution_uses_env_overrides(monkeypatch):
     assert relay_url == "https://relay.example"
     assert relay_port == 4444
     assert format_relay_target(relay_url, relay_port) == "https://relay.example:4444"
+
+
+def test_compute_node_runtime_resolve_relay_port_accepts_explicit_zero_port():
+    assert resolve_relay_port(None, "https://token.place:0") == 0
+
+
+def test_compute_node_runtime_stop_delegates_to_relay_client():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    runtime.stop()
+    relay_client.stop.assert_called_once_with()

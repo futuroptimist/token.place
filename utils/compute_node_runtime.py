@@ -12,7 +12,7 @@ from utils.crypto.crypto_manager import get_crypto_manager
 from utils.llm.model_manager import get_model_manager
 from utils.networking.relay_client import RelayClient
 
-logger = logging.getLogger("server_app")
+logger = logging.getLogger(__name__)
 
 
 def _log_info(message: str) -> None:
@@ -83,7 +83,7 @@ def resolve_relay_port(cli_default: Optional[int], relay_url: str) -> Optional[i
             return cli_default
 
     parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
-    if parsed.port:
+    if parsed.port is not None:
         return parsed.port
 
     if cli_default is not None:
@@ -160,3 +160,8 @@ class ComputeNodeRuntime:
         """Ping relay /sink and return response data."""
 
         return self.relay_client.ping_relay()
+
+    def stop(self) -> None:
+        """Stop relay polling and network activity."""
+
+        self.relay_client.stop()

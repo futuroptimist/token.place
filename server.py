@@ -24,6 +24,7 @@ from utils.compute_node_runtime import (
     resolve_relay_port,
     resolve_relay_url,
 )
+from utils.networking.relay_client import RelayClient
 
 # Import config
 from config import get_config

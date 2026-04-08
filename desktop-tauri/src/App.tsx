@@ -14,8 +14,17 @@ interface BackendInfo {
 
 interface DesktopConfig {
   model_path: string;
+  resolved_model_path: string;
   relay_base_url: string;
   preferred_mode: BackendMode;
+}
+
+interface ModelMetadata {
+  canonical_model_family_url: string;
+  artifact_filename: string;
+  artifact_url: string;
+  resolved_model_path: string;
+  models_dir: string;
 }
 
 interface SidecarEvent {
@@ -40,9 +49,12 @@ export function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
     model_path: '',
+    resolved_model_path: '',
     relay_base_url: 'https://token.place',
     preferred_mode: 'auto',
   });
+  const [modelMetadata, setModelMetadata] = useState<ModelMetadata | null>(null);
+  const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
   const [requestId, setRequestId] = useState<string>('');
@@ -55,6 +67,7 @@ export function App() {
   useEffect(() => {
     invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
     invoke<DesktopConfig>('load_config').then(setConfig).catch((e) => setError(String(e)));
+    invoke<ModelMetadata>('get_model_metadata').then(setModelMetadata).catch((e) => setError(String(e)));
   }, []);
 
   useEffect(() => {
@@ -94,8 +107,12 @@ export function App() {
   }, []);
 
   const canStart = useMemo(
-    () => Boolean(config.model_path.trim()) && Boolean(prompt.trim()) && status !== 'starting' && status !== 'streaming',
-    [config.model_path, prompt, status]
+    () =>
+      Boolean((config.resolved_model_path || config.model_path).trim()) &&
+      Boolean(prompt.trim()) &&
+      status !== 'starting' &&
+      status !== 'streaming',
+    [config.model_path, config.resolved_model_path, prompt, status]
   );
 
   const scheduleConfigSave = (next: DesktopConfig) => {
@@ -122,10 +139,31 @@ export function App() {
       });
       const path = selectedModelPath(selection);
       if (path) {
-        updateConfig({ ...config, model_path: path });
+        updateConfig({ ...config, model_path: path, resolved_model_path: path });
       }
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const downloadModel = async () => {
+    try {
+      setIsDownloadingModel(true);
+      setError('');
+      const result = await invoke<{ resolved_model_path: string }>('download_model_artifact');
+      updateConfig({
+        ...config,
+        model_path: result.resolved_model_path,
+        resolved_model_path: result.resolved_model_path,
+      });
+      setModelMetadata((prev) => {
+        if (!prev) return prev;
+        return { ...prev, resolved_model_path: result.resolved_model_path };
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIsDownloadingModel(false);
     }
   };
 
@@ -137,12 +175,12 @@ export function App() {
     requestIdRef.current = nextRequestId;
     setRequestId(nextRequestId);
     await invoke('start_inference', {
-      request: {
-        request_id: nextRequestId,
-        model_path: config.model_path,
-        prompt,
-        mode: config.preferred_mode,
-      },
+        request: {
+          request_id: nextRequestId,
+          model_path: config.resolved_model_path || config.model_path,
+          prompt,
+          mode: config.preferred_mode,
+        },
     });
   };
 
@@ -172,9 +210,39 @@ export function App() {
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
-        <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
-        <button type="button" onClick={chooseModelPath}>Choose GGUF</button>
+        <input
+          value={config.model_path}
+          style={{ width: '100%' }}
+          onChange={(e) =>
+            updateConfig({
+              ...config,
+              model_path: e.target.value,
+              resolved_model_path: e.target.value,
+            })
+          }
+        />
+        <button type="button" onClick={chooseModelPath}>Browse</button>
+        <button type="button" disabled={isDownloadingModel} onClick={downloadModel}>
+          {isDownloadingModel ? 'Downloading…' : 'Download'}
+        </button>
       </div>
+      <p style={{ marginTop: 8 }}>
+        Canonical model family:{' '}
+        <a href={modelMetadata?.canonical_model_family_url} target="_blank" rel="noreferrer">
+          {modelMetadata?.canonical_model_family_url ?? 'loading...'}
+        </a>
+      </p>
+      <p>
+        Runtime artifact:{' '}
+        {modelMetadata?.artifact_filename ? (
+          <a href={modelMetadata.artifact_url} target="_blank" rel="noreferrer">
+            {modelMetadata.artifact_filename}
+          </a>
+        ) : (
+          'loading...'
+        )}
+      </p>
+      <p>Resolved model path: {config.resolved_model_path || modelMetadata?.resolved_model_path || 'not set'}</p>
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
       <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>

@@ -3,10 +3,12 @@ mod config;
 mod forward;
 mod keygen;
 mod logging;
+mod model_bridge;
 mod sidecar;
 
 use backend::{detect_backend_for, BackendInfo};
 use config::{config_path, DesktopConfig};
+use model_bridge::{download_model, fetch_model_metadata, ModelDownloadResult, ModelMetadata};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::PathBuf;
@@ -64,6 +66,16 @@ fn save_config(
 }
 
 #[tauri::command]
+fn get_model_metadata() -> Result<ModelMetadata, String> {
+    fetch_model_metadata().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn download_model_artifact() -> Result<ModelDownloadResult, String> {
+    download_model().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn start_inference(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -117,6 +129,8 @@ pub fn run() {
             detect_backend,
             load_config,
             save_config,
+            get_model_metadata,
+            download_model_artifact,
             start_inference,
             cancel_inference,
             encrypt_and_forward

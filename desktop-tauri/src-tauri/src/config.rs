@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DesktopConfig {
     pub model_path: String,
+    pub resolved_model_path: String,
     pub relay_base_url: String,
     pub preferred_mode: ComputeMode,
 }
@@ -13,6 +15,7 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             model_path: String::new(),
+            resolved_model_path: String::new(),
             relay_base_url: "https://token.place".into(),
             preferred_mode: ComputeMode::Auto,
         }

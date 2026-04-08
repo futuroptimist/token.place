@@ -4,7 +4,10 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 
 ## Scope of this MVP
 
-- Single-screen UI for BYO GGUF model path + prompt entry.
+- Single-screen UI for GGUF management + prompt entry:
+  - browse to an existing local GGUF
+  - download the runtime GGUF used by the shared Python model manager
+  - show both the canonical model family page and the concrete artifact URL
 - Runtime backend preference display:
   - macOS arm64 => `Metal / Apple Silicon`
   - Windows x64 => `CUDA / NVIDIA`
@@ -40,8 +43,8 @@ npm run tauri dev
 ## Privacy defaults
 
 - Prompt/response plaintext stays in-memory by default.
-- The app only persists non-plaintext settings (model path, relay URL,
-  preferred mode) in app-local config.
+- The app only persists non-plaintext settings (model path, resolved model
+  path, relay URL, preferred mode) in app-local config.
 - Log lines are redacted to metadata (byte counts, request ids).
 
 ## Cutting a desktop release

@@ -196,26 +196,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn fake_sidecar_happy_path() {
-        let model = NamedTempFile::new().expect("tempfile");
-        let mut child = Command::new("python3")
-            .arg("../sidecar/fake_llama_sidecar.py")
-            .arg("--model")
-            .arg(model.path())
-            .arg("--mode")
-            .arg("cpu")
-            .arg("--prompt")
-            .arg("hello world")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn fake sidecar");
+    #[test]
+    fn fake_sidecar_happy_path() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let model = NamedTempFile::new().expect("tempfile");
+            let mut child = Command::new("python3")
+                .arg("../sidecar/fake_llama_sidecar.py")
+                .arg("--model")
+                .arg(model.path())
+                .arg("--mode")
+                .arg("cpu")
+                .arg("--prompt")
+                .arg("hello world")
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn fake sidecar");
 
-        let stdout = child.stdout.take().expect("stdout");
-        let events = collect_events_from_stdout(stdout)
-            .await
-            .expect("collect events");
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+            let stdout = child.stdout.take().expect("stdout");
+            let events = collect_events_from_stdout(stdout)
+                .await
+                .expect("collect events");
+            assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+            assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+        });
     }
 }

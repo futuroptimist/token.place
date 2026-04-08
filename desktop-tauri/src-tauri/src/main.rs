@@ -3,6 +3,7 @@ mod config;
 mod forward;
 mod keygen;
 mod logging;
+mod model_bridge;
 mod sidecar;
 
 use backend::{detect_backend_for, BackendInfo};
@@ -48,7 +49,8 @@ fn load_config(
         return Ok(DesktopConfig::default());
     }
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| e.to_string())
+    let parsed: DesktopConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(parsed.with_defaults())
 }
 
 #[tauri::command]
@@ -108,6 +110,16 @@ async fn encrypt_and_forward(relay_base_url: String, final_output: String) -> Re
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_model_artifact_metadata() -> Result<model_bridge::ModelArtifactMetadata, String> {
+    model_bridge::load_model_metadata()
+}
+
+#[tauri::command]
+fn download_model_artifact() -> Result<model_bridge::ModelArtifactMetadata, String> {
+    model_bridge::download_model_artifact()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -117,6 +129,8 @@ pub fn run() {
             detect_backend,
             load_config,
             save_config,
+            get_model_artifact_metadata,
+            download_model_artifact,
             start_inference,
             cancel_inference,
             encrypt_and_forward

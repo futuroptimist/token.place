@@ -26,6 +26,15 @@ interface SidecarEvent {
   message?: string;
 }
 
+interface ModelArtifactMetadata {
+  canonical_family_url: string;
+  artifact_file_name: string;
+  artifact_url: string;
+  model_path: string;
+  models_dir: string;
+  is_downloaded: boolean;
+}
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -43,18 +52,23 @@ export function App() {
     relay_base_url: 'https://token.place',
     preferred_mode: 'auto',
   });
+  const [artifact, setArtifact] = useState<ModelArtifactMetadata | null>(null);
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
   const [requestId, setRequestId] = useState<string>('');
   const [status, setStatus] = useState<UiState>('idle');
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
     invoke<DesktopConfig>('load_config').then(setConfig).catch((e) => setError(String(e)));
+    invoke<ModelArtifactMetadata>('get_model_artifact_metadata')
+      .then(setArtifact)
+      .catch((e) => setError(String(e)));
   }, []);
 
   useEffect(() => {
@@ -94,7 +108,11 @@ export function App() {
   }, []);
 
   const canStart = useMemo(
-    () => Boolean(config.model_path.trim()) && Boolean(prompt.trim()) && status !== 'starting' && status !== 'streaming',
+    () =>
+      Boolean(config.model_path.trim()) &&
+      Boolean(prompt.trim()) &&
+      status !== 'starting' &&
+      status !== 'streaming',
     [config.model_path, prompt, status]
   );
 
@@ -126,6 +144,20 @@ export function App() {
       }
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const downloadConfiguredModel = async () => {
+    try {
+      setIsDownloadingModel(true);
+      setError('');
+      const metadata = await invoke<ModelArtifactMetadata>('download_model_artifact');
+      setArtifact(metadata);
+      updateConfig({ ...config, model_path: metadata.model_path });
+    } catch (e) {
+      setError(`Model download failed: ${String(e)}`);
+    } finally {
+      setIsDownloadingModel(false);
     }
   };
 
@@ -169,34 +201,95 @@ export function App() {
   return (
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop (Tauri MVP)</h1>
-      <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
+      <p>
+        Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong>
+      </p>
+
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
-        <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
-        <button type="button" onClick={chooseModelPath}>Choose GGUF</button>
+        <input
+          value={config.model_path}
+          style={{ width: '100%' }}
+          onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
+        />
+        <button type="button" onClick={chooseModelPath}>
+          Browse GGUF
+        </button>
+        <button type="button" disabled={isDownloadingModel} onClick={downloadConfiguredModel}>
+          {isDownloadingModel ? 'Downloading…' : 'Download'}
+        </button>
+      </div>
+
+      <div style={{ marginTop: 8, fontSize: 14 }}>
+        <div>
+          Canonical model family:{' '}
+          {artifact ? (
+            <a href={artifact.canonical_family_url} target="_blank" rel="noreferrer">
+              {artifact.canonical_family_url}
+            </a>
+          ) : (
+            'loading...'
+          )}
+        </div>
+        <div>GGUF artifact: {artifact?.artifact_file_name ?? 'loading...'}</div>
+        <div>
+          Artifact URL:{' '}
+          {artifact ? (
+            <a href={artifact.artifact_url} target="_blank" rel="noreferrer">
+              {artifact.artifact_url}
+            </a>
+          ) : (
+            'loading...'
+          )}
+        </div>
+        <div>Models dir: {artifact?.models_dir ?? 'loading...'}</div>
+        <div>Downloaded: {artifact ? (artifact.is_downloaded ? 'Yes' : 'No') : 'loading...'}</div>
       </div>
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
-      <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>
+      <select
+        value={config.preferred_mode}
+        onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
+      >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
         <option value="cpu">CPU fallback</option>
       </select>
 
       <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
-      <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
+      <textarea
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        rows={6}
+        style={{ width: '100%' }}
+      />
 
       <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
-        <button disabled={!canStart} onClick={startInference}>Start inference</button>
-        <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
-        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Encrypt + forward output</button>
+        <button disabled={!canStart} onClick={startInference}>
+          Start inference
+        </button>
+        <button
+          disabled={status !== 'starting' && status !== 'streaming'}
+          onClick={cancelInference}
+        >
+          Cancel
+        </button>
+        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>
+          Encrypt + forward output
+        </button>
       </div>
 
-      <p>Status: <strong>{status}</strong></p>
+      <p>
+        Status: <strong>{status}</strong>
+      </p>
       {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
-      <input value={config.relay_base_url} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })} />
+      <input
+        value={config.relay_base_url}
+        style={{ width: '100%' }}
+        onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })}
+      />
     </main>
   );
 }

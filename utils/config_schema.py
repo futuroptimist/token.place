@@ -67,6 +67,7 @@ class ModelSettings(TypedDict, total=False):
     context_size: int
     chat_format: str
     download_chunk_size_mb: int
+    family_url: str
 
 
 class ConstantsSettings(TypedDict, total=False):
@@ -150,6 +151,7 @@ DEFAULT_CONFIG: AppConfig = {
         "context_size": 8192,
         "chat_format": "llama-3",
         "download_chunk_size_mb": 10,
+        "family_url": "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
     },
     "constants": {
         "KB": 1024,

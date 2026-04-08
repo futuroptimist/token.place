@@ -41,6 +41,9 @@ class ModelManager:
             ),
         )
         self.chunk_size_mb = config.get('model.download_chunk_size_mb', 10)
+        self.family_url = config.get(
+            'model.family_url', 'https://huggingface.co/meta-llama/Meta-Llama-3-8B'
+        )
         # Network timeout for model downloads (seconds)
         self.download_timeout = config.get('model.download_timeout', 30)
         self.models_dir = config.get('paths.models_dir')
@@ -151,6 +154,17 @@ class ModelManager:
         else:
             self.log_error("Download failed or file size does not match.")
             return False
+
+    def artifact_metadata(self) -> Dict[str, Any]:
+        """Return model family + concrete artifact metadata used by runtime."""
+        return {
+            "canonical_family_url": self.family_url,
+            "artifact_file_name": self.file_name,
+            "artifact_url": self.url,
+            "model_path": self.model_path,
+            "models_dir": self.models_dir,
+            "is_downloaded": os.path.exists(self.model_path),
+        }
 
     def download_model_if_needed(self) -> bool:
         """

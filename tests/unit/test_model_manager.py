@@ -103,6 +103,18 @@ class TestModelManager:
         assert model_manager.llm is None
         assert model_manager.use_mock_llm is False
 
+
+    def test_artifact_metadata(self, model_manager):
+        """Test runtime artifact metadata payload."""
+        metadata = model_manager.artifact_metadata()
+
+        assert metadata["canonical_family_url"] == "https://huggingface.co/meta-llama/Meta-Llama-3-8B"
+        assert metadata["artifact_file_name"] == "test_model.gguf"
+        assert metadata["artifact_url"] == "https://example.com/model.gguf"
+        assert metadata["model_path"] == os.path.join(self._temp_dir, "test_model.gguf")
+        assert metadata["models_dir"] == self._temp_dir
+        assert metadata["is_downloaded"] is True
+
     def test_create_models_directory(self, model_manager):
         """Test create_models_directory method."""
         # Create a new temporary directory path that doesn't exist

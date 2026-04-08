@@ -4,7 +4,7 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 
 ## Scope of this MVP
 
-- Single-screen UI for BYO GGUF model path + prompt entry.
+- Single-screen UI for BYO GGUF model path + prompt entry, plus shared-model metadata and download actions.
 - Runtime backend preference display:
   - macOS arm64 => `Metal / Apple Silicon`
   - Windows x64 => `CUDA / NVIDIA`
@@ -59,3 +59,5 @@ Desktop binaries are published by the GitHub Actions workflow
 
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.
+
+- The desktop UI now displays the canonical model family link and the concrete GGUF artifact metadata used by runtime config via `utils/llm/desktop_model_bridge.py`.

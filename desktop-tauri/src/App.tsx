@@ -26,6 +26,26 @@ interface SidecarEvent {
   message?: string;
 }
 
+interface ModelArtifactMetadata {
+  filename: string;
+  url: string;
+  models_dir: string;
+  resolved_model_path: string;
+}
+
+interface ModelMetadataResponse {
+  canonical_model_family_url: string;
+  artifact: ModelArtifactMetadata;
+}
+
+interface DownloadModelResponse {
+  ok: boolean;
+  artifact?: ModelArtifactMetadata;
+  error?: string;
+}
+
+const DEFAULT_RELAY_URL = 'https://token.place';
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -40,21 +60,32 @@ export function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
     model_path: '',
-    relay_base_url: 'https://token.place',
+    relay_base_url: DEFAULT_RELAY_URL,
     preferred_mode: 'auto',
   });
+  const [metadata, setMetadata] = useState<ModelMetadataResponse | null>(null);
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
   const [requestId, setRequestId] = useState<string>('');
   const [status, setStatus] = useState<UiState>('idle');
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
-    invoke<DesktopConfig>('load_config').then(setConfig).catch((e) => setError(String(e)));
+    invoke<DesktopConfig>('load_config')
+      .then((loaded) => {
+        const normalized = {
+          ...loaded,
+          relay_base_url: loaded.relay_base_url?.trim() ? loaded.relay_base_url : DEFAULT_RELAY_URL,
+        };
+        setConfig(normalized);
+      })
+      .catch((e) => setError(String(e)));
+    invoke<ModelMetadataResponse>('load_model_metadata').then(setMetadata).catch((e) => setError(String(e)));
   }, []);
 
   useEffect(() => {
@@ -129,6 +160,35 @@ export function App() {
     }
   };
 
+  const downloadModel = async () => {
+    try {
+      setError('');
+      setIsDownloading(true);
+      const response = await invoke<DownloadModelResponse>('download_runtime_model');
+      if (!response.ok) {
+        throw new Error(response.error ?? 'Model download failed.');
+      }
+      if (response.artifact) {
+        setMetadata((prev) =>
+          prev
+            ? {
+                ...prev,
+                artifact: response.artifact!,
+              }
+            : {
+                canonical_model_family_url: 'https://huggingface.co/meta-llama/Meta-Llama-3-8B',
+                artifact: response.artifact!,
+              }
+        );
+        updateConfig({ ...config, model_path: response.artifact.resolved_model_path });
+      }
+    } catch (e) {
+      setError(`Download failed: ${String(e)}`);
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
   const startInference = async () => {
     setOutput('');
     setError('');
@@ -170,11 +230,33 @@ export function App() {
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop (Tauri MVP)</h1>
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
+
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
         <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
-        <button type="button" onClick={chooseModelPath}>Choose GGUF</button>
+        <button type="button" onClick={chooseModelPath}>Browse</button>
+        <button type="button" onClick={downloadModel} disabled={isDownloading}>{isDownloading ? 'Downloading…' : 'Download'}</button>
       </div>
+
+      {metadata && (
+        <div style={{ marginTop: 8, padding: 10, border: '1px solid #ddd', borderRadius: 4 }}>
+          <div>
+            Canonical model family:{' '}
+            <a href={metadata.canonical_model_family_url} target="_blank" rel="noreferrer">
+              {metadata.canonical_model_family_url}
+            </a>
+          </div>
+          <div>Artifact filename: <code>{metadata.artifact.filename}</code></div>
+          <div>
+            Artifact URL:{' '}
+            <a href={metadata.artifact.url} target="_blank" rel="noreferrer">
+              {metadata.artifact.url}
+            </a>
+          </div>
+          <div>Models directory: <code>{metadata.artifact.models_dir}</code></div>
+          <div>Resolved model path: <code>{metadata.artifact.resolved_model_path}</code></div>
+        </div>
+      )}
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
       <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>

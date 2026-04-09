@@ -17,15 +17,20 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 - Optional `Encrypt + forward output` action that sends the final output through
   the existing relay-compatible encrypted `/next_server` + `/faucet` flow.
 
-## Why a fake sidecar for this slice?
+## Inference sidecar behavior
 
-To keep this PR vertical and small, the app uses a tiny NDJSON sidecar
-(`sidecar/fake_llama_sidecar.py`) that models the interface we need for
-llama.cpp integration (start/token/done/error/canceled) without requiring model
-runtime packaging in CI.
+Desktop now defaults to a Python NDJSON bridge
+(`src-tauri/python/inference_sidecar.py`) that reuses the shared
+`utils.llm.model_manager` runtime and emits the existing
+`started/token/done/canceled/error` event contract.
 
-The seam is intentionally replaceable: swap the sidecar executable and preserve
-the JSON event contract.
+The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
+and fast local testing:
+
+- Set `TOKEN_PLACE_USE_FAKE_SIDECAR=1` to explicitly opt into the fake sidecar.
+- Set `TOKEN_PLACE_SIDECAR=/full/path/to/script.py` to explicitly override the
+  sidecar command path (this takes precedence over
+  `TOKEN_PLACE_USE_FAKE_SIDECAR`).
 
 ## Run locally
 

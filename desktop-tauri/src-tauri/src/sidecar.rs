@@ -71,13 +71,91 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
 
     if is_python {
         let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python".into());
+            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
         let mut cmd = Command::new(python_bin);
         cmd.arg(sidecar_path);
         return cmd;
     }
 
     Command::new(sidecar_path)
+}
+
+fn resolve_default_sidecar_script() -> String {
+    let mut candidates = Vec::new();
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("inference_sidecar.py"),
+            );
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("fake_llama_sidecar.py"),
+            );
+            candidates.push(exe_dir.join("inference_sidecar.py"));
+            candidates.push(exe_dir.join("fake_llama_sidecar.py"));
+
+            if let Some(parent_dir) = exe_dir.parent() {
+                candidates.push(
+                    parent_dir
+                        .join("Resources")
+                        .join("python")
+                        .join("inference_sidecar.py"),
+                );
+                candidates.push(
+                    parent_dir
+                        .join("Resources")
+                        .join("python")
+                        .join("fake_llama_sidecar.py"),
+                );
+                candidates.push(
+                    parent_dir
+                        .join("resources")
+                        .join("python")
+                        .join("inference_sidecar.py"),
+                );
+                candidates.push(
+                    parent_dir
+                        .join("resources")
+                        .join("python")
+                        .join("fake_llama_sidecar.py"),
+                );
+            }
+        }
+    }
+
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("inference_sidecar.py"),
+    );
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("sidecar")
+            .join("fake_llama_sidecar.py"),
+    );
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "../sidecar/fake_llama_sidecar.py".into()
+}
+
+fn should_force_fake_sidecar() -> bool {
+    matches!(
+        std::env::var("TOKEN_PLACE_USE_FAKE_SIDECAR").as_deref(),
+        Ok("1")
+    )
 }
 
 pub async fn start_sidecar(
@@ -97,8 +175,13 @@ pub async fn start_sidecar(
         *state.stdin.lock().await = None;
     }
 
-    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR")
-        .unwrap_or_else(|_| "../sidecar/fake_llama_sidecar.py".into());
+    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR").unwrap_or_else(|_| {
+        if should_force_fake_sidecar() {
+            "../sidecar/fake_llama_sidecar.py".into()
+        } else {
+            resolve_default_sidecar_script()
+        }
+    });
 
     let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")
@@ -207,6 +290,7 @@ mod tests {
             .arg("cpu")
             .arg("--prompt")
             .arg("hello world")
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn fake sidecar");
@@ -216,6 +300,38 @@ mod tests {
             .await
             .expect("collect events");
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn real_bridge_happy_path_with_mock_runtime() {
+        let model = NamedTempFile::new().expect("tempfile");
+        let sidecar_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("inference_sidecar.py");
+
+        let mut child = Command::new("python3")
+            .arg(sidecar_script)
+            .arg("--model")
+            .arg(model.path())
+            .arg("--mode")
+            .arg("cpu")
+            .arg("--prompt")
+            .arg("hello world")
+            .env("USE_MOCK_LLM", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn bridge sidecar");
+
+        let stdout = child.stdout.take().expect("stdout");
+        let events = collect_events_from_stdout(stdout)
+            .await
+            .expect("collect events");
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Token { .. })));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
     }
 }

@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
 from werkzeug.serving import make_server
+from utils.distributed_api_v1 import DISTRIBUTED_V1_REQUIRED_FIELDS
 
 # Logging --------------------------------------------------------------------
 
@@ -664,7 +665,8 @@ def faucet():
     # Parse the request data
     data = request.get_json()
 
-    if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
+    required_fields = {"server_public_key", *DISTRIBUTED_V1_REQUIRED_FIELDS[1:]}
+    if not isinstance(data, dict) or not required_fields.issubset(data.keys()):
         return jsonify({
             'error': {
                 'message': 'Invalid request data',
@@ -796,7 +798,7 @@ def source():
         return auth_error
 
     data = request.get_json()
-    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
+    if not isinstance(data, dict) or not set(DISTRIBUTED_V1_REQUIRED_FIELDS).issubset(data.keys()):
         return jsonify({'error': 'Invalid request data'}), 400
 
     client_public_key = data['client_public_key']

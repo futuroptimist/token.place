@@ -85,6 +85,7 @@ def run(args: argparse.Namespace) -> int:
             resolve_relay_port,
             resolve_relay_url,
         )
+        from utils.distributed_api_v1 import has_distributed_v1_payload
     except ModuleNotFoundError as exc:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
@@ -134,8 +135,7 @@ def run(args: argparse.Namespace) -> int:
             if not registered:
                 last_error = str(relay_response.get("error", "relay registration failed"))
             else:
-                required_fields = {"client_public_key", "chat_history", "cipherkey", "iv"}
-                if required_fields.issubset(relay_response.keys()):
+                if has_distributed_v1_payload(relay_response):
                     processed = runtime.process_relay_request(relay_response)
                     if not processed:
                         last_error = "failed to process relay request"

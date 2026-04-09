@@ -12,6 +12,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 import requests
+from utils.distributed_api_v1 import (
+    DISTRIBUTED_V1_REQUIRED_FIELDS,
+    has_distributed_v1_payload,
+)
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -24,7 +28,7 @@ def get_config_lazy():
 # Define JSON schema for messages
 MESSAGE_SCHEMA = {
     "type": "object",
-    "required": ["client_public_key", "chat_history", "cipherkey", "iv"],
+    "required": list(DISTRIBUTED_V1_REQUIRED_FIELDS),
     "properties": {
         "client_public_key": {"type": "string"},
         "chat_history": {"type": "string"},
@@ -659,8 +663,7 @@ class RelayClient:
                     )
 
                     # Check if there's a client request to process
-                    required_fields = ['client_public_key', 'chat_history', 'cipherkey', 'iv']
-                    if all(field in relay_response for field in required_fields):
+                    if has_distributed_v1_payload(relay_response):
                         log_info("Processing client request...")
                         self.process_client_request(relay_response)
                     else:

@@ -11,6 +11,9 @@ import uuid
 import logging
 import os
 import math
+from typing import Any, Callable, Dict, Optional
+
+import requests
 
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
@@ -109,6 +112,106 @@ def _configured_relay_servers() -> list[str]:
 
 
 _image_generator = LocalImageGenerator()
+
+COMPUTE_PROVIDER_ENV = "TOKENPLACE_API_V1_COMPUTE_PROVIDER"
+COMPUTE_PROVIDER_DISTRIBUTED = "distributed"
+
+
+class ComputeProviderError(Exception):
+    """Raised when a compute provider cannot satisfy a request."""
+
+
+class ComputeProvider:
+    """Abstraction over local and distributed API v1 chat execution."""
+
+    def complete_chat(
+        self,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+
+class LocalComputeProvider(ComputeProvider):
+    """Adapter for the legacy in-process llama.cpp execution path."""
+
+    def __init__(self, generator: Callable[..., list[dict[str, Any]]]):
+        self._generator = generator
+
+    def complete_chat(
+        self,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        return self._generator(model_id, messages, **(options or {}))
+
+
+class DistributedComputeProvider(ComputeProvider):
+    """HTTP adapter for API v1-compatible remote compute nodes."""
+
+    def __init__(
+        self,
+        upstreams: list[str],
+        *,
+        timeout_seconds: float = 15.0,
+        session: Any = requests,
+    ):
+        self._upstreams = [candidate.rstrip("/") for candidate in upstreams if candidate]
+        self._timeout_seconds = timeout_seconds
+        self._session = session
+
+    def complete_chat(
+        self,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        if not self._upstreams:
+            raise ComputeProviderError("No distributed API v1 compute upstreams configured")
+
+        payload: Dict[str, Any] = {"model": model_id, "messages": messages}
+        payload.update(options or {})
+
+        last_error: Exception | None = None
+        for upstream in self._upstreams:
+            try:
+                response = self._session.post(
+                    f"{upstream}/v1/chat/completions",
+                    json=payload,
+                    timeout=self._timeout_seconds,
+                )
+                response.raise_for_status()
+                body = response.json()
+                choices = body.get("choices") if isinstance(body, dict) else None
+                if not isinstance(choices, list) or not choices:
+                    raise ComputeProviderError("Distributed provider returned no choices")
+                message = choices[0].get("message", {})
+                if not isinstance(message, dict):
+                    raise ComputeProviderError("Distributed provider returned an invalid message")
+                return messages + [message]
+            except Exception as exc:  # pragma: no cover - defensive network handling
+                last_error = exc
+
+        raise ComputeProviderError(f"Distributed compute failed: {last_error}")
+
+
+def _select_compute_provider() -> ComputeProvider:
+    """Return a compute provider, preserving legacy local execution by default."""
+
+    provider_mode = os.getenv(COMPUTE_PROVIDER_ENV, "").strip().lower()
+    if provider_mode != COMPUTE_PROVIDER_DISTRIBUTED:
+        return LocalComputeProvider(generate_response)
+
+    configured_servers = [candidate.strip() for candidate in _configured_relay_servers() if candidate]
+    if not configured_servers:
+        return LocalComputeProvider(generate_response)
+
+    return DistributedComputeProvider(configured_servers)
 
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
@@ -293,7 +396,31 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
+        provider = _select_compute_provider()
+        provider_options = {
+            key: value
+            for key, value in data.items()
+            if key
+            not in {
+                "model",
+                "messages",
+                "encrypted",
+                "client_public_key",
+            }
+        }
+        try:
+            updated_messages = provider.complete_chat(
+                model_id,
+                messages,
+                options=provider_options,
+            )
+        except ComputeProviderError as exc:
+            log_warning(f"Distributed provider unavailable; falling back locally: {exc}")
+            updated_messages = LocalComputeProvider(generate_response).complete_chat(
+                model_id,
+                messages,
+                options=provider_options,
+            )
 
         assistant_message = updated_messages[-1]
         log_info("Response generated successfully")
@@ -445,8 +572,32 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
+        provider_options = {
+            key: value
+            for key, value in data.items()
+            if key
+            not in {
+                "model",
+                "prompt",
+                "encrypted",
+                "client_public_key",
+            }
+        }
+        provider = _select_compute_provider()
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
+        try:
+            updated_messages = provider.complete_chat(
+                model_id,
+                messages,
+                options=provider_options,
+            )
+        except ComputeProviderError as exc:
+            log_warning(f"Distributed provider unavailable; falling back locally: {exc}")
+            updated_messages = LocalComputeProvider(generate_response).complete_chat(
+                model_id,
+                messages,
+                options=provider_options,
+            )
 
         assistant_message = updated_messages[-1]
         log_info("Response generated successfully")

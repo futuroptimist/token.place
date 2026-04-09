@@ -720,8 +720,6 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
         "api.v1.routes.get_models_info",
         lambda: [{"id": "llama-3-8b-instruct"}],
     )
-    monkeypatch.setattr("api.v1.routes.validate_model_name", lambda *a, **k: None)
-    monkeypatch.setattr("api.v1.routes.get_model_instance", lambda model_id: object())
     monkeypatch.setattr("api.v1.routes.validate_chat_messages", lambda msgs: None)
 
     captured = {}
@@ -732,7 +730,7 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
             {"role": "assistant", "content": "Alias resolved response"}
         ]
 
-    monkeypatch.setattr("api.v1.routes.generate_response", fake_generate_response)
+    monkeypatch.setattr("api.v1.compute_provider.generate_response", fake_generate_response)
 
     payload = {
         "model": "gpt-3.5-turbo",
@@ -900,9 +898,8 @@ def test_completions_encryption_error(client, monkeypatch, mock_llama):
 
 
 def test_create_completion_encrypted_success(client, monkeypatch, mock_llama):
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
     monkeypatch.setattr(
-        'api.v1.routes.generate_response',
+        'api.v1.compute_provider.generate_response',
         lambda m, msgs, **kwargs: msgs + [{'role':'assistant','content':'ok'}],
     )
     monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda data, key: {'ciphertext':'a','cipherkey':'b','iv':'c'})
@@ -917,9 +914,8 @@ def test_create_chat_completion_model_error(client, monkeypatch, mock_llama):
     class DummyErr(Exception):
         pass
     from api.v1.models import ModelError
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
     monkeypatch.setattr(
-        'api.v1.routes.generate_response',
+        'api.v1.compute_provider.generate_response',
         lambda m, msgs, **kwargs: (_ for _ in ()).throw(ModelError('boom')),
     )
     payload = {'model':'llama-3-8b-instruct','messages':[{'role':'user','content':'hi'}]}
@@ -929,7 +925,10 @@ def test_create_chat_completion_model_error(client, monkeypatch, mock_llama):
 
 
 def test_create_completion_exception(client, monkeypatch, mock_llama):
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: (_ for _ in ()).throw(RuntimeError('oops')))
+    monkeypatch.setattr(
+        'api.v1.compute_provider.generate_response',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('oops')),
+    )
     payload = {'model':'llama-3-8b-instruct','prompt':'hi'}
     res = client.post('/api/v1/completions', json=payload)
     assert res.status_code == 400
@@ -1009,9 +1008,8 @@ def test_chat_completion_invalid_role(client):
 
 
 def test_chat_completion_encrypt_failure_on_response(client, monkeypatch):
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
     monkeypatch.setattr(
-        'api.v1.routes.generate_response',
+        'api.v1.compute_provider.generate_response',
         lambda m, msgs, **kwargs: msgs + [{'role': 'assistant', 'content': 'ok'}],
     )
     monkeypatch.setattr('api.v1.routes.encryption_manager.encrypt_message', lambda *a, **k: None)
@@ -1104,8 +1102,6 @@ def test_get_public_key_exception(client, monkeypatch):
 
 def test_chat_completion_validation_error(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
-    monkeypatch.setattr('api.v1.routes.validate_model_name', lambda *a, **k: None)
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda *a, **k: object())
     from api.v1.validation import ValidationError
     monkeypatch.setattr('api.v1.routes.validate_encrypted_request', lambda d: (_ for _ in ()).throw(ValidationError('bad', field='f', code='c')))
     payload = {
@@ -1125,10 +1121,11 @@ def test_chat_completion_validation_error(client, monkeypatch):
 
 def test_chat_completion_unexpected_exception(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'x'}])
-    monkeypatch.setattr('api.v1.routes.validate_model_name', lambda *a, **k: None)
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda *a, **k: object())
     monkeypatch.setattr('api.v1.routes.validate_chat_messages', lambda m: None)
-    monkeypatch.setattr('api.v1.routes.generate_response', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('fail')))
+    monkeypatch.setattr(
+        'api.v1.compute_provider.generate_response',
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('fail')),
+    )
     payload = {'model': 'x', 'messages': [{'role': 'user', 'content': 'hi'}]}
     resp = client.post('/api/v1/chat/completions', json=payload)
     assert resp.status_code == 500
@@ -1149,7 +1146,10 @@ def test_completions_missing_model(client):
 
 def test_completions_model_error(client, monkeypatch):
     from api.v1.models import ModelError
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: (_ for _ in ()).throw(ModelError('no', status_code=404, error_type='model_not_found')))
+    monkeypatch.setattr(
+        'api.v1.compute_provider.generate_response',
+        lambda *a, **k: (_ for _ in ()).throw(ModelError('no', status_code=404, error_type='model_not_found')),
+    )
     resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
     assert resp.status_code == 404
     assert 'model_not_found' in resp.get_json()['error']['type']
@@ -1157,8 +1157,10 @@ def test_completions_model_error(client, monkeypatch):
 
 def test_completions_generate_model_error(client, monkeypatch):
     from api.v1.models import ModelError
-    monkeypatch.setattr('api.v1.routes.get_model_instance', lambda m: object())
-    monkeypatch.setattr('api.v1.routes.generate_response', lambda *a, **k: (_ for _ in ()).throw(ModelError('bad', status_code=402)))
+    monkeypatch.setattr(
+        'api.v1.compute_provider.generate_response',
+        lambda *a, **k: (_ for _ in ()).throw(ModelError('bad', status_code=402)),
+    )
     resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
     assert resp.status_code == 402
     assert 'bad' in resp.get_json()['error']['message']

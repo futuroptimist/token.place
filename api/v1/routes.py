@@ -29,11 +29,13 @@ from api.v1.models import (
     get_models_info,
     ModelError,
     resolve_model_alias,
+    generate_response as _generate_response,
     get_model_instance as _get_model_instance,
 )
 from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
+    validate_model_name as _validate_model_name,
     validate_chat_messages, validate_encrypted_request,
     validate_image_generation_payload,
 )
@@ -57,6 +59,11 @@ get_provider_directory = get_registry_provider_directory
 # compatibility even though runtime model loading now happens in compute
 # providers.
 get_model_instance = _get_model_instance
+
+# Keep legacy route-level symbols available so older tests monkeypatching
+# `api.v1.routes.*` continue to work as API internals migrate to providers.
+generate_response = _generate_response
+validate_model_name = _validate_model_name
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set

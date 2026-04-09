@@ -32,6 +32,7 @@ pub struct ComputeNodeState {
     pub child: Arc<Mutex<Option<Child>>>,
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub status: Arc<Mutex<ComputeNodeStatus>>,
+    pub lifecycle_lock: Arc<Mutex<()>>,
 }
 
 fn build_bridge_command(bridge_path: &str) -> Command {
@@ -132,6 +133,8 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
+    let _lifecycle_lock = state.lifecycle_lock.lock().await;
+
     {
         let mut child_slot = state.child.lock().await;
         if child_slot
@@ -144,20 +147,8 @@ pub async fn start_compute_node(
         *state.stdin.lock().await = None;
     }
 
-    {
-        let mut status = state.status.lock().await;
-        *status = ComputeNodeStatus {
-            running: true,
-            registered: false,
-            active_relay_url: request.relay_base_url.clone(),
-            backend_mode: format!("{:?}", request.mode).to_lowercase(),
-            model_path: request.model_path.clone(),
-            last_error: None,
-        };
-    }
-
     let bridge_script = resolve_bridge_script();
-    let mut child = build_bridge_command(&bridge_script)
+    let spawn_result = build_bridge_command(&bridge_script)
         .arg("--model")
         .arg(&request.model_path)
         .arg("--mode")
@@ -167,7 +158,27 @@ pub async fn start_compute_node(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn();
+
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(err) => {
+            {
+                let mut status = state.status.lock().await;
+                *status = ComputeNodeStatus {
+                    running: false,
+                    registered: false,
+                    active_relay_url: request.relay_base_url.clone(),
+                    backend_mode: format!("{:?}", request.mode).to_lowercase(),
+                    model_path: request.model_path.clone(),
+                    last_error: Some(format!("failed to start compute-node bridge: {err}")),
+                };
+            }
+            *state.child.lock().await = None;
+            *state.stdin.lock().await = None;
+            anyhow::bail!("failed to spawn compute-node bridge: {err}");
+        }
+    };
 
     let stdout = child
         .stdout
@@ -183,6 +194,15 @@ pub async fn start_compute_node(
         *child_slot = Some(child);
         let mut stdin_slot = state.stdin.lock().await;
         *stdin_slot = Some(stdin);
+        let mut status = state.status.lock().await;
+        *status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            active_relay_url: request.relay_base_url.clone(),
+            backend_mode: format!("{:?}", request.mode).to_lowercase(),
+            model_path: request.model_path.clone(),
+            last_error: None,
+        };
     }
 
     let mut lines = BufReader::new(stdout).lines();
@@ -199,6 +219,7 @@ pub async fn start_compute_node(
     {
         let mut status = state.status.lock().await;
         status.running = false;
+        status.registered = false;
     }
     *state.child.lock().await = None;
     *state.stdin.lock().await = None;
@@ -207,27 +228,47 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
+    let _lifecycle_lock = state.lifecycle_lock.lock().await;
+
     if let Some(stdin) = state.stdin.lock().await.as_mut() {
         stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
         stdin.flush().await?;
     }
 
-    let mut child_lock = state.child.lock().await;
-    if let Some(child) = child_lock.as_mut() {
-        for _ in 0..20 {
-            if child.try_wait()?.is_some() {
-                *child_lock = None;
-                *state.stdin.lock().await = None;
-                state.status.lock().await.running = false;
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut should_kill = false;
+    for _ in 0..20 {
+        let mut child_lock = state.child.lock().await;
+        let Some(child) = child_lock.as_mut() else {
+            break;
+        };
+
+        if child.try_wait()?.is_some() {
+            *child_lock = None;
+            *state.stdin.lock().await = None;
+            let mut status = state.status.lock().await;
+            status.running = false;
+            status.registered = false;
+            return Ok(());
         }
-        let _ = child.kill().await;
+
+        should_kill = true;
+        drop(child_lock);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    *child_lock = None;
+    if should_kill {
+        let mut child_lock = state.child.lock().await;
+        if let Some(child) = child_lock.as_mut() {
+            let _ = child.kill().await;
+        }
+    }
+
+    *state.child.lock().await = None;
     *state.stdin.lock().await = None;
-    state.status.lock().await.running = false;
+    {
+        let mut status = state.status.lock().await;
+        status.running = false;
+        status.registered = false;
+    }
     Ok(())
 }

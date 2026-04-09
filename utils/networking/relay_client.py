@@ -491,7 +491,7 @@ class RelayClient:
                 return False
 
             client_pub_key_b64 = request_data['client_public_key']
-            stream_requested = bool(request_data.get('stream', False))
+            stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
 
             log_info("Decrypting client request...")

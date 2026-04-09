@@ -62,16 +62,16 @@ class FakeRuntime:
         return None
 
 
-def _install_fake_runtime_module():
+def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module = ModuleType('utils.compute_node_runtime')
     module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port: SimpleNamespace(
         relay_url=relay_url,
         relay_port=relay_port,
     )
-    module.ComputeNodeRuntime = FakeRuntime
+    module.ComputeNodeRuntime = runtime_cls
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
-    sys.modules['utils.compute_node_runtime'] = module
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 
 def _reset_cancel_queue():
@@ -81,7 +81,7 @@ def _reset_cancel_queue():
 
 def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeypatch):
     _reset_cancel_queue()
-    _install_fake_runtime_module()
+    _install_fake_runtime_module(monkeypatch)
 
     stop_counter = {'count': 0}
 
@@ -109,22 +109,14 @@ def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeyp
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
 
 
-def test_run_reports_model_initialization_failures(capsys):
+def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     _reset_cancel_queue()
 
     class FailingRuntime(FakeRuntime):
         def ensure_model_ready(self):
             return False
 
-    module = ModuleType('utils.compute_node_runtime')
-    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port: SimpleNamespace(
-        relay_url=relay_url,
-        relay_port=relay_port,
-    )
-    module.ComputeNodeRuntime = FailingRuntime
-    module.resolve_relay_url = lambda relay_url: relay_url
-    module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
-    sys.modules['utils.compute_node_runtime'] = module
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FailingRuntime)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',

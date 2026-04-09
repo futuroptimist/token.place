@@ -153,11 +153,13 @@ export function App() {
           typeof payload.backend_mode === 'string' ? payload.backend_mode : prev.backend_mode,
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
         last_error:
-          typeof payload.last_error === 'string'
-            ? payload.last_error
-            : typeof payload.message === 'string'
-              ? payload.message
-              : prev.last_error,
+          payload.last_error === null
+            ? null
+            : typeof payload.last_error === 'string'
+              ? payload.last_error
+              : typeof payload.message === 'string'
+                ? payload.message
+                : prev.last_error,
       }));
     });
 
@@ -260,18 +262,26 @@ export function App() {
   };
 
   const startComputeNode = async () => {
-    setError('');
-    await invoke('start_compute_node', {
-      request: {
-        model_path: config.model_path,
-        relay_base_url: config.relay_base_url,
-        mode: config.preferred_mode,
-      },
-    });
+    try {
+      setError('');
+      await invoke('start_compute_node', {
+        request: {
+          model_path: config.model_path,
+          relay_base_url: config.relay_base_url,
+          mode: config.preferred_mode,
+        },
+      });
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const stopComputeNode = async () => {
-    await invoke('stop_compute_node');
+    try {
+      await invoke('stop_compute_node');
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const forwardEncrypted = async () => {

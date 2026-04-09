@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import queue
 import sys
 import threading
@@ -142,6 +141,8 @@ def run(args: argparse.Namespace) -> int:
                         last_error = "failed to process relay request"
                     else:
                         last_error = None
+                else:
+                    last_error = None
 
             emit(
                 {
@@ -169,7 +170,7 @@ def run(args: argparse.Namespace) -> int:
             "active_relay_url": runtime.relay_client.relay_url,
             "backend_mode": args.mode,
             "model_path": args.model,
-            "last_error": last_error,
+            "last_error": None,
         }
     )
     return 0

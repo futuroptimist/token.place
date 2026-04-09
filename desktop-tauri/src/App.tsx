@@ -18,6 +18,16 @@ interface DesktopConfig {
   preferred_mode: BackendMode;
 }
 
+interface ModelArtifactInfo {
+  canonical_family_url: string;
+  filename: string;
+  url: string;
+  models_dir: string;
+  resolved_model_path: string;
+  exists: boolean;
+  size_bytes: number | null;
+}
+
 interface SidecarEvent {
   request_id: string;
   type: string;
@@ -47,6 +57,8 @@ export function App() {
   const [output, setOutput] = useState('');
   const [requestId, setRequestId] = useState<string>('');
   const [status, setStatus] = useState<UiState>('idle');
+  const [artifact, setArtifact] = useState<ModelArtifactInfo | null>(null);
+  const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
@@ -54,7 +66,28 @@ export function App() {
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
-    invoke<DesktopConfig>('load_config').then(setConfig).catch((e) => setError(String(e)));
+
+    const initializeConfigAndArtifact = async () => {
+      try {
+        const loadedConfig = await invoke<DesktopConfig>('load_config');
+        setConfig(loadedConfig);
+
+        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
+        setArtifact(info);
+
+        if (loadedConfig.model_path.trim()) {
+          return;
+        }
+
+        const next = { ...loadedConfig, model_path: info.resolved_model_path };
+        await invoke('save_config', { config: next });
+        setConfig(next);
+      } catch (e) {
+        setError(String(e));
+      }
+    };
+
+    initializeConfigAndArtifact();
   }, []);
 
   useEffect(() => {
@@ -129,6 +162,24 @@ export function App() {
     }
   };
 
+  const downloadModel = async () => {
+    try {
+      setIsDownloadingModel(true);
+      setError('');
+      const info = await invoke<ModelArtifactInfo>('download_model_artifact');
+      setArtifact(info);
+      setConfig((prev) => {
+        const next = { ...prev, model_path: info.resolved_model_path };
+        scheduleConfigSave(next);
+        return next;
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIsDownloadingModel(false);
+    }
+  };
+
   const startInference = async () => {
     setOutput('');
     setError('');
@@ -172,9 +223,39 @@ export function App() {
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
-        <input value={config.model_path} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, model_path: e.target.value })} />
-        <button type="button" onClick={chooseModelPath}>Choose GGUF</button>
+        <input
+          value={config.model_path}
+          style={{ width: '100%' }}
+          onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
+        />
+        <button type="button" onClick={chooseModelPath}>Browse</button>
+        <button type="button" onClick={downloadModel} disabled={isDownloadingModel}>
+          {isDownloadingModel ? 'Downloading…' : 'Download'}
+        </button>
       </div>
+      {artifact && (
+        <section style={{ marginTop: 8, fontSize: 14 }}>
+          <div>
+            Canonical model family:{' '}
+            <a href={artifact.canonical_family_url} target="_blank" rel="noreferrer">
+              {artifact.canonical_family_url}
+            </a>
+          </div>
+          <div>Runtime GGUF filename: <code>{artifact.filename}</code></div>
+          <div>
+            Runtime GGUF source:{' '}
+            <a href={artifact.url} target="_blank" rel="noreferrer">
+              {artifact.url}
+            </a>
+          </div>
+          <div>Runtime models directory: <code>{artifact.models_dir}</code></div>
+          <div>Runtime resolved path: <code>{artifact.resolved_model_path}</code></div>
+          <div>
+            Downloaded: <strong>{artifact.exists ? 'yes' : 'no'}</strong>
+            {artifact.size_bytes != null ? ` (${artifact.size_bytes.toLocaleString()} bytes)` : ''}
+          </div>
+        </section>
+      )}
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
       <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>

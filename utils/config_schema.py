@@ -64,6 +64,7 @@ class ModelSettings(TypedDict, total=False):
     use_mock: bool
     filename: str
     url: str
+    canonical_family_url: str
     context_size: int
     chat_format: str
     download_chunk_size_mb: int
@@ -147,6 +148,7 @@ DEFAULT_CONFIG: AppConfig = {
             "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
             "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
         ),
+        "canonical_family_url": "https://huggingface.co/meta-llama/Meta-Llama-3-8B",
         "context_size": 8192,
         "chat_format": "llama-3",
         "download_chunk_size_mb": 10,

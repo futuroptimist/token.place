@@ -29,6 +29,7 @@ from api.v1.models import (
     get_models_info,
     ModelError,
     resolve_model_alias,
+    get_model_instance as _get_model_instance,
 )
 from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
 from api.v1.validation import (
@@ -51,6 +52,11 @@ get_registry_provider_directory = _get_registry_provider_directory
 # exercising the server provider endpoint. Keep that alias pointing at the
 # registry loader so existing test suites continue to work.
 get_provider_directory = get_registry_provider_directory
+
+# Keep the get_model_instance symbol available for tests/backwards
+# compatibility even though runtime model loading now happens in compute
+# providers.
+get_model_instance = _get_model_instance
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set

@@ -300,6 +300,38 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
     assert response.get_json()['choices'][0]['message']['content'] == 'local fallback response'
 
 
+def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monkeypatch):
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+    monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
+
+    monkeypatch.setattr(
+        'api.v1.routes.get_api_v1_compute_provider',
+        lambda: importlib.import_module('api.v1.compute_provider').DistributedApiV1ComputeProvider(
+            base_url='https://compute.example'
+        ),
+    )
+
+    monkeypatch.setattr(
+        'api.v1.compute_provider.requests.post',
+        lambda _url, json=None, timeout=None: MagicMock(status_code=503, json=lambda: {'error': 'down'}),
+    )
+
+    local_generate = MagicMock(side_effect=AssertionError('local generation should not run'))
+    monkeypatch.setattr('api.v1.compute_provider.generate_response', local_generate)
+
+    response = client.post(
+        '/api/v1/chat/completions',
+        json={
+            'model': 'llama-3-8b-instruct',
+            'messages': [{'role': 'user', 'content': 'no fallback please'}],
+        },
+    )
+
+    assert response.status_code == 502
+    local_generate.assert_not_called()
+
+
 def test_chat_completion_rejects_empty_messages(client):
     """Empty chat message arrays should be rejected as invalid input."""
 

@@ -234,6 +234,39 @@ def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client()
     relay_client.ping_relay.assert_called_once_with()
 
 
+def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    assert any(isinstance(adapter, LegacyRelayRequestAdapter) for adapter in runtime.request_adapters)
+
+    legacy_payload = {
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+
+    relay_client.process_client_request.return_value = True
+    relay_client.ping_relay.side_effect = lambda: {
+        "relayStatus": "ok",
+        "processed": runtime.process_relay_request(legacy_payload),
+    }
+
+    assert runtime.register_and_poll_once() == {"relayStatus": "ok", "processed": True}
+    relay_client.ping_relay.assert_called_once_with()
+    relay_client.process_client_request.assert_called_once_with(legacy_payload)
+
+
 def test_compute_node_runtime_stop_delegates_to_relay_client():
     relay_client = MagicMock()
     model_manager = MagicMock()

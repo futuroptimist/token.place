@@ -4,7 +4,9 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 
 ## Scope of this MVP
 
-- Single-screen UI for BYO GGUF model path + prompt entry.
+- Single-screen UI with:
+  - operator controls for running the desktop as a relay compute node, and
+  - a local prompt smoke-test/debug panel.
 - Shows the canonical model family page and runtime GGUF artifact metadata from
   shared Python config/runtime logic.
 - Lets users either browse to an existing GGUF or download the configured GGUF
@@ -14,8 +16,25 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   - Windows x64 => `CUDA / NVIDIA`
   - other targets => `CPU fallback`
 - Sidecar-driven streaming output with explicit cancellation.
-- Optional `Encrypt + forward output` action that sends the final output through
-  the existing relay-compatible encrypted `/next_server` + `/faucet` flow.
+- Production operator flow now runs a background compute-node bridge that polls
+  relay `/sink`, decrypts/processes requests with shared runtime code, and
+  posts results to `/source` (or `/stream/source` when streaming is enabled).
+- A legacy smoke action remains available for `/next_server` + `/faucet` relay
+  testing and is explicitly labeled as non-production behavior.
+
+## Compute node operator behavior
+
+Desktop ships a Python bridge (`src-tauri/python/compute_node_bridge.py`) that
+reuses the shared `utils.compute_node_runtime.ComputeNodeRuntime` extracted
+from `server.py`.
+
+Operator status surfaced in the UI:
+
+- registered/running
+- active relay URL
+- backend mode
+- model path
+- last error
 
 ## Inference sidecar behavior
 

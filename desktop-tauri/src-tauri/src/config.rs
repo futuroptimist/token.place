@@ -7,6 +7,8 @@ pub struct DesktopConfig {
     pub model_path: String,
     pub relay_base_url: String,
     pub preferred_mode: ComputeMode,
+    #[serde(default)]
+    pub streaming_enabled: bool,
 }
 
 impl Default for DesktopConfig {
@@ -15,6 +17,7 @@ impl Default for DesktopConfig {
             model_path: String::new(),
             relay_base_url: "https://token.place".into(),
             preferred_mode: ComputeMode::Auto,
+            streaming_enabled: false,
         }
     }
 }

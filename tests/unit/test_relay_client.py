@@ -723,6 +723,48 @@ class TestRelayClient:
         call = mock_post.call_args
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_streaming_uses_stream_source(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.streaming_enabled': True,
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://localhost",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        response = MagicMock()
+        response.status_code = 200
+        response.text = "ok"
+        mock_post.return_value = response
+
+        payload = TEST_VALID_RESPONSE.copy()
+        payload['stream'] = True
+        payload['stream_session_id'] = 'session-1'
+
+        assert client.process_client_request(payload) is True
+        assert mock_post.call_args.args[0] == 'http://localhost:5000/stream/source'
+        assert mock_post.call_args.kwargs['json'] == {
+            'session_id': 'session-1',
+            'chunk': 'The capital of France is Paris.',
+            'final': True,
+        }
+
     @patch('utils.networking.relay_client.jsonschema.validate', side_effect=jsonschema.exceptions.ValidationError("bad"))
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_invalid_payload(self, mock_post, mock_validate, relay_client):

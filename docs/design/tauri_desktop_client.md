@@ -63,7 +63,7 @@ Desktop parity includes model-management behaviors, not just prompt UI.
   - <https://www.llama.com/models/>
 - Show the actual GGUF artifact the runtime is using (path/name/version where available).
 - Support model browse + download UX (with explicit status/progress/error handling).
-- Default relay URL should be `https://token.place`, but must remain overrideable for local/staging.
+- Default relay URL should be `https://token.place`, but must remain overridable for local/staging.
 
 ## Operational alignment
 

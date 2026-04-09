@@ -157,6 +157,7 @@ class RelayClient:
         self.model_manager = model_manager
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._registration_token: Optional[str] = None
+        self._streaming_enabled: bool = False
         configured_servers: List[Any] = []
         self._cluster_only = False
 
@@ -191,6 +192,15 @@ class RelayClient:
             if not token_value:
                 token_value = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
             self._registration_token = _normalise_registration_token(token_value)
+            stream_setting = (
+                config.get('relay.enable_streaming_source', None)
+                or config.get('relay.streaming_enabled', None)
+                or os.environ.get('TOKENPLACE_RELAY_STREAMING')
+                or os.environ.get('TOKEN_PLACE_RELAY_STREAMING')
+            )
+            parsed_stream_setting = _coerce_optional_bool(stream_setting)
+            if parsed_stream_setting is not None:
+                self._streaming_enabled = parsed_stream_setting
 
         except Exception:
             self._request_timeout = 10  # Fallback default
@@ -234,6 +244,13 @@ class RelayClient:
             self._registration_token = _normalise_registration_token(
                 os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
             )
+            stream_setting = (
+                os.environ.get('TOKENPLACE_RELAY_STREAMING')
+                or os.environ.get('TOKEN_PLACE_RELAY_STREAMING')
+            )
+            parsed_stream_setting = _coerce_optional_bool(stream_setting)
+            if parsed_stream_setting is not None:
+                self._streaming_enabled = parsed_stream_setting
 
         self._relay_urls = self._build_relay_targets(
             base_url,
@@ -542,7 +559,28 @@ class RelayClient:
                 log_error("Invalid response payload format: {}", str(e))
                 return False
 
-            log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
+            use_stream_source = bool(
+                self._streaming_enabled
+                and request_data.get('stream')
+                and request_data.get('stream_session_id')
+            )
+            source_path = '/stream/source' if use_stream_source else '/source'
+            post_payload: Dict[str, Any]
+            if use_stream_source:
+                try:
+                    last_message = response_history[-1] if response_history else {}
+                    chunk = last_message.get('content', '') if isinstance(last_message, dict) else ''
+                except Exception:
+                    chunk = ''
+                post_payload = {
+                    'session_id': request_data.get('stream_session_id'),
+                    'chunk': chunk,
+                    'final': True,
+                }
+            else:
+                post_payload = source_payload
+
+            log_info("Posting response to {}{}. Payload keys: {}", self.relay_url, source_path, list(post_payload.keys()))
 
             # Send the response to the relay
             try:
@@ -550,13 +588,14 @@ class RelayClient:
                     'json': source_payload,
                     'timeout': self._request_timeout,
                 }
+                request_kwargs['json'] = post_payload
                 headers = self._auth_headers()
                 if headers:
                     request_kwargs['headers'] = headers
 
                 timeout = request_kwargs.pop('timeout', self._request_timeout)
                 source_response = requests.post(
-                    f'{self.relay_url}/source',
+                    f'{self.relay_url}{source_path}',
                     timeout=timeout,
                     **request_kwargs
                 )

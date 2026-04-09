@@ -16,6 +16,16 @@ interface DesktopConfig {
   model_path: string;
   relay_base_url: string;
   preferred_mode: BackendMode;
+  streaming_enabled?: boolean;
+}
+
+interface ComputeNodeStatus {
+  running: boolean;
+  registered: boolean;
+  relay_url: string;
+  backend_mode: string;
+  model_path: string;
+  last_error?: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -61,6 +71,8 @@ export function App() {
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [computeNodeStatus, setComputeNodeStatus] = useState<ComputeNodeStatus | null>(null);
+  const [isComputeNodeBusy, setIsComputeNodeBusy] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
@@ -70,7 +82,7 @@ export function App() {
     const initializeConfigAndArtifact = async () => {
       try {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
-        setConfig(loadedConfig);
+        setConfig({ ...loadedConfig, streaming_enabled: loadedConfig.streaming_enabled ?? false });
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
@@ -88,6 +100,19 @@ export function App() {
     };
 
     initializeConfigAndArtifact();
+  }, []);
+
+  useEffect(() => {
+    invoke<ComputeNodeStatus>('get_compute_node_status')
+      .then(setComputeNodeStatus)
+      .catch((e) => setError(String(e)));
+
+    const unlisten = listen<ComputeNodeStatus>('compute_node_status', (evt) => {
+      setComputeNodeStatus(evt.payload);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
   }, []);
 
   useEffect(() => {
@@ -217,6 +242,37 @@ export function App() {
     }
   };
 
+  const startComputeNode = async () => {
+    try {
+      setError('');
+      setIsComputeNodeBusy(true);
+      await invoke('start_compute_node_operator', {
+        request: {
+          relay_base_url: config.relay_base_url,
+          model_path: config.model_path,
+          mode: config.preferred_mode,
+          streaming_enabled: Boolean(config.streaming_enabled),
+        },
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIsComputeNodeBusy(false);
+    }
+  };
+
+  const stopComputeNode = async () => {
+    try {
+      setError('');
+      setIsComputeNodeBusy(true);
+      await invoke('stop_compute_node_operator');
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIsComputeNodeBusy(false);
+    }
+  };
+
   return (
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop (Tauri MVP)</h1>
@@ -262,14 +318,42 @@ export function App() {
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
         <option value="cpu">CPU fallback</option>
       </select>
+      <label style={{ display: 'block', marginTop: 12 }}>
+        <input
+          type="checkbox"
+          checked={Boolean(config.streaming_enabled)}
+          onChange={(e) => updateConfig({ ...config, streaming_enabled: e.target.checked })}
+        />{' '}
+        Enable relay streaming (/stream/source)
+      </label>
 
+      <section style={{ marginTop: 12, padding: 12, border: '1px solid #ddd' }}>
+        <h2 style={{ margin: '0 0 8px 0', fontSize: 18 }}>Compute node operator (production path)</h2>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          <button disabled={isComputeNodeBusy || !config.model_path.trim()} onClick={startComputeNode}>
+            Start compute node
+          </button>
+          <button disabled={isComputeNodeBusy || !computeNodeStatus?.running} onClick={stopComputeNode}>
+            Stop compute node
+          </button>
+        </div>
+        <div>Registered/running: <strong>{computeNodeStatus?.registered ? 'registered' : 'not registered'}</strong> / <strong>{computeNodeStatus?.running ? 'running' : 'stopped'}</strong></div>
+        <div>Active relay URL: <code>{computeNodeStatus?.relay_url || config.relay_base_url}</code></div>
+        <div>Backend mode: <code>{computeNodeStatus?.backend_mode || config.preferred_mode}</code></div>
+        <div>Model path: <code>{computeNodeStatus?.model_path || config.model_path}</code></div>
+        <div>Last error: <code>{computeNodeStatus?.last_error || 'none'}</code></div>
+      </section>
+
+      <h2 style={{ marginTop: 16, fontSize: 18 }}>Local prompt smoke test (debug only)</h2>
       <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
       <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
 
       <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
         <button disabled={!canStart} onClick={startInference}>Start inference</button>
         <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
-        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Encrypt + forward output</button>
+        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>
+          Legacy smoke send (/next_server + /faucet)
+        </button>
       </div>
 
       <p>Status: <strong>{status}</strong></p>

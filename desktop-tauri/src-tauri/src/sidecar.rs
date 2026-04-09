@@ -1,6 +1,6 @@
 use crate::backend::ComputeMode;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +62,68 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     Ok(events)
 }
 
+fn find_existing_sidecar_path(relative_candidates: &[&str]) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            for candidate in relative_candidates {
+                candidates.push(exe_dir.join(candidate));
+            }
+        }
+    }
+
+    for candidate in relative_candidates {
+        candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join(candidate));
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn resolve_real_sidecar_path() -> Option<String> {
+    find_existing_sidecar_path(&[
+        "python/inference_sidecar.py",
+        "resources/python/inference_sidecar.py",
+        "../Resources/python/inference_sidecar.py",
+    ])
+    .map(|path| path.to_string_lossy().to_string())
+}
+
+fn resolve_mock_sidecar_path() -> Option<String> {
+    find_existing_sidecar_path(&[
+        "../sidecar/fake_llama_sidecar.py",
+        "sidecar/fake_llama_sidecar.py",
+        "resources/sidecar/fake_llama_sidecar.py",
+    ])
+    .map(|path| path.to_string_lossy().to_string())
+}
+
+fn resolve_sidecar_path() -> anyhow::Result<String> {
+    if let Ok(explicit) = std::env::var("TOKEN_PLACE_SIDECAR") {
+        return Ok(explicit);
+    }
+
+    let mode = std::env::var("TOKEN_PLACE_SIDECAR_MODE").unwrap_or_else(|_| "auto".into());
+
+    match mode.to_ascii_lowercase().as_str() {
+        "mock" | "fake" => resolve_mock_sidecar_path()
+            .ok_or_else(|| anyhow::anyhow!("unable to locate mock sidecar script")),
+        "real" => resolve_real_sidecar_path()
+            .ok_or_else(|| anyhow::anyhow!("unable to locate real inference sidecar script")),
+        "auto" => {
+            if let Some(real) = resolve_real_sidecar_path() {
+                return Ok(real);
+            }
+            resolve_mock_sidecar_path().ok_or_else(|| {
+                anyhow::anyhow!("unable to locate either real or mock sidecar script")
+            })
+        }
+        other => {
+            anyhow::bail!("invalid TOKEN_PLACE_SIDECAR_MODE `{other}`; expected auto|real|mock")
+        }
+    }
+}
+
 fn build_sidecar_command(sidecar_path: &str) -> Command {
     let path = Path::new(sidecar_path);
     let is_python = path
@@ -97,8 +159,7 @@ pub async fn start_sidecar(
         *state.stdin.lock().await = None;
     }
 
-    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR")
-        .unwrap_or_else(|_| "../sidecar/fake_llama_sidecar.py".into());
+    let sidecar_script = resolve_sidecar_path()?;
 
     let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")
@@ -179,14 +240,16 @@ mod tests {
 
     #[test]
     fn parses_token_event() {
-        let event = parse_event_line(r#"{"type":"token","text":"hi"}"#).expect("parse");
+        let event = parse_event_line(r#"{\"type\":\"token\",\"text\":\"hi\"}"#).expect("parse");
         assert_eq!(event, SidecarEvent::Token { text: "hi".into() });
     }
 
     #[test]
     fn maps_error_event() {
-        let event = parse_event_line(r#"{"type":"error","code":"bad_model","message":"no file"}"#)
-            .expect("parse");
+        let event = parse_event_line(
+            r#"{\"type\":\"error\",\"code\":\"bad_model\",\"message\":\"no file\"}"#,
+        )
+        .expect("parse");
         assert_eq!(
             event,
             SidecarEvent::Error {
@@ -194,6 +257,13 @@ mod tests {
                 message: "no file".into()
             }
         );
+    }
+
+    #[test]
+    fn resolves_sidecar_mode() {
+        let _guard = ScopedEnvVar::set("TOKEN_PLACE_SIDECAR_MODE", Some("mock"));
+        let path = resolve_sidecar_path().expect("resolve mock sidecar");
+        assert!(path.contains("fake_llama_sidecar.py"));
     }
 
     #[tokio::test]
@@ -217,5 +287,63 @@ mod tests {
             .expect("collect events");
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn real_bridge_happy_path_with_mock_llm() {
+        let model = NamedTempFile::new().expect("tempfile");
+        let mut child = Command::new("python3")
+            .arg("python/inference_sidecar.py")
+            .arg("--model")
+            .arg(model.path())
+            .arg("--mode")
+            .arg("cpu")
+            .arg("--prompt")
+            .arg("say hi")
+            .env("USE_MOCK_LLM", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn real bridge sidecar");
+
+        let stdout = child.stdout.take().expect("stdout");
+        let events = collect_events_from_stdout(stdout)
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(
+            events.iter().any(
+                |e| matches!(e, SidecarEvent::Token { text } if text.contains("Mock Response"))
+            ),
+            "expected real bridge to emit model-derived token text"
+        );
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            if let Some(next) = value {
+                std::env::set_var(key, next);
+            } else {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
     }
 }

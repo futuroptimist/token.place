@@ -71,6 +71,21 @@ class FakeDictCompletionLlm:
         return {'choices': [{'message': {'content': 'dict response'}}]}
 
 
+class FakeNoLlmManager(FakeManager):
+    def get_llm_instance(self):
+        return None
+
+
+class FakeLongStreamLlm:
+    def create_chat_completion(self, **_kwargs):
+        return iter(
+            [
+                {'choices': [{'delta': {'content': 'first'}, 'finish_reason': None}]},
+                {'choices': [{'delta': {'content': ' second'}, 'finish_reason': None}]},
+            ]
+        )
+
+
 @pytest.fixture(autouse=True)
 def restore_model_manager_module():
     original = sys.modules.get('utils.llm.model_manager')
@@ -227,3 +242,65 @@ def test_normalize_chunk_fallback_handles_object_shapes():
     assert inference_sidecar._fallback_normalize_chunk(WithDunderDict()) == {
         'choices': [{'delta': {'content': 'z'}}]
     }
+
+
+def test_run_emits_runtime_unavailable_when_model_manager_missing(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'utils'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    sys.modules.pop('utils.llm.model_manager', None)
+
+    args = SimpleNamespace(model=str(model_path), mode='cpu', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    event = json.loads(capsys.readouterr().out.strip())
+    assert event['code'] == 'runtime_unavailable'
+
+
+def test_run_emits_bad_model_when_runtime_returns_no_llm(tmp_path, capsys):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeNoLlmManager()
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode='cpu', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    event = json.loads(capsys.readouterr().out.strip())
+    assert event['code'] == 'bad_model'
+
+
+def test_run_cancels_during_streaming_after_started(tmp_path, capsys):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager(llm=FakeLongStreamLlm())
+    _install_fake_manager_module(manager)
+    inference_sidecar._stdin_lines.put('not-json')
+    inference_sidecar._stdin_lines.put('{"type":"noop"}')
+    inference_sidecar._stdin_lines.put('{"type":"cancel"}')
+
+    args = SimpleNamespace(model=str(model_path), mode='cpu', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event['type'] for event in events] == ['started', 'canceled']
+
+
+def test_extract_text_from_completion_handles_non_dict_message():
+    assert inference_sidecar._extract_text_from_completion({'choices': [{'message': 'x'}]}) == ''

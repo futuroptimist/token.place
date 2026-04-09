@@ -80,6 +80,26 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
     Command::new(sidecar_path)
 }
 
+fn resolve_default_sidecar_script() -> String {
+    let candidates = [
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("inference_sidecar.py"),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("sidecar")
+            .join("fake_llama_sidecar.py"),
+    ];
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "../sidecar/fake_llama_sidecar.py".into()
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -97,8 +117,8 @@ pub async fn start_sidecar(
         *state.stdin.lock().await = None;
     }
 
-    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR")
-        .unwrap_or_else(|_| "../sidecar/fake_llama_sidecar.py".into());
+    let sidecar_script =
+        std::env::var("TOKEN_PLACE_SIDECAR").unwrap_or_else(|_| resolve_default_sidecar_script());
 
     let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")
@@ -216,6 +236,37 @@ mod tests {
             .await
             .expect("collect events");
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn real_bridge_happy_path_with_mock_runtime() {
+        let model = NamedTempFile::new().expect("tempfile");
+        let sidecar_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("inference_sidecar.py");
+
+        let mut child = Command::new("python3")
+            .arg(sidecar_script)
+            .arg("--model")
+            .arg(model.path())
+            .arg("--mode")
+            .arg("cpu")
+            .arg("--prompt")
+            .arg("hello world")
+            .env("USE_MOCK_LLM", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn bridge sidecar");
+
+        let stdout = child.stdout.take().expect("stdout");
+        let events = collect_events_from_stdout(stdout)
+            .await
+            .expect("collect events");
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Token { .. })));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
     }
 }

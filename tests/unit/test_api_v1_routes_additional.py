@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 import pytest
+import requests
 
 from relay import app
 from api.v1 import routes
@@ -142,3 +143,89 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 
     body = response.get_json()
     assert body['metadata'] == payload['metadata']
+
+
+def test_chat_completion_uses_distributed_compute_provider(client, monkeypatch):
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'Hello distributed node'}],
+    }
+
+    monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr(routes, 'validate_model_name', lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, 'get_model_instance', lambda model_id: object())
+    monkeypatch.setattr(routes, 'resolve_model_alias', lambda model_id: None)
+    monkeypatch.setattr(
+        routes,
+        'evaluate_messages_for_policy',
+        lambda messages: SimpleNamespace(allowed=True),
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_URL", "https://compute.example")
+
+    called = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "remote response",
+                        }
+                    }
+                ]
+            }
+
+    def _fake_post(url, json, timeout):
+        called["url"] = url
+        called["json"] = json
+        called["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(routes.requests, "post", _fake_post)
+
+    response = client.post('/api/v1/chat/completions', json=payload)
+    assert response.status_code == 200
+
+    body = response.get_json()
+    assert body["choices"][0]["message"]["content"] == "remote response"
+    assert called["url"] == "https://compute.example/api/v1/chat/completions"
+    assert called["json"]["messages"] == payload["messages"]
+
+
+def test_chat_completion_distributed_provider_falls_back_to_legacy(client, monkeypatch):
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'Hello fallback'}],
+    }
+
+    monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr(routes, 'validate_model_name', lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, 'get_model_instance', lambda model_id: object())
+    monkeypatch.setattr(routes, 'resolve_model_alias', lambda model_id: None)
+    monkeypatch.setattr(
+        routes,
+        'evaluate_messages_for_policy',
+        lambda messages: SimpleNamespace(allowed=True),
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_URL", "https://compute.example")
+    monkeypatch.setattr(
+        routes.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(requests.Timeout("boom")),
+    )
+    monkeypatch.setattr(
+        routes,
+        "generate_response",
+        lambda model_id, messages, **kwargs: messages + [
+            {"role": "assistant", "content": "legacy fallback response"}
+        ],
+    )
+
+    response = client.post('/api/v1/chat/completions', json=payload)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["choices"][0]["message"]["content"] == "legacy fallback response"

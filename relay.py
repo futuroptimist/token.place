@@ -664,7 +664,17 @@ def faucet():
     # Parse the request data
     data = request.get_json()
 
-    if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
+    if not data or 'server_public_key' not in data:
+        return jsonify({
+            'error': {
+                'message': 'Invalid request data',
+                'code': 400
+            }
+        }), 400
+
+    is_legacy_encrypted = all(field in data for field in ('chat_history', 'cipherkey', 'iv'))
+    is_distributed_v1 = isinstance(data.get('api_v1_request'), dict)
+    if not is_legacy_encrypted and not is_distributed_v1:
         return jsonify({
             'error': {
                 'message': 'Invalid request data',
@@ -673,9 +683,9 @@ def faucet():
         }), 400
 
     server_public_key = data['server_public_key']
-    chat_history_ciphertext = data['chat_history']
-    cipherkey = data['cipherkey']
-    iv = data['iv']  # Extract the IV from the request data
+    chat_history_ciphertext = data.get('chat_history')
+    cipherkey = data.get('cipherkey')
+    iv = data.get('iv', '')  # Extract the IV from the request data
     stream_requested = bool(data.get('stream', False))
     client_public_key = data.get('client_public_key', None)
 
@@ -694,13 +704,16 @@ def faucet():
     # Append the client's request to the list of requests for the server
     if server_public_key not in client_inference_requests:
         client_inference_requests[server_public_key] = []
-    client_inference_requests[server_public_key].append({
+    queued_request = {
         'chat_history': chat_history_ciphertext,
         'client_public_key': client_public_key,
         'cipherkey': cipherkey,
         'iv': iv,  # Include the IV in the saved client's request
         'stream': stream_requested,
-    })
+    }
+    if is_distributed_v1:
+        queued_request['api_v1_request'] = data.get('api_v1_request')
+    client_inference_requests[server_public_key].append(queued_request)
     return jsonify({'message': 'Request received'}), 200
 
 @app.route('/sink', methods=['POST'])
@@ -776,6 +789,8 @@ def sink():
             'cipherkey': first_request['cipherkey'],
             'iv': first_request.get('iv', ''),
         })
+        if isinstance(first_request.get('api_v1_request'), dict):
+            response_data['api_v1_request'] = first_request['api_v1_request']
 
         if first_request.get('stream') and first_request.get('stream_session_id'):
             response_data['stream'] = True
@@ -796,20 +811,29 @@ def source():
         return auth_error
 
     data = request.get_json()
-    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
+    if not data or 'client_public_key' not in data:
         return jsonify({'error': 'Invalid request data'}), 400
 
     client_public_key = data['client_public_key']
-    encrypted_chat_history = data['chat_history']
-    encrypted_cipherkey = data['cipherkey']
-    iv = data['iv']
+    has_legacy_payload = all(field in data for field in ('chat_history', 'cipherkey', 'iv'))
+    has_distributed_payload = isinstance(data.get('api_v1_response'), dict)
+    if not has_legacy_payload and not has_distributed_payload:
+        return jsonify({'error': 'Invalid request data'}), 400
 
     # Store the response in the client_responses dictionary
-    client_responses[client_public_key] = {
-        'chat_history': encrypted_chat_history,
-        'cipherkey': encrypted_cipherkey,
-        'iv': iv
-    }
+    if has_distributed_payload:
+        client_responses[client_public_key] = {
+            'api_v1_response': data['api_v1_response'],
+        }
+    else:
+        encrypted_chat_history = data['chat_history']
+        encrypted_cipherkey = data['cipherkey']
+        iv = data['iv']
+        client_responses[client_public_key] = {
+            'chat_history': encrypted_chat_history,
+            'cipherkey': encrypted_cipherkey,
+            'iv': iv
+        }
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 

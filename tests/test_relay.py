@@ -240,6 +240,30 @@ def test_faucet_submit_request(client):
     assert queued_req['client_public_key'] == DUMMY_CLIENT_PUB_KEY
     assert queued_req['chat_history'] == "encrypted_chat_history_data"
 
+
+def test_faucet_accepts_distributed_api_v1_request(client):
+    """Test distributed API v1 work can be queued via /faucet during migration."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': time.time(),
+        'last_ping_duration': 10,
+    }
+
+    payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "server_public_key": DUMMY_SERVER_PUB_KEY,
+        "api_v1_request": {
+            "request_id": "req-123",
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    }
+    response = client.post("/faucet", json=payload)
+    assert response.status_code == 200
+
+    queued_req = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
+    assert queued_req["api_v1_request"]["request_id"] == "req-123"
+
 def test_faucet_invalid_payload(client):
     """Test /faucet with missing fields."""
     # Register server
@@ -348,6 +372,28 @@ def test_source_submit_response(client):
     queued_resp = client_responses[DUMMY_CLIENT_PUB_KEY]
     assert queued_resp['chat_history'] == "server_encrypted_response_history"
 
+
+def test_source_accepts_distributed_api_v1_response(client):
+    """Test /source accepts distributed API v1 response envelopes."""
+    payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "api_v1_response": {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "model": "llama-3-8b-instruct",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "distributed"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    }
+    response = client.post("/source", json=payload)
+    assert response.status_code == 200
+    assert client_responses[DUMMY_CLIENT_PUB_KEY]["api_v1_response"]["id"] == "chatcmpl-123"
+
 def test_source_invalid_payload(client):
     """Test /source with missing fields."""
     payload = { "client_public_key": DUMMY_CLIENT_PUB_KEY } # Missing other fields
@@ -379,6 +425,21 @@ def test_retrieve_get_response(client):
 
     # Check state - response should be removed after retrieval
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_retrieve_get_distributed_api_v1_response(client):
+    """Test /retrieve returns distributed API v1 responses unchanged."""
+    client_responses[DUMMY_CLIENT_PUB_KEY] = {
+        "api_v1_response": {
+            "id": "chatcmpl-321",
+            "object": "chat.completion",
+        }
+    }
+    payload = {"client_public_key": DUMMY_CLIENT_PUB_KEY}
+    response = client.post("/retrieve", json=payload)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["api_v1_response"]["id"] == "chatcmpl-321"
 
 def test_retrieve_no_response_available(client):
     """Test /retrieve when no response is queued for the client."""

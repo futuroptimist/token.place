@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 import requests
+from utils.distributed_api_v1 import build_chat_completion_response, extract_assistant_message
 
 # Configure logging
 logger = logging.getLogger('relay_client')
@@ -484,6 +485,50 @@ class RelayClient:
             bool: True if processing succeeded, False otherwise
         """
         try:
+            distributed_request = request_data.get('api_v1_request')
+            if isinstance(distributed_request, dict):
+                client_public_key = request_data.get('client_public_key')
+                if not isinstance(client_public_key, str) or not client_public_key.strip():
+                    log_error("Distributed API v1 relay payload missing client_public_key")
+                    return False
+
+                request_messages = distributed_request.get('messages', [])
+                if not isinstance(request_messages, list):
+                    log_error("Distributed API v1 relay payload has invalid messages format")
+                    return False
+
+                response_model = str(distributed_request.get('model', 'llama-3-8b-instruct'))
+                generated = self.model_manager.llama_cpp_get_response(request_messages)
+                assistant_message = extract_assistant_message(generated)
+                api_response = build_chat_completion_response(
+                    model=response_model,
+                    assistant_message=assistant_message,
+                    response_id=distributed_request.get("request_id"),
+                )
+
+                source_payload = {
+                    'client_public_key': client_public_key,
+                    'api_v1_response': api_response,
+                }
+                request_kwargs = {
+                    'json': source_payload,
+                    'timeout': self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs['headers'] = headers
+
+                timeout = request_kwargs.pop('timeout', self._request_timeout)
+                source_response = requests.post(
+                    f'{self.relay_url}/source',
+                    timeout=timeout,
+                    **request_kwargs
+                )
+                if source_response.status_code != 200:
+                    log_error("Error status from /source for distributed API v1 request: {}", source_response.status_code)
+                    return False
+                return True
+
             try:
                 jsonschema.validate(instance=request_data, schema=MESSAGE_SCHEMA)
             except jsonschema.exceptions.ValidationError as e:

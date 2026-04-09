@@ -11,6 +11,7 @@ import uuid
 import logging
 import os
 import math
+import requests
 
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
@@ -43,6 +44,11 @@ from utils.providers import (
     ProviderRegistryError,
 )
 from utils.vision import ImageGenerationError, LocalImageGenerator
+from utils.distributed_api_v1 import (
+    build_chat_completion_response,
+    completion_prompt_to_messages,
+    extract_assistant_message,
+)
 
 # Expose directory loaders for tests and backwards compatibility
 get_community_provider_directory = _get_community_provider_directory
@@ -109,6 +115,55 @@ def _configured_relay_servers() -> list[str]:
 
 
 _image_generator = LocalImageGenerator()
+
+
+def _distributed_api_v1_base_url() -> str | None:
+    configured = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_URL", "").strip()
+    if configured:
+        return configured.rstrip("/")
+    return None
+
+
+def _generate_response_with_provider(model_id, messages, **options):
+    """Dispatch API v1 inference via distributed provider when configured."""
+
+    distributed_base_url = _distributed_api_v1_base_url()
+    if not distributed_base_url:
+        return generate_response(model_id, messages, **options)
+
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        **options,
+    }
+    timeout = float(os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "20"))
+
+    try:
+        response = requests.post(
+            f"{distributed_base_url}/api/v1/chat/completions",
+            json=payload,
+            timeout=timeout,
+        )
+        if response.status_code == 200:
+            body = response.json()
+            assistant = body.get("choices", [{}])[0].get("message", {})
+            updated_messages = list(messages)
+            updated_messages.append(
+                {
+                    "role": assistant.get("role", "assistant"),
+                    "content": assistant.get("content", ""),
+                    **({"tool_calls": assistant.get("tool_calls")} if assistant.get("tool_calls") else {}),
+                }
+            )
+            return updated_messages
+        log_warning(
+            f"Distributed API v1 compute provider returned status {response.status_code}; "
+            "falling back to legacy local generation"
+        )
+    except requests.RequestException:
+        log_warning("Distributed API v1 compute provider unavailable; falling back to local generation")
+
+    return generate_response(model_id, messages, **options)
 
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
@@ -293,9 +348,9 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
+        updated_messages = _generate_response_with_provider(model_id, messages)
 
-        assistant_message = updated_messages[-1]
+        assistant_message = extract_assistant_message(updated_messages)
         log_info("Response generated successfully")
 
         tool_calls = assistant_message.get("tool_calls")
@@ -317,23 +372,14 @@ def _handle_chat_completion_request(data):
         prompt_tokens = sum(_estimate_token_length(text) for text in prompt_contents_for_usage)
         completion_tokens = _estimate_token_length("\n".join(filter(None, completion_segments)))
 
-        response_data = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": response_model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message_payload,
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+        response_data = build_chat_completion_response(
+            model=response_model_id,
+            assistant_message=message_payload,
+        )
+        response_data["usage"] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         }
 
         request_metadata = data.get("metadata")
@@ -430,7 +476,7 @@ def _handle_text_completion_request(data):
                 status_code=e.status_code,
             )
 
-        messages = [{"role": "user", "content": prompt}]
+        messages = completion_prompt_to_messages(prompt)
 
         decision = evaluate_messages_for_policy(messages)
         if not decision.allowed:
@@ -446,9 +492,9 @@ def _handle_text_completion_request(data):
             )
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
+        updated_messages = _generate_response_with_provider(model_id, messages)
 
-        assistant_message = updated_messages[-1]
+        assistant_message = extract_assistant_message(updated_messages)
         log_info("Response generated successfully")
 
         response_data = {

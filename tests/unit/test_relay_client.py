@@ -630,6 +630,41 @@ class TestRelayClient:
         # Check the result
         assert result is False
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_distributed_api_v1_success(
+        self,
+        mock_post,
+        relay_client,
+        mock_model_manager,
+        mock_http_response,
+    ):
+        """Distributed API v1 envelopes should be posted to /source as api_v1_response."""
+        mock_http_response.status_code = 200
+        mock_post.return_value = mock_http_response
+        mock_model_manager.llama_cpp_get_response.return_value = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello from compute node"},
+        ]
+
+        request_data = {
+            "client_public_key": "Y2xpZW50X2tleV9iNjQ=",
+            "api_v1_request": {
+                "request_id": "chatcmpl-test",
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        }
+        result = relay_client.process_client_request(request_data)
+
+        assert result is True
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
+            request_data["api_v1_request"]["messages"]
+        )
+        assert mock_post.call_args.args[0] == 'http://localhost:5000/source'
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["client_public_key"] == request_data["client_public_key"]
+        assert payload["api_v1_response"]["id"] == "chatcmpl-test"
+
     def test_process_client_request_decryption_failure(self, relay_client, mock_crypto_manager):
         """Test processing a client request with decryption failure."""
         # Setup

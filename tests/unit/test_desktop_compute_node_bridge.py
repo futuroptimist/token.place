@@ -106,6 +106,9 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         relay_port=relay_port,
     )
     module.ComputeNodeRuntime = runtime_cls
+    module.is_legacy_relay_payload = (
+        lambda payload: {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(payload)
+    )
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)

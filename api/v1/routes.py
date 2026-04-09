@@ -27,11 +27,11 @@ from api.v1.community import (
 )
 from api.v1.models import (
     get_models_info,
-    generate_response,
     get_model_instance,
     ModelError,
     resolve_model_alias,
 )
+from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_chat_messages, validate_encrypted_request, validate_model_name,
@@ -157,6 +157,27 @@ def _estimate_token_length(text: str) -> int:
     return max(1, math.ceil(len(stripped) / 4))
 
 
+def _extract_chat_completion_options(data: dict) -> dict:
+    """Pass through compatible OpenAI-style chat options to compute providers."""
+
+    passthrough_fields = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "frequency_penalty",
+        "presence_penalty",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "seed",
+    }
+    return {
+        key: value
+        for key, value in data.items()
+        if key in passthrough_fields and value is not None
+    }
+
+
 def _handle_chat_completion_request(data):
     """Core implementation for the chat completions endpoint."""
 
@@ -200,7 +221,7 @@ def _handle_chat_completion_request(data):
 
         validate_model_name(model_id, available_model_ids)
 
-        model_instance = get_model_instance(model_id)
+        get_model_instance(model_id)
         log_info(f"Model instance obtained for {model_id}")
 
         messages = None
@@ -293,9 +314,12 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
-
-        assistant_message = updated_messages[-1]
+        provider = get_api_v1_compute_provider()
+        assistant_message = provider.complete_chat(
+            model_id=model_id,
+            messages=messages,
+            options=_extract_chat_completion_options(data),
+        )
         log_info("Response generated successfully")
 
         tool_calls = assistant_message.get("tool_calls")
@@ -366,6 +390,12 @@ def _handle_chat_completion_request(data):
             e.message,
             error_type="model_error",
             status_code=400,
+        )
+    except ComputeProviderError as e:
+        return format_error_response(
+            str(e),
+            error_type="server_error",
+            status_code=502,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
@@ -446,9 +476,12 @@ def _handle_text_completion_request(data):
             )
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
-
-        assistant_message = updated_messages[-1]
+        provider = get_api_v1_compute_provider()
+        assistant_message = provider.complete_chat(
+            model_id=model_id,
+            messages=messages,
+            options=_extract_chat_completion_options(data),
+        )
         log_info("Response generated successfully")
 
         response_data = {
@@ -490,6 +523,12 @@ def _handle_text_completion_request(data):
             e.message,
             error_type=e.error_type,
             status_code=e.status_code,
+        )
+    except ComputeProviderError as e:
+        return format_error_response(
+            str(e),
+            error_type="server_error",
+            status_code=502,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
         log_error("Unexpected error in create_completion endpoint")

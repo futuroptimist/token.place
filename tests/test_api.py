@@ -226,6 +226,79 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     assert 'Mock response' in data['choices'][0]['message']['content']
 
 
+def test_api_v1_chat_completion_supports_distributed_provider_contract(client, monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured['url'] = url
+        captured['json'] = json
+        captured['timeout'] = timeout
+        return MagicMock(
+            status_code=200,
+            json=lambda: {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'distributed-path response',
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr('api.v1.compute_provider.requests.post', fake_post)
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+
+    payload = {
+        'model': 'llama-3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'Ping distributed runtime'}],
+        'temperature': 0.2,
+    }
+    response = client.post('/api/v1/chat/completions', json=payload)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['choices'][0]['message']['content'] == 'distributed-path response'
+
+    assert captured['url'] == 'https://compute.example/api/v1/chat/completions'
+    assert captured['json']['model'] == 'llama-3-8b-instruct'
+    assert captured['json']['messages'][0]['content'] == 'Ping distributed runtime'
+    assert captured['json']['stream'] is False
+
+
+def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
+    monkeypatch.setattr(
+        'api.v1.compute_provider.requests.post',
+        lambda _url, json=None, timeout=None: MagicMock(status_code=503, json=lambda: {'error': 'down'}),
+    )
+
+    fallback_message = {
+        'role': 'assistant',
+        'content': 'local fallback response',
+    }
+
+    monkeypatch.setattr('api.v1.compute_provider.get_model_instance', lambda _model: 'MOCK_MODEL')
+    monkeypatch.setattr(
+        'api.v1.compute_provider.generate_response',
+        lambda _model, messages, **_options: messages + [fallback_message],
+    )
+
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+
+    response = client.post(
+        '/api/v1/chat/completions',
+        json={
+            'model': 'llama-3-8b-instruct',
+            'messages': [{'role': 'user', 'content': 'fallback please'}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()['choices'][0]['message']['content'] == 'local fallback response'
+
+
 def test_chat_completion_rejects_empty_messages(client):
     """Empty chat message arrays should be rejected as invalid input."""
 

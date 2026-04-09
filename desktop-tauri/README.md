@@ -4,7 +4,7 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 
 ## Scope of this MVP
 
-- Single-screen UI for BYO GGUF model path + prompt entry.
+- Single-screen UI for BYO GGUF model path + operator controls.
 - Shows the canonical model family page and runtime GGUF artifact metadata from
   shared Python config/runtime logic.
 - Lets users either browse to an existing GGUF or download the configured GGUF
@@ -13,9 +13,12 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   - macOS arm64 => `Metal / Apple Silicon`
   - Windows x64 => `CUDA / NVIDIA`
   - other targets => `CPU fallback`
-- Sidecar-driven streaming output with explicit cancellation.
-- Optional `Encrypt + forward output` action that sends the final output through
-  the existing relay-compatible encrypted `/next_server` + `/faucet` flow.
+- Desktop compute-node mode that registers via `/sink`, decrypts relay work,
+  runs local inference, and posts responses through `/source` (or
+  `/stream/source` when streaming is enabled).
+- Local prompt + output panel retained as a smoke-test/debug tool.
+- Legacy `Encrypt + forward output` path remains debug-only and does not imply
+  parity with `server.py` operator semantics.
 
 ## Inference sidecar behavior
 

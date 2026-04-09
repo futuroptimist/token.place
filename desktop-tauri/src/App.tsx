@@ -16,6 +16,7 @@ interface DesktopConfig {
   model_path: string;
   relay_base_url: string;
   preferred_mode: BackendMode;
+  stream_enabled?: boolean;
 }
 
 interface ModelArtifactInfo {
@@ -36,6 +37,16 @@ interface SidecarEvent {
   message?: string;
 }
 
+interface ComputeNodeStatus {
+  registered: boolean;
+  running: boolean;
+  active_relay_url: string;
+  backend_mode: string;
+  model_path: string;
+  stream_enabled: boolean;
+  last_error: string;
+}
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -52,12 +63,22 @@ export function App() {
     model_path: '',
     relay_base_url: 'https://token.place',
     preferred_mode: 'auto',
+    stream_enabled: false,
   });
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
   const [requestId, setRequestId] = useState<string>('');
   const [status, setStatus] = useState<UiState>('idle');
   const [artifact, setArtifact] = useState<ModelArtifactInfo | null>(null);
+  const [operatorStatus, setOperatorStatus] = useState<ComputeNodeStatus>({
+    registered: false,
+    running: false,
+    active_relay_url: '',
+    backend_mode: 'auto',
+    model_path: '',
+    stream_enabled: false,
+    last_error: '',
+  });
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
@@ -70,7 +91,7 @@ export function App() {
     const initializeConfigAndArtifact = async () => {
       try {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
-        setConfig(loadedConfig);
+        setConfig({ ...loadedConfig, stream_enabled: loadedConfig.stream_enabled ?? false });
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
@@ -88,6 +109,7 @@ export function App() {
     };
 
     initializeConfigAndArtifact();
+    invoke<ComputeNodeStatus>('get_compute_node_status').then(setOperatorStatus).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -113,8 +135,12 @@ export function App() {
         setError(payload.message ?? payload.code ?? 'unknown error');
       }
     });
+    const unlistenComputeNode = listen<ComputeNodeStatus>('compute_node_status', (evt) => {
+      setOperatorStatus(evt.payload);
+    });
     return () => {
       unlisten.then((f) => f());
+      unlistenComputeNode.then((f) => f());
     };
   }, []);
 
@@ -217,9 +243,33 @@ export function App() {
     }
   };
 
+  const startComputeNode = async () => {
+    try {
+      setError('');
+      await invoke('start_compute_node', {
+        request: {
+          relay_base_url: config.relay_base_url,
+          model_path: config.model_path,
+          mode: config.preferred_mode,
+          stream_enabled: Boolean(config.stream_enabled),
+        },
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const stopComputeNode = async () => {
+    try {
+      await invoke('stop_compute_node');
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
-      <h1>token.place desktop (Tauri MVP)</h1>
+      <h1>token.place desktop compute node</h1>
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
@@ -263,21 +313,46 @@ export function App() {
         <option value="cpu">CPU fallback</option>
       </select>
 
+      <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
+      <input value={config.relay_base_url} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })} />
+
+      <label style={{ display: 'block', marginTop: 12 }}>
+        <input
+          type="checkbox"
+          checked={Boolean(config.stream_enabled)}
+          onChange={(e) => updateConfig({ ...config, stream_enabled: e.target.checked })}
+        />{' '}
+        Use /stream/source for streaming relay requests
+      </label>
+
+      <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+        <button disabled={operatorStatus.running || !config.model_path} onClick={startComputeNode}>Start compute node</button>
+        <button disabled={!operatorStatus.running} onClick={stopComputeNode}>Stop compute node</button>
+      </div>
+
+      <section style={{ marginTop: 12, border: '1px solid #ddd', padding: 12 }}>
+        <h2 style={{ marginTop: 0 }}>Operator status</h2>
+        <div>Registered/running: <strong>{operatorStatus.registered ? 'registered' : 'not registered'}</strong> / <strong>{operatorStatus.running ? 'running' : 'stopped'}</strong></div>
+        <div>Active relay URL: <code>{operatorStatus.active_relay_url || config.relay_base_url}</code></div>
+        <div>Backend mode: <code>{operatorStatus.backend_mode || config.preferred_mode}</code></div>
+        <div>Model path: <code>{operatorStatus.model_path || config.model_path || '(not set)'}</code></div>
+        <div>Last error: <code>{operatorStatus.last_error || 'none'}</code></div>
+      </section>
+
+      <h2 style={{ marginTop: 18 }}>Local prompt smoke test</h2>
+      <p style={{ marginTop: 0, color: '#555' }}>Use this only for local debugging. Production relay work runs through compute-node mode above.</p>
       <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
       <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
 
       <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
         <button disabled={!canStart} onClick={startInference}>Start inference</button>
         <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
-        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Encrypt + forward output</button>
+        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Legacy debug forward output</button>
       </div>
 
       <p>Status: <strong>{status}</strong></p>
       {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
-
-      <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
-      <input value={config.relay_base_url} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })} />
     </main>
   );
 }

@@ -18,6 +18,15 @@ interface DesktopConfig {
   preferred_mode: BackendMode;
 }
 
+interface ComputeNodeStatus {
+  running: boolean;
+  registered: boolean;
+  active_relay_url: string;
+  backend_mode: string;
+  model_path: string;
+  last_error: string | null;
+}
+
 interface ModelArtifactInfo {
   canonical_family_url: string;
   filename: string;
@@ -36,6 +45,15 @@ interface SidecarEvent {
   message?: string;
 }
 
+const defaultComputeStatus: ComputeNodeStatus = {
+  running: false,
+  registered: false,
+  active_relay_url: '',
+  backend_mode: 'auto',
+  model_path: '',
+  last_error: null,
+};
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -53,6 +71,7 @@ export function App() {
     relay_base_url: 'https://token.place',
     preferred_mode: 'auto',
   });
+  const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
   const [requestId, setRequestId] = useState<string>('');
@@ -71,6 +90,8 @@ export function App() {
       try {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
         setConfig(loadedConfig);
+        const nodeStatus = await invoke<ComputeNodeStatus>('get_compute_node_status');
+        setComputeStatus(nodeStatus);
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
@@ -119,6 +140,33 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
+      const payload = evt.payload;
+      setComputeStatus((prev) => ({
+        running: typeof payload.running === 'boolean' ? payload.running : prev.running,
+        registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
+        active_relay_url:
+          typeof payload.active_relay_url === 'string'
+            ? payload.active_relay_url
+            : prev.active_relay_url,
+        backend_mode:
+          typeof payload.backend_mode === 'string' ? payload.backend_mode : prev.backend_mode,
+        model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
+        last_error:
+          typeof payload.last_error === 'string'
+            ? payload.last_error
+            : typeof payload.message === 'string'
+              ? payload.message
+              : prev.last_error,
+      }));
+    });
+
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (saveTimerRef.current !== null) {
         window.clearTimeout(saveTimerRef.current);
@@ -127,8 +175,17 @@ export function App() {
   }, []);
 
   const canStart = useMemo(
-    () => Boolean(config.model_path.trim()) && Boolean(prompt.trim()) && status !== 'starting' && status !== 'streaming',
+    () =>
+      Boolean(config.model_path.trim()) &&
+      Boolean(prompt.trim()) &&
+      status !== 'starting' &&
+      status !== 'streaming',
     [config.model_path, prompt, status]
+  );
+
+  const canStartComputeNode = useMemo(
+    () => Boolean(config.model_path.trim()) && !computeStatus.running,
+    [config.model_path, computeStatus.running]
   );
 
   const scheduleConfigSave = (next: DesktopConfig) => {
@@ -202,6 +259,21 @@ export function App() {
     await invoke('cancel_inference', { request_id: requestIdRef.current });
   };
 
+  const startComputeNode = async () => {
+    setError('');
+    await invoke('start_compute_node', {
+      request: {
+        model_path: config.model_path,
+        relay_base_url: config.relay_base_url,
+        mode: config.preferred_mode,
+      },
+    });
+  };
+
+  const stopComputeNode = async () => {
+    await invoke('stop_compute_node');
+  };
+
   const forwardEncrypted = async () => {
     try {
       setIsForwarding(true);
@@ -219,7 +291,7 @@ export function App() {
 
   return (
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
-      <h1>token.place desktop (Tauri MVP)</h1>
+      <h1>token.place desktop compute node</h1>
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
@@ -258,26 +330,53 @@ export function App() {
       )}
 
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
-      <select value={config.preferred_mode} onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}>
+      <select
+        value={config.preferred_mode}
+        onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
+      >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
         <option value="cpu">CPU fallback</option>
       </select>
 
-      <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
-      <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
+      <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
+      <input
+        value={config.relay_base_url}
+        style={{ width: '100%' }}
+        onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })}
+      />
 
-      <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
-        <button disabled={!canStart} onClick={startInference}>Start inference</button>
-        <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
-        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Encrypt + forward output</button>
-      </div>
+      <section style={{ marginTop: 14, border: '1px solid #ddd', padding: 12 }}>
+        <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
+          <button disabled={!computeStatus.running} onClick={stopComputeNode}>Stop operator</button>
+        </div>
+        <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend mode: <code>{computeStatus.backend_mode || config.preferred_mode}</code></p>
+        <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
+        <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
+      </section>
 
-      <p>Status: <strong>{status}</strong></p>
+      <section style={{ marginTop: 14, borderTop: '1px solid #ddd', paddingTop: 12 }}>
+        <h2 style={{ marginTop: 0 }}>Local prompt smoke test</h2>
+        <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
+        <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
+
+        <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+          <button disabled={!canStart} onClick={startInference}>Start local inference</button>
+          <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
+          <button disabled={!output || isForwarding} onClick={forwardEncrypted}>
+            Debug relay forward (legacy /next_server + /faucet)
+          </button>
+        </div>
+
+        <p>Status: <strong>{status}</strong></p>
+      </section>
+
       {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
-
-      <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
-      <input value={config.relay_base_url} style={{ width: '100%' }} onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })} />
     </main>
   );
 }

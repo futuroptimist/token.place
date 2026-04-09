@@ -482,21 +482,8 @@ class RelayClient:
 
         Returns:
             bool: True if processing succeeded, False otherwise
-
-        Example:
-            ```python
-            # Process data from relay
-            request_data = {
-                'client_public_key': 'base64_encoded_client_key',
-                'chat_history': 'encrypted_data',
-                'cipherkey': 'encrypted_key',
-                'iv': 'initialization_vector'
-            }
-            success = relay_client.process_client_request(request_data)
-            ```
         """
         try:
-            # Validate request data against schema
             try:
                 jsonschema.validate(instance=request_data, schema=MESSAGE_SCHEMA)
             except jsonschema.exceptions.ValidationError as e:
@@ -504,38 +491,65 @@ class RelayClient:
                 return False
 
             client_pub_key_b64 = request_data['client_public_key']
+            stream_requested = bool(request_data.get('stream', False))
+            stream_session_id = request_data.get('stream_session_id')
 
-            # Decrypt the request
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
-
             if decrypted_chat_history is None:
                 log_info("Decryption failed. Skipping.")
                 return False
 
             log_info("Decrypted client request")
+            client_pub_key = base64.b64decode(client_pub_key_b64)
 
-            # Process with LLM
+            if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
+                log_info("Processing streaming relay request for session {}", stream_session_id)
+                response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
+                encrypted_response = self.crypto_manager.encrypt_message(response_history, client_pub_key)
+                chunk_payload = {
+                    'session_id': stream_session_id,
+                    'chunk': {
+                        'client_public_key': client_pub_key_b64,
+                        **encrypted_response,
+                    },
+                    'final': True,
+                }
+
+                request_kwargs = {
+                    'json': chunk_payload,
+                    'timeout': self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs['headers'] = headers
+
+                timeout = request_kwargs.pop('timeout', self._request_timeout)
+                stream_response = requests.post(
+                    f'{self.relay_url}/stream/source',
+                    timeout=timeout,
+                    **request_kwargs,
+                )
+                if stream_response.status_code != 200:
+                    log_error("Error status from /stream/source: {}", stream_response.status_code)
+                    return False
+                return True
+
             log_info("Getting response from LLM...")
             response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
             log_info("LLM generated response")
 
-            # Encrypt the response for the client
             log_info("Encrypting response for client...")
-            client_pub_key = base64.b64decode(client_pub_key_b64)
-
             encrypted_response = self.crypto_manager.encrypt_message(
                 response_history,
                 client_pub_key
             )
 
-            # Create the payload for the source endpoint
             source_payload = {
                 'client_public_key': client_pub_key_b64,
-                **encrypted_response  # Include chat_history, cipherkey, and iv
+                **encrypted_response
             }
 
-            # Validate the outgoing payload
             try:
                 jsonschema.validate(instance=source_payload, schema=MESSAGE_SCHEMA)
             except jsonschema.exceptions.ValidationError as e:
@@ -544,52 +558,47 @@ class RelayClient:
 
             log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
 
-            # Send the response to the relay
-            try:
-                request_kwargs = {
-                    'json': source_payload,
-                    'timeout': self._request_timeout,
-                }
-                headers = self._auth_headers()
-                if headers:
-                    request_kwargs['headers'] = headers
+            request_kwargs = {
+                'json': source_payload,
+                'timeout': self._request_timeout,
+            }
+            headers = self._auth_headers()
+            if headers:
+                request_kwargs['headers'] = headers
 
-                timeout = request_kwargs.pop('timeout', self._request_timeout)
-                source_response = requests.post(
-                    f'{self.relay_url}/source',
-                    timeout=timeout,
-                    **request_kwargs
-                )
+            timeout = request_kwargs.pop('timeout', self._request_timeout)
+            source_response = requests.post(
+                f'{self.relay_url}/source',
+                timeout=timeout,
+                **request_kwargs
+            )
 
-                log_info(
-                    "Response sent to /source. Status: {}, body length: {}",
-                    source_response.status_code,
-                    len(source_response.text)
-                )
+            log_info(
+                "Response sent to /source. Status: {}, body length: {}",
+                source_response.status_code,
+                len(source_response.text)
+            )
 
-                # Validate response beyond just status code
-                if source_response.status_code != 200:
-                    log_error("Error status from /source: {}", source_response.status_code)
-                    return False
-
-                # Check if response has valid content
-                response_content = source_response.text.strip()
-                if not response_content:
-                    log_error("Empty response from /source")
-                    return False
-
-                return True
-
-            except requests.ConnectionError as e:
-                log_error("Connection error when posting to /source: {}", str(e), exc_info=True)
-                return False
-            except requests.Timeout as e:
-                log_error("Request timeout when posting to /source: {}", str(e), exc_info=True)
-                return False
-            except requests.RequestException as e:
-                log_error("Request exception when posting to /source: {}", str(e), exc_info=True)
+            if source_response.status_code != 200:
+                log_error("Error status from /source: {}", source_response.status_code)
                 return False
 
+            response_content = source_response.text.strip()
+            if not response_content:
+                log_error("Empty response from /source")
+                return False
+
+            return True
+
+        except requests.ConnectionError as e:
+            log_error("Connection error when posting to relay source endpoint: {}", str(e), exc_info=True)
+            return False
+        except requests.Timeout as e:
+            log_error("Request timeout when posting to relay source endpoint: {}", str(e), exc_info=True)
+            return False
+        except requests.RequestException as e:
+            log_error("Request exception when posting to relay source endpoint: {}", str(e), exc_info=True)
+            return False
         except Exception as e:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
             return False

@@ -4,7 +4,7 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 
 ## Scope of this MVP
 
-- Single-screen UI for BYO GGUF model path + prompt entry.
+- Single-screen UI with a background compute-node operator mode plus a local prompt smoke-test panel.
 - Shows the canonical model family page and runtime GGUF artifact metadata from
   shared Python config/runtime logic.
 - Lets users either browse to an existing GGUF or download the configured GGUF
@@ -13,16 +13,16 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   - macOS arm64 => `Metal / Apple Silicon`
   - Windows x64 => `CUDA / NVIDIA`
   - other targets => `CPU fallback`
-- Sidecar-driven streaming output with explicit cancellation.
-- Optional `Encrypt + forward output` action that sends the final output through
-  the existing relay-compatible encrypted `/next_server` + `/faucet` flow.
+- Background compute-node mode that registers and polls via `/sink`, decrypts requests, runs local inference, and posts responses to `/source` (or `/stream/source` when streaming is requested by the relay contract).
+- Sidecar-driven local prompt smoke-test output with explicit cancellation.
+- Optional debug-only relay forward action for manual `/next_server` + `/faucet` checks.
 
-## Inference sidecar behavior
+## Compute-node bridge behavior
 
-Desktop now defaults to a Python NDJSON bridge
-(`src-tauri/python/inference_sidecar.py`) that reuses the shared
-`utils.llm.model_manager` runtime and emits the existing
-`started/token/done/canceled/error` event contract.
+Desktop includes a Python compute-node bridge
+(`src-tauri/python/compute_node_bridge.py`) that reuses
+`utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
+The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:
@@ -69,3 +69,6 @@ Desktop binaries are published by the GitHub Actions workflow
 
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.
+
+
+The local prompt panel still uses `src-tauri/python/inference_sidecar.py` as a smoke test for local model setup.

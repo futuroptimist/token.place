@@ -252,9 +252,10 @@ def test_api_v1_chat_completion_supports_distributed_provider_contract(client, m
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
 
     payload = {
-        'model': 'llama-3-8b-instruct',
+        'model': 'remote-only-model',
         'messages': [{'role': 'user', 'content': 'Ping distributed runtime'}],
         'temperature': 0.2,
+        'stop': ['END'],
     }
     response = client.post('/api/v1/chat/completions', json=payload)
     assert response.status_code == 200
@@ -262,9 +263,10 @@ def test_api_v1_chat_completion_supports_distributed_provider_contract(client, m
     assert data['choices'][0]['message']['content'] == 'distributed-path response'
 
     assert captured['url'] == 'https://compute.example/api/v1/chat/completions'
-    assert captured['json']['model'] == 'llama-3-8b-instruct'
+    assert captured['json']['model'] == 'remote-only-model'
     assert captured['json']['messages'][0]['content'] == 'Ping distributed runtime'
     assert captured['json']['stream'] is False
+    assert captured['json']['stop'] == ['END']
 
 
 def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
@@ -278,7 +280,6 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
         'content': 'local fallback response',
     }
 
-    monkeypatch.setattr('api.v1.compute_provider.get_model_instance', lambda _model: 'MOCK_MODEL')
     monkeypatch.setattr(
         'api.v1.compute_provider.generate_response',
         lambda _model, messages, **_options: messages + [fallback_message],

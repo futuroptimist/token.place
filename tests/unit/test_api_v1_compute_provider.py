@@ -58,7 +58,6 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(mon
 
     fallback_message = {"role": "assistant", "content": "local fallback"}
 
-    monkeypatch.setattr("api.v1.compute_provider.get_model_instance", lambda _model: "MOCK_MODEL")
     monkeypatch.setattr(
         "api.v1.compute_provider.generate_response",
         lambda _model, messages, **_options: messages + [fallback_message],

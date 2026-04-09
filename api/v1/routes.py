@@ -27,14 +27,13 @@ from api.v1.community import (
 )
 from api.v1.models import (
     get_models_info,
-    get_model_instance,
     ModelError,
     resolve_model_alias,
 )
 from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
-    validate_chat_messages, validate_encrypted_request, validate_model_name,
+    validate_chat_messages, validate_encrypted_request,
     validate_image_generation_payload,
 )
 from config import get_config
@@ -166,6 +165,7 @@ def _extract_chat_completion_options(data: dict) -> dict:
         "max_tokens",
         "frequency_penalty",
         "presence_penalty",
+        "stop",
         "tools",
         "tool_choice",
         "response_format",
@@ -208,9 +208,6 @@ def _handle_chat_completion_request(data):
                 status_code=400,
             )
 
-        models = get_models_info()
-        available_model_ids = [model["id"] for model in models]
-
         requested_model_id = data["model"]
         response_model_id = requested_model_id
         model_id = resolve_model_alias(requested_model_id) or requested_model_id
@@ -218,11 +215,6 @@ def _handle_chat_completion_request(data):
             log_info(
                 f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
             )
-
-        validate_model_name(model_id, available_model_ids)
-
-        get_model_instance(model_id)
-        log_info(f"Model instance obtained for {model_id}")
 
         messages = None
         client_public_key = None
@@ -445,19 +437,6 @@ def _handle_text_completion_request(data):
                 error_type="invalid_request_error",
                 param="model",
                 status_code=400,
-            )
-
-        try:
-            get_model_instance(model_id)
-            log_info(f"Model instance obtained for {model_id}")
-        except ModelError as e:
-            log_warning(f"Model error: {e.message}")
-            return format_error_response(
-                e.message,
-                error_type=e.error_type,
-                param="model",
-                code="model_not_found" if e.error_type == "model_not_found" else None,
-                status_code=e.status_code,
             )
 
         messages = [{"role": "user", "content": prompt}]

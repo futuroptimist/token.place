@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
 import requests
 
-from api.v1.models import generate_response, get_model_instance
+from api.v1.models import generate_response
 
 logger = logging.getLogger("api.v1.compute_provider")
 
@@ -46,7 +47,6 @@ class LocalApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        get_model_instance(model_id)
         updated_messages = generate_response(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
@@ -143,16 +143,15 @@ class FallbackApiV1ComputeProvider:
             )
 
 
-def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
-    """Resolve the active provider based on environment configuration."""
+@lru_cache(maxsize=8)
+def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1ComputeProvider:
+    """Create a compute provider for the normalized environment inputs."""
 
-    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
     local_provider = LocalApiV1ComputeProvider()
 
     if mode != "distributed":
         return local_provider
 
-    distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
     if not distributed_url:
         logger.warning(
             "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed set without "
@@ -162,3 +161,11 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
 
     distributed_provider = DistributedApiV1ComputeProvider(base_url=distributed_url)
     return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
+
+
+def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
+    """Resolve the active provider based on environment configuration."""
+
+    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
+    distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    return _build_api_v1_compute_provider(mode, distributed_url)

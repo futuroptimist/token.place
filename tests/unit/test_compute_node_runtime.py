@@ -142,6 +142,30 @@ def test_compute_node_runtime_process_relay_request_returns_false_for_unknown_pa
     relay_client.process_client_request.assert_not_called()
 
 
+def test_compute_node_runtime_respects_explicit_empty_adapter_list():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+        request_adapters=[],
+    )
+
+    legacy_payload = {
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+    assert runtime.process_relay_request(legacy_payload) is False
+    relay_client.process_client_request.assert_not_called()
+
+
 def test_legacy_relay_request_adapter_only_matches_legacy_contract():
     relay_client = MagicMock()
     adapter = LegacyRelayRequestAdapter(relay_client)

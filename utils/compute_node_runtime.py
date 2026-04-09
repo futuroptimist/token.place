@@ -5,12 +5,11 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Any, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence
 from urllib.parse import urlparse
 
-from utils.crypto.crypto_manager import get_crypto_manager
-from utils.llm.model_manager import get_model_manager
-from utils.networking.relay_client import RelayClient
+if TYPE_CHECKING:
+    from utils.networking.relay_client import RelayClient
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,7 @@ class RelayRequestAdapter(Protocol):
 class LegacyRelayRequestAdapter:
     """Compatibility adapter for the existing relay sink/source request shape."""
 
-    def __init__(self, relay_client: RelayClient):
+    def __init__(self, relay_client: "RelayClient"):
         self._relay_client = relay_client
 
     def can_process(self, request_data: Dict[str, Any]) -> bool:
@@ -142,12 +141,16 @@ class ComputeNodeRuntime:
         self,
         runtime_config: ComputeNodeRuntimeConfig,
         *,
-        relay_client: Optional[RelayClient] = None,
+        relay_client: Optional["RelayClient"] = None,
         crypto_manager=None,
         model_manager=None,
         thread_factory: Callable[..., threading.Thread] = threading.Thread,
         request_adapters: Optional[Sequence[RelayRequestAdapter]] = None,
     ):
+        from utils.crypto.crypto_manager import get_crypto_manager
+        from utils.llm.model_manager import get_model_manager
+        from utils.networking.relay_client import RelayClient
+
         self.config = runtime_config
         self._thread_factory = thread_factory
         self.model_manager = model_manager or get_model_manager()
@@ -158,9 +161,10 @@ class ComputeNodeRuntime:
             crypto_manager=self.crypto_manager,
             model_manager=self.model_manager,
         )
-        self.request_adapters: List[RelayRequestAdapter] = list(
-            request_adapters or [LegacyRelayRequestAdapter(self.relay_client)]
-        )
+        if request_adapters is None:
+            self.request_adapters = [LegacyRelayRequestAdapter(self.relay_client)]
+        else:
+            self.request_adapters = list(request_adapters)
 
     def ensure_model_ready(self) -> bool:
         """Initialize model runtime and report readiness."""

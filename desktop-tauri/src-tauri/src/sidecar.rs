@@ -151,6 +151,13 @@ fn resolve_default_sidecar_script() -> String {
     "../sidecar/fake_llama_sidecar.py".into()
 }
 
+fn should_force_fake_sidecar() -> bool {
+    matches!(
+        std::env::var("TOKEN_PLACE_USE_FAKE_SIDECAR").as_deref(),
+        Ok("1")
+    )
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -168,8 +175,13 @@ pub async fn start_sidecar(
         *state.stdin.lock().await = None;
     }
 
-    let sidecar_script =
-        std::env::var("TOKEN_PLACE_SIDECAR").unwrap_or_else(|_| resolve_default_sidecar_script());
+    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR").unwrap_or_else(|_| {
+        if should_force_fake_sidecar() {
+            "../sidecar/fake_llama_sidecar.py".into()
+        } else {
+            resolve_default_sidecar_script()
+        }
+    });
 
     let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")

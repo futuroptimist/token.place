@@ -24,9 +24,13 @@ Desktop now defaults to a Python NDJSON bridge
 `utils.llm.model_manager` runtime and emits the existing
 `started/token/done/canceled/error` event contract.
 
-For CI and fast local testing, the fake sidecar remains available at
-`sidecar/fake_llama_sidecar.py` and can be selected by setting
-`TOKEN_PLACE_SIDECAR`.
+The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
+and fast local testing:
+
+- Set `TOKEN_PLACE_USE_FAKE_SIDECAR=1` to explicitly opt into the fake sidecar.
+- Set `TOKEN_PLACE_SIDECAR=/full/path/to/script.py` to explicitly override the
+  sidecar command path (this takes precedence over
+  `TOKEN_PLACE_USE_FAKE_SIDECAR`).
 
 ## Run locally
 

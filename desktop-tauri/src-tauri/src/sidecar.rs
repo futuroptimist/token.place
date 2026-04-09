@@ -1,6 +1,6 @@
 use crate::backend::ComputeMode;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +80,57 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
     Command::new(sidecar_path)
 }
 
+fn find_existing_inference_bridge_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            candidates.push(exe_dir.join("python").join("inference_bridge.py"));
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("inference_bridge.py"),
+            );
+            candidates.push(
+                exe_dir
+                    .join("..")
+                    .join("Resources")
+                    .join("python")
+                    .join("inference_bridge.py"),
+            );
+        }
+    }
+
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("inference_bridge.py"),
+    );
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn default_sidecar_script() -> String {
+    if let Ok(sidecar) = std::env::var("TOKEN_PLACE_SIDECAR") {
+        return sidecar;
+    }
+
+    if std::env::var("TOKEN_PLACE_USE_FAKE_SIDECAR")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return "../sidecar/fake_llama_sidecar.py".into();
+    }
+
+    if let Some(path) = find_existing_inference_bridge_path() {
+        return path.to_string_lossy().to_string();
+    }
+
+    "../sidecar/fake_llama_sidecar.py".into()
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -97,8 +148,7 @@ pub async fn start_sidecar(
         *state.stdin.lock().await = None;
     }
 
-    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR")
-        .unwrap_or_else(|_| "../sidecar/fake_llama_sidecar.py".into());
+    let sidecar_script = default_sidecar_script();
 
     let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")
@@ -174,6 +224,7 @@ pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::NamedTempFile;
     use tokio::process::Command;
 
@@ -217,5 +268,43 @@ mod tests {
             .expect("collect events");
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn real_bridge_happy_path_with_mock_runtime() {
+        let mut model = NamedTempFile::new().expect("tempfile");
+        model.write_all(b"not-a-real-model").expect("write model");
+        let mut child = Command::new("python3")
+            .arg("../python/inference_bridge.py")
+            .arg("--model")
+            .arg(model.path())
+            .arg("--mode")
+            .arg("cpu")
+            .arg("--prompt")
+            .arg("hello world")
+            .env("USE_MOCK_LLM", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn inference bridge");
+
+        let stdout = child.stdout.take().expect("stdout");
+        let events = collect_events_from_stdout(stdout)
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Token { .. })));
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[test]
+    fn respects_fake_sidecar_override() {
+        let key = "TOKEN_PLACE_USE_FAKE_SIDECAR";
+        std::env::set_var(key, "1");
+        let selected = default_sidecar_script();
+        std::env::remove_var(key);
+        assert_eq!(selected, "../sidecar/fake_llama_sidecar.py");
     }
 }

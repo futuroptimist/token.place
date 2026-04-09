@@ -24,6 +24,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "python/*.py",
+      "../sidecar/fake_llama_sidecar.py"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -304,3 +304,61 @@ def test_run_cancels_during_streaming_after_started(tmp_path, capsys):
 
 def test_extract_text_from_completion_handles_non_dict_message():
     assert inference_sidecar._extract_text_from_completion({'choices': [{'message': 'x'}]}) == ''
+
+
+def test_extract_text_from_completion_handles_empty_choices():
+    assert inference_sidecar._extract_text_from_completion({}) == ''
+
+
+def test_normalize_chunk_fallback_handles_typeerror_and_unknown_shape():
+    class WithBadDict:
+        def dict(self, required):  # pragma: no cover - signature intentionally incompatible
+            return {'choices': []}
+
+    class UnknownShape:
+        pass
+
+    assert inference_sidecar._fallback_normalize_chunk(WithBadDict()) == {}
+    assert inference_sidecar._fallback_normalize_chunk(UnknownShape()) == {}
+
+
+def test_stream_content_ignores_invalid_chunks_and_stops_on_finish_reason(capsys):
+    inference_sidecar._stdin_lines = queue.Queue()
+    inference_sidecar._stdin_reader_started = True
+
+    chunks = iter(
+        [
+            {'choices': []},
+            {'choices': [{'delta': 'not-a-dict', 'finish_reason': None}]},
+            {'choices': [{'delta': {'content': 'ok'}, 'finish_reason': 'stop'}]},
+            {'choices': [{'delta': {'content': 'skipped-after-stop'}, 'finish_reason': None}]},
+        ]
+    )
+    text, canceled = inference_sidecar._stream_content(chunks, lambda chunk: chunk)
+
+    assert canceled is False
+    assert text == 'ok'
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [{'type': 'token', 'text': 'ok'}]
+
+
+def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, capsys):
+    class EmptyLlm:
+        def create_chat_completion(self, **kwargs):
+            if kwargs.get('stream') is False:
+                return {'choices': [{'message': {'content': ''}}]}
+            return iter([{'choices': [{'delta': {}, 'finish_reason': 'stop'}]}])
+
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager(llm=EmptyLlm())
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event['type'] for event in events] == ['started', 'done']

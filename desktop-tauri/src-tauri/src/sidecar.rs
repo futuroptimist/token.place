@@ -71,7 +71,7 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
 
     if is_python {
         let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python".into());
+            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
         let mut cmd = Command::new(python_bin);
         cmd.arg(sidecar_path);
         return cmd;
@@ -81,15 +81,66 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
 }
 
 fn resolve_default_sidecar_script() -> String {
-    let candidates = [
+    let mut candidates = Vec::new();
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("inference_sidecar.py"),
+            );
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("fake_llama_sidecar.py"),
+            );
+            candidates.push(exe_dir.join("inference_sidecar.py"));
+            candidates.push(exe_dir.join("fake_llama_sidecar.py"));
+
+            if let Some(parent_dir) = exe_dir.parent() {
+                candidates.push(
+                    parent_dir
+                        .join("Resources")
+                        .join("python")
+                        .join("inference_sidecar.py"),
+                );
+                candidates.push(
+                    parent_dir
+                        .join("Resources")
+                        .join("python")
+                        .join("fake_llama_sidecar.py"),
+                );
+                candidates.push(
+                    parent_dir
+                        .join("resources")
+                        .join("python")
+                        .join("inference_sidecar.py"),
+                );
+                candidates.push(
+                    parent_dir
+                        .join("resources")
+                        .join("python")
+                        .join("fake_llama_sidecar.py"),
+                );
+            }
+        }
+    }
+
+    candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("python")
             .join("inference_sidecar.py"),
+    );
+    candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("sidecar")
             .join("fake_llama_sidecar.py"),
-    ];
+    );
 
     for candidate in candidates {
         if candidate.is_file() {
@@ -227,6 +278,7 @@ mod tests {
             .arg("cpu")
             .arg("--prompt")
             .arg("hello world")
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn fake sidecar");
@@ -255,6 +307,7 @@ mod tests {
             .arg("--prompt")
             .arg("hello world")
             .env("USE_MOCK_LLM", "1")
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn bridge sidecar");

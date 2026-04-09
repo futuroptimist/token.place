@@ -10,7 +10,7 @@ import queue
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Callable, Dict, Iterable, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -65,7 +65,7 @@ def canceled_requested() -> bool:
             return True
 
 
-def _normalize_chunk(chunk: Any) -> Dict[str, Any]:
+def _fallback_normalize_chunk(chunk: Any) -> Dict[str, Any]:
     if isinstance(chunk, dict):
         return chunk
 
@@ -84,7 +84,10 @@ def _normalize_chunk(chunk: Any) -> Dict[str, Any]:
     return {}
 
 
-def _stream_content(completion: Iterable[Any]) -> Tuple[str, bool]:
+def _stream_content(
+    completion: Iterable[Any],
+    normalize_chunk: Callable[[Any], Dict[str, Any]],
+) -> Tuple[str, bool]:
     full_text = []
     emitted = False
     for raw_chunk in completion:
@@ -92,7 +95,7 @@ def _stream_content(completion: Iterable[Any]) -> Tuple[str, bool]:
             emit({"type": "canceled"})
             return "", True
 
-        chunk = _normalize_chunk(raw_chunk)
+        chunk = normalize_chunk(raw_chunk)
         choices = chunk.get("choices") or []
         if not choices:
             continue
@@ -112,12 +115,27 @@ def _stream_content(completion: Iterable[Any]) -> Tuple[str, bool]:
     return "".join(full_text) if emitted else "", False
 
 
+def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
+    choices = completion.get("choices") or [{}]
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    return message.get("content", "") if isinstance(message, dict) else ""
+
+
+def _apply_compute_mode(manager: Any, mode: str) -> None:
+    selected = (mode or "auto").lower()
+    if selected == "cpu":
+        manager.default_n_gpu_layers = 0
+    elif selected in {"metal", "cuda"}:
+        manager.default_n_gpu_layers = -1
+
+
 def run(args: argparse.Namespace) -> int:
     if not os.path.exists(args.model):
         return emit_error("bad_model", "model path not found")
 
     try:
-        from utils.llm.model_manager import get_model_manager
+        from utils.llm.model_manager import ModelManager, get_model_manager
     except ModuleNotFoundError as exc:
         return emit_error(
             "runtime_unavailable",
@@ -126,9 +144,7 @@ def run(args: argparse.Namespace) -> int:
 
     manager = get_model_manager()
     manager.model_path = args.model
-
-    if os.getenv("TOKEN_PLACE_USE_FAKE_SIDECAR") == "1":
-        manager.use_mock_llm = True
+    _apply_compute_mode(manager, args.mode)
 
     llm = manager.get_llm_instance()
     if llm is None:
@@ -140,26 +156,44 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     messages = [{"role": "user", "content": args.prompt}]
+    request_kwargs = {
+        "messages": messages,
+        "max_tokens": manager.config.get("model.max_tokens", 512),
+        "temperature": manager.config.get("model.temperature", 0.7),
+        "top_p": manager.config.get("model.top_p", 0.9),
+        "stop": manager.config.get("model.stop_tokens", []),
+    }
     try:
         completion = llm.create_chat_completion(
-            messages=messages,
-            max_tokens=manager.config.get("model.max_tokens", 512),
-            temperature=manager.config.get("model.temperature", 0.7),
-            top_p=manager.config.get("model.top_p", 0.9),
-            stop=manager.config.get("model.stop_tokens", []),
+            **request_kwargs,
             stream=True,
         )
     except Exception as exc:  # pragma: no cover - defensive runtime handling
         return emit_error("inference_failed", f"streaming completion failed: {exc}")
 
+    normalize_chunk = getattr(ModelManager, "_normalize_stream_chunk", _fallback_normalize_chunk)
+
     if isinstance(completion, dict):
-        text = ((completion.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        text = _extract_text_from_completion(completion)
         if text:
             emit({"type": "token", "text": text})
     else:
-        _, canceled = _stream_content(completion)
+        text, canceled = _stream_content(completion, normalize_chunk)
         if canceled:
             return 0
+
+        if not text:
+            try:
+                fallback = llm.create_chat_completion(
+                    **request_kwargs,
+                    stream=False,
+                )
+            except Exception as exc:  # pragma: no cover - defensive runtime handling
+                return emit_error("inference_failed", f"non-streaming completion failed: {exc}")
+
+            fallback_text = _extract_text_from_completion(fallback)
+            if fallback_text:
+                emit({"type": "token", "text": fallback_text})
 
     emit({"type": "done"})
     return 0
@@ -168,7 +202,7 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop inference sidecar")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mode", default="auto")
+    parser.add_argument("--mode", default="auto", choices=["auto", "metal", "cuda", "cpu"])
     parser.add_argument("--prompt", required=True)
     args = parser.parse_args()
     try:

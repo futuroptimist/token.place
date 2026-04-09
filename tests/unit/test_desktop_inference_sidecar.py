@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -27,7 +28,10 @@ class FakeConfig:
 
 
 class FakeLlm:
-    def create_chat_completion(self, **_kwargs):
+    def create_chat_completion(self, **kwargs):
+        if kwargs.get('stream') is False:
+            return {'choices': [{'message': {'content': 'fallback response'}}]}
+
         return iter(
             [
                 {'choices': [{'delta': {'content': 'Hello'}, 'finish_reason': None}]},
@@ -37,19 +41,51 @@ class FakeLlm:
         )
 
 
+class FakeStreamNoContentLlm:
+    def create_chat_completion(self, **kwargs):
+        if kwargs.get('stream') is False:
+            return {'choices': [{'message': {'content': 'fallback response'}}]}
+
+        return iter(
+            [
+                {'choices': [{'delta': {}, 'finish_reason': None}]},
+                {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
+            ]
+        )
+
+
 class FakeManager:
-    def __init__(self):
+    def __init__(self, llm=None):
         self.config = FakeConfig()
         self.model_path = ''
         self.use_mock_llm = False
+        self.default_n_gpu_layers = -1
+        self._llm = llm or FakeLlm()
 
     def get_llm_instance(self):
-        return FakeLlm()
+        return self._llm
+
+
+@pytest.fixture(autouse=True)
+def restore_model_manager_module():
+    original = sys.modules.get('utils.llm.model_manager')
+    yield
+    if original is None:
+        sys.modules.pop('utils.llm.model_manager', None)
+    else:
+        sys.modules['utils.llm.model_manager'] = original
 
 
 def _install_fake_manager_module(manager):
     module = ModuleType('utils.llm.model_manager')
     module.get_model_manager = lambda: manager
+
+    class _ModelManager:
+        @staticmethod
+        def _normalize_stream_chunk(chunk):
+            return chunk
+
+    module.ModelManager = _ModelManager
     sys.modules['utils.llm.model_manager'] = module
 
 
@@ -84,6 +120,7 @@ def test_run_streams_started_token_done_with_shared_runtime(tmp_path, capsys):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'token', 'token', 'done']
+    assert manager.default_n_gpu_layers == 0
 
 
 def test_run_emits_canceled_when_cancel_signal_arrives(tmp_path, capsys):
@@ -101,3 +138,20 @@ def test_run_emits_canceled_when_cancel_signal_arrives(tmp_path, capsys):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'canceled']
+
+
+def test_run_falls_back_to_non_streaming_when_stream_is_empty(tmp_path, capsys):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager(llm=FakeStreamNoContentLlm())
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='Say hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event['type'] for event in events] == ['started', 'token', 'done']
+    assert events[1]['text'] == 'fallback response'

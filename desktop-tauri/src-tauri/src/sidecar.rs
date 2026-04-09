@@ -80,6 +80,48 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
     Command::new(sidecar_path)
 }
 
+fn should_use_mock_sidecar() -> bool {
+    std::env::var("TOKEN_PLACE_USE_FAKE_SIDECAR")
+        .ok()
+        .is_some_and(|value| value == "1")
+        || std::env::var("TOKEN_PLACE_SIDECAR_KIND")
+            .ok()
+            .is_some_and(|value| value.eq_ignore_ascii_case("mock"))
+}
+
+fn resolve_default_sidecar_path() -> String {
+    if should_use_mock_sidecar() {
+        return "../sidecar/fake_llama_sidecar.py".into();
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let packaged = exe_dir
+                .join("resources")
+                .join("python")
+                .join("inference_bridge.py");
+            if packaged.is_file() {
+                return packaged.to_string_lossy().to_string();
+            }
+
+            let macos_bundle = exe_dir
+                .join("..")
+                .join("Resources")
+                .join("python")
+                .join("inference_bridge.py");
+            if macos_bundle.is_file() {
+                return macos_bundle.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join("inference_bridge.py")
+        .to_string_lossy()
+        .to_string()
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -97,8 +139,8 @@ pub async fn start_sidecar(
         *state.stdin.lock().await = None;
     }
 
-    let sidecar_script = std::env::var("TOKEN_PLACE_SIDECAR")
-        .unwrap_or_else(|_| "../sidecar/fake_llama_sidecar.py".into());
+    let sidecar_script =
+        std::env::var("TOKEN_PLACE_SIDECAR").unwrap_or_else(|_| resolve_default_sidecar_path());
 
     let mut child = build_sidecar_command(&sidecar_script)
         .arg("--model")
@@ -217,5 +259,52 @@ mod tests {
             .expect("collect events");
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn inference_bridge_happy_path_uses_shared_runtime() {
+        let model = NamedTempFile::new().expect("tempfile");
+        let bridge_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("inference_bridge.py");
+        let mut child = Command::new("python3")
+            .arg(bridge_path)
+            .arg("--model")
+            .arg(model.path())
+            .arg("--mode")
+            .arg("cpu")
+            .arg("--prompt")
+            .arg("hello world")
+            .env("USE_MOCK_LLM", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn inference bridge");
+
+        let stdout = child.stdout.take().expect("stdout");
+        let events = collect_events_from_stdout(stdout)
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Token { text } if !text.trim().is_empty())));
+    }
+
+    #[test]
+    fn defaults_to_real_inference_bridge() {
+        std::env::remove_var("TOKEN_PLACE_USE_FAKE_SIDECAR");
+        std::env::remove_var("TOKEN_PLACE_SIDECAR_KIND");
+        let path = resolve_default_sidecar_path();
+        assert!(path.ends_with("python/inference_bridge.py"));
+    }
+
+    #[test]
+    fn supports_mock_sidecar_opt_in() {
+        std::env::set_var("TOKEN_PLACE_USE_FAKE_SIDECAR", "1");
+        let path = resolve_default_sidecar_path();
+        std::env::remove_var("TOKEN_PLACE_USE_FAKE_SIDECAR");
+        assert!(path.ends_with("sidecar/fake_llama_sidecar.py"));
     }
 }

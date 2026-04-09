@@ -14,18 +14,26 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   - Windows x64 => `CUDA / NVIDIA`
   - other targets => `CPU fallback`
 - Sidecar-driven streaming output with explicit cancellation.
+  - Defaults to `src-tauri/python/inference_bridge.py`, which reuses the shared
+    Python model runtime for real local inference.
+  - Keeps `sidecar/fake_llama_sidecar.py` available via
+    `TOKEN_PLACE_USE_FAKE_SIDECAR=1` (or `TOKEN_PLACE_SIDECAR_KIND=mock`) for
+    CI and fast local tests.
 - Optional `Encrypt + forward output` action that sends the final output through
   the existing relay-compatible encrypted `/next_server` + `/faucet` flow.
 
-## Why a fake sidecar for this slice?
+## Sidecar contract
 
-To keep this PR vertical and small, the app uses a tiny NDJSON sidecar
-(`sidecar/fake_llama_sidecar.py`) that models the interface we need for
-llama.cpp integration (start/token/done/error/canceled) without requiring model
-runtime packaging in CI.
+Desktop inference consumes NDJSON events with this contract:
 
-The seam is intentionally replaceable: swap the sidecar executable and preserve
-the JSON event contract.
+- `started`
+- `token`
+- `done`
+- `canceled`
+- `error`
+
+`inference_bridge.py` emits this same contract while using the shared Python
+runtime and model manager. The fake sidecar remains opt-in for CI/dev speed.
 
 ## Run locally
 

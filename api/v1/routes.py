@@ -43,6 +43,7 @@ from utils.providers import (
     ProviderRegistryError,
 )
 from utils.vision import ImageGenerationError, LocalImageGenerator
+from utils.compute_provider import build_chat_compute_provider
 
 # Expose directory loaders for tests and backwards compatibility
 get_community_provider_directory = _get_community_provider_directory
@@ -109,6 +110,15 @@ def _configured_relay_servers() -> list[str]:
 
 
 _image_generator = LocalImageGenerator()
+
+
+def _chat_compute_provider():
+    """Resolve the API v1 chat compute provider for this request."""
+
+    return build_chat_compute_provider(
+        local_handler=generate_response,
+        warning_logger=log_warning,
+    )
 
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
@@ -200,8 +210,10 @@ def _handle_chat_completion_request(data):
 
         validate_model_name(model_id, available_model_ids)
 
-        model_instance = get_model_instance(model_id)
-        log_info(f"Model instance obtained for {model_id}")
+        compute_provider = _chat_compute_provider()
+        if compute_provider.requires_local_model_validation:
+            get_model_instance(model_id)
+            log_info(f"Model instance obtained for {model_id}")
 
         messages = None
         client_public_key = None
@@ -293,7 +305,7 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
+        updated_messages = compute_provider.generate(model_id, messages)
 
         assistant_message = updated_messages[-1]
         log_info("Response generated successfully")
@@ -417,18 +429,20 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        try:
-            get_model_instance(model_id)
-            log_info(f"Model instance obtained for {model_id}")
-        except ModelError as e:
-            log_warning(f"Model error: {e.message}")
-            return format_error_response(
-                e.message,
-                error_type=e.error_type,
-                param="model",
-                code="model_not_found" if e.error_type == "model_not_found" else None,
-                status_code=e.status_code,
-            )
+        compute_provider = _chat_compute_provider()
+        if compute_provider.requires_local_model_validation:
+            try:
+                get_model_instance(model_id)
+                log_info(f"Model instance obtained for {model_id}")
+            except ModelError as e:
+                log_warning(f"Model error: {e.message}")
+                return format_error_response(
+                    e.message,
+                    error_type=e.error_type,
+                    param="model",
+                    code="model_not_found" if e.error_type == "model_not_found" else None,
+                    status_code=e.status_code,
+                )
 
         messages = [{"role": "user", "content": prompt}]
 
@@ -446,7 +460,7 @@ def _handle_text_completion_request(data):
             )
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
+        updated_messages = compute_provider.generate(model_id, messages)
 
         assistant_message = updated_messages[-1]
         log_info("Response generated successfully")

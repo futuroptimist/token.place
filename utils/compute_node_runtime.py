@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any, Protocol
 from urllib.parse import urlparse
 
 from utils.crypto.crypto_manager import get_crypto_manager
@@ -39,6 +39,44 @@ class ComputeNodeRuntimeConfig:
 
     relay_url: str
     relay_port: Optional[int]
+
+
+RELAY_ASSIGNMENT_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
+
+
+def has_relay_assignment(payload: Dict[str, Any]) -> bool:
+    """Return ``True`` when the relay payload includes an inference assignment."""
+
+    return RELAY_ASSIGNMENT_REQUIRED_FIELDS.issubset(payload.keys())
+
+
+class RelayTransport(Protocol):
+    """Abstraction over relay request polling and source publishing."""
+
+    def poll_once(self) -> Dict[str, Any]:
+        ...
+
+    def process_request(self, request_data: Dict[str, Any]) -> bool:
+        ...
+
+    def stop(self) -> None:
+        ...
+
+
+class LegacyRelaySinkSourceAdapter:
+    """Adapter preserving the legacy sink/source transport during migration."""
+
+    def __init__(self, relay_client: RelayClient):
+        self._relay_client = relay_client
+
+    def poll_once(self) -> Dict[str, Any]:
+        return self._relay_client.ping_relay()
+
+    def process_request(self, request_data: Dict[str, Any]) -> bool:
+        return self._relay_client.process_client_request(request_data)
+
+    def stop(self) -> None:
+        self._relay_client.stop()
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -112,6 +150,7 @@ class ComputeNodeRuntime:
         crypto_manager=None,
         model_manager=None,
         thread_factory: Callable[..., threading.Thread] = threading.Thread,
+        relay_transport: Optional[RelayTransport] = None,
     ):
         self.config = runtime_config
         self._thread_factory = thread_factory
@@ -122,6 +161,9 @@ class ComputeNodeRuntime:
             port=runtime_config.relay_port,
             crypto_manager=self.crypto_manager,
             model_manager=self.model_manager,
+        )
+        self.relay_transport: RelayTransport = (
+            relay_transport or LegacyRelaySinkSourceAdapter(self.relay_client)
         )
 
     def ensure_model_ready(self) -> bool:
@@ -154,14 +196,20 @@ class ComputeNodeRuntime:
     def process_relay_request(self, request_data: Dict[str, Any]) -> bool:
         """Process a relay payload via decrypt -> infer -> encrypt -> respond flow."""
 
-        return self.relay_client.process_client_request(request_data)
+        return self.relay_transport.process_request(request_data)
 
     def register_and_poll_once(self) -> Dict[str, Any]:
         """Ping relay /sink and return response data."""
 
-        return self.relay_client.ping_relay()
+        return self.relay_transport.poll_once()
+
+    @staticmethod
+    def has_relay_assignment(response_data: Dict[str, Any]) -> bool:
+        """Check whether a relay response includes a compute request assignment."""
+
+        return has_relay_assignment(response_data)
 
     def stop(self) -> None:
         """Stop relay polling and network activity."""
 
-        self.relay_client.stop()
+        self.relay_transport.stop()

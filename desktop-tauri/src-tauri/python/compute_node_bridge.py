@@ -134,8 +134,7 @@ def run(args: argparse.Namespace) -> int:
             if not registered:
                 last_error = str(relay_response.get("error", "relay registration failed"))
             else:
-                required_fields = {"client_public_key", "chat_history", "cipherkey", "iv"}
-                if required_fields.issubset(relay_response.keys()):
+                if runtime.has_relay_assignment(relay_response):
                     processed = runtime.process_relay_request(relay_response)
                     if not processed:
                         last_error = "failed to process relay request"

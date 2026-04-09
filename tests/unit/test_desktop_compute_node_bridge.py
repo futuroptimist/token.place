@@ -70,6 +70,11 @@ class FakeRuntime:
         self._processed.append(payload)
         return True
 
+    @staticmethod
+    def has_relay_assignment(payload):
+        required_fields = {"client_public_key", "chat_history", "cipherkey", "iv"}
+        return required_fields.issubset(payload.keys())
+
     def stop(self):
         return None
 

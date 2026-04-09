@@ -66,6 +66,11 @@ class FakeManager:
         return self._llm
 
 
+class FakeDictCompletionLlm:
+    def create_chat_completion(self, **_kwargs):
+        return {'choices': [{'message': {'content': 'dict response'}}]}
+
+
 @pytest.fixture(autouse=True)
 def restore_model_manager_module():
     original = sys.modules.get('utils.llm.model_manager')
@@ -155,3 +160,70 @@ def test_run_falls_back_to_non_streaming_when_stream_is_empty(tmp_path, capsys):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'token', 'done']
     assert events[1]['text'] == 'fallback response'
+
+
+@pytest.mark.parametrize(
+    ('mode', 'expected'),
+    [('cpu', 0), ('metal', -1), ('cuda', -1), ('auto', -1)],
+)
+def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode=mode, prompt='Mode test')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    _ = capsys.readouterr()
+    assert manager.default_n_gpu_layers == expected
+
+
+def test_run_handles_dict_completion_payload(tmp_path, capsys):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager(llm=FakeDictCompletionLlm())
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event['type'] for event in events] == ['started', 'token', 'done']
+    assert events[1]['text'] == 'dict response'
+
+
+def test_normalize_chunk_fallback_handles_object_shapes():
+    class WithToDict:
+        def to_dict(self):
+            return {'choices': []}
+
+    class WithModelDump:
+        def model_dump(self):
+            return {'choices': [{'delta': {'content': 'x'}}]}
+
+    class WithDictMethod:
+        def dict(self):
+            return {'choices': [{'delta': {'content': 'y'}}]}
+
+    class WithDunderDict:
+        def __init__(self):
+            self.choices = [{'delta': {'content': 'z'}}]
+
+    assert inference_sidecar._fallback_normalize_chunk({'choices': []}) == {'choices': []}
+    assert inference_sidecar._fallback_normalize_chunk(WithToDict()) == {'choices': []}
+    assert inference_sidecar._fallback_normalize_chunk(WithModelDump()) == {
+        'choices': [{'delta': {'content': 'x'}}]
+    }
+    assert inference_sidecar._fallback_normalize_chunk(WithDictMethod()) == {
+        'choices': [{'delta': {'content': 'y'}}]
+    }
+    assert inference_sidecar._fallback_normalize_chunk(WithDunderDict()) == {
+        'choices': [{'delta': {'content': 'z'}}]
+    }

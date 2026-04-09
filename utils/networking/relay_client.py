@@ -8,6 +8,7 @@ import jsonschema
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
@@ -15,6 +16,20 @@ import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')
+
+try:
+    from encrypt import encrypt_stream_chunk, StreamSession
+except Exception:  # pragma: no cover - defensive import for degraded envs
+    encrypt_stream_chunk = None
+    StreamSession = None
+
+
+@dataclass
+class StreamingProcessingResult:
+    """Container for streamed response data."""
+
+    full_text: str
+    streamed_any: bool
 
 def get_config_lazy():
     """Lazy import of config to avoid circular imports"""
@@ -364,6 +379,123 @@ class RelayClient:
             return {}
         return {"X-Relay-Server-Token": self._registration_token}
 
+    def _post_stream_chunk(
+        self,
+        *,
+        session_id: str,
+        chunk: Dict[str, Any],
+        final: bool = False,
+    ) -> bool:
+        """Post a streaming chunk to relay /stream/source."""
+
+        payload: Dict[str, Any] = {
+            "session_id": session_id,
+            "chunk": chunk,
+        }
+        if final:
+            payload["final"] = True
+
+        try:
+            request_kwargs = {
+                'json': payload,
+                'timeout': self._request_timeout,
+            }
+            headers = self._auth_headers()
+            if headers:
+                request_kwargs['headers'] = headers
+
+            timeout = request_kwargs.pop('timeout', self._request_timeout)
+            response = requests.post(
+                f'{self.relay_url}/stream/source',
+                timeout=timeout,
+                **request_kwargs,
+            )
+            if response.status_code != 200:
+                log_error("Error status from /stream/source: {}", response.status_code)
+                return False
+            return True
+        except requests.RequestException as exc:
+            log_error("Failed posting /stream/source chunk: {}", str(exc), exc_info=True)
+            return False
+
+    def _emit_streaming_completion(
+        self,
+        *,
+        completion: Any,
+        client_pub_key_b64: str,
+        stream_session_id: str,
+    ) -> StreamingProcessingResult:
+        """Emit relay streaming chunks while aggregating final output text."""
+
+        streamed_any = False
+        text_parts: List[str] = []
+        stream_session: Optional[Any] = None
+
+        normalize_chunk = getattr(
+            self.model_manager,
+            "_normalize_stream_chunk",
+            lambda value: value if isinstance(value, dict) else {},
+        )
+
+        for raw_chunk in completion:
+            chunk = normalize_chunk(raw_chunk)
+            if not isinstance(chunk, dict):
+                continue
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+
+            delta = (choices[0] or {}).get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+
+            content = delta.get("content")
+            if content:
+                streamed_any = True
+                text_parts.append(content)
+                stream_payload: Dict[str, Any] = {"content": content}
+
+                if encrypt_stream_chunk is not None and StreamSession is not None:
+                    try:
+                        client_pub_key = base64.b64decode(client_pub_key_b64)
+                        encrypted_chunk, cipherkey, stream_session = encrypt_stream_chunk(
+                            content.encode("utf-8"),
+                            client_pub_key,
+                            session=stream_session,
+                        )
+                        stream_payload = {
+                            "encrypted": True,
+                            "data": {
+                                "chat_history": base64.b64encode(
+                                    encrypted_chunk["ciphertext"]
+                                ).decode("utf-8"),
+                                "iv": base64.b64encode(encrypted_chunk["iv"]).decode("utf-8"),
+                            },
+                        }
+                        if cipherkey is not None:
+                            stream_payload["data"]["cipherkey"] = base64.b64encode(
+                                cipherkey
+                            ).decode("utf-8")
+                    except Exception as exc:
+                        log_error("Failed to encrypt streaming chunk: {}", str(exc), exc_info=True)
+
+                self._post_stream_chunk(session_id=stream_session_id, chunk=stream_payload)
+
+            finish_reason = (choices[0] or {}).get("finish_reason")
+            if finish_reason:
+                break
+
+        self._post_stream_chunk(
+            session_id=stream_session_id,
+            chunk={"done": True},
+            final=True,
+        )
+        return StreamingProcessingResult(
+            full_text="".join(text_parts),
+            streamed_any=streamed_any,
+        )
+
     def start(self):
         """Start the polling loop by setting stop_polling to False"""
         self.stop_polling = False
@@ -517,7 +649,34 @@ class RelayClient:
 
             # Process with LLM
             log_info("Getting response from LLM...")
-            response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
+            streaming_enabled = bool(request_data.get("stream"))
+            stream_session_id = request_data.get("stream_session_id")
+            response_history = None
+
+            if streaming_enabled and isinstance(stream_session_id, str) and stream_session_id:
+                llm_instance = self.model_manager.get_llm_instance()
+                if llm_instance is not None:
+                    completion = llm_instance.create_chat_completion(
+                        messages=decrypted_chat_history,
+                        max_tokens=self.model_manager.config.get("model.max_tokens", 512),
+                        temperature=self.model_manager.config.get("model.temperature", 0.7),
+                        top_p=self.model_manager.config.get("model.top_p", 0.9),
+                        stop=self.model_manager.config.get("model.stop_tokens", []),
+                        stream=True,
+                    )
+                    streamed = self._emit_streaming_completion(
+                        completion=completion,
+                        client_pub_key_b64=client_pub_key_b64,
+                        stream_session_id=stream_session_id,
+                    )
+                    response_history = list(decrypted_chat_history)
+                    response_history.append(
+                        {"role": "assistant", "content": streamed.full_text}
+                    )
+
+            if response_history is None:
+                response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
+
             log_info("LLM generated response")
 
             # Encrypt the response for the client

@@ -36,6 +36,16 @@ interface SidecarEvent {
   message?: string;
 }
 
+interface ComputeNodeStatus {
+  state: string;
+  registered: boolean;
+  running: boolean;
+  relay_url: string;
+  backend_mode: string;
+  model_path: string;
+  last_error: string;
+}
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -61,6 +71,15 @@ export function App() {
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [operatorStatus, setOperatorStatus] = useState<ComputeNodeStatus>({
+    state: 'stopped',
+    registered: false,
+    running: false,
+    relay_url: '',
+    backend_mode: 'unknown',
+    model_path: '',
+    last_error: '',
+  });
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
@@ -71,6 +90,8 @@ export function App() {
       try {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
         setConfig(loadedConfig);
+        const status = await invoke<ComputeNodeStatus>('compute_node_status');
+        setOperatorStatus(status);
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
@@ -112,6 +133,15 @@ export function App() {
         setStatus('failed');
         setError(payload.message ?? payload.code ?? 'unknown error');
       }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<ComputeNodeStatus>('compute_node_status', (evt) => {
+      setOperatorStatus(evt.payload);
     });
     return () => {
       unlisten.then((f) => f());
@@ -217,10 +247,57 @@ export function App() {
     }
   };
 
+  const startOperator = async () => {
+    setError('');
+    try {
+      await invoke('start_compute_node', {
+        request: {
+          model_path: config.model_path,
+          relay_base_url: config.relay_base_url,
+          preferred_mode: config.preferred_mode,
+        },
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const stopOperator = async () => {
+    setError('');
+    try {
+      await invoke('stop_compute_node');
+      const status = await invoke<ComputeNodeStatus>('compute_node_status');
+      setOperatorStatus(status);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop (Tauri MVP)</h1>
       <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
+      <section style={{ border: '1px solid #ddd', padding: 12, marginBottom: 12 }}>
+        <h2 style={{ marginTop: 0 }}>Compute node operator (production path)</h2>
+        <p style={{ marginBottom: 8 }}>
+          Status: <strong>{operatorStatus.state}</strong> · Registered:{' '}
+          <strong>{operatorStatus.registered ? 'yes' : 'no'}</strong>
+        </p>
+        <ul style={{ marginTop: 0 }}>
+          <li>Active relay URL: <code>{operatorStatus.relay_url || config.relay_base_url}</code></li>
+          <li>Backend mode: <code>{operatorStatus.backend_mode}</code></li>
+          <li>Model path: <code>{operatorStatus.model_path || config.model_path || 'unset'}</code></li>
+          <li>Last error: <code>{operatorStatus.last_error || 'none'}</code></li>
+        </ul>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button type="button" onClick={startOperator} disabled={!config.model_path || operatorStatus.running}>
+            Start compute node
+          </button>
+          <button type="button" onClick={stopOperator} disabled={!operatorStatus.running}>
+            Stop compute node
+          </button>
+        </div>
+      </section>
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
         <input
@@ -263,13 +340,13 @@ export function App() {
         <option value="cpu">CPU fallback</option>
       </select>
 
-      <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
+      <label style={{ display: 'block', marginTop: 12 }}>Prompt (local smoke test)</label>
       <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
 
       <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
         <button disabled={!canStart} onClick={startInference}>Start inference</button>
         <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
-        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Encrypt + forward output</button>
+        <button disabled={!output || isForwarding} onClick={forwardEncrypted}>Debug: encrypt + forward local output</button>
       </div>
 
       <p>Status: <strong>{status}</strong></p>

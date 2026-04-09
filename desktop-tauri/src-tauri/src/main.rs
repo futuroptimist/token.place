@@ -1,4 +1,5 @@
 mod backend;
+mod compute_node;
 mod config;
 mod forward;
 mod keygen;
@@ -6,6 +7,7 @@ mod logging;
 mod sidecar;
 
 use backend::{detect_backend_for, BackendInfo};
+use compute_node::{ComputeNodeStartRequest, ComputeNodeState, ComputeNodeStatus};
 use config::{config_path, DesktopConfig};
 use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
@@ -18,6 +20,7 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 struct AppState {
     sidecar: SidecarState,
+    compute_node: ComputeNodeState,
     config_dir: Mutex<Option<PathBuf>>,
 }
 
@@ -208,6 +211,31 @@ async fn encrypt_and_forward(relay_base_url: String, final_output: String) -> Re
 }
 
 #[tauri::command]
+async fn start_compute_node(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: ComputeNodeStartRequest,
+) -> Result<(), String> {
+    compute_node::start_compute_node(app, state.compute_node.clone(), request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_compute_node(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    compute_node::stop_compute_node(state.compute_node.clone())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn compute_node_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<ComputeNodeStatus, String> {
+    Ok(compute_node::latest_status(state.compute_node.clone()).await)
+}
+
+#[tauri::command]
 fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
     run_model_bridge("inspect")
 }
@@ -231,6 +259,9 @@ pub fn run() {
             start_inference,
             cancel_inference,
             encrypt_and_forward,
+            start_compute_node,
+            stop_compute_node,
+            compute_node_status,
             inspect_model_artifact,
             download_model_artifact
         ])

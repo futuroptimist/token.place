@@ -13,9 +13,11 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   - macOS arm64 => `Metal / Apple Silicon`
   - Windows x64 => `CUDA / NVIDIA`
   - other targets => `CPU fallback`
-- Sidecar-driven streaming output with explicit cancellation.
-- Optional `Encrypt + forward output` action that sends the final output through
-  the existing relay-compatible encrypted `/next_server` + `/faucet` flow.
+- Desktop compute-node operator mode that uses legacy relay `/sink` polling and
+  posts results via `/source` (`/stream/source` for streaming requests).
+- Sidecar-driven local prompt output with explicit cancellation as a smoke test.
+- Optional debug-only `encrypt + forward local output` action that sends the
+  local prompt output through `/next_server` + `/faucet`.
 
 ## Inference sidecar behavior
 

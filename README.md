@@ -177,6 +177,14 @@ See also:
 - **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
   contracts after parity and operational readiness gates are complete.
 
+### Workstation runtime targets (near term)
+
+- `server.py` and desktop-tauri are workstation compute-node runtimes.
+- `cuda` mode targets Windows 11 + NVIDIA GPUs (for example RTX 4090 operator hosts).
+- `metal` mode targets macOS Apple Silicon operators (for example Mac mini M4).
+- `cpu` mode remains a valid fallback on unsupported GPU hosts.
+- Raspberry Pi is a later low-power workstation target, not part of the relay-on-sugarkube rollout.
+
 ## sugarkube deployment
 
 `relay.py` is the first token.place component targeted for sugarkube because it is lightweight and

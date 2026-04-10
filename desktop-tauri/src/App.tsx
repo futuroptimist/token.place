@@ -353,10 +353,14 @@ export function App() {
         onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
       >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
-        <option value="metal" disabled={!metalSupported}>Metal GPU</option>
-        <option value="cuda" disabled={!cudaSupported}>CUDA GPU</option>
+        <option value="metal" disabled={!metalSupported}>Metal GPU (macOS/Apple Silicon)</option>
+        <option value="cuda" disabled={!cudaSupported}>CUDA GPU (Windows/NVIDIA)</option>
         <option value="cpu">CPU fallback</option>
       </select>
+      <p style={{ marginTop: 6, fontSize: 13, color: '#444' }}>
+        Recommended targets: Windows 11 + NVIDIA CUDA, macOS + Apple Silicon Metal. Raspberry Pi
+        remains a later low-power workstation target.
+      </p>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
       <input

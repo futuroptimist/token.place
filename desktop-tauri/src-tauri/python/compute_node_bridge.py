@@ -61,11 +61,16 @@ def emit(payload: Dict[str, Any]) -> None:
 
 
 def _apply_compute_mode(manager: Any, mode: str) -> None:
-    selected = (mode or "auto").lower()
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    elif selected in {"metal", "cuda"}:
-        manager.default_n_gpu_layers = -1
+    try:
+        from utils.compute_node_runtime import apply_compute_mode
+
+        apply_compute_mode(manager, mode)
+    except ModuleNotFoundError:
+        selected = (mode or "auto").strip().lower()
+        if selected == "cpu":
+            manager.default_n_gpu_layers = 0
+        else:
+            manager.default_n_gpu_layers = -1
 
 
 def _sleep_with_cancel(seconds: float) -> bool:
@@ -101,7 +106,14 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    _apply_compute_mode(runtime.model_manager, args.mode)
+    selected_mode = (args.mode or "auto").strip().lower()
+    try:
+        from utils.compute_node_runtime import normalize_compute_mode
+
+        selected_mode = normalize_compute_mode(args.mode)
+    except ModuleNotFoundError:
+        selected_mode = selected_mode if selected_mode in {"auto", "cpu", "metal", "cuda"} else "auto"
+    _apply_compute_mode(runtime.model_manager, selected_mode)
 
     if not runtime.ensure_model_ready():
         emit(
@@ -120,7 +132,8 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": args.mode,
+            "backend_mode": selected_mode,
+            "requested_backend_mode": args.mode,
             "model_path": args.model,
             "last_error": None,
         }
@@ -150,7 +163,8 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
-                    "backend_mode": args.mode,
+                    "backend_mode": selected_mode,
+                    "requested_backend_mode": args.mode,
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -168,7 +182,8 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": args.mode,
+            "backend_mode": selected_mode,
+            "requested_backend_mode": args.mode,
             "model_path": args.model,
             "last_error": None,
         }

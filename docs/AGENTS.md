@@ -127,6 +127,12 @@ For convenience, you can execute all available test suites with `./run_all_tests
 
 ## Development Tips
 
+- Architecture guardrail (release-readiness phase): treat sugarkube/k3s as relay-only (`relay.py`)
+  while compute runtimes (`server.py`, desktop-tauri) remain workstation-hosted.
+- Preserve canonical entrypoints: `server.py` is canonical; `server/server_app.py` must stay a
+  thin compatibility shim.
+- Keep API v1 distributed compute migration scoped as post-parity work; avoid protocol churn during
+  workstation parity fixes.
 - Run `./run_all_tests.sh` to verify changes before committing. Set `TEST_COVERAGE=1` to collect coverage data when running this script. Coverage is uploaded to Codecov automatically via the GitHub Actions workflow.
 - Install `pre-commit` and run `pre-commit run --all-files` before pushing changes.
 - Keep the roadmap in [README.md](../README.md) updated as features progress.

@@ -111,6 +111,18 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    module.normalize_compute_mode = (
+        lambda mode: (mode or 'auto').strip().lower()
+        if (mode or 'auto').strip().lower() in {'auto', 'cpu', 'metal', 'cuda'}
+        else 'auto'
+    )
+    module.apply_compute_mode = (
+        lambda manager, mode: setattr(
+            manager,
+            'default_n_gpu_layers',
+            0 if module.normalize_compute_mode(mode) == 'cpu' else -1,
+        )
+    )
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 
@@ -224,3 +236,33 @@ def test_apply_compute_mode_supports_gpu_and_cpu_modes():
 
     compute_node_bridge._apply_compute_mode(manager, 'cpu')
     assert manager.default_n_gpu_layers == 0
+
+
+def test_run_normalizes_backend_mode_for_status_events(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='CUDA',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert all(event.get('backend_mode') == 'cuda' for event in events if 'backend_mode' in event)
+    assert all(
+        event.get('requested_backend_mode') == 'CUDA'
+        for event in events
+        if 'requested_backend_mode' in event
+    )

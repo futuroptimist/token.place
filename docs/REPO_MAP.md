@@ -39,6 +39,8 @@ near-term, and target architecture.
 
 - **Current contract:** legacy relay sink/source flows used by `server.py` and relay nodes.
 - **Planned runtime alignment:** shared compute-node runtime co-used by `server.py` and desktop-tauri.
+- **Workstation target modes:** `cuda` (Windows 11 + NVIDIA), `metal` (macOS Apple Silicon), `cpu`
+  fallback; Raspberry Pi is a later workstation target.
 - **Future contract:** API v1-aligned distributed compute after parity and operations readiness.
 
 ## Deployment and operations docs

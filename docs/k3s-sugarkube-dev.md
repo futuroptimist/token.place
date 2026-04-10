@@ -10,6 +10,9 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 - ingress/tunnel plumbing
 - relay image/chart updates
 - registration and polling behavior with external compute nodes
+- relay readiness/liveness/draining behavior (`/livez`, `/healthz`)
+
+Out of scope for this runbook: moving `server.py` or desktop compute nodes into k3s.
 
 ## Prerequisites
 

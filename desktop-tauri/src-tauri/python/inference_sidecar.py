@@ -123,11 +123,16 @@ def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
 
 
 def _apply_compute_mode(manager: Any, mode: str) -> None:
-    selected = (mode or "auto").lower()
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    elif selected in {"metal", "cuda"}:
-        manager.default_n_gpu_layers = -1
+    try:
+        from utils.compute_node_runtime import apply_compute_mode
+
+        apply_compute_mode(manager, mode)
+    except ModuleNotFoundError:
+        selected = (mode or "auto").strip().lower()
+        if selected == "cpu":
+            manager.default_n_gpu_layers = 0
+        else:
+            manager.default_n_gpu_layers = -1
 
 
 def run(args: argparse.Namespace) -> int:
@@ -143,8 +148,15 @@ def run(args: argparse.Namespace) -> int:
         )
 
     manager = get_model_manager()
+    selected_mode = (args.mode or "auto").strip().lower()
+    try:
+        from utils.compute_node_runtime import normalize_compute_mode
+
+        selected_mode = normalize_compute_mode(args.mode)
+    except ModuleNotFoundError:
+        selected_mode = selected_mode if selected_mode in {"auto", "cpu", "metal", "cuda"} else "auto"
     manager.model_path = args.model
-    _apply_compute_mode(manager, args.mode)
+    _apply_compute_mode(manager, selected_mode)
 
     llm = manager.get_llm_instance()
     if llm is None:

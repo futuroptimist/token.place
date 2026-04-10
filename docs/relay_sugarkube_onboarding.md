@@ -3,6 +3,12 @@
 This guide explains how and why to run `relay.py` on sugarkube before full desktop/server
 migration is complete.
 
+Short-to-medium-term architecture contract:
+
+- sugarkube/k3s scope is relay-only (`relay.py`)
+- compute runtimes stay on operator workstations (`server.py`, desktop-tauri)
+- API v1 distributed compute migration is explicitly deferred until after workstation parity
+
 ## Why relay.py belongs on sugarkube
 
 `relay.py` is lightweight compared with compute nodes and is operationally a good fit for k3s:
@@ -22,6 +28,8 @@ Roadmap alignment: [desktop compute-node migration roadmap](roadmap/desktop_comp
 - **Current:** relay can run locally or in Kubernetes; staging-oriented docs exist.
 - **Planned near-term:** standardized dev/staging/prod sugarkube runbooks for relay.
 - **Not yet:** full post-API-v1 distributed deployment model.
+- **Platform focus for external compute nodes:** Windows 11 + CUDA/NVIDIA, macOS + Metal/Apple
+  Silicon, CPU fallback; Raspberry Pi is a later low-power workstation target.
 
 ## Minimal requirements
 

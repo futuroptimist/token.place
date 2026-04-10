@@ -6,6 +6,8 @@ This is the canonical migration plan for moving token.place from today's
 - **Current state:** desktop-tauri is an MVP and is **not** feature-parity with `server.py`.
 - **Near-term target:** achieve desktop parity on the legacy relay sink/source contract first.
 - **Future target:** migrate distributed compute to API v1 **after** parity is complete.
+- **Deployment guardrail (short-to-medium term):** sugarkube/k3s runs `relay.py` only; compute
+  nodes (`server.py`, desktop-tauri) run on operator workstations.
 
 See also:
 
@@ -116,6 +118,13 @@ Desktop is considered parity-ready only when all of the following are true:
   - explicit GGUF artifact selection used by runtime
   - model browse + download flow
   - default relay URL `https://token.place` with user override support
+- Keeps compute-mode contract aligned (`auto`, `cpu`, `metal`, `cuda`) across workstation
+  runtimes and desktop/operator surfaces.
+- Reflects operator target platforms:
+  - Windows 11 + NVIDIA CUDA (`cuda`)
+  - macOS Apple Silicon + Metal (`metal`)
+  - CPU fallback for unsupported hosts (`cpu`)
+  - Raspberry Pi as a later low-power workstation target (not part of relay-on-sugarkube rollout)
 
 ## Readiness checklists
 
@@ -126,6 +135,7 @@ Desktop is considered parity-ready only when all of the following are true:
 - [ ] Streaming and cancellation match server runtime behavior.
 - [ ] Relay integration passes legacy contract integration tests.
 - [ ] Model-management parity requirements are implemented.
+- [x] Compute-mode normalization contract is shared/tested (`auto`/`cpu`/`metal`/`cuda`).
 
 ### Legacy multi-node relay readiness
 
@@ -153,5 +163,5 @@ Desktop is considered parity-ready only when all of the following are true:
 - **Current:** `relay.py` + `server.py` legacy flow is the production baseline; desktop-tauri is MVP.
   `server/server_app.py` remains compatibility-only and should not diverge from `server.py`.
 - **Near-term:** desktop and `server.py` co-evolve through a shared runtime while relay moves onto
-  sugarkube.
+  sugarkube. Compute nodes continue to run on end-user/operator workstations.
 - **Target:** post-parity, post-API-v1 distributed compute with secure API v1-aligned components.

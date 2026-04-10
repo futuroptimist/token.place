@@ -8,6 +8,9 @@
 Relay-only staging at `staging.token.place` (or equivalent environment hostname), with external
 compute nodes still using legacy sink/source contract.
 
+Out of scope in staging: deploying workstation compute nodes (`server.py`, desktop-tauri) inside
+the cluster before post-parity API v1 migration planning.
+
 ## Prerequisites
 
 - staging cluster namespace access

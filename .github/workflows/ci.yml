@@ -10,50 +10,186 @@ jobs:
     name: Run tests and collect coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - id: checkout
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Initialize CI log collection
+        id: init_logs
+        run: |
+          mkdir -p .ci-logs
+        continue-on-error: true
+
       - name: Set up Python
+        id: setup_python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: |
             requirements.txt
+        continue-on-error: true
+
       - name: Set up Node.js
+        id: setup_node
         uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: 'npm'
+        continue-on-error: true
+
       - name: Prepare Raspberry Pi cgroups
         id: prep
         run: |
           set +e
-          sudo bash scripts/prepare-pi-cgroups.sh
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          sudo bash scripts/prepare-pi-cgroups.sh 2>&1 | tee .ci-logs/prepare-pi-cgroups.log
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           exit 0
+        continue-on-error: true
+
       - name: Stop for reboot
+        id: stop_for_reboot
         if: steps.prep.outputs.rc == '2'
         run: echo "Cgroup configuration updated. Reboot runner and re-run job."
+        continue-on-error: true
+
       - name: Validate dependency compatibility
-        run: python scripts/validate_dependencies.py
-        if: steps.prep.outputs.rc != '2'
-      - name: Install Python dependencies
+        id: validate_dependencies
         if: steps.prep.outputs.rc != '2'
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          set -o pipefail
+          python scripts/validate_dependencies.py 2>&1 | tee .ci-logs/validate-dependencies.log
+        continue-on-error: true
+
+      - name: Install Python dependencies
+        id: install_python_deps
+        if: steps.prep.outputs.rc != '2'
+        run: |
+          set -o pipefail
+          python -m pip install --upgrade pip 2>&1 | tee .ci-logs/pip-upgrade.log
+          pip install -r requirements.txt 2>&1 | tee .ci-logs/pip-install.log
+        continue-on-error: true
+
       - name: Install Playwright browsers
+        id: install_playwright
         if: steps.prep.outputs.rc != '2'
-        run: playwright install
+        run: |
+          set -o pipefail
+          playwright install 2>&1 | tee .ci-logs/playwright-install.log
+        continue-on-error: true
+
       - name: Install Node.js dependencies
+        id: install_node_deps
         if: steps.prep.outputs.rc != '2'
-        run: npm ci
+        run: |
+          set -o pipefail
+          npm ci 2>&1 | tee .ci-logs/npm-ci.log
+        continue-on-error: true
+
       - name: Run tests
+        id: run_tests
         if: steps.prep.outputs.rc != '2'
-        run: ./run_all_tests.sh
+        run: |
+          set -o pipefail
+          ./run_all_tests.sh 2>&1 | tee .ci-logs/run-all-tests.log
         env:
           TEST_COVERAGE: '1'
+        continue-on-error: true
+
       - name: Upload coverage reports to Codecov
+        id: upload_codecov
         if: steps.prep.outputs.rc != '2'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+        continue-on-error: true
+
+      - name: Summarize errors across workflow
+        if: always()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          INIT_LOGS_OUTCOME: ${{ steps.init_logs.outcome }}
+          SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup_node.outcome }}
+          PREP_OUTCOME: ${{ steps.prep.outcome }}
+          STOP_FOR_REBOOT_OUTCOME: ${{ steps.stop_for_reboot.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate_dependencies.outcome }}
+          INSTALL_PYTHON_OUTCOME: ${{ steps.install_python_deps.outcome }}
+          INSTALL_PLAYWRIGHT_OUTCOME: ${{ steps.install_playwright.outcome }}
+          INSTALL_NODE_OUTCOME: ${{ steps.install_node_deps.outcome }}
+          RUN_TESTS_OUTCOME: ${{ steps.run_tests.outcome }}
+          UPLOAD_CODECOV_OUTCOME: ${{ steps.upload_codecov.outcome }}
+        run: |
+          {
+            echo "## CI Error Summary"
+            echo
+            echo "### Step outcomes"
+            echo
+            echo "| Step | Outcome |"
+            echo "|---|---|"
+            echo "| checkout | ${CHECKOUT_OUTCOME:-not-run} |"
+            echo "| init_logs | ${INIT_LOGS_OUTCOME:-not-run} |"
+            echo "| setup_python | ${SETUP_PYTHON_OUTCOME:-not-run} |"
+            echo "| setup_node | ${SETUP_NODE_OUTCOME:-not-run} |"
+            echo "| prep | ${PREP_OUTCOME:-not-run} |"
+            echo "| stop_for_reboot | ${STOP_FOR_REBOOT_OUTCOME:-not-run} |"
+            echo "| validate_dependencies | ${VALIDATE_OUTCOME:-not-run} |"
+            echo "| install_python_deps | ${INSTALL_PYTHON_OUTCOME:-not-run} |"
+            echo "| install_playwright | ${INSTALL_PLAYWRIGHT_OUTCOME:-not-run} |"
+            echo "| install_node_deps | ${INSTALL_NODE_OUTCOME:-not-run} |"
+            echo "| run_tests | ${RUN_TESTS_OUTCOME:-not-run} |"
+            echo "| upload_codecov | ${UPLOAD_CODECOV_OUTCOME:-not-run} |"
+            echo
+            echo "### Error lines captured from command logs"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          matches="$(grep -nH -E '(^ERROR\b|\bError:\b|\bException\b|\bTraceback\b|\bFAILED\b|\bFAIL\b|\bAssertionError\b)' .ci-logs/*.log 2>/dev/null || true)"
+
+          if [ -n "$matches" ]; then
+            {
+              echo '```text'
+              echo "$matches"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No explicit error patterns were found in captured command logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail job if any tracked step failed
+        if: always()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          INIT_LOGS_OUTCOME: ${{ steps.init_logs.outcome }}
+          SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup_node.outcome }}
+          PREP_OUTCOME: ${{ steps.prep.outcome }}
+          STOP_FOR_REBOOT_OUTCOME: ${{ steps.stop_for_reboot.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate_dependencies.outcome }}
+          INSTALL_PYTHON_OUTCOME: ${{ steps.install_python_deps.outcome }}
+          INSTALL_PLAYWRIGHT_OUTCOME: ${{ steps.install_playwright.outcome }}
+          INSTALL_NODE_OUTCOME: ${{ steps.install_node_deps.outcome }}
+          RUN_TESTS_OUTCOME: ${{ steps.run_tests.outcome }}
+          UPLOAD_CODECOV_OUTCOME: ${{ steps.upload_codecov.outcome }}
+        run: |
+          outcomes=(
+            "$CHECKOUT_OUTCOME"
+            "$INIT_LOGS_OUTCOME"
+            "$SETUP_PYTHON_OUTCOME"
+            "$SETUP_NODE_OUTCOME"
+            "$PREP_OUTCOME"
+            "$STOP_FOR_REBOOT_OUTCOME"
+            "$VALIDATE_OUTCOME"
+            "$INSTALL_PYTHON_OUTCOME"
+            "$INSTALL_PLAYWRIGHT_OUTCOME"
+            "$INSTALL_NODE_OUTCOME"
+            "$RUN_TESTS_OUTCOME"
+            "$UPLOAD_CODECOV_OUTCOME"
+          )
+
+          for outcome in "${outcomes[@]}"; do
+            if [ "$outcome" = "failure" ]; then
+              echo "One or more CI steps failed. See the CI Error Summary above."
+              exit 1
+            fi
+          done

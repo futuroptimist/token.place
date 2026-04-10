@@ -41,6 +41,7 @@ class ComputeNodeRuntimeConfig:
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
+SUPPORTED_COMPUTE_MODES = ("auto", "cpu", "metal", "cuda")
 
 
 def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
@@ -49,6 +50,26 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
     return LEGACY_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
+
+
+def normalize_compute_mode(mode: Optional[str]) -> str:
+    """Normalize requested compute mode to the supported workstation contract."""
+
+    candidate = (mode or "auto").strip().lower()
+    if candidate in SUPPORTED_COMPUTE_MODES:
+        return candidate
+    return "auto"
+
+
+def apply_compute_mode_to_model_manager(manager: Any, mode: Optional[str]) -> str:
+    """Apply normalized compute mode to a model manager and return the mode used."""
+
+    normalized = normalize_compute_mode(mode)
+    if normalized == "cpu":
+        manager.default_n_gpu_layers = 0
+    elif normalized in {"metal", "cuda", "auto"}:
+        manager.default_n_gpu_layers = -1
+    return normalized
 
 
 class RelayRequestAdapter(Protocol):

@@ -6,6 +6,8 @@ This is the canonical migration plan for moving token.place from today's
 - **Current state:** desktop-tauri is an MVP and is **not** feature-parity with `server.py`.
 - **Near-term target:** achieve desktop parity on the legacy relay sink/source contract first.
 - **Future target:** migrate distributed compute to API v1 **after** parity is complete.
+- **Deployment boundary (short/medium term):** sugarkube/k3s is relay-only (`relay.py`);
+  compute runtimes (`server.py`, desktop-tauri) stay on operator workstations.
 
 See also:
 
@@ -121,11 +123,12 @@ Desktop is considered parity-ready only when all of the following are true:
 
 ### Desktop parity readiness
 
-- [ ] Shared compute-node runtime is consumed by both `server.py` and desktop-tauri.
+- [x] Shared compute-node runtime is consumed by both `server.py` and desktop-tauri.
 - [ ] Desktop executes real inference workloads (not fake sidecar only).
 - [ ] Streaming and cancellation match server runtime behavior.
 - [ ] Relay integration passes legacy contract integration tests.
-- [ ] Model-management parity requirements are implemented.
+- [x] Compute-mode contract is normalized across desktop UI/bridge/sidecar/runtime (`auto`, `cpu`, `metal`, `cuda`).
+- [ ] Model-management parity requirements are fully implemented.
 
 ### Legacy multi-node relay readiness
 
@@ -153,5 +156,7 @@ Desktop is considered parity-ready only when all of the following are true:
 - **Current:** `relay.py` + `server.py` legacy flow is the production baseline; desktop-tauri is MVP.
   `server/server_app.py` remains compatibility-only and should not diverge from `server.py`.
 - **Near-term:** desktop and `server.py` co-evolve through a shared runtime while relay moves onto
-  sugarkube.
-- **Target:** post-parity, post-API-v1 distributed compute with secure API v1-aligned components.
+  sugarkube. Workstation targets are Windows 11 (CUDA/NVIDIA), macOS (Metal/Apple Silicon), and
+  later Raspberry Pi as a low-power workstation/server target.
+- **Target (deferred until after parity):** post-API-v1 distributed compute with secure API
+  v1-aligned components.

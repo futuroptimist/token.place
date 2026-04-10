@@ -28,6 +28,14 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [server.py](../server.py): Main server implementation for the proxy service
 - [relay.py](../relay.py): Middleware server that forwards encrypted messages between clients and servers
 
+## Architecture guardrails (release-readiness)
+
+- Treat short-to-medium-term deployment scope as **relay-only on sugarkube/k3s** (`relay.py`).
+- Treat `server.py` and `desktop-tauri/` as workstation compute-node runtimes.
+- Keep `server.py` canonical; keep `server/server_app.py` compatibility-only.
+- Keep legacy relay sink/source contract active through parity; defer API v1 distributed migration
+  until parity is accepted.
+
 ## Documentation
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md): Contribution guidelines for developers

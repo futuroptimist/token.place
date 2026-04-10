@@ -7,6 +7,7 @@
 
 Relay-only staging at `staging.token.place` (or equivalent environment hostname), with external
 compute nodes still using legacy sink/source contract.
+Compute runtimes are workstation-hosted in this phase (not in-cluster workloads).
 
 ## Prerequisites
 

@@ -24,7 +24,7 @@ near-term, and target architecture.
   - Package utilities and compatibility imports.
 - `relay.py`
   - Lightweight relay handling legacy sink/source and multi-node registration.
-  - First deployment candidate for sugarkube.
+  - First and only short/medium-term deployment candidate for sugarkube.
 - `api/`
   - FastAPI implementation and experimental API surface for contributors evaluating API-facing
     runtime paths.
@@ -32,6 +32,8 @@ near-term, and target architecture.
   - Forward-looking desktop client path.
   - Must reach feature parity with `server.py` via shared compute-node runtime before API v1
     distributed migration.
+  - Primary workstation targets: Windows 11 (CUDA/NVIDIA) and macOS Apple Silicon (Metal), with
+    CPU fallback and later Raspberry Pi support.
 - `desktop/`
   - Deprecated Electron prototype retained as historical context.
 

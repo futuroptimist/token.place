@@ -7,6 +7,7 @@
 
 Run `relay.py` on sugarkube production with strict change control. Compute nodes remain external
 until parity and later API v1 migration phases are complete.
+This runbook does not move compute runtimes into k3s.
 
 ## Prerequisites
 

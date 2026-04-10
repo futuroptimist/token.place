@@ -54,8 +54,8 @@ pre-commit run --all-files
   formatting, linting, and quick tests.
 - **Full test sweep** — `./run_all_tests.sh` (or `make test`) calls pytest, Playwright, npm checks,
   and Bandit just like CI.
-- **Deploy Kubernetes manifests** — `make k8s-deploy` applies everything under `k8s/` to the active
-  cluster context.
+- **Deploy relay Kubernetes manifests** — `make k8s-deploy` applies the relay-focused manifests
+  under `k8s/` to the active cluster context.
 
 Make targets surface the same workflows in shorthand:
 
@@ -156,6 +156,12 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 The `desktop-tauri/` app is the forward-looking desktop path, but it is currently an MVP and does
 **not** yet replace `server.py`. The canonical migration sequence is documented in
 [`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+Short-to-medium-term runtime targets are:
+
+- Windows 11 workstations with NVIDIA GPUs (`cuda` mode)
+- macOS workstations on Apple Silicon (`metal` mode)
+- CPU fallback for unsupported hosts (`cpu` mode)
+- Raspberry Pi later as a low-power workstation/server target (not part of sugarkube relay rollout)
 
 See also:
 
@@ -181,6 +187,7 @@ See also:
 
 `relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
 operationally separate from GPU-heavy compute nodes.
+`server.py` and desktop-tauri compute runtimes are intentionally out of current sugarkube scope.
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

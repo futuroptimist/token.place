@@ -1,7 +1,7 @@
 # Relay on sugarkube onboarding (token.place)
 
-This guide explains how and why to run `relay.py` on sugarkube before full desktop/server
-migration is complete.
+This guide explains how and why to run `relay.py` on sugarkube while compute runtimes stay on
+operator workstations during the parity phase.
 
 ## Why relay.py belongs on sugarkube
 
@@ -13,7 +13,9 @@ migration is complete.
 - easier centralized ingress/tunnel management
 
 This allows token.place to improve relay availability and operator workflows while GPU-heavy
-compute nodes (`server.py` and later desktop compute nodes) remain external during parity phases.
+compute nodes (`server.py` and desktop compute nodes) remain external during parity phases.
+Initial workstation targets are Windows 11 + NVIDIA/CUDA and macOS + Apple Silicon/Metal, with
+Raspberry Pi as a later low-power target.
 
 Roadmap alignment: [desktop compute-node migration roadmap](roadmap/desktop_compute_node_migration.md).
 
@@ -21,7 +23,7 @@ Roadmap alignment: [desktop compute-node migration roadmap](roadmap/desktop_comp
 
 - **Current:** relay can run locally or in Kubernetes; staging-oriented docs exist.
 - **Planned near-term:** standardized dev/staging/prod sugarkube runbooks for relay.
-- **Not yet:** full post-API-v1 distributed deployment model.
+- **Not yet:** full post-parity API v1 distributed compute migration/deployment model.
 
 ## Minimal requirements
 

@@ -22,6 +22,7 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 
 - In-cluster: `relay.py` deployment + service + ingress
 - External: `server.py` and/or desktop compute nodes using legacy relay contract
+  (`cuda` Windows/NVIDIA, `metal` macOS/Apple Silicon, `cpu` fallback)
 
 ## Release model
 

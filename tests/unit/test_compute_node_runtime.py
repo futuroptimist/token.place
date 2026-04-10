@@ -1,12 +1,15 @@
 from unittest.mock import MagicMock
 
 from utils.compute_node_runtime import (
+    SUPPORTED_COMPUTE_MODES,
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
     LegacyRelayRequestAdapter,
+    apply_compute_mode_to_model_manager,
     first_env,
     format_relay_target,
     is_legacy_relay_payload,
+    normalize_compute_mode,
     resolve_relay_port,
     resolve_relay_url,
 )
@@ -17,6 +20,29 @@ def test_first_env_skips_blank_values(monkeypatch):
     monkeypatch.setenv("TOKEN_PLACE_RELAY_URL", "https://fallback.example")
 
     assert first_env(["TOKENPLACE_RELAY_URL", "TOKEN_PLACE_RELAY_URL"]) == "https://fallback.example"
+
+
+def test_normalize_compute_mode_matches_supported_workstation_modes():
+    assert tuple(SUPPORTED_COMPUTE_MODES) == ("auto", "cpu", "metal", "cuda")
+    assert normalize_compute_mode(None) == "auto"
+    assert normalize_compute_mode(" CUDA ") == "cuda"
+    assert normalize_compute_mode("metal") == "metal"
+    assert normalize_compute_mode("CPU") == "cpu"
+    assert normalize_compute_mode("unsupported") == "auto"
+
+
+def test_apply_compute_mode_to_model_manager_updates_gpu_layers():
+    manager = MagicMock()
+    manager.default_n_gpu_layers = -999
+
+    assert apply_compute_mode_to_model_manager(manager, "cpu") == "cpu"
+    assert manager.default_n_gpu_layers == 0
+
+    assert apply_compute_mode_to_model_manager(manager, "cuda") == "cuda"
+    assert manager.default_n_gpu_layers == -1
+
+    assert apply_compute_mode_to_model_manager(manager, "bad-value") == "auto"
+    assert manager.default_n_gpu_layers == -1
 
 
 def test_compute_node_runtime_ensure_model_ready_download_success():

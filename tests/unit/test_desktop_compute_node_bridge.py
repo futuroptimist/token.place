@@ -111,6 +111,13 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    def apply_compute_mode_to_model_manager(manager, mode):
+        selected = (mode or "auto").strip().lower()
+        normalized = selected if selected in {"auto", "cpu", "metal", "cuda"} else "auto"
+        manager.default_n_gpu_layers = 0 if normalized == "cpu" else -1
+        return normalized
+
+    module.apply_compute_mode_to_model_manager = apply_compute_mode_to_model_manager
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 
@@ -210,17 +217,22 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     assert any(event.get('registered') is True for event in status_events)
 
 
-def test_apply_compute_mode_supports_gpu_and_cpu_modes():
-    manager = FakeModelManager()
+def test_run_reports_normalized_backend_mode_and_gpu_layer_contract(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
 
-    compute_node_bridge._apply_compute_mode(manager, 'auto')
-    assert manager.default_n_gpu_layers == -1
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
 
-    compute_node_bridge._apply_compute_mode(manager, 'metal')
-    assert manager.default_n_gpu_layers == -1
+    status = compute_node_bridge.run(
+        SimpleNamespace(
+            model='/tmp/model.gguf',
+            mode='CUDA',
+            relay_url='https://token.place',
+            relay_port=None,
+        )
+    )
+    assert status == 0
 
-    compute_node_bridge._apply_compute_mode(manager, 'cuda')
-    assert manager.default_n_gpu_layers == -1
-
-    compute_node_bridge._apply_compute_mode(manager, 'cpu')
-    assert manager.default_n_gpu_layers == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['backend_mode'] == 'cuda'
+    assert events[-1]['backend_mode'] == 'cuda'

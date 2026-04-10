@@ -357,6 +357,10 @@ export function App() {
         <option value="cuda" disabled={!cudaSupported}>CUDA GPU</option>
         <option value="cpu">CPU fallback</option>
       </select>
+      <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13 }}>
+        Mode guidance: CUDA for Windows/NVIDIA workstations, Metal for macOS Apple Silicon,
+        CPU as fallback.
+      </p>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
       <input

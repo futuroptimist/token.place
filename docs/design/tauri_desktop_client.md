@@ -21,6 +21,8 @@ migration.
 1. `server.py` and desktop-tauri must co-evolve in lockstep through a **shared compute-node runtime**.
 2. Desktop parity on the **legacy relay sink/source contract** comes before API v1 distributed migration.
 3. Relay operations can move to sugarkube earlier because `relay.py` is lightweight and stateless.
+4. Workstation backend modes must stay explicit and consistent across UI and Python runtime:
+   `cuda` (Windows 11/NVIDIA), `metal` (macOS/Apple Silicon), `cpu` fallback, `auto` normalized.
 
 ## Current vs near-term vs target
 
@@ -36,6 +38,7 @@ migration.
 - Desktop-tauri runs shared compute-node runtime behaviors equivalent to `server.py`.
 - Desktop nodes and `server.py` can both operate on legacy relay flows.
 - `relay.py` is deployed on sugarkube for dev/staging/prod operations.
+- Raspberry Pi support is tracked as a later low-power workstation/server target.
 
 ### Target state (later)
 

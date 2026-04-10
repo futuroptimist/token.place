@@ -350,6 +350,51 @@ def test_main_emits_inference_failed_when_compute_runtime_missing(capsys, monkey
     assert 'bridge failure:' in event['message']
 
 
+def test_main_normalizes_mode_before_run(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured['mode'] = args.mode
+        return 0
+
+    monkeypatch.setattr(inference_sidecar, 'run', fake_run)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'inference_sidecar.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'CUDA',
+            '--prompt',
+            'hello',
+        ],
+    )
+
+    status = inference_sidecar.main()
+    assert status == 0
+    assert captured['mode'] == 'cuda'
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'inference_sidecar.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'unsupported',
+            '--prompt',
+            'hello',
+        ],
+    )
+
+    status = inference_sidecar.main()
+    assert status == 0
+    assert captured['mode'] == 'auto'
+
+
 def test_extract_text_from_completion_handles_non_dict_message():
     assert inference_sidecar._extract_text_from_completion({'choices': [{'message': 'x'}]}) == ''
 

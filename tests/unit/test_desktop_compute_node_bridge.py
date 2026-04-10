@@ -282,3 +282,32 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
     assert 'bridge failure:' in payload['message']
+
+
+def test_main_normalizes_mode_before_run(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured['mode'] = args.mode
+        return 0
+
+    monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'CUDA'],
+    )
+
+    status = compute_node_bridge.main()
+    assert status == 0
+    assert captured['mode'] == 'cuda'
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'unsupported'],
+    )
+
+    status = compute_node_bridge.main()
+    assert status == 0
+    assert captured['mode'] == 'auto'

@@ -357,6 +357,11 @@ export function App() {
         <option value="cuda" disabled={!cudaSupported}>CUDA GPU (Windows/NVIDIA)</option>
         <option value="cpu">CPU fallback</option>
       </select>
+      <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
+        Operator note: <code>cuda</code> is for Windows/NVIDIA workstations, <code>metal</code> is
+        for macOS/Apple Silicon, and <code>cpu</code> is fallback. Raspberry Pi remains a later
+        low-power workstation target and is not part of the current sugarkube relay rollout.
+      </p>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
       <input

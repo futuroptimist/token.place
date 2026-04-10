@@ -34,26 +34,140 @@ jobs:
         if: steps.prep.outputs.rc == '2'
         run: echo "Cgroup configuration updated. Reboot runner and re-run job."
       - name: Validate dependency compatibility
-        run: python scripts/validate_dependencies.py
+        id: validate
         if: steps.prep.outputs.rc != '2'
-      - name: Install Python dependencies
-        if: steps.prep.outputs.rc != '2'
+        continue-on-error: true
         run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          python scripts/validate_dependencies.py \
+            > >(tee .ci-logs/validate.out) \
+            2> >(tee .ci-logs/validate.err >&2)
+      - name: Install Python dependencies
+        id: install_py
+        if: steps.prep.outputs.rc != '2' && steps.validate.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt \
+            > >(tee .ci-logs/install_py.out) \
+            2> >(tee .ci-logs/install_py.err >&2)
       - name: Install Playwright browsers
-        if: steps.prep.outputs.rc != '2'
-        run: playwright install
+        id: install_playwright
+        if: steps.prep.outputs.rc != '2' && steps.install_py.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          playwright install \
+            > >(tee .ci-logs/install_playwright.out) \
+            2> >(tee .ci-logs/install_playwright.err >&2)
       - name: Install Node.js dependencies
-        if: steps.prep.outputs.rc != '2'
-        run: npm ci
+        id: install_node
+        if: steps.prep.outputs.rc != '2' && steps.install_playwright.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          npm ci \
+            > >(tee .ci-logs/install_node.out) \
+            2> >(tee .ci-logs/install_node.err >&2)
       - name: Run tests
-        if: steps.prep.outputs.rc != '2'
-        run: ./run_all_tests.sh
+        id: run_tests
+        if: steps.prep.outputs.rc != '2' && steps.install_node.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          ./run_all_tests.sh \
+            > >(tee .ci-logs/run_tests.out) \
+            2> >(tee .ci-logs/run_tests.err >&2)
         env:
           TEST_COVERAGE: '1'
       - name: Upload coverage reports to Codecov
-        if: steps.prep.outputs.rc != '2'
+        id: codecov
+        if: steps.prep.outputs.rc != '2' && steps.run_tests.outcome == 'success'
+        continue-on-error: true
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Summarize workflow errors
+        if: always()
+        run: |
+          mkdir -p .ci-logs
+          {
+            echo "## CI error summary"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${{ steps.prep.outputs.rc }}" == "2" ]]; then
+            {
+              echo "- ❌ **Prepare Raspberry Pi cgroups** requested reboot (exit code 2)."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          failed=0
+          summarize_step() {
+            local step_id="$1"
+            local label="$2"
+            local err_file="$3"
+
+            if [[ "${step_id}" == "codecov" ]]; then
+              if [[ "${{ steps.codecov.outcome }}" == "failure" ]]; then
+                failed=1
+                echo "- ❌ **${label}** failed." >> "$GITHUB_STEP_SUMMARY"
+              fi
+              return
+            fi
+
+            if [[ "${{ steps.validate.outcome }}" == "failure" && "${step_id}" != "validate" ]]; then
+              return
+            fi
+            if [[ "${{ steps.install_py.outcome }}" == "failure" && "${step_id}" != "install_py" ]]; then
+              return
+            fi
+            if [[ "${{ steps.install_playwright.outcome }}" == "failure" &&
+              "${step_id}" != "install_playwright" ]]; then
+              return
+            fi
+            if [[ "${{ steps.install_node.outcome }}" == "failure" && "${step_id}" != "install_node" ]]; then
+              return
+            fi
+            if [[ "${{ steps.run_tests.outcome }}" == "failure" && "${step_id}" != "run_tests" ]]; then
+              return
+            fi
+
+            if [[ "${step_id}" == "validate" && "${{ steps.validate.outcome }}" == "failure" ]] ||
+              [[ "${step_id}" == "install_py" && "${{ steps.install_py.outcome }}" == "failure" ]] ||
+              [[ "${step_id}" == "install_playwright" &&
+                "${{ steps.install_playwright.outcome }}" == "failure" ]] ||
+              [[ "${step_id}" == "install_node" && "${{ steps.install_node.outcome }}" == "failure" ]] ||
+              [[ "${step_id}" == "run_tests" && "${{ steps.run_tests.outcome }}" == "failure" ]]; then
+              failed=1
+              echo "- ❌ **${label}** failed." >> "$GITHUB_STEP_SUMMARY"
+              if [[ -f "${err_file}" ]]; then
+                echo "  Errors:" >> "$GITHUB_STEP_SUMMARY"
+                while IFS= read -r line; do
+                  [[ -z "${line}" ]] && continue
+                  printf '    - `%s`\n' "${line}" >> "$GITHUB_STEP_SUMMARY"
+                done < "${err_file}"
+              fi
+            fi
+          }
+
+          summarize_step "validate" "Validate dependency compatibility" ".ci-logs/validate.err"
+          summarize_step "install_py" "Install Python dependencies" ".ci-logs/install_py.err"
+          summarize_step "install_playwright" "Install Playwright browsers" ".ci-logs/install_playwright.err"
+          summarize_step "install_node" "Install Node.js dependencies" ".ci-logs/install_node.err"
+          summarize_step "run_tests" "Run tests" ".ci-logs/run_tests.err"
+          summarize_step "codecov" "Upload coverage reports to Codecov" ""
+
+          if [[ "${failed}" -eq 0 ]]; then
+            echo "- ✅ No errors were raised." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "${failed}"

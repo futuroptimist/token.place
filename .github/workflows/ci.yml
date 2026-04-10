@@ -9,6 +9,9 @@ jobs:
   test:
     name: Run tests and collect coverage
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -57,3 +60,66 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Summarize workflow errors
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p .gha-logs
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/logs" \
+            -o .gha-logs/workflow-logs.zip
+          unzip -qo .gha-logs/workflow-logs.zip -d .gha-logs/raw
+
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          raw_dir = Path('.gha-logs/raw')
+          summary_file = Path('.gha-logs/error-summary.md')
+
+          patterns = [
+              r'::error[^\n]*',
+              r'##\[error\][^\n]*',
+              r'^Error:\s+.*',
+              r'^ERROR:\s+.*',
+          ]
+          combined = re.compile('|'.join(f'({p})' for p in patterns), re.MULTILINE)
+
+          errors = []
+          for log_file in sorted(raw_dir.rglob('*.txt')):
+              text = log_file.read_text(encoding='utf-8', errors='replace')
+              for match in combined.finditer(text):
+                  line = next(group for group in match.groups() if group)
+                  cleaned = re.sub(r'\s+', ' ', line).strip()
+                  if cleaned:
+                      errors.append((log_file.relative_to(raw_dir), cleaned))
+
+          unique = []
+          seen = set()
+          for source, message in errors:
+              key = (str(source), message)
+              if key in seen:
+                  continue
+              seen.add(key)
+              unique.append((source, message))
+
+          with summary_file.open('w', encoding='utf-8') as out:
+              out.write('## CI Error Summary\n\n')
+              if not unique:
+                  out.write('No error lines were detected in the workflow logs.\n')
+              else:
+                  out.write(
+                      'Captured from `::error`, `##[error]`, and `Error:`/`ERROR:` log lines '\
+                      'across all steps in this run.\n\n'
+                  )
+                  for source, message in unique:
+                      out.write(f'- `{source}`: `{message}`\n')
+          PY
+
+          cat .gha-logs/error-summary.md >> "$GITHUB_STEP_SUMMARY"

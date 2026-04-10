@@ -65,6 +65,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -uo pipefail
 
@@ -84,6 +85,7 @@ jobs:
 
           raw_dir = Path('.gha-logs/raw')
           summary_file = Path('.gha-logs/error-summary.md')
+          job_status = '${JOB_STATUS}'.strip().lower()
           ansi_re = re.compile(r'\x1B\[[0-9;]*[mGKHF]|\x1B\(B')
 
           patterns = [
@@ -91,18 +93,34 @@ jobs:
               r'##\[error\][^\n]*',
               r'^Error:\s+.*',
               r'^ERROR:\s+.*',
+              r'^Traceback[^\n]*',
+              r'^Exception[^\n]*',
+              r'^(?:FAIL|FAILED)\b[^\n]*',
+              r'^AssertionError[^\n]*',
+              r'^ModuleNotFoundError[^\n]*',
+              r'^RuntimeError[^\n]*',
+              r'^fatal[^\n]*',
           ]
           combined = re.compile('|'.join(f'({p})' for p in patterns), re.MULTILINE)
+          interesting_re = re.compile(
+              r'traceback|exception|assertionerror|modulenotfounderror|runtimeerror|\bfail(?:ed)?\b|fatal|error',
+              re.IGNORECASE,
+          )
 
           errors = []
+          scanned_files = []
+          texts_by_file = {}
           for log_file in sorted(raw_dir.rglob('*.txt')):
+              relative = log_file.relative_to(raw_dir)
+              scanned_files.append(relative)
               text = log_file.read_text(encoding='utf-8', errors='replace')
+              texts_by_file[relative] = text
               for match in combined.finditer(text):
                   line = next(group for group in match.groups() if group)
                   line = ansi_re.sub('', line)
                   cleaned = re.sub(r'\s+', ' ', line).strip()
                   if cleaned:
-                      errors.append((log_file.relative_to(raw_dir), cleaned))
+                      errors.append((relative, cleaned))
 
           unique = []
           seen = set()
@@ -116,10 +134,38 @@ jobs:
           with summary_file.open('w', encoding='utf-8') as out:
               out.write('## CI Error Summary\n\n')
               if not unique:
-                  out.write('No error lines were detected in the workflow logs.\n')
+                  out.write('No direct error lines were detected in the workflow logs.\n')
+                  if job_status != 'success':
+                      out.write('\n### Fallback context (job failed)\n\n')
+                      if not scanned_files:
+                          out.write('- No log files were found in the downloaded archive.\n')
+                      else:
+                          out.write('Scanned log files:\n')
+                          for source in scanned_files:
+                              out.write(f'- `{source}`\n')
+
+                          candidates = [
+                              source
+                              for source in scanned_files
+                              if interesting_re.search(texts_by_file.get(source, ''))
+                          ]
+                          if not candidates:
+                              candidates = scanned_files
+
+                          out.write('\nLast 20 lines from fallback log files:\n')
+                          for source in candidates:
+                              out.write(f'\n#### `{source}`\n\n')
+                              lines = texts_by_file.get(source, '').splitlines()
+                              tail = lines[-20:] if lines else ['<empty log file>']
+                              out.write('```\n')
+                              for ln in tail:
+                                  out.write(f'{ansi_re.sub("", ln)}\n')
+                              out.write('```\n')
               else:
                   out.write(
-                      'Captured from `::error`, `##[error]`, and `Error:`/`ERROR:` log lines '\
+                      'Captured from `::error`, `##[error]`, `Error:`/`ERROR:`, '\
+                      '`Traceback`, `Exception`, `FAIL`/`FAILED`, `AssertionError`, '\
+                      '`ModuleNotFoundError`, `RuntimeError`, and `fatal` log lines '\
                       'across all steps in this run.\n\n'
                   )
                   for source, message in unique:

@@ -214,7 +214,7 @@ def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     manager = FakeModelManager()
 
     compute_node_bridge._apply_compute_mode(manager, 'auto')
-    assert manager.default_n_gpu_layers == 0
+    assert manager.default_n_gpu_layers == -1
 
     compute_node_bridge._apply_compute_mode(manager, 'metal')
     assert manager.default_n_gpu_layers == -1

@@ -46,6 +46,8 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 
 ## Rollback
 
+Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
+
 - immediate rollback to prior known-good Helm revision/image tag
 - validate health and request flow
 - record deployment outcome and follow-up actions

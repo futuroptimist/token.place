@@ -1,183 +1,131 @@
+"""Compatibility shim for legacy ``server.server_app`` imports.
+
+Canonical compute-node entrypoint: repository-root ``server.py``.
+This module stays intentionally thin and forwards legacy patch points into the
+canonical implementation so behavior cannot drift.
 """
-Main server application module that integrates all components.
-"""
-import os
-import threading
-import argparse
-import logging
-from urllib.parse import urlparse
-from flask import Flask, request, jsonify
-from typing import Dict, Any, List, Optional
 
-# Import our refactored modules
-from utils.llm.model_manager import get_model_manager
-from utils.crypto.crypto_manager import get_crypto_manager
-from utils.networking.relay_client import RelayClient
-from utils.system import collect_resource_usage
+from __future__ import annotations
 
-# Import config
-from config import get_config
+import importlib.util
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from types import ModuleType
 
-# Get configuration instance
-config = get_config()
+from utils.crypto.crypto_manager import get_crypto_manager as _default_get_crypto_manager
+from utils.llm.model_manager import get_model_manager as _default_get_model_manager
+from utils.networking.relay_client import RelayClient as _default_relay_client
+from utils.system import collect_resource_usage as _default_collect_resource_usage
 
-# Configure logging
-logging.basicConfig(level=logging.INFO if not config.is_production else logging.ERROR,
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('server_app')
-
-def log_info(message):
-    """Log info only in non-production environments"""
-    if not config.is_production:
-        logger.info(message)
-
-def log_error(message, exc_info=False):
-    """Log errors only in non-production environments"""
-    if not config.is_production:
-        logger.error(message, exc_info=exc_info)
+_CANONICAL_MODULE_NAME = "tokenplace_canonical_server"
+_canonical: ModuleType | None = None
 
 
-def _format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
-    """Create a display-ready relay target without duplicating explicit URL ports."""
+def _load_canonical_server_module() -> ModuleType:
+    repo_root = Path(__file__).resolve().parents[1]
+    canonical_path = repo_root / "server.py"
+    spec = importlib.util.spec_from_file_location(_CANONICAL_MODULE_NAME, canonical_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load canonical server module from {canonical_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_CANONICAL_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
 
-    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
-    if relay_port is None or parsed.port is not None:
-        return relay_url
-    return f"{relay_url}:{relay_port}"
+
+def _get_canonical() -> ModuleType:
+    global _canonical
+    if _canonical is None:
+        _canonical = sys.modules.get(_CANONICAL_MODULE_NAME)
+    if _canonical is None:
+        _canonical = _load_canonical_server_module()
+    return _canonical
+
+
+# Re-export legacy patch points used by existing tests/callers.
+get_model_manager = _default_get_model_manager
+get_crypto_manager = _default_get_crypto_manager
+RelayClient = _default_relay_client
+collect_resource_usage = _default_collect_resource_usage
+
+
+def _sync_patch_points() -> ModuleType:
+    canonical = _get_canonical()
+    canonical.get_model_manager = get_model_manager
+    canonical.get_crypto_manager = get_crypto_manager
+    canonical.RelayClient = RelayClient
+    canonical.collect_resource_usage = collect_resource_usage
+    return canonical
+
+
+@contextmanager
+def _patched_runtime_constructor(canonical: ModuleType):
+    """Inject legacy patch hooks into canonical runtime construction."""
+
+    original_runtime = canonical.ComputeNodeRuntime
+
+    def _shim_runtime(runtime_config, *args, **kwargs):
+        kwargs.setdefault("model_manager", get_model_manager())
+        kwargs.setdefault("crypto_manager", get_crypto_manager())
+        kwargs.setdefault(
+            "relay_client",
+            RelayClient(
+                base_url=runtime_config.relay_url,
+                port=runtime_config.relay_port,
+                crypto_manager=kwargs["crypto_manager"],
+                model_manager=kwargs["model_manager"],
+            ),
+        )
+        return original_runtime(runtime_config, *args, **kwargs)
+
+    canonical.ComputeNodeRuntime = _shim_runtime
+    try:
+        yield
+    finally:
+        canonical.ComputeNodeRuntime = original_runtime
+
 
 class ServerApp:
-    """
-    Main server application that integrates all components.
-    """
-    def __init__(
-        self,
-        server_port: int = 3000,
-        relay_port: Optional[int] = None,
-        relay_url: str = "https://token.place",
-    ):
-        """
-        Initialize the server application.
+    """Compatibility wrapper that returns canonical ServerApp instances lazily."""
 
-        Args:
-            server_port: Port to run the server on
-            relay_port: Port the relay server is running on
-            relay_url: URL of the relay server
-        """
-        self.server_port = server_port
-        self.relay_port = relay_port
-        self.relay_url = relay_url
-        self.server_host = config.get('server.host', '127.0.0.1')
+    def __new__(cls, *args, **kwargs):
+        canonical = _sync_patch_points()
+        with _patched_runtime_constructor(canonical):
+            return canonical.ServerApp(*args, **kwargs)
 
-        # Create Flask app
-        self.app = Flask(__name__)
 
-        # Set up endpoints
-        self.setup_routes()
+def parse_args():
+    return _get_canonical().parse_args()
 
-        # Create relay client
-        self.relay_client = RelayClient(
-            base_url=relay_url,
-            port=relay_port,
-            crypto_manager=get_crypto_manager(),
-            model_manager=get_model_manager()
-        )
 
-        # Initialize LLM by downloading model if needed
-        self.initialize_llm()
+def main():
+    canonical = _sync_patch_points()
+    return canonical.main()
 
-    def initialize_llm(self):
-        """Initialize the LLM by downloading the model if needed."""
-        log_info("Initializing LLM...")
-        model_mgr = get_model_manager()
-        if model_mgr.use_mock_llm:
-            log_info("Using mock LLM based on configuration")
-        else:
-            # Download model if needed
-            if model_mgr.download_model_if_needed():
-                log_info("Model ready for inference")
-            else:
-                log_error("Failed to download or verify model")
 
-    def setup_routes(self):
-        """Set up Flask routes for the server."""
-        # Root endpoint
-        @self.app.route('/')
-        def index():
-            return jsonify({
-                'status': 'ok',
-                'message': 'token.place server is running'
-            })
+def __getattr__(name: str):
+    if name == "config":
+        return _get_canonical().config
+    if name == "argparse":
+        return _get_canonical().argparse
+    if name == "_format_relay_target":
+        return _get_canonical()._format_relay_target
+    if name == "log_error":
+        return _get_canonical().log_error
+    raise AttributeError(name)
 
-        # Health check endpoint
-        @self.app.route('/health')
-        def health():
-            return jsonify({
-                'status': 'ok',
-                'version': config.get('version', 'dev'),
-                'mock_mode': get_model_manager().use_mock_llm
-            })
 
-        @self.app.route('/metrics/resource')
-        def resource_metrics():
-            """Expose basic CPU and memory usage metrics for cross-platform monitoring."""
-            usage = collect_resource_usage()
-            return jsonify(usage)
-
-        # Endpoints for direct API access (if needed)
-        # These endpoints might be unused if all communication goes through the relay
-
-    def start_relay_polling(self):  # pragma: no cover
-        """Start polling the relay in a background thread."""
-        relay_thread = threading.Thread(
-            target=self.relay_client.poll_relay_continuously,
-            daemon=True
-        )
-        relay_thread.start()
-        relay_target = _format_relay_target(self.relay_url, self.relay_port)
-        log_info(f"Started relay polling thread for {relay_target}")
-
-    def run(self):  # pragma: no cover
-        """Run the server application."""
-        log_info(f"Starting server on {self.server_host}:{self.server_port}")
-
-        # Start relay polling in a background thread
-        self.start_relay_polling()
-
-        # Run the Flask app. Bind to localhost by default to avoid exposing the
-        # service unintentionally; allow override via configuration.
-        host = config.get('server.host', '127.0.0.1')
-        self.app.run(
-            host=self.server_host,
-            port=self.server_port,
-            debug=not config.is_production,
-            use_reloader=False  # Disable reloader to avoid duplicate threads
-        )
-
-def parse_args():  # pragma: no cover
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="token.place server")
-    parser.add_argument("--server_port", type=int, default=3000, help="Port to run the server on")
-    parser.add_argument("--relay_port", type=int, default=None, help="Port the relay server is running on")
-    parser.add_argument("--relay_url", type=str, default="https://token.place", help="URL of the relay server")
-    parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
-    return parser.parse_args()
-
-def main():  # pragma: no cover
-    """Main entry point for the server application."""
-    args = parse_args()
-
-    # Set USE_MOCK_LLM environment variable if flag is set
-    if args.use_mock_llm:
-        os.environ['USE_MOCK_LLM'] = '1'
-        print("Running in mock LLM mode")
-
-    # Create and run the server
-    server = ServerApp(
-        server_port=args.server_port,
-        relay_port=args.relay_port,
-        relay_url=args.relay_url
-    )
-    server.run()
-
-if __name__ == "__main__":  # pragma: no cover
-    main()
+__all__ = [
+    "ServerApp",
+    "parse_args",
+    "main",
+    "config",
+    "argparse",
+    "_format_relay_target",
+    "get_model_manager",
+    "get_crypto_manager",
+    "RelayClient",
+    "log_error",
+    "collect_resource_usage",
+]

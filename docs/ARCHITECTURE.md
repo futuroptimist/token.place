@@ -141,8 +141,10 @@ The system is tested at multiple levels:
 
 Canonical sequencing lives in [roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md).
 
-- **Current state:** `server.py` is the primary compute-node runtime; `relay.py` handles legacy
-  sink/source and multi-node registration; desktop-tauri is MVP only.
+- **Current state:** `server.py` is the canonical compute-node runtime/entrypoint; `relay.py` is
+  the canonical relay entrypoint; desktop-tauri is MVP only.
+- **Legacy compatibility:** `server/server_app.py` is shim-only and delegates into `server.py` to
+  prevent dual server implementations from drifting.
 - **Near-term:** `server.py` and desktop-tauri co-evolve through a shared compute-node runtime while
   relay operations move onto sugarkube.
 - **Target state (later):** post-parity migration to API v1-aligned distributed compute contracts.

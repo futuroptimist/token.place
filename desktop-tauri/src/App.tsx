@@ -189,6 +189,14 @@ export function App() {
     () => Boolean(config.model_path.trim()) && !computeStatus.running,
     [config.model_path, computeStatus.running]
   );
+  const platformLabel = (backend?.platform_label ?? '').toLowerCase();
+  const backendDisplayLabel = (backend?.display_label ?? '').toLowerCase();
+  const metalSupported = platformLabel.includes('apple') || platformLabel.includes('mac');
+  const cudaSupported =
+    backend?.preferred_mode === 'cuda' ||
+    backendDisplayLabel.includes('cuda') ||
+    platformLabel.includes('nvidia') ||
+    platformLabel.includes('cuda');
 
   const scheduleConfigSave = (next: DesktopConfig) => {
     if (saveTimerRef.current !== null) {
@@ -345,6 +353,8 @@ export function App() {
         onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
       >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
+        <option value="metal" disabled={!metalSupported}>Metal GPU</option>
+        <option value="cuda" disabled={!cudaSupported}>CUDA GPU</option>
         <option value="cpu">CPU fallback</option>
       </select>
 

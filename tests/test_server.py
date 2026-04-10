@@ -104,36 +104,19 @@ def test_setup_routes(server_app):
 
 def test_initialize_llm_mock_mode(server_app):
     """Test the initialize_llm method in mock mode."""
-    with patch('server.server_app.get_model_manager') as mock_get_model_manager:
-        mock_model_manager = MagicMock()
-        mock_model_manager.use_mock_llm = True
-        mock_get_model_manager.return_value = mock_model_manager
+    with patch.object(server_app.runtime, "ensure_model_ready") as mock_ensure_model_ready:
         server_app.initialize_llm()
-        # Verify that download_model_if_needed was not called
-        mock_model_manager.download_model_if_needed.assert_not_called()
+        mock_ensure_model_ready.assert_called_once_with()
 
 def test_initialize_llm_real_mode(server_app):
     """Test the initialize_llm method in real mode."""
-    with patch('server.server_app.get_model_manager') as mock_get_model_manager:
-        mock_model_manager = MagicMock()
-        mock_model_manager.use_mock_llm = False
-        mock_model_manager.download_model_if_needed.return_value = True
-        mock_get_model_manager.return_value = mock_model_manager
+    with patch.object(server_app.runtime, "ensure_model_ready", return_value=True) as mock_ensure_model_ready:
         server_app.initialize_llm()
-        # Verify that download_model_if_needed was called
-        mock_model_manager.download_model_if_needed.assert_called_once()
+        mock_ensure_model_ready.assert_called_once_with()
 
 
 def test_initialize_llm_real_mode_failure(server_app):
-    """Log an error when model download fails."""
-    with patch('server.server_app.get_model_manager') as mock_get_model_manager, \
-         patch('server.server_app.log_error') as mock_log_error:
-        mock_model_manager = MagicMock()
-        mock_model_manager.use_mock_llm = False
-        mock_model_manager.download_model_if_needed.return_value = False
-        mock_get_model_manager.return_value = mock_model_manager
-
-        server_app.initialize_llm()
-
-        mock_model_manager.download_model_if_needed.assert_called_once()
-        mock_log_error.assert_called_once_with("Failed to download or verify model")
+    """Ensure initialize_llm surfaces runtime failures."""
+    with patch.object(server_app.runtime, "ensure_model_ready", side_effect=RuntimeError("model download failed")):
+        with pytest.raises(RuntimeError, match="model download failed"):
+            server_app.initialize_llm()

@@ -162,6 +162,12 @@ See also:
 - [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
+## Canonical entrypoints
+
+- `server.py` is the canonical compute-node server entrypoint.
+- `relay.py` is the canonical relay entrypoint.
+- `server/server_app.py` is retained only as a legacy compatibility shim that delegates to `server.py`.
+
 ## Deployment topology
 
 - **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the

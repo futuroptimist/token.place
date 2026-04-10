@@ -1,93 +1,57 @@
-from unittest.mock import MagicMock, patch
-import os
+"""Compatibility tests for legacy server.server_app shim."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
 
 import server.server_app as sa
 
 
-def test_parse_args_defaults(monkeypatch):
-    import sys
-
-    monkeypatch.setattr(sys, "argv", ["server.py"])
-    args = sa.parse_args()
-    assert args.server_port == 3000
-    assert args.relay_port is None
-    assert args.relay_url == "https://token.place"
-    assert args.use_mock_llm is False
+def test_server_app_shim_reexports_canonical_symbols():
+    canonical = sa._get_canonical()
+    assert callable(canonical.ServerApp)
+    assert callable(sa.parse_args)
+    assert callable(sa.main)
 
 
-def test_parse_args_custom(monkeypatch):
-    import sys
+def test_server_app_main_delegates_to_canonical(monkeypatch):
+    canonical = sa._get_canonical()
+    mock_main = MagicMock()
+    monkeypatch.setattr(canonical, "main", mock_main)
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "server.py",
-            "--server_port",
-            "1234",
-            "--relay_port",
-            "7777",
-            "--relay_url",
-            "http://example.com",
-            "--use_mock_llm",
-        ],
-    )
-    args = sa.parse_args()
-    assert args.server_port == 1234
-    assert args.relay_port == 7777
-    assert args.relay_url == "http://example.com"
-    assert args.use_mock_llm is True
-
-
-def test_initialize_llm_mock():
-    with patch("server.server_app.get_model_manager") as gm:
-        gm.return_value.use_mock_llm = True
-        app = sa.ServerApp()
-        # initialize_llm called in __init__; ensure method executed
-        gm.assert_called()
-
-
-def test_initialize_llm_download():
-    mm = MagicMock()
-    mm.use_mock_llm = False
-    mm.download_model_if_needed.return_value = True
-    with patch("server.server_app.get_model_manager", return_value=mm):
-        app = sa.ServerApp()
-        mm.download_model_if_needed.assert_called_once()
-
-
-def test_start_relay_polling():
-    with patch("server.server_app.RelayClient") as rc:
-        instance = rc.return_value
-        instance.poll_relay_continuously = MagicMock()
-        app = sa.ServerApp()
-        with patch("threading.Thread") as th:
-            thread = MagicMock()
-            th.return_value = thread
-            app.start_relay_polling()
-            thread.start.assert_called_once()
-
-
-def test_main_invocation(monkeypatch):
-    args = sa.argparse.Namespace(
-        server_port=1111,
-        relay_port=2222,
-        relay_url="http://foo",
-        use_mock_llm=True,
-    )
-    monkeypatch.setattr(sa, "parse_args", lambda: args)
-    mock_app = MagicMock()
-    monkeypatch.setattr(sa, "ServerApp", MagicMock(return_value=mock_app))
-    monkeypatch.delenv("USE_MOCK_LLM", raising=False)
     sa.main()
-    sa.ServerApp.assert_called_once_with(
-        server_port=1111,
-        relay_port=2222,
-        relay_url="http://foo",
+
+    mock_main.assert_called_once_with()
+
+
+def test_parse_args_still_available(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["server.py", "--server_port", "3333"])
+    args = sa.parse_args()
+    assert args.server_port == 3333
+
+
+def test_server_app_uses_legacy_patch_hooks_for_runtime(monkeypatch):
+    canonical = sa._get_canonical()
+    model_manager = MagicMock(use_mock_llm=True)
+    crypto_manager = MagicMock()
+    relay_client = MagicMock()
+    relay_ctor = MagicMock(return_value=relay_client)
+
+    monkeypatch.setattr(canonical.ServerApp, "initialize_llm", lambda self: None)
+    monkeypatch.setattr(sa, "get_model_manager", lambda: model_manager)
+    monkeypatch.setattr(sa, "get_crypto_manager", lambda: crypto_manager)
+    monkeypatch.setattr(sa, "RelayClient", relay_ctor)
+
+    app = sa.ServerApp(server_port=3333, relay_url="http://localhost", relay_port=5555)
+
+    assert app.runtime.model_manager is model_manager
+    assert app.runtime.crypto_manager is crypto_manager
+    assert app.runtime.relay_client is relay_client
+    relay_ctor.assert_called_once_with(
+        base_url="http://localhost",
+        port=5555,
+        crypto_manager=crypto_manager,
+        model_manager=model_manager,
     )
-    mock_app.run.assert_called_once()
-    assert os.environ["USE_MOCK_LLM"] == "1"
-
-
-def test_format_relay_target_avoids_duplicate_port():
-    assert sa._format_relay_target("http://localhost:5000", 5000) == "http://localhost:5000"

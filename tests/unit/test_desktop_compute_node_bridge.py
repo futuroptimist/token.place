@@ -213,6 +213,9 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     manager = FakeModelManager()
 
+    compute_node_bridge._apply_compute_mode(manager, 'auto')
+    assert manager.default_n_gpu_layers == 0
+
     compute_node_bridge._apply_compute_mode(manager, 'metal')
     assert manager.default_n_gpu_layers == -1
 

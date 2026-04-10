@@ -69,7 +69,7 @@ def test_next_server_one_server(client):
     # Simulate server registration (directly modifying state for setup)
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,
-        'last_ping': time.time(),
+        'last_ping': datetime.now(),
         'last_ping_duration': 10
     }
 

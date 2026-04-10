@@ -30,5 +30,5 @@ def test_shim_main_delegates_to_canonical_server():
     canonical_module.main.assert_called_once_with()
 
 
-def test_shim_relay_target_format_helper_is_canonical():
-    assert shim._format_relay_target("http://localhost:5000", 5000) == "http://localhost:5000"
+def test_shim_limits_exports_to_compat_entrypoints():
+    assert shim.__all__ == ["ServerApp", "parse_args", "main"]

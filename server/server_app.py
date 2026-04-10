@@ -39,13 +39,7 @@ def _load_canonical() -> ModuleType:
 
 
 def __getattr__(name: str):
-    if name in {
-        "ServerApp",
-        "_first_env",
-        "_resolve_relay_url",
-        "_resolve_relay_port",
-        "_format_relay_target",
-    }:
+    if name == "ServerApp":
         return getattr(_load_canonical(), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -65,10 +59,6 @@ __all__ = [
     "ServerApp",
     "parse_args",
     "main",
-    "_first_env",
-    "_resolve_relay_url",
-    "_resolve_relay_port",
-    "_format_relay_target",
 ]
 
 

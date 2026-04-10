@@ -148,8 +148,18 @@ def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeyp
     assert event_types[0] == 'started'
     assert 'status' in event_types
     assert event_types[-1] == 'stopped'
+    assert events[0]['relay_port'] is None
+    assert events[0]['relay_target'] == 'https://token.place'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
+    assert all(event.get('relay_port') is None for event in events if event['type'] == 'status')
+    assert all(
+        event.get('relay_target') == 'https://token.place'
+        for event in events
+        if event['type'] == 'status'
+    )
+    assert events[-1]['relay_port'] is None
+    assert events[-1]['relay_target'] == 'https://token.place'
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):
@@ -173,6 +183,8 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
     assert 'failed to initialize model runtime' in payload['message']
+    assert payload['relay_port'] is None
+    assert payload['relay_target'] == 'https://token.place'
 
 
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):

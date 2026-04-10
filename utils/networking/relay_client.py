@@ -117,23 +117,54 @@ def log_error(message, *args, exc_info: bool = False) -> None:
 
 def _extract_chat_history_and_validate_key_binding(
     decrypted_payload: Any,
-    relay_client_public_key_b64: str,
+    expected_client_public_key_b64: str,
 ) -> Optional[Any]:
     """Validate optional encrypted key-binding metadata and return chat history."""
 
+    def _is_valid_chat_history(chat_history: Any) -> bool:
+        if not isinstance(chat_history, list):
+            return False
+
+        for message in chat_history:
+            if not isinstance(message, dict):
+                return False
+            if not isinstance(message.get("role"), str):
+                return False
+            if not isinstance(message.get("content"), str):
+                return False
+
+        return True
+
     if isinstance(decrypted_payload, dict):
         bound_client_key = decrypted_payload.get("client_public_key")
-        if bound_client_key is None:
-            return decrypted_payload.get("chat_history", decrypted_payload)
-        if not isinstance(bound_client_key, str):
-            log_error("Invalid encrypted payload: client_public_key binding must be a string")
-            return None
-        if bound_client_key != relay_client_public_key_b64:
-            log_error("Rejected request: relay client key does not match encrypted key binding")
-            return None
-        return decrypted_payload.get("chat_history")
+        if bound_client_key is not None:
+            if not isinstance(bound_client_key, str):
+                log_error("Invalid encrypted payload: client_public_key binding must be a string")
+                return None
+            if bound_client_key != expected_client_public_key_b64:
+                log_error("Rejected request: relay client key does not match encrypted key binding")
+                return None
+        else:
+            # Legacy clients may still send unbound payloads; continue to accept for compatibility.
+            pass
 
-    return decrypted_payload
+        if "chat_history" not in decrypted_payload:
+            log_error("Invalid encrypted payload: missing chat_history")
+            return None
+
+        chat_history = decrypted_payload.get("chat_history")
+        if not _is_valid_chat_history(chat_history):
+            log_error("Invalid encrypted payload: chat_history must be a list of role/content message objects")
+            return None
+
+        return chat_history
+
+    if _is_valid_chat_history(decrypted_payload):
+        return decrypted_payload
+
+    log_error("Invalid encrypted payload: expected chat_history list or payload containing chat_history")
+    return None
+
 
 class RelayClient:
     """

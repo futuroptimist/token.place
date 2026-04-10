@@ -727,6 +727,42 @@ class TestRelayClient:
         assert result is True
         mock_model_manager.llama_cpp_get_response.assert_called_once_with(chat_history)
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_rejects_bound_payload_missing_chat_history(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Bound payloads without chat_history are rejected."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "client_public_key": request_data["client_public_key"],
+        }
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is False
+        mock_post.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_rejects_invalid_chat_history_shape(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Decrypted payloads with invalid chat message shape are rejected."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "chat_history": [{"role": "user", "content": 123}],
+        }
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is False
+        mock_post.assert_not_called()
+
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_streaming_posts_to_stream_source(

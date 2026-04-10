@@ -503,6 +503,8 @@ def healthz():
 @app.route("/livez", methods=["GET"])
 def livez():
     return jsonify({"status": "alive"})
+
+
 def _register_stream_session(server_public_key, client_public_key):
     """Create or replace the streaming session for a client/server pair."""
 

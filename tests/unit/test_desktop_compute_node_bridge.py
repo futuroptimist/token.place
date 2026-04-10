@@ -111,6 +111,9 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    module.format_relay_target = (
+        lambda relay_url, relay_port: f"{relay_url}:{relay_port}" if relay_port else relay_url
+    )
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 

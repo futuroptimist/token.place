@@ -8,49 +8,58 @@ retained to keep older imports working while delegating all behavior to
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
+from types import ModuleType
 
 
 _CANONICAL_SERVER_PATH = Path(__file__).resolve().parents[1] / "server.py"
-_CANONICAL_SERVER_SPEC = importlib.util.spec_from_file_location(
-    "tokenplace_canonical_server",
-    _CANONICAL_SERVER_PATH,
-)
-if _CANONICAL_SERVER_SPEC is None or _CANONICAL_SERVER_SPEC.loader is None:  # pragma: no cover
-    raise RuntimeError(f"unable to load canonical server module from {_CANONICAL_SERVER_PATH}")
+_canonical_server: ModuleType | None = None
 
-_canonical_server = importlib.util.module_from_spec(_CANONICAL_SERVER_SPEC)
-_CANONICAL_SERVER_SPEC.loader.exec_module(_canonical_server)
 
-ServerApp = _canonical_server.ServerApp
-_first_env = _canonical_server._first_env
-_resolve_relay_url = _canonical_server._resolve_relay_url
-_resolve_relay_port = _canonical_server._resolve_relay_port
-_format_relay_target = _canonical_server._format_relay_target
+def _load_canonical() -> ModuleType:
+    """Load and cache the canonical server module on first use."""
+
+    global _canonical_server
+    if _canonical_server is not None:
+        return _canonical_server
+
+    canonical_spec = importlib.util.spec_from_file_location(
+        "tokenplace_canonical_server",
+        _CANONICAL_SERVER_PATH,
+    )
+    if canonical_spec is None or canonical_spec.loader is None:  # pragma: no cover
+        raise RuntimeError(
+            f"unable to load canonical server module from {_CANONICAL_SERVER_PATH}"
+        )
+
+    canonical_module = importlib.util.module_from_spec(canonical_spec)
+    canonical_spec.loader.exec_module(canonical_module)
+    _canonical_server = canonical_module
+    return canonical_module
+
+
+def __getattr__(name: str):
+    if name in {
+        "ServerApp",
+        "_first_env",
+        "_resolve_relay_url",
+        "_resolve_relay_port",
+        "_format_relay_target",
+    }:
+        return getattr(_load_canonical(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def parse_args():
     """Compatibility wrapper around canonical CLI parsing."""
 
-    return _canonical_server.parse_args()
+    return _load_canonical().parse_args()
 
 
 def main() -> None:
     """Compatibility wrapper that delegates startup to ``server.py``."""
 
-    args = parse_args()
-    if args.use_mock_llm:
-        os.environ["USE_MOCK_LLM"] = "1"
-    relay_url = _resolve_relay_url(args.relay_url)
-    relay_port = _resolve_relay_port(args.relay_port, relay_url)
-    server = ServerApp(
-        server_port=args.server_port,
-        server_host=args.server_host,
-        relay_port=relay_port,
-        relay_url=relay_url,
-    )
-    server.run()
+    _load_canonical().main()
 
 __all__ = [
     "ServerApp",

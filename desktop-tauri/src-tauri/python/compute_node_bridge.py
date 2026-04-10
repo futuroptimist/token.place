@@ -82,6 +82,7 @@ def run(args: argparse.Namespace) -> int:
         from utils.compute_node_runtime import (
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
+            format_relay_target,
             is_legacy_relay_payload,
             resolve_relay_port,
             resolve_relay_url,
@@ -92,6 +93,7 @@ def run(args: argparse.Namespace) -> int:
 
     relay_url = resolve_relay_url(args.relay_url)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
+    relay_target = format_relay_target(relay_url, relay_port)
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
@@ -110,7 +112,7 @@ def run(args: argparse.Namespace) -> int:
                 "message": "failed to initialize model runtime",
                 "active_relay_url": runtime.relay_client.relay_url,
                 "relay_port": relay_port,
-                "relay_target": runtime.relay_client.relay_url,
+                "relay_target": relay_target,
             }
         )
         return 1
@@ -123,7 +125,7 @@ def run(args: argparse.Namespace) -> int:
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
             "relay_port": relay_port,
-            "relay_target": runtime.relay_client.relay_url,
+            "relay_target": relay_target,
             "backend_mode": args.mode,
             "model_path": args.model,
             "last_error": None,
@@ -155,7 +157,7 @@ def run(args: argparse.Namespace) -> int:
                     "registered": registered,
                     "active_relay_url": active_relay_url,
                     "relay_port": relay_port,
-                    "relay_target": active_relay_url,
+                    "relay_target": relay_target,
                     "backend_mode": args.mode,
                     "model_path": args.model,
                     "last_error": last_error,
@@ -175,7 +177,7 @@ def run(args: argparse.Namespace) -> int:
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
             "relay_port": relay_port,
-            "relay_target": runtime.relay_client.relay_url,
+            "relay_target": relay_target,
             "backend_mode": args.mode,
             "model_path": args.model,
             "last_error": None,

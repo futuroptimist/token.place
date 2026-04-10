@@ -1,8 +1,6 @@
 """Tests for the legacy ``server.server_app`` compatibility shim."""
 
-import argparse
 from unittest.mock import patch
-from unittest.mock import MagicMock
 
 import server
 import server.server_app as shim
@@ -25,27 +23,11 @@ def test_shim_parse_args_matches_canonical_defaults(monkeypatch):
     assert args.use_mock_llm is False
 
 
-def test_shim_main_delegates_to_canonical_server(monkeypatch):
-    args = argparse.Namespace(
-        server_port=1111,
-        server_host="0.0.0.0",
-        relay_port=2222,
-        relay_url="http://relay.example.com",
-        use_mock_llm=False,
-    )
-    mock_server = MagicMock()
-
-    monkeypatch.setattr(shim, "parse_args", lambda: args)
-    with patch("server.server_app.ServerApp", return_value=mock_server) as server_ctor:
+def test_shim_main_delegates_to_canonical_server():
+    with patch("server.server_app._load_canonical") as load_canonical:
+        canonical_module = load_canonical.return_value
         shim.main()
-
-    server_ctor.assert_called_once_with(
-        server_port=1111,
-        server_host="0.0.0.0",
-        relay_port=2222,
-        relay_url="http://relay.example.com",
-    )
-    mock_server.run.assert_called_once()
+    canonical_module.main.assert_called_once_with()
 
 
 def test_shim_relay_target_format_helper_is_canonical():

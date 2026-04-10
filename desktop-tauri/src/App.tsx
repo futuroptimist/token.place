@@ -155,7 +155,12 @@ export function App() {
             : prev.active_relay_url,
         relay_target:
           typeof payload.relay_target === 'string' ? payload.relay_target : prev.relay_target,
-        relay_port: typeof payload.relay_port === 'number' ? payload.relay_port : prev.relay_port,
+        relay_port:
+          payload.relay_port === null
+            ? null
+            : typeof payload.relay_port === 'number'
+              ? payload.relay_port
+              : prev.relay_port,
         backend_mode:
           typeof payload.backend_mode === 'string' ? payload.backend_mode : prev.backend_mode,
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,

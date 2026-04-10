@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
@@ -58,12 +59,40 @@ def _sync_patch_points() -> ModuleType:
     return canonical
 
 
+@contextmanager
+def _patched_runtime_constructor(canonical: ModuleType):
+    """Inject legacy patch hooks into canonical runtime construction."""
+
+    original_runtime = canonical.ComputeNodeRuntime
+
+    def _shim_runtime(runtime_config, *args, **kwargs):
+        kwargs.setdefault("model_manager", get_model_manager())
+        kwargs.setdefault("crypto_manager", get_crypto_manager())
+        kwargs.setdefault(
+            "relay_client",
+            RelayClient(
+                base_url=runtime_config.relay_url,
+                port=runtime_config.relay_port,
+                crypto_manager=kwargs["crypto_manager"],
+                model_manager=kwargs["model_manager"],
+            ),
+        )
+        return original_runtime(runtime_config, *args, **kwargs)
+
+    canonical.ComputeNodeRuntime = _shim_runtime
+    try:
+        yield
+    finally:
+        canonical.ComputeNodeRuntime = original_runtime
+
+
 class ServerApp:
     """Compatibility wrapper that returns canonical ServerApp instances lazily."""
 
     def __new__(cls, *args, **kwargs):
         canonical = _sync_patch_points()
-        return canonical.ServerApp(*args, **kwargs)
+        with _patched_runtime_constructor(canonical):
+            return canonical.ServerApp(*args, **kwargs)
 
 
 def parse_args():

@@ -190,8 +190,13 @@ export function App() {
     [config.model_path, computeStatus.running]
   );
   const platformLabel = (backend?.platform_label ?? '').toLowerCase();
+  const backendDisplayLabel = (backend?.display_label ?? '').toLowerCase();
   const metalSupported = platformLabel.includes('apple') || platformLabel.includes('mac');
-  const cudaSupported = platformLabel.includes('nvidia') || platformLabel.includes('cuda');
+  const cudaSupported =
+    backend?.preferred_mode === 'cuda' ||
+    backendDisplayLabel.includes('cuda') ||
+    platformLabel.includes('nvidia') ||
+    platformLabel.includes('cuda');
 
   const scheduleConfigSave = (next: DesktopConfig) => {
     if (saveTimerRef.current !== null) {

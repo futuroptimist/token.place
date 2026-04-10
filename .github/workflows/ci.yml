@@ -9,9 +9,12 @@ jobs:
   test:
     name: Run tests and collect coverage
     runs-on: ubuntu-latest
+    env:
+      CI_LOG_DIR: ${{ runner.temp }}/ci-logs
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
+        id: setup_python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -19,41 +22,136 @@ jobs:
           cache-dependency-path: |
             requirements.txt
       - name: Set up Node.js
+        id: setup_node
         uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: 'npm'
+      - name: Initialize CI log directory
+        id: init_logs
+        run: mkdir -p "$CI_LOG_DIR"
       - name: Prepare Raspberry Pi cgroups
         id: prep
         run: |
           set +e
-          sudo bash scripts/prepare-pi-cgroups.sh
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          sudo bash scripts/prepare-pi-cgroups.sh 2>&1 | tee "$CI_LOG_DIR/prep.log"
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Stop for reboot
         if: steps.prep.outputs.rc == '2'
         run: echo "Cgroup configuration updated. Reboot runner and re-run job."
       - name: Validate dependency compatibility
-        run: python scripts/validate_dependencies.py
-        if: steps.prep.outputs.rc != '2'
-      - name: Install Python dependencies
+        id: validate_dependencies
         if: steps.prep.outputs.rc != '2'
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          set +e
+          python scripts/validate_dependencies.py 2>&1 | tee "$CI_LOG_DIR/validate_dependencies.log"
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Install Python dependencies
+        id: install_python_deps
+        if: steps.prep.outputs.rc != '2'
+        run: |
+          set +e
+          {
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          } 2>&1 | tee "$CI_LOG_DIR/install_python_deps.log"
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Install Playwright browsers
+        id: install_playwright
         if: steps.prep.outputs.rc != '2'
-        run: playwright install
+        run: |
+          set +e
+          playwright install 2>&1 | tee "$CI_LOG_DIR/install_playwright.log"
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Install Node.js dependencies
+        id: install_node_deps
         if: steps.prep.outputs.rc != '2'
-        run: npm ci
+        run: |
+          set +e
+          npm ci 2>&1 | tee "$CI_LOG_DIR/install_node_deps.log"
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Run tests
+        id: run_tests
         if: steps.prep.outputs.rc != '2'
-        run: ./run_all_tests.sh
-        env:
-          TEST_COVERAGE: '1'
+        run: |
+          set +e
+          TEST_COVERAGE=1 ./run_all_tests.sh 2>&1 | tee "$CI_LOG_DIR/run_tests.log"
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Upload coverage reports to Codecov
-        if: steps.prep.outputs.rc != '2'
+        if: steps.prep.outputs.rc != '2' && steps.run_tests.outputs.exit_code == '0'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Summarize CI errors
+        if: always()
+        run: |
+          set -euo pipefail
+
+          declare -a failed_steps=()
+
+          collect_errors() {
+            local title="$1"
+            local code="$2"
+            local log_file="$3"
+
+            if [ "${code:-0}" != "0" ]; then
+              failed_steps+=("$title")
+              {
+                echo "### $title (exit code $code)"
+                if [ -f "$log_file" ]; then
+                  if ! grep -Ein 'error|failed|traceback|exception|fatal' "$log_file" | tail -n 40; then
+                    echo "No explicit error lines matched; showing last 40 lines:"
+                    tail -n 40 "$log_file"
+                  fi
+                else
+                  echo "No log file found for this step."
+                fi
+                echo
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          if [ "${{ steps.prep.outputs.rc }}" = "2" ]; then
+            {
+              echo "## CI failure summary"
+              echo "Runner requires reboot after cgroup changes."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## CI failure summary"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          collect_errors "Validate dependency compatibility" "${{ steps.validate_dependencies.outputs.exit_code || '0' }}" "$CI_LOG_DIR/validate_dependencies.log"
+          collect_errors "Install Python dependencies" "${{ steps.install_python_deps.outputs.exit_code || '0' }}" "$CI_LOG_DIR/install_python_deps.log"
+          collect_errors "Install Playwright browsers" "${{ steps.install_playwright.outputs.exit_code || '0' }}" "$CI_LOG_DIR/install_playwright.log"
+          collect_errors "Install Node.js dependencies" "${{ steps.install_node_deps.outputs.exit_code || '0' }}" "$CI_LOG_DIR/install_node_deps.log"
+          collect_errors "Run tests" "${{ steps.run_tests.outputs.exit_code || '0' }}" "$CI_LOG_DIR/run_tests.log"
+
+          if [ ${#failed_steps[@]} -eq 0 ]; then
+            echo "No errors were detected in run steps." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Failed steps"
+            for step_name in "${failed_steps[@]}"; do
+              echo "- $step_name"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit 1

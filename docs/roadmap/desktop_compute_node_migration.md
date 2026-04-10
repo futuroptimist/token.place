@@ -116,15 +116,28 @@ Desktop is considered parity-ready only when all of the following are true:
   - explicit GGUF artifact selection used by runtime
   - model browse + download flow
   - default relay URL `https://token.place` with user override support
+  - compute-mode contract parity (`auto|cpu|metal|cuda`) with normalized operator reporting
+
+## Workstation platform targeting (short-to-medium term)
+
+- `server.py` and desktop-tauri are the workstation compute-node runtimes in this phase.
+- Mode intent:
+  - `cuda` for Windows 11 + NVIDIA workstations (for example RTX 4090-class operators)
+  - `metal` for macOS on Apple Silicon (including Mac Mini M4-class hosts)
+  - `cpu` as portable fallback on any workstation
+  - Raspberry Pi remains a **later** low-power workstation/server target
+- sugarkube/k3s remains **relay-only** for this phase (`relay.py`), not compute-node hosting.
 
 ## Readiness checklists
 
 ### Desktop parity readiness
 
-- [ ] Shared compute-node runtime is consumed by both `server.py` and desktop-tauri.
+- [x] Shared compute-node runtime is consumed by both `server.py` and desktop-tauri.
 - [ ] Desktop executes real inference workloads (not fake sidecar only).
 - [ ] Streaming and cancellation match server runtime behavior.
 - [ ] Relay integration passes legacy contract integration tests.
+- [x] Compute-mode normalization and operator-visible mode/reporting are consistent (`auto|cpu|metal|cuda`).
+- [x] Relay URL + model path + backend mode are propagated in desktop operator status events.
 - [ ] Model-management parity requirements are implemented.
 
 ### Legacy multi-node relay readiness
@@ -152,6 +165,6 @@ Desktop is considered parity-ready only when all of the following are true:
 
 - **Current:** `relay.py` + `server.py` legacy flow is the production baseline; desktop-tauri is MVP.
   `server/server_app.py` remains compatibility-only and should not diverge from `server.py`.
-- **Near-term:** desktop and `server.py` co-evolve through a shared runtime while relay moves onto
-  sugarkube.
+- **Near-term:** desktop and `server.py` co-evolve through a shared runtime while **relay-only**
+  deployment moves onto sugarkube.
 - **Target:** post-parity, post-API-v1 distributed compute with secure API v1-aligned components.

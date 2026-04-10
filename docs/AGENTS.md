@@ -140,3 +140,15 @@ For convenience, you can execute all available test suites with `./run_all_tests
 - Tag **@claude** in a pull request or issue to invoke the Claude PR Assistant defined in `.github/workflows/claude.yml`.
 - Ensure the [Codecov GitHub App](https://github.com/marketplace/codecov) is installed on your fork so coverage badges and PR comments work reliably.
 - Real-world integration tests live in the [DSPACE project](https://github.com/democratizedspace/dspace); token.place acts as its OpenAI-compatible backend.
+
+## Architecture guardrails (current phase)
+
+- Keep `server.py` as the canonical compute-node entrypoint.
+- Keep `server/server_app.py` as compatibility-only shim behavior.
+- Keep sugarkube/k3s scope relay-only (`relay.py`) during parity work.
+- Keep workstation compute targets explicit in docs/code paths:
+  - Windows + CUDA/NVIDIA
+  - macOS + Metal/Apple Silicon
+  - CPU fallback
+  - Raspberry Pi later (not part of current relay rollout)
+- Do not start full API v1 distributed compute migration work until parity gates are complete.

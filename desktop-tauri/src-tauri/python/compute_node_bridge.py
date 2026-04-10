@@ -60,14 +60,6 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def _apply_compute_mode(manager: Any, mode: str) -> None:
-    selected = (mode or "auto").lower()
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    elif selected in {"metal", "cuda"}:
-        manager.default_n_gpu_layers = -1
-
-
 def _sleep_with_cancel(seconds: float) -> bool:
     deadline = time.time() + max(seconds, 0)
     while time.time() < deadline:
@@ -83,6 +75,8 @@ def run(args: argparse.Namespace) -> int:
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_legacy_relay_payload,
+            normalize_compute_mode,
+            apply_compute_mode,
             resolve_relay_port,
             resolve_relay_url,
         )
@@ -101,7 +95,8 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    _apply_compute_mode(runtime.model_manager, args.mode)
+    selected_mode = normalize_compute_mode(args.mode)
+    apply_compute_mode(runtime.model_manager, selected_mode)
 
     if not runtime.ensure_model_ready():
         emit(
@@ -120,7 +115,7 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": args.mode,
+            "backend_mode": selected_mode,
             "model_path": args.model,
             "last_error": None,
         }
@@ -150,7 +145,7 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
-                    "backend_mode": args.mode,
+                    "backend_mode": selected_mode,
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -168,7 +163,7 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": args.mode,
+            "backend_mode": selected_mode,
             "model_path": args.model,
             "last_error": None,
         }

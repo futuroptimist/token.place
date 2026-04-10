@@ -11,6 +11,8 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 - relay image/chart updates
 - registration and polling behavior with external compute nodes
 
+Out of scope in this runbook: moving `server.py` or desktop compute nodes into the k3s cluster.
+
 ## Prerequisites
 
 - sugarkube dev cluster access

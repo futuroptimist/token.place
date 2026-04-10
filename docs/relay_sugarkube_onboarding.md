@@ -1,7 +1,7 @@
 # Relay on sugarkube onboarding (token.place)
 
-This guide explains how and why to run `relay.py` on sugarkube before full desktop/server
-migration is complete.
+This guide explains how and why to run `relay.py` on sugarkube while workstation compute runtimes
+(`server.py` and desktop-tauri) remain outside k3s during parity work.
 
 ## Why relay.py belongs on sugarkube
 
@@ -14,6 +14,13 @@ migration is complete.
 
 This allows token.place to improve relay availability and operator workflows while GPU-heavy
 compute nodes (`server.py` and later desktop compute nodes) remain external during parity phases.
+
+Workstation target profile in this phase:
+
+- Windows 11 + NVIDIA (`cuda`)
+- macOS + Apple Silicon (`metal`)
+- CPU fallback on either platform
+- Raspberry Pi later as low-power workstation/server follow-on (not part of relay-on-k3s rollout)
 
 Roadmap alignment: [desktop compute-node migration roadmap](roadmap/desktop_compute_node_migration.md).
 
@@ -80,6 +87,8 @@ curl -fsS https://<env-host>/healthz
 
 - Compute nodes are still external during parity phases.
 - Legacy sink/source contract remains active until post-parity API v1 migration.
+- `server.py` remains the canonical compute-node entrypoint; `server/server_app.py` remains a
+  compatibility shim only.
 - Final sugarkube automation wrappers may still be in progress per environment.
 
 ## How this fits the broader roadmap

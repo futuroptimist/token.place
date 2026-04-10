@@ -8,6 +8,8 @@
 Relay-only staging at `staging.token.place` (or equivalent environment hostname), with external
 compute nodes still using legacy sink/source contract.
 
+Out of scope in this runbook: scheduling compute-node workloads inside sugarkube.
+
 ## Prerequisites
 
 - staging cluster namespace access

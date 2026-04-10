@@ -177,10 +177,21 @@ See also:
 - **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
   contracts after parity and operational readiness gates are complete.
 
+## Workstation compute targets (current phase)
+
+- `server.py` and desktop-tauri are workstation compute-node runtimes.
+- Preferred modes:
+  - `cuda`: Windows 11 + NVIDIA operators (for example RTX 4090 class)
+  - `metal`: macOS + Apple Silicon operators (including Mac Mini M4 class)
+  - `cpu`: portable fallback where GPU acceleration is unavailable
+- Raspberry Pi is a later low-power workstation/server target and is not part of the current
+  sugarkube relay rollout.
+
 ## sugarkube deployment
 
 `relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
-operationally separate from GPU-heavy compute nodes.
+operationally separate from GPU-heavy compute nodes. In the short-to-medium term, sugarkube is
+relay-only (`relay.py`), while compute nodes continue to run on operator workstations.
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

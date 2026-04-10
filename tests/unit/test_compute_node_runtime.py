@@ -4,9 +4,11 @@ from utils.compute_node_runtime import (
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
     LegacyRelayRequestAdapter,
+    apply_compute_mode,
     first_env,
     format_relay_target,
     is_legacy_relay_payload,
+    normalize_compute_mode,
     resolve_relay_port,
     resolve_relay_url,
 )
@@ -214,6 +216,25 @@ def test_compute_node_runtime_relay_port_returns_none_when_no_values(monkeypatch
 
 def test_compute_node_runtime_format_relay_target_preserves_explicit_url_port():
     assert format_relay_target("https://token.place:7443", 9999) == "https://token.place:7443"
+
+
+def test_normalize_compute_mode_handles_case_and_unknown_inputs():
+    assert normalize_compute_mode("CuDa") == "cuda"
+    assert normalize_compute_mode(" metal ") == "metal"
+    assert normalize_compute_mode("unknown") == "auto"
+    assert normalize_compute_mode(None) == "auto"
+
+
+def test_apply_compute_mode_sets_cpu_fallback_layers():
+    manager = MagicMock()
+
+    selected_cpu = apply_compute_mode(manager, "cpu")
+    assert selected_cpu == "cpu"
+    assert manager.default_n_gpu_layers == 0
+
+    selected_auto = apply_compute_mode(manager, "not-real")
+    assert selected_auto == "auto"
+    assert manager.default_n_gpu_layers == -1
 
 
 def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client():

@@ -147,6 +147,12 @@ Canonical sequencing lives in [roadmap/desktop_compute_node_migration.md](roadma
   prevent dual server implementations from drifting.
 - **Near-term:** `server.py` and desktop-tauri co-evolve through a shared compute-node runtime while
   relay operations move onto sugarkube.
+- **Near-term deployment boundary:** sugarkube/k3s is relay-only (`relay.py`); workstation compute
+  runtimes (`server.py`, desktop-tauri) stay external.
+- **Workstation mode contract:** `auto|cpu|metal|cuda` with `cuda` targeting Windows/NVIDIA,
+  `metal` targeting macOS/Apple Silicon, and `cpu` as fallback.
+- **Deferred intentionally:** full API v1 distributed-compute migration happens only after parity
+  and relay runbooks are stable.
 - **Target state (later):** post-parity migration to API v1-aligned distributed compute contracts.
 
 Related operations docs:

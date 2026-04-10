@@ -122,20 +122,13 @@ def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
     return message.get("content", "") if isinstance(message, dict) else ""
 
 
-def _apply_compute_mode(manager: Any, mode: str) -> None:
-    selected = (mode or "auto").lower()
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    elif selected in {"metal", "cuda"}:
-        manager.default_n_gpu_layers = -1
-
-
 def run(args: argparse.Namespace) -> int:
     if not os.path.exists(args.model):
         return emit_error("bad_model", "model path not found")
 
     try:
         from utils.llm.model_manager import ModelManager, get_model_manager
+        from utils.compute_node_runtime import apply_compute_mode, normalize_compute_mode
     except ModuleNotFoundError as exc:
         return emit_error(
             "runtime_unavailable",
@@ -144,7 +137,8 @@ def run(args: argparse.Namespace) -> int:
 
     manager = get_model_manager()
     manager.model_path = args.model
-    _apply_compute_mode(manager, args.mode)
+    selected_mode = normalize_compute_mode(args.mode)
+    apply_compute_mode(manager, selected_mode)
 
     llm = manager.get_llm_instance()
     if llm is None:

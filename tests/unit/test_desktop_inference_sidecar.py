@@ -179,7 +179,7 @@ def test_run_falls_back_to_non_streaming_when_stream_is_empty(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     ('mode', 'expected'),
-    [('cpu', 0), ('metal', -1), ('cuda', -1), ('auto', -1)],
+    [('cpu', 0), ('metal', -1), ('cuda', -1), ('auto', -1), ('CuDa', -1), ('unknown', -1)],
 )
 def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
     _reset_cancel_queue()
@@ -312,7 +312,7 @@ def test_extract_text_from_completion_handles_empty_choices():
 
 def test_normalize_chunk_fallback_handles_typeerror_and_unknown_shape():
     class WithBadDict:
-        def dict(self, required):  # pragma: no cover - signature intentionally incompatible
+        def dict(self, _required):  # pragma: no cover - signature intentionally incompatible
             return {'choices': []}
 
     class UnknownShape:

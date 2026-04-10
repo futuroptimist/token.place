@@ -39,6 +39,10 @@ near-term, and target architecture.
 
 - **Current contract:** legacy relay sink/source flows used by `server.py` and relay nodes.
 - **Planned runtime alignment:** shared compute-node runtime co-used by `server.py` and desktop-tauri.
+- **Current deployment boundary:** sugarkube/k3s hosts relay-only (`relay.py`); compute nodes stay
+  on operator workstations.
+- **Current workstation targets:** Windows 11 + CUDA/NVIDIA, macOS + Metal/Apple Silicon, CPU
+  fallback on either; Raspberry Pi later as a low-power workstation/server target.
 - **Future contract:** API v1-aligned distributed compute after parity and operations readiness.
 
 ## Deployment and operations docs

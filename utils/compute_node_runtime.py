@@ -134,6 +134,27 @@ def format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
     return f"{relay_url}:{relay_port}"
 
 
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "metal", "cuda"})
+
+
+def normalize_compute_mode(mode: Optional[str]) -> str:
+    """Normalize user/operator compute mode input to supported runtime values."""
+
+    selected = (mode or "auto").strip().lower()
+    return selected if selected in SUPPORTED_COMPUTE_MODES else "auto"
+
+
+def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
+    """Apply normalized compute mode defaults to a model manager-like object."""
+
+    selected = normalize_compute_mode(mode)
+    if selected == "cpu":
+        manager.default_n_gpu_layers = 0
+    else:
+        manager.default_n_gpu_layers = -1
+    return selected
+
+
 class ComputeNodeRuntime:
     """Reusable compute-node runtime that wraps relay + model lifecycle concerns."""
 

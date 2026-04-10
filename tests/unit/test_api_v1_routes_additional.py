@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from relay import app
-from api.v1 import routes
+from api.v1 import compute_provider, routes
 from api.v1.models import ModelError
 from api.v1.validation import ValidationError
 
@@ -83,7 +83,7 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
     monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': canonical_id}])
     validate_model_name = MagicMock()
     monkeypatch.setattr(routes, 'validate_model_name', validate_model_name)
-    monkeypatch.setattr(routes, 'get_model_instance', MagicMock(return_value='MOCK'))
+    monkeypatch.setattr(compute_provider, 'get_model_instance', MagicMock(return_value='MOCK'))
 
     captured = {}
 
@@ -91,7 +91,7 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
         captured['model_id'] = model_id
         return messages + [{'role': 'assistant', 'content': 'Mock reply'}]
 
-    monkeypatch.setattr(routes, 'generate_response', fake_generate_response)
+    monkeypatch.setattr(compute_provider, 'generate_response', fake_generate_response)
 
     alias = MagicMock(return_value=canonical_id)
     monkeypatch.setattr(routes, 'resolve_model_alias', alias)

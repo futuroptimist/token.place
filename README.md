@@ -164,6 +164,11 @@ See also:
 
 ## Deployment topology
 
+- **Canonical compute-node entrypoint:** `python server.py`
+- **Canonical relay entrypoint:** `python relay.py`
+- **Legacy compatibility only:** `server/server_app.py` now delegates to `server.py` and should not
+  be used for new runtime logic.
+
 - **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
   legacy sink/source contract.
 - **Near-term multi-node legacy flow:** multiple compute nodes (including desktop-tauri after

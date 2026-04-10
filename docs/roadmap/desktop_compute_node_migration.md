@@ -151,6 +151,8 @@ Desktop is considered parity-ready only when all of the following are true:
 ## Current vs target summary
 
 - **Current:** `relay.py` + `server.py` legacy flow is the production baseline; desktop-tauri is MVP.
+- **Canonical entrypoints:** `server.py` (compute node) and `relay.py` (relay); `server/server_app.py`
+  remains legacy compatibility-only delegation.
 - **Near-term:** desktop and `server.py` co-evolve through a shared runtime while relay moves onto
   sugarkube.
 - **Target:** post-parity, post-API-v1 distributed compute with secure API v1-aligned components.

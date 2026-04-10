@@ -58,16 +58,32 @@ than inventing values.
 Minimum operator checks after deploy:
 
 1. Pod readiness and restart counts are stable.
-2. Ingress host resolves and serves `/healthz`.
+2. Ingress host resolves and serves `/livez` (process liveness).
+3. Ingress host resolves and serves `/healthz` (readiness).
 3. Relay can accept registration/polling traffic from external compute nodes.
+
+`relay.py` probe semantics:
+
+- `GET /livez` => process is alive (`200` with `{"status":"alive"}`).
+- `GET /healthz` => readiness for traffic:
+  - `200` when ready,
+  - `503` with `status=draining` during termination,
+  - `503` with `status=degraded` when configured GPU host cannot be resolved.
 
 Example checks:
 
 ```bash
 kubectl -n tokenplace get pods
 kubectl -n tokenplace get ingress
+curl -fsS https://<env-host>/livez
 curl -fsS https://<env-host>/healthz
 ```
+
+Environment/config keys to set explicitly in deployment values/manifests:
+
+- `TOKENPLACE_RELAY_PUBLIC_URL` (or `TOKEN_PLACE_RELAY_PUBLIC_URL`) for externally advertised base URL.
+- `TOKENPLACE_RELAY_UPSTREAM_URL` (or `TOKENPLACE_GPU_HOST`/`TOKENPLACE_GPU_PORT`) for upstream hints.
+- `TOKEN_PLACE_RELAY_SERVER_TOKENS` / `TOKEN_PLACE_RELAY_SERVER_TOKEN` for compute-node registration auth.
 
 ## Current limitations
 
@@ -86,3 +102,6 @@ curl -fsS https://<env-host>/healthz
 - [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md)
 - [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md)
 - [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
+
+Each runbook includes rollout + rollback validation; keep those steps tied to `/livez` + `/healthz`
+checks and a canary registration poll from at least one external compute node.

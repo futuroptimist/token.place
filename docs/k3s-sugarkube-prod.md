@@ -40,6 +40,7 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 ## Validation checklist
 
 - [ ] production relay endpoints reachable and healthy
+- [ ] `/livez` returns alive and `/healthz` returns ready before traffic cutover
 - [ ] registration/polling from external compute nodes succeeds
 - [ ] error rate/latency within expected baseline
 - [ ] rollback command and previous revision confirmed before sign-off

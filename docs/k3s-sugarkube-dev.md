@@ -43,13 +43,14 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 
 - [ ] `kubectl get pods` shows ready relay pod(s)
 - [ ] ingress host resolves in dev
+- [ ] `GET /livez` returns `{"status":"alive"}`
 - [ ] `GET /healthz` returns success
 - [ ] external compute node can register/poll relay
 
 ## Rollback
 
 - Roll back to previous image tag and/or Helm revision.
-- Verify readiness and `/healthz` immediately after rollback.
+- Verify `/livez` and `/healthz` immediately after rollback.
 
 ## Operator notes
 

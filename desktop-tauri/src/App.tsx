@@ -345,6 +345,8 @@ export function App() {
         onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
       >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
+        <option value="metal">Metal (Apple Silicon)</option>
+        <option value="cuda">CUDA (NVIDIA)</option>
         <option value="cpu">CPU fallback</option>
       </select>
 

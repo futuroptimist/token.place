@@ -44,11 +44,12 @@ providers without seeing plaintext content.
 
 ### 2. Server-Side Components
 
-- **Server Application** (`server.py`):
-  - Handles client requests
-  - Proxies encrypted communications to AI providers
-  - Manages server-side keys
-  - Implements API-compatible endpoints
+- **Compute-node host** (`server.py`):
+  - Canonical compute-node entrypoint for relay `/sink` + `/source` operation
+  - Reuses `utils.compute_node_runtime` for model lifecycle, relay polling, and legacy payload handling
+  - Should be used by operators instead of `server/server_app.py`
+- **Legacy compatibility shim** (`server/server_app.py`):
+  - Delegates to `server.py` only, so alternate entrypoint imports keep working without divergence
 
 - **CryptoManager** (`utils/crypto/crypto_manager.py`):
   - Generates and manages RSA key pairs

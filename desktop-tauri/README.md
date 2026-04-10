@@ -13,6 +13,7 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   - macOS arm64 => `Metal / Apple Silicon`
   - Windows x64 => `CUDA / NVIDIA`
   - other targets => `CPU fallback`
+- Compute-mode selector exposes `auto`, `metal`, `cuda`, and `cpu` so operators can match server/runtime choices.
 - Background compute-node mode that registers and polls via `/sink`, decrypts requests, runs local inference, and posts responses to `/source` (or `/stream/source` when streaming is requested by the relay contract).
 - Sidecar-driven local prompt smoke-test output with explicit cancellation.
 - Optional debug-only relay forward action for manual `/next_server` + `/faucet` checks.

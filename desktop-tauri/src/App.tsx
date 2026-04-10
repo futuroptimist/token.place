@@ -353,10 +353,15 @@ export function App() {
         onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
       >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
-        <option value="metal" disabled={!metalSupported}>Metal GPU</option>
-        <option value="cuda" disabled={!cudaSupported}>CUDA GPU</option>
+        <option value="metal" disabled={!metalSupported}>Metal GPU (macOS Apple Silicon)</option>
+        <option value="cuda" disabled={!cudaSupported}>CUDA GPU (Windows/NVIDIA)</option>
         <option value="cpu">CPU fallback</option>
       </select>
+      <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
+        Operator note: <code>cuda</code> is for Windows/NVIDIA workstations, <code>metal</code> is
+        for macOS/Apple Silicon, and <code>cpu</code> is fallback. Raspberry Pi remains a later
+        low-power workstation target and is not part of the current sugarkube relay rollout.
+      </p>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
       <input

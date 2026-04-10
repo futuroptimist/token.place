@@ -214,6 +214,22 @@ def test_run_handles_dict_completion_payload(tmp_path, capsys):
     assert events[1]['text'] == 'dict response'
 
 
+def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode='UNSUPPORTED', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    _ = capsys.readouterr()
+    assert manager.default_n_gpu_layers == -1
+
+
 def test_normalize_chunk_fallback_handles_object_shapes():
     class WithToDict:
         def to_dict(self):
@@ -300,6 +316,83 @@ def test_run_cancels_during_streaming_after_started(tmp_path, capsys):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'canceled']
+
+
+def test_main_emits_inference_failed_when_compute_runtime_missing(capsys, monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.compute_node_runtime':
+            raise ModuleNotFoundError("No module named 'utils.compute_node_runtime'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'inference_sidecar.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'auto',
+            '--prompt',
+            'hello',
+        ],
+    )
+
+    status = inference_sidecar.main()
+
+    assert status == 1
+    event = json.loads(capsys.readouterr().out.strip())
+    assert event['type'] == 'error'
+    assert event['code'] == 'inference_failed'
+    assert 'bridge failure:' in event['message']
+
+
+def test_main_normalizes_mode_before_run(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured['mode'] = args.mode
+        return 0
+
+    monkeypatch.setattr(inference_sidecar, 'run', fake_run)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'inference_sidecar.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'CUDA',
+            '--prompt',
+            'hello',
+        ],
+    )
+
+    status = inference_sidecar.main()
+    assert status == 0
+    assert captured['mode'] == 'cuda'
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'inference_sidecar.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'unsupported',
+            '--prompt',
+            'hello',
+        ],
+    )
+
+    status = inference_sidecar.main()
+    assert status == 0
+    assert captured['mode'] == 'auto'
 
 
 def test_extract_text_from_completion_handles_non_dict_message():

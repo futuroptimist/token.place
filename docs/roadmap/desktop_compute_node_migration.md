@@ -6,6 +6,8 @@ This is the canonical migration plan for moving token.place from today's
 - **Current state:** desktop-tauri is an MVP and is **not** feature-parity with `server.py`.
 - **Near-term target:** achieve desktop parity on the legacy relay sink/source contract first.
 - **Future target:** migrate distributed compute to API v1 **after** parity is complete.
+- **Deployment boundary (short-to-medium term):** sugarkube/k3s runs `relay.py` only; compute nodes
+  run on operator workstations (`server.py`, desktop-tauri).
 
 See also:
 
@@ -116,6 +118,26 @@ Desktop is considered parity-ready only when all of the following are true:
   - explicit GGUF artifact selection used by runtime
   - model browse + download flow
   - default relay URL `https://token.place` with user override support
+- Enforces consistent compute-mode normalization (`auto`, `cpu`, `metal`, `cuda`) and status
+  reporting across desktop UI, bridge, sidecar, and shared runtime.
+
+## Platform readiness contract (short-to-medium term)
+
+- **Windows 11 + NVIDIA (CUDA):** primary workstation target for high-throughput operators.
+- **macOS Apple Silicon / Mac mini M4 (Metal):** primary workstation target for Apple hardware.
+- **CPU fallback:** always valid when GPU backends are unavailable.
+- **Raspberry Pi:** later low-power workstation/server target; not part of sugarkube relay rollout.
+
+## Parity status snapshot (April 2026)
+
+- ✅ Completed in parity scope:
+  - Shared runtime relay/model configuration reuse between `server.py` and desktop Python helpers.
+  - Compute-mode normalization contract and tests (`auto`/`cpu`/`metal`/`cuda`).
+  - Operator-visible bridge status payload includes relay URL, backend mode, model path, and error
+    state.
+- 🟡 Still intentionally deferred (out of this parity PR scope):
+  - Full API v1 distributed compute migration and legacy sink/source retirement.
+  - Non-legacy distributed protocol redesign beyond current compatibility adapters.
 
 ## Readiness checklists
 

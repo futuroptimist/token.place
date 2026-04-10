@@ -176,11 +176,14 @@ See also:
   parity) register through `relay.py` using the same legacy contract.
 - **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
   contracts after parity and operational readiness gates are complete.
+- **Operator platform targets:** Windows 11 + NVIDIA/CUDA and macOS Apple Silicon + Metal first,
+  CPU fallback always supported, Raspberry Pi as a later low-power compute-node target.
 
 ## sugarkube deployment
 
 `relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
 operationally separate from GPU-heavy compute nodes.
+In the short-to-medium term architecture, sugarkube scope remains relay-only.
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

@@ -14,6 +14,8 @@ migration is complete.
 
 This allows token.place to improve relay availability and operator workflows while GPU-heavy
 compute nodes (`server.py` and later desktop compute nodes) remain external during parity phases.
+Workstation targets for those external compute nodes are Windows 11 + CUDA/NVIDIA and macOS Apple
+Silicon + Metal, with CPU fallback available and Raspberry Pi planned later.
 
 Roadmap alignment: [desktop compute-node migration roadmap](roadmap/desktop_compute_node_migration.md).
 

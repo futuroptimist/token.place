@@ -28,6 +28,14 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - [server.py](../server.py): Main server implementation for the proxy service
 - [relay.py](../relay.py): Middleware server that forwards encrypted messages between clients and servers
 
+## Architecture guardrails (release-readiness)
+
+- Treat repository-root `server.py` as the canonical compute-node entrypoint.
+- Keep `server/server_app.py` as compatibility-only shim behavior.
+- Keep sugarkube/k3s scope relay-only (`relay.py`) in short-to-medium-term planning.
+- Keep desktop/server parity work on the legacy relay sink/source contract until explicitly
+  approved API v1 distributed migration phase.
+
 ## Documentation
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md): Contribution guidelines for developers

@@ -48,7 +48,7 @@ def emit_error(code: str, message: str) -> int:
     return 1
 
 
-def canceled_requested() -> bool:
+def cancel_requested() -> bool:
     _start_stdin_reader()
     while True:
         try:
@@ -91,7 +91,7 @@ def _stream_content(
     full_text = []
     emitted = False
     for raw_chunk in completion:
-        if canceled_requested():
+        if cancel_requested():
             emit({"type": "canceled"})
             return "", True
 
@@ -122,19 +122,12 @@ def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
     return message.get("content", "") if isinstance(message, dict) else ""
 
 
-def _apply_compute_mode(manager: Any, mode: str) -> None:
-    selected = (mode or "auto").lower()
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    elif selected in {"metal", "cuda"}:
-        manager.default_n_gpu_layers = -1
-
-
 def run(args: argparse.Namespace) -> int:
     if not os.path.exists(args.model):
         return emit_error("bad_model", "model path not found")
 
     try:
+        from utils.compute_node_runtime import apply_compute_mode
         from utils.llm.model_manager import ModelManager, get_model_manager
     except ModuleNotFoundError as exc:
         return emit_error(
@@ -144,14 +137,14 @@ def run(args: argparse.Namespace) -> int:
 
     manager = get_model_manager()
     manager.model_path = args.model
-    _apply_compute_mode(manager, args.mode)
+    apply_compute_mode(manager, args.mode)
 
     llm = manager.get_llm_instance()
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
     emit({"type": "started"})
-    if canceled_requested():
+    if cancel_requested():
         emit({"type": "canceled"})
         return 0
 
@@ -202,10 +195,13 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop inference sidecar")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mode", default="auto", choices=["auto", "metal", "cuda", "cpu"])
+    parser.add_argument("--mode", default="auto")
     parser.add_argument("--prompt", required=True)
     args = parser.parse_args()
     try:
+        from utils.compute_node_runtime import normalize_compute_mode
+
+        args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort error handling
         return emit_error("inference_failed", f"bridge failure: {exc}")

@@ -21,6 +21,7 @@ until parity and later API v1 migration phases are complete.
 - Public ingress terminates through Cloudflare+tunnel to sugarkube Traefik
 - relay pods run in dedicated namespace with health probes and resource limits
 - external compute nodes connect via approved relay URL
+  - workstation focus remains Windows CUDA / macOS Metal; Raspberry Pi remains a later target
 
 ## Release model
 

@@ -146,8 +146,10 @@ Canonical sequencing lives in [roadmap/desktop_compute_node_migration.md](roadma
 - **Legacy compatibility:** `server/server_app.py` is shim-only and delegates into `server.py` to
   prevent dual server implementations from drifting.
 - **Near-term:** `server.py` and desktop-tauri co-evolve through a shared compute-node runtime while
-  relay operations move onto sugarkube.
+  relay operations move onto sugarkube (`relay.py` only).
 - **Target state (later):** post-parity migration to API v1-aligned distributed compute contracts.
+- **Operator platform focus:** Windows 11 + CUDA/NVIDIA and macOS Apple Silicon + Metal, with CPU
+  fallback and later Raspberry Pi support.
 
 Related operations docs:
 

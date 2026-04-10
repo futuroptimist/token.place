@@ -304,9 +304,14 @@ class CryptoClient:
 
         logger.debug("Sending chat message with %d entries", len(chat_history))
 
+        wrapped_payload = {
+            "chat_history": chat_history,
+            "client_public_key": self.client_public_key_b64,
+        }
+
         # Encrypt the chat history
         try:
-            encrypted_data = self.encrypt_message(chat_history)
+            encrypted_data = self.encrypt_message(wrapped_payload)
         except Exception as e:
             logger.error(
                 "Failed to encrypt message: %s",

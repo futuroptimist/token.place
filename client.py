@@ -314,7 +314,14 @@ class ChatClient:
         logger.debug("Retrieved server public key (%d bytes)", len(server_public_key))
 
         if server_public_key:
-            ciphertext_dict, cipherkey, iv = encrypt(json.dumps(self.chat_history).encode('utf-8'), server_public_key)
+            bound_payload = {
+                "chat_history": self.chat_history,
+                "client_public_key": self.public_key_b64,
+            }
+            ciphertext_dict, cipherkey, iv = encrypt(
+                json.dumps(bound_payload).encode('utf-8'),
+                server_public_key,
+            )
             encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
             iv_b64 = base64.b64encode(iv).decode('utf-8')
             encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')

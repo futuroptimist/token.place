@@ -111,6 +111,20 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    def _normalize_compute_mode(mode):
+        selected = (mode or 'auto').strip().lower()
+        if selected in {'auto', 'cpu', 'metal', 'cuda'}:
+            return selected
+        return 'auto'
+
+    module.normalize_compute_mode = _normalize_compute_mode
+
+    def _apply_compute_mode(manager, mode):
+        selected = module.normalize_compute_mode(mode)
+        manager.default_n_gpu_layers = 0 if selected == 'cpu' else -1
+        return selected
+
+    module.apply_compute_mode = _apply_compute_mode
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 
@@ -212,15 +226,35 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     manager = FakeModelManager()
+    from utils.compute_node_runtime import apply_compute_mode
 
-    compute_node_bridge._apply_compute_mode(manager, 'auto')
+    assert apply_compute_mode(manager, 'auto') == 'auto'
     assert manager.default_n_gpu_layers == -1
 
-    compute_node_bridge._apply_compute_mode(manager, 'metal')
+    assert apply_compute_mode(manager, 'metal') == 'metal'
     assert manager.default_n_gpu_layers == -1
 
-    compute_node_bridge._apply_compute_mode(manager, 'cuda')
+    assert apply_compute_mode(manager, 'cuda') == 'cuda'
     assert manager.default_n_gpu_layers == -1
 
-    compute_node_bridge._apply_compute_mode(manager, 'cpu')
+    assert apply_compute_mode(manager, 'cpu') == 'cpu'
     assert manager.default_n_gpu_layers == 0
+
+
+def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='UNSUPPORTED',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[0]['backend_mode'] == 'auto'

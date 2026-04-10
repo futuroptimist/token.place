@@ -60,14 +60,6 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def _apply_compute_mode(manager: Any, mode: str) -> None:
-    selected = (mode or "auto").lower()
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    elif selected in {"metal", "cuda"}:
-        manager.default_n_gpu_layers = -1
-
-
 def _sleep_with_cancel(seconds: float) -> bool:
     deadline = time.time() + max(seconds, 0)
     while time.time() < deadline:
@@ -80,9 +72,11 @@ def _sleep_with_cancel(seconds: float) -> bool:
 def run(args: argparse.Namespace) -> int:
     try:
         from utils.compute_node_runtime import (
+            apply_compute_mode,
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_legacy_relay_payload,
+            normalize_compute_mode,
             resolve_relay_port,
             resolve_relay_url,
         )
@@ -101,7 +95,7 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    _apply_compute_mode(runtime.model_manager, args.mode)
+    resolved_mode = apply_compute_mode(runtime.model_manager, args.mode)
 
     if not runtime.ensure_model_ready():
         emit(
@@ -120,7 +114,7 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": args.mode,
+            "backend_mode": resolved_mode,
             "model_path": args.model,
             "last_error": None,
         }
@@ -150,7 +144,7 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
-                    "backend_mode": args.mode,
+                    "backend_mode": resolved_mode,
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -168,7 +162,7 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": args.mode,
+            "backend_mode": resolved_mode,
             "model_path": args.model,
             "last_error": None,
         }
@@ -177,14 +171,17 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    from utils.compute_node_runtime import normalize_compute_mode
+
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mode", default="auto", choices=["auto", "metal", "cuda", "cpu"])
+    parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", default="https://token.place")
     parser.add_argument("--relay-port", type=int, default=None)
     args = parser.parse_args()
 
     try:
+        args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         emit({"type": "error", "message": f"bridge failure: {exc}"})

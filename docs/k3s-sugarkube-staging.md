@@ -19,6 +19,7 @@ compute nodes still using legacy sink/source contract.
 
 - Client -> Cloudflare -> tunnel -> Traefik ingress -> relay service/pod
 - compute nodes (`server.py`, later desktop parity nodes) remain external
+  - expected operators are workstation nodes (Windows CUDA, macOS Metal, CPU fallback)
 
 ## Release model
 

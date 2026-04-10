@@ -30,6 +30,8 @@ migration.
 - `server/server_app.py` is compatibility-only and delegates to `server.py`.
 - `relay.py` supports legacy sink/source contract and multi-node registration.
 - desktop-tauri provides MVP scaffolding but does not yet replace `server.py`.
+- Workstation platform targets are Windows 11 (CUDA), macOS Apple Silicon (Metal), then later
+  Raspberry Pi (CPU-focused/low-power).
 
 ### Near-term state (post-parity goal)
 

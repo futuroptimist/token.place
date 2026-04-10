@@ -214,6 +214,22 @@ def test_run_handles_dict_completion_payload(tmp_path, capsys):
     assert events[1]['text'] == 'dict response'
 
 
+def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    args = SimpleNamespace(model=str(model_path), mode='UNSUPPORTED', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    _ = capsys.readouterr()
+    assert manager.default_n_gpu_layers == -1
+
+
 def test_normalize_chunk_fallback_handles_object_shapes():
     class WithToDict:
         def to_dict(self):

@@ -24,7 +24,7 @@ near-term, and target architecture.
   - Package utilities and compatibility imports.
 - `relay.py`
   - Lightweight relay handling legacy sink/source and multi-node registration.
-  - First deployment candidate for sugarkube.
+  - First (and short-to-medium-term only) deployment candidate for sugarkube.
 - `api/`
   - FastAPI implementation and experimental API surface for contributors evaluating API-facing
     runtime paths.
@@ -39,6 +39,8 @@ near-term, and target architecture.
 
 - **Current contract:** legacy relay sink/source flows used by `server.py` and relay nodes.
 - **Planned runtime alignment:** shared compute-node runtime co-used by `server.py` and desktop-tauri.
+- **Platform focus during parity:** workstation compute nodes on Windows 11 CUDA, macOS Metal, and
+  CPU fallback; Raspberry Pi later.
 - **Future contract:** API v1-aligned distributed compute after parity and operations readiness.
 
 ## Deployment and operations docs

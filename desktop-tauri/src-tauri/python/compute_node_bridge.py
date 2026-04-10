@@ -82,6 +82,7 @@ def run(args: argparse.Namespace) -> int:
         from utils.compute_node_runtime import (
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
+            is_legacy_relay_payload,
             resolve_relay_port,
             resolve_relay_url,
         )
@@ -134,8 +135,7 @@ def run(args: argparse.Namespace) -> int:
             if not registered:
                 last_error = str(relay_response.get("error", "relay registration failed"))
             else:
-                required_fields = {"client_public_key", "chat_history", "cipherkey", "iv"}
-                if required_fields.issubset(relay_response.keys()):
+                if is_legacy_relay_payload(relay_response):
                     processed = runtime.process_relay_request(relay_response)
                     if not processed:
                         last_error = "failed to process relay request"

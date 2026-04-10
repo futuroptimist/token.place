@@ -27,14 +27,16 @@ from api.v1.community import (
 )
 from api.v1.models import (
     get_models_info,
-    generate_response,
-    get_model_instance,
     ModelError,
     resolve_model_alias,
+    generate_response as _generate_response,
+    get_model_instance as _get_model_instance,
 )
+from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
-    validate_chat_messages, validate_encrypted_request, validate_model_name,
+    validate_model_name as _validate_model_name,
+    validate_chat_messages, validate_encrypted_request,
     validate_image_generation_payload,
 )
 from config import get_config
@@ -52,6 +54,16 @@ get_registry_provider_directory = _get_registry_provider_directory
 # exercising the server provider endpoint. Keep that alias pointing at the
 # registry loader so existing test suites continue to work.
 get_provider_directory = get_registry_provider_directory
+
+# Keep the get_model_instance symbol available for tests/backwards
+# compatibility even though runtime model loading now happens in compute
+# providers.
+get_model_instance = _get_model_instance
+
+# Keep legacy route-level symbols available so older tests monkeypatching
+# `api.v1.routes.*` continue to work as API internals migrate to providers.
+generate_response = _generate_response
+validate_model_name = _validate_model_name
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -157,6 +169,28 @@ def _estimate_token_length(text: str) -> int:
     return max(1, math.ceil(len(stripped) / 4))
 
 
+def _extract_chat_completion_options(data: dict) -> dict:
+    """Pass through compatible OpenAI-style chat options to compute providers."""
+
+    passthrough_fields = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "seed",
+    }
+    return {
+        key: value
+        for key, value in data.items()
+        if key in passthrough_fields and value is not None
+    }
+
+
 def _handle_chat_completion_request(data):
     """Core implementation for the chat completions endpoint."""
 
@@ -187,9 +221,6 @@ def _handle_chat_completion_request(data):
                 status_code=400,
             )
 
-        models = get_models_info()
-        available_model_ids = [model["id"] for model in models]
-
         requested_model_id = data["model"]
         response_model_id = requested_model_id
         model_id = resolve_model_alias(requested_model_id) or requested_model_id
@@ -197,11 +228,6 @@ def _handle_chat_completion_request(data):
             log_info(
                 f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
             )
-
-        validate_model_name(model_id, available_model_ids)
-
-        model_instance = get_model_instance(model_id)
-        log_info(f"Model instance obtained for {model_id}")
 
         messages = None
         client_public_key = None
@@ -293,9 +319,12 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
-
-        assistant_message = updated_messages[-1]
+        provider = get_api_v1_compute_provider()
+        assistant_message = provider.complete_chat(
+            model_id=model_id,
+            messages=messages,
+            options=_extract_chat_completion_options(data),
+        )
         log_info("Response generated successfully")
 
         tool_calls = assistant_message.get("tool_calls")
@@ -367,6 +396,12 @@ def _handle_chat_completion_request(data):
             error_type="model_error",
             status_code=400,
         )
+    except ComputeProviderError as e:
+        return format_error_response(
+            str(e),
+            error_type="server_error",
+            status_code=502,
+        )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
@@ -417,19 +452,6 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
-        try:
-            get_model_instance(model_id)
-            log_info(f"Model instance obtained for {model_id}")
-        except ModelError as e:
-            log_warning(f"Model error: {e.message}")
-            return format_error_response(
-                e.message,
-                error_type=e.error_type,
-                param="model",
-                code="model_not_found" if e.error_type == "model_not_found" else None,
-                status_code=e.status_code,
-            )
-
         messages = [{"role": "user", "content": prompt}]
 
         decision = evaluate_messages_for_policy(messages)
@@ -446,9 +468,12 @@ def _handle_text_completion_request(data):
             )
 
         log_info(f"Generating response using model {model_id}")
-        updated_messages = generate_response(model_id, messages)
-
-        assistant_message = updated_messages[-1]
+        provider = get_api_v1_compute_provider()
+        assistant_message = provider.complete_chat(
+            model_id=model_id,
+            messages=messages,
+            options=_extract_chat_completion_options(data),
+        )
         log_info("Response generated successfully")
 
         response_data = {
@@ -490,6 +515,12 @@ def _handle_text_completion_request(data):
             e.message,
             error_type=e.error_type,
             status_code=e.status_code,
+        )
+    except ComputeProviderError as e:
+        return format_error_response(
+            str(e),
+            error_type="server_error",
+            status_code=502,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
         log_error("Unexpected error in create_completion endpoint")

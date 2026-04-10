@@ -3,8 +3,10 @@ from unittest.mock import MagicMock
 from utils.compute_node_runtime import (
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
+    LegacyRelayRequestAdapter,
     first_env,
     format_relay_target,
+    is_legacy_relay_payload,
     resolve_relay_port,
     resolve_relay_url,
 )
@@ -123,6 +125,63 @@ def test_compute_node_runtime_request_flow_delegates_to_relay_client():
     relay_client.process_client_request.assert_called_once_with(payload)
 
 
+def test_compute_node_runtime_process_relay_request_returns_false_for_unknown_payload():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    assert runtime.process_relay_request({"unexpected": "payload"}) is False
+    relay_client.process_client_request.assert_not_called()
+
+
+def test_compute_node_runtime_respects_explicit_empty_adapter_list():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+        request_adapters=[],
+    )
+
+    legacy_payload = {
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+    assert runtime.process_relay_request(legacy_payload) is False
+    relay_client.process_client_request.assert_not_called()
+
+
+def test_legacy_relay_request_adapter_only_matches_legacy_contract():
+    relay_client = MagicMock()
+    adapter = LegacyRelayRequestAdapter(relay_client)
+
+    legacy_payload = {
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+
+    assert is_legacy_relay_payload(legacy_payload) is True
+    assert adapter.can_process(legacy_payload) is True
+    assert adapter.can_process({"chat_history": "missing keys"}) is False
+
+
 def test_compute_node_runtime_relay_resolution_uses_env_overrides(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_RELAY_URL", "https://relay.example")
     monkeypatch.setenv("TOKENPLACE_RELAY_PORT", "4444")
@@ -173,6 +232,39 @@ def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client()
 
     assert runtime.register_and_poll_once() == {"relayStatus": "ok"}
     relay_client.ping_relay.assert_called_once_with()
+
+
+def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    assert any(isinstance(adapter, LegacyRelayRequestAdapter) for adapter in runtime.request_adapters)
+
+    legacy_payload = {
+        "client_public_key": "key",
+        "chat_history": "payload",
+        "cipherkey": "cipher",
+        "iv": "iv",
+    }
+
+    relay_client.process_client_request.return_value = True
+    relay_client.ping_relay.side_effect = lambda: {
+        "relayStatus": "ok",
+        "processed": runtime.process_relay_request(legacy_payload),
+    }
+
+    assert runtime.register_and_poll_once() == {"relayStatus": "ok", "processed": True}
+    relay_client.ping_relay.assert_called_once_with()
+    relay_client.process_client_request.assert_called_once_with(legacy_payload)
 
 
 def test_compute_node_runtime_stop_delegates_to_relay_client():

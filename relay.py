@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import Counter, REGISTRY
 from werkzeug.serving import make_server
-from utils.compute_node_runtime import is_legacy_relay_payload
 
 # Logging --------------------------------------------------------------------
 
@@ -797,7 +796,7 @@ def source():
         return auth_error
 
     data = request.get_json()
-    if not is_legacy_relay_payload(data or {}):
+    if not data or 'client_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({'error': 'Invalid request data'}), 400
 
     client_public_key = data['client_public_key']

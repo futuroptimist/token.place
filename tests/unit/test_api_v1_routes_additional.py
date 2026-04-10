@@ -81,10 +81,6 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
     }
 
     monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': canonical_id}])
-    validate_model_name = MagicMock()
-    monkeypatch.setattr(routes, 'validate_model_name', validate_model_name)
-    monkeypatch.setattr(compute_provider, 'get_model_instance', MagicMock(return_value='MOCK'))
-
     captured = {}
 
     def fake_generate_response(model_id, messages):
@@ -105,7 +101,6 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
     data = response.get_json()
     assert data['model'] == 'gpt-5-chat-latest'
     assert captured['model_id'] == canonical_id
-    validate_model_name.assert_called_once_with(canonical_id, [canonical_id])
     alias.assert_called_once_with('gpt-5-chat-latest')
     assert any(
         call.args

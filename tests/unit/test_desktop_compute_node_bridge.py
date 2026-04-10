@@ -100,6 +100,12 @@ class StreamingRuntime(FakeRuntime):
 
 
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
+    from utils.compute_node_runtime import (
+        SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
+        apply_compute_mode as _apply_compute_mode,
+        normalize_compute_mode as _normalize_compute_mode,
+    )
+
     module = ModuleType('utils.compute_node_runtime')
     module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port: SimpleNamespace(
         relay_url=relay_url,
@@ -111,19 +117,8 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
-    def _normalize_compute_mode(mode):
-        selected = (mode or 'auto').strip().lower()
-        if selected in {'auto', 'cpu', 'metal', 'cuda'}:
-            return selected
-        return 'auto'
-
+    module.SUPPORTED_COMPUTE_MODES = _SUPPORTED_COMPUTE_MODES
     module.normalize_compute_mode = _normalize_compute_mode
-
-    def _apply_compute_mode(manager, mode):
-        selected = module.normalize_compute_mode(mode)
-        manager.default_n_gpu_layers = 0 if selected == 'cpu' else -1
-        return selected
-
     module.apply_compute_mode = _apply_compute_mode
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
@@ -258,3 +253,32 @@ def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]['type'] == 'started'
     assert events[0]['backend_mode'] == 'auto'
+
+
+def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.compute_node_runtime':
+            raise ModuleNotFoundError("No module named 'utils.compute_node_runtime'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'compute_node_bridge.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'auto',
+        ],
+    )
+
+    status = compute_node_bridge.main()
+
+    assert status == 1
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['type'] == 'error'
+    assert 'bridge failure:' in payload['message']

@@ -48,7 +48,7 @@ def emit_error(code: str, message: str) -> int:
     return 1
 
 
-def canceled_requested() -> bool:
+def cancel_requested() -> bool:
     _start_stdin_reader()
     while True:
         try:
@@ -91,7 +91,7 @@ def _stream_content(
     full_text = []
     emitted = False
     for raw_chunk in completion:
-        if canceled_requested():
+        if cancel_requested():
             emit({"type": "canceled"})
             return "", True
 
@@ -144,7 +144,7 @@ def run(args: argparse.Namespace) -> int:
         return emit_error("bad_model", "unable to initialize model runtime")
 
     emit({"type": "started"})
-    if canceled_requested():
+    if cancel_requested():
         emit({"type": "canceled"})
         return 0
 
@@ -193,14 +193,14 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    from utils.compute_node_runtime import normalize_compute_mode
-
     parser = argparse.ArgumentParser(description="token.place desktop inference sidecar")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--prompt", required=True)
     args = parser.parse_args()
     try:
+        from utils.compute_node_runtime import normalize_compute_mode
+
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort error handling

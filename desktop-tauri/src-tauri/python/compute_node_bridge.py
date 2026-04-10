@@ -76,7 +76,6 @@ def run(args: argparse.Namespace) -> int:
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_legacy_relay_payload,
-            normalize_compute_mode,
             resolve_relay_port,
             resolve_relay_url,
         )
@@ -171,8 +170,6 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    from utils.compute_node_runtime import normalize_compute_mode
-
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default="auto")
@@ -181,6 +178,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        from utils.compute_node_runtime import normalize_compute_mode
+
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling

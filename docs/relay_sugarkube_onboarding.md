@@ -9,7 +9,7 @@ migration is complete.
 
 - stateless request relay behavior
 - modest CPU/memory footprint
-- clear health endpoint (`/healthz`)
+- clear health/readiness endpoints (`/livez` and `/healthz`)
 - easier centralized ingress/tunnel management
 
 This allows token.place to improve relay availability and operator workflows while GPU-heavy
@@ -58,8 +58,16 @@ than inventing values.
 Minimum operator checks after deploy:
 
 1. Pod readiness and restart counts are stable.
-2. Ingress host resolves and serves `/healthz`.
+2. Ingress host resolves and serves both `/livez` and `/healthz`.
 3. Relay can accept registration/polling traffic from external compute nodes.
+
+`relay.py` semantics used by sugarkube probes:
+
+- `/livez` is process liveness (`200` with `{"status":"alive"}` when the process is up).
+- `/healthz` is readiness/operational status:
+  - `200` when relay is ready (can include warning details like empty known server pool).
+  - `503` with `status=draining` during SIGTERM/SIGINT shutdown drain.
+  - `503` with `status=degraded` if configured GPU upstream hostname resolution fails.
 
 Example checks:
 
@@ -67,6 +75,7 @@ Example checks:
 kubectl -n tokenplace get pods
 kubectl -n tokenplace get ingress
 curl -fsS https://<env-host>/healthz
+curl -fsS https://<env-host>/livez
 ```
 
 ## Current limitations

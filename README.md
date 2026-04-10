@@ -156,6 +156,8 @@ For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 The `desktop-tauri/` app is the forward-looking desktop path, but it is currently an MVP and does
 **not** yet replace `server.py`. The canonical migration sequence is documented in
 [`docs/roadmap/desktop_compute_node_migration.md`](docs/roadmap/desktop_compute_node_migration.md).
+`server.py` remains the canonical compute-node entrypoint, while `server/server_app.py` is retained
+as a legacy compatibility shim that delegates to `server.py`.
 
 See also:
 
@@ -175,6 +177,7 @@ See also:
 
 `relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
 operationally separate from GPU-heavy compute nodes.
+`relay.py` is the canonical relay entrypoint.
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

@@ -312,7 +312,7 @@ def test_extract_text_from_completion_handles_empty_choices():
 
 def test_normalize_chunk_fallback_handles_typeerror_and_unknown_shape():
     class WithBadDict:
-        def dict(self, required):  # pragma: no cover - signature intentionally incompatible
+        def dict(self, _required):  # pragma: no cover - signature intentionally incompatible
             return {'choices': []}
 
     class UnknownShape:

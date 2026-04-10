@@ -40,6 +40,8 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 ## Validation checklist
 
 - [ ] production relay endpoints reachable and healthy
+- [ ] `GET /livez` confirms process liveness
+- [ ] `GET /healthz` confirms readiness (non-draining)
 - [ ] registration/polling from external compute nodes succeeds
 - [ ] error rate/latency within expected baseline
 - [ ] rollback command and previous revision confirmed before sign-off
@@ -47,7 +49,7 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 ## Rollback
 
 - immediate rollback to prior known-good Helm revision/image tag
-- validate health and request flow
+- validate `/livez`, `/healthz`, and request flow
 - record deployment outcome and follow-up actions
 
 ## Operator notes

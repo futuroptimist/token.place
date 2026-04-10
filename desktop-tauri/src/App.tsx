@@ -22,6 +22,8 @@ interface ComputeNodeStatus {
   running: boolean;
   registered: boolean;
   active_relay_url: string;
+  relay_target: string;
+  relay_port: number | null;
   backend_mode: string;
   model_path: string;
   last_error: string | null;
@@ -49,6 +51,8 @@ const defaultComputeStatus: ComputeNodeStatus = {
   running: false,
   registered: false,
   active_relay_url: '',
+  relay_target: '',
+  relay_port: null,
   backend_mode: 'auto',
   model_path: '',
   last_error: null,
@@ -149,6 +153,9 @@ export function App() {
           typeof payload.active_relay_url === 'string'
             ? payload.active_relay_url
             : prev.active_relay_url,
+        relay_target:
+          typeof payload.relay_target === 'string' ? payload.relay_target : prev.relay_target,
+        relay_port: typeof payload.relay_port === 'number' ? payload.relay_port : prev.relay_port,
         backend_mode:
           typeof payload.backend_mode === 'string' ? payload.backend_mode : prev.backend_mode,
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
@@ -345,6 +352,8 @@ export function App() {
         onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
       >
         <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
+        <option value="metal">Metal (Apple Silicon)</option>
+        <option value="cuda">CUDA (NVIDIA)</option>
         <option value="cpu">CPU fallback</option>
       </select>
 
@@ -364,6 +373,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
+        <p style={{ marginBottom: 0 }}>Resolved relay target: <code>{computeStatus.relay_target || computeStatus.active_relay_url || config.relay_base_url}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay port: <code>{computeStatus.relay_port ?? 'auto'}</code></p>
         <p style={{ marginBottom: 0 }}>Backend mode: <code>{computeStatus.backend_mode || config.preferred_mode}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>

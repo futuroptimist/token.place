@@ -13,6 +13,7 @@ from relay import app
 # Import the global dictionaries from relay to inspect/manipulate state if needed
 # Be cautious with direct manipulation in tests, prefer using API endpoints
 from relay import (
+    DRAINING,
     known_servers,
     client_inference_requests,
     client_responses,
@@ -327,6 +328,26 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
     assert "https://configured-one.example.com:8000" not in {
         node["server_public_key"] for node in payload["registeredServers"]
     }
+
+
+def test_livez_reports_process_liveness(client):
+    response = client.get("/livez")
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "alive"}
+
+
+def test_healthz_reports_draining_state(client):
+    DRAINING.set()
+    try:
+        response = client.get("/healthz")
+    finally:
+        DRAINING.clear()
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "draining"
+    assert payload["details"]["shutdown"] is True
+    assert response.headers["Retry-After"] == "0"
 
 # --- Test /source ---
 

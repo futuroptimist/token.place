@@ -17,9 +17,10 @@ near-term, and target architecture.
 ## Applications
 
 - `server/` and `server.py`
-  - Current compute-node baseline.
+  - `server.py` is the canonical compute-node entrypoint.
+  - `server/server_app.py` is a legacy compatibility shim that delegates to `server.py`.
 - `relay.py`
-  - Lightweight relay handling legacy sink/source and multi-node registration.
+  - Canonical relay entrypoint handling legacy sink/source and multi-node registration.
   - First deployment candidate for sugarkube.
 - `api/`
   - FastAPI implementation and experimental API surface for contributors evaluating API-facing

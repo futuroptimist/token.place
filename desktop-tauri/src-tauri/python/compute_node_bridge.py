@@ -109,6 +109,8 @@ def run(args: argparse.Namespace) -> int:
                 "type": "error",
                 "message": "failed to initialize model runtime",
                 "active_relay_url": runtime.relay_client.relay_url,
+                "relay_port": relay_port,
+                "relay_target": runtime.relay_client.relay_url,
             }
         )
         return 1
@@ -120,6 +122,8 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
+            "relay_port": relay_port,
+            "relay_target": runtime.relay_client.relay_url,
             "backend_mode": args.mode,
             "model_path": args.model,
             "last_error": None,
@@ -150,6 +154,8 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
+                    "relay_port": relay_port,
+                    "relay_target": active_relay_url,
                     "backend_mode": args.mode,
                     "model_path": args.model,
                     "last_error": last_error,
@@ -168,6 +174,8 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
+            "relay_port": relay_port,
+            "relay_target": runtime.relay_client.relay_url,
             "backend_mode": args.mode,
             "model_path": args.model,
             "last_error": None,

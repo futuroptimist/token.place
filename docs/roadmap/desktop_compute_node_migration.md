@@ -4,6 +4,8 @@ This is the canonical migration plan for moving token.place from today's
 `server.py`-centered runtime toward a desktop-led compute-node architecture.
 
 - **Current state:** desktop-tauri is an MVP and is **not** feature-parity with `server.py`.
+- **Canonical entrypoints:** `server.py` is the canonical compute-node entrypoint and `relay.py` is
+  the canonical relay entrypoint. `server/server_app.py` is compatibility-only.
 - **Near-term target:** achieve desktop parity on the legacy relay sink/source contract first.
 - **Future target:** migrate distributed compute to API v1 **after** parity is complete.
 

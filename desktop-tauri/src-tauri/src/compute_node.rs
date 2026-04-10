@@ -22,6 +22,8 @@ pub struct ComputeNodeStatus {
     pub running: bool,
     pub registered: bool,
     pub active_relay_url: String,
+    pub relay_target: String,
+    pub relay_port: Option<i64>,
     pub backend_mode: String,
     pub model_path: String,
     pub last_error: Option<String>,
@@ -107,6 +109,12 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     if let Some(active_relay_url) = payload.get("active_relay_url").and_then(Value::as_str) {
         status.active_relay_url = active_relay_url.into();
     }
+    if let Some(relay_target) = payload.get("relay_target").and_then(Value::as_str) {
+        status.relay_target = relay_target.into();
+    }
+    if payload.get("relay_port").is_some() {
+        status.relay_port = payload.get("relay_port").and_then(Value::as_i64);
+    }
     if let Some(backend_mode) = payload.get("backend_mode").and_then(Value::as_str) {
         status.backend_mode = backend_mode.into();
     }
@@ -168,10 +176,12 @@ pub async fn start_compute_node(
                 *status = ComputeNodeStatus {
                     running: false,
                     registered: false,
-                    active_relay_url: request.relay_base_url.clone(),
-                    backend_mode: format!("{:?}", request.mode).to_lowercase(),
-                    model_path: request.model_path.clone(),
-                    last_error: Some(format!("failed to start compute-node bridge: {err}")),
+            active_relay_url: request.relay_base_url.clone(),
+            relay_target: request.relay_base_url.clone(),
+            relay_port: None,
+            backend_mode: format!("{:?}", request.mode).to_lowercase(),
+            model_path: request.model_path.clone(),
+            last_error: Some(format!("failed to start compute-node bridge: {err}")),
                 };
             }
             *state.child.lock().await = None;
@@ -199,6 +209,8 @@ pub async fn start_compute_node(
             running: true,
             registered: false,
             active_relay_url: request.relay_base_url.clone(),
+            relay_target: request.relay_base_url.clone(),
+            relay_port: None,
             backend_mode: format!("{:?}", request.mode).to_lowercase(),
             model_path: request.model_path.clone(),
             last_error: None,

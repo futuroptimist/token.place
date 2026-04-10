@@ -26,7 +26,8 @@ migration.
 
 ### Current state
 
-- `server.py` is the primary compute-node implementation.
+- `server.py` is the canonical compute-node implementation.
+- `server/server_app.py` is legacy compatibility-only and delegates to `server.py`.
 - `relay.py` supports legacy sink/source contract and multi-node registration.
 - desktop-tauri provides MVP scaffolding but does not yet replace `server.py`.
 
@@ -63,7 +64,7 @@ Desktop parity includes model-management behaviors, not just prompt UI.
   - <https://www.llama.com/models/>
 - Show the actual GGUF artifact the runtime is using (path/name/version where available).
 - Support model browse + download UX (with explicit status/progress/error handling).
-- Default relay URL should be `https://token.place`, but must remain overrideable for local/staging.
+- Default relay URL should be `https://token.place`, but must remain overridable for local/staging.
 
 ## Operational alignment
 

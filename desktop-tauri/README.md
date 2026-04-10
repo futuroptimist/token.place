@@ -23,6 +23,14 @@ Desktop includes a Python compute-node bridge
 (`src-tauri/python/compute_node_bridge.py`) that reuses
 `utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
 The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
+Operator status now also includes the resolved relay target and relay port selected by shared
+runtime URL/port resolution.
+
+Canonical entrypoints in the repository remain:
+
+- compute nodes: `server.py`
+- relay: `relay.py`
+- `server/server_app.py`: legacy compatibility shim only
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:

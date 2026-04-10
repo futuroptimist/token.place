@@ -121,7 +121,7 @@ For convenience, you can execute all available test suites with `./run_all_tests
 ## Configuration
 
 - [config.py](../config.py): Configuration management for different environments
-- [server/server_app.py](../server/server_app.py): Logging infrastructure for the application
+- [server/server_app.py](../server/server_app.py): Legacy compatibility shim delegating to canonical `server.py`
 - [pytest.ini](../pytest.ini): Configuration for Python test suite
 - **Privacy**: Do not log plaintext or ciphertext of user messages. Remove debugging statements that could leak sensitive data.
 

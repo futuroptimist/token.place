@@ -208,3 +208,16 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
+
+
+def test_apply_compute_mode_supports_gpu_and_cpu_modes():
+    manager = FakeModelManager()
+
+    compute_node_bridge._apply_compute_mode(manager, 'metal')
+    assert manager.default_n_gpu_layers == -1
+
+    compute_node_bridge._apply_compute_mode(manager, 'cuda')
+    assert manager.default_n_gpu_layers == -1
+
+    compute_node_bridge._apply_compute_mode(manager, 'cpu')
+    assert manager.default_n_gpu_layers == 0

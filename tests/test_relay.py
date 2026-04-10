@@ -328,6 +328,37 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
         node["server_public_key"] for node in payload["registeredServers"]
     }
 
+
+def test_healthz_returns_draining_when_shutdown_flag_set(client):
+    """healthz should switch to draining status and 503 during shutdown."""
+    from relay import DRAINING
+
+    DRAINING.set()
+    try:
+        response = client.get("/healthz")
+    finally:
+        DRAINING.clear()
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "0"
+    payload = response.get_json()
+    assert payload["status"] == "draining"
+    assert payload["details"]["shutdown"] is True
+
+
+def test_livez_remains_alive_when_draining(client):
+    """livez should stay green so orchestrators can distinguish readiness from liveness."""
+    from relay import DRAINING
+
+    DRAINING.set()
+    try:
+        response = client.get("/livez")
+    finally:
+        DRAINING.clear()
+
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "alive"
+
 # --- Test /source ---
 
 def test_source_submit_response(client):

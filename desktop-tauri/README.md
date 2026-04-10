@@ -9,10 +9,7 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
   shared Python config/runtime logic.
 - Lets users either browse to an existing GGUF or download the configured GGUF
   artifact into the shared models directory.
-- Runtime backend preference display:
-  - macOS arm64 => `Metal / Apple Silicon`
-  - Windows x64 => `CUDA / NVIDIA`
-  - other targets => `CPU fallback`
+- Runtime backend preference controls expose `auto`, `metal`, `cuda`, and `cpu` modes.
 - Background compute-node mode that registers and polls via `/sink`, decrypts requests, runs local inference, and posts responses to `/source` (or `/stream/source` when streaming is requested by the relay contract).
 - Sidecar-driven local prompt smoke-test output with explicit cancellation.
 - Optional debug-only relay forward action for manual `/next_server` + `/faucet` checks.
@@ -23,6 +20,7 @@ Desktop includes a Python compute-node bridge
 (`src-tauri/python/compute_node_bridge.py`) that reuses
 `utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
 The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
+Root `server.py` remains the canonical compute-node entrypoint; this desktop path must stay parity-aligned on the same legacy relay contract until post-parity API v1 migration work begins.
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:

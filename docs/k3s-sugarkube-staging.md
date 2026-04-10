@@ -50,6 +50,8 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 
 ## Rollback
 
+Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
+
 - revert Helm release revision and/or pinned image tag
 - confirm health endpoint and registration flow after rollback
 - capture incident notes in outages/ if customer-visible

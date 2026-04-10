@@ -46,6 +46,9 @@ providers without seeing plaintext content.
 
 - **Server Application** (`server.py`):
   - Handles client requests
+  - Canonical compute-node entrypoint for operators and contributors
+- **Legacy compatibility shim** (`server/server_app.py`):
+  - Delegates to `server.py` only and is retained for backwards-compatible imports
   - Proxies encrypted communications to AI providers
   - Manages server-side keys
   - Implements API-compatible endpoints

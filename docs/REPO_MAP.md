@@ -16,8 +16,10 @@ near-term, and target architecture.
 
 ## Applications
 
-- `server/` and `server.py`
-  - Current compute-node baseline.
+- `server.py`
+  - Canonical compute-node entrypoint and runtime wrapper.
+- `server/server_app.py`
+  - Legacy compatibility shim that delegates into `server.py`.
 - `relay.py`
   - Lightweight relay handling legacy sink/source and multi-node registration.
   - First deployment candidate for sugarkube.

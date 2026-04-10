@@ -26,7 +26,8 @@ migration.
 
 ### Current state
 
-- `server.py` is the primary compute-node implementation.
+- `server.py` is the canonical compute-node implementation.
+- `server/server_app.py` is legacy compatibility-only and delegates to `server.py`.
 - `relay.py` supports legacy sink/source contract and multi-node registration.
 - desktop-tauri provides MVP scaffolding but does not yet replace `server.py`.
 

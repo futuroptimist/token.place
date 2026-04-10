@@ -210,6 +210,13 @@ def test_two_servers_receive_only_addressed_work(client):
     assert server_one_work.status_code == 200
     assert server_one_work.get_json()["chat_history"] == "work-for-server-one"
 
+
+
+def test_livez_returns_alive_status(client):
+    """/livez should report process liveness independent of readiness."""
+    response = client.get("/livez")
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "alive"}
 # --- Test /faucet ---
 
 def test_faucet_submit_request(client):

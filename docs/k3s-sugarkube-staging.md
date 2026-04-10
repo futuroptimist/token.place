@@ -44,14 +44,14 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 ## Validation checklist
 
 - [ ] relay pod(s) healthy and stable
-- [ ] ingress route serves `https://staging.token.place/healthz`
+- [ ] ingress route serves `https://staging.token.place/livez` and `https://staging.token.place/healthz`
 - [ ] relay receives expected registration/poll traffic from external nodes
 - [ ] smoke test request flow succeeds end-to-end on legacy contract
 
 ## Rollback
 
 - revert Helm release revision and/or pinned image tag
-- confirm health endpoint and registration flow after rollback
+- confirm `/livez`, `/healthz`, and registration flow after rollback
 - capture incident notes in outages/ if customer-visible
 
 ## Operator notes

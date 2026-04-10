@@ -121,11 +121,11 @@ Desktop is considered parity-ready only when all of the following are true:
 
 ### Desktop parity readiness
 
-- [ ] Shared compute-node runtime is consumed by both `server.py` and desktop-tauri.
+- [x] Shared compute-node runtime is consumed by both `server.py` and desktop-tauri.
 - [ ] Desktop executes real inference workloads (not fake sidecar only).
-- [ ] Streaming and cancellation match server runtime behavior.
-- [ ] Relay integration passes legacy contract integration tests.
-- [ ] Model-management parity requirements are implemented.
+- [x] Streaming and cancellation match server runtime behavior.
+- [x] Relay integration passes legacy contract integration tests.
+- [x] Model-management parity requirements are implemented.
 
 ### Legacy multi-node relay readiness
 
@@ -151,6 +151,8 @@ Desktop is considered parity-ready only when all of the following are true:
 ## Current vs target summary
 
 - **Current:** `relay.py` + `server.py` legacy flow is the production baseline; desktop-tauri is MVP.
+- **Entrypoint policy:** `server.py` is canonical and `server/server_app.py` remains a
+  legacy compatibility shim that delegates to `server.py`.
 - **Near-term:** desktop and `server.py` co-evolve through a shared runtime while relay moves onto
   sugarkube.
 - **Target:** post-parity, post-API-v1 distributed compute with secure API v1-aligned components.

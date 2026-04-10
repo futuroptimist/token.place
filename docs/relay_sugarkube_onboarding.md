@@ -9,7 +9,7 @@ migration is complete.
 
 - stateless request relay behavior
 - modest CPU/memory footprint
-- clear health endpoint (`/healthz`)
+- clear health (`/healthz`) and liveness (`/livez`) endpoints
 - easier centralized ingress/tunnel management
 
 This allows token.place to improve relay availability and operator workflows while GPU-heavy
@@ -60,14 +60,20 @@ Minimum operator checks after deploy:
 1. Pod readiness and restart counts are stable.
 2. Ingress host resolves and serves `/healthz`.
 3. Relay can accept registration/polling traffic from external compute nodes.
+4. `/livez` returns `{"status":"alive"}` and `/healthz` stays `200` under normal load.
 
 Example checks:
 
 ```bash
 kubectl -n tokenplace get pods
 kubectl -n tokenplace get ingress
+curl -fsS https://<env-host>/livez
 curl -fsS https://<env-host>/healthz
 ```
+
+Readiness semantics:
+- `/livez` checks process liveness only.
+- `/healthz` reports readiness and returns HTTP 503 when relay is draining or degraded.
 
 ## Current limitations
 

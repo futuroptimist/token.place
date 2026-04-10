@@ -168,6 +168,8 @@ See also:
   legacy sink/source contract.
 - **Near-term multi-node legacy flow:** multiple compute nodes (including desktop-tauri after
   parity) register through `relay.py` using the same legacy contract.
+- **Canonical compute-node entrypoint:** root `server.py` is canonical; `server/server_app.py` is
+  a compatibility shim that delegates to `server.py`.
 - **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
   contracts after parity and operational readiness gates are complete.
 

@@ -114,6 +114,27 @@ def log_error(message, *args, exc_info: bool = False) -> None:
     """Log errors only in non-production environments using consistent formatting"""
     _log("error", message, *args, exc_info=exc_info)
 
+
+def _extract_chat_history_and_validate_key_binding(
+    decrypted_payload: Any,
+    relay_client_public_key_b64: str,
+) -> Optional[Any]:
+    """Validate optional encrypted key-binding metadata and return chat history."""
+
+    if isinstance(decrypted_payload, dict):
+        bound_client_key = decrypted_payload.get("client_public_key")
+        if bound_client_key is None:
+            return decrypted_payload.get("chat_history", decrypted_payload)
+        if not isinstance(bound_client_key, str):
+            log_error("Invalid encrypted payload: client_public_key binding must be a string")
+            return None
+        if bound_client_key != relay_client_public_key_b64:
+            log_error("Rejected request: relay client key does not match encrypted key binding")
+            return None
+        return decrypted_payload.get("chat_history")
+
+    return decrypted_payload
+
 class RelayClient:
     """
     Client for communicating with relay servers.
@@ -501,11 +522,17 @@ class RelayClient:
                 return False
 
             log_info("Decrypted client request")
+            chat_history = _extract_chat_history_and_validate_key_binding(
+                decrypted_chat_history,
+                client_pub_key_b64,
+            )
+            if chat_history is None:
+                return False
             client_pub_key = base64.b64decode(client_pub_key_b64)
 
             if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
                 log_info("Processing streaming relay request for session {}", stream_session_id)
-                response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
+                response_history = self.model_manager.llama_cpp_get_response(chat_history)
                 encrypted_response = self.crypto_manager.encrypt_message(response_history, client_pub_key)
                 chunk_payload = {
                     'session_id': stream_session_id,
@@ -536,7 +563,7 @@ class RelayClient:
                 return True
 
             log_info("Getting response from LLM...")
-            response_history = self.model_manager.llama_cpp_get_response(decrypted_chat_history)
+            response_history = self.model_manager.llama_cpp_get_response(chat_history)
             log_info("LLM generated response")
 
             log_info("Encrypting response for client...")

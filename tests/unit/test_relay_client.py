@@ -684,6 +684,49 @@ class TestRelayClient:
             timeout=relay_client._request_timeout
         )
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_rejects_mismatched_bound_client_key(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Requests are rejected when encrypted payload key binding mismatches relay key."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "chat_history": [{"role": "user", "content": "hello"}],
+            "client_public_key": "different-client-key",
+        }
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is False
+        mock_post.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_accepts_matching_bound_client_key(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+        mock_http_response,
+    ):
+        """Requests with matching encrypted key binding are processed normally."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        chat_history = [{"role": "user", "content": "hello"}]
+        mock_crypto_manager.decrypt_message.return_value = {
+            "chat_history": chat_history,
+            "client_public_key": request_data["client_public_key"],
+        }
+        mock_http_response.status_code = 200
+        mock_post.return_value = mock_http_response
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is True
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(chat_history)
+
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_streaming_posts_to_stream_source(

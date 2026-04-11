@@ -66,6 +66,9 @@ jobs:
         # before Tauri's internal beforeBuildCommand hook on clean runners.
         run: npm run build
 
+      - name: Check Rust desktop crate compiles
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
       - name: Build Tauri bundles
         shell: bash
         run: |

@@ -4,8 +4,10 @@ mod config;
 mod forward;
 mod keygen;
 mod logging;
+mod python_runtime;
 mod sidecar;
 
+use crate::python_runtime::resolve_python_command;
 use backend::{detect_backend_for, BackendInfo};
 use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};
 use config::{config_path, DesktopConfig};
@@ -80,9 +82,10 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
 }
 
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
-    let python_bin = std::env::var("TOKEN_PLACE_PYTHON").unwrap_or_else(|_| "python".into());
+    let python_spec = resolve_python_command("TOKEN_PLACE_PYTHON").map_err(|e| e.to_string())?;
     let bridge_script = resolve_model_bridge_script_path()?;
-    let output = Command::new(python_bin)
+    let output = Command::new(python_spec.program)
+        .args(python_spec.args)
         .arg(&bridge_script)
         .arg(action)
         .output()

@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::python_runtime::command_for_python_script;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -39,7 +40,7 @@ fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error>
     serde_json::from_str::<Value>(line)
 }
 
-fn build_bridge_command(bridge_path: &str) -> Command {
+fn build_bridge_command(bridge_path: &str) -> anyhow::Result<Command> {
     let path = Path::new(bridge_path);
     let is_python = path
         .extension()
@@ -47,14 +48,10 @@ fn build_bridge_command(bridge_path: &str) -> Command {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
 
     if is_python {
-        let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
-        let mut cmd = Command::new(python_bin);
-        cmd.arg(bridge_path);
-        return cmd;
+        return command_for_python_script(bridge_path, "TOKEN_PLACE_SIDECAR_PYTHON");
     }
 
-    Command::new(bridge_path)
+    Ok(Command::new(bridge_path))
 }
 
 fn resolve_bridge_script() -> String {
@@ -162,7 +159,8 @@ pub async fn start_compute_node(
     }
 
     let bridge_script = resolve_bridge_script();
-    let spawn_result = build_bridge_command(&bridge_script)
+    let mut bridge_command = build_bridge_command(&bridge_script)?;
+    let spawn_result = bridge_command
         .arg("--model")
         .arg(&request.model_path)
         .arg("--mode")

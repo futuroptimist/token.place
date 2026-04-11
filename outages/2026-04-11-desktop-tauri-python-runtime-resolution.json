@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-tauri-python-runtime-resolution",
+  "summary": "Desktop Tauri operator startup failed on Windows because Python sidecars were launched with a single hard-coded interpreter name that was not reliably available.",
+  "impact": "Clicking Start operator briefly showed running=true, then the bridge exited and operator registration failed with Python-not-found errors.",
+  "fix": "Introduced a shared Python runtime resolver that validates launchers, prioritizes env overrides, uses OS-specific fallback order (Windows: py -3, python, python3; non-Windows: python3, python), and updated compute-node sidecar, inference sidecar, and model bridge to use it.",
+  "lessons": "All Python subprocess entrypoints must share a single runtime-resolution path and include explicit fallback behavior for Windows launcher differences."
+}

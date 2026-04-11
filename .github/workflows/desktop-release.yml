@@ -66,6 +66,15 @@ jobs:
         # before Tauri's internal beforeBuildCommand hook on clean runners.
         run: npm run build
 
+      - name: Compile desktop Rust crate
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.tauri_target }}" ]; then
+            cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.tauri_target }}
+          else
+            cargo check --manifest-path src-tauri/Cargo.toml
+          fi
+
       - name: Build Tauri bundles
         shell: bash
         run: |

@@ -14,7 +14,7 @@ use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
 #[derive(Default)]

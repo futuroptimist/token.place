@@ -21,7 +21,7 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -76,15 +76,6 @@ jobs:
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
         # before Tauri's internal beforeBuildCommand hook on clean runners.
         run: npm run build
-
-      - name: Compile desktop Rust crate
-        shell: bash
-        run: |
-          if [ -n "${{ matrix.tauri_target }}" ]; then
-            cargo check --release --manifest-path src-tauri/Cargo.toml --target ${{ matrix.tauri_target }}
-          else
-            cargo check --release --manifest-path src-tauri/Cargo.toml
-          fi
 
       - name: Build Tauri bundles
         shell: bash
@@ -165,6 +156,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+    permissions:
+      contents: write
     steps:
       - name: Resolve release tag
         id: tag

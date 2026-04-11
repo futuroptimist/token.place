@@ -62,6 +62,19 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     Ok(events)
 }
 
+async fn drain_prefixed_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    prefix: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut seen = Vec::new();
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        eprintln!("{prefix} {line}");
+        seen.push(line);
+    }
+    Ok(seen)
+}
+
 fn build_sidecar_command(sidecar_path: &str) -> Command {
     let path = Path::new(sidecar_path);
     let is_python = path
@@ -199,6 +212,10 @@ pub async fn start_sidecar(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing sidecar stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sidecar stderr"))?;
     let stdin = child
         .stdin
         .take()
@@ -212,20 +229,74 @@ pub async fn start_sidecar(
     }
 
     let request_id = request.request_id;
+    let request_id_for_stderr = request_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = drain_prefixed_lines(
+            stderr,
+            &format!("desktop.sidecar.stderr request_id={request_id_for_stderr}"),
+        )
+        .await
+        {
+            eprintln!(
+                "desktop.sidecar.stderr.read_error request_id={} error={err}",
+                request_id_for_stderr
+            );
+        }
+    });
+
+    let mut saw_terminal_event = false;
     let mut reader = BufReader::new(stdout).lines();
     while let Some(line) = reader.next_line().await? {
-        if let Ok(event) = parse_event_line(&line) {
+        match parse_event_line(&line) {
+            Ok(event) => {
+                if matches!(
+                    event,
+                    SidecarEvent::Done | SidecarEvent::Canceled | SidecarEvent::Error { .. }
+                ) {
+                    saw_terminal_event = true;
+                }
+                app.emit(
+                    "inference_event",
+                    UiInferenceEvent {
+                        request_id: request_id.clone(),
+                        event,
+                    },
+                )?;
+            }
+            Err(err) => {
+                eprintln!(
+                    "desktop.sidecar.stdout.invalid_json request_id={} error={} line={}",
+                    request_id, err, line
+                );
+            }
+        }
+    }
+
+    if let Some(mut child) = state.child.lock().await.take() {
+        let status = child.wait().await?;
+        if !status.success() && !saw_terminal_event {
+            let code = status
+                .code()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "signal".into());
+            let message =
+                format!("inference sidecar exited early with code {code}; check desktop.sidecar.stderr logs");
+            eprintln!(
+                "desktop.sidecar.exit request_id={} success=false code={code}",
+                request_id
+            );
             app.emit(
                 "inference_event",
                 UiInferenceEvent {
                     request_id: request_id.clone(),
-                    event,
+                    event: SidecarEvent::Error {
+                        code: "sidecar_exit".into(),
+                        message,
+                    },
                 },
             )?;
         }
     }
-
-    *state.child.lock().await = None;
     *state.stdin.lock().await = None;
     Ok(())
 }
@@ -258,6 +329,7 @@ pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     #[test]
@@ -333,5 +405,18 @@ mod tests {
             .iter()
             .any(|e| matches!(e, SidecarEvent::Token { .. })));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn drain_prefixed_lines_reads_all_lines() {
+        let (reader, mut writer) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            writer.write_all(b"line-a\nline-b\n").await.expect("write");
+        });
+
+        let lines = drain_prefixed_lines(reader, "desktop.sidecar.stderr test")
+            .await
+            .expect("drain lines");
+        assert_eq!(lines, vec!["line-a".to_string(), "line-b".to_string()]);
     }
 }

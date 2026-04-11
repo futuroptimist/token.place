@@ -254,13 +254,16 @@ export function App() {
     const nextRequestId = crypto.randomUUID();
     requestIdRef.current = nextRequestId;
     setRequestId(nextRequestId);
-    await invoke('start_inference', {
+    void invoke('start_inference', {
       request: {
         request_id: nextRequestId,
         model_path: config.model_path,
         prompt,
         mode: config.preferred_mode,
       },
+    }).catch((e) => {
+      setStatus('failed');
+      setError(String(e));
     });
   };
 
@@ -270,18 +273,24 @@ export function App() {
   };
 
   const startComputeNode = async () => {
-    try {
-      setError('');
-      await invoke('start_compute_node', {
-        request: {
-          model_path: config.model_path,
-          relay_base_url: config.relay_base_url,
-          mode: config.preferred_mode,
-        },
-      });
-    } catch (e) {
+    setError('');
+    setComputeStatus((prev) => ({ ...prev, last_error: null }));
+    void invoke('start_compute_node', {
+      request: {
+        model_path: config.model_path,
+        relay_base_url: config.relay_base_url,
+        mode: config.preferred_mode,
+      },
+    }).catch((e) => {
+      const message = String(e);
       setError(String(e));
-    }
+      setComputeStatus((prev) => ({
+        ...prev,
+        running: false,
+        registered: false,
+        last_error: message,
+      }));
+    });
   };
 
   const stopComputeNode = async () => {

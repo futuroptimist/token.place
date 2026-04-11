@@ -181,6 +181,18 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert 'failed to initialize model runtime' in payload['message']
 
 
+def test_describe_relay_error_marks_legacy_sink_incompatibility():
+    message = compute_node_bridge._describe_relay_error('404 Not Found: /sink')
+    assert '404 Not Found: /sink' in message
+    assert 'aef3057bc4f4c895c96a1ba9e90dd0434baf3452' in message
+
+
+def test_describe_relay_error_marks_unreachable_relay():
+    message = compute_node_bridge._describe_relay_error('Connection refused')
+    assert 'Connection refused' in message
+    assert 'relay unreachable or unavailable' in message
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

@@ -60,6 +60,21 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def _describe_relay_error(error: Any) -> str:
+    message = str(error or "relay registration failed")
+    lowered = message.lower()
+    incompatible_hint = (
+        "relay appears incompatible with desktop-v0.1.0 operator bridge "
+        "(expected current /sink registration contract; older relay.py revisions "
+        "such as aef3057bc4f4c895c96a1ba9e90dd0434baf3452 may be unsupported)"
+    )
+    if any(token in lowered for token in ("404", "not found", "/sink", "unsupported")):
+        return f"{message}; {incompatible_hint}"
+    if any(token in lowered for token in ("connection", "timeout", "refused", "no relay targets responded")):
+        return f"{message}; relay unreachable or unavailable"
+    return message
+
+
 def _sleep_with_cancel(seconds: float) -> bool:
     deadline = time.time() + max(seconds, 0)
     while time.time() < deadline:
@@ -126,7 +141,7 @@ def run(args: argparse.Namespace) -> int:
             registered = "error" not in relay_response
 
             if not registered:
-                last_error = str(relay_response.get("error", "relay registration failed"))
+                last_error = _describe_relay_error(relay_response.get("error"))
             else:
                 if is_legacy_relay_payload(relay_response):
                     processed = runtime.process_relay_request(relay_response)

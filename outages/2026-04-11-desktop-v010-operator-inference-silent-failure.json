@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-v010-operator-inference-silent-failure",
+  "summary": "Desktop MVP startup failures for local inference and compute-node operator were easy to miss in practice: UI state could remain in starting while actionable sidecar/bridge errors were not visible.",
+  "impact": "Users observed Start local inference and Start operator as no-op behavior with limited diagnostics, blocking smoke-test confidence and operator registration troubleshooting.",
+  "fix": "Drained/logged child stderr in Rust for inference sidecar and compute-node bridge, logged malformed stdout lines, emitted explicit inference early-exit errors, added frontend invoke rejection handling to force failed status and visible errors, and added relay error compatibility hints in compute_node_bridge.py.",
+  "lessons": "Desktop child-process stderr must always be drained and surfaced; startup invokes must map rejection paths into stable failed UI state; and relay compatibility errors must be explicit to avoid silent operator no-op perception."
+}

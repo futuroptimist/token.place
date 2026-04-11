@@ -128,6 +128,19 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+async fn drain_prefixed_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    prefix: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut seen = Vec::new();
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        eprintln!("{prefix} {line}");
+        seen.push(line);
+    }
+    Ok(seen)
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -184,6 +197,10 @@ pub async fn start_compute_node(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stderr"))?;
     let stdin = child
         .stdin
         .take()
@@ -205,14 +222,37 @@ pub async fn start_compute_node(
         };
     }
 
+    let relay_base_url = request.relay_base_url.clone();
+    tokio::spawn(async move {
+        if let Err(err) = drain_prefixed_lines(
+            stderr,
+            &format!("desktop.compute_node.stderr relay_url={relay_base_url}"),
+        )
+        .await
+        {
+            eprintln!(
+                "desktop.compute_node.stderr.read_error relay_url={} error={err}",
+                relay_base_url
+            );
+        }
+    });
+
     let mut lines = BufReader::new(stdout).lines();
     while let Some(line) = lines.next_line().await? {
-        if let Ok(payload) = serde_json::from_str::<Value>(&line) {
-            {
-                let mut status = state.status.lock().await;
-                update_status_from_event(&mut status, &payload);
+        match serde_json::from_str::<Value>(&line) {
+            Ok(payload) => {
+                {
+                    let mut status = state.status.lock().await;
+                    update_status_from_event(&mut status, &payload);
+                }
+                app.emit("compute_node_event", payload)?;
             }
-            app.emit("compute_node_event", payload)?;
+            Err(err) => {
+                eprintln!(
+                    "desktop.compute_node.stdout.invalid_json relay_url={} error={} line={}",
+                    request.relay_base_url, err, line
+                );
+            }
         }
     }
 
@@ -225,6 +265,31 @@ pub async fn start_compute_node(
     *state.stdin.lock().await = None;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_prefixed_lines;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn drain_prefixed_lines_reads_compute_node_stderr() {
+        let (reader, mut writer) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"bridge-error-a\nbridge-error-b\n")
+                .await
+                .expect("write");
+        });
+
+        let lines = drain_prefixed_lines(reader, "desktop.compute_node.stderr test")
+            .await
+            .expect("drain lines");
+        assert_eq!(
+            lines,
+            vec!["bridge-error-a".to_string(), "bridge-error-b".to_string()]
+        );
+    }
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {

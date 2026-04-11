@@ -4,6 +4,7 @@ mod config;
 mod forward;
 mod keygen;
 mod logging;
+mod python_runtime;
 mod sidecar;
 
 use backend::{detect_backend_for, BackendInfo};

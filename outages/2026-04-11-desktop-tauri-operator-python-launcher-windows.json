@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-tauri-operator-python-launcher-windows",
+  "summary": "Desktop-tauri operator startup failed on affected Windows hosts because Python launcher resolution could select an unusable command (Microsoft Store alias or missing python3), causing immediate bridge exit.",
+  "impact": "Users could not keep the compute-node operator running; the UI briefly showed running=true before resetting and reporting bridge exit.",
+  "fix": "Introduced shared platform-aware Python launcher resolution with validation and fallback (including Windows py -3), rejected known Store-alias failure signatures, and reused the resolver for both compute-node and inference sidecar startups.",
+  "lessons": "Desktop subprocess launchers should be validated before spawn and selected through a single, tested resolver rather than one hard-coded interpreter name."
+}

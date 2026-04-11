@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::python_runtime::resolve_python_launcher;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -73,7 +74,7 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     Ok(())
 }
 
-fn build_sidecar_command(sidecar_path: &str) -> Command {
+fn build_sidecar_command(sidecar_path: &str) -> anyhow::Result<Command> {
     let path = Path::new(sidecar_path);
     let is_python = path
         .extension()
@@ -81,14 +82,11 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
 
     if is_python {
-        let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
-        let mut cmd = Command::new(python_bin);
-        cmd.arg(sidecar_path);
-        return cmd;
+        let launcher = resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON")?;
+        return Ok(launcher.command_for_script(sidecar_path));
     }
 
-    Command::new(sidecar_path)
+    Ok(Command::new(sidecar_path))
 }
 
 fn resolve_default_sidecar_script() -> String {
@@ -194,7 +192,9 @@ pub async fn start_sidecar(
         }
     });
 
-    let mut child = build_sidecar_command(&sidecar_script)
+    let mut sidecar_command = build_sidecar_command(&sidecar_script)?;
+
+    let mut child = sidecar_command
         .arg("--model")
         .arg(&request.model_path)
         .arg("--mode")

@@ -54,6 +54,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> target
+
       - name: Add macOS arm64 Rust target
         if: matrix.tauri_target != ''
         run: rustup target add ${{ matrix.tauri_target }}
@@ -65,6 +70,15 @@ jobs:
         # Keep this explicit pre-build. Some CI failures reported frontendDist validation
         # before Tauri's internal beforeBuildCommand hook on clean runners.
         run: npm run build
+
+      - name: Compile desktop Rust crate
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.tauri_target }}" ]; then
+            cargo check --release --manifest-path src-tauri/Cargo.toml --target ${{ matrix.tauri_target }}
+          else
+            cargo check --release --manifest-path src-tauri/Cargo.toml
+          fi
 
       - name: Build Tauri bundles
         shell: bash

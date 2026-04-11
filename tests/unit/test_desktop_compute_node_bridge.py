@@ -99,6 +99,14 @@ class StreamingRuntime(FakeRuntime):
         return self.relay_client.process_client_request(payload)
 
 
+class IncompatibleRelayRuntime(FakeRuntime):
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClient()
+        self._responses = [{'next_ping_in_x_seconds': 0}]
+        self._processed = []
+
+
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     from utils.compute_node_runtime import (
         SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
@@ -217,6 +225,27 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
+
+
+def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=IncompatibleRelayRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert status_events[0]['registered'] is False
+    assert 'desktop-v0.1.0 operator' in status_events[0]['last_error']
 
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():

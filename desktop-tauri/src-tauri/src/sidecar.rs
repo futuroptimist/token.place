@@ -62,6 +62,17 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     Ok(events)
 }
 
+async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+    }
+    Ok(())
+}
+
 fn build_sidecar_command(sidecar_path: &str) -> Command {
     let path = Path::new(sidecar_path);
     let is_python = path
@@ -199,6 +210,10 @@ pub async fn start_sidecar(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing sidecar stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sidecar stderr"))?;
     let stdin = child
         .stdin
         .take()
@@ -212,20 +227,71 @@ pub async fn start_sidecar(
     }
 
     let request_id = request.request_id;
+    let stderr_request_id = request_id.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Err(err) = drain_sidecar_stderr(stderr, &stderr_request_id).await {
+            eprintln!(
+                "desktop.sidecar.stderr_error request_id={} error={}",
+                stderr_request_id, err
+            );
+        }
+    });
+
     let mut reader = BufReader::new(stdout).lines();
+    let mut saw_error_event = false;
     while let Some(line) = reader.next_line().await? {
-        if let Ok(event) = parse_event_line(&line) {
-            app.emit(
-                "inference_event",
-                UiInferenceEvent {
-                    request_id: request_id.clone(),
-                    event,
-                },
-            )?;
+        match parse_event_line(&line) {
+            Ok(event) => {
+                if matches!(event, SidecarEvent::Error { .. }) {
+                    saw_error_event = true;
+                }
+                app.emit(
+                    "inference_event",
+                    UiInferenceEvent {
+                        request_id: request_id.clone(),
+                        event,
+                    },
+                )?;
+            }
+            Err(err) => {
+                eprintln!(
+                    "desktop.sidecar.stdout_parse_error request_id={} error={} line={}",
+                    request_id, err, line
+                );
+            }
         }
     }
 
-    *state.child.lock().await = None;
+    if let Err(err) = stderr_task.await {
+        eprintln!(
+            "desktop.sidecar.stderr_task_join_error request_id={} error={}",
+            request_id, err
+        );
+    }
+
+    let mut running_child = {
+        let mut child_slot = state.child.lock().await;
+        child_slot
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("sidecar process handle missing after stdout closed"))?
+    };
+    let exit_status = running_child.wait().await?;
+
+    if !exit_status.success() && !saw_error_event {
+        app.emit(
+            "inference_event",
+            UiInferenceEvent {
+                request_id: request_id.clone(),
+                event: SidecarEvent::Error {
+                    code: "sidecar_exit".into(),
+                    message: format!(
+                        "sidecar exited with status {exit_status}; see desktop.sidecar.stderr logs"
+                    ),
+                },
+            },
+        )?;
+    }
+
     *state.stdin.lock().await = None;
     Ok(())
 }
@@ -333,5 +399,28 @@ mod tests {
             .iter()
             .any(|e| matches!(e, SidecarEvent::Token { .. })));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn drain_sidecar_stderr_reads_all_lines() {
+        let script = NamedTempFile::new().expect("temp script");
+        std::fs::write(
+            script.path(),
+            "#!/usr/bin/env python3\nimport sys\nprint('first', file=sys.stderr)\nprint('second', file=sys.stderr)\n",
+        )
+        .expect("write script");
+
+        let mut child = Command::new("python3")
+            .arg(script.path())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stderr script");
+
+        let stderr = child.stderr.take().expect("stderr");
+        drain_sidecar_stderr(stderr, "test")
+            .await
+            .expect("drain stderr");
+        let status = child.wait().await.expect("wait child");
+        assert!(status.success());
     }
 }

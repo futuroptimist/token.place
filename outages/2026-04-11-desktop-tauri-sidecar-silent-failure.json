@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-tauri-sidecar-silent-failure",
+  "summary": "Desktop v0.1.0 sidecar and operator startup failures appeared as no-ops because child stderr was not drained/logged, malformed stdout lines were ignored, and frontend invoke rejection paths did not consistently transition UI state to failure.",
+  "impact": "Desktop local smoke tests and operator startup failures were difficult to diagnose; missing Python/runtime/import errors and relay incompatibility often looked silent.",
+  "fix": "Drained and prefix-logged sidecar/bridge stderr, logged malformed stdout lines, emitted fallback error events on non-zero child exits without structured error payloads, made start commands return after successful spawn with lifecycle driven by events, added frontend invoke failure handling, and surfaced an actionable relay compatibility error for non-legacy payloads.",
+  "lessons": "All desktop child processes must have stderr drained and surfaced, and UI start flows must always map invoke rejections and startup failures into explicit failed status plus actionable error text."
+}

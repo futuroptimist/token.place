@@ -181,9 +181,27 @@ async fn start_inference(
         "inference.start {}",
         serde_json::to_string(&redacted).unwrap_or_default()
     );
-    sidecar::start_sidecar(app, state.sidecar.clone(), request)
-        .await
-        .map_err(|e| e.to_string())
+    let sidecar_state = state.sidecar.clone();
+    let request_id = request.request_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = sidecar::start_sidecar(app.clone(), sidecar_state, request).await {
+            eprintln!(
+                "desktop.sidecar.start_failure request_id={} error={}",
+                request_id, err
+            );
+            let _ = app.emit(
+                "inference_event",
+                sidecar::UiInferenceEvent {
+                    request_id,
+                    event: sidecar::SidecarEvent::Error {
+                        code: "sidecar_start_failed".into(),
+                        message: err.to_string(),
+                    },
+                },
+            );
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -216,9 +234,31 @@ async fn start_compute_node(
     state: tauri::State<'_, AppState>,
     request: ComputeNodeRequest,
 ) -> Result<(), String> {
-    compute_node::start_compute_node(app, state.compute_node.clone(), request)
-        .await
-        .map_err(|e| e.to_string())
+    let compute_state = state.compute_node.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
+        {
+            eprintln!("desktop.compute_node.start_failure error={}", err);
+            {
+                let mut status = compute_state.status.lock().await;
+                status.running = false;
+                status.registered = false;
+                status.last_error = Some(err.to_string());
+            }
+            let _ = app.emit(
+                "compute_node_event",
+                serde_json::json!({
+                    "type": "error",
+                    "running": false,
+                    "registered": false,
+                    "last_error": err.to_string(),
+                    "message": err.to_string(),
+                }),
+            );
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

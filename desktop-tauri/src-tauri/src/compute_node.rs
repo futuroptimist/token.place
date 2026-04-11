@@ -105,6 +105,17 @@ fn resolve_bridge_script() -> String {
     "python/compute_node_bridge.py".into()
 }
 
+fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
+    ComputeNodeStatus {
+        running: false,
+        registered: false,
+        active_relay_url: request.relay_base_url.clone(),
+        backend_mode: format!("{:?}", request.mode).to_lowercase(),
+        model_path: request.model_path.clone(),
+        last_error: Some(last_error),
+    }
+}
+
 fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     if let Some(running) = payload.get("running").and_then(Value::as_bool) {
         status.running = running;
@@ -175,14 +186,7 @@ pub async fn start_compute_node(
                 Err(err) => {
                     {
                         let mut status = state.status.lock().await;
-                        *status = ComputeNodeStatus {
-                            running: false,
-                            registered: false,
-                            active_relay_url: request.relay_base_url.clone(),
-                            backend_mode: format!("{:?}", request.mode).to_lowercase(),
-                            model_path: request.model_path.clone(),
-                            last_error: Some(err.to_string()),
-                        };
+                        *status = startup_failure_status(&request, err.to_string());
                     }
                     return Err(err);
                 }
@@ -191,14 +195,7 @@ pub async fn start_compute_node(
                 let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
                 {
                     let mut status = state.status.lock().await;
-                    *status = ComputeNodeStatus {
-                        running: false,
-                        registered: false,
-                        active_relay_url: request.relay_base_url.clone(),
-                        backend_mode: format!("{:?}", request.mode).to_lowercase(),
-                        model_path: request.model_path.clone(),
-                        last_error: Some(err.to_string()),
-                    };
+                    *status = startup_failure_status(&request, err.to_string());
                 }
                 return Err(err);
             }
@@ -212,14 +209,7 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = ComputeNodeStatus {
-                    running: false,
-                    registered: false,
-                    active_relay_url: request.relay_base_url.clone(),
-                    backend_mode: format!("{:?}", request.mode).to_lowercase(),
-                    model_path: request.model_path.clone(),
-                    last_error: Some(err.to_string()),
-                };
+                *status = startup_failure_status(&request, err.to_string());
             }
             return Err(err);
         }
@@ -242,14 +232,10 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = ComputeNodeStatus {
-                    running: false,
-                    registered: false,
-                    active_relay_url: request.relay_base_url.clone(),
-                    backend_mode: format!("{:?}", request.mode).to_lowercase(),
-                    model_path: request.model_path.clone(),
-                    last_error: Some(format!("failed to start compute-node bridge: {err}")),
-                };
+                *status = startup_failure_status(
+                    &request,
+                    format!("failed to start compute-node bridge: {err}"),
+                );
             }
             *state.child.lock().await = None;
             *state.stdin.lock().await = None;
@@ -460,5 +446,27 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[test]
+    fn startup_failure_status_records_resolver_error_and_not_running() {
+        let request = ComputeNodeRequest {
+            model_path: "model.gguf".into(),
+            relay_base_url: "https://relay.example".into(),
+            mode: ComputeMode::Cpu,
+        };
+        let status = startup_failure_status(
+            &request,
+            "no usable Python 3 interpreter found for desktop Python subprocess".into(),
+        );
+
+        assert!(!status.running);
+        assert!(!status.registered);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("no usable Python 3 interpreter found for desktop Python subprocess")
+        );
+        assert_eq!(status.active_relay_url, request.relay_base_url);
+        assert_eq!(status.model_path, request.model_path);
     }
 }

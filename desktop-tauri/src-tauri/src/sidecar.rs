@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::python_runtime;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -81,9 +82,9 @@ fn build_sidecar_command(sidecar_path: &str) -> Command {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
 
     if is_python {
-        let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
-        let mut cmd = Command::new(python_bin);
+        let runtime = python_runtime::resolve_python_runtime("TOKEN_PLACE_SIDECAR_PYTHON");
+        let mut cmd = Command::new(runtime.program);
+        runtime.apply_to(&mut cmd);
         cmd.arg(sidecar_path);
         return cmd;
     }

@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-tauri-python-alias-runtime-failure",
+  "summary": "Desktop operator startup on Windows failed when python resolved to the Microsoft Store App Execution Alias shim, causing immediate bridge exit after spawn.",
+  "impact": "Affected desktop users could not keep operator mode running or register compute nodes, with failures surfacing as non-zero bridge exits.",
+  "fix": "Added a shared Python runtime resolver with executable probing and platform-aware fallback order, then wired compute-node bridge, inference sidecar, and model bridge launches through it.",
+  "lessons": "Do not assume python/python3 on PATH is a real interpreter on Windows; probe runtime executability and centralize launcher selection in one shared helper."
+}

@@ -4,6 +4,7 @@ mod config;
 mod forward;
 mod keygen;
 mod logging;
+mod python_runtime;
 mod sidecar;
 
 use backend::{detect_backend_for, BackendInfo};
@@ -80,10 +81,11 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
 }
 
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
-    let python_bin = std::env::var("TOKEN_PLACE_PYTHON").unwrap_or_else(|_| "python".into());
+    let runtime = python_runtime::resolve_python_runtime("TOKEN_PLACE_PYTHON");
     let bridge_script = resolve_model_bridge_script_path()?;
-    let output = Command::new(python_bin)
-        .arg(&bridge_script)
+    let mut command = Command::new(&runtime.program);
+    command.args(&runtime.prefix_args).arg(&bridge_script);
+    let output = command
         .arg(action)
         .output()
         .map_err(|e| format!("unable to run model bridge: {e}"))?;

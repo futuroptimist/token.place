@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::python_runtime::{resolve_python_launcher, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -73,22 +74,25 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     Ok(())
 }
 
-fn build_sidecar_command(sidecar_path: &str) -> Command {
-    let path = Path::new(sidecar_path);
-    let is_python = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
-
-    if is_python {
-        let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
-        let mut cmd = Command::new(python_bin);
-        cmd.arg(sidecar_path);
-        return cmd;
+fn build_sidecar_command(
+    sidecar_path: &str,
+    launcher: Option<PythonLauncher>,
+) -> anyhow::Result<Command> {
+    if is_python_script(sidecar_path) {
+        let launcher = launcher.ok_or_else(|| {
+            anyhow::anyhow!("missing resolved Python launcher for sidecar script")
+        })?;
+        return Ok(launcher.command_for_script(sidecar_path));
     }
 
-    Command::new(sidecar_path)
+    Ok(Command::new(sidecar_path))
+}
+
+fn is_python_script(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
 fn resolve_default_sidecar_script() -> String {
@@ -194,7 +198,19 @@ pub async fn start_sidecar(
         }
     });
 
-    let mut child = build_sidecar_command(&sidecar_script)
+    let launcher = if is_python_script(&sidecar_script) {
+        Some(
+            tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
+                .await
+                .map_err(|e| anyhow::anyhow!("python launcher resolver task failed: {e}"))??,
+        )
+    } else {
+        None
+    };
+
+    let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
+
+    let mut child = sidecar_command
         .arg("--model")
         .arg(&request.model_path)
         .arg("--mode")

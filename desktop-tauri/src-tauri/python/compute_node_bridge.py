@@ -135,7 +135,12 @@ def run(args: argparse.Namespace) -> int:
                     else:
                         last_error = None
                 else:
-                    last_error = None
+                    registered = False
+                    last_error = (
+                        "relay protocol incompatible: desktop-v0.1.0 operator expects "
+                        "legacy /sink payload fields (client_public_key, chat_history, "
+                        "cipherkey, iv). Upgrade relay.py to latest HEAD."
+                    )
 
             emit(
                 {

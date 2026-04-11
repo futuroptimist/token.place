@@ -128,6 +128,45 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+fn log_compute_stderr_line(line: &str) {
+    eprintln!("desktop.compute_node.stderr line={}", line);
+}
+
+fn log_compute_malformed_stdout(line: &str, err: &serde_json::Error) {
+    eprintln!(
+        "desktop.compute_node.stdout_malformed error={} line={}",
+        err, line
+    );
+}
+
+fn emit_compute_error_payload(
+    app: &AppHandle,
+    request: &ComputeNodeRequest,
+    message: String,
+) -> anyhow::Result<()> {
+    app.emit(
+        "compute_node_event",
+        serde_json::json!({
+            "type": "error",
+            "running": false,
+            "registered": false,
+            "active_relay_url": request.relay_base_url,
+            "backend_mode": format!("{:?}", request.mode).to_lowercase(),
+            "model_path": request.model_path,
+            "last_error": message,
+            "message": message,
+        }),
+    )?;
+    Ok(())
+}
+
+async fn drain_compute_stderr<R: tokio::io::AsyncRead + Unpin>(reader: R) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        log_compute_stderr_line(&line);
+    }
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -163,6 +202,7 @@ pub async fn start_compute_node(
     let mut child = match spawn_result {
         Ok(child) => child,
         Err(err) => {
+            let message = format!("failed to start compute-node bridge: {err}");
             {
                 let mut status = state.status.lock().await;
                 *status = ComputeNodeStatus {
@@ -171,11 +211,12 @@ pub async fn start_compute_node(
                     active_relay_url: request.relay_base_url.clone(),
                     backend_mode: format!("{:?}", request.mode).to_lowercase(),
                     model_path: request.model_path.clone(),
-                    last_error: Some(format!("failed to start compute-node bridge: {err}")),
+                    last_error: Some(message.clone()),
                 };
             }
             *state.child.lock().await = None;
             *state.stdin.lock().await = None;
+            let _ = emit_compute_error_payload(&app, &request, message.clone());
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
     };
@@ -184,10 +225,15 @@ pub async fn start_compute_node(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stderr"))?;
     let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
+    let stderr_task = tokio::spawn(drain_compute_stderr(stderr));
 
     {
         let mut child_slot = state.child.lock().await;
@@ -207,13 +253,35 @@ pub async fn start_compute_node(
 
     let mut lines = BufReader::new(stdout).lines();
     while let Some(line) = lines.next_line().await? {
-        if let Ok(payload) = serde_json::from_str::<Value>(&line) {
-            {
-                let mut status = state.status.lock().await;
-                update_status_from_event(&mut status, &payload);
+        match serde_json::from_str::<Value>(&line) {
+            Ok(payload) => {
+                {
+                    let mut status = state.status.lock().await;
+                    update_status_from_event(&mut status, &payload);
+                }
+                app.emit("compute_node_event", payload)?;
             }
-            app.emit("compute_node_event", payload)?;
+            Err(err) => log_compute_malformed_stdout(&line, &err),
         }
+    }
+
+    if let Some(mut child) = state.child.lock().await.take() {
+        if let Ok(exit_status) = child.wait().await {
+            if !exit_status.success() {
+                let message = format!(
+                    "compute-node bridge exited with status {}; check desktop.compute_node.stderr logs",
+                    exit_status
+                );
+                {
+                    let mut status = state.status.lock().await;
+                    status.last_error = Some(message.clone());
+                }
+                let _ = emit_compute_error_payload(&app, &request, message);
+            }
+        }
+    }
+    if let Err(err) = stderr_task.await {
+        eprintln!("desktop.compute_node.stderr_task_failed error={}", err);
     }
 
     {
@@ -221,7 +289,6 @@ pub async fn start_compute_node(
         status.running = false;
         status.registered = false;
     }
-    *state.child.lock().await = None;
     *state.stdin.lock().await = None;
 
     Ok(())
@@ -271,4 +338,29 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         status.registered = false;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_stdout_log_helper_accepts_invalid_json() {
+        let err = serde_json::from_str::<Value>("{oops").expect_err("invalid json");
+        log_compute_malformed_stdout("{oops", &err);
+    }
+
+    #[test]
+    fn status_updates_from_error_event_message() {
+        let mut status = ComputeNodeStatus::default();
+        let payload = serde_json::json!({
+            "type": "error",
+            "message": "relay protocol incompatible"
+        });
+        update_status_from_event(&mut status, &payload);
+        assert_eq!(
+            status.last_error,
+            Some("relay protocol incompatible".to_string())
+        );
+    }
 }

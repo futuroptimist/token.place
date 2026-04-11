@@ -49,6 +49,27 @@ pub fn parse_event_line(line: &str) -> Result<SidecarEvent, serde_json::Error> {
     serde_json::from_str::<SidecarEvent>(line)
 }
 
+fn log_sidecar_stderr_line(request_id: &str, line: &str) {
+    eprintln!(
+        "desktop.sidecar.stderr request_id={} line={}",
+        request_id, line
+    );
+}
+
+fn log_sidecar_malformed_stdout(request_id: &str, line: &str, err: &serde_json::Error) {
+    eprintln!(
+        "desktop.sidecar.stdout_malformed request_id={} error={} line={}",
+        request_id, err, line
+    );
+}
+
+async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(reader: R, request_id: String) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        log_sidecar_stderr_line(&request_id, &line);
+    }
+}
+
 pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
 ) -> anyhow::Result<Vec<SidecarEvent>> {
@@ -199,10 +220,17 @@ pub async fn start_sidecar(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing sidecar stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sidecar stderr"))?;
     let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing sidecar stdin"))?;
+
+    let request_id = request.request_id;
+    let stderr_task = tokio::spawn(drain_sidecar_stderr(stderr, request_id.clone()));
 
     {
         let mut child_slot = state.child.lock().await;
@@ -211,21 +239,56 @@ pub async fn start_sidecar(
         *stdin_slot = Some(stdin);
     }
 
-    let request_id = request.request_id;
+    let mut saw_terminal_event = false;
     let mut reader = BufReader::new(stdout).lines();
     while let Some(line) = reader.next_line().await? {
-        if let Ok(event) = parse_event_line(&line) {
-            app.emit(
-                "inference_event",
-                UiInferenceEvent {
-                    request_id: request_id.clone(),
+        match parse_event_line(&line) {
+            Ok(event) => {
+                if matches!(
                     event,
-                },
-            )?;
+                    SidecarEvent::Done | SidecarEvent::Canceled | SidecarEvent::Error { .. }
+                ) {
+                    saw_terminal_event = true;
+                }
+                app.emit(
+                    "inference_event",
+                    UiInferenceEvent {
+                        request_id: request_id.clone(),
+                        event,
+                    },
+                )?;
+            }
+            Err(err) => log_sidecar_malformed_stdout(&request_id, &line, &err),
         }
     }
 
-    *state.child.lock().await = None;
+    if let Some(mut child) = state.child.lock().await.take() {
+        if let Ok(exit_status) = child.wait().await {
+            if !exit_status.success() && !saw_terminal_event {
+                let message = format!(
+                    "inference sidecar exited early with status {}; check desktop.sidecar.stderr logs",
+                    exit_status
+                );
+                app.emit(
+                    "inference_event",
+                    UiInferenceEvent {
+                        request_id: request_id.clone(),
+                        event: SidecarEvent::Error {
+                            code: "sidecar_exit".into(),
+                            message,
+                        },
+                    },
+                )?;
+            }
+        }
+    }
+    if let Err(err) = stderr_task.await {
+        eprintln!(
+            "desktop.sidecar.stderr_task_failed request_id={} error={}",
+            request_id, err
+        );
+    }
+
     *state.stdin.lock().await = None;
     Ok(())
 }
@@ -277,6 +340,17 @@ mod tests {
                 message: "no file".into()
             }
         );
+    }
+
+    #[test]
+    fn malformed_stdout_is_parse_error() {
+        let err = parse_event_line("{oops").expect_err("must fail");
+        log_sidecar_malformed_stdout("req-123", "{oops", &err);
+    }
+
+    #[test]
+    fn stderr_log_helper_accepts_runtime_errors() {
+        log_sidecar_stderr_line("req-123", "ModuleNotFoundError: No module named llama_cpp");
     }
 
     #[tokio::test]

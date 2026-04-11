@@ -14,7 +14,7 @@ use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -181,9 +181,27 @@ async fn start_inference(
         "inference.start {}",
         serde_json::to_string(&redacted).unwrap_or_default()
     );
-    sidecar::start_sidecar(app, state.sidecar.clone(), request)
-        .await
-        .map_err(|e| e.to_string())
+    let sidecar_state = state.sidecar.clone();
+    tokio::spawn(async move {
+        if let Err(err) = sidecar::start_sidecar(app.clone(), sidecar_state, request.clone()).await
+        {
+            eprintln!(
+                "desktop.sidecar.start_failed request_id={} error={}",
+                request.request_id, err
+            );
+            let _ = app.emit(
+                "inference_event",
+                sidecar::UiInferenceEvent {
+                    request_id: request.request_id,
+                    event: sidecar::SidecarEvent::Error {
+                        code: "start_failed".into(),
+                        message: err.to_string(),
+                    },
+                },
+            );
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -216,9 +234,28 @@ async fn start_compute_node(
     state: tauri::State<'_, AppState>,
     request: ComputeNodeRequest,
 ) -> Result<(), String> {
-    compute_node::start_compute_node(app, state.compute_node.clone(), request)
-        .await
-        .map_err(|e| e.to_string())
+    let node_state = state.compute_node.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            compute_node::start_compute_node(app.clone(), node_state, request.clone()).await
+        {
+            eprintln!("desktop.compute_node.start_failed error={}", err);
+            let _ = app.emit(
+                "compute_node_event",
+                serde_json::json!({
+                    "type": "error",
+                    "running": false,
+                    "registered": false,
+                    "active_relay_url": request.relay_base_url,
+                    "backend_mode": format!("{:?}", request.mode).to_lowercase(),
+                    "model_path": request.model_path,
+                    "last_error": err.to_string(),
+                    "message": err.to_string(),
+                }),
+            );
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

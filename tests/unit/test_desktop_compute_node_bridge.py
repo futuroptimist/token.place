@@ -219,6 +219,39 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     assert any(event.get('registered') is True for event in status_events)
 
 
+def test_run_reports_incompatible_relay_payload_as_actionable_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class IncompatibleRelayRuntime(FakeRuntime):
+        def __init__(self, _config):
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClient()
+            self._responses = [{'next_ping_in_x_seconds': 0, 'new_protocol': {'version': 2}}]
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=IncompatibleRelayRuntime)
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_event = next(event for event in events if event['type'] == 'status')
+    assert status_event['registered'] is False
+    assert 'relay protocol incompatible' in status_event['last_error']
+
+
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode

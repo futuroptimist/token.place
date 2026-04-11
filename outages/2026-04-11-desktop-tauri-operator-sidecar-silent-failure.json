@@ -1,0 +1,17 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-tauri-operator-sidecar-silent-failure",
+  "summary": "Desktop-tauri desktop-v0.1.0 could fail to start local inference or operator flows with little or no visible error because child process stderr was piped but not surfaced and frontend invoke rejection handling was incomplete.",
+  "impact": "Desktop MVP local smoke tests and operator startup looked like no-ops, leaving running/registered false and forcing manual deep debugging for routine runtime and relay compatibility issues.",
+  "fix": "Drained and logged sidecar/bridge stderr with structured Rust prefixes, logged malformed stdout lines, emitted explicit startup failure events, made frontend startup invoke failures transition to failed/last_error, and added explicit relay protocol incompatibility messaging for older relay payloads.",
+  "lessons": "Desktop hosts must always drain child stderr and map startup/runtime failures to both shell logs and UI-visible errors. Protocol mismatch cases need explicit, actionable error text.",
+  "detection": {
+    "symptoms": [
+      "Start operator appears to do nothing",
+      "Running and Registered stay no",
+      "Start local inference can stay at starting",
+      "Errors are invisible or easy to lose"
+    ]
+  },
+  "rootCause": "Rust Tauri sidecar/bridge process management captured child stderr but did not reliably surface it, while frontend start inference invoke handling lacked robust rejection handling. Older relay payload mismatches were not surfaced as explicit compatibility errors."
+}

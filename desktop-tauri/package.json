@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "vitest run",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -15,10 +16,13 @@
     "@tauri-apps/plugin-dialog": "^2.0.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.0",
     "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "jsdom": "^25.0.1",
     "typescript": "^5.9.3",
+    "vitest": "^2.1.8",
     "vite": "^5.4.10"
   }
 }

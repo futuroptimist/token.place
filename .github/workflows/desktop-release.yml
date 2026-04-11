@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'desktop-v*'
+  pull_request:
   workflow_dispatch:
     inputs:
       tag_name:
@@ -53,6 +54,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+        with:
+          toolchain: stable
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -158,7 +161,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
     steps:
       - name: Resolve release tag
         id: tag

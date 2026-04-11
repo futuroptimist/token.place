@@ -75,9 +75,9 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.tauri_target }}" ]; then
-            cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.tauri_target }}
+            cargo check --release --manifest-path src-tauri/Cargo.toml --target ${{ matrix.tauri_target }}
           else
-            cargo check --manifest-path src-tauri/Cargo.toml
+            cargo check --release --manifest-path src-tauri/Cargo.toml
           fi
 
       - name: Build Tauri bundles

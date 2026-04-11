@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::python_runtime::resolve_python_launcher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -47,11 +48,9 @@ fn build_bridge_command(bridge_path: &str) -> Command {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
 
     if is_python {
-        let python_bin =
-            std::env::var("TOKEN_PLACE_SIDECAR_PYTHON").unwrap_or_else(|_| "python3".into());
-        let mut cmd = Command::new(python_bin);
-        cmd.arg(bridge_path);
-        return cmd;
+        if let Ok(launcher) = resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON") {
+            return launcher.into_command_for_script(bridge_path);
+        }
     }
 
     Command::new(bridge_path)
@@ -162,7 +161,27 @@ pub async fn start_compute_node(
     }
 
     let bridge_script = resolve_bridge_script();
-    let spawn_result = build_bridge_command(&bridge_script)
+    let mut bridge_command = build_bridge_command(&bridge_script);
+    if Path::new(&bridge_script)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
+    {
+        if let Err(err) = resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON") {
+            let mut status = state.status.lock().await;
+            *status = ComputeNodeStatus {
+                running: false,
+                registered: false,
+                active_relay_url: request.relay_base_url.clone(),
+                backend_mode: format!("{:?}", request.mode).to_lowercase(),
+                model_path: request.model_path.clone(),
+                last_error: Some(format!("failed to locate Python runtime: {err}")),
+            };
+            anyhow::bail!("failed to locate Python runtime: {err}");
+        }
+    }
+
+    let spawn_result = bridge_command
         .arg("--model")
         .arg(&request.model_path)
         .arg("--mode")

@@ -35,6 +35,10 @@ pub struct ComputeNodeState {
     pub lifecycle_lock: Arc<Mutex<()>>,
 }
 
+fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str::<Value>(line)
+}
+
 fn build_bridge_command(bridge_path: &str) -> Command {
     let path = Path::new(bridge_path);
     let is_python = path
@@ -128,6 +132,16 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+) -> anyhow::Result<()> {
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        eprintln!("desktop.compute_node.stderr line={line}");
+    }
+    Ok(())
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -184,6 +198,10 @@ pub async fn start_compute_node(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stderr"))?;
     let stdin = child
         .stdin
         .take()
@@ -205,23 +223,79 @@ pub async fn start_compute_node(
         };
     }
 
+    let stderr_task = tokio::spawn(async move {
+        if let Err(err) = drain_compute_node_stderr(stderr).await {
+            eprintln!("desktop.compute_node.stderr_error error={err}");
+        }
+    });
+
     let mut lines = BufReader::new(stdout).lines();
+    let mut saw_error_event = false;
     while let Some(line) = lines.next_line().await? {
-        if let Ok(payload) = serde_json::from_str::<Value>(&line) {
-            {
-                let mut status = state.status.lock().await;
-                update_status_from_event(&mut status, &payload);
+        match parse_compute_node_event_line(&line) {
+            Ok(payload) => {
+                if payload.get("type").and_then(Value::as_str) == Some("error") {
+                    saw_error_event = true;
+                }
+                {
+                    let mut status = state.status.lock().await;
+                    update_status_from_event(&mut status, &payload);
+                }
+                app.emit("compute_node_event", payload)?;
             }
-            app.emit("compute_node_event", payload)?;
+            Err(err) => {
+                eprintln!(
+                    "desktop.compute_node.stdout_parse_error error={} line={}",
+                    err, line
+                );
+            }
         }
     }
 
-    {
+    if let Err(err) = stderr_task.await {
+        eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
+    }
+
+    let running_child = {
+        let mut child_slot = state.child.lock().await;
+        child_slot.take()
+    };
+
+    if let Some(mut running_child) = running_child {
+        let exit_status = running_child.wait().await?;
+
+        {
+            let mut status = state.status.lock().await;
+            status.running = false;
+            status.registered = false;
+            if !exit_status.success() && status.last_error.is_none() {
+                status.last_error = Some(format!(
+                    "compute-node bridge exited with status {exit_status}; \
+                     see desktop.compute_node.stderr logs"
+                ));
+            }
+        }
+        *state.stdin.lock().await = None;
+
+        if !exit_status.success() && !saw_error_event {
+            app.emit(
+                "compute_node_event",
+                serde_json::json!({
+                    "type": "error",
+                    "running": false,
+                    "registered": false,
+                    "last_error": format!(
+                        "compute-node bridge exited with status {exit_status}; \
+                         see desktop.compute_node.stderr logs"
+                    ),
+                }),
+            )?;
+        }
+    } else {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
     }
-    *state.child.lock().await = None;
     *state.stdin.lock().await = None;
 
     Ok(())
@@ -271,4 +345,57 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         status.registered = false;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+
+    #[tokio::test]
+    async fn malformed_stdout_lines_are_ignored_without_blocking_valid_events() {
+        let reader = BufReader::new(
+            b"{\"type\":\"status\",\"running\":true}\nnot-json\n{\"type\":\"error\",\"message\":\"boom\"}\n"
+                .as_slice(),
+        );
+        let mut lines = reader.lines();
+        let mut event_types = Vec::new();
+
+        while let Some(line) = lines.next_line().await.expect("read line") {
+            if let Ok(payload) = parse_compute_node_event_line(&line) {
+                let event_type = payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .expect("event type");
+                event_types.push(event_type.to_string());
+            }
+        }
+
+        assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drain_compute_node_stderr_reads_all_lines() {
+        let script = NamedTempFile::new().expect("temp script");
+        std::fs::write(
+            script.path(),
+            "#!/usr/bin/env python3\nimport sys\nprint('bridge-failure', file=sys.stderr)\n",
+        )
+        .expect("write script");
+
+        let mut child = Command::new("python3")
+            .arg(script.path())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stderr script");
+
+        let stderr = child.stderr.take().expect("stderr");
+        drain_compute_node_stderr(stderr)
+            .await
+            .expect("drain stderr");
+        let status = child.wait().await.expect("wait child");
+        assert!(status.success());
+    }
 }

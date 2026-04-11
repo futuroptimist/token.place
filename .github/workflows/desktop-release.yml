@@ -54,6 +54,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> target
+
       - name: Add macOS arm64 Rust target
         if: matrix.tauri_target != ''
         run: rustup target add ${{ matrix.tauri_target }}

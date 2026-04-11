@@ -248,20 +248,25 @@ export function App() {
   };
 
   const startInference = async () => {
-    setOutput('');
-    setError('');
-    setStatus('starting');
-    const nextRequestId = crypto.randomUUID();
-    requestIdRef.current = nextRequestId;
-    setRequestId(nextRequestId);
-    await invoke('start_inference', {
-      request: {
-        request_id: nextRequestId,
-        model_path: config.model_path,
-        prompt,
-        mode: config.preferred_mode,
-      },
-    });
+    try {
+      setOutput('');
+      setError('');
+      setStatus('starting');
+      const nextRequestId = crypto.randomUUID();
+      requestIdRef.current = nextRequestId;
+      setRequestId(nextRequestId);
+      await invoke('start_inference', {
+        request: {
+          request_id: nextRequestId,
+          model_path: config.model_path,
+          prompt,
+          mode: config.preferred_mode,
+        },
+      });
+    } catch (e) {
+      setStatus('failed');
+      setError(String(e));
+    }
   };
 
   const cancelInference = async () => {
@@ -280,7 +285,14 @@ export function App() {
         },
       });
     } catch (e) {
-      setError(String(e));
+      const message = String(e);
+      setError(message);
+      setComputeStatus((prev) => ({
+        ...prev,
+        running: false,
+        registered: false,
+        last_error: message,
+      }));
     }
   };
 

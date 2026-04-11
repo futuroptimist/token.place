@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -128,6 +129,25 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+fn spawn_stderr_logger<R>(reader: R, stream_label: &'static str) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => eprintln!("desktop.compute_node.{stream_label} {line}"),
+                Ok(None) => break,
+                Err(err) => {
+                    eprintln!("desktop.compute_node.{stream_label}.read_error {err}");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 pub async fn start_compute_node(
     app: AppHandle,
     state: ComputeNodeState,
@@ -184,6 +204,10 @@ pub async fn start_compute_node(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stderr"))?;
     let stdin = child
         .stdin
         .take()
@@ -205,14 +229,74 @@ pub async fn start_compute_node(
         };
     }
 
+    let stderr_task = spawn_stderr_logger(stderr, "stderr");
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
-        if let Ok(payload) = serde_json::from_str::<Value>(&line) {
-            {
-                let mut status = state.status.lock().await;
-                update_status_from_event(&mut status, &payload);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
+                Ok(payload) => {
+                    {
+                        let mut status = state.status.lock().await;
+                        update_status_from_event(&mut status, &payload);
+                    }
+                    app.emit("compute_node_event", payload)?;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "desktop.compute_node.stdout.malformed_json error={} line={}",
+                        err, line
+                    );
+                }
+            },
+            Ok(None) => break,
+            Err(err) => {
+                let message = format!("failed reading compute-node bridge stdout: {err}");
+                eprintln!("desktop.compute_node.stdout.read_error {message}");
+                {
+                    let mut status = state.status.lock().await;
+                    status.running = false;
+                    status.registered = false;
+                    status.last_error = Some(message.clone());
+                }
+                app.emit(
+                    "compute_node_event",
+                    serde_json::json!({
+                        "type": "error",
+                        "running": false,
+                        "registered": false,
+                        "last_error": message,
+                    }),
+                )?;
+                break;
             }
-            app.emit("compute_node_event", payload)?;
+        }
+    }
+    let _ = stderr_task.await;
+
+    let mut child = state.child.lock().await.take();
+    if let Some(child_ref) = child.as_mut() {
+        match child_ref.wait().await {
+            Ok(exit) if !exit.success() => {
+                let message = format!("compute-node bridge exited with status {exit}");
+                eprintln!("desktop.compute_node.exit {message}");
+                {
+                    let mut status = state.status.lock().await;
+                    status.last_error = Some(message.clone());
+                }
+                app.emit(
+                    "compute_node_event",
+                    serde_json::json!({
+                        "type": "error",
+                        "running": false,
+                        "registered": false,
+                        "last_error": message,
+                    }),
+                )?;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("desktop.compute_node.wait_error {err}");
+            }
         }
     }
 

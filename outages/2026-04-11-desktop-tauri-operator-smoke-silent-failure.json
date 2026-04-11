@@ -1,0 +1,14 @@
+{
+  "date": "2026-04-11",
+  "slug": "desktop-tauri-operator-smoke-silent-failure",
+  "summary": "In desktop-v0.1.0, operator and local inference startup failures could appear as no-ops because sidecar stderr was not surfaced and frontend error handling left ambiguous UI states.",
+  "impact": "Desktop MVP users could not reliably diagnose startup failures for local smoke tests or operator relay registration.",
+  "fix": "Drain and prefix-log sidecar stderr/stdout parse errors in Rust host, emit explicit startup/runtime error events, run sidecar lifecycles in background tasks so start invokes return promptly, harden frontend failed-state handling, and add actionable relay compatibility guidance.",
+  "lessons": "Desktop host process observability must treat child stderr as first-class signal and startup paths must always drive deterministic UI failure states.",
+  "rootCause": "Rust Tauri sidecar orchestration piped child stderr without draining/logging it and frontend invoke-failure handling did not consistently transition UI status to failure, producing silent startup failures.",
+  "symptoms": [
+    "Start operator appeared to do nothing while Running/Registered stayed no",
+    "Start local inference appeared to do nothing and could remain stuck in starting",
+    "Errors were easy to lose because child stderr was not visible"
+  ]
+}

@@ -219,6 +219,80 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     assert any(event.get('registered') is True for event in status_events)
 
 
+def test_run_adds_actionable_guidance_for_unreachable_or_old_relay(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class Relay404Runtime(FakeRuntime):
+        def __init__(self, _config):
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClient()
+            self._responses = [{'error': '404 not found'}]
+
+        def stop(self):
+            return None
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=Relay404Runtime)
+    calls = {'count': 0}
+
+    def fake_stop_requested():
+        calls['count'] += 1
+        return calls['count'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert status_events[-1]['registered'] is False
+    assert 'update relay.py to token.place HEAD' in status_events[-1]['last_error']
+
+
+def test_run_marks_incompatible_relay_payload_as_not_registered(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class IncompatibleRelayRuntime(FakeRuntime):
+        def __init__(self, _config):
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClient()
+            self._responses = [{'unexpected': 'payload'}]
+
+        def stop(self):
+            return None
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=IncompatibleRelayRuntime)
+    calls = {'count': 0}
+
+    def fake_stop_requested():
+        calls['count'] += 1
+        return calls['count'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert status_events[-1]['registered'] is False
+    assert 'incompatible with desktop-v0.1.0 operator bridge' in status_events[-1]['last_error']
+
+
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode

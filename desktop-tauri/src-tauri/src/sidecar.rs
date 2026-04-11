@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -60,6 +61,27 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
         }
     }
     Ok(events)
+}
+
+fn spawn_stderr_logger<R>(reader: R, stream_label: &'static str) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    eprintln!("desktop.sidecar.{stream_label} {line}");
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    eprintln!("desktop.sidecar.{stream_label}.read_error {err}");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 fn build_sidecar_command(sidecar_path: &str) -> Command {
@@ -199,6 +221,10 @@ pub async fn start_sidecar(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing sidecar stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sidecar stderr"))?;
     let stdin = child
         .stdin
         .take()
@@ -212,16 +238,74 @@ pub async fn start_sidecar(
     }
 
     let request_id = request.request_id;
+    let stderr_task = spawn_stderr_logger(stderr, "stderr");
     let mut reader = BufReader::new(stdout).lines();
-    while let Some(line) = reader.next_line().await? {
-        if let Ok(event) = parse_event_line(&line) {
-            app.emit(
-                "inference_event",
-                UiInferenceEvent {
-                    request_id: request_id.clone(),
-                    event,
-                },
-            )?;
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => match parse_event_line(&line) {
+                Ok(event) => {
+                    app.emit(
+                        "inference_event",
+                        UiInferenceEvent {
+                            request_id: request_id.clone(),
+                            event,
+                        },
+                    )?;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "desktop.sidecar.stdout.malformed_json request_id={} error={} line={}",
+                        request_id, err, line
+                    );
+                }
+            },
+            Ok(None) => break,
+            Err(err) => {
+                let message = format!("failed reading inference sidecar stdout: {err}");
+                eprintln!(
+                    "desktop.sidecar.stdout.read_error request_id={} {message}",
+                    request_id
+                );
+                app.emit(
+                    "inference_event",
+                    UiInferenceEvent {
+                        request_id: request_id.clone(),
+                        event: SidecarEvent::Error {
+                            code: "runtime_io".into(),
+                            message,
+                        },
+                    },
+                )?;
+                break;
+            }
+        }
+    }
+    let _ = stderr_task.await;
+
+    let mut child = state.child.lock().await.take();
+    if let Some(child_ref) = child.as_mut() {
+        match child_ref.wait().await {
+            Ok(exit) if !exit.success() => {
+                let message = format!("inference sidecar exited with status {exit}");
+                eprintln!("desktop.sidecar.exit request_id={} {message}", request_id);
+                app.emit(
+                    "inference_event",
+                    UiInferenceEvent {
+                        request_id: request_id.clone(),
+                        event: SidecarEvent::Error {
+                            code: "runtime_exit".into(),
+                            message,
+                        },
+                    },
+                )?;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "desktop.sidecar.wait_error request_id={} {}",
+                    request_id, err
+                );
+            }
         }
     }
 
@@ -258,6 +342,7 @@ pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     #[test]
@@ -333,5 +418,20 @@ mod tests {
             .iter()
             .any(|e| matches!(e, SidecarEvent::Token { .. })));
         assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn stderr_logger_drains_lines_until_eof() {
+        let (reader, mut writer) = tokio::io::duplex(256);
+        let task = spawn_stderr_logger(reader, "stderr_test");
+        writer
+            .write_all(b"line one\nline two\n")
+            .await
+            .expect("write stderr");
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stderr drain timeout")
+            .expect("stderr drain task");
     }
 }

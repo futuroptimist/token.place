@@ -69,6 +69,18 @@ def _sleep_with_cancel(seconds: float) -> bool:
     return stop_requested()
 
 
+def _with_relay_compat_guidance(error_message: str) -> str:
+    text = (error_message or "relay registration failed").strip()
+    lowered = text.lower()
+    compatibility_signals = ("404", "not found", "unsupported", "invalid", "connection", "timed out")
+    if any(signal in lowered for signal in compatibility_signals):
+        return (
+            f"{text}. Relay may be unreachable or too old for desktop-v0.1.0 operator; "
+            "update relay.py to token.place HEAD."
+        )
+    return text
+
+
 def run(args: argparse.Namespace) -> int:
     try:
         from utils.compute_node_runtime import (
@@ -126,7 +138,9 @@ def run(args: argparse.Namespace) -> int:
             registered = "error" not in relay_response
 
             if not registered:
-                last_error = str(relay_response.get("error", "relay registration failed"))
+                last_error = _with_relay_compat_guidance(
+                    str(relay_response.get("error", "relay registration failed"))
+                )
             else:
                 if is_legacy_relay_payload(relay_response):
                     processed = runtime.process_relay_request(relay_response)
@@ -135,7 +149,15 @@ def run(args: argparse.Namespace) -> int:
                     else:
                         last_error = None
                 else:
-                    last_error = None
+                    next_ping = relay_response.get("next_ping_in_x_seconds")
+                    if next_ping is None and relay_response.get("type") is None:
+                        registered = False
+                        last_error = (
+                            "relay response incompatible with desktop-v0.1.0 operator bridge; "
+                            "update relay.py to token.place HEAD"
+                        )
+                    else:
+                        last_error = None
 
             emit(
                 {

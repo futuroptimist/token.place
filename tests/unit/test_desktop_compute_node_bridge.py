@@ -230,7 +230,13 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
 def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=IncompatibleRelayRuntime)
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',

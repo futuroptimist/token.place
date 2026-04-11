@@ -54,6 +54,10 @@ const defaultComputeStatus: ComputeNodeStatus = {
   last_error: null,
 };
 
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -84,7 +88,9 @@ export function App() {
   const requestIdRef = useRef('');
 
   useEffect(() => {
-    invoke<BackendInfo>('detect_backend').then(setBackend).catch((e) => setError(String(e)));
+    invoke<BackendInfo>('detect_backend')
+      .then(setBackend)
+      .catch((e) => setError(formatErrorMessage(e)));
 
     const initializeConfigAndArtifact = async () => {
       try {
@@ -104,7 +110,7 @@ export function App() {
         await invoke('save_config', { config: next });
         setConfig(next);
       } catch (e) {
-        setError(String(e));
+        setError(formatErrorMessage(e));
       }
     };
 
@@ -143,7 +149,12 @@ export function App() {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
       setComputeStatus((prev) => ({
-        running: typeof payload.running === 'boolean' ? payload.running : prev.running,
+        running:
+          typeof payload.running === 'boolean'
+            ? payload.running
+            : payload.type === 'error'
+              ? false
+              : prev.running,
         registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
         active_relay_url:
           typeof payload.active_relay_url === 'string'
@@ -203,7 +214,7 @@ export function App() {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
-      invoke('save_config', { config: next }).catch((e) => setError(String(e)));
+      invoke('save_config', { config: next }).catch((e) => setError(formatErrorMessage(e)));
       saveTimerRef.current = null;
     }, 300);
   };
@@ -225,7 +236,7 @@ export function App() {
         updateConfig({ ...config, model_path: path });
       }
     } catch (e) {
-      setError(String(e));
+      setError(formatErrorMessage(e));
     }
   };
 
@@ -241,7 +252,7 @@ export function App() {
         return next;
       });
     } catch (e) {
-      setError(String(e));
+      setError(formatErrorMessage(e));
     } finally {
       setIsDownloadingModel(false);
     }
@@ -265,7 +276,7 @@ export function App() {
       });
     } catch (e) {
       setStatus('failed');
-      setError(String(e));
+      setError(formatErrorMessage(e));
     }
   };
 
@@ -294,13 +305,14 @@ export function App() {
         },
       });
     } catch (e) {
+      const message = formatErrorMessage(e);
       setComputeStatus((prev) => ({
         ...prev,
         running: false,
         registered: false,
-        last_error: String(e),
+        last_error: message,
       }));
-      setError(String(e));
+      setError(message);
     }
   };
 
@@ -308,7 +320,7 @@ export function App() {
     try {
       await invoke('stop_compute_node');
     } catch (e) {
-      setError(String(e));
+      setError(formatErrorMessage(e));
     }
   };
 
@@ -321,7 +333,7 @@ export function App() {
         final_output: output,
       });
     } catch (e) {
-      setError(String(e));
+      setError(formatErrorMessage(e));
     } finally {
       setIsForwarding(false);
     }

@@ -250,41 +250,47 @@ pub async fn start_compute_node(
         eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
     }
 
-    let mut running_child = {
+    let running_child = {
         let mut child_slot = state.child.lock().await;
-        child_slot.take().ok_or_else(|| {
-            anyhow::anyhow!("compute-node process handle missing after stdout closed")
-        })?
+        child_slot.take()
     };
-    let exit_status = running_child.wait().await?;
 
-    {
+    if let Some(mut running_child) = running_child {
+        let exit_status = running_child.wait().await?;
+
+        {
+            let mut status = state.status.lock().await;
+            status.running = false;
+            status.registered = false;
+            if !exit_status.success() && status.last_error.is_none() {
+                status.last_error = Some(format!(
+                    "compute-node bridge exited with status {exit_status}; \
+                     see desktop.compute_node.stderr logs"
+                ));
+            }
+        }
+        *state.stdin.lock().await = None;
+
+        if !exit_status.success() && !saw_payload {
+            app.emit(
+                "compute_node_event",
+                serde_json::json!({
+                    "type": "error",
+                    "running": false,
+                    "registered": false,
+                    "last_error": format!(
+                        "compute-node bridge exited with status {exit_status}; \
+                         see desktop.compute_node.stderr logs"
+                    ),
+                }),
+            )?;
+        }
+    } else {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
-        if !exit_status.success() && status.last_error.is_none() {
-            status.last_error = Some(format!(
-                "compute-node bridge exited with status {exit_status}; \
-                 see desktop.compute_node.stderr logs"
-            ));
-        }
     }
     *state.stdin.lock().await = None;
-
-    if !exit_status.success() && !saw_payload {
-        app.emit(
-            "compute_node_event",
-            serde_json::json!({
-                "type": "error",
-                "running": false,
-                "registered": false,
-                "last_error": format!(
-                    "compute-node bridge exited with status {exit_status}; \
-                     see desktop.compute_node.stderr logs"
-                ),
-            }),
-        )?;
-    }
 
     Ok(())
 }

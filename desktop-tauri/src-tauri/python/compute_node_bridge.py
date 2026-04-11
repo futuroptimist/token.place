@@ -129,8 +129,6 @@ def run(args: argparse.Namespace) -> int:
             if not registered:
                 if "error" in relay_response:
                     last_error = str(relay_response.get("error", "relay registration failed"))
-                elif legacy_payload:
-                    last_error = None
                 else:
                     last_error = (
                         "relay response is incompatible with desktop-v0.1.0 operator; "

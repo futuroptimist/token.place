@@ -111,7 +111,11 @@ describe('desktop app start failure handling', () => {
       .parentElement?.querySelector('textarea');
     expect(promptArea).toBeTruthy();
     fireEvent.change(promptArea as HTMLTextAreaElement, { target: { value: 'hello' } });
-    fireEvent.click(screen.getByText('Start local inference'));
+    const startInferenceButton = (await screen.findByText(
+      'Start local inference'
+    )) as HTMLButtonElement;
+    await waitFor(() => expect(startInferenceButton.disabled).toBe(false));
+    fireEvent.click(startInferenceButton);
 
     await waitFor(() =>
       expect(screen.getByText('Status:').textContent).toContain('failed')
@@ -162,7 +166,9 @@ describe('desktop app start failure handling', () => {
     });
 
     render(<App />);
-    fireEvent.click(await screen.findByText('Start operator'));
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
     await waitFor(() =>
       expect(screen.getByText(/Last error:/).textContent).toContain(
         'relay unreachable'

@@ -269,27 +269,28 @@ pub async fn start_sidecar(
         );
     }
 
-    let mut running_child = {
+    let running_child = {
         let mut child_slot = state.child.lock().await;
-        child_slot
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("sidecar process handle missing after stdout closed"))?
+        child_slot.take()
     };
-    let exit_status = running_child.wait().await?;
 
-    if !exit_status.success() && !saw_error_event {
-        app.emit(
-            "inference_event",
-            UiInferenceEvent {
-                request_id: request_id.clone(),
-                event: SidecarEvent::Error {
-                    code: "sidecar_exit".into(),
-                    message: format!(
-                        "sidecar exited with status {exit_status}; see desktop.sidecar.stderr logs"
-                    ),
+    if let Some(mut running_child) = running_child {
+        let exit_status = running_child.wait().await?;
+
+        if !exit_status.success() && !saw_error_event {
+            app.emit(
+                "inference_event",
+                UiInferenceEvent {
+                    request_id: request_id.clone(),
+                    event: SidecarEvent::Error {
+                        code: "sidecar_exit".into(),
+                        message: format!(
+                            "sidecar exited with status {exit_status}; see desktop.sidecar.stderr logs"
+                        ),
+                    },
                 },
-            },
-        )?;
+            )?;
+        }
     }
 
     *state.stdin.lock().await = None;

@@ -45,7 +45,10 @@ import/runtime issues, relay incompatibility, and bridge startup crashes looked 
 ## Follow-up / prevention
 - Keep startup lifecycle event-driven and include explicit startup-failure events.
 - Keep stderr draining in place for all future desktop child-process integrations.
+- Ensure child-exit fallback errors do not overwrite more actionable structured errors already emitted
+  on stdout.
 - Preserve regression coverage for:
+  - malformed stdout line handling (ignore/log malformed lines while keeping valid event flow)
   - sidecar/bridge stderr drain behavior
   - inference start invoke rejection UI behavior
   - operator relay incompatibility error surfacing

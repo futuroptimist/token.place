@@ -131,8 +131,8 @@ def run(args: argparse.Namespace) -> int:
                     last_error = str(relay_response.get("error", "relay registration failed"))
                 else:
                     last_error = (
-                        "relay response is incompatible with desktop-v0.1.0 operator; "
-                        "upgrade relay.py to HEAD"
+                        "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
+                        "operator; update relay.py to repo HEAD"
                     )
             else:
                 processed = runtime.process_relay_request(relay_response)

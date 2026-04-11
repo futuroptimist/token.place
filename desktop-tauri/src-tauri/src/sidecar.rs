@@ -424,4 +424,21 @@ mod tests {
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
     }
+
+    #[tokio::test]
+    async fn collect_events_ignores_malformed_stdout_lines_and_keeps_valid_flow() {
+        let stdout = b"{\"type\":\"started\"}\nnot-json\n{\"type\":\"token\",\"text\":\"ok\"}\n{\"type\":\"done\"}\n"
+            .as_slice();
+        let events = collect_events_from_stdout(stdout)
+            .await
+            .expect("collect events");
+        assert_eq!(
+            events,
+            vec![
+                SidecarEvent::Started,
+                SidecarEvent::Token { text: "ok".into() },
+                SidecarEvent::Done
+            ]
+        );
+    }
 }

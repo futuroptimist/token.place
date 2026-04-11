@@ -35,6 +35,10 @@ pub struct ComputeNodeState {
     pub lifecycle_lock: Arc<Mutex<()>>,
 }
 
+fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str::<Value>(line)
+}
+
 fn build_bridge_command(bridge_path: &str) -> Command {
     let path = Path::new(bridge_path);
     let is_python = path
@@ -226,11 +230,13 @@ pub async fn start_compute_node(
     });
 
     let mut lines = BufReader::new(stdout).lines();
-    let mut saw_payload = false;
+    let mut saw_error_event = false;
     while let Some(line) = lines.next_line().await? {
-        match serde_json::from_str::<Value>(&line) {
+        match parse_compute_node_event_line(&line) {
             Ok(payload) => {
-                saw_payload = true;
+                if payload.get("type").and_then(Value::as_str) == Some("error") {
+                    saw_error_event = true;
+                }
                 {
                     let mut status = state.status.lock().await;
                     update_status_from_event(&mut status, &payload);
@@ -271,7 +277,7 @@ pub async fn start_compute_node(
         }
         *state.stdin.lock().await = None;
 
-        if !exit_status.success() && !saw_payload {
+        if !exit_status.success() && !saw_error_event {
             app.emit(
                 "compute_node_event",
                 serde_json::json!({
@@ -345,7 +351,30 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    #[tokio::test]
+    async fn malformed_stdout_lines_are_ignored_without_blocking_valid_events() {
+        let reader = BufReader::new(
+            b"{\"type\":\"status\",\"running\":true}\nnot-json\n{\"type\":\"error\",\"message\":\"boom\"}\n"
+                .as_slice(),
+        );
+        let mut lines = reader.lines();
+        let mut event_types = Vec::new();
+
+        while let Some(line) = lines.next_line().await.expect("read line") {
+            if let Ok(payload) = parse_compute_node_event_line(&line) {
+                let event_type = payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .expect("event type");
+                event_types.push(event_type.to_string());
+            }
+        }
+
+        assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
+    }
 
     #[tokio::test]
     async fn drain_compute_node_stderr_reads_all_lines() {

@@ -4,6 +4,7 @@ import { App } from './App';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
+const eventHandlers = new Map<string, (evt: { payload: Record<string, unknown> }) => void>();
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
@@ -25,7 +26,11 @@ describe('desktop app start failure handling', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     listenMock.mockReset();
-    listenMock.mockResolvedValue(() => {});
+    eventHandlers.clear();
+    listenMock.mockImplementation((event: string, handler: unknown) => {
+      eventHandlers.set(event, handler as (evt: { payload: Record<string, unknown> }) => void);
+      return Promise.resolve(() => {});
+    });
 
     invokeMock.mockImplementation((command: string) => {
       if (command === 'detect_backend') {
@@ -174,5 +179,51 @@ describe('desktop app start failure handling', () => {
         'relay unreachable'
       )
     );
+  });
+
+  it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
+    render(<App />);
+    const promptArea = (await screen.findByText('Prompt'))
+      .parentElement?.querySelector('textarea');
+    expect(promptArea).toBeTruthy();
+    fireEvent.change(promptArea as HTMLTextAreaElement, { target: { value: 'hello' } });
+    const startInferenceButton = (await screen.findByText(
+      'Start local inference'
+    )) as HTMLButtonElement;
+    await waitFor(() => expect(startInferenceButton.disabled).toBe(false));
+    fireEvent.click(startInferenceButton);
+
+    const inferenceHandler = eventHandlers.get('inference_event');
+    expect(inferenceHandler).toBeTruthy();
+    inferenceHandler?.({
+      payload: {
+        request_id: '00000000-0000-4000-8000-000000000000',
+        type: 'error',
+        message: 'ignore stale request',
+      },
+    });
+    inferenceHandler?.({
+      payload: {
+        request_id: 'not-the-current-request',
+        type: 'error',
+        message: 'ignore stale request',
+      },
+    });
+
+    const startInvocation = invokeMock.mock.calls.find((args) => args[0] === 'start_inference');
+    expect(startInvocation).toBeTruthy();
+    const currentRequestId = startInvocation?.[1]?.request?.request_id as string;
+    inferenceHandler?.({
+      payload: {
+        request_id: currentRequestId,
+        type: 'error',
+        message: 'event failure path',
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText('Status:').textContent).toContain('failed')
+    );
+    expect(screen.getByText(/Error:/).textContent).toContain('event failure path');
   });
 });

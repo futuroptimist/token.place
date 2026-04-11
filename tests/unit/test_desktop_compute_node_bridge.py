@@ -251,7 +251,8 @@ def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
     assert status_events[0]['registered'] is False
-    assert 'desktop-v0.1.0 operator' in status_events[0]['last_error']
+    assert 'unreachable, old, or incompatible' in status_events[0]['last_error']
+    assert 'update relay.py to repo HEAD' in status_events[0]['last_error']
 
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():

@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
@@ -81,10 +80,11 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
 }
 
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
-    let python_bin = std::env::var("TOKEN_PLACE_PYTHON").unwrap_or_else(|_| "python".into());
+    let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
+        .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path()?;
-    let output = Command::new(python_bin)
-        .arg(&bridge_script)
+    let output = launcher
+        .command_for_script_blocking(bridge_script.to_str().unwrap_or_default())
         .arg(action)
         .output()
         .map_err(|e| format!("unable to run model bridge: {e}"))?;

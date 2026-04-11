@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::resolve_python_launcher;
+use crate::python_runtime::{resolve_python_launcher, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -40,19 +40,25 @@ fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error>
     serde_json::from_str::<Value>(line)
 }
 
-fn build_bridge_command(bridge_path: &str) -> anyhow::Result<Command> {
-    let path = Path::new(bridge_path);
-    let is_python = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"));
-
-    if is_python {
-        let launcher = resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON")?;
+fn build_bridge_command(
+    bridge_path: &str,
+    launcher: Option<PythonLauncher>,
+) -> anyhow::Result<Command> {
+    if is_python_script(bridge_path) {
+        let launcher = launcher.ok_or_else(|| {
+            anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
+        })?;
         return Ok(launcher.command_for_script(bridge_path));
     }
 
     Ok(Command::new(bridge_path))
+}
+
+fn is_python_script(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
 fn resolve_bridge_script() -> String {
@@ -160,7 +166,48 @@ pub async fn start_compute_node(
     }
 
     let bridge_script = resolve_bridge_script();
-    let mut bridge_command = match build_bridge_command(&bridge_script) {
+    let launcher = if is_python_script(&bridge_script) {
+        match tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
+            .await
+        {
+            Ok(result) => match result {
+                Ok(launcher) => Some(launcher),
+                Err(err) => {
+                    {
+                        let mut status = state.status.lock().await;
+                        *status = ComputeNodeStatus {
+                            running: false,
+                            registered: false,
+                            active_relay_url: request.relay_base_url.clone(),
+                            backend_mode: format!("{:?}", request.mode).to_lowercase(),
+                            model_path: request.model_path.clone(),
+                            last_error: Some(err.to_string()),
+                        };
+                    }
+                    return Err(err);
+                }
+            },
+            Err(err) => {
+                let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
+                {
+                    let mut status = state.status.lock().await;
+                    *status = ComputeNodeStatus {
+                        running: false,
+                        registered: false,
+                        active_relay_url: request.relay_base_url.clone(),
+                        backend_mode: format!("{:?}", request.mode).to_lowercase(),
+                        model_path: request.model_path.clone(),
+                        last_error: Some(err.to_string()),
+                    };
+                }
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
             {
@@ -174,7 +221,7 @@ pub async fn start_compute_node(
                     last_error: Some(err.to_string()),
                 };
             }
-            anyhow::bail!(err);
+            return Err(err);
         }
     };
 

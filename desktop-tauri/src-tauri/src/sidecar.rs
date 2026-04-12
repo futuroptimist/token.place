@@ -50,6 +50,7 @@ pub fn parse_event_line(line: &str) -> Result<SidecarEvent, serde_json::Error> {
     serde_json::from_str::<SidecarEvent>(line)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
 ) -> anyhow::Result<Vec<SidecarEvent>> {

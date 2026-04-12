@@ -114,12 +114,16 @@ def diagnostics_message(
 
 
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
-    locator = f"//label[normalize-space()='{label_text}']"
+    locator = (
+        f"(//label[normalize-space()='{label_text}']/following::input[1] | "
+        f"//label[normalize-space()='{label_text}']/following::textarea[1])[1]"
+    )
 
     def _set_value(_: webdriver.Remote) -> bool:
         try:
-            label = driver.find_element(By.XPATH, locator)
-            input_el = label.find_element(By.XPATH, "(following::input | following::textarea)[1]")
+            with contextlib.suppress(WebDriverException):
+                driver.switch_to.default_content()
+            input_el = driver.find_element(By.XPATH, locator)
             input_el.send_keys(Keys.CONTROL, "a")
             input_el.send_keys(Keys.DELETE)
             input_el.send_keys(value)
@@ -134,6 +138,26 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
     if not WebDriverWait(driver, 45, poll_frequency=0.25).until(_set_value):
         raise RuntimeError(f"failed to set input for label: {label_text}")
+
+
+def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
+    def _ready(d: webdriver.Remote) -> bool:
+        try:
+            with contextlib.suppress(WebDriverException):
+                d.switch_to.default_content()
+            state = d.execute_script("return document.readyState")
+            if state != "complete":
+                return False
+            return bool(d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']"))
+        except (
+            NoSuchFrameException,
+            StaleElementReferenceException,
+            WebDriverException,
+        ):
+            return False
+
+    if not WebDriverWait(driver, timeout_seconds, poll_frequency=0.25).until(_ready):
+        raise RuntimeError("desktop UI never became ready")
 
 
 def terminate_process(process: subprocess.Popen[str]) -> None:
@@ -247,6 +271,7 @@ def main() -> int:
 
         driver = start_driver(app_binary)
         wait = WebDriverWait(driver, 45)
+        wait_for_ui_ready(driver)
 
         fill_input_by_label(driver, "Model GGUF path", "mock.gguf")
         fill_input_by_label(driver, "Relay URL", relay_url)
@@ -297,6 +322,10 @@ def main() -> int:
     except AssertionError as exc:
         raise RuntimeError(
             diagnostics_message(f"desktop UI e2e assertion failed: {exc}", relay_log, driver_log, driver)
+        ) from exc
+    except WebDriverException as exc:
+        raise RuntimeError(
+            diagnostics_message(f"desktop UI e2e webdriver failure: {exc}", relay_log, driver_log, driver)
         ) from exc
     finally:
         if driver is not None:

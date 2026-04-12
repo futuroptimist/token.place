@@ -12,9 +12,12 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(__file__)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

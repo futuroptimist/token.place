@@ -145,8 +145,12 @@ def start_driver(app_binary: Path) -> webdriver.Remote:
 
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
+    webkit_driver_bin = shutil.which("WebKitWebDriver")
     if tauri_driver_bin is not None:
-        return [tauri_driver_bin, "--port", "4444"]
+        command = [tauri_driver_bin, "--port", "4444"]
+        if webkit_driver_bin is not None:
+            command.extend(["--native-driver", webkit_driver_bin])
+        return command
     raise RuntimeError(
         "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
     )

@@ -95,10 +95,13 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_default_sidecar_script() -> String {
+fn default_sidecar_script_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
@@ -145,25 +148,33 @@ fn resolve_default_sidecar_script() -> String {
         }
     }
 
+    candidates.push(manifest_dir.join("python").join("inference_sidecar.py"));
     candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("python")
-            .join("inference_sidecar.py"),
-    );
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        manifest_dir
             .join("..")
             .join("sidecar")
             .join("fake_llama_sidecar.py"),
     );
+    candidates
+}
 
-    for candidate in candidates {
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
-        }
+fn resolve_default_sidecar_script() -> String {
+    let exe_path = std::env::current_exe().ok();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidates = default_sidecar_script_candidates(exe_path.as_deref(), manifest_dir);
+
+    if let Some(path) = first_existing_script(candidates) {
+        return path;
     }
 
     "../sidecar/fake_llama_sidecar.py".into()
+}
+
+fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> {
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
 fn should_force_fake_sidecar() -> bool {
@@ -340,7 +351,7 @@ pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
     use tokio::process::Command;
 
     #[test]
@@ -456,5 +467,45 @@ mod tests {
                 SidecarEvent::Done
             ]
         );
+    }
+
+    #[test]
+    fn sidecar_candidates_include_packaged_resource_locations() {
+        let temp = TempDir::new().expect("tempdir");
+        let app_root = temp.path().join("Token Place.app");
+        let exe_dir = app_root.join("Contents").join("MacOS");
+        let exe_path = exe_dir.join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let candidates = default_sidecar_script_candidates(Some(&exe_path), &manifest_dir);
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("resources/python/inference_sidecar.py")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("Resources/python/inference_sidecar.py")));
+        assert!(candidates.iter().any(
+            |candidate| candidate == &manifest_dir.join("python").join("inference_sidecar.py")
+        ));
+    }
+
+    #[test]
+    fn first_existing_script_finds_packaged_resource_sidecar_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let resources_dir = exe_dir.join("resources").join("python");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+        let sidecar = resources_dir.join("inference_sidecar.py");
+        std::fs::write(&sidecar, "print('ok')\n").expect("write sidecar");
+
+        let exe_path = exe_dir.join("token.place.exe");
+        let candidates = default_sidecar_script_candidates(Some(&exe_path), temp.path());
+        let resolved = first_existing_script(candidates).expect("resolved sidecar path");
+
+        assert_eq!(Path::new(&resolved), sidecar);
     }
 }

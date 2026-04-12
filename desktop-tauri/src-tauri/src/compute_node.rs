@@ -210,6 +210,7 @@ pub async fn start_compute_node(
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
     let _lifecycle_lock = state.lifecycle_lock.lock().await;
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     {
         let mut child_slot = state.child.lock().await;

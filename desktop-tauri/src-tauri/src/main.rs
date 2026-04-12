@@ -43,21 +43,34 @@ struct BridgeResponse {
 }
 
 fn find_existing_bridge_script_path() -> Option<PathBuf> {
+    model_bridge_script_candidates(std::env::current_exe().ok().as_deref())
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn model_bridge_script_candidates(current_exe: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(current_exe) = std::env::current_exe() {
+    if let Some(current_exe) = current_exe {
         if let Some(exe_dir) = current_exe.parent() {
-            candidates.push(exe_dir.join("python").join("model_bridge.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
                     .join("python")
                     .join("model_bridge.py"),
             );
+            candidates.push(exe_dir.join("python").join("model_bridge.py"));
             candidates.push(
                 exe_dir
                     .join("..")
                     .join("Resources")
+                    .join("python")
+                    .join("model_bridge.py"),
+            );
+            candidates.push(
+                exe_dir
+                    .join("..")
+                    .join("resources")
                     .join("python")
                     .join("model_bridge.py"),
             );
@@ -70,7 +83,7 @@ fn find_existing_bridge_script_path() -> Option<PathBuf> {
             .join("model_bridge.py"),
     );
 
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
@@ -312,4 +325,23 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_bridge_candidates_include_packaged_resource_path() {
+        let exe = Path::new(
+            r"C:\Users\tester\AppData\Local\token.place desktop\token.place desktop.exe",
+        );
+        let candidates = model_bridge_script_candidates(Some(exe));
+        assert_eq!(
+            candidates[0],
+            PathBuf::from(
+                r"C:\Users\tester\AppData\Local\token.place desktop\resources\python\model_bridge.py",
+            )
+        );
+    }
 }

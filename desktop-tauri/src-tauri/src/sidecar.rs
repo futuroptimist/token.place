@@ -95,18 +95,18 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_default_sidecar_script() -> String {
+fn default_sidecar_script_candidates(current_exe: Option<&Path>) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = current_exe {
         if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
                     .join("python")
                     .join("inference_sidecar.py"),
             );
+            candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
@@ -157,7 +157,11 @@ fn resolve_default_sidecar_script() -> String {
             .join("fake_llama_sidecar.py"),
     );
 
-    for candidate in candidates {
+    candidates
+}
+
+fn resolve_default_sidecar_script() -> String {
+    for candidate in default_sidecar_script_candidates(std::env::current_exe().ok().as_deref()) {
         if candidate.is_file() {
             return candidate.to_string_lossy().into_owned();
         }
@@ -340,6 +344,7 @@ pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::process::Command;
 
@@ -455,6 +460,21 @@ mod tests {
                 SidecarEvent::Token { text: "ok".into() },
                 SidecarEvent::Done
             ]
+        );
+    }
+
+    #[test]
+    fn default_sidecar_candidates_include_packaged_resource_path() {
+        let exe = Path::new(
+            r"C:\Users\tester\AppData\Local\token.place desktop\token.place desktop.exe",
+        );
+        let candidates = default_sidecar_script_candidates(Some(exe));
+
+        assert_eq!(
+            candidates[0],
+            PathBuf::from(
+                r"C:\Users\tester\AppData\Local\token.place desktop\resources\python\inference_sidecar.py"
+            )
         );
     }
 }

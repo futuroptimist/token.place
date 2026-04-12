@@ -61,18 +61,13 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_bridge_script() -> String {
+fn bridge_script_candidates(current_exe: Option<&Path>) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = current_exe {
         if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("resources").join("python").join("compute_node_bridge.py"));
             candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
-            candidates.push(
-                exe_dir
-                    .join("resources")
-                    .join("python")
-                    .join("compute_node_bridge.py"),
-            );
             if let Some(parent_dir) = exe_dir.parent() {
                 candidates.push(
                     parent_dir
@@ -96,7 +91,11 @@ fn resolve_bridge_script() -> String {
             .join("compute_node_bridge.py"),
     );
 
-    for candidate in candidates {
+    candidates
+}
+
+fn resolve_bridge_script() -> String {
+    for candidate in bridge_script_candidates(std::env::current_exe().ok().as_deref()) {
         if candidate.is_file() {
             return candidate.to_string_lossy().into_owned();
         }
@@ -399,6 +398,8 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
@@ -468,5 +469,54 @@ mod tests {
         );
         assert_eq!(status.active_relay_url, request.relay_base_url);
         assert_eq!(status.model_path, request.model_path);
+    }
+
+    #[test]
+    fn bridge_script_candidates_include_packaged_and_dev_paths() {
+        let exe = Path::new(r"C:\Users\tester\AppData\Local\token.place desktop\token.place desktop.exe");
+        let candidates = bridge_script_candidates(Some(exe));
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from(
+                    r"C:\Users\tester\AppData\Local\token.place desktop\resources\python\compute_node_bridge.py",
+                ),
+                PathBuf::from(
+                    r"C:\Users\tester\AppData\Local\token.place desktop\python\compute_node_bridge.py",
+                ),
+                PathBuf::from(
+                    r"C:\Users\tester\AppData\Local\Resources\python\compute_node_bridge.py",
+                ),
+                PathBuf::from(
+                    r"C:\Users\tester\AppData\Local\resources\python\compute_node_bridge.py",
+                ),
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("python")
+                    .join("compute_node_bridge.py"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tauri_bundle_resources_include_python_bridges() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let raw = std::fs::read_to_string(config_path).expect("read tauri.conf.json");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse tauri.conf.json");
+
+        let resources = parsed
+            .get("bundle")
+            .and_then(|bundle| bundle.get("resources"))
+            .and_then(Value::as_array)
+            .expect("bundle.resources array");
+
+        let resource_values = resources
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert!(resource_values.contains(&"python/compute_node_bridge.py"));
+        assert!(resource_values.contains(&"python/inference_sidecar.py"));
+        assert!(resource_values.contains(&"python/model_bridge.py"));
     }
 }

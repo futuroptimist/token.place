@@ -145,7 +145,17 @@ def start_driver(app_binary: Path) -> webdriver.Remote:
 
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
-    webkit_driver_bin = shutil.which("WebKitWebDriver")
+    webkit_driver_bin = shutil.which("WebKitWebDriver") or shutil.which("webkit2gtk-driver")
+    if webkit_driver_bin is None:
+        for candidate in (
+            Path("/usr/bin/WebKitWebDriver"),
+            Path("/usr/bin/webkit2gtk-driver"),
+            Path("/usr/libexec/webkit2gtk-4.1/WebKitWebDriver"),
+            Path("/usr/libexec/webkit2gtk-4.0/WebKitWebDriver"),
+        ):
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                webkit_driver_bin = str(candidate)
+                break
     if tauri_driver_bin is not None:
         command = [tauri_driver_bin, "--port", "4444"]
         if webkit_driver_bin is not None:

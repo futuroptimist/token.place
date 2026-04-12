@@ -14,24 +14,41 @@ import time
 from pathlib import Path
 from urllib.request import urlopen
 
-from selenium import webdriver
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    NoSuchFrameException,
-    StaleElementReferenceException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-
-from utils.crypto_helpers import CryptoClient
-
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
 TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
 WEBDRIVER_URL = "http://127.0.0.1:4444"
+LOGS_DIR = REPO_ROOT / ".desktop-e2e-logs"
+BOOTSTRAP_LOG = LOGS_DIR / "bootstrap.log"
+
+# Ensure diagnostics artifact directory exists before fragile bootstrap/import steps.
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ensure repo-local imports work when this file is executed directly.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        NoSuchFrameException,
+        StaleElementReferenceException,
+        TimeoutException,
+        WebDriverException,
+    )
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    from utils.crypto_helpers import CryptoClient
+except Exception as exc:
+    BOOTSTRAP_LOG.write_text(
+        "desktop ui e2e bootstrap failure\n"
+        f"error_type={type(exc).__name__}\n"
+        f"error={exc}\n",
+        encoding="utf-8",
+    )
+    raise
 
 
 def reserve_free_port() -> int:
@@ -412,8 +429,7 @@ def main() -> int:
     relay_port = reserve_free_port()
     relay_url = f"http://127.0.0.1:{relay_port}"
 
-    logs_dir = REPO_ROOT / ".desktop-e2e-logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = LOGS_DIR
     relay_log = logs_dir / "relay.log"
     driver_log = logs_dir / "tauri-driver.log"
 
@@ -556,4 +572,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        BOOTSTRAP_LOG.write_text(
+            "desktop ui e2e top-level failure\n"
+            f"error_type={type(exc).__name__}\n"
+            f"error={exc}\n",
+            encoding="utf-8",
+        )
+        raise

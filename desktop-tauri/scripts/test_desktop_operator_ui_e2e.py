@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -142,6 +143,15 @@ def start_driver(app_binary: Path) -> webdriver.Remote:
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
 
 
+def tauri_driver_command() -> list[str]:
+    tauri_driver_bin = shutil.which("tauri-driver")
+    if tauri_driver_bin is not None:
+        return [tauri_driver_bin, "--port", "4444"]
+    raise RuntimeError(
+        "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
+    )
+
+
 def main() -> int:
     relay_port = reserve_free_port()
     relay_url = f"http://127.0.0.1:{relay_port}"
@@ -172,7 +182,7 @@ def main() -> int:
     )
 
     tauri_driver = subprocess.Popen(  # noqa: S603
-        ["npm", "run", "tauri", "driver", "--", "--port", "4444"],
+        tauri_driver_command(),
         cwd=DESKTOP_ROOT,
         env=env,
         stdout=driver_log.open("w", encoding="utf-8"),

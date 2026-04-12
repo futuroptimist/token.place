@@ -27,7 +27,9 @@
     "resources": [
       "python/compute_node_bridge.py",
       "python/inference_sidecar.py",
-      "python/model_bridge.py"
+      "python/model_bridge.py",
+      "../../config.py",
+      "../../utils"
     ],
     "icon": [
       "icons/32x32.png",

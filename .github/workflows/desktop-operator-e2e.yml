@@ -64,6 +64,13 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install tauri-driver
+        run: cargo install tauri-driver
+
+      - name: Build desktop frontend assets
+        working-directory: desktop-tauri
+        run: npm run build
+
       - name: Build desktop binary
         working-directory: desktop-tauri
         run: cargo build --manifest-path src-tauri/Cargo.toml

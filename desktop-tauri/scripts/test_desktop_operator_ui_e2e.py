@@ -71,10 +71,25 @@ def read_tail(path: Path) -> str:
 
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
     label = driver.find_element(By.XPATH, f"//label[normalize-space()='{label_text}']")
-    input_el = label.find_element(By.XPATH, "following-sibling::*[1]")
+    input_el = label.find_element(By.XPATH, "(following::input | following::textarea)[1]")
     input_el.send_keys(Keys.CONTROL, "a")
     input_el.send_keys(Keys.DELETE)
     input_el.send_keys(value)
+
+
+def terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Preserve original failure reason if process refuses to exit.
+            pass
 
 
 def start_driver(app_binary: Path) -> webdriver.Remote:
@@ -136,7 +151,8 @@ def main() -> int:
         wait_for_port("127.0.0.1", 4444)
         ensure_alive(tauri_driver, "tauri-driver")
 
-        app_binary = TAURI_ROOT / "target" / "debug" / "token-place-desktop-tauri"
+        suffix = ".exe" if sys.platform == "win32" else ""
+        app_binary = TAURI_ROOT / "target" / "debug" / f"token-place-desktop-tauri{suffix}"
         if not app_binary.exists():
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
@@ -186,12 +202,8 @@ def main() -> int:
     finally:
         if driver is not None:
             driver.quit()
-        if tauri_driver.poll() is None:
-            tauri_driver.terminate()
-            tauri_driver.wait(timeout=10)
-        if relay.poll() is None:
-            relay.terminate()
-            relay.wait(timeout=10)
+        terminate_process(tauri_driver)
+        terminate_process(relay)
 
     return 0
 

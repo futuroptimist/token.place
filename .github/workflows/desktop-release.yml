@@ -191,7 +191,7 @@ jobs:
           path: release-assets/windows
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@c062e08bd532815e2082a7e09a9927dc4bc7a32c # v2
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}

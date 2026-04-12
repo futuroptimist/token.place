@@ -61,10 +61,13 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_bridge_script() -> String {
+fn bridge_script_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
             candidates.push(
@@ -90,10 +93,15 @@ fn resolve_bridge_script() -> String {
         }
     }
 
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("python")
-            .join("compute_node_bridge.py"),
+    candidates.push(manifest_dir.join("python").join("compute_node_bridge.py"));
+    candidates
+}
+
+fn resolve_bridge_script() -> String {
+    let current_exe = std::env::current_exe().ok();
+    let candidates = bridge_script_candidates(
+        current_exe.as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
     );
 
     for candidate in candidates {
@@ -399,6 +407,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
@@ -468,5 +477,30 @@ mod tests {
         );
         assert_eq!(status.active_relay_url, request.relay_base_url);
         assert_eq!(status.model_path, request.model_path);
+    }
+
+    #[test]
+    fn bridge_script_candidates_include_packaged_resource_paths() {
+        let exe =
+            PathBuf::from(r"C:\Users\danie\AppData\Local\token.place desktop\token.place.exe");
+        let manifest_dir = Path::new("/repo/desktop-tauri/src-tauri");
+        let candidates = bridge_script_candidates(Some(&exe), manifest_dir);
+
+        assert_eq!(
+            candidates[0],
+            PathBuf::from(
+                r"C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py"
+            )
+        );
+        assert_eq!(
+            candidates[1],
+            PathBuf::from(
+                r"C:\Users\danie\AppData\Local\token.place desktop\resources\python\compute_node_bridge.py"
+            )
+        );
+        assert!(candidates.iter().any(|candidate| candidate
+            == &PathBuf::from(
+                r"C:\Users\danie\AppData\Local\Resources\python\compute_node_bridge.py"
+            )));
     }
 }

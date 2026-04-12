@@ -1,0 +1,48 @@
+name: Desktop operator packaged bridge e2e
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-operator-e2e.yml'
+      - 'desktop-tauri/src-tauri/python/**'
+      - 'desktop-tauri/src-tauri/tauri.conf.json'
+      - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'utils/**'
+      - 'config.py'
+      - 'encrypt.py'
+      - 'relay.py'
+      - 'requirements.txt'
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/desktop-operator-e2e.yml'
+      - 'desktop-tauri/src-tauri/python/**'
+      - 'desktop-tauri/src-tauri/tauri.conf.json'
+      - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'utils/**'
+      - 'config.py'
+      - 'encrypt.py'
+      - 'relay.py'
+      - 'requirements.txt'
+
+jobs:
+  packaged-operator-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run packaged operator bridge e2e
+        run: python desktop-tauri/scripts/test_packaged_operator_e2e.py

@@ -10,9 +10,14 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+if __package__ in (None, ""):
+    script_dir = str(Path(__file__).resolve().parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(__file__)
 
 
 def _response(ok: bool, *, payload: Dict[str, Any] | None = None, error: str = "") -> int:

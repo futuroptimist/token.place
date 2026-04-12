@@ -388,12 +388,17 @@ mod tests {
             "python/compute_node_bridge.py",
             "python/inference_sidecar.py",
             "python/model_bridge.py",
+            "python/path_bootstrap.py",
+            "../../utils",
+            "../../config.py",
+            "../../encrypt.py",
         ];
 
+        // Intentional strict count: this guards against accidental bundle bloat.
         assert_eq!(
             resources.len(),
             required.len(),
-            "bundle.resources should only include required python bridge scripts"
+            "bundle.resources should only include required Python bridge/runtime resources"
         );
 
         for script in required {

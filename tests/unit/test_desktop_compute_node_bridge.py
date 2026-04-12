@@ -103,7 +103,7 @@ class IncompatibleRelayRuntime(FakeRuntime):
     def __init__(self, _config):
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClient()
-        self._responses = [{'next_ping_in_x_seconds': 0}]
+        self._responses = [{}]
         self._processed = []
 
 

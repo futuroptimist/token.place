@@ -1,36 +1,59 @@
-name: Desktop operator packaged bridge e2e
+name: Desktop operator packaged runtime e2e
 
 on:
   pull_request:
     paths:
       - '.github/workflows/desktop-operator-e2e.yml'
       - 'desktop-tauri/src-tauri/python/**'
+      - 'desktop-tauri/src-tauri/src/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/src/**'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
       - 'relay.py'
       - 'requirements.txt'
+      - 'desktop-tauri/package.json'
+      - 'desktop-tauri/package-lock.json'
   push:
     branches: [ main, master ]
     paths:
       - '.github/workflows/desktop-operator-e2e.yml'
       - 'desktop-tauri/src-tauri/python/**'
+      - 'desktop-tauri/src-tauri/src/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/src/**'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
       - 'relay.py'
       - 'requirements.txt'
+      - 'desktop-tauri/package.json'
+      - 'desktop-tauri/package-lock.json'
 
 jobs:
-  packaged-operator-e2e:
+  packaged-operator-runtime-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop-tauri
+
+      - name: Build desktop frontend
+        run: npm run build
+        working-directory: desktop-tauri
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,5 +67,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run packaged operator bridge e2e
+      - name: Run packaged operator runtime e2e
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py

@@ -101,4 +101,5 @@ jobs:
         with:
           name: desktop-operator-e2e-logs
           path: .desktop-e2e-logs/
+          include-hidden-files: true
           if-no-files-found: warn

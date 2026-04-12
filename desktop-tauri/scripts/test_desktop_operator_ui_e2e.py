@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.request import urlopen
@@ -113,6 +114,13 @@ def diagnostics_message(
     )
 
 
+def assert_model_path_exists(path: str) -> None:
+    if not path.strip():
+        raise AssertionError("model path is empty")
+    if not Path(path).expanduser().exists():
+        raise AssertionError(f"model path does not exist: {path}")
+
+
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
     locator = (
         f"(//label[normalize-space()='{label_text}']/following::input[1] | "
@@ -180,6 +188,32 @@ def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -
 
     if not WebDriverWait(driver, timeout_seconds, poll_frequency=0.25).until(_ready):
         raise RuntimeError("desktop UI never became ready")
+
+
+def wait_for_inference_result(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> str:
+    wait = WebDriverWait(driver, timeout_seconds, poll_frequency=0.25)
+
+    def _done_or_failed(d: webdriver.Remote) -> bool:
+        status = d.find_element(By.XPATH, "//p[contains(.,'Status:')]//strong").text.strip().lower()
+        output = d.find_element(By.XPATH, "//pre").text.strip()
+        error_text = ""
+        with contextlib.suppress(NoSuchElementException):
+            error_text = d.find_element(By.XPATH, "//p[starts-with(normalize-space(),'Error:')]").text.strip()
+        if status == "failed" or error_text:
+            raise RuntimeError(
+                f"inference failed early; status={status}; error={error_text}; output={output}"
+            )
+        return status == "completed" and bool(output)
+
+    wait.until(_done_or_failed)
+    output_text = driver.find_element(By.XPATH, "//pre").text.strip()
+    last_error_text = driver.find_element(By.XPATH, "//p[contains(.,'Last error:')]").text.strip()
+    for marker in ("model path not found", "bridge failure", "no module named", "importerror"):
+        if marker in output_text.lower() or marker in last_error_text.lower():
+            raise AssertionError(
+                f"unexpected error marker `{marker}` seen; output={output_text}; last_error={last_error_text}"
+            )
+    return output_text
 
 
 def terminate_process(process: subprocess.Popen[str]) -> None:
@@ -278,6 +312,7 @@ def main() -> int:
     )
 
     driver: webdriver.Remote | None = None
+    model_path: str | None = None
     try:
         wait_for_http_200(f"{relay_url}/livez")
         ensure_alive(relay, "relay")
@@ -301,7 +336,10 @@ def main() -> int:
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
 
-        fill_input_by_label(driver, "Model GGUF path", "mock.gguf")
+        with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
+            model_path = model_file.name
+        fill_input_by_label(driver, "Model GGUF path", model_path)
+        assert_model_path_exists(model_path)
         fill_input_by_label(driver, "Relay URL", relay_url)
 
         wait.until(lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
@@ -330,8 +368,7 @@ def main() -> int:
         )
         driver.find_element(By.XPATH, "//button[.='Start local inference']").click()
 
-        wait.until(lambda d: d.find_element(By.XPATH, "//pre").text.strip() != "")
-        output_text = driver.find_element(By.XPATH, "//pre").text.strip()
+        output_text = wait_for_inference_result(driver)
         assert output_text, "inference output is empty"
 
         last_error_text = driver.find_element(By.XPATH, "//p[contains(.,'Last error:')]").text
@@ -358,6 +395,9 @@ def main() -> int:
     finally:
         if driver is not None:
             driver.quit()
+        if model_path:
+            with contextlib.suppress(FileNotFoundError):
+                Path(model_path).unlink()
         terminate_process(tauri_driver)
         terminate_process(relay)
 

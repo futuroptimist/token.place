@@ -48,9 +48,12 @@ def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: flo
 
 
 def create_packaged_layout(tmp_root: Path) -> Path:
-    resources_root = tmp_root / "resources"
+    executable_root = tmp_root / "bin"
+    resources_root = executable_root / "resources"
+    resources_up = resources_root / "_up_"
     python_dir = resources_root / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
+    resources_up.mkdir(parents=True, exist_ok=True)
 
     for filename in (
         "compute_node_bridge.py",
@@ -63,11 +66,24 @@ def create_packaged_layout(tmp_root: Path) -> Path:
             python_dir / filename,
         )
 
-    shutil.copy2(REPO_ROOT / "config.py", resources_root / "config.py")
-    shutil.copy2(REPO_ROOT / "encrypt.py", resources_root / "encrypt.py")
-    shutil.copytree(REPO_ROOT / "utils", resources_root / "utils", dirs_exist_ok=True)
+    shutil.copy2(REPO_ROOT / "config.py", resources_up / "config.py")
+    shutil.copy2(REPO_ROOT / "encrypt.py", resources_up / "encrypt.py")
+    shutil.copytree(REPO_ROOT / "utils", resources_up / "utils", dirs_exist_ok=True)
 
-    return python_dir / "compute_node_bridge.py"
+    executable_python_dir = executable_root / "python"
+    executable_python_dir.mkdir(parents=True, exist_ok=True)
+    for filename in (
+        "compute_node_bridge.py",
+        "inference_sidecar.py",
+        "model_bridge.py",
+        "path_bootstrap.py",
+    ):
+        shutil.copy2(
+            REPO_ROOT / "desktop-tauri" / "src-tauri" / "python" / filename,
+            executable_python_dir / filename,
+        )
+
+    return executable_python_dir / "compute_node_bridge.py"
 
 
 def main() -> int:

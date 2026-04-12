@@ -6,22 +6,32 @@ import sys
 from pathlib import Path
 
 
+def _candidate_roots(resources_root: Path, script_path: Path) -> list[Path]:
+    candidates: list[Path] = [
+        resources_root,
+        script_path.parent.parent.parent,
+    ]
+
+    # Tauri rewrites ".." path traversals in bundle resources as nested _up_ folders.
+    up_cursor = resources_root
+    for _ in range(4):
+        up_cursor = up_cursor / "_up_"
+        candidates.append(up_cursor)
+
+    if len(script_path.parents) > 3:
+        candidates.append(script_path.parents[3])
+
+    return candidates
+
+
 def ensure_runtime_import_paths(script_file: str) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
     script_path = Path(script_file).resolve()
     resources_root = script_path.parent.parent
-    candidates = [
-        resources_root,  # bundled resources root in packaged apps
-        resources_root / "_up_",  # tauri ".." resources are rewritten under _up_
-        script_path.parent.parent.parent,
-    ]
-
-    if len(script_path.parents) > 3:
-        candidates.append(script_path.parents[3])  # repo root in development tree
 
     valid_candidates: list[str] = []
-    for candidate in candidates:
+    for candidate in _candidate_roots(resources_root, script_path):
         if not candidate.exists():
             continue
         has_runtime_modules = (candidate / "utils").is_dir() or (candidate / "config.py").is_file()

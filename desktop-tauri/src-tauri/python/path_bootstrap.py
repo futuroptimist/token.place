@@ -11,11 +11,14 @@ def ensure_runtime_import_paths(script_file: str) -> None:
 
     script_path = Path(script_file).resolve()
     resources_root = script_path.parent.parent
-    candidates = [
-        resources_root,  # bundled resources root in packaged apps
-        resources_root / "_up_",  # tauri ".." resources are rewritten under _up_
-        script_path.parent.parent.parent,
-    ]
+    candidates = [resources_root, script_path.parent.parent.parent]
+
+    # In packaged apps Tauri rewrites ".." path segments in bundled resources as
+    # nested "_up_" directories (e.g. ../../utils -> _up_/_up_/utils).
+    up_cursor = resources_root
+    for _ in range(3):
+        up_cursor = up_cursor / "_up_"
+        candidates.append(up_cursor)
 
     if len(script_path.parents) > 3:
         candidates.append(script_path.parents[3])  # repo root in development tree

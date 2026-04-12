@@ -264,7 +264,9 @@ def main() -> int:
 
     tauri_driver = subprocess.Popen(  # noqa: S603
         tauri_driver_command(),
-        cwd=DESKTOP_ROOT,
+        # Keep cwd aligned with src-tauri so runtime asset resolution for ../dist works
+        # when the app starts under tauri-driver in CI.
+        cwd=TAURI_ROOT,
         env=env,
         stdout=driver_log.open("w", encoding="utf-8"),
         stderr=subprocess.STDOUT,

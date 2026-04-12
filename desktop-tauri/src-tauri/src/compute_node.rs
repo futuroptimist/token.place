@@ -69,13 +69,13 @@ fn bridge_script_candidates(
 
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
                     .join("python")
                     .join("compute_node_bridge.py"),
             );
+            candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
             if let Some(parent_dir) = exe_dir.parent() {
                 candidates.push(
                     parent_dir
@@ -520,5 +520,26 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), bridge);
+    }
+
+    #[test]
+    fn first_existing_script_prefers_resources_over_exe_python_bridge_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let exe_python_dir = exe_dir.join("python");
+        let resources_dir = exe_dir.join("resources").join("python");
+        std::fs::create_dir_all(&exe_python_dir).expect("create exe python dir");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+
+        let exe_bridge = exe_python_dir.join("compute_node_bridge.py");
+        std::fs::write(&exe_bridge, "print('exe')\n").expect("write exe bridge");
+        let resources_bridge = resources_dir.join("compute_node_bridge.py");
+        std::fs::write(&resources_bridge, "print('resources')\n").expect("write resources bridge");
+
+        let exe_path = exe_dir.join("token.place");
+        let candidates = bridge_script_candidates(Some(&exe_path), temp.path());
+        let resolved = first_existing_script(candidates).expect("resolved bridge path");
+
+        assert_eq!(Path::new(&resolved), resources_bridge);
     }
 }

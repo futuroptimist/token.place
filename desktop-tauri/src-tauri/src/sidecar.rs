@@ -50,6 +50,7 @@ pub fn parse_event_line(line: &str) -> Result<SidecarEvent, serde_json::Error> {
     serde_json::from_str::<SidecarEvent>(line)
 }
 
+#[cfg(test)]
 pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
 ) -> anyhow::Result<Vec<SidecarEvent>> {
@@ -103,13 +104,13 @@ fn default_sidecar_script_candidates(
 
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
                     .join("python")
                     .join("inference_sidecar.py"),
             );
+            candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
@@ -507,5 +508,27 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved sidecar path");
 
         assert_eq!(Path::new(&resolved), sidecar);
+    }
+
+    #[test]
+    fn first_existing_script_prefers_resources_over_exe_python_sidecar_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let exe_python_dir = exe_dir.join("python");
+        let resources_dir = exe_dir.join("resources").join("python");
+        std::fs::create_dir_all(&exe_python_dir).expect("create exe python dir");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+
+        let exe_sidecar = exe_python_dir.join("inference_sidecar.py");
+        std::fs::write(&exe_sidecar, "print('exe')\n").expect("write exe sidecar");
+        let resources_sidecar = resources_dir.join("inference_sidecar.py");
+        std::fs::write(&resources_sidecar, "print('resources')\n")
+            .expect("write resources sidecar");
+
+        let exe_path = exe_dir.join("token.place");
+        let candidates = default_sidecar_script_candidates(Some(&exe_path), temp.path());
+        let resolved = first_existing_script(candidates).expect("resolved sidecar path");
+
+        assert_eq!(Path::new(&resolved), resources_sidecar);
     }
 }

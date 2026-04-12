@@ -99,6 +99,26 @@ class StreamingRuntime(FakeRuntime):
         return self.relay_client.process_client_request(payload)
 
 
+class ProcessingFailureRuntime(FakeRuntime):
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClient()
+        self._responses = [
+            {
+                'next_ping_in_x_seconds': 0,
+                'client_public_key': 'abc',
+                'chat_history': 'ciphertext',
+                'cipherkey': 'key',
+                'iv': 'iv',
+            },
+        ]
+        self._processed = []
+
+    def process_relay_request(self, payload):
+        self._processed.append(payload)
+        return False
+
+
 class IncompatibleRelayRuntime(FakeRuntime):
     def __init__(self, _config):
         self.model_manager = FakeModelManager()
@@ -259,6 +279,33 @@ def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch
     assert actionable_errors
     assert actionable_errors[0]['registered'] is False
     assert 'update relay.py to repo HEAD' in actionable_errors[0]['last_error']
+
+
+def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ProcessingFailureRuntime)
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert status_events[0]['registered'] is True
+    assert status_events[0]['last_error'] == 'failed to process relay request'
 
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():

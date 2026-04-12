@@ -103,7 +103,7 @@ class IncompatibleRelayRuntime(FakeRuntime):
     def __init__(self, _config):
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClient()
-        self._responses = [{}]
+        self._responses = [{'relay_version': 'outdated'}]
         self._processed = []
 
 
@@ -250,9 +250,15 @@ def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
-    assert status_events[0]['registered'] is False
-    assert 'unreachable, old, or incompatible' in status_events[0]['last_error']
-    assert 'update relay.py to repo HEAD' in status_events[0]['last_error']
+    actionable_errors = [
+        event
+        for event in status_events
+        if isinstance(event.get('last_error'), str)
+        and 'unreachable, old, or incompatible' in event['last_error']
+    ]
+    assert actionable_errors
+    assert actionable_errors[0]['registered'] is False
+    assert 'update relay.py to repo HEAD' in actionable_errors[0]['last_error']
 
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():

@@ -185,6 +185,43 @@ fn should_force_fake_sidecar() -> bool {
     )
 }
 
+fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
+    let mut candidates = vec![manifest_dir.to_path_buf()];
+    if let Some(parent) = manifest_dir.parent() {
+        candidates.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.to_path_buf());
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn configure_runtime_pythonpath(command: &mut Command) {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+        match std::env::var("PYTHONPATH") {
+            Ok(existing) if !existing.trim().is_empty() => {
+                if let Ok(joined) =
+                    std::env::join_paths([Path::new(&import_root), Path::new(&existing)])
+                {
+                    command.env("PYTHONPATH", joined);
+                } else {
+                    command.env("PYTHONPATH", import_root);
+                }
+            }
+            _ => {
+                command.env("PYTHONPATH", import_root);
+            }
+        }
+    }
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -221,6 +258,7 @@ pub async fn start_sidecar(
     };
 
     let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
+    configure_runtime_pythonpath(&mut sidecar_command);
 
     let mut child = sidecar_command
         .arg("--model")

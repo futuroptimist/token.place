@@ -14,7 +14,13 @@ from pathlib import Path
 from urllib.request import urlopen
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    NoSuchFrameException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -108,11 +114,26 @@ def diagnostics_message(
 
 
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
-    label = driver.find_element(By.XPATH, f"//label[normalize-space()='{label_text}']")
-    input_el = label.find_element(By.XPATH, "(following::input | following::textarea)[1]")
-    input_el.send_keys(Keys.CONTROL, "a")
-    input_el.send_keys(Keys.DELETE)
-    input_el.send_keys(value)
+    locator = f"//label[normalize-space()='{label_text}']"
+
+    def _set_value(_: webdriver.Remote) -> bool:
+        try:
+            label = driver.find_element(By.XPATH, locator)
+            input_el = label.find_element(By.XPATH, "(following::input | following::textarea)[1]")
+            input_el.send_keys(Keys.CONTROL, "a")
+            input_el.send_keys(Keys.DELETE)
+            input_el.send_keys(value)
+            return True
+        except (
+            NoSuchElementException,
+            NoSuchFrameException,
+            StaleElementReferenceException,
+            WebDriverException,
+        ):
+            return False
+
+    if not WebDriverWait(driver, 45, poll_frequency=0.25).until(_set_value):
+        raise RuntimeError(f"failed to set input for label: {label_text}")
 
 
 def terminate_process(process: subprocess.Popen[str]) -> None:

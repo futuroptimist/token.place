@@ -72,9 +72,9 @@ jobs:
         working-directory: desktop-tauri
         run: npm run build
 
-      - name: Build desktop binary
+      - name: Build desktop binary (Tauri pipeline)
         working-directory: desktop-tauri
-        run: cargo build --manifest-path src-tauri/Cargo.toml
+        run: npm run tauri build -- --debug
 
       - name: Set up Python
         uses: actions/setup-python@v5

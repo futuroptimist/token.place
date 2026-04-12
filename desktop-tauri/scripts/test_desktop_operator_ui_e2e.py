@@ -141,14 +141,30 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
 
 def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
+    attempted_recover = False
+
     def _ready(d: webdriver.Remote) -> bool:
+        nonlocal attempted_recover
         try:
             with contextlib.suppress(WebDriverException):
                 d.switch_to.default_content()
             state = d.execute_script("return document.readyState")
             if state != "complete":
                 return False
-            return bool(d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']"))
+            if d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']"):
+                return True
+
+            page_source = ""
+            with contextlib.suppress(WebDriverException):
+                page_source = d.page_source
+            if (
+                not attempted_recover
+                and "could not connect to localhost" in page_source.lower()
+            ):
+                attempted_recover = True
+                with contextlib.suppress(WebDriverException):
+                    d.get("tauri://localhost")
+            return False
         except (
             NoSuchFrameException,
             StaleElementReferenceException,

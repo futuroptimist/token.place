@@ -56,13 +56,13 @@ fn model_bridge_script_candidates(exe_path: Option<&Path>, manifest_dir: &Path) 
 
     if let Some(current_exe) = exe_path {
         if let Some(exe_dir) = current_exe.parent() {
-            candidates.push(exe_dir.join("python").join("model_bridge.py"));
             candidates.push(
                 exe_dir
                     .join("resources")
                     .join("python")
                     .join("model_bridge.py"),
             );
+            candidates.push(exe_dir.join("python").join("model_bridge.py"));
             candidates.push(
                 exe_dir
                     .join("..")
@@ -372,6 +372,30 @@ mod tests {
             .expect("resolved bridge path");
 
         assert_eq!(resolved, bridge);
+    }
+
+    #[test]
+    fn model_bridge_candidates_prefer_resources_over_exe_python_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let exe_python_dir = exe_dir.join("python");
+        let resources_dir = exe_dir.join("resources").join("python");
+        std::fs::create_dir_all(&exe_python_dir).expect("create exe python dir");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+
+        let exe_bridge = exe_python_dir.join("model_bridge.py");
+        std::fs::write(&exe_bridge, "print('exe')\n").expect("write exe bridge");
+        let resources_bridge = resources_dir.join("model_bridge.py");
+        std::fs::write(&resources_bridge, "print('resources')\n").expect("write resources bridge");
+
+        let exe_path = exe_dir.join("token.place");
+        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path());
+        let resolved = candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .expect("resolved bridge path");
+
+        assert_eq!(resolved, resources_bridge);
     }
 
     #[test]

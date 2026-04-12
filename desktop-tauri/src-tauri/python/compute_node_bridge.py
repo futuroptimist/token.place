@@ -129,7 +129,8 @@ def run(args: argparse.Namespace) -> int:
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
-            registered = "error" not in relay_response and legacy_payload
+            heartbeat_ack = "next_ping_in_x_seconds" in relay_response
+            registered = "error" not in relay_response and (legacy_payload or heartbeat_ack)
 
             if not registered:
                 if "error" in relay_response:
@@ -139,12 +140,14 @@ def run(args: argparse.Namespace) -> int:
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
-            else:
+            elif legacy_payload:
                 processed = runtime.process_relay_request(relay_response)
                 if not processed:
                     last_error = "failed to process relay request"
                 else:
                     last_error = None
+            else:
+                last_error = None
 
             emit(
                 {

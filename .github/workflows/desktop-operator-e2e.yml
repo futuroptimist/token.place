@@ -93,3 +93,11 @@ jobs:
 
       - name: Run packaged operator bridge e2e
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
+      - name: Upload desktop e2e logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-operator-e2e-logs
+          path: .desktop-e2e-logs/
+          if-no-files-found: warn

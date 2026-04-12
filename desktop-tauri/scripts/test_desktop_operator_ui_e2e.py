@@ -69,6 +69,24 @@ def read_tail(path: Path) -> str:
     return text[-4000:]
 
 
+def diagnostics_message(
+    message: str,
+    relay_log: Path,
+    driver_log: Path,
+    driver: webdriver.Remote | None = None,
+) -> str:
+    page_source_tail = ""
+    if driver is not None:
+        with contextlib.suppress(Exception):
+            page_source_tail = driver.page_source[-4000:]
+    return (
+        f"{message}; "
+        f"relay_log_tail={read_tail(relay_log)}; "
+        f"tauri_driver_log_tail={read_tail(driver_log)}; "
+        f"page_source_tail={page_source_tail}"
+    )
+
+
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
     label = driver.find_element(By.XPATH, f"//label[normalize-space()='{label_text}']")
     input_el = label.find_element(By.XPATH, "(following::input | following::textarea)[1]")
@@ -188,16 +206,26 @@ def main() -> int:
         )
         driver.find_element(By.XPATH, "//button[.='Start local inference']").click()
 
-        wait.until(
-            lambda d: d.find_element(By.XPATH, "//pre").text.strip() != ""
-            and "Last error: bridge failure" not in d.page_source
-            and "No module named 'utils'" not in d.page_source
+        wait.until(lambda d: d.find_element(By.XPATH, "//pre").text.strip() != "")
+        output_text = driver.find_element(By.XPATH, "//pre").text.strip()
+        assert output_text, "inference output is empty"
+
+        last_error_text = driver.find_element(By.XPATH, "//p[contains(.,'Last error:')]").text
+        lowered_last_error = last_error_text.lower()
+        assert "bridge failure" not in lowered_last_error, (
+            f"Last error still indicates bridge failure: {last_error_text}"
+        )
+        assert "no module named" not in lowered_last_error, (
+            f"Last error still indicates import failure: {last_error_text}"
+        )
+        assert "importerror" not in lowered_last_error, (
+            f"Last error still indicates import failure: {last_error_text}"
         )
     except TimeoutException as exc:
+        raise RuntimeError(diagnostics_message("desktop UI e2e timed out", relay_log, driver_log, driver)) from exc
+    except AssertionError as exc:
         raise RuntimeError(
-            "desktop UI e2e timed out; "
-            f"relay_log_tail={read_tail(relay_log)}; "
-            f"tauri_driver_log_tail={read_tail(driver_log)}"
+            diagnostics_message(f"desktop UI e2e assertion failed: {exc}", relay_log, driver_log, driver)
         ) from exc
     finally:
         if driver is not None:

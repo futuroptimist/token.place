@@ -10,10 +10,12 @@ def ensure_runtime_import_paths(script_file: str) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
     script_path = Path(script_file).resolve()
-    resources_root = script_path.parent.parent
+    script_root = script_path.parent.parent
     candidates = [
-        resources_root,  # bundled resources root in packaged apps
-        resources_root / "_up_",  # tauri ".." resources are rewritten under _up_
+        script_root,  # bundled resources root in packaged apps
+        script_root / "resources",  # no-bundle/debug layout when script is under <exe>/python
+        script_root / "Resources",  # macOS-style resources casing
+        script_root / "_up_",  # tauri ".." resources are rewritten under _up_
         script_path.parent.parent.parent,
     ]
 

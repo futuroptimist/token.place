@@ -95,10 +95,13 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_default_sidecar_script() -> String {
+fn default_sidecar_script_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
@@ -145,17 +148,20 @@ fn resolve_default_sidecar_script() -> String {
         }
     }
 
+    candidates.push(manifest_dir.join("python").join("inference_sidecar.py"));
     candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("python")
-            .join("inference_sidecar.py"),
-    );
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        manifest_dir
             .join("..")
             .join("sidecar")
             .join("fake_llama_sidecar.py"),
     );
+    candidates
+}
+
+fn resolve_default_sidecar_script() -> String {
+    let exe_path = std::env::current_exe().ok();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidates = default_sidecar_script_candidates(exe_path.as_deref(), manifest_dir);
 
     for candidate in candidates {
         if candidate.is_file() {
@@ -455,6 +461,25 @@ mod tests {
                 SidecarEvent::Token { text: "ok".into() },
                 SidecarEvent::Done
             ]
+        );
+    }
+
+    #[test]
+    fn sidecar_candidates_include_packaged_resource_locations() {
+        let exe_path =
+            Path::new("C:\\Users\\danie\\AppData\\Local\\token.place desktop\\token.place.exe");
+        let manifest_dir = Path::new("C:\\repo\\desktop-tauri\\src-tauri");
+        let candidates = default_sidecar_script_candidates(Some(exe_path), manifest_dir);
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("resources/python/inference_sidecar.py")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("Resources/python/inference_sidecar.py")));
+        assert_eq!(
+            candidates[candidates.len() - 2],
+            manifest_dir.join("python").join("inference_sidecar.py")
         );
     }
 }

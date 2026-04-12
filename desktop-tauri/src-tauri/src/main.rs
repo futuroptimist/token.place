@@ -43,13 +43,29 @@ struct BridgeResponse {
 }
 
 fn find_existing_bridge_script_path() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    let candidates = model_bridge_script_candidates(
+        current_exe.as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    );
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn model_bridge_script_candidates(exe_path: Option<&Path>, manifest_dir: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(current_exe) = std::env::current_exe() {
+    if let Some(current_exe) = exe_path {
         if let Some(exe_dir) = current_exe.parent() {
             candidates.push(exe_dir.join("python").join("model_bridge.py"));
             candidates.push(
                 exe_dir
+                    .join("resources")
+                    .join("python")
+                    .join("model_bridge.py"),
+            );
+            candidates.push(
+                exe_dir
+                    .join("..")
                     .join("resources")
                     .join("python")
                     .join("model_bridge.py"),
@@ -64,13 +80,8 @@ fn find_existing_bridge_script_path() -> Option<PathBuf> {
         }
     }
 
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("python")
-            .join("model_bridge.py"),
-    );
-
-    candidates.into_iter().find(|path| path.is_file())
+    candidates.push(manifest_dir.join("python").join("model_bridge.py"));
+    candidates
 }
 
 fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
@@ -312,4 +323,52 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_bridge_candidates_include_packaged_resources() {
+        let exe_path =
+            Path::new("C:\\Users\\danie\\AppData\\Local\\token.place desktop\\token.place.exe");
+        let manifest_dir = Path::new("C:\\repo\\desktop-tauri\\src-tauri");
+        let candidates = model_bridge_script_candidates(Some(exe_path), manifest_dir);
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("resources/python/model_bridge.py")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("Resources/python/model_bridge.py")));
+        assert_eq!(
+            candidates.last().expect("manifest candidate"),
+            &manifest_dir.join("python").join("model_bridge.py")
+        );
+    }
+
+    #[test]
+    fn tauri_bundle_resources_include_python_bridge_scripts() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("parse tauri config");
+        let resources = config
+            .get("bundle")
+            .and_then(|bundle| bundle.get("resources"))
+            .and_then(serde_json::Value::as_array)
+            .expect("bundle.resources array");
+
+        let required = [
+            "python/compute_node_bridge.py",
+            "python/inference_sidecar.py",
+            "python/model_bridge.py",
+        ];
+
+        for script in required {
+            assert!(
+                resources.iter().any(|entry| entry.as_str() == Some(script)),
+                "missing bundled python resource: {script}"
+            );
+        }
+    }
 }

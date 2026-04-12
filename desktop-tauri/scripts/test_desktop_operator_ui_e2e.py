@@ -244,6 +244,10 @@ def main() -> int:
 
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)
+    )
 
     relay = subprocess.Popen(  # noqa: S603
         [

@@ -1,10 +1,16 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
 const eventHandlers = new Map<string, (evt: { payload: Record<string, unknown> }) => void>();
+const testDir = path.dirname(fileURLToPath(import.meta.url));
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
@@ -181,7 +187,9 @@ describe('desktop app start failure handling', () => {
     );
   });
 
-  it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
+  it(
+    'marks local inference as failed on emitted error events after start invoke resolves',
+    async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))
       .parentElement?.querySelector('textarea');
@@ -225,5 +233,137 @@ describe('desktop app start failure handling', () => {
       expect(screen.getByText('Status:').textContent).toContain('failed')
     );
     expect(screen.getByText(/Error:/).textContent).toContain('event failure path');
-  });
+    },
+  );
+
+  it(
+    'starts operator end-to-end against a local relay using packaged bridge layout',
+    async () => {
+      if (process.env.RUN_DESKTOP_OPERATOR_E2E !== '1') {
+        return;
+      }
+
+      const pythonCommand = process.env.PYTHON ?? process.env.PYTHON3 ?? 'python3';
+      const relayPort = 19567;
+      const relayUrl = `http://127.0.0.1:${relayPort}`;
+      const relayProcess = spawn(
+        pythonCommand,
+        [path.resolve(testDir, '../../relay.py'), '--port', String(relayPort), '--use_mock_llm'],
+        { env: { ...process.env, TOKEN_PLACE_ENV: 'testing', USE_MOCK_LLM: '1' } },
+      );
+
+      const waitForRelay = async () => {
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < 20_000) {
+          try {
+            const response = await fetch(`${relayUrl}/`);
+            if (response.ok) {
+              return;
+            }
+          } catch {
+            // Relay is still booting.
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        throw new Error('relay failed to start in test timeout');
+      };
+
+      let bridgeProcess: ChildProcessWithoutNullStreams | null = null;
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'token-place-packaged-'));
+      const resourcesRoot = path.join(tempRoot, 'resources');
+      const bridgePath = path.join(resourcesRoot, 'python', 'compute_node_bridge.py');
+
+      await fs.mkdir(path.dirname(bridgePath), { recursive: true });
+      await fs.cp(path.resolve(testDir, '../src-tauri/python/compute_node_bridge.py'), bridgePath);
+      await fs.cp(path.resolve(testDir, '../../utils'), path.join(resourcesRoot, 'utils'), {
+        recursive: true,
+      });
+      await fs.copyFile(
+        path.resolve(testDir, '../../config.py'),
+        path.join(resourcesRoot, 'config.py'),
+      );
+
+      const stopBridge = async () => {
+        if (!bridgeProcess) {
+          return;
+        }
+        bridgeProcess.stdin.write('{"type":"cancel"}\n');
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        bridgeProcess.kill('SIGTERM');
+      };
+
+      try {
+        await waitForRelay();
+        const defaultInvoke = invokeMock.getMockImplementation();
+
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+          if (command === 'start_compute_node') {
+            const request = (args?.request as Record<string, string>) ?? {};
+            const handler = eventHandlers.get('compute_node_event');
+            bridgeProcess = spawn(
+              pythonCommand,
+              [
+                bridgePath,
+                '--model',
+                request.model_path,
+                '--mode',
+                request.mode,
+                '--relay-url',
+                request.relay_base_url,
+              ],
+              {
+                cwd: resourcesRoot,
+                env: {
+                  ...process.env,
+                  TOKEN_PLACE_ENV: 'testing',
+                  USE_MOCK_LLM: '1',
+                },
+              },
+            );
+            bridgeProcess.stdout.on('data', (chunk) => {
+              const lines = String(chunk)
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean);
+              for (const line of lines) {
+                try {
+                  handler?.({ payload: JSON.parse(line) });
+                } catch {
+                  // Ignore malformed NDJSON test output.
+                }
+              }
+            });
+            return Promise.resolve(undefined);
+          }
+          if (command === 'stop_compute_node') {
+            return stopBridge();
+          }
+          return defaultInvoke
+            ? (defaultInvoke(command, args) as Promise<unknown>)
+            : Promise.resolve(undefined);
+        });
+
+        render(<App />);
+        const relayInput = (await screen.findByText('Relay URL'))
+          .parentElement?.querySelector('input') as HTMLInputElement;
+        fireEvent.change(relayInput, { target: { value: relayUrl } });
+
+        const startOperatorButton =
+          (await screen.findByText('Start operator')) as HTMLButtonElement;
+        await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+        fireEvent.click(startOperatorButton);
+
+        await waitFor(
+          () => expect(screen.getByText(/Registered:/).textContent).toContain('yes'),
+          { timeout: 25_000 },
+        );
+        expect(screen.getByText(/Last error:/).textContent).not.toContain('No module named');
+      } finally {
+        await stopBridge();
+        relayProcess.kill('SIGTERM');
+        await fs.rm(tempRoot, { recursive: true, force: true });
+      }
+    },
+    40_000,
+  );
 });

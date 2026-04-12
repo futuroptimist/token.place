@@ -9,6 +9,8 @@ on:
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'utils/**'
       - 'config.py'
+      - 'relay.py'
+      - 'requirements.txt'
   push:
     branches: [ main, master ]
     paths:
@@ -18,10 +20,13 @@ on:
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'utils/**'
       - 'config.py'
+      - 'relay.py'
+      - 'requirements.txt'
 
 jobs:
   packaged-operator-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

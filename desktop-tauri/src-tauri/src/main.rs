@@ -393,6 +393,7 @@ mod tests {
             "../../config.py",
         ];
 
+        // Intentional strict count: this guards against accidental bundle bloat.
         assert_eq!(
             resources.len(),
             required.len(),

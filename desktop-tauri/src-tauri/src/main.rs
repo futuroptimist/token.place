@@ -356,6 +356,25 @@ mod tests {
     }
 
     #[test]
+    fn model_bridge_candidates_select_packaged_resource_path_when_present() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let resources_dir = exe_dir.join("resources").join("python");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+        let bridge = resources_dir.join("model_bridge.py");
+        std::fs::write(&bridge, "print('ok')\n").expect("write model bridge");
+
+        let exe_path = exe_dir.join("token.place.exe");
+        let candidates = model_bridge_script_candidates(Some(&exe_path), temp.path());
+        let resolved = candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .expect("resolved bridge path");
+
+        assert_eq!(resolved, bridge);
+    }
+
+    #[test]
     fn tauri_bundle_resources_include_python_bridge_scripts() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("parse tauri config");
@@ -370,6 +389,12 @@ mod tests {
             "python/inference_sidecar.py",
             "python/model_bridge.py",
         ];
+
+        assert_eq!(
+            resources.len(),
+            required.len(),
+            "bundle.resources should only include required python bridge scripts"
+        );
 
         for script in required {
             assert!(

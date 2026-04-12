@@ -492,4 +492,20 @@ mod tests {
             |candidate| candidate == &manifest_dir.join("python").join("inference_sidecar.py")
         ));
     }
+
+    #[test]
+    fn first_existing_script_finds_packaged_resource_sidecar_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let resources_dir = exe_dir.join("resources").join("python");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+        let sidecar = resources_dir.join("inference_sidecar.py");
+        std::fs::write(&sidecar, "print('ok')\n").expect("write sidecar");
+
+        let exe_path = exe_dir.join("token.place.exe");
+        let candidates = default_sidecar_script_candidates(Some(&exe_path), temp.path());
+        let resolved = first_existing_script(candidates).expect("resolved sidecar path");
+
+        assert_eq!(Path::new(&resolved), sidecar);
+    }
 }

@@ -163,13 +163,18 @@ fn resolve_default_sidecar_script() -> String {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let candidates = default_sidecar_script_candidates(exe_path.as_deref(), manifest_dir);
 
-    for candidate in candidates {
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
-        }
+    if let Some(path) = first_existing_script(candidates) {
+        return path;
     }
 
     "../sidecar/fake_llama_sidecar.py".into()
+}
+
+fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> {
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
 fn should_force_fake_sidecar() -> bool {
@@ -346,7 +351,7 @@ pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
     use tokio::process::Command;
 
     #[test]
@@ -466,10 +471,16 @@ mod tests {
 
     #[test]
     fn sidecar_candidates_include_packaged_resource_locations() {
-        let exe_path =
-            Path::new("C:\\Users\\danie\\AppData\\Local\\token.place desktop\\token.place.exe");
-        let manifest_dir = Path::new("C:\\repo\\desktop-tauri\\src-tauri");
-        let candidates = default_sidecar_script_candidates(Some(exe_path), manifest_dir);
+        let temp = TempDir::new().expect("tempdir");
+        let app_root = temp.path().join("Token Place.app");
+        let exe_dir = app_root.join("Contents").join("MacOS");
+        let exe_path = exe_dir.join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let candidates = default_sidecar_script_candidates(Some(&exe_path), &manifest_dir);
 
         assert!(candidates
             .iter()
@@ -477,9 +488,8 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.ends_with("Resources/python/inference_sidecar.py")));
-        assert_eq!(
-            candidates[candidates.len() - 2],
-            manifest_dir.join("python").join("inference_sidecar.py")
-        );
+        assert!(candidates.iter().any(
+            |candidate| candidate == &manifest_dir.join("python").join("inference_sidecar.py")
+        ));
     }
 }

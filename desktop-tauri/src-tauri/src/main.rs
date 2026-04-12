@@ -328,13 +328,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn model_bridge_candidates_include_packaged_resources() {
-        let exe_path =
-            Path::new("C:\\Users\\danie\\AppData\\Local\\token.place desktop\\token.place.exe");
-        let manifest_dir = Path::new("C:\\repo\\desktop-tauri\\src-tauri");
-        let candidates = model_bridge_script_candidates(Some(exe_path), manifest_dir);
+        let temp = TempDir::new().expect("tempdir");
+        let app_root = temp.path().join("Token Place.app");
+        let exe_dir = app_root.join("Contents").join("MacOS");
+        let exe_path = exe_dir.join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let candidates = model_bridge_script_candidates(Some(&exe_path), &manifest_dir);
 
         assert!(candidates
             .iter()

@@ -12,9 +12,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from path_bootstrap import bootstrap_repo_imports
+
+bootstrap_repo_imports(Path(__file__))
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

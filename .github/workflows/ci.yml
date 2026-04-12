@@ -50,6 +50,14 @@ jobs:
       - name: Install Node.js dependencies
         if: steps.prep.outputs.rc != '2'
         run: npm ci
+      - name: Desktop operator bridge e2e (local relay)
+        if: steps.prep.outputs.rc != '2'
+        run: |
+          set -euo pipefail
+          python relay.py --host 127.0.0.1 --port 8765 --use_mock_llm > /tmp/relay.log 2>&1 &
+          relay_pid=$!
+          trap 'kill ${relay_pid} || true' EXIT
+          python scripts/desktop_operator_e2e.py --relay-url http://127.0.0.1:8765
       - name: Run tests
         if: steps.prep.outputs.rc != '2'
         run: ./run_all_tests.sh

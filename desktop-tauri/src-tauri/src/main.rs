@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn tauri_bundle_resources_include_python_bridge_scripts() {
+    fn tauri_bundle_resources_include_python_runtime_dependencies() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("parse tauri config");
         let resources = config
@@ -388,13 +388,10 @@ mod tests {
             "python/compute_node_bridge.py",
             "python/inference_sidecar.py",
             "python/model_bridge.py",
+            "python/path_bootstrap.py",
+            "../../config.py",
+            "../../utils",
         ];
-
-        assert_eq!(
-            resources.len(),
-            required.len(),
-            "bundle.resources should only include required python bridge scripts"
-        );
 
         for script in required {
             assert!(

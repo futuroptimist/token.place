@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::{env, ffi::OsString, path::Path};
 
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
@@ -18,6 +19,7 @@ impl PythonLauncher {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
         cmd.arg(script_path);
+        apply_pythonpath_env(script_path, &mut cmd);
         cmd
     }
 
@@ -25,7 +27,60 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         cmd.arg(script_path);
+        apply_pythonpath_env(script_path, &mut cmd);
         cmd
+    }
+}
+
+fn apply_pythonpath_env<T>(script_path: &str, cmd: &mut T)
+where
+    T: PythonPathCommand,
+{
+    if let Some(pythonpath) = resolved_pythonpath(script_path, env::var_os("PYTHONPATH")) {
+        cmd.set_pythonpath(pythonpath);
+    }
+}
+
+fn resolved_pythonpath(script_path: &str, existing: Option<OsString>) -> Option<OsString> {
+    let import_root = detect_python_import_root(script_path)?;
+    let mut entries = vec![import_root];
+    if let Some(existing) = existing {
+        entries.extend(env::split_paths(&existing));
+    }
+    env::join_paths(entries).ok()
+}
+
+fn detect_python_import_root(script_path: &str) -> Option<std::path::PathBuf> {
+    let script = Path::new(script_path);
+    let mut candidates = Vec::new();
+
+    if let Some(parent) = script.parent() {
+        candidates.push(parent.to_path_buf());
+        if let Some(parent_of_parent) = parent.parent() {
+            candidates.push(parent_of_parent.to_path_buf());
+        }
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(manifest_dir.join("..").join(".."));
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() && candidate.join("config.py").is_file())
+}
+
+trait PythonPathCommand {
+    fn set_pythonpath(&mut self, value: OsString);
+}
+
+impl PythonPathCommand for Command {
+    fn set_pythonpath(&mut self, value: OsString) {
+        self.env("PYTHONPATH", value);
+    }
+}
+
+impl PythonPathCommand for tokio::process::Command {
+    fn set_pythonpath(&mut self, value: OsString) {
+        self.env("PYTHONPATH", value);
     }
 }
 
@@ -147,11 +202,13 @@ pub fn resolve_python_launcher(var_name: &str) -> anyhow::Result<PythonLauncher>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf};
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -307,5 +364,42 @@ mod tests {
         assert!(msg.contains("python  -> status="));
         assert!(msg.contains("Python 2.7.18"));
         assert!(msg.contains("python3  -> spawn failed"));
+    }
+
+    #[test]
+    fn detects_packaged_python_import_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let resources = temp.path().join("resources");
+        fs::create_dir_all(resources.join("python")).expect("create python");
+        fs::create_dir_all(resources.join("utils")).expect("create utils");
+        fs::write(resources.join("config.py"), "# test").expect("write config");
+        let script_path = resources
+            .join("python")
+            .join("compute_node_bridge.py")
+            .to_string_lossy()
+            .to_string();
+
+        let detected = detect_python_import_root(&script_path).expect("detect import root");
+        assert_eq!(detected, resources);
+    }
+
+    #[test]
+    fn resolved_pythonpath_prepends_detected_import_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let import_root = temp.path().join("bundle");
+        fs::create_dir_all(import_root.join("python")).expect("create python");
+        fs::create_dir_all(import_root.join("utils")).expect("create utils");
+        fs::write(import_root.join("config.py"), "# test").expect("write config");
+        let script_path = import_root
+            .join("python")
+            .join("model_bridge.py")
+            .to_string_lossy()
+            .to_string();
+
+        let existing = env::join_paths([PathBuf::from("/tmp/existing")]).expect("join existing");
+        let resolved = resolved_pythonpath(&script_path, Some(existing)).expect("resolve pythonpath");
+        let parts = env::split_paths(&resolved).collect::<Vec<_>>();
+        assert_eq!(parts.first(), Some(&import_root));
+        assert!(parts.iter().any(|entry| entry == &PathBuf::from("/tmp/existing")));
     }
 }

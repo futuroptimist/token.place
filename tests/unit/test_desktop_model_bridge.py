@@ -2,6 +2,10 @@
 
 import importlib.util
 import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -109,3 +113,58 @@ def test_main_dispatches_download_action():
             assert model_bridge.main() == 0
 
     download_model.assert_called_once_with()
+
+
+def test_packaged_layout_with_nested_up_resources_can_import_utils():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_root = Path(tmpdir)
+        resources_python = temp_root / 'resources' / 'python'
+        resources_python.mkdir(parents=True)
+
+        bridge_path = resources_python / 'model_bridge.py'
+        bridge_path.write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
+        bootstrap_path = resources_python / 'path_bootstrap.py'
+        bootstrap_path.write_text(
+            (
+                Path(__file__).resolve().parents[2]
+                / 'desktop-tauri'
+                / 'src-tauri'
+                / 'python'
+                / 'path_bootstrap.py'
+            ).read_text(encoding='utf-8'),
+            encoding='utf-8',
+        )
+
+        packaged_root = temp_root / 'resources' / '_up_' / '_up_'
+        utils_llm = packaged_root / 'utils' / 'llm'
+        utils_llm.mkdir(parents=True)
+        (packaged_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
+        (utils_llm / '__init__.py').write_text('', encoding='utf-8')
+        (utils_llm / 'model_manager.py').write_text(
+            """
+def get_model_manager():
+    class _Manager:
+        def get_model_artifact_metadata(self):
+            return {"resolved_model_path": "packaged/model.gguf", "exists": False}
+    return _Manager()
+""".strip()
+            + '\n',
+            encoding='utf-8',
+        )
+        (packaged_root / 'config.py').write_text('MODEL_PATH = "dummy"\n', encoding='utf-8')
+
+        env = os.environ.copy()
+        env.pop('PYTHONPATH', None)
+        result = subprocess.run(
+            [sys.executable, str(bridge_path), 'inspect'],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(temp_root),
+        )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload['ok'] is True
+    assert payload['payload']['resolved_model_path'] == 'packaged/model.gguf'

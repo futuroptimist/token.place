@@ -11,11 +11,13 @@ def ensure_runtime_import_paths(script_file: str) -> None:
 
     script_path = Path(script_file).resolve()
     resources_root = script_path.parent.parent
-    candidates = [
-        resources_root,  # bundled resources root in packaged apps
-        resources_root / "_up_",  # tauri ".." resources are rewritten under _up_
-        script_path.parent.parent.parent,
-    ]
+    tauri_up_roots = [resources_root]  # bundled resources root in packaged apps
+    current = resources_root
+    for _ in range(4):
+        current = current / "_up_"
+        tauri_up_roots.append(current)
+
+    candidates = [*tauri_up_roots, script_path.parent.parent.parent]
 
     if len(script_path.parents) > 3:
         candidates.append(script_path.parents[3])  # repo root in development tree

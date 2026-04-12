@@ -9,6 +9,7 @@ on:
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'utils/**'
       - 'config.py'
+      - 'encrypt.py'
       - 'relay.py'
       - 'requirements.txt'
   push:
@@ -20,6 +21,7 @@ on:
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'utils/**'
       - 'config.py'
+      - 'encrypt.py'
       - 'relay.py'
       - 'requirements.txt'
 

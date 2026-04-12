@@ -391,6 +391,7 @@ mod tests {
             "python/path_bootstrap.py",
             "../../utils",
             "../../config.py",
+            "../../encrypt.py",
         ];
 
         // Intentional strict count: this guards against accidental bundle bloat.

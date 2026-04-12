@@ -30,7 +30,8 @@
       "python/model_bridge.py",
       "python/path_bootstrap.py",
       "../../utils",
-      "../../config.py"
+      "../../config.py",
+      "../../encrypt.py"
     ],
     "icon": [
       "icons/32x32.png",

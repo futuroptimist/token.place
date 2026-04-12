@@ -64,6 +64,7 @@ def create_packaged_layout(tmp_root: Path) -> Path:
         )
 
     shutil.copy2(REPO_ROOT / "config.py", resources_root / "config.py")
+    shutil.copy2(REPO_ROOT / "encrypt.py", resources_root / "encrypt.py")
     shutil.copytree(REPO_ROOT / "utils", resources_root / "utils", dirs_exist_ok=True)
 
     return python_dir / "compute_node_bridge.py"

@@ -45,14 +45,33 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
     raise RuntimeError(f"timeout waiting for {url}: {last_error}")
 
 
-def wait_for_port(host: str, port: int, timeout_seconds: float = 30.0) -> None:
+def wait_for_port(
+    host: str,
+    port: int,
+    process: subprocess.Popen[str] | None = None,
+    process_label: str = "process",
+    process_log: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            log_tail = read_tail(process_log) if process_log is not None else ""
+            raise RuntimeError(
+                f"{process_label} exited before opening {host}:{port}; "
+                f"returncode={process.returncode}; log_tail={log_tail}"
+            )
         with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
             sock.settimeout(1)
             if sock.connect_ex((host, port)) == 0:
                 return
         time.sleep(0.25)
+    if process is not None and process.poll() is not None:
+        log_tail = read_tail(process_log) if process_log is not None else ""
+        raise RuntimeError(
+            f"timeout waiting for {host}:{port}; {process_label} already exited; "
+            f"returncode={process.returncode}; log_tail={log_tail}"
+        )
     raise RuntimeError(f"timeout waiting for {host}:{port}")
 
 
@@ -166,7 +185,14 @@ def main() -> int:
         wait_for_http_200(f"{relay_url}/livez")
         ensure_alive(relay, "relay")
 
-        wait_for_port("127.0.0.1", 4444)
+        wait_for_port(
+            "127.0.0.1",
+            4444,
+            process=tauri_driver,
+            process_label="tauri-driver",
+            process_log=driver_log,
+            timeout_seconds=90,
+        )
         ensure_alive(tauri_driver, "tauri-driver")
 
         suffix = ".exe" if sys.platform == "win32" else ""

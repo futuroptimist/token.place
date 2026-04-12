@@ -23,8 +23,9 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
+
+from utils.crypto_helpers import CryptoClient
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -131,11 +132,25 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
         try:
             with contextlib.suppress(WebDriverException):
                 driver.switch_to.default_content()
-            input_el = driver.find_element(By.XPATH, locator)
-            input_el.send_keys(Keys.CONTROL, "a")
-            input_el.send_keys(Keys.DELETE)
-            input_el.send_keys(value)
-            return True
+            element = driver.find_element(By.XPATH, locator)
+            driver.execute_script(
+                """
+                const el = arguments[0];
+                const nextValue = arguments[1];
+                el.focus();
+                const proto = el.tagName === 'TEXTAREA'
+                  ? HTMLTextAreaElement.prototype
+                  : HTMLInputElement.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                descriptor.set.call(el, nextValue);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                """,
+                element,
+                value,
+            )
+            return element.get_attribute("value") == value
         except (
             NoSuchElementException,
             NoSuchFrameException,
@@ -146,6 +161,8 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
     if not WebDriverWait(driver, 45, poll_frequency=0.25).until(_set_value):
         raise RuntimeError(f"failed to set input for label: {label_text}")
+    input_el = driver.find_element(By.XPATH, locator)
+    assert input_el.get_attribute("value") == value
 
 
 def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
@@ -161,7 +178,22 @@ def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -
             state = d.execute_script("return document.readyState")
             if state != "complete":
                 return False
-            if d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']"):
+            model_label_ready = bool(
+                d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']")
+            )
+            relay_input_ready = bool(
+                d.find_elements(
+                    By.XPATH,
+                    "(//label[normalize-space()='Relay URL']/following::input[1])[1]",
+                )
+            )
+            runtime_path_ready = bool(
+                d.find_elements(
+                    By.XPATH,
+                    "//div[contains(normalize-space(),'Runtime resolved path:')]/code",
+                )
+            )
+            if model_label_ready and relay_input_ready and runtime_path_ready:
                 return True
 
             page_source = ""
@@ -214,6 +246,115 @@ def wait_for_inference_result(driver: webdriver.Remote, timeout_seconds: float =
                 f"unexpected error marker `{marker}` seen; output={output_text}; last_error={last_error_text}"
             )
     return output_text
+
+
+def read_runtime_resolved_path(driver: webdriver.Remote) -> str | None:
+    with contextlib.suppress(NoSuchElementException, WebDriverException):
+        runtime_path = driver.find_element(
+            By.XPATH,
+            "//div[contains(normalize-space(),'Runtime resolved path:')]/code",
+        ).text.strip()
+        return runtime_path or None
+    return None
+
+
+def wait_for_start_operator_enabled(
+    driver: webdriver.Remote,
+    relay_log: Path,
+    driver_log: Path,
+    timeout_seconds: float = 45.0,
+) -> None:
+    button_xpath = "//button[.='Start operator']"
+    wait = WebDriverWait(driver, timeout_seconds, poll_frequency=0.25)
+    try:
+        wait.until(lambda d: d.find_element(By.XPATH, button_xpath).is_enabled())
+    except TimeoutException as exc:
+        model_value = ""
+        relay_value = ""
+        status_snippet = ""
+        with contextlib.suppress(Exception):
+            model_value = driver.find_element(
+                By.XPATH,
+                "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
+            ).get_attribute("value")
+        with contextlib.suppress(Exception):
+            relay_value = driver.find_element(
+                By.XPATH,
+                "(//label[normalize-space()='Relay URL']/following::input[1])[1]",
+            ).get_attribute("value")
+        with contextlib.suppress(Exception):
+            status_snippet = " | ".join(
+                p.text for p in driver.find_elements(By.XPATH, "//section//p")
+            )
+        raise RuntimeError(
+            diagnostics_message(
+                (
+                    "Start operator remained disabled after filling inputs; "
+                    f"model_input={model_value!r}; relay_input={relay_value!r}; "
+                    f"status={status_snippet!r}"
+                ),
+                relay_log,
+                driver_log,
+                driver,
+            )
+        ) from exc
+
+
+def assert_relay_roundtrip(
+    relay_url: str,
+    relay_log: Path,
+    driver_log: Path,
+    driver: webdriver.Remote,
+) -> None:
+    client = CryptoClient(relay_url, debug=True)
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        if client.fetch_server_public_key():
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError(
+            diagnostics_message("failed to fetch server public key from relay", relay_log, driver_log, driver)
+        )
+
+    response = client.send_chat_message("say hello from mock", max_retries=12)
+    if not response:
+        raise RuntimeError(
+            diagnostics_message("no relay roundtrip response returned to client", relay_log, driver_log, driver)
+        )
+    response_text = " ".join(
+        str(message.get("content", ""))
+        for message in response
+        if isinstance(message, dict)
+    )
+    if not response_text.strip():
+        raise AssertionError(
+            diagnostics_message("relay roundtrip response was empty", relay_log, driver_log, driver)
+        )
+
+    relay_text = relay_log.read_text(encoding="utf-8", errors="replace")
+    for marker in ('"http_path": "/faucet"', '"http_path": "/source"', '"http_path": "/retrieve"'):
+        if marker not in relay_text:
+            raise AssertionError(
+                diagnostics_message(
+                    f"relay roundtrip missing expected marker {marker}",
+                    relay_log,
+                    driver_log,
+                    driver,
+                )
+            )
+
+    last_error_text = driver.find_element(By.XPATH, "//p[contains(.,'Last error:')]").text.lower()
+    for marker in ("bridge failure", "no module named", "importerror", "model path not found"):
+        if marker in last_error_text:
+            raise AssertionError(
+                diagnostics_message(
+                    f"unexpected app error marker after relay roundtrip: {marker}",
+                    relay_log,
+                    driver_log,
+                    driver,
+                )
+            )
 
 
 def terminate_process(process: subprocess.Popen[str]) -> None:
@@ -336,13 +477,22 @@ def main() -> int:
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
 
+        runtime_resolved_path = read_runtime_resolved_path(driver)
         with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
             model_path = model_file.name
+        if runtime_resolved_path:
+            # Capture for diagnostics, but keep temp path deterministic for CI.
+            print(f"Runtime resolved path (not used as primary test path): {runtime_resolved_path}")
         fill_input_by_label(driver, "Model GGUF path", model_path)
+        model_input = driver.find_element(
+            By.XPATH,
+            "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
+        )
+        assert model_input.get_attribute("value") == model_path
         assert_model_path_exists(model_path)
         fill_input_by_label(driver, "Relay URL", relay_url)
 
-        wait.until(lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
+        wait_for_start_operator_enabled(driver, relay_log, driver_log)
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
 
         wait.until(
@@ -382,6 +532,7 @@ def main() -> int:
         assert "importerror" not in lowered_last_error, (
             f"Last error still indicates import failure: {last_error_text}"
         )
+        assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
     except TimeoutException as exc:
         raise RuntimeError(diagnostics_message("desktop UI e2e timed out", relay_log, driver_log, driver)) from exc
     except AssertionError as exc:

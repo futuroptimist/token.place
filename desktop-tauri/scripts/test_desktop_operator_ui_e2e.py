@@ -141,10 +141,12 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
 
 def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
-    attempted_recover = False
+    recovery_attempts = 0
+    last_recovery_at = 0.0
 
     def _ready(d: webdriver.Remote) -> bool:
-        nonlocal attempted_recover
+        nonlocal recovery_attempts
+        nonlocal last_recovery_at
         try:
             with contextlib.suppress(WebDriverException):
                 d.switch_to.default_content()
@@ -158,12 +160,16 @@ def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -
             with contextlib.suppress(WebDriverException):
                 page_source = d.page_source
             if (
-                not attempted_recover
+                recovery_attempts < 4
                 and "could not connect to localhost" in page_source.lower()
+                and (time.time() - last_recovery_at) >= 1.0
             ):
-                attempted_recover = True
+                recovery_attempts += 1
+                last_recovery_at = time.time()
                 with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost")
+                    d.get("tauri://localhost/")
+                with contextlib.suppress(WebDriverException):
+                    d.get("tauri://localhost/index.html")
             return False
         except (
             NoSuchFrameException,

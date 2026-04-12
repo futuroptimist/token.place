@@ -687,6 +687,11 @@ def _public_key_response(log_label: str | None = None):
         if log_label is None:
             log_label = f"{request.method.upper()} {request.path}"
         log_info(f"API request: {log_label}")
+        if encryption_manager is None:
+            log_warning("Public key requested before encryption manager initialization")
+            return format_error_response(
+                "Failed to retrieve public key: encryption is not initialized",
+            )
         return jsonify({'public_key': encryption_manager.public_key_b64})
     except Exception as exc:
         log_error("Error in get_public_key endpoint", exc_info=True)

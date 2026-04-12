@@ -12,9 +12,31 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+
+def _configure_import_root() -> None:
+    script_path = Path(__file__).resolve()
+    candidates = []
+
+    for parent in script_path.parents:
+        if (parent / "utils").is_dir() and (parent / "config.py").is_file():
+            candidates.append(parent)
+            break
+
+    candidates.append(script_path.parents[3])
+    candidates.append(Path.cwd())
+
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidate_str = str(resolved)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+
+
+_configure_import_root()
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

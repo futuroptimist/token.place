@@ -61,10 +61,10 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_bridge_script() -> String {
+fn bridge_script_candidates(current_exe: Option<&Path>) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = current_exe {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
             candidates.push(
@@ -96,13 +96,20 @@ fn resolve_bridge_script() -> String {
             .join("compute_node_bridge.py"),
     );
 
-    for candidate in candidates {
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
+    candidates
+}
 
-    "python/compute_node_bridge.py".into()
+fn first_existing_candidate(candidates: &[std::path::PathBuf]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn resolve_bridge_script() -> String {
+    let current_exe = std::env::current_exe().ok();
+    let candidates = bridge_script_candidates(current_exe.as_deref());
+    first_existing_candidate(&candidates).unwrap_or_else(|| "python/compute_node_bridge.py".into())
 }
 
 fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
@@ -399,6 +406,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
     use tempfile::NamedTempFile;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
@@ -468,5 +478,50 @@ mod tests {
         );
         assert_eq!(status.active_relay_url, request.relay_base_url);
         assert_eq!(status.model_path, request.model_path);
+    }
+
+    #[test]
+    fn bridge_script_candidates_include_packaged_layouts() {
+        let candidates = bridge_script_candidates(Some(Path::new(
+            "C:/Program Files/token.place desktop/token.place desktop.exe",
+        )));
+        let candidate_strings: Vec<String> = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(candidate_strings
+            .iter()
+            .any(|path| path.ends_with("/resources/python/compute_node_bridge.py")));
+        assert!(candidate_strings
+            .iter()
+            .any(|path| path.ends_with("/Resources/python/compute_node_bridge.py")));
+    }
+
+    #[test]
+    fn first_existing_candidate_uses_packaged_resources_bridge() {
+        let temp = tempdir().expect("tempdir");
+        let exe = temp.path().join("token.place desktop.exe");
+        let resources_dir = temp.path().join("resources").join("python");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+        let packaged_bridge = resources_dir.join("compute_node_bridge.py");
+        std::fs::write(&packaged_bridge, "print('ok')").expect("write bridge");
+
+        let candidates = bridge_script_candidates(Some(&exe));
+        let selected = first_existing_candidate(&candidates).expect("select path");
+        assert_eq!(PathBuf::from(selected), packaged_bridge);
+    }
+
+    #[test]
+    fn tauri_bundle_resources_include_python_bridge_scripts() {
+        let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).expect("json");
+        let resources = config
+            .get("bundle")
+            .and_then(|bundle| bundle.get("resources"))
+            .and_then(Value::as_array)
+            .expect("bundle.resources array");
+        let resource_values: Vec<&str> = resources.iter().filter_map(Value::as_str).collect();
+        assert!(resource_values.contains(&"python/compute_node_bridge.py"));
+        assert!(resource_values.contains(&"python/inference_sidecar.py"));
+        assert!(resource_values.contains(&"python/model_bridge.py"));
     }
 }

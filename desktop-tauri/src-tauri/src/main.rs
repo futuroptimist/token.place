@@ -43,10 +43,17 @@ struct BridgeResponse {
 }
 
 fn find_existing_bridge_script_path() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    model_bridge_script_candidates(current_exe.as_deref())
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn model_bridge_script_candidates(current_exe: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(exe_dir) = current_exe.parent() {
+    if let Some(exe_path) = current_exe {
+        if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("python").join("model_bridge.py"));
             candidates.push(
                 exe_dir
@@ -70,7 +77,7 @@ fn find_existing_bridge_script_path() -> Option<PathBuf> {
             .join("model_bridge.py"),
     );
 
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
@@ -312,4 +319,27 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_bridge_script_candidates;
+    use std::path::Path;
+
+    #[test]
+    fn model_bridge_candidates_include_packaged_layouts() {
+        let candidates = model_bridge_script_candidates(Some(Path::new(
+            "C:/Program Files/token.place desktop/token.place desktop.exe",
+        )));
+        let candidate_strings: Vec<String> = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(candidate_strings
+            .iter()
+            .any(|path| path.ends_with("/resources/python/model_bridge.py")));
+        assert!(candidate_strings
+            .iter()
+            .any(|path| path.ends_with("/Resources/python/model_bridge.py")));
+    }
 }

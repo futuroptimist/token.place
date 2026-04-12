@@ -95,10 +95,10 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn resolve_default_sidecar_script() -> String {
+fn sidecar_script_candidates(current_exe: Option<&Path>) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_path) = current_exe {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("python").join("inference_sidecar.py"));
             candidates.push(
@@ -156,6 +156,13 @@ fn resolve_default_sidecar_script() -> String {
             .join("sidecar")
             .join("fake_llama_sidecar.py"),
     );
+
+    candidates
+}
+
+fn resolve_default_sidecar_script() -> String {
+    let current_exe = std::env::current_exe().ok();
+    let candidates = sidecar_script_candidates(current_exe.as_deref());
 
     for candidate in candidates {
         if candidate.is_file() {
@@ -456,5 +463,22 @@ mod tests {
                 SidecarEvent::Done
             ]
         );
+    }
+
+    #[test]
+    fn sidecar_script_candidates_include_packaged_layouts() {
+        let candidates = sidecar_script_candidates(Some(Path::new(
+            "C:/Program Files/token.place desktop/token.place desktop.exe",
+        )));
+        let candidate_strings: Vec<String> = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(candidate_strings
+            .iter()
+            .any(|path| path.ends_with("/resources/python/inference_sidecar.py")));
+        assert!(candidate_strings
+            .iter()
+            .any(|path| path.ends_with("/Resources/python/inference_sidecar.py")));
     }
 }

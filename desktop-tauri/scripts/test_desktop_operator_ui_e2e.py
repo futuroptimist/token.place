@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Desktop UI end-to-end test: relay + Tauri app + operator + inference."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.request import urlopen
+
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
+TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
+WEBDRIVER_URL = "http://127.0.0.1:4444"
+
+
+def reserve_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
+    deadline = time.time() + timeout_seconds
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=2) as response:  # noqa: S310
+                if response.status == 200:
+                    return
+        except Exception as exc:  # pragma: no cover
+            last_error = exc
+        time.sleep(0.25)
+    raise RuntimeError(f"timeout waiting for {url}: {last_error}")
+
+
+def wait_for_port(host: str, port: int, timeout_seconds: float = 30.0) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            sock.settimeout(1)
+            if sock.connect_ex((host, port)) == 0:
+                return
+        time.sleep(0.25)
+    raise RuntimeError(f"timeout waiting for {host}:{port}")
+
+
+def ensure_alive(process: subprocess.Popen[str], label: str) -> None:
+    if process.poll() is None:
+        return
+    raise RuntimeError(f"{label} exited early with code {process.returncode}")
+
+
+def read_tail(path: Path) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return text[-4000:]
+
+
+def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
+    label = driver.find_element(By.XPATH, f"//label[normalize-space()='{label_text}']")
+    input_el = label.find_element(By.XPATH, "following-sibling::*[1]")
+    input_el.send_keys(Keys.CONTROL, "a")
+    input_el.send_keys(Keys.DELETE)
+    input_el.send_keys(value)
+
+
+def start_driver(app_binary: Path) -> webdriver.Remote:
+    options = webdriver.ChromeOptions()
+    options.set_capability("browserName", "wry")
+    options.set_capability(
+        "tauri:options",
+        {
+            "application": str(app_binary),
+            "args": [],
+        },
+    )
+    return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
+
+
+def main() -> int:
+    relay_port = reserve_free_port()
+    relay_url = f"http://127.0.0.1:{relay_port}"
+
+    logs_dir = REPO_ROOT / ".desktop-e2e-logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    relay_log = logs_dir / "relay.log"
+    driver_log = logs_dir / "tauri-driver.log"
+
+    env = os.environ.copy()
+    env["USE_MOCK_LLM"] = "1"
+
+    relay = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            str(REPO_ROOT / "relay.py"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(relay_port),
+            "--use_mock_llm",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=relay_log.open("w", encoding="utf-8"),
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    tauri_driver = subprocess.Popen(  # noqa: S603
+        ["npm", "run", "tauri", "driver", "--", "--port", "4444"],
+        cwd=DESKTOP_ROOT,
+        env=env,
+        stdout=driver_log.open("w", encoding="utf-8"),
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    driver: webdriver.Remote | None = None
+    try:
+        wait_for_http_200(f"{relay_url}/livez")
+        ensure_alive(relay, "relay")
+
+        wait_for_port("127.0.0.1", 4444)
+        ensure_alive(tauri_driver, "tauri-driver")
+
+        app_binary = TAURI_ROOT / "target" / "debug" / "token-place-desktop-tauri"
+        if not app_binary.exists():
+            raise RuntimeError(f"missing desktop binary: {app_binary}")
+
+        driver = start_driver(app_binary)
+        wait = WebDriverWait(driver, 45)
+
+        fill_input_by_label(driver, "Model GGUF path", "mock.gguf")
+        fill_input_by_label(driver, "Relay URL", relay_url)
+
+        wait.until(lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
+        driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+
+        wait.until(
+            lambda d: d.find_element(
+                By.XPATH,
+                "//p[contains(.,'Running:')]//strong[normalize-space()='yes']",
+            )
+        )
+        wait.until(
+            lambda d: d.find_element(
+                By.XPATH,
+                "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
+            )
+        )
+
+        prompt = driver.find_element(
+            By.XPATH,
+            "//label[normalize-space()='Prompt']/following-sibling::textarea[1]",
+        )
+        prompt.send_keys("say hello from mock")
+        wait.until(
+            lambda d: d.find_element(By.XPATH, "//button[.='Start local inference']").is_enabled()
+        )
+        driver.find_element(By.XPATH, "//button[.='Start local inference']").click()
+
+        wait.until(
+            lambda d: d.find_element(By.XPATH, "//pre").text.strip() != ""
+            and "Last error: bridge failure" not in d.page_source
+            and "No module named 'utils'" not in d.page_source
+        )
+    except TimeoutException as exc:
+        raise RuntimeError(
+            "desktop UI e2e timed out; "
+            f"relay_log_tail={read_tail(relay_log)}; "
+            f"tauri_driver_log_tail={read_tail(driver_log)}"
+        ) from exc
+    finally:
+        if driver is not None:
+            driver.quit()
+        if tauri_driver.poll() is None:
+            tauri_driver.terminate()
+            tauri_driver.wait(timeout=10)
+        if relay.poll() is None:
+            relay.terminate()
+            relay.wait(timeout=10)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
@@ -84,6 +85,43 @@ fn model_bridge_script_candidates(exe_path: Option<&Path>, manifest_dir: &Path) 
     candidates
 }
 
+
+fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
+    let mut candidates = vec![manifest_dir.to_path_buf()];
+    if let Some(parent) = manifest_dir.parent() {
+        candidates.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.to_path_buf());
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path) {
+    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+        match std::env::var("PYTHONPATH") {
+            Ok(existing) if !existing.trim().is_empty() => {
+                if let Ok(joined) =
+                    std::env::join_paths([Path::new(&import_root), Path::new(&existing)])
+                {
+                    command.env("PYTHONPATH", joined);
+                } else {
+                    command.env("PYTHONPATH", import_root);
+                }
+            }
+            _ => {
+                command.env("PYTHONPATH", import_root);
+            }
+        }
+    }
+}
+
 fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
     find_existing_bridge_script_path().ok_or_else(|| {
         "unable to locate model bridge script relative to executable/resources or development source tree".into()
@@ -94,8 +132,11 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path()?;
-    let output = launcher
-        .command_for_script_blocking(bridge_script.to_str().unwrap_or_default())
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut bridge_command =
+        launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
+    configure_runtime_pythonpath(&mut bridge_command, manifest_dir);
+    let output = bridge_command
         .arg(action)
         .output()
         .map_err(|e| format!("unable to run model bridge: {e}"))?;
@@ -329,6 +370,41 @@ fn main() {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn configure_runtime_pythonpath_prefixes_manifest_import_root() {
+        let mut command = std::process::Command::new("python");
+        configure_runtime_pythonpath(&mut command, Path::new(env!("CARGO_MANIFEST_DIR")));
+
+        let configured = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "PYTHONPATH" {
+                    value.map(|raw| raw.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("configured PYTHONPATH");
+        let mut configured_paths = std::env::split_paths(&configured).collect::<Vec<_>>();
+
+        if configured_paths.is_empty() {
+            configured_paths.push(PathBuf::from(configured));
+        }
+
+        let expected_root = repo_runtime_import_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("repo runtime import root")
+            .to_lowercase();
+
+        assert_eq!(
+            configured_paths
+                .first()
+                .expect("first PYTHONPATH entry")
+                .to_string_lossy()
+                .to_lowercase(),
+            expected_root
+        );
+    }
 
     #[test]
     fn model_bridge_candidates_include_packaged_resources() {

@@ -14,7 +14,13 @@ def ensure_runtime_import_paths(script_file: str) -> None:
     candidates = [
         resources_root,  # bundled resources root in packaged apps
         resources_root / "_up_",  # tauri ".." resources are rewritten under _up_
+        resources_root / "resources",
+        resources_root / "resources" / "_up_",
         script_path.parent.parent.parent,
+        script_path.parent.parent.parent / "resources",
+        script_path.parent.parent.parent / "resources" / "_up_",
+        script_path.parent.parent.parent / "Resources",
+        script_path.parent.parent.parent / "Resources" / "_up_",
     ]
 
     if len(script_path.parents) > 3:

@@ -63,9 +63,12 @@ def create_packaged_layout(tmp_root: Path) -> Path:
             python_dir / filename,
         )
 
-    shutil.copy2(REPO_ROOT / "config.py", resources_root / "config.py")
-    shutil.copy2(REPO_ROOT / "encrypt.py", resources_root / "encrypt.py")
-    shutil.copytree(REPO_ROOT / "utils", resources_root / "utils", dirs_exist_ok=True)
+    # This mirrors Tauri's bundled path rewrite for ../../utils and ../../config.py.
+    rewritten_root = resources_root / "_up_" / "_up_"
+    rewritten_root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO_ROOT / "config.py", rewritten_root / "config.py")
+    shutil.copy2(REPO_ROOT / "encrypt.py", rewritten_root / "encrypt.py")
+    shutil.copytree(REPO_ROOT / "utils", rewritten_root / "utils", dirs_exist_ok=True)
 
     return python_dir / "compute_node_bridge.py"
 

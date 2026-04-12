@@ -11,9 +11,13 @@ def ensure_runtime_import_paths(script_file: str) -> None:
 
     script_path = Path(script_file).resolve()
     resources_root = script_path.parent.parent
+    sibling_resources_root = script_path.parent.parent / "resources"
+    sibling_resources_up = sibling_resources_root / "_up_"
     candidates = [
         resources_root,  # bundled resources root in packaged apps
         resources_root / "_up_",  # tauri ".." resources are rewritten under _up_
+        sibling_resources_root,  # packaged apps can place python beside executable
+        sibling_resources_up,
         script_path.parent.parent.parent,
     ]
 

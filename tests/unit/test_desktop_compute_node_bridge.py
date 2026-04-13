@@ -137,15 +137,16 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
 
     module = ModuleType('utils.compute_node_runtime')
-    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port: SimpleNamespace(
+    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
         relay_url=relay_url,
         relay_port=relay_port,
+        **kwargs,
     )
     module.ComputeNodeRuntime = runtime_cls
     module.is_legacy_relay_payload = (
         lambda payload: {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(payload)
     )
-    module.resolve_relay_url = lambda relay_url: relay_url
+    module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     module.SUPPORTED_COMPUTE_MODES = _SUPPORTED_COMPUTE_MODES
     module.normalize_compute_mode = _normalize_compute_mode

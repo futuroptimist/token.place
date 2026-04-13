@@ -19,6 +19,7 @@ class LlamaCppInstallPlan:
     index_url: str | None = None
     extra_index_url: str | None = None
     only_binary: bool = False
+    no_binary: bool = False
 
     def pip_install_args(self) -> list[str]:
         args = ["--upgrade", "--no-cache-dir"]
@@ -28,6 +29,8 @@ class LlamaCppInstallPlan:
             args.extend(["--extra-index-url", self.extra_index_url])
         if self.only_binary:
             args.extend(["--only-binary", "llama-cpp-python"])
+        if self.no_binary:
+            args.extend(["--no-binary", "llama-cpp-python"])
         if self.index_url or self.extra_index_url:
             args.append("--prefer-binary")
         return args
@@ -120,7 +123,7 @@ def llama_cpp_install_plan_fallbacks(
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
                 extra_index_url=None,
-                only_binary=False,
+                only_binary=True,
             )
         )
 
@@ -138,6 +141,7 @@ def llama_cpp_install_plan_fallbacks(
                 index_url="https://pypi.org/simple",
                 extra_index_url=None,
                 only_binary=False,
+                no_binary=True,
             )
         )
 

@@ -27,7 +27,7 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
     assert cpu_fallback.extra_index_url is None
-    assert cpu_fallback.only_binary is False
+    assert cpu_fallback.only_binary is True
 
 
 def test_macos_install_plan_requests_metal_then_source_fallback():
@@ -45,6 +45,7 @@ def test_macos_install_plan_requests_metal_then_source_fallback():
     assert source_fallback.index_url == "https://pypi.org/simple"
     assert source_fallback.only_binary is False
     assert source_fallback.force_cmake is True
+    assert source_fallback.no_binary is True
     assert source_fallback.pip_env() == {
         "CMAKE_ARGS": "-DGGML_METAL=on -DGGML_NATIVE=off",
         "FORCE_CMAKE": "1",

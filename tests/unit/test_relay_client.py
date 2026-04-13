@@ -119,6 +119,40 @@ def test_init_can_disable_configured_server_fallbacks():
     assert client.relay_urls == ('http://127.0.0.1:5010',)
 
 
+def test_init_excludes_config_and_env_fallback_relays_when_configured_servers_disabled(monkeypatch):
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    mock_config.get.side_effect = lambda key, default: {
+        'relay.request_timeout': 10,
+        'relay.cluster_only': True,
+        'relay.server_url': 'https://token.place',
+        'relay.additional_servers': ['https://relay-backup.example'],
+        'relay.cloudflare_fallback_urls': ['https://cloudflare-a.example'],
+    }.get(key, default)
+
+    monkeypatch.setenv(
+        'TOKEN_PLACE_RELAY_UPSTREAMS',
+        'https://token.place,https://env-upstream.example',
+    )
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', 'https://token.place')
+    monkeypatch.setenv(
+        'TOKEN_PLACE_RELAY_CLOUDFLARE_URLS',
+        '["https://token.place","https://env-cloudflare.example"]',
+    )
+
+    with patch('utils.networking.relay_client.get_config_lazy', return_value=mock_config):
+        client = RelayClient(
+            base_url='http://127.0.0.1:5010',
+            port=None,
+            crypto_manager=object(),
+            model_manager=object(),
+            include_configured_servers=False,
+        )
+
+    assert client.relay_urls == ('http://127.0.0.1:5010',)
+    assert 'https://token.place' not in client.relay_urls
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

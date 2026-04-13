@@ -24,6 +24,7 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+DEFAULT_RELAY_URL = "https://token.place"
 
 
 def _start_stdin_reader() -> None:
@@ -82,13 +83,12 @@ def run(args: argparse.Namespace) -> int:
             ComputeNodeRuntimeConfig,
             is_legacy_relay_payload,
             resolve_relay_port,
-            resolve_relay_url,
         )
     except ModuleNotFoundError as exc:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
 
-    relay_url = resolve_relay_url(args.relay_url)
+    relay_url = str(args.relay_url).strip() or DEFAULT_RELAY_URL
     relay_port = resolve_relay_port(args.relay_port, relay_url)
 
     runtime = ComputeNodeRuntime(
@@ -185,7 +185,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default="auto")
-    parser.add_argument("--relay-url", default="https://token.place")
+    parser.add_argument("--relay-url", default=DEFAULT_RELAY_URL)
     parser.add_argument("--relay-port", type=int, default=None)
     args = parser.parse_args()
 

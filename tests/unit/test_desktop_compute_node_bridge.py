@@ -129,6 +129,17 @@ class IncompatibleRelayRuntime(FakeRuntime):
         self._processed = []
 
 
+class RelayUrlCaptureRuntime(FakeRuntime):
+    last_relay_url = None
+
+    def __init__(self, config):
+        RelayUrlCaptureRuntime.last_relay_url = config.relay_url
+        self.model_manager = FakeModelManager()
+        self.relay_client = SimpleNamespace(relay_url=config.relay_url)
+        self._responses = []
+        self._processed = []
+
+
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     from utils.compute_node_runtime import (
         SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
@@ -344,6 +355,27 @@ def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]['type'] == 'started'
     assert events[0]['backend_mode'] == 'auto'
+
+
+def test_run_prefers_explicit_relay_url_over_environment_override(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RelayUrlCaptureRuntime)
+    monkeypatch.setenv('TOKENPLACE_RELAY_URL', 'https://token.place')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='http://127.0.0.1:5010',
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert RelayUrlCaptureRuntime.last_relay_url == 'http://127.0.0.1:5010'
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['active_relay_url'] == 'http://127.0.0.1:5010'
 
 
 def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkeypatch):

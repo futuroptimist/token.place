@@ -115,17 +115,18 @@ def test_main_dispatches_download_action():
 
 
 def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):
-    """Regression: pre-fix exe/python + resources layout failed with No module named 'utils'."""
-    python_dir = tmp_path / 'bin' / 'python'
+    """Regression: packaged resources with ../../utils failed with No module named 'utils'."""
+    python_dir = tmp_path / 'bin' / 'resources' / 'python'
     resources_dir = tmp_path / 'bin' / 'resources'
-    utils_llm_dir = resources_dir / 'utils' / 'llm'
+    import_root = resources_dir / '_up_' / '_up_'
+    utils_llm_dir = import_root / 'utils' / 'llm'
     python_dir.mkdir(parents=True)
     utils_llm_dir.mkdir(parents=True)
 
     (python_dir / 'model_bridge.py').write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
     path_bootstrap_path = MODULE_PATH.parent / 'path_bootstrap.py'
     (python_dir / 'path_bootstrap.py').write_text(path_bootstrap_path.read_text(encoding='utf-8'), encoding='utf-8')
-    (resources_dir / 'utils' / '__init__.py').write_text('', encoding='utf-8')
+    (import_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / 'model_manager.py').write_text(
         """

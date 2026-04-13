@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -144,9 +145,51 @@ pub fn resolve_python_launcher(var_name: &str) -> anyhow::Result<PythonLauncher>
     })
 }
 
+pub fn resolve_runtime_import_root(
+    script_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(explicit) = std::env::var("TOKEN_PLACE_PYTHON_IMPORT_ROOT") {
+        let explicit = PathBuf::from(explicit);
+        if !explicit.as_os_str().is_empty() {
+            candidates.push(explicit);
+        }
+    }
+
+    if let Some(script_path) = script_path {
+        let script_dir = script_path.parent()?;
+        if let Some(script_root) = script_dir.parent() {
+            candidates.push(script_root.to_path_buf());
+            let mut up = script_root.to_path_buf();
+            for _ in 0..4 {
+                up = up.join("_up_");
+                candidates.push(up.clone());
+            }
+            if let Some(root_parent) = script_root.parent() {
+                candidates.push(root_parent.to_path_buf());
+            }
+        }
+    }
+
+    candidates.push(manifest_dir.to_path_buf());
+    if let Some(parent) = manifest_dir.parent() {
+        candidates.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.to_path_buf());
+        }
+    }
+
+    candidates.into_iter().find(|candidate| {
+        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
@@ -307,5 +350,18 @@ mod tests {
         assert!(msg.contains("python  -> status="));
         assert!(msg.contains("Python 2.7.18"));
         assert!(msg.contains("python3  -> spawn failed"));
+    }
+
+    #[test]
+    fn resolve_runtime_import_root_detects_nested_up_layout() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("resources").join("python").join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
+        let import_root = temp.path().join("resources").join("_up_").join("_up_");
+        std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");
+
+        let resolved = resolve_runtime_import_root(Some(&script), Path::new("/missing"));
+        assert_eq!(resolved.as_deref(), Some(import_root.as_path()));
     }
 }

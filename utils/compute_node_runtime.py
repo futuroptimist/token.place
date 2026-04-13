@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence
@@ -134,29 +135,101 @@ def format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
     return f"{relay_url}:{relay_port}"
 
 
-SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "metal", "cuda"})
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "gpu", "hybrid", "metal", "cuda"})
+HYBRID_GPU_LAYERS = 16
+
+
+@dataclass(frozen=True)
+class ComputeModeResolution:
+    requested_mode: str
+    backend_available: str
+    effective_mode: str
+    mode_reason: Optional[str]
+    n_gpu_layers: int
 
 
 def normalize_compute_mode(mode: Optional[str]) -> str:
     """Normalize operator-provided compute mode values."""
 
     selected = (mode or "auto").strip().lower()
+    legacy_aliases = {"metal": "gpu", "cuda": "gpu"}
+    selected = legacy_aliases.get(selected, selected)
     if selected in SUPPORTED_COMPUTE_MODES:
+        if selected in ("metal", "cuda"):
+            return "gpu"
         return selected
     return "auto"
+
+
+def detect_backend_for_host() -> str:
+    """Return platform-default accelerator backend."""
+
+    platform = (os.environ.get("TOKEN_PLACE_PLATFORM") or sys.platform).lower()
+    if platform.startswith("win"):
+        return "cuda"
+    if platform == "darwin":
+        return "metal"
+    return "cpu"
+
+
+def resolve_compute_mode(manager: Any, mode: Optional[str]) -> ComputeModeResolution:
+    """Resolve user mode to backend intent and GPU layer policy."""
+
+    selected = normalize_compute_mode(mode)
+    backend_available = detect_backend_for_host()
+
+    if selected == "cpu":
+        return ComputeModeResolution(
+            requested_mode=selected,
+            backend_available=backend_available,
+            effective_mode="cpu",
+            mode_reason="operator selected CPU-only mode",
+            n_gpu_layers=0,
+        )
+
+    if backend_available == "cpu":
+        return ComputeModeResolution(
+            requested_mode=selected,
+            backend_available=backend_available,
+            effective_mode="cpu",
+            mode_reason="no supported GPU backend available on this host",
+            n_gpu_layers=0,
+        )
+
+    if selected == "hybrid":
+        return ComputeModeResolution(
+            requested_mode=selected,
+            backend_available=backend_available,
+            effective_mode=f"{backend_available}-hybrid",
+            mode_reason=f"partial {backend_available} offload requested",
+            n_gpu_layers=HYBRID_GPU_LAYERS,
+        )
+
+    # GPU and auto both prefer full offload on GPU-capable hosts.
+    mode_label = f"{backend_available}-gpu" if selected == "gpu" else f"{backend_available}-auto"
+    reason = (
+        f"full {backend_available} offload requested"
+        if selected == "gpu"
+        else f"auto selected {backend_available} backend"
+    )
+    return ComputeModeResolution(
+        requested_mode=selected,
+        backend_available=backend_available,
+        effective_mode=mode_label,
+        mode_reason=reason,
+        n_gpu_layers=-1,
+    )
 
 
 def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
     """Apply normalized compute mode to model-manager GPU settings."""
 
-    selected = normalize_compute_mode(mode)
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    else:
-        # ``auto`` follows runtime autodetection and maps to GPU-preferred layers where available.
-        # ``metal`` and ``cuda`` also request GPU-backed inference on supported hosts.
-        manager.default_n_gpu_layers = -1
-    return selected
+    resolution = resolve_compute_mode(manager, mode)
+    manager.default_n_gpu_layers = resolution.n_gpu_layers
+    manager.requested_compute_mode = resolution.requested_mode
+    manager.available_compute_backend = resolution.backend_available
+    manager.requested_mode_reason = resolution.mode_reason
+    return resolution.requested_mode
 
 
 class ComputeNodeRuntime:

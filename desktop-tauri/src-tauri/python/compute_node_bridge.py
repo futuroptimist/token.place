@@ -78,6 +78,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         from utils.compute_node_runtime import (
             apply_compute_mode,
+            resolve_compute_mode,
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_legacy_relay_payload,
@@ -99,7 +100,10 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    resolved_mode = apply_compute_mode(runtime.model_manager, args.mode)
+    requested_mode = apply_compute_mode(runtime.model_manager, args.mode)
+    resolution = resolve_compute_mode(runtime.model_manager, requested_mode)
+    effective_mode = getattr(runtime.model_manager, "effective_compute_mode", "uninitialized")
+    mode_reason = getattr(runtime.model_manager, "last_compute_note", None) or resolution.mode_reason
 
     if not runtime.ensure_model_ready():
         emit(
@@ -107,6 +111,10 @@ def run(args: argparse.Namespace) -> int:
                 "type": "error",
                 "message": "failed to initialize model runtime",
                 "active_relay_url": runtime.relay_client.relay_url,
+                "backend_mode_requested": resolution.requested_mode,
+                "backend_mode_effective": effective_mode,
+                "backend_available": resolution.backend_available,
+                "mode_reason": mode_reason,
             }
         )
         return 1
@@ -118,7 +126,10 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": resolved_mode,
+            "backend_mode_requested": resolution.requested_mode,
+            "backend_mode_effective": effective_mode,
+            "backend_available": resolution.backend_available,
+            "mode_reason": mode_reason,
             "model_path": args.model,
             "last_error": None,
         }
@@ -155,7 +166,10 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
-                    "backend_mode": resolved_mode,
+                    "backend_mode_requested": resolution.requested_mode,
+                    "backend_mode_effective": effective_mode,
+                    "backend_available": resolution.backend_available,
+                    "mode_reason": mode_reason,
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -173,7 +187,10 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": resolved_mode,
+            "backend_mode_requested": resolution.requested_mode,
+            "backend_mode_effective": effective_mode,
+            "backend_available": resolution.backend_available,
+            "mode_reason": mode_reason,
             "model_path": args.model,
             "last_error": None,
         }

@@ -60,6 +60,12 @@ class ModelManager:
         self.default_n_gpu_layers = config.get('model.n_gpu_layers', -1)
         self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
+        self.requested_compute_mode = 'auto'
+        self.available_compute_backend = 'unknown'
+        self.requested_mode_reason = None
+        self.effective_compute_mode = 'uninitialized'
+        self.effective_n_gpu_layers = None
+        self.last_compute_note = None
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
@@ -250,13 +256,37 @@ class ModelManager:
                                         )
                                         n_gpu_layers = 0
 
+                            llama_kwargs = {
+                                'model_path': self.model_path,
+                                'n_gpu_layers': n_gpu_layers,
+                                'n_ctx': self.config.get('model.context_size', 8192),
+                                'chat_format': self.config.get('model.chat_format', 'llama-3'),
+                            }
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
-                            self.llm = Llama(
-                                model_path=self.model_path,
-                                n_gpu_layers=n_gpu_layers,
-                                n_ctx=self.config.get('model.context_size', 8192),
-                                chat_format=self.config.get('model.chat_format', 'llama-3')
-                            )
+                            try:
+                                self.llm = Llama(**llama_kwargs)
+                                self.effective_n_gpu_layers = n_gpu_layers
+                                self.effective_compute_mode = (
+                                    f"{self.available_compute_backend}-gpu"
+                                    if n_gpu_layers != 0
+                                    else "cpu"
+                                )
+                                self.last_compute_note = self.requested_mode_reason
+                            except Exception as gpu_exc:
+                                if n_gpu_layers == 0:
+                                    raise
+
+                                self.log_warning(
+                                    "GPU initialization failed; retrying with CPU-only "
+                                    f"inference: {gpu_exc}"
+                                )
+                                self.last_compute_note = (
+                                    f"GPU initialization failed ({gpu_exc}); fell back to CPU"
+                                )
+                                self.effective_compute_mode = "cpu-fallback"
+                                llama_kwargs['n_gpu_layers'] = 0
+                                self.llm = Llama(**llama_kwargs)
+                                self.effective_n_gpu_layers = 0
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

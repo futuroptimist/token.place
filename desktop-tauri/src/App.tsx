@@ -4,25 +4,29 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
-type BackendMode = 'auto' | 'metal' | 'cuda' | 'cpu';
+type ComputeMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
 
 interface BackendInfo {
   platform_label: string;
-  preferred_mode: BackendMode;
+  available_backend: string;
+  gpu_available: boolean;
   display_label: string;
 }
 
 interface DesktopConfig {
   model_path: string;
   relay_base_url: string;
-  preferred_mode: BackendMode;
+  preferred_mode: ComputeMode;
 }
 
 interface ComputeNodeStatus {
   running: boolean;
   registered: boolean;
   active_relay_url: string;
-  backend_mode: string;
+  backend_mode_requested: string;
+  backend_mode_effective: string;
+  backend_available: string;
+  mode_reason: string | null;
   model_path: string;
   last_error: string | null;
 }
@@ -49,7 +53,10 @@ const defaultComputeStatus: ComputeNodeStatus = {
   running: false,
   registered: false,
   active_relay_url: '',
-  backend_mode: 'auto',
+  backend_mode_requested: 'auto',
+  backend_mode_effective: 'unknown',
+  backend_available: 'unknown',
+  mode_reason: null,
   model_path: '',
   last_error: null,
 };
@@ -160,8 +167,24 @@ export function App() {
           typeof payload.active_relay_url === 'string'
             ? payload.active_relay_url
             : prev.active_relay_url,
-        backend_mode:
-          typeof payload.backend_mode === 'string' ? payload.backend_mode : prev.backend_mode,
+        backend_mode_requested:
+          typeof payload.backend_mode_requested === 'string'
+            ? payload.backend_mode_requested
+            : prev.backend_mode_requested,
+        backend_mode_effective:
+          typeof payload.backend_mode_effective === 'string'
+            ? payload.backend_mode_effective
+            : prev.backend_mode_effective,
+        backend_available:
+          typeof payload.backend_available === 'string'
+            ? payload.backend_available
+            : prev.backend_available,
+        mode_reason:
+          payload.mode_reason === null
+            ? null
+            : typeof payload.mode_reason === 'string'
+              ? payload.mode_reason
+              : prev.mode_reason,
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
         last_error:
           payload.last_error === null
@@ -200,15 +223,6 @@ export function App() {
     () => Boolean(config.model_path.trim()) && !computeStatus.running,
     [config.model_path, computeStatus.running]
   );
-  const platformLabel = (backend?.platform_label ?? '').toLowerCase();
-  const backendDisplayLabel = (backend?.display_label ?? '').toLowerCase();
-  const metalSupported = platformLabel.includes('apple') || platformLabel.includes('mac');
-  const cudaSupported =
-    backend?.preferred_mode === 'cuda' ||
-    backendDisplayLabel.includes('cuda') ||
-    platformLabel.includes('nvidia') ||
-    platformLabel.includes('cuda');
-
   const scheduleConfigSave = (next: DesktopConfig) => {
     if (saveTimerRef.current !== null) {
       window.clearTimeout(saveTimerRef.current);
@@ -293,7 +307,10 @@ export function App() {
         running: true,
         registered: false,
         active_relay_url: config.relay_base_url,
-        backend_mode: config.preferred_mode,
+        backend_mode_requested: config.preferred_mode,
+        backend_mode_effective: 'initializing',
+        backend_available: backend?.available_backend ?? 'unknown',
+        mode_reason: null,
         model_path: config.model_path,
         last_error: null,
       }));
@@ -342,7 +359,7 @@ export function App() {
   return (
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop compute node</h1>
-      <p>Detected backend: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
+      <p>Detected capability: <strong>{backend?.display_label ?? 'loading...'}</strong></p>
       <label>Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
         <input
@@ -382,17 +399,15 @@ export function App() {
       <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
       <select
         value={config.preferred_mode}
-        onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
+        onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as ComputeMode })}
       >
-        <option value="auto">Auto ({backend?.display_label ?? '...'})</option>
-        <option value="metal" disabled={!metalSupported}>Metal GPU (macOS Apple Silicon)</option>
-        <option value="cuda" disabled={!cudaSupported}>CUDA GPU (Windows/NVIDIA)</option>
-        <option value="cpu">CPU fallback</option>
+        <option value="auto">Auto (platform-aware)</option>
+        <option value="cpu">CPU only</option>
+        <option value="gpu">GPU only</option>
+        <option value="hybrid">Hybrid (partial GPU offload)</option>
       </select>
       <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
-        Operator note: <code>cuda</code> is for Windows/NVIDIA workstations, <code>metal</code> is
-        for macOS/Apple Silicon, and <code>cpu</code> is fallback. Raspberry Pi remains a later
-        low-power workstation target and is not part of the current sugarkube relay rollout.
+        Runtime note: requested mode and effective runtime are tracked separately.
       </p>
 
       <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
@@ -411,7 +426,16 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend mode: <code>{computeStatus.backend_mode || config.preferred_mode}</code></p>
+        <p style={{ marginBottom: 0 }}>
+          Requested mode: <code>{computeStatus.backend_mode_requested || config.preferred_mode}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Effective mode: <code>{computeStatus.backend_mode_effective || 'unknown'}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Available backend: <code>{computeStatus.backend_available || backend?.available_backend || 'unknown'}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>Mode reason: <code>{computeStatus.mode_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
       </section>

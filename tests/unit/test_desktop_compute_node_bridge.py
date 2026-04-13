@@ -134,6 +134,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
         apply_compute_mode as _apply_compute_mode,
         normalize_compute_mode as _normalize_compute_mode,
+        resolve_compute_mode as _resolve_compute_mode,
     )
 
     module = ModuleType('utils.compute_node_runtime')
@@ -150,6 +151,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module.SUPPORTED_COMPUTE_MODES = _SUPPORTED_COMPUTE_MODES
     module.normalize_compute_mode = _normalize_compute_mode
     module.apply_compute_mode = _apply_compute_mode
+    module.resolve_compute_mode = _resolve_compute_mode
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 
@@ -310,18 +312,19 @@ def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, mo
     assert status_events[0]['last_error'] == 'failed to process relay request'
 
 
-def test_apply_compute_mode_supports_gpu_and_cpu_modes():
+def test_apply_compute_mode_supports_gpu_and_cpu_modes(monkeypatch):
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode
 
+    monkeypatch.setenv('TOKEN_PLACE_PLATFORM', 'win32')
     assert apply_compute_mode(manager, 'auto') == 'auto'
     assert manager.default_n_gpu_layers == -1
 
-    assert apply_compute_mode(manager, 'metal') == 'metal'
+    assert apply_compute_mode(manager, 'gpu') == 'gpu'
     assert manager.default_n_gpu_layers == -1
 
-    assert apply_compute_mode(manager, 'cuda') == 'cuda'
-    assert manager.default_n_gpu_layers == -1
+    assert apply_compute_mode(manager, 'hybrid') == 'hybrid'
+    assert manager.default_n_gpu_layers > 0
 
     assert apply_compute_mode(manager, 'cpu') == 'cpu'
     assert manager.default_n_gpu_layers == 0
@@ -343,7 +346,7 @@ def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]['type'] == 'started'
-    assert events[0]['backend_mode'] == 'auto'
+    assert events[0]['backend_mode_requested'] == 'auto'
 
 
 def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkeypatch):
@@ -391,7 +394,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'cuda'
+    assert captured['mode'] == 'gpu'
 
     monkeypatch.setattr(
         sys,
@@ -423,7 +426,7 @@ def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_pat
     (utils_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
-SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "cuda", "metal"}
+SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid"}
 
 
 def normalize_compute_mode(mode):
@@ -433,6 +436,17 @@ def normalize_compute_mode(mode):
 
 def apply_compute_mode(_model_manager, mode):
     return normalize_compute_mode(mode)
+
+
+def resolve_compute_mode(_model_manager, mode):
+    resolved = normalize_compute_mode(mode)
+    return type("Resolution", (), {
+        "requested_mode": resolved,
+        "backend_available": "cpu",
+        "effective_mode": "cpu",
+        "mode_reason": "test",
+        "n_gpu_layers": 0,
+    })()
 
 
 def resolve_relay_url(relay_url):

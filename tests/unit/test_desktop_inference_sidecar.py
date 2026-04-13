@@ -179,9 +179,10 @@ def test_run_falls_back_to_non_streaming_when_stream_is_empty(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     ('mode', 'expected'),
-    [('cpu', 0), ('metal', -1), ('cuda', -1), ('auto', -1)],
+    [('cpu', 0), ('gpu', -1), ('hybrid', 16), ('auto', -1)],
 )
-def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
+def test_run_applies_compute_mode_to_manager(tmp_path, capsys, monkeypatch, mode, expected):
+    monkeypatch.setenv('TOKEN_PLACE_PLATFORM', 'win32')
     _reset_cancel_queue()
     model_path = tmp_path / 'model.gguf'
     model_path.write_text('fake-model')
@@ -214,7 +215,8 @@ def test_run_handles_dict_completion_payload(tmp_path, capsys):
     assert events[1]['text'] == 'dict response'
 
 
-def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys):
+def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_PLATFORM', 'win32')
     _reset_cancel_queue()
     model_path = tmp_path / 'model.gguf'
     model_path.write_text('fake-model')
@@ -374,7 +376,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = inference_sidecar.main()
     assert status == 0
-    assert captured['mode'] == 'cuda'
+    assert captured['mode'] == 'gpu'
 
     monkeypatch.setattr(
         sys,
@@ -405,7 +407,7 @@ def test_extract_text_from_completion_handles_empty_choices():
 
 def test_normalize_chunk_fallback_handles_typeerror_and_unknown_shape():
     class WithBadDict:
-        def dict(self, required):  # pragma: no cover - signature intentionally incompatible
+        def dict(self, _required):  # pragma: no cover - signature intentionally incompatible
             return {'choices': []}
 
     class UnknownShape:

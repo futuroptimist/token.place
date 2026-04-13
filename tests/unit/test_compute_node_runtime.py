@@ -219,21 +219,26 @@ def test_compute_node_runtime_format_relay_target_preserves_explicit_url_port():
 
 
 def test_normalize_compute_mode_is_case_insensitive_and_falls_back_to_auto():
-    assert normalize_compute_mode("CUDA") == "cuda"
-    assert normalize_compute_mode("  metal ") == "metal"
+    assert normalize_compute_mode("CUDA") == "gpu"
+    assert normalize_compute_mode("  metal ") == "gpu"
+    assert normalize_compute_mode("hybrid") == "hybrid"
     assert normalize_compute_mode("unknown") == "auto"
     assert normalize_compute_mode("") == "auto"
     assert normalize_compute_mode(None) == "auto"
 
 
-def test_apply_compute_mode_sets_expected_gpu_layer_defaults():
+def test_apply_compute_mode_sets_expected_gpu_layer_defaults(monkeypatch):
     manager = MagicMock()
+    monkeypatch.setenv("TOKEN_PLACE_PLATFORM", "win32")
 
     assert apply_compute_mode(manager, "cpu") == "cpu"
     assert manager.default_n_gpu_layers == 0
 
     assert apply_compute_mode(manager, "auto") == "auto"
     assert manager.default_n_gpu_layers == -1
+
+    assert apply_compute_mode(manager, "hybrid") == "hybrid"
+    assert manager.default_n_gpu_layers > 0
 
 
 def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client():

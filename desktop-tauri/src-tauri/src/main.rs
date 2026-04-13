@@ -90,12 +90,53 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
     })
 }
 
+fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
+    let mut candidates = vec![manifest_dir.to_path_buf()];
+    if let Some(parent) = manifest_dir.parent() {
+        candidates.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.to_path_buf());
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn configure_runtime_pythonpath(command: &mut std::process::Command) {
+    // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
+    // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+        match std::env::var("PYTHONPATH") {
+            Ok(existing) if !existing.trim().is_empty() => {
+                let mut components = vec![PathBuf::from(&import_root)];
+                components.extend(std::env::split_paths(&existing));
+                if let Ok(joined) = std::env::join_paths(components) {
+                    command.env("PYTHONPATH", joined);
+                } else {
+                    command.env("PYTHONPATH", import_root);
+                }
+            }
+            _ => {
+                command.env("PYTHONPATH", import_root);
+            }
+        }
+    }
+}
+
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path()?;
-    let output = launcher
-        .command_for_script_blocking(bridge_script.to_str().unwrap_or_default())
+    let mut bridge_command =
+        launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
+    configure_runtime_pythonpath(&mut bridge_command);
+    let output = bridge_command
         .arg(action)
         .output()
         .map_err(|e| format!("unable to run model bridge: {e}"))?;

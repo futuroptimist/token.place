@@ -38,6 +38,7 @@ class ComputeNodeRuntimeConfig:
 
     relay_url: str
     relay_port: Optional[int]
+    use_configured_relay_fallbacks: bool = True
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
@@ -86,8 +87,11 @@ def first_env(keys: List[str]) -> Optional[str]:
     return None
 
 
-def resolve_relay_url(cli_default: str) -> str:
+def resolve_relay_url(cli_default: str, *, prefer_cli: bool = False) -> str:
     """Resolve the relay base URL from CLI or env."""
+
+    if prefer_cli and cli_default.strip():
+        return cli_default.strip()
 
     env_override = first_env(
         [
@@ -227,6 +231,7 @@ class ComputeNodeRuntime:
             port=runtime_config.relay_port,
             crypto_manager=self.crypto_manager,
             model_manager=self.model_manager,
+            include_configured_servers=runtime_config.use_configured_relay_fallbacks,
         )
         if request_adapters is None:
             self.request_adapters = [LegacyRelayRequestAdapter(self.relay_client)]

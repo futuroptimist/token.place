@@ -89,13 +89,14 @@ def run(args: argparse.Namespace) -> int:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
 
-    relay_url = resolve_relay_url(args.relay_url)
+    relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
             relay_url=relay_url,
             relay_port=relay_port,
+            use_configured_relay_fallbacks=False,
         )
     )
 

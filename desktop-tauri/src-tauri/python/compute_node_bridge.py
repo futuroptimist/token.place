@@ -95,6 +95,7 @@ def run(args: argparse.Namespace) -> int:
         ComputeNodeRuntimeConfig(
             relay_url=relay_url,
             relay_port=relay_port,
+            include_configured_relay_pool=False,
         )
     )
 

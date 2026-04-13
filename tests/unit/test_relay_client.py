@@ -97,6 +97,28 @@ def test_compose_relay_url_keeps_explicit_localhost_port():
     assert result == 'http://localhost:5000'
 
 
+def test_init_can_disable_configured_relay_pool(monkeypatch):
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    mock_config.get.side_effect = lambda key, default=None: {
+        'relay.request_timeout': 10,
+        'relay.server_url': 'https://token.place',
+        'relay.additional_servers': ['https://backup-relay.example'],
+    }.get(key, default)
+    monkeypatch.setattr('utils.networking.relay_client.get_config_lazy', lambda: mock_config)
+
+    relay_client = RelayClient(
+        base_url='http://127.0.0.1',
+        port=5010,
+        crypto_manager=MagicMock(public_key_b64='mock_public_key_b64'),
+        model_manager=MagicMock(),
+        include_configured_servers=False,
+    )
+
+    assert relay_client.relay_urls == ('http://127.0.0.1:5010',)
+    assert relay_client.relay_url == 'http://127.0.0.1:5010'
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

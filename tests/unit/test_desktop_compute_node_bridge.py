@@ -129,6 +129,14 @@ class IncompatibleRelayRuntime(FakeRuntime):
         self._processed = []
 
 
+class RuntimeConfigCapture(FakeRuntime):
+    last_config = None
+
+    def __init__(self, runtime_config):
+        RuntimeConfigCapture.last_config = runtime_config
+        super().__init__(runtime_config)
+
+
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     from utils.compute_node_runtime import (
         SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
@@ -137,9 +145,10 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
 
     module = ModuleType('utils.compute_node_runtime')
-    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port: SimpleNamespace(
+    module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
         relay_url=relay_url,
         relay_port=relay_port,
+        include_configured_relay_pool=kwargs.get('include_configured_relay_pool', True),
     )
     module.ComputeNodeRuntime = runtime_cls
     module.is_legacy_relay_payload = (
@@ -186,6 +195,26 @@ def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeyp
     assert event_types[-1] == 'stopped'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
+
+
+def test_run_disables_configured_relay_pool_for_desktop(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RuntimeConfigCapture)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='http://127.0.0.1:5010',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert RuntimeConfigCapture.last_config is not None
+    assert RuntimeConfigCapture.last_config.relay_url == 'http://127.0.0.1:5010'
+    assert RuntimeConfigCapture.last_config.include_configured_relay_pool is False
+    assert capsys.readouterr().out
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):
@@ -448,9 +477,10 @@ def is_legacy_relay_payload(_payload):
 
 
 class ComputeNodeRuntimeConfig:
-    def __init__(self, relay_url, relay_port):
+    def __init__(self, relay_url, relay_port, include_configured_relay_pool=True):
         self.relay_url = relay_url
         self.relay_port = relay_port
+        self.include_configured_relay_pool = include_configured_relay_pool
 
 
 class _RelayClient:

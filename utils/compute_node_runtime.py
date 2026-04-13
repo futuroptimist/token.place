@@ -38,6 +38,7 @@ class ComputeNodeRuntimeConfig:
 
     relay_url: str
     relay_port: Optional[int]
+    include_configured_relay_pool: bool = True
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
@@ -183,6 +184,7 @@ class ComputeNodeRuntime:
         self.relay_client = relay_client or RelayClient(
             base_url=runtime_config.relay_url,
             port=runtime_config.relay_port,
+            include_configured_servers=runtime_config.include_configured_relay_pool,
             crypto_manager=self.crypto_manager,
             model_manager=self.model_manager,
         )

@@ -123,9 +123,9 @@ fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, brid
         command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
-                if let Ok(joined) =
-                    std::env::join_paths([import_root.as_path(), Path::new(&existing)])
-                {
+                let mut components = vec![import_root.clone()];
+                components.extend(std::env::split_paths(&existing));
+                if let Ok(joined) = std::env::join_paths(components) {
                     command.env("PYTHONPATH", joined);
                 } else {
                     command.env("PYTHONPATH", import_root);

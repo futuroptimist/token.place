@@ -152,23 +152,24 @@ pub fn resolve_runtime_import_root(
     let mut candidates = Vec::new();
 
     if let Ok(explicit) = std::env::var("TOKEN_PLACE_PYTHON_IMPORT_ROOT") {
-        let explicit = PathBuf::from(explicit);
-        if !explicit.as_os_str().is_empty() {
-            candidates.push(explicit);
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            candidates.push(PathBuf::from(explicit));
         }
     }
 
     if let Some(script_path) = script_path {
-        let script_dir = script_path.parent()?;
-        if let Some(script_root) = script_dir.parent() {
-            candidates.push(script_root.to_path_buf());
-            let mut up = script_root.to_path_buf();
-            for _ in 0..4 {
-                up = up.join("_up_");
-                candidates.push(up.clone());
-            }
-            if let Some(root_parent) = script_root.parent() {
-                candidates.push(root_parent.to_path_buf());
+        if let Some(script_dir) = script_path.parent() {
+            if let Some(script_root) = script_dir.parent() {
+                candidates.push(script_root.to_path_buf());
+                let mut up = script_root.to_path_buf();
+                for _ in 0..2 {
+                    up = up.join("_up_");
+                    candidates.push(up.clone());
+                }
+                if let Some(root_parent) = script_root.parent() {
+                    candidates.push(root_parent.to_path_buf());
+                }
             }
         }
     }

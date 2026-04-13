@@ -54,3 +54,38 @@ def test_bootstrap_adds_repo_root_for_dev_layout(tmp_path, path_bootstrap):
         assert str(repo_root) in sys.path
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_supports_nested_up_packaged_layout(tmp_path, path_bootstrap):
+    script = tmp_path / 'bin' / 'resources' / 'python' / 'model_bridge.py'
+    import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
+    (import_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert str(import_root) in sys.path
+        assert sys.path.index(str(import_root)) == 0
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_bootstrap_prefers_explicit_env_import_root(tmp_path, path_bootstrap, monkeypatch):
+    script = tmp_path / 'bin' / 'resources' / 'python' / 'model_bridge.py'
+    fallback_root = tmp_path / 'bin' / 'resources' / '_up_'
+    explicit_root = tmp_path / 'explicit-import-root'
+    (fallback_root / 'utils').mkdir(parents=True)
+    (explicit_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(explicit_root))
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert str(explicit_root) in sys.path
+        assert sys.path.index(str(explicit_root)) == 0
+    finally:
+        sys.path[:] = original_sys_path

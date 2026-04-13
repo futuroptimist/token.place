@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::{resolve_python_launcher, PythonLauncher};
+use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -116,30 +116,16 @@ fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> 
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
-    let mut candidates = vec![manifest_dir.to_path_buf()];
-    if let Some(parent) = manifest_dir.parent() {
-        candidates.push(parent.to_path_buf());
-        if let Some(grandparent) = parent.parent() {
-            candidates.push(grandparent.to_path_buf());
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| {
-            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path) {
-    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, bridge_script: &str) {
+    if let Some(import_root) =
+        resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir)
+    {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
-                if let Ok(joined) =
-                    std::env::join_paths([Path::new(&import_root), Path::new(&existing)])
-                {
+                let mut components = vec![import_root.clone()];
+                components.extend(std::env::split_paths(&existing));
+                if let Ok(joined) = std::env::join_paths(components) {
                     command.env("PYTHONPATH", joined);
                 } else {
                     command.env("PYTHONPATH", import_root);
@@ -262,7 +248,7 @@ pub async fn start_compute_node(
             return Err(err);
         }
     };
-    configure_runtime_pythonpath(&mut bridge_command, manifest_dir);
+    configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
 
     let spawn_result = bridge_command
         .arg("--model")

@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::{resolve_python_launcher, PythonLauncher};
+use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -185,31 +185,17 @@ fn should_force_fake_sidecar() -> bool {
     )
 }
 
-fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
-    let mut candidates = vec![manifest_dir.to_path_buf()];
-    if let Some(parent) = manifest_dir.parent() {
-        candidates.push(parent.to_path_buf());
-        if let Some(grandparent) = parent.parent() {
-            candidates.push(grandparent.to_path_buf());
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| {
-            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-fn configure_runtime_pythonpath(command: &mut Command) {
+fn configure_runtime_pythonpath(command: &mut Command, sidecar_path: &str) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+    if let Some(import_root) =
+        resolve_runtime_import_root(Some(Path::new(sidecar_path)), manifest_dir)
+    {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
-                if let Ok(joined) =
-                    std::env::join_paths([Path::new(&import_root), Path::new(&existing)])
-                {
+                let mut components = vec![import_root.clone()];
+                components.extend(std::env::split_paths(&existing));
+                if let Ok(joined) = std::env::join_paths(components) {
                     command.env("PYTHONPATH", joined);
                 } else {
                     command.env("PYTHONPATH", import_root);
@@ -258,7 +244,7 @@ pub async fn start_sidecar(
     };
 
     let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
-    configure_runtime_pythonpath(&mut sidecar_command);
+    configure_runtime_pythonpath(&mut sidecar_command, &sidecar_script);
 
     let mut child = sidecar_command
         .arg("--model")

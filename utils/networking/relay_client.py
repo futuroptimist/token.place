@@ -192,7 +192,15 @@ class RelayClient:
         polling_thread.join(timeout=15)  # Wait for thread to finish
         ```
     """
-    def __init__(self, base_url: str, port: Optional[int], crypto_manager, model_manager):
+    def __init__(
+        self,
+        base_url: str,
+        port: Optional[int],
+        crypto_manager,
+        model_manager,
+        *,
+        include_configured_servers: bool = True,
+    ):
         """
         Initialize the RelayClient.
 
@@ -202,6 +210,8 @@ class RelayClient:
             port: Optional relay port injected only for non-HTTPS URLs without an explicit port
             crypto_manager: Instance of CryptoManager for encryption/decryption
             model_manager: Instance of ModelManager for LLM interaction
+            include_configured_servers: When True, include configured/env relay fallbacks
+                and relay cluster-only mode. When False, use only the explicit base relay.
         """
         self.base_url = base_url
         self.port = port
@@ -216,28 +226,30 @@ class RelayClient:
             config = get_config_lazy()
             self._request_timeout = config.get('relay.request_timeout', 10)
 
-            configured_servers = list(config.get('relay.additional_servers', []) or [])
+            if include_configured_servers:
+                configured_servers = list(config.get('relay.additional_servers', []) or [])
 
-            cf_fallbacks = config.get('relay.cloudflare_fallback_urls', []) or []
-            for entry in cf_fallbacks:
-                if entry not in configured_servers:
-                    configured_servers.append(entry)
+                cf_fallbacks = config.get('relay.cloudflare_fallback_urls', []) or []
+                for entry in cf_fallbacks:
+                    if entry not in configured_servers:
+                        configured_servers.append(entry)
 
-            pool_secondary = config.get('relay.server_pool_secondary', []) or []
-            for entry in pool_secondary:
-                if entry not in configured_servers:
-                    configured_servers.append(entry)
+                pool_secondary = config.get('relay.server_pool_secondary', []) or []
+                for entry in pool_secondary:
+                    if entry not in configured_servers:
+                        configured_servers.append(entry)
 
-            primary_config_url = config.get('relay.server_url', '')
-            if primary_config_url and primary_config_url not in configured_servers:
-                configured_servers.insert(0, primary_config_url)
+                primary_config_url = config.get('relay.server_url', '')
+                if primary_config_url and primary_config_url not in configured_servers:
+                    configured_servers.insert(0, primary_config_url)
 
-            cluster_only_value = config.get('relay.cluster_only', False)
-            parsed_cluster_only = _coerce_optional_bool(cluster_only_value)
-            if parsed_cluster_only is not None:
-                self._cluster_only = parsed_cluster_only
-            elif isinstance(cluster_only_value, bool):
-                self._cluster_only = cluster_only_value
+            if include_configured_servers:
+                cluster_only_value = config.get('relay.cluster_only', False)
+                parsed_cluster_only = _coerce_optional_bool(cluster_only_value)
+                if parsed_cluster_only is not None:
+                    self._cluster_only = parsed_cluster_only
+                elif isinstance(cluster_only_value, bool):
+                    self._cluster_only = cluster_only_value
 
             token_value = config.get('relay.server_registration_token', None)
             if not token_value:
@@ -246,42 +258,44 @@ class RelayClient:
 
         except Exception:
             self._request_timeout = 10  # Fallback default
-            cluster_env = _coerce_optional_bool(os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY'))
-            self._cluster_only = cluster_env if cluster_env is not None else False
+            if include_configured_servers:
+                cluster_env = _coerce_optional_bool(os.environ.get('TOKEN_PLACE_RELAY_CLUSTER_ONLY'))
+                self._cluster_only = cluster_env if cluster_env is not None else False
 
-            upstreams_raw = os.environ.get('TOKEN_PLACE_RELAY_UPSTREAMS', '')
-            if upstreams_raw:
-                normalised = upstreams_raw.replace('\n', ',')
-                configured_servers.extend(
-                    entry.strip()
-                    for entry in normalised.split(',')
-                    if entry and entry.strip()
-                )
-
-            cf_raw = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URLS', '')
-            cf_single = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', '')
-            combined = ','.join(part for part in (cf_raw, cf_single) if part)
-            if combined:
-                entries: List[str] = []
-                try:
-                    loaded = json.loads(combined)
-                except json.JSONDecodeError:
-                    normalised_cf = combined.replace('\n', ',')
-                    entries.extend(
-                        segment.strip()
-                        for segment in normalised_cf.split(',')
-                        if segment.strip()
+            if include_configured_servers:
+                upstreams_raw = os.environ.get('TOKEN_PLACE_RELAY_UPSTREAMS', '')
+                if upstreams_raw:
+                    normalised = upstreams_raw.replace('\n', ',')
+                    configured_servers.extend(
+                        entry.strip()
+                        for entry in normalised.split(',')
+                        if entry and entry.strip()
                     )
-                else:
-                    if isinstance(loaded, str):
-                        entries.append(loaded.strip())
-                    elif isinstance(loaded, (list, tuple)):
-                        for item in loaded:
-                            if isinstance(item, str) and item.strip():
-                                entries.append(item.strip())
-                for entry in entries:
-                    if entry and entry not in configured_servers:
-                        configured_servers.append(entry)
+
+                cf_raw = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URLS', '')
+                cf_single = os.environ.get('TOKEN_PLACE_RELAY_CLOUDFLARE_URL', '')
+                combined = ','.join(part for part in (cf_raw, cf_single) if part)
+                if combined:
+                    entries: List[str] = []
+                    try:
+                        loaded = json.loads(combined)
+                    except json.JSONDecodeError:
+                        normalised_cf = combined.replace('\n', ',')
+                        entries.extend(
+                            segment.strip()
+                            for segment in normalised_cf.split(',')
+                            if segment.strip()
+                        )
+                    else:
+                        if isinstance(loaded, str):
+                            entries.append(loaded.strip())
+                        elif isinstance(loaded, (list, tuple)):
+                            for item in loaded:
+                                if isinstance(item, str) and item.strip():
+                                    entries.append(item.strip())
+                    for entry in entries:
+                        if entry and entry not in configured_servers:
+                            configured_servers.append(entry)
 
             self._registration_token = _normalise_registration_token(
                 os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')

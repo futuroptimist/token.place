@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
+
+
+def _candidate_import_roots_from_resource_dir(resource_dir: Path) -> list[Path]:
+    candidates: list[Path] = [resource_dir]
+    current = resource_dir
+    for _ in range(4):
+        current = current / "_up_"
+        candidates.append(current)
+    return candidates
 
 
 def ensure_runtime_import_paths(script_file: str) -> None:
@@ -11,11 +21,25 @@ def ensure_runtime_import_paths(script_file: str) -> None:
 
     script_path = Path(script_file).resolve()
     script_root = script_path.parent.parent
+    env_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    env_resource_dir = os.environ.get("TOKEN_PLACE_RESOURCE_DIR", "").strip()
+
+    env_candidates: list[Path] = []
+    if env_import_root:
+        env_candidates.append(Path(env_import_root).expanduser())
+    if env_resource_dir:
+        env_candidates.extend(
+            _candidate_import_roots_from_resource_dir(Path(env_resource_dir).expanduser())
+        )
+
     candidates = [
+        *env_candidates,
         script_root,  # bundled resources root in packaged apps
         script_root / "resources",  # no-bundle/debug layout when script is under <exe>/python
         script_root / "Resources",  # macOS-style resources casing
         script_root / "_up_",  # tauri ".." resources are rewritten under _up_
+        script_root / "_up_" / "_up_",
+        script_root / "_up_" / "_up_" / "_up_",
         script_path.parent.parent.parent,
     ]
 

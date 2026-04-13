@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tauri::{Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -90,31 +90,25 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
     })
 }
 
-fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
-    let mut candidates = vec![manifest_dir.to_path_buf()];
-    if let Some(parent) = manifest_dir.parent() {
-        candidates.push(parent.to_path_buf());
-        if let Some(grandparent) = parent.parent() {
-            candidates.push(grandparent.to_path_buf());
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| {
-            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-fn configure_runtime_pythonpath(command: &mut std::process::Command) {
-    // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
-    // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
+fn configure_runtime_python_env(command: &mut std::process::Command, app: Option<&AppHandle>) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+    let resource_dir = app.and_then(|handle| handle.path().resource_dir().ok());
+    if let Some(resource_dir) = resource_dir.as_ref() {
+        command.env(
+            python_runtime::RESOURCE_DIR_ENV,
+            resource_dir.to_string_lossy().as_ref(),
+        );
+    }
+    if let Some(import_root) =
+        python_runtime::resolve_runtime_import_root(resource_dir.as_deref(), manifest_dir)
+    {
+        command.env(
+            python_runtime::PYTHON_IMPORT_ROOT_ENV,
+            import_root.to_string_lossy().as_ref(),
+        );
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
-                let mut components = vec![PathBuf::from(&import_root)];
+                let mut components = vec![import_root.clone()];
                 components.extend(std::env::split_paths(&existing));
                 if let Ok(joined) = std::env::join_paths(components) {
                     command.env("PYTHONPATH", joined);
@@ -129,13 +123,13 @@ fn configure_runtime_pythonpath(command: &mut std::process::Command) {
     }
 }
 
-fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
+fn run_model_bridge(action: &str, app: Option<&AppHandle>) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path()?;
     let mut bridge_command =
         launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
-    configure_runtime_pythonpath(&mut bridge_command);
+    configure_runtime_python_env(&mut bridge_command, app);
     let output = bridge_command
         .arg(action)
         .output()
@@ -329,13 +323,13 @@ async fn get_compute_node_status(
 }
 
 #[tauri::command]
-fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
-    run_model_bridge("inspect")
+fn inspect_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    run_model_bridge("inspect", Some(&app))
 }
 
 #[tauri::command]
-async fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
-    tokio::task::spawn_blocking(|| run_model_bridge("download"))
+async fn download_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    tokio::task::spawn_blocking(move || run_model_bridge("download", Some(&app)))
         .await
         .map_err(|e| format!("download bridge task failed: {e}"))?
 }

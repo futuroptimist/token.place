@@ -1,9 +1,56 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
     pub program: String,
     pub args: Vec<String>,
+}
+
+pub const PYTHON_IMPORT_ROOT_ENV: &str = "TOKEN_PLACE_PYTHON_IMPORT_ROOT";
+pub const RESOURCE_DIR_ENV: &str = "TOKEN_PLACE_RESOURCE_DIR";
+
+fn has_runtime_modules(candidate: &Path) -> bool {
+    candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
+}
+
+fn runtime_import_candidates_from_resource_dir(resource_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut current = resource_dir.to_path_buf();
+    candidates.push(current.clone());
+
+    for _ in 0..4 {
+        current = current.join("_up_");
+        candidates.push(current.clone());
+    }
+
+    candidates
+}
+
+pub fn resolve_runtime_import_root(
+    resource_dir: Option<&Path>,
+    manifest_dir: &Path,
+) -> Option<PathBuf> {
+    if let Some(resource_dir) = resource_dir {
+        if let Some(import_root) = runtime_import_candidates_from_resource_dir(resource_dir)
+            .into_iter()
+            .find(|candidate| has_runtime_modules(candidate))
+        {
+            return Some(import_root);
+        }
+    }
+
+    let mut repo_candidates = vec![manifest_dir.to_path_buf()];
+    if let Some(parent) = manifest_dir.parent() {
+        repo_candidates.push(parent.to_path_buf());
+        if let Some(grandparent) = parent.parent() {
+            repo_candidates.push(grandparent.to_path_buf());
+        }
+    }
+
+    repo_candidates
+        .into_iter()
+        .find(|candidate| has_runtime_modules(candidate))
 }
 
 impl PythonLauncher {
@@ -152,6 +199,7 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -307,5 +355,24 @@ mod tests {
         assert!(msg.contains("python  -> status="));
         assert!(msg.contains("Python 2.7.18"));
         assert!(msg.contains("python3  -> spawn failed"));
+    }
+
+    #[test]
+    fn runtime_import_root_prefers_packaged_up_path_when_present() {
+        let temp = TempDir::new().expect("tempdir");
+        let resource_dir = temp.path().join("resources");
+        let import_root = resource_dir.join("_up_").join("_up_");
+        std::fs::create_dir_all(import_root.join("utils")).expect("create utils");
+
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+
+        let resolved =
+            resolve_runtime_import_root(Some(&resource_dir), &manifest_dir).expect("import root");
+        assert_eq!(resolved, import_root);
     }
 }

@@ -116,29 +116,28 @@ fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> 
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
-    let mut candidates = vec![manifest_dir.to_path_buf()];
-    if let Some(parent) = manifest_dir.parent() {
-        candidates.push(parent.to_path_buf());
-        if let Some(grandparent) = parent.parent() {
-            candidates.push(grandparent.to_path_buf());
-        }
+fn configure_runtime_python_env(
+    command: &mut Command,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) {
+    if let Some(resource_dir) = resource_dir {
+        command.env(
+            crate::python_runtime::RESOURCE_DIR_ENV,
+            resource_dir.to_string_lossy().as_ref(),
+        );
     }
-
-    candidates
-        .into_iter()
-        .find(|candidate| {
-            candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path) {
-    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+    if let Some(import_root) =
+        crate::python_runtime::resolve_runtime_import_root(resource_dir, manifest_dir)
+    {
+        command.env(
+            crate::python_runtime::PYTHON_IMPORT_ROOT_ENV,
+            import_root.to_string_lossy().as_ref(),
+        );
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
                 if let Ok(joined) =
-                    std::env::join_paths([Path::new(&import_root), Path::new(&existing)])
+                    std::env::join_paths([import_root.as_path(), Path::new(&existing)])
                 {
                     command.env("PYTHONPATH", joined);
                 } else {
@@ -262,7 +261,8 @@ pub async fn start_compute_node(
             return Err(err);
         }
     };
-    configure_runtime_pythonpath(&mut bridge_command, manifest_dir);
+    let resource_dir = app.path().resource_dir().ok();
+    configure_runtime_python_env(&mut bridge_command, manifest_dir, resource_dir.as_deref());
 
     let spawn_result = bridge_command
         .arg("--model")

@@ -16,13 +16,19 @@ def test_windows_install_plan_requests_cuda_build_flags():
 
     assert plan.backend == "cuda"
     assert plan.package_spec.startswith("llama-cpp-python==")
-    assert plan.extra_index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    assert plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    assert plan.extra_index_url == "https://pypi.org/simple"
+    assert plan.only_binary is True
     assert plan.pip_env() == {}
     assert plan.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",
-        "--extra-index-url",
+        "--index-url",
         "https://abetlen.github.io/llama-cpp-python/whl/cu124",
+        "--extra-index-url",
+        "https://pypi.org/simple",
+        "--only-binary",
+        "llama-cpp-python",
         "--prefer-binary",
     ]
 
@@ -32,13 +38,19 @@ def test_macos_install_plan_requests_metal_build_flags():
 
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
-    assert plan.extra_index_url == "https://abetlen.github.io/llama-cpp-python/whl/metal"
+    assert plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/metal"
+    assert plan.extra_index_url == "https://pypi.org/simple"
+    assert plan.only_binary is True
     assert plan.pip_env() == {}
     assert plan.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",
-        "--extra-index-url",
+        "--index-url",
         "https://abetlen.github.io/llama-cpp-python/whl/metal",
+        "--extra-index-url",
+        "https://pypi.org/simple",
+        "--only-binary",
+        "llama-cpp-python",
         "--prefer-binary",
     ]
 

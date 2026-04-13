@@ -16,12 +16,19 @@ class LlamaCppInstallPlan:
     package_spec: str
     cmake_args: str | None
     force_cmake: bool
+    index_url: str | None = None
     extra_index_url: str | None = None
+    only_binary: bool = False
 
     def pip_install_args(self) -> list[str]:
         args = ["--upgrade", "--no-cache-dir"]
+        if self.index_url:
+            args.extend(["--index-url", self.index_url])
         if self.extra_index_url:
             args.extend(["--extra-index-url", self.extra_index_url])
+        if self.only_binary:
+            args.extend(["--only-binary", "llama-cpp-python"])
+        if self.index_url or self.extra_index_url:
             args.append("--prefer-binary")
         return args
 
@@ -65,7 +72,9 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args=None,
             force_cmake=False,
-            extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+            index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+            extra_index_url="https://pypi.org/simple",
+            only_binary=True,
         )
 
     if detected_platform == "darwin":
@@ -75,7 +84,9 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args=None,
             force_cmake=False,
-            extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/metal",
+            index_url="https://abetlen.github.io/llama-cpp-python/whl/metal",
+            extra_index_url="https://pypi.org/simple",
+            only_binary=True,
         )
 
     return LlamaCppInstallPlan(

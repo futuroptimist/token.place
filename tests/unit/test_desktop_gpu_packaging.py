@@ -16,10 +16,15 @@ def test_windows_install_plan_requests_cuda_build_flags():
 
     assert plan.backend == "cuda"
     assert plan.package_spec.startswith("llama-cpp-python==")
-    assert plan.pip_env() == {
-        "CMAKE_ARGS": "-DGGML_CUDA=on",
-        "FORCE_CMAKE": "1",
-    }
+    assert plan.extra_index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    assert plan.pip_env() == {}
+    assert plan.pip_install_args() == [
+        "--upgrade",
+        "--no-cache-dir",
+        "--extra-index-url",
+        "https://abetlen.github.io/llama-cpp-python/whl/cu124",
+        "--prefer-binary",
+    ]
 
 
 def test_macos_install_plan_requests_metal_build_flags():
@@ -27,10 +32,15 @@ def test_macos_install_plan_requests_metal_build_flags():
 
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
-    assert plan.pip_env() == {
-        "CMAKE_ARGS": "-DGGML_METAL=on -DGGML_NATIVE=off",
-        "FORCE_CMAKE": "1",
-    }
+    assert plan.extra_index_url == "https://abetlen.github.io/llama-cpp-python/whl/metal"
+    assert plan.pip_env() == {}
+    assert plan.pip_install_args() == [
+        "--upgrade",
+        "--no-cache-dir",
+        "--extra-index-url",
+        "https://abetlen.github.io/llama-cpp-python/whl/metal",
+        "--prefer-binary",
+    ]
 
 
 def test_linux_install_plan_remains_cpu_default():
@@ -38,3 +48,4 @@ def test_linux_install_plan_remains_cpu_default():
 
     assert plan.backend == "cpu"
     assert plan.pip_env() == {}
+    assert plan.pip_install_args() == ["--upgrade", "--no-cache-dir"]

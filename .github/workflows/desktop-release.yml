@@ -96,11 +96,13 @@ jobs:
           from desktop_gpu_packaging import llama_cpp_install_plan
 
           plan = llama_cpp_install_plan(platform=sys.platform, requirements_path=repo_root / "requirements.txt")
-          command = [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", plan.package_spec]
+          command = [sys.executable, "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec]
           env = os.environ.copy()
           env.update(plan.pip_env())
 
           print(f"Installing {plan.package_spec} for backend={plan.backend} on platform={sys.platform}")
+          if plan.extra_index_url:
+              print(f"Using wheel index: {plan.extra_index_url}")
           if plan.pip_env():
               print(f"Using build env: {plan.pip_env()}")
           subprocess.check_call(command, env=env)

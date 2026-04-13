@@ -16,6 +16,14 @@ class LlamaCppInstallPlan:
     package_spec: str
     cmake_args: str | None
     force_cmake: bool
+    extra_index_url: str | None = None
+
+    def pip_install_args(self) -> list[str]:
+        args = ["--upgrade", "--no-cache-dir"]
+        if self.extra_index_url:
+            args.extend(["--extra-index-url", self.extra_index_url])
+            args.append("--prefer-binary")
+        return args
 
     def pip_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
@@ -55,8 +63,9 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="cuda",
             package_spec=package_spec,
-            cmake_args="-DGGML_CUDA=on",
-            force_cmake=True,
+            cmake_args=None,
+            force_cmake=False,
+            extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
         )
 
     if detected_platform == "darwin":
@@ -64,8 +73,9 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="metal",
             package_spec=package_spec,
-            cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
-            force_cmake=True,
+            cmake_args=None,
+            force_cmake=False,
+            extra_index_url="https://abetlen.github.io/llama-cpp-python/whl/metal",
         )
 
     return LlamaCppInstallPlan(

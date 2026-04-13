@@ -2,6 +2,9 @@
 
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -109,3 +112,47 @@ def test_main_dispatches_download_action():
             assert model_bridge.main() == 0
 
     download_model.assert_called_once_with()
+
+
+def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):
+    """Regression: pre-fix exe/python + resources layout failed with No module named 'utils'."""
+    python_dir = tmp_path / 'bin' / 'python'
+    resources_dir = tmp_path / 'bin' / 'resources'
+    utils_llm_dir = resources_dir / 'utils' / 'llm'
+    python_dir.mkdir(parents=True)
+    utils_llm_dir.mkdir(parents=True)
+
+    (python_dir / 'model_bridge.py').write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
+    path_bootstrap_path = MODULE_PATH.parent / 'path_bootstrap.py'
+    (python_dir / 'path_bootstrap.py').write_text(path_bootstrap_path.read_text(encoding='utf-8'), encoding='utf-8')
+    (resources_dir / 'utils' / '__init__.py').write_text('', encoding='utf-8')
+    (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_llm_dir / 'model_manager.py').write_text(
+        """
+class _Manager:
+    def get_model_artifact_metadata(self):
+        return {"filename": "mock.gguf", "exists": False}
+
+
+def get_model_manager():
+    return _Manager()
+""".strip()
+        + "\n",
+        encoding='utf-8',
+    )
+
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    result = subprocess.run(
+        [sys.executable, str(python_dir / 'model_bridge.py'), 'inspect'],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload['ok'] is True
+    assert payload['payload']['filename'] == 'mock.gguf'
+    assert "Missing Python dependency for model downloads" not in result.stdout

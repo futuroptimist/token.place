@@ -28,7 +28,7 @@ def test_macos_install_plan_requests_metal_build_flags():
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
     assert plan.pip_env() == {
-        "CMAKE_ARGS": "-DGGML_METAL=on",
+        "CMAKE_ARGS": "-DGGML_METAL=on -DGGML_NATIVE=off",
         "FORCE_CMAKE": "1",
     }
 

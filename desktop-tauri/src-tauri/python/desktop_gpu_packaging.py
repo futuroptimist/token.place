@@ -64,7 +64,7 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="metal",
             package_spec=package_spec,
-            cmake_args="-DGGML_METAL=on",
+            cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
             force_cmake=True,
         )
 

@@ -202,9 +202,39 @@ fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn configure_runtime_pythonpath(command: &mut Command) {
+fn resolve_runtime_import_root(
+    sidecar_script: &Path,
+    manifest_dir: &Path,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    let resource_dir = sidecar_script.parent().and_then(|parent| parent.parent());
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = resource_dir {
+        candidates.push(resource_dir.to_path_buf());
+        let mut nested = resource_dir.to_path_buf();
+        for _ in 0..4 {
+            nested = nested.join("_up_");
+            candidates.push(nested.clone());
+        }
+    }
+    if let Some(repo_root) = repo_runtime_import_root(manifest_dir) {
+        candidates.push(std::path::PathBuf::from(repo_root));
+    }
+    let import_root = candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned());
+    (resource_dir.map(Path::to_path_buf), import_root)
+}
+
+fn configure_runtime_pythonpath(command: &mut Command, sidecar_script: &str) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+    let sidecar_path = Path::new(sidecar_script);
+    let (resource_dir, import_root) = resolve_runtime_import_root(sidecar_path, manifest_dir);
+    if let Some(resource_dir) = resource_dir {
+        command.env("TOKEN_PLACE_RESOURCE_DIR", resource_dir);
+    }
+    if let Some(import_root) = import_root {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
                 if let Ok(joined) =
@@ -258,7 +288,7 @@ pub async fn start_sidecar(
     };
 
     let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
-    configure_runtime_pythonpath(&mut sidecar_command);
+    configure_runtime_pythonpath(&mut sidecar_command, &sidecar_script);
 
     let mut child = sidecar_command
         .arg("--model")

@@ -107,11 +107,43 @@ fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn configure_runtime_pythonpath(command: &mut std::process::Command) {
+fn resolve_runtime_import_root(
+    bridge_script: &Path,
+    manifest_dir: &Path,
+) -> (Option<PathBuf>, Option<String>) {
+    let resource_dir = bridge_script.parent().and_then(|parent| parent.parent());
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = resource_dir {
+        candidates.push(resource_dir.to_path_buf());
+        let mut nested = resource_dir.to_path_buf();
+        for _ in 0..4 {
+            nested = nested.join("_up_");
+            candidates.push(nested.clone());
+        }
+    }
+    if let Some(repo_root) = repo_runtime_import_root(manifest_dir) {
+        candidates.push(PathBuf::from(repo_root));
+    }
+    let import_root = candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned());
+    (resource_dir.map(Path::to_path_buf), import_root)
+}
+
+fn configure_runtime_pythonpath(
+    command: &mut std::process::Command,
+    bridge_script: &Path,
+    manifest_dir: &Path,
+) {
+    let (resource_dir, import_root) = resolve_runtime_import_root(bridge_script, manifest_dir);
+    if let Some(resource_dir) = resource_dir {
+        command.env("TOKEN_PLACE_RESOURCE_DIR", resource_dir);
+    }
     // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
     // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
+    if let Some(import_root) = import_root {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
                 let mut components = vec![PathBuf::from(&import_root)];
@@ -130,12 +162,13 @@ fn configure_runtime_pythonpath(command: &mut std::process::Command) {
 }
 
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path()?;
     let mut bridge_command =
         launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
-    configure_runtime_pythonpath(&mut bridge_command);
+    configure_runtime_pythonpath(&mut bridge_command, &bridge_script, manifest_dir);
     let output = bridge_command
         .arg(action)
         .output()

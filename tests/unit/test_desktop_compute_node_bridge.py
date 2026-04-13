@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+import os
 import queue
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -400,3 +402,104 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     status = compute_node_bridge.main()
     assert status == 0
     assert captured['mode'] == 'auto'
+
+
+def test_compute_node_subprocess_resolves_nested_up_packaged_layout(tmp_path):
+    python_dir = tmp_path / 'installed' / 'resources' / 'python'
+    runtime_root = tmp_path / 'installed' / 'resources' / '_up_' / '_up_'
+    utils_dir = runtime_root / 'utils'
+    python_dir.mkdir(parents=True)
+    utils_dir.mkdir(parents=True)
+
+    (python_dir / 'compute_node_bridge.py').write_text(
+        MODULE_PATH.read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    bridge_bootstrap = MODULE_PATH.parent / 'path_bootstrap.py'
+    (python_dir / 'path_bootstrap.py').write_text(
+        bridge_bootstrap.read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    (utils_dir / '__init__.py').write_text('', encoding='utf-8')
+    (utils_dir / 'compute_node_runtime.py').write_text(
+        """
+def normalize_compute_mode(mode):
+    return mode.lower()
+
+
+def apply_compute_mode(_manager, mode):
+    return mode
+
+
+def resolve_relay_url(relay_url):
+    return relay_url
+
+
+def resolve_relay_port(relay_port, _relay_url):
+    return relay_port
+
+
+def is_legacy_relay_payload(payload):
+    return False
+
+
+class _RelayClient:
+    relay_url = "https://token.place"
+
+
+class _ModelManager:
+    model_path = ""
+
+
+class ComputeNodeRuntimeConfig:
+    def __init__(self, relay_url, relay_port):
+        self.relay_url = relay_url
+        self.relay_port = relay_port
+
+
+class ComputeNodeRuntime:
+    def __init__(self, _config):
+        self.model_manager = _ModelManager()
+        self.relay_client = _RelayClient()
+
+    def ensure_model_ready(self):
+        return True
+
+    def register_and_poll_once(self):
+        return {"next_ping_in_x_seconds": 0}
+
+    def process_relay_request(self, _payload):
+        return True
+
+    def stop(self):
+        return None
+""".strip()
+        + "\n",
+        encoding='utf-8',
+    )
+
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    env['TOKEN_PLACE_RESOURCE_DIR'] = str(tmp_path / 'installed' / 'resources')
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(python_dir / 'compute_node_bridge.py'),
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'cpu',
+            '--relay-url',
+            'https://token.place',
+        ],
+        input='{"type":"cancel"}\n',
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'stopped'

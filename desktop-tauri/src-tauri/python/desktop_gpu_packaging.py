@@ -96,3 +96,49 @@ def llama_cpp_install_plan(
         cmake_args=None,
         force_cmake=False,
     )
+
+
+def llama_cpp_install_plan_fallbacks(
+    platform: str | None = None,
+    requirements_path: str | Path = "requirements.txt",
+) -> list[LlamaCppInstallPlan]:
+    """Return ordered install plans with conservative fallbacks per platform."""
+
+    primary = llama_cpp_install_plan(platform=platform, requirements_path=requirements_path)
+    plans = [primary]
+
+    if primary.platform.startswith("win"):
+        # 0.3.16 CUDA indexes publish Linux wheels only; keep desktop CI/release
+        # buildable by falling back to the pinned PyPI package when CUDA wheels
+        # are unavailable for the current Python ABI.
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="cpu",
+                package_spec=primary.package_spec,
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=False,
+            )
+        )
+
+    if primary.platform == "darwin":
+        # The Metal wheel can intermittently fail integrity checks in CI.
+        # Fall back to a deterministic source build with Metal enabled and
+        # GGML native tuning disabled to avoid arm64 i8mm compile issues.
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="metal",
+                package_spec=primary.package_spec,
+                cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=False,
+            )
+        )
+
+    return plans

@@ -93,30 +93,38 @@ jobs:
           desktop_python_root = repo_root / "desktop-tauri" / "src-tauri" / "python"
           sys.path.insert(0, str(desktop_python_root))
 
-          from desktop_gpu_packaging import llama_cpp_install_plan
+          from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks
 
-          plan = llama_cpp_install_plan(platform=sys.platform, requirements_path=repo_root / "requirements.txt")
-          install_args = plan.pip_install_args()
-          command = [sys.executable, "-m", "pip", "install", *install_args, plan.package_spec]
-          env = os.environ.copy()
-          env.update(plan.pip_env())
+          plans = llama_cpp_install_plan_fallbacks(platform=sys.platform, requirements_path=repo_root / "requirements.txt")
 
-          print(f"Installing {plan.package_spec} for backend={plan.backend} on platform={sys.platform}")
-          if plan.index_url:
-              print(f"Using primary wheel index: {plan.index_url}")
-          if plan.extra_index_url:
-              print(f"Using extra package index: {plan.extra_index_url}")
-          if plan.pip_env():
-              print(f"Using build env: {plan.pip_env()}")
+          for plan_index, plan in enumerate(plans, start=1):
+              install_args = plan.pip_install_args()
+              command = [sys.executable, "-m", "pip", "install", *install_args, plan.package_spec]
+              env = os.environ.copy()
+              env.update(plan.pip_env())
 
-          for attempt in range(1, 4):
-              try:
-                  subprocess.check_call(command, env=env)
-                  break
-              except subprocess.CalledProcessError:
-                  if attempt >= 3:
-                      raise
-                  print(f"Install attempt {attempt} failed, retrying...")
+              print(f"Installing {plan.package_spec} for backend={plan.backend} on platform={sys.platform}")
+              print(f"Install plan {plan_index}/{len(plans)}")
+              if plan.index_url:
+                  print(f"Using primary wheel index: {plan.index_url}")
+              if plan.extra_index_url:
+                  print(f"Using extra package index: {plan.extra_index_url}")
+              if plan.pip_env():
+                  print(f"Using build env: {plan.pip_env()}")
+
+              for attempt in range(1, 4):
+                  try:
+                      subprocess.check_call(command, env=env)
+                      raise SystemExit(0)
+                  except subprocess.CalledProcessError:
+                      if attempt >= 3:
+                          print(f"Install attempt {attempt} failed for plan {plan_index}.")
+                      else:
+                          print(f"Install attempt {attempt} failed, retrying...")
+
+              print(f"Falling back from plan {plan_index} to next candidate...")
+
+          raise RuntimeError("Failed to install llama-cpp-python for all configured plans")
           PY
 
       - name: Build frontend assets

@@ -58,8 +58,118 @@ class ModelManager:
         # Check if mock mode is enabled
         self.use_mock_llm = config.get('model.use_mock', False) or os.getenv('USE_MOCK_LLM') == '1'
         self.default_n_gpu_layers = config.get('model.n_gpu_layers', -1)
+        self.hybrid_n_gpu_layers = config.get('model.hybrid_n_gpu_layers', 24)
         self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
+        self.requested_compute_mode = 'auto'
+        self.last_compute_diagnostics = {
+            'requested_mode': 'auto',
+            'effective_mode': 'pending',
+            'backend_available': 'unknown',
+            'backend_selected': 'unknown',
+            'backend_used': 'unknown',
+            'n_gpu_layers': self.default_n_gpu_layers,
+            'fallback_reason': None,
+        }
+
+    @staticmethod
+    def _platform_gpu_backend() -> Optional[str]:
+        if sys.platform == 'darwin':
+            return 'metal'
+        if sys.platform.startswith('win'):
+            return 'cuda'
+        return None
+
+    @staticmethod
+    def _llama_gpu_offload_available() -> bool:
+        try:
+            import llama_cpp
+        except Exception:
+            return False
+
+        supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+        if callable(supports_gpu):
+            try:
+                return bool(supports_gpu())
+            except Exception:
+                return False
+
+        for marker in ('GGML_USE_CUDA', 'GGML_USE_METAL'):
+            if bool(getattr(llama_cpp, marker, False)):
+                return True
+        return False
+
+    def _resolve_compute_plan(self) -> Dict[str, Any]:
+        requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
+        backend_available = self._platform_gpu_backend() or 'cpu'
+        gpu_runtime_supported = self._llama_gpu_offload_available()
+        fallback_reason = None
+
+        if requested == 'auto':
+            n_gpu_layers = int(self.default_n_gpu_layers)
+            gpu_requested = n_gpu_layers != 0
+            backend_selected = backend_available if gpu_requested else 'cpu'
+            return {
+                'requested_mode': requested,
+                'effective_mode': backend_selected if gpu_requested else 'cpu',
+                'backend_available': backend_available,
+                'backend_selected': backend_selected,
+                'backend_used': backend_selected if gpu_requested else 'cpu',
+                'n_gpu_layers': n_gpu_layers,
+                'fallback_reason': None,
+            }
+
+        if requested == 'cpu':
+            return {
+                'requested_mode': requested,
+                'effective_mode': 'cpu',
+                'backend_available': backend_available,
+                'backend_selected': 'cpu',
+                'backend_used': 'cpu',
+                'n_gpu_layers': 0,
+                'fallback_reason': None,
+            }
+
+        if backend_available == 'cpu':
+            fallback_reason = 'no CUDA/Metal backend is supported on this platform'
+        elif not gpu_runtime_supported:
+            fallback_reason = (
+                f'llama-cpp-python runtime does not expose {backend_available} GPU offload support'
+            )
+
+        if fallback_reason:
+            return {
+                'requested_mode': requested,
+                'effective_mode': 'cpu_fallback',
+                'backend_available': backend_available,
+                'backend_selected': backend_available,
+                'backend_used': 'cpu',
+                'n_gpu_layers': 0,
+                'fallback_reason': fallback_reason,
+            }
+
+        if requested == 'hybrid':
+            n_gpu_layers = max(1, int(self.hybrid_n_gpu_layers))
+            return {
+                'requested_mode': requested,
+                'effective_mode': f'hybrid_{backend_available}',
+                'backend_available': backend_available,
+                'backend_selected': backend_available,
+                'backend_used': backend_available,
+                'n_gpu_layers': n_gpu_layers,
+                'fallback_reason': None,
+            }
+
+        # Explicit ``gpu`` uses full offload when backend support is available.
+        return {
+            'requested_mode': requested,
+            'effective_mode': backend_available,
+            'backend_available': backend_available,
+            'backend_selected': backend_available,
+            'backend_used': backend_available,
+            'n_gpu_layers': -1,
+            'fallback_reason': None,
+        }
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
@@ -233,7 +343,8 @@ class ModelManager:
                             # Dynamically import Llama only when needed
                             from llama_cpp import Llama
 
-                            n_gpu_layers = self.default_n_gpu_layers
+                            compute_plan = self._resolve_compute_plan()
+                            n_gpu_layers = int(compute_plan['n_gpu_layers'])
                             if self.enforce_gpu_headroom and n_gpu_layers != 0:
                                 try:
                                     model_size = os.path.getsize(self.model_path)
@@ -249,6 +360,11 @@ class ModelManager:
                                             "to CPU inference for this model."
                                         )
                                         n_gpu_layers = 0
+                                        compute_plan['effective_mode'] = 'cpu_fallback'
+                                        compute_plan['backend_used'] = 'cpu'
+                                        compute_plan['fallback_reason'] = (
+                                            'insufficient GPU memory headroom for safe offload'
+                                        )
 
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
                             self.llm = Llama(
@@ -257,6 +373,8 @@ class ModelManager:
                                 n_ctx=self.config.get('model.context_size', 8192),
                                 chat_format=self.config.get('model.chat_format', 'llama-3')
                             )
+                            compute_plan['n_gpu_layers'] = n_gpu_layers
+                            self.last_compute_diagnostics = compute_plan
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

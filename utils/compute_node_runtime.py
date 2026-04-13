@@ -134,13 +134,15 @@ def format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
     return f"{relay_url}:{relay_port}"
 
 
-SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "metal", "cuda"})
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "gpu", "hybrid"})
+LEGACY_COMPUTE_MODE_ALIASES = {"cuda": "gpu", "metal": "gpu"}
 
 
 def normalize_compute_mode(mode: Optional[str]) -> str:
     """Normalize operator-provided compute mode values."""
 
     selected = (mode or "auto").strip().lower()
+    selected = LEGACY_COMPUTE_MODE_ALIASES.get(selected, selected)
     if selected in SUPPORTED_COMPUTE_MODES:
         return selected
     return "auto"
@@ -150,13 +152,44 @@ def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
     """Apply normalized compute mode to model-manager GPU settings."""
 
     selected = normalize_compute_mode(mode)
+    manager.requested_compute_mode = selected
     if selected == "cpu":
         manager.default_n_gpu_layers = 0
+    elif selected == "hybrid":
+        manager.default_n_gpu_layers = getattr(manager, "hybrid_n_gpu_layers", 24)
     else:
-        # ``auto`` follows runtime autodetection and maps to GPU-preferred layers where available.
-        # ``metal`` and ``cuda`` also request GPU-backed inference on supported hosts.
+        # ``auto`` and explicit ``gpu`` request full offload when a compatible backend exists.
         manager.default_n_gpu_layers = -1
     return selected
+
+
+def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
+    """Return compute-mode diagnostics from manager state for bridge/UI status payloads."""
+
+    runtime = getattr(manager, "last_compute_diagnostics", None)
+    if isinstance(runtime, dict):
+        return dict(runtime)
+
+    requested = normalize_compute_mode(getattr(manager, "requested_compute_mode", "auto"))
+    if requested == "cpu":
+        return {
+            "requested_mode": requested,
+            "effective_mode": "cpu",
+            "backend_available": "unknown",
+            "backend_selected": "cpu",
+            "backend_used": "cpu",
+            "n_gpu_layers": 0,
+            "fallback_reason": None,
+        }
+    return {
+        "requested_mode": requested,
+        "effective_mode": "pending",
+        "backend_available": "unknown",
+        "backend_selected": "unknown",
+        "backend_used": "unknown",
+        "n_gpu_layers": getattr(manager, "default_n_gpu_layers", -1),
+        "fallback_reason": None,
+    }
 
 
 class ComputeNodeRuntime:

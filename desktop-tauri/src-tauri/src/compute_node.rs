@@ -23,7 +23,12 @@ pub struct ComputeNodeStatus {
     pub running: bool,
     pub registered: bool,
     pub active_relay_url: String,
-    pub backend_mode: String,
+    pub requested_mode: String,
+    pub effective_mode: String,
+    pub backend_available: String,
+    pub backend_selected: String,
+    pub backend_used: String,
+    pub fallback_reason: Option<String>,
     pub model_path: String,
     pub last_error: Option<String>,
 }
@@ -143,7 +148,12 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         running: false,
         registered: false,
         active_relay_url: request.relay_base_url.clone(),
-        backend_mode: format!("{:?}", request.mode).to_lowercase(),
+        requested_mode: format!("{:?}", request.mode).to_lowercase(),
+        effective_mode: "cpu".into(),
+        backend_available: "unknown".into(),
+        backend_selected: "cpu".into(),
+        backend_used: "cpu".into(),
+        fallback_reason: None,
         model_path: request.model_path.clone(),
         last_error: Some(last_error),
     }
@@ -159,8 +169,26 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     if let Some(active_relay_url) = payload.get("active_relay_url").and_then(Value::as_str) {
         status.active_relay_url = active_relay_url.into();
     }
-    if let Some(backend_mode) = payload.get("backend_mode").and_then(Value::as_str) {
-        status.backend_mode = backend_mode.into();
+    if let Some(requested_mode) = payload.get("requested_mode").and_then(Value::as_str) {
+        status.requested_mode = requested_mode.into();
+    }
+    if let Some(effective_mode) = payload.get("effective_mode").and_then(Value::as_str) {
+        status.effective_mode = effective_mode.into();
+    }
+    if let Some(backend_available) = payload.get("backend_available").and_then(Value::as_str) {
+        status.backend_available = backend_available.into();
+    }
+    if let Some(backend_selected) = payload.get("backend_selected").and_then(Value::as_str) {
+        status.backend_selected = backend_selected.into();
+    }
+    if let Some(backend_used) = payload.get("backend_used").and_then(Value::as_str) {
+        status.backend_used = backend_used.into();
+    }
+    if payload.get("fallback_reason").is_some() {
+        status.fallback_reason = payload
+            .get("fallback_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
     }
     if let Some(model_path) = payload.get("model_path").and_then(Value::as_str) {
         status.model_path = model_path.into();
@@ -301,7 +329,12 @@ pub async fn start_compute_node(
             running: true,
             registered: false,
             active_relay_url: request.relay_base_url.clone(),
-            backend_mode: format!("{:?}", request.mode).to_lowercase(),
+            requested_mode: format!("{:?}", request.mode).to_lowercase(),
+            effective_mode: "cpu".into(),
+            backend_available: "unknown".into(),
+            backend_selected: "cpu".into(),
+            backend_used: "cpu".into(),
+            fallback_reason: None,
             model_path: request.model_path.clone(),
             last_error: None,
         };

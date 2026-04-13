@@ -78,6 +78,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         from utils.compute_node_runtime import (
             apply_compute_mode,
+            compute_mode_diagnostics,
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_legacy_relay_payload,
@@ -99,7 +100,7 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    resolved_mode = apply_compute_mode(runtime.model_manager, args.mode)
+    apply_compute_mode(runtime.model_manager, args.mode)
 
     if not runtime.ensure_model_ready():
         emit(
@@ -111,6 +112,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    diagnostics = compute_mode_diagnostics(runtime.model_manager)
     last_error: Optional[str] = None
     emit(
         {
@@ -118,7 +120,12 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": resolved_mode,
+            "requested_mode": diagnostics.get("requested_mode"),
+            "effective_mode": diagnostics.get("effective_mode"),
+            "backend_available": diagnostics.get("backend_available"),
+            "backend_selected": diagnostics.get("backend_selected"),
+            "backend_used": diagnostics.get("backend_used"),
+            "fallback_reason": diagnostics.get("fallback_reason"),
             "model_path": args.model,
             "last_error": None,
         }
@@ -155,7 +162,12 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
-                    "backend_mode": resolved_mode,
+                    "requested_mode": diagnostics.get("requested_mode"),
+                    "effective_mode": diagnostics.get("effective_mode"),
+                    "backend_available": diagnostics.get("backend_available"),
+                    "backend_selected": diagnostics.get("backend_selected"),
+                    "backend_used": diagnostics.get("backend_used"),
+                    "fallback_reason": diagnostics.get("fallback_reason"),
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -173,7 +185,12 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": resolved_mode,
+            "requested_mode": diagnostics.get("requested_mode"),
+            "effective_mode": diagnostics.get("effective_mode"),
+            "backend_available": diagnostics.get("backend_available"),
+            "backend_selected": diagnostics.get("backend_selected"),
+            "backend_used": diagnostics.get("backend_used"),
+            "fallback_reason": diagnostics.get("fallback_reason"),
             "model_path": args.model,
             "last_error": None,
         }

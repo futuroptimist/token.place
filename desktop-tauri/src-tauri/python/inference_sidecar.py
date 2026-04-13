@@ -132,7 +132,7 @@ def run(args: argparse.Namespace) -> int:
         return emit_error("bad_model", "model path not found")
 
     try:
-        from utils.compute_node_runtime import apply_compute_mode
+        from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
         from utils.llm.model_manager import ModelManager, get_model_manager
     except ModuleNotFoundError as exc:
         return emit_error(
@@ -148,7 +148,17 @@ def run(args: argparse.Namespace) -> int:
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
-    emit({"type": "started"})
+    diagnostics = compute_mode_diagnostics(manager)
+    emit(
+        {
+            "type": "started",
+            "requested_mode": diagnostics.get("requested_mode"),
+            "effective_mode": diagnostics.get("effective_mode"),
+            "backend_used": diagnostics.get("backend_used"),
+            "n_gpu_layers": diagnostics.get("n_gpu_layers"),
+            "fallback_reason": diagnostics.get("fallback_reason"),
+        }
+    )
     if cancel_requested():
         emit({"type": "canceled"})
         return 0

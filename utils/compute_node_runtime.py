@@ -160,17 +160,26 @@ def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
     else:
         # ``auto`` and explicit ``gpu`` request full offload when a compatible backend exists.
         manager.default_n_gpu_layers = -1
+    manager.last_compute_diagnostics = {
+        "requested_mode": selected,
+        "effective_mode": "cpu" if selected == "cpu" else "pending",
+        "backend_available": "unknown",
+        "backend_selected": "cpu" if selected == "cpu" else "unknown",
+        "backend_used": "cpu" if selected == "cpu" else "unknown",
+        "n_gpu_layers": manager.default_n_gpu_layers,
+        "fallback_reason": None,
+    }
     return selected
 
 
 def compute_mode_diagnostics(manager: Any) -> Dict[str, Any]:
     """Return compute-mode diagnostics from manager state for bridge/UI status payloads."""
 
+    requested = normalize_compute_mode(getattr(manager, "requested_compute_mode", "auto"))
     runtime = getattr(manager, "last_compute_diagnostics", None)
-    if isinstance(runtime, dict):
+    if isinstance(runtime, dict) and runtime.get("requested_mode") == requested:
         return dict(runtime)
 
-    requested = normalize_compute_mode(getattr(manager, "requested_compute_mode", "auto"))
     if requested == "cpu":
         return {
             "requested_mode": requested,

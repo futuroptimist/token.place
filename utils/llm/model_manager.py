@@ -78,6 +78,23 @@ class ModelManager:
             return 'metal'
         if sys.platform.startswith('win'):
             return 'cuda'
+        if sys.platform.startswith('linux'):
+            try:
+                import llama_cpp
+            except Exception:
+                return None
+            if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
+                return 'cuda'
+            if bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
+                return 'metal'
+            supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+            if callable(supports_gpu):
+                try:
+                    if bool(supports_gpu()):
+                        # Linux builds that expose GPU offload are expected to be CUDA.
+                        return 'cuda'
+                except Exception:
+                    return None
         return None
 
     @staticmethod
@@ -106,17 +123,30 @@ class ModelManager:
         fallback_reason = None
 
         if requested == 'auto':
-            n_gpu_layers = int(self.default_n_gpu_layers)
+            requested_layers = int(self.default_n_gpu_layers)
+            n_gpu_layers = requested_layers
             gpu_requested = n_gpu_layers != 0
             backend_selected = backend_available if gpu_requested else 'cpu'
+            if gpu_requested and (
+                backend_available == 'cpu' or not gpu_runtime_supported
+            ):
+                n_gpu_layers = 0
+                fallback_reason = (
+                    'no CUDA/Metal backend is supported on this platform'
+                    if backend_available == 'cpu'
+                    else (
+                        f'llama-cpp-python runtime does not expose {backend_available} '
+                        'GPU offload support'
+                    )
+                )
             return {
                 'requested_mode': requested,
-                'effective_mode': backend_selected if gpu_requested else 'cpu',
+                'effective_mode': 'cpu_fallback' if fallback_reason else backend_selected,
                 'backend_available': backend_available,
                 'backend_selected': backend_selected,
-                'backend_used': backend_selected if gpu_requested else 'cpu',
+                'backend_used': 'cpu' if fallback_reason else backend_selected,
                 'n_gpu_layers': n_gpu_layers,
-                'fallback_reason': None,
+                'fallback_reason': fallback_reason,
             }
 
         if requested == 'cpu':
@@ -314,6 +344,7 @@ class ModelManager:
         # Check if mocking is enabled via configuration
         if self.use_mock_llm:
             self.log_info("Using Mock LLM instance based on USE_MOCK_LLM configuration.")
+            self.last_compute_diagnostics = self._resolve_compute_plan()
             mock_llama_instance = MagicMock()
             mock_response = {
                 'choices': [

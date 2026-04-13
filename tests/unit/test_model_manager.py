@@ -270,7 +270,9 @@ class TestModelManager:
         instance = MagicMock()
         mock_llama.return_value = instance
 
-        result = model_manager.get_llm_instance()
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            result = model_manager.get_llm_instance()
 
         assert result is instance
         mock_llama.assert_called_once()
@@ -295,7 +297,9 @@ class TestModelManager:
         instance = MagicMock()
         mock_llama.return_value = instance
 
-        result = model_manager.get_llm_instance()
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            result = model_manager.get_llm_instance()
 
         assert result is instance
         kwargs = mock_llama.call_args.kwargs
@@ -310,7 +314,9 @@ class TestModelManager:
         with patch('llama_cpp.Llama', return_value=instance, create=True) as mock_llama, \
              patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory') as mock_can_allocate, \
              patch('utils.llm.model_manager.os.path.exists', return_value=True), \
-             patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')):
+             patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')), \
+             patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
 
             result = model_manager.get_llm_instance()
 

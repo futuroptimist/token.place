@@ -23,11 +23,11 @@ interface ComputeNodeStatus {
   running: boolean;
   registered: boolean;
   active_relay_url: string;
-  requested_mode: string;
-  effective_mode: string;
-  backend_available: string;
-  backend_selected: string;
-  backend_used: string;
+  requested_mode: string | null;
+  effective_mode: string | null;
+  backend_available: string | null;
+  backend_selected: string | null;
+  backend_used: string | null;
   fallback_reason: string | null;
   model_path: string;
   last_error: string | null;
@@ -56,10 +56,10 @@ const defaultComputeStatus: ComputeNodeStatus = {
   registered: false,
   active_relay_url: '',
   requested_mode: 'auto',
-  effective_mode: 'cpu',
-  backend_available: 'unknown',
-  backend_selected: 'cpu',
-  backend_used: 'cpu',
+  effective_mode: null,
+  backend_available: null,
+  backend_selected: null,
+  backend_used: null,
   fallback_reason: null,
   model_path: '',
   last_error: null,
@@ -317,6 +317,11 @@ export function App() {
         registered: false,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
+        effective_mode: null,
+        backend_available: null,
+        backend_selected: null,
+        backend_used: null,
+        fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
       }));
@@ -434,10 +439,10 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
         <p style={{ marginBottom: 0 }}>Requested mode: <code>{computeStatus.requested_mode || config.preferred_mode}</code></p>
-        <p style={{ marginBottom: 0 }}>Effective mode: <code>{computeStatus.effective_mode}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend available: <code>{computeStatus.backend_available}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend selected: <code>{computeStatus.backend_selected}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend used: <code>{computeStatus.backend_used}</code></p>
+        <p style={{ marginBottom: 0 }}>Effective mode: <code>{computeStatus.effective_mode ?? 'pending'}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend available: <code>{computeStatus.backend_available ?? 'pending'}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend selected: <code>{computeStatus.backend_selected ?? 'pending'}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend used: <code>{computeStatus.backend_used ?? 'pending'}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>

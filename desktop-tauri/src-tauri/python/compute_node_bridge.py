@@ -156,6 +156,7 @@ def run(args: argparse.Namespace) -> int:
             else:
                 last_error = None
 
+            diagnostics = compute_mode_diagnostics(runtime.model_manager)
             emit(
                 {
                     "type": "status",
@@ -179,6 +180,7 @@ def run(args: argparse.Namespace) -> int:
     finally:
         runtime.stop()
 
+    diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(
         {
             "type": "stopped",

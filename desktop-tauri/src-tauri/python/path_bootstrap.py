@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 
@@ -11,13 +12,28 @@ def ensure_runtime_import_paths(script_file: str) -> None:
 
     script_path = Path(script_file).resolve()
     script_root = script_path.parent.parent
-    candidates = [
+    env_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    env_resource_dir = os.environ.get("TOKEN_PLACE_RESOURCE_DIR", "").strip()
+
+    candidates = []
+    if env_import_root:
+        candidates.append(Path(env_import_root))
+    if env_resource_dir:
+        resource_dir = Path(env_resource_dir)
+        candidates.extend(
+            [
+                resource_dir,
+                resource_dir / "_up_",
+            ]
+        )
+
+    candidates.extend([
         script_root,  # bundled resources root in packaged apps
         script_root / "resources",  # no-bundle/debug layout when script is under <exe>/python
         script_root / "Resources",  # macOS-style resources casing
         script_root / "_up_",  # tauri ".." resources are rewritten under _up_
         script_path.parent.parent.parent,
-    ]
+    ])
 
     if len(script_path.parents) > 3:
         candidates.append(script_path.parents[3])  # repo root in development tree

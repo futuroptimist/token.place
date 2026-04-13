@@ -129,6 +129,40 @@ fn configure_runtime_pythonpath(command: &mut std::process::Command) {
     }
 }
 
+fn resolve_runtime_import_root(script_path: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(script_dir) = script_path.parent() {
+        if let Some(parent) = script_dir.parent() {
+            candidates.push(parent.to_path_buf());
+            candidates.push(parent.join("_up_"));
+        }
+        if let Some(grandparent) = script_dir.parent().and_then(|p| p.parent()) {
+            candidates.push(grandparent.to_path_buf());
+            candidates.push(grandparent.join("_up_"));
+        }
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo_root) = repo_runtime_import_root(manifest_dir) {
+        candidates.push(PathBuf::from(repo_root));
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+}
+
+fn configure_runtime_import_contract(command: &mut std::process::Command, script_path: &Path) {
+    if let Some(script_dir) = script_path.parent() {
+        if let Some(resource_dir) = script_dir.parent() {
+            command.env("TOKEN_PLACE_RESOURCE_DIR", resource_dir);
+        }
+    }
+    if let Some(import_root) = resolve_runtime_import_root(script_path) {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root);
+    }
+}
+
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
@@ -136,6 +170,7 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
     let mut bridge_command =
         launcher.command_for_script_blocking(bridge_script.to_str().unwrap_or_default());
     configure_runtime_pythonpath(&mut bridge_command);
+    configure_runtime_import_contract(&mut bridge_command, &bridge_script);
     let output = bridge_command
         .arg(action)
         .output()
@@ -472,5 +507,18 @@ mod tests {
                 "missing bundled python resource: {script}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_import_root_prefers_packaged_resources_up_layout() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("bin").join("resources").join("python").join("model_bridge.py");
+        let import_root = temp.path().join("bin").join("resources").join("_up_");
+        std::fs::create_dir_all(import_root.join("utils")).expect("create import root");
+        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script parent");
+        std::fs::write(&script, "print('ok')\n").expect("write bridge script");
+
+        let resolved = resolve_runtime_import_root(&script).expect("resolve import root");
+        assert_eq!(resolved, import_root);
     }
 }

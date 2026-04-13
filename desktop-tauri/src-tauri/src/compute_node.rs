@@ -152,6 +152,40 @@ fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path) {
     }
 }
 
+fn resolve_runtime_import_root(
+    bridge_path: &Path,
+    manifest_dir: &Path,
+) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(script_dir) = bridge_path.parent() {
+        if let Some(parent) = script_dir.parent() {
+            candidates.push(parent.to_path_buf());
+            candidates.push(parent.join("_up_"));
+        }
+        if let Some(grandparent) = script_dir.parent().and_then(|p| p.parent()) {
+            candidates.push(grandparent.to_path_buf());
+            candidates.push(grandparent.join("_up_"));
+        }
+    }
+    if let Some(repo_root) = repo_runtime_import_root(manifest_dir) {
+        candidates.push(std::path::PathBuf::from(repo_root));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+}
+
+fn configure_runtime_import_contract(command: &mut Command, bridge_path: &Path, manifest_dir: &Path) {
+    if let Some(script_dir) = bridge_path.parent() {
+        if let Some(resource_dir) = script_dir.parent() {
+            command.env("TOKEN_PLACE_RESOURCE_DIR", resource_dir);
+        }
+    }
+    if let Some(import_root) = resolve_runtime_import_root(bridge_path, manifest_dir) {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root);
+    }
+}
+
 fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
     ComputeNodeStatus {
         running: false,
@@ -263,6 +297,7 @@ pub async fn start_compute_node(
         }
     };
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir);
+    configure_runtime_import_contract(&mut bridge_command, Path::new(&bridge_script), manifest_dir);
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -579,5 +614,25 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), resources_bridge);
+    }
+
+    #[test]
+    fn runtime_import_root_prefers_packaged_resources_up_layout() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp
+            .path()
+            .join("bin")
+            .join("resources")
+            .join("python")
+            .join("compute_node_bridge.py");
+        let import_root = temp.path().join("bin").join("resources").join("_up_");
+        std::fs::create_dir_all(import_root.join("utils")).expect("create import root");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script parent");
+        std::fs::write(&script, "print('ok')\n").expect("write bridge script");
+
+        let resolved =
+            resolve_runtime_import_root(&script, temp.path()).expect("resolve import root");
+        assert_eq!(resolved, import_root);
     }
 }

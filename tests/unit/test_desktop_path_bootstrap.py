@@ -54,3 +54,20 @@ def test_bootstrap_adds_repo_root_for_dev_layout(tmp_path, path_bootstrap):
         assert str(repo_root) in sys.path
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_prefers_explicit_runtime_import_root_env(tmp_path, path_bootstrap, monkeypatch):
+    script = tmp_path / 'unrelated' / 'python' / 'model_bridge.py'
+    explicit_root = tmp_path / 'packaged' / 'resources' / '_up_'
+    (explicit_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(explicit_root))
+    monkeypatch.delenv('TOKEN_PLACE_RESOURCE_DIR', raising=False)
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert sys.path[0] == str(explicit_root)
+    finally:
+        sys.path[:] = original_sys_path

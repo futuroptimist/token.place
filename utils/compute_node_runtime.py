@@ -166,6 +166,7 @@ class ComputeNodeRuntime:
         self,
         runtime_config: ComputeNodeRuntimeConfig,
         *,
+        include_configured_relays: bool = True,
         relay_client: Optional["RelayClient"] = None,
         crypto_manager=None,
         model_manager=None,
@@ -183,6 +184,7 @@ class ComputeNodeRuntime:
         self.relay_client = relay_client or RelayClient(
             base_url=runtime_config.relay_url,
             port=runtime_config.relay_port,
+            include_configured_relays=include_configured_relays,
             crypto_manager=self.crypto_manager,
             model_manager=self.model_manager,
         )

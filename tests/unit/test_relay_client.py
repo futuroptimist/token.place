@@ -97,6 +97,28 @@ def test_compose_relay_url_keeps_explicit_localhost_port():
     assert result == 'http://localhost:5000'
 
 
+def test_init_can_disable_configured_relay_fallbacks():
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    config_values = {
+        'relay.request_timeout': 10,
+        'relay.server_url': 'https://token.place',
+        'relay.additional_servers': ['https://backup.token.place'],
+    }
+    mock_config.get.side_effect = lambda key, default: config_values.get(key, default)
+
+    with patch('utils.networking.relay_client.get_config_lazy', return_value=mock_config):
+        client = RelayClient(
+            base_url='http://127.0.0.1:5010',
+            port=None,
+            crypto_manager=MagicMock(public_key_b64='key'),
+            model_manager=MagicMock(),
+            include_configured_relays=False,
+        )
+
+    assert client.relay_urls == ('http://127.0.0.1:5010',)
+
+
 class TestRelayClient:
     """Test class for RelayClient."""
 

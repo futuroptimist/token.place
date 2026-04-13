@@ -192,7 +192,15 @@ class RelayClient:
         polling_thread.join(timeout=15)  # Wait for thread to finish
         ```
     """
-    def __init__(self, base_url: str, port: Optional[int], crypto_manager, model_manager):
+    def __init__(
+        self,
+        base_url: str,
+        port: Optional[int],
+        crypto_manager,
+        model_manager,
+        *,
+        include_configured_relays: bool = True,
+    ):
         """
         Initialize the RelayClient.
 
@@ -216,21 +224,22 @@ class RelayClient:
             config = get_config_lazy()
             self._request_timeout = config.get('relay.request_timeout', 10)
 
-            configured_servers = list(config.get('relay.additional_servers', []) or [])
+            if include_configured_relays:
+                configured_servers = list(config.get('relay.additional_servers', []) or [])
 
-            cf_fallbacks = config.get('relay.cloudflare_fallback_urls', []) or []
-            for entry in cf_fallbacks:
-                if entry not in configured_servers:
-                    configured_servers.append(entry)
+                cf_fallbacks = config.get('relay.cloudflare_fallback_urls', []) or []
+                for entry in cf_fallbacks:
+                    if entry not in configured_servers:
+                        configured_servers.append(entry)
 
-            pool_secondary = config.get('relay.server_pool_secondary', []) or []
-            for entry in pool_secondary:
-                if entry not in configured_servers:
-                    configured_servers.append(entry)
+                pool_secondary = config.get('relay.server_pool_secondary', []) or []
+                for entry in pool_secondary:
+                    if entry not in configured_servers:
+                        configured_servers.append(entry)
 
-            primary_config_url = config.get('relay.server_url', '')
-            if primary_config_url and primary_config_url not in configured_servers:
-                configured_servers.insert(0, primary_config_url)
+                primary_config_url = config.get('relay.server_url', '')
+                if primary_config_url and primary_config_url not in configured_servers:
+                    configured_servers.insert(0, primary_config_url)
 
             cluster_only_value = config.get('relay.cluster_only', False)
             parsed_cluster_only = _coerce_optional_bool(cluster_only_value)

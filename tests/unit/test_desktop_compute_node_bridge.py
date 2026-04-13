@@ -45,7 +45,7 @@ class FakeRelayClientRouting(FakeRelayClient):
 
 
 class FakeRuntime:
-    def __init__(self, _config):
+    def __init__(self, _config, **_kwargs):
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClient()
         self._responses = [
@@ -79,7 +79,7 @@ class FakeRuntime:
 class StreamingRuntime(FakeRuntime):
     last_instance = None
 
-    def __init__(self, _config):
+    def __init__(self, _config, **_kwargs):
         StreamingRuntime.last_instance = self
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClientRouting()
@@ -102,7 +102,7 @@ class StreamingRuntime(FakeRuntime):
 
 
 class ProcessingFailureRuntime(FakeRuntime):
-    def __init__(self, _config):
+    def __init__(self, _config, **_kwargs):
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClient()
         self._responses = [
@@ -122,7 +122,7 @@ class ProcessingFailureRuntime(FakeRuntime):
 
 
 class IncompatibleRelayRuntime(FakeRuntime):
-    def __init__(self, _config):
+    def __init__(self, _config, **_kwargs):
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClient()
         self._responses = [{'relay_version': 'outdated'}]
@@ -209,6 +209,30 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
     assert 'failed to initialize model runtime' in payload['message']
+
+
+def test_run_disables_configured_relay_fallbacks(monkeypatch):
+    _reset_cancel_queue()
+    captured = {}
+
+    class CapturingRuntime(FakeRuntime):
+        def __init__(self, _config, **kwargs):
+            captured.update(kwargs)
+            super().__init__(_config, **kwargs)
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=CapturingRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='http://127.0.0.1:5010',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert captured == {'include_configured_relays': False}
 
 
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
@@ -463,7 +487,7 @@ class _ModelManager:
 
 
 class ComputeNodeRuntime:
-    def __init__(self, config):
+    def __init__(self, config, **_kwargs):
         self.relay_client = _RelayClient(config.relay_url)
         self.model_manager = _ModelManager()
 

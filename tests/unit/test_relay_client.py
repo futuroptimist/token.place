@@ -102,6 +102,7 @@ def test_init_can_disable_configured_server_fallbacks():
     mock_config.is_production = False
     mock_config.get.side_effect = lambda key, default: {
         'relay.request_timeout': 10,
+        'relay.cluster_only': True,
         'relay.server_url': 'https://token.place',
         'relay.additional_servers': ['https://relay-backup.example'],
     }.get(key, default)

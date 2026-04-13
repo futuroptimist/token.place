@@ -436,7 +436,7 @@ def apply_compute_mode(_model_manager, mode):
     return normalize_compute_mode(mode)
 
 
-def resolve_relay_url(relay_url):
+def resolve_relay_url(relay_url, **_kwargs):
     return relay_url
 
 
@@ -449,7 +449,7 @@ def is_legacy_relay_payload(_payload):
 
 
 class ComputeNodeRuntimeConfig:
-    def __init__(self, relay_url, relay_port):
+    def __init__(self, relay_url, relay_port, **_kwargs):
         self.relay_url = relay_url
         self.relay_port = relay_port
 

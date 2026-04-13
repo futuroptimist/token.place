@@ -530,7 +530,7 @@ class ComputeNodeRuntime:
         return True
 
     def register_and_poll_once(self):
-        return {"next_ping_in_x_seconds": 0}
+        return {"next_ping_in_x_seconds": 1}
 
     def process_relay_request(self, _payload):
         return True

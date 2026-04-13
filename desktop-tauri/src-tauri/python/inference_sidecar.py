@@ -132,7 +132,7 @@ def run(args: argparse.Namespace) -> int:
         return emit_error("bad_model", "model path not found")
 
     try:
-        from utils.compute_node_runtime import apply_compute_mode
+        from utils.compute_node_runtime import apply_compute_mode, describe_compute_mode
         from utils.llm.model_manager import ModelManager, get_model_manager
     except ModuleNotFoundError as exc:
         return emit_error(
@@ -142,13 +142,13 @@ def run(args: argparse.Namespace) -> int:
 
     manager = get_model_manager()
     manager.model_path = args.model
-    apply_compute_mode(manager, args.mode)
+    apply_compute_mode(manager, args.mode, getattr(args, "backend", "unknown"))
 
     llm = manager.get_llm_instance()
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
-    emit({"type": "started"})
+    emit({"type": "started", **describe_compute_mode(manager)})
     if cancel_requested():
         emit({"type": "canceled"})
         return 0
@@ -201,6 +201,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop inference sidecar")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default="auto")
+    parser.add_argument("--backend", default="unknown")
     parser.add_argument("--prompt", required=True)
     args = parser.parse_args()
     try:

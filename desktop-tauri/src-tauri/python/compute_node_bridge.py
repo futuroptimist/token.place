@@ -80,6 +80,7 @@ def run(args: argparse.Namespace) -> int:
             apply_compute_mode,
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
+            describe_compute_mode,
             is_legacy_relay_payload,
             resolve_relay_port,
             resolve_relay_url,
@@ -99,7 +100,12 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    resolved_mode = apply_compute_mode(runtime.model_manager, args.mode)
+    resolved_mode = apply_compute_mode(
+        runtime.model_manager,
+        args.mode,
+        getattr(args, "backend", "unknown"),
+    )
+    mode_details = describe_compute_mode(runtime.model_manager)
 
     if not runtime.ensure_model_ready():
         emit(
@@ -119,6 +125,7 @@ def run(args: argparse.Namespace) -> int:
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
             "backend_mode": resolved_mode,
+            **mode_details,
             "model_path": args.model,
             "last_error": None,
         }
@@ -149,6 +156,7 @@ def run(args: argparse.Namespace) -> int:
             else:
                 last_error = None
 
+            mode_details = describe_compute_mode(runtime.model_manager)
             emit(
                 {
                     "type": "status",
@@ -156,6 +164,7 @@ def run(args: argparse.Namespace) -> int:
                     "registered": registered,
                     "active_relay_url": active_relay_url,
                     "backend_mode": resolved_mode,
+                    **mode_details,
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -167,6 +176,7 @@ def run(args: argparse.Namespace) -> int:
     finally:
         runtime.stop()
 
+    mode_details = describe_compute_mode(runtime.model_manager)
     emit(
         {
             "type": "stopped",
@@ -174,6 +184,7 @@ def run(args: argparse.Namespace) -> int:
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
             "backend_mode": resolved_mode,
+            **mode_details,
             "model_path": args.model,
             "last_error": None,
         }
@@ -185,6 +196,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default="auto")
+    parser.add_argument("--backend", default="unknown")
     parser.add_argument("--relay-url", default="https://token.place")
     parser.add_argument("--relay-port", type=int, default=None)
     args = parser.parse_args()

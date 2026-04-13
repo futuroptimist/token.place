@@ -134,29 +134,86 @@ def format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
     return f"{relay_url}:{relay_port}"
 
 
-SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "metal", "cuda"})
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "gpu", "hybrid", "metal", "cuda"})
+SUPPORTED_BACKEND_HINTS = frozenset({"cpu", "cuda", "metal", "unknown"})
 
 
 def normalize_compute_mode(mode: Optional[str]) -> str:
     """Normalize operator-provided compute mode values."""
 
     selected = (mode or "auto").strip().lower()
+    if selected in {"metal", "cuda"}:
+        return "gpu"
     if selected in SUPPORTED_COMPUTE_MODES:
         return selected
     return "auto"
 
 
-def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
+def normalize_backend_hint(backend_hint: Optional[str]) -> str:
+    """Normalize host backend hints provided by desktop launchers."""
+
+    selected = (backend_hint or "unknown").strip().lower()
+    if selected in SUPPORTED_BACKEND_HINTS:
+        return selected
+    return "unknown"
+
+
+def _resolve_gpu_layers(mode: str, backend_hint: str) -> tuple[int, str, Optional[str]]:
+    """Resolve n_gpu_layers and effective mode for requested mode + backend hint."""
+
+    if mode == "cpu":
+        return 0, "cpu", None
+    if mode == "hybrid":
+        if backend_hint in {"cuda", "metal"}:
+            return 20, f"{backend_hint}-hybrid", None
+        if backend_hint == "cpu":
+            return 0, "cpu", "hybrid requested but no GPU backend is available on this host"
+        return 20, "hybrid", None
+    if mode == "gpu":
+        if backend_hint in {"cuda", "metal"}:
+            return -1, f"{backend_hint}-gpu", None
+        if backend_hint == "cpu":
+            return 0, "cpu", "gpu requested but no GPU backend is available on this host"
+        return -1, "gpu", None
+
+    # auto
+    if backend_hint in {"cuda", "metal"}:
+        return -1, f"{backend_hint}-gpu(auto)", None
+    if backend_hint == "cpu":
+        return 0, "cpu", "auto selected CPU because this host has no supported GPU backend"
+    return -1, "auto", None
+
+
+def apply_compute_mode(manager: Any, mode: Optional[str], backend_hint: Optional[str] = None) -> str:
     """Apply normalized compute mode to model-manager GPU settings."""
 
     selected = normalize_compute_mode(mode)
-    if selected == "cpu":
-        manager.default_n_gpu_layers = 0
-    else:
-        # ``auto`` follows runtime autodetection and maps to GPU-preferred layers where available.
-        # ``metal`` and ``cuda`` also request GPU-backed inference on supported hosts.
-        manager.default_n_gpu_layers = -1
+    resolved_backend = normalize_backend_hint(backend_hint)
+    n_gpu_layers, effective_mode, fallback_reason = _resolve_gpu_layers(selected, resolved_backend)
+    manager.default_n_gpu_layers = n_gpu_layers
+    manager.requested_compute_mode = selected
+    manager.requested_backend_hint = resolved_backend
+    manager.effective_compute_mode = effective_mode
+    manager.compute_fallback_reason = fallback_reason
     return selected
+
+
+def describe_compute_mode(manager: Any) -> Dict[str, Any]:
+    """Return request/effective compute mode diagnostics for desktop status surfaces."""
+
+    n_gpu_layers = getattr(manager, "last_runtime_n_gpu_layers", manager.default_n_gpu_layers)
+    return {
+        "requested_mode": getattr(manager, "requested_compute_mode", "auto"),
+        "backend_available": getattr(manager, "requested_backend_hint", "unknown"),
+        "effective_mode": getattr(
+            manager,
+            "effective_compute_mode",
+            "cpu" if n_gpu_layers == 0 else "gpu",
+        ),
+        "backend_used": getattr(manager, "effective_backend_used", "cpu" if n_gpu_layers == 0 else "gpu"),
+        "n_gpu_layers": n_gpu_layers,
+        "fallback_reason": getattr(manager, "compute_fallback_reason", None),
+    }
 
 
 class ComputeNodeRuntime:

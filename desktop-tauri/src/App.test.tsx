@@ -36,8 +36,8 @@ describe('desktop app start failure handling', () => {
       if (command === 'detect_backend') {
         return Promise.resolve({
           platform_label: 'macos',
-          preferred_mode: 'auto',
-          display_label: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal backend available',
         });
       }
       if (command === 'load_config') {
@@ -53,6 +53,12 @@ describe('desktop app start failure handling', () => {
           registered: false,
           active_relay_url: '',
           backend_mode: 'auto',
+          requested_mode: 'auto',
+          backend_available: 'metal',
+          effective_mode: 'unknown',
+          backend_used: 'unknown',
+          n_gpu_layers: 0,
+          fallback_reason: null,
           model_path: '',
           last_error: null,
         });
@@ -87,8 +93,8 @@ describe('desktop app start failure handling', () => {
           : command === 'detect_backend'
             ? {
                 platform_label: 'macos',
-                preferred_mode: 'auto',
-                display_label: 'auto',
+                available_backend: 'metal',
+                availability_label: 'Metal backend available',
               }
             : command === 'get_compute_node_status'
               ? {
@@ -96,6 +102,12 @@ describe('desktop app start failure handling', () => {
                   registered: false,
                   active_relay_url: '',
                   backend_mode: 'auto',
+                  requested_mode: 'auto',
+                  backend_available: 'metal',
+                  effective_mode: 'unknown',
+                  backend_used: 'unknown',
+                  n_gpu_layers: 0,
+                  fallback_reason: null,
                   model_path: '',
                   last_error: null,
                 }
@@ -138,8 +150,8 @@ describe('desktop app start failure handling', () => {
       if (command === 'detect_backend') {
         return Promise.resolve({
           platform_label: 'macos',
-          preferred_mode: 'auto',
-          display_label: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal backend available',
         });
       }
       if (command === 'load_config') {
@@ -155,6 +167,12 @@ describe('desktop app start failure handling', () => {
           registered: false,
           active_relay_url: '',
           backend_mode: 'auto',
+          requested_mode: 'auto',
+          backend_available: 'metal',
+          effective_mode: 'unknown',
+          backend_used: 'unknown',
+          n_gpu_layers: 0,
+          fallback_reason: null,
           model_path: '',
           last_error: null,
         });

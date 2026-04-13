@@ -179,7 +179,7 @@ def test_run_falls_back_to_non_streaming_when_stream_is_empty(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     ('mode', 'expected'),
-    [('cpu', 0), ('metal', -1), ('cuda', -1), ('auto', -1)],
+    [('cpu', 0), ('gpu', -1), ('hybrid', 20), ('auto', -1)],
 )
 def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
     _reset_cancel_queue()
@@ -374,7 +374,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = inference_sidecar.main()
     assert status == 0
-    assert captured['mode'] == 'cuda'
+    assert captured['mode'] == 'gpu'
 
     monkeypatch.setattr(
         sys,

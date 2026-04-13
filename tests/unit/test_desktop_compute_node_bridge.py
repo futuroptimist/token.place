@@ -186,6 +186,8 @@ def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeyp
     assert event_types[-1] == 'stopped'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
+    assert events[0]['requested_mode'] == 'cpu'
+    assert events[0]['n_gpu_layers'] == 0
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):
@@ -317,11 +319,11 @@ def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     assert apply_compute_mode(manager, 'auto') == 'auto'
     assert manager.default_n_gpu_layers == -1
 
-    assert apply_compute_mode(manager, 'metal') == 'metal'
+    assert apply_compute_mode(manager, 'gpu') == 'gpu'
     assert manager.default_n_gpu_layers == -1
 
-    assert apply_compute_mode(manager, 'cuda') == 'cuda'
-    assert manager.default_n_gpu_layers == -1
+    assert apply_compute_mode(manager, 'hybrid') == 'hybrid'
+    assert manager.default_n_gpu_layers == 20
 
     assert apply_compute_mode(manager, 'cpu') == 'cpu'
     assert manager.default_n_gpu_layers == 0
@@ -391,7 +393,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'cuda'
+    assert captured['mode'] == 'gpu'
 
     monkeypatch.setattr(
         sys,
@@ -423,7 +425,7 @@ def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_pat
     (utils_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
-SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "cuda", "metal"}
+SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid"}
 
 
 def normalize_compute_mode(mode):

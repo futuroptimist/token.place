@@ -60,6 +60,12 @@ class ModelManager:
         self.default_n_gpu_layers = config.get('model.n_gpu_layers', -1)
         self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
+        self.requested_compute_mode = 'auto'
+        self.requested_backend_hint = 'unknown'
+        self.effective_compute_mode = 'auto'
+        self.effective_backend_used = 'unknown'
+        self.compute_fallback_reason = None
+        self.last_runtime_n_gpu_layers = self.default_n_gpu_layers
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
@@ -231,9 +237,11 @@ class ModelManager:
                     else:
                         try:
                             # Dynamically import Llama only when needed
+                            import llama_cpp
                             from llama_cpp import Llama
 
                             n_gpu_layers = self.default_n_gpu_layers
+                            fallback_reason = self.compute_fallback_reason
                             if self.enforce_gpu_headroom and n_gpu_layers != 0:
                                 try:
                                     model_size = os.path.getsize(self.model_path)
@@ -249,6 +257,25 @@ class ModelManager:
                                             "to CPU inference for this model."
                                         )
                                         n_gpu_layers = 0
+                                        fallback_reason = (
+                                            "insufficient GPU memory headroom; running on CPU"
+                                        )
+                            if n_gpu_layers != 0:
+                                gpu_support_fn = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+                                if callable(gpu_support_fn):
+                                    try:
+                                        if not bool(gpu_support_fn()):
+                                            self.log_warning(
+                                                "llama.cpp runtime reports no GPU offload support; "
+                                                "forcing CPU mode."
+                                            )
+                                            n_gpu_layers = 0
+                                            fallback_reason = (
+                                                "llama_cpp build has no GPU offload support; running on CPU"
+                                            )
+                                    except Exception:
+                                        # Capability probing is best-effort only.
+                                        pass
 
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
                             self.llm = Llama(
@@ -257,6 +284,19 @@ class ModelManager:
                                 n_ctx=self.config.get('model.context_size', 8192),
                                 chat_format=self.config.get('model.chat_format', 'llama-3')
                             )
+                            self.last_runtime_n_gpu_layers = n_gpu_layers
+                            if n_gpu_layers == 0:
+                                self.effective_backend_used = 'cpu'
+                                self.effective_compute_mode = 'cpu'
+                            elif n_gpu_layers < 0:
+                                self.effective_backend_used = self.requested_backend_hint
+                                self.effective_compute_mode = f'{self.requested_backend_hint}-gpu'
+                            else:
+                                self.effective_backend_used = self.requested_backend_hint
+                                self.effective_compute_mode = (
+                                    f'{self.requested_backend_hint}-hybrid({n_gpu_layers})'
+                                )
+                            self.compute_fallback_reason = fallback_reason
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

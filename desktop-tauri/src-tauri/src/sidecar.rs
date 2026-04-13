@@ -1,4 +1,4 @@
-use crate::backend::ComputeMode;
+use crate::backend::{detect_backend_for, ComputeMode};
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -251,6 +251,12 @@ pub async fn start_sidecar(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
+        .arg("--backend")
+        .arg(format!(
+            "{:?}",
+            detect_backend_for(std::env::consts::OS, std::env::consts::ARCH).available_backend
+        )
+        .to_lowercase())
         .arg("--prompt")
         .arg(&request.prompt)
         .stdin(Stdio::piped())

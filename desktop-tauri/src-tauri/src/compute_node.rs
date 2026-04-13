@@ -1,4 +1,4 @@
-use crate::backend::ComputeMode;
+use crate::backend::{detect_backend_for, ComputeMode};
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +24,12 @@ pub struct ComputeNodeStatus {
     pub registered: bool,
     pub active_relay_url: String,
     pub backend_mode: String,
+    pub requested_mode: String,
+    pub backend_available: String,
+    pub effective_mode: String,
+    pub backend_used: String,
+    pub n_gpu_layers: i32,
+    pub fallback_reason: Option<String>,
     pub model_path: String,
     pub last_error: Option<String>,
 }
@@ -139,11 +145,22 @@ fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, brid
 }
 
 fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
+    let backend_available = format!(
+        "{:?}",
+        detect_backend_for(std::env::consts::OS, std::env::consts::ARCH).available_backend
+    )
+    .to_lowercase();
     ComputeNodeStatus {
         running: false,
         registered: false,
         active_relay_url: request.relay_base_url.clone(),
         backend_mode: format!("{:?}", request.mode).to_lowercase(),
+        requested_mode: format!("{:?}", request.mode).to_lowercase(),
+        backend_available,
+        effective_mode: "unknown".into(),
+        backend_used: "unknown".into(),
+        n_gpu_layers: 0,
+        fallback_reason: None,
         model_path: request.model_path.clone(),
         last_error: Some(last_error),
     }
@@ -161,6 +178,27 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
     if let Some(backend_mode) = payload.get("backend_mode").and_then(Value::as_str) {
         status.backend_mode = backend_mode.into();
+    }
+    if let Some(requested_mode) = payload.get("requested_mode").and_then(Value::as_str) {
+        status.requested_mode = requested_mode.into();
+    }
+    if let Some(backend_available) = payload.get("backend_available").and_then(Value::as_str) {
+        status.backend_available = backend_available.into();
+    }
+    if let Some(effective_mode) = payload.get("effective_mode").and_then(Value::as_str) {
+        status.effective_mode = effective_mode.into();
+    }
+    if let Some(backend_used) = payload.get("backend_used").and_then(Value::as_str) {
+        status.backend_used = backend_used.into();
+    }
+    if let Some(n_gpu_layers) = payload.get("n_gpu_layers").and_then(Value::as_i64) {
+        status.n_gpu_layers = n_gpu_layers as i32;
+    }
+    if payload.get("fallback_reason").is_some() {
+        status.fallback_reason = payload
+            .get("fallback_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
     }
     if let Some(model_path) = payload.get("model_path").and_then(Value::as_str) {
         status.model_path = model_path.into();
@@ -255,6 +293,12 @@ pub async fn start_compute_node(
         .arg(&request.model_path)
         .arg("--mode")
         .arg(format!("{:?}", request.mode).to_lowercase())
+        .arg("--backend")
+        .arg(format!(
+            "{:?}",
+            detect_backend_for(std::env::consts::OS, std::env::consts::ARCH).available_backend
+        )
+        .to_lowercase())
         .arg("--relay-url")
         .arg(&request.relay_base_url)
         .stdin(Stdio::piped())
@@ -302,6 +346,16 @@ pub async fn start_compute_node(
             registered: false,
             active_relay_url: request.relay_base_url.clone(),
             backend_mode: format!("{:?}", request.mode).to_lowercase(),
+            requested_mode: format!("{:?}", request.mode).to_lowercase(),
+            backend_available: format!(
+                "{:?}",
+                detect_backend_for(std::env::consts::OS, std::env::consts::ARCH).available_backend
+            )
+            .to_lowercase(),
+            effective_mode: "unknown".into(),
+            backend_used: "unknown".into(),
+            n_gpu_layers: 0,
+            fallback_reason: None,
             model_path: request.model_path.clone(),
             last_error: None,
         };

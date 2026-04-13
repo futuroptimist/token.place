@@ -108,13 +108,15 @@ fn repo_runtime_import_root(manifest_dir: &Path) -> Option<String> {
 }
 
 fn configure_runtime_pythonpath(command: &mut std::process::Command) {
+    // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
+    // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(import_root) = repo_runtime_import_root(manifest_dir) {
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
-                if let Ok(joined) =
-                    std::env::join_paths([Path::new(&import_root), Path::new(&existing)])
-                {
+                let mut components = vec![PathBuf::from(&import_root)];
+                components.extend(std::env::split_paths(&existing));
+                if let Ok(joined) = std::env::join_paths(components) {
                     command.env("PYTHONPATH", joined);
                 } else {
                     command.env("PYTHONPATH", import_root);

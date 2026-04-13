@@ -310,18 +310,19 @@ def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, mo
     assert status_events[0]['last_error'] == 'failed to process relay request'
 
 
-def test_apply_compute_mode_supports_gpu_and_cpu_modes():
+def test_apply_compute_mode_supports_gpu_and_cpu_modes(monkeypatch):
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode
+    monkeypatch.setattr('utils.compute_node_runtime.platform.system', lambda: 'Windows')
 
     assert apply_compute_mode(manager, 'auto') == 'auto'
+    assert manager.default_n_gpu_layers in {0, -1}
+
+    assert apply_compute_mode(manager, 'gpu') == 'gpu'
     assert manager.default_n_gpu_layers == -1
 
-    assert apply_compute_mode(manager, 'metal') == 'metal'
-    assert manager.default_n_gpu_layers == -1
-
-    assert apply_compute_mode(manager, 'cuda') == 'cuda'
-    assert manager.default_n_gpu_layers == -1
+    assert apply_compute_mode(manager, 'hybrid') == 'hybrid'
+    assert manager.default_n_gpu_layers > 0
 
     assert apply_compute_mode(manager, 'cpu') == 'cpu'
     assert manager.default_n_gpu_layers == 0
@@ -343,7 +344,7 @@ def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]['type'] == 'started'
-    assert events[0]['backend_mode'] == 'auto'
+    assert events[0]['requested_mode'] == 'auto'
 
 
 def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkeypatch):
@@ -386,12 +387,12 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     monkeypatch.setattr(
         sys,
         'argv',
-        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'CUDA'],
+        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'GPU'],
     )
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'cuda'
+    assert captured['mode'] == 'gpu'
 
     monkeypatch.setattr(
         sys,
@@ -423,7 +424,7 @@ def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_pat
     (utils_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
-SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "cuda", "metal"}
+SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid", "cuda", "metal"}
 
 
 def normalize_compute_mode(mode):

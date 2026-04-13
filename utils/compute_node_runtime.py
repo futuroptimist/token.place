@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import platform
 import os
 import threading
 from dataclasses import dataclass
@@ -134,7 +135,7 @@ def format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
     return f"{relay_url}:{relay_port}"
 
 
-SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "metal", "cuda"})
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "gpu", "hybrid", "metal", "cuda"})
 
 
 def normalize_compute_mode(mode: Optional[str]) -> str:
@@ -146,17 +147,88 @@ def normalize_compute_mode(mode: Optional[str]) -> str:
     return "auto"
 
 
+def _detect_available_gpu_backend() -> str:
+    system = platform.system().lower()
+    if system == "windows":
+        return "cuda"
+    if system == "darwin":
+        return "metal"
+    return "none"
+
+
+def _hybrid_gpu_layers(manager: Any) -> int:
+    configured = 20
+    config = getattr(manager, "config", None)
+    if config is not None and hasattr(config, "get"):
+        configured = config.get("model.hybrid_n_gpu_layers", 20)
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        value = 20
+    return max(1, value)
+
+
 def apply_compute_mode(manager: Any, mode: Optional[str]) -> str:
     """Apply normalized compute mode to model-manager GPU settings."""
 
     selected = normalize_compute_mode(mode)
+    available_backend = _detect_available_gpu_backend()
+    requested_mode = selected
+    effective_mode = "cpu"
+    mode_reason: Optional[str] = None
+
     if selected == "cpu":
         manager.default_n_gpu_layers = 0
+        mode_reason = "Operator selected CPU-only mode."
+    elif selected in {"cuda", "metal"}:
+        requested_mode = "gpu"
+        if selected == available_backend:
+            manager.default_n_gpu_layers = -1
+            effective_mode = f"{available_backend}_gpu"
+            mode_reason = f"Explicit {available_backend} request."
+        else:
+            manager.default_n_gpu_layers = 0
+            mode_reason = (
+                f"Requested {selected} backend is not available on this host; using CPU fallback."
+            )
+    elif selected == "gpu":
+        if available_backend == "none":
+            manager.default_n_gpu_layers = 0
+            mode_reason = "No supported GPU backend available on this host; using CPU fallback."
+        else:
+            manager.default_n_gpu_layers = -1
+            effective_mode = f"{available_backend}_gpu"
+            mode_reason = f"Operator selected GPU-only mode ({available_backend})."
+    elif selected == "hybrid":
+        if available_backend == "none":
+            manager.default_n_gpu_layers = 0
+            mode_reason = "Hybrid mode requested but no GPU backend is available; using CPU fallback."
+        else:
+            manager.default_n_gpu_layers = _hybrid_gpu_layers(manager)
+            effective_mode = f"hybrid_{available_backend}"
+            mode_reason = (
+                f"Operator selected hybrid mode with n_gpu_layers={manager.default_n_gpu_layers}."
+            )
     else:
-        # ``auto`` follows runtime autodetection and maps to GPU-preferred layers where available.
-        # ``metal`` and ``cuda`` also request GPU-backed inference on supported hosts.
-        manager.default_n_gpu_layers = -1
-    return selected
+        if available_backend == "none":
+            manager.default_n_gpu_layers = 0
+            mode_reason = "Auto selected; no supported GPU backend detected, using CPU."
+        else:
+            manager.default_n_gpu_layers = -1
+            effective_mode = f"{available_backend}_gpu"
+            mode_reason = f"Auto selected; requesting full {available_backend} GPU offload."
+
+    manager.requested_compute_mode = requested_mode
+    manager.available_gpu_backend = available_backend
+    manager.mode_reason = mode_reason
+    manager.last_runtime_compute_status = {
+        "requested_mode": requested_mode,
+        "effective_mode": effective_mode if manager.default_n_gpu_layers != 0 else "cpu",
+        "backend_available": available_backend,
+        "mode_reason": mode_reason,
+        "n_gpu_layers": manager.default_n_gpu_layers,
+    }
+    return requested_mode
 
 
 class ComputeNodeRuntime:

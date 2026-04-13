@@ -179,7 +179,7 @@ def test_run_falls_back_to_non_streaming_when_stream_is_empty(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     ('mode', 'expected'),
-    [('cpu', 0), ('metal', -1), ('cuda', -1), ('auto', -1)],
+    [('cpu', 0), ('gpu', -1), ('hybrid', 20), ('auto', -1)],
 )
 def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
     _reset_cancel_queue()
@@ -188,6 +188,8 @@ def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
 
     manager = FakeManager()
     _install_fake_manager_module(manager)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr('utils.compute_node_runtime.platform.system', lambda: 'Windows')
 
     args = SimpleNamespace(model=str(model_path), mode=mode, prompt='Mode test')
     status = inference_sidecar.run(args)
@@ -195,6 +197,7 @@ def test_run_applies_compute_mode_to_manager(tmp_path, capsys, mode, expected):
     assert status == 0
     _ = capsys.readouterr()
     assert manager.default_n_gpu_layers == expected
+    monkeypatch.undo()
 
 
 def test_run_handles_dict_completion_payload(tmp_path, capsys):
@@ -221,6 +224,8 @@ def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys):
 
     manager = FakeManager()
     _install_fake_manager_module(manager)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr('utils.compute_node_runtime.platform.system', lambda: 'Windows')
 
     args = SimpleNamespace(model=str(model_path), mode='UNSUPPORTED', prompt='hello')
     status = inference_sidecar.run(args)
@@ -228,6 +233,7 @@ def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys):
     assert status == 0
     _ = capsys.readouterr()
     assert manager.default_n_gpu_layers == -1
+    monkeypatch.undo()
 
 
 def test_normalize_chunk_fallback_handles_object_shapes():

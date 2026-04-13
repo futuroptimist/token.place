@@ -60,6 +60,16 @@ class ModelManager:
         self.default_n_gpu_layers = config.get('model.n_gpu_layers', -1)
         self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
+        self.requested_compute_mode = 'auto'
+        self.available_gpu_backend = 'unknown'
+        self.mode_reason = None
+        self.last_runtime_compute_status = {
+            'requested_mode': 'auto',
+            'effective_mode': 'unknown',
+            'backend_available': 'unknown',
+            'mode_reason': None,
+            'n_gpu_layers': self.default_n_gpu_layers,
+        }
 
     def get_model_artifact_metadata(self) -> Dict[str, Any]:
         """Return runtime model metadata used by server and desktop bridges."""
@@ -234,6 +244,7 @@ class ModelManager:
                             from llama_cpp import Llama
 
                             n_gpu_layers = self.default_n_gpu_layers
+                            mode_reason = self.mode_reason
                             if self.enforce_gpu_headroom and n_gpu_layers != 0:
                                 try:
                                     model_size = os.path.getsize(self.model_path)
@@ -249,6 +260,10 @@ class ModelManager:
                                             "to CPU inference for this model."
                                         )
                                         n_gpu_layers = 0
+                                        mode_reason = (
+                                            "GPU mode requested but insufficient GPU memory "
+                                            "headroom was detected; using CPU fallback."
+                                        )
 
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
                             self.llm = Llama(
@@ -258,8 +273,27 @@ class ModelManager:
                                 chat_format=self.config.get('model.chat_format', 'llama-3')
                             )
                             self.log_info("Llama model initialized successfully.")
+                            effective_mode = 'cpu'
+                            if n_gpu_layers == -1 and self.available_gpu_backend not in {'none', 'unknown'}:
+                                effective_mode = f'{self.available_gpu_backend}_gpu'
+                            elif n_gpu_layers > 0 and self.available_gpu_backend not in {'none', 'unknown'}:
+                                effective_mode = f'hybrid_{self.available_gpu_backend}'
+                            self.last_runtime_compute_status = {
+                                'requested_mode': self.requested_compute_mode,
+                                'effective_mode': effective_mode,
+                                'backend_available': self.available_gpu_backend,
+                                'mode_reason': mode_reason,
+                                'n_gpu_layers': n_gpu_layers,
+                            }
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)
+                            self.last_runtime_compute_status = {
+                                'requested_mode': self.requested_compute_mode,
+                                'effective_mode': 'cpu',
+                                'backend_available': self.available_gpu_backend,
+                                'mode_reason': f'model initialization failed: {e}',
+                                'n_gpu_layers': 0,
+                            }
                             return None
 
         return self.llm

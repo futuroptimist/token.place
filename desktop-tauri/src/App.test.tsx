@@ -37,6 +37,8 @@ describe('desktop app start failure handling', () => {
         return Promise.resolve({
           platform_label: 'macos',
           preferred_mode: 'auto',
+          available_backend: 'none',
+          gpu_backend_available: false,
           display_label: 'auto',
         });
       }
@@ -53,6 +55,10 @@ describe('desktop app start failure handling', () => {
           registered: false,
           active_relay_url: '',
           backend_mode: 'auto',
+          requested_mode: 'auto',
+          effective_mode: 'pending',
+          backend_available: 'unknown',
+          mode_reason: null,
           model_path: '',
           last_error: null,
         });
@@ -88,6 +94,8 @@ describe('desktop app start failure handling', () => {
             ? {
                 platform_label: 'macos',
                 preferred_mode: 'auto',
+                available_backend: 'none',
+                gpu_backend_available: false,
                 display_label: 'auto',
               }
             : command === 'get_compute_node_status'
@@ -96,6 +104,10 @@ describe('desktop app start failure handling', () => {
                   registered: false,
                   active_relay_url: '',
                   backend_mode: 'auto',
+                  requested_mode: 'auto',
+                  effective_mode: 'pending',
+                  backend_available: 'unknown',
+                  mode_reason: null,
                   model_path: '',
                   last_error: null,
                 }
@@ -139,6 +151,8 @@ describe('desktop app start failure handling', () => {
         return Promise.resolve({
           platform_label: 'macos',
           preferred_mode: 'auto',
+          available_backend: 'none',
+          gpu_backend_available: false,
           display_label: 'auto',
         });
       }
@@ -155,6 +169,10 @@ describe('desktop app start failure handling', () => {
           registered: false,
           active_relay_url: '',
           backend_mode: 'auto',
+          requested_mode: 'auto',
+          effective_mode: 'pending',
+          backend_available: 'unknown',
+          mode_reason: null,
           model_path: '',
           last_error: null,
         });

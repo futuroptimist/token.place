@@ -148,7 +148,16 @@ def run(args: argparse.Namespace) -> int:
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
-    emit({"type": "started"})
+    diagnostics = getattr(manager, "last_runtime_compute_status", {})
+    emit(
+        {
+            "type": "started",
+            "requested_mode": diagnostics.get("requested_mode", args.mode),
+            "effective_mode": diagnostics.get("effective_mode", "cpu"),
+            "backend_available": diagnostics.get("backend_available", "unknown"),
+            "mode_reason": diagnostics.get("mode_reason"),
+        }
+    )
     if cancel_requested():
         emit({"type": "canceled"})
         return 0

@@ -99,7 +99,7 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    resolved_mode = apply_compute_mode(runtime.model_manager, args.mode)
+    requested_mode = apply_compute_mode(runtime.model_manager, args.mode)
 
     if not runtime.ensure_model_ready():
         emit(
@@ -111,6 +111,10 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    diagnostics = getattr(runtime.model_manager, "last_runtime_compute_status", {})
+    effective_mode = diagnostics.get("effective_mode", "cpu")
+    backend_available = diagnostics.get("backend_available", "unknown")
+    mode_reason = diagnostics.get("mode_reason")
     last_error: Optional[str] = None
     emit(
         {
@@ -118,7 +122,11 @@ def run(args: argparse.Namespace) -> int:
             "running": True,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": resolved_mode,
+            "backend_mode": effective_mode,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "backend_available": backend_available,
+            "mode_reason": mode_reason,
             "model_path": args.model,
             "last_error": None,
         }
@@ -155,7 +163,11 @@ def run(args: argparse.Namespace) -> int:
                     "running": True,
                     "registered": registered,
                     "active_relay_url": active_relay_url,
-                    "backend_mode": resolved_mode,
+                    "backend_mode": effective_mode,
+                    "requested_mode": requested_mode,
+                    "effective_mode": effective_mode,
+                    "backend_available": backend_available,
+                    "mode_reason": mode_reason,
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -173,7 +185,11 @@ def run(args: argparse.Namespace) -> int:
             "running": False,
             "registered": False,
             "active_relay_url": runtime.relay_client.relay_url,
-            "backend_mode": resolved_mode,
+            "backend_mode": effective_mode,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "backend_available": backend_available,
+            "mode_reason": mode_reason,
             "model_path": args.model,
             "last_error": None,
         }

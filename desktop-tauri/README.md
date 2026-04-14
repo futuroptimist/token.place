@@ -35,8 +35,13 @@ and fast local testing:
 ```bash
 cd desktop-tauri
 npm ci
+python scripts/install_desktop_llama_runtime.py
 npm run tauri dev
 ```
+
+The runtime installer follows the same fallback sequence used by desktop release
+builds: prefer GPU-capable wheels (CUDA on Windows, Metal on macOS), then
+gracefully fall back to CPU-only wheels when GPU packages are unavailable.
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 

@@ -842,6 +842,22 @@ class TestModelManager:
 
         assert backend == 'metal'
 
+    def test_platform_gpu_backend_prefers_runtime_marker_over_platform_default(self):
+        """Windows should use runtime markers instead of assuming CUDA blindly."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            GGML_USE_VULKAN=True,
+            GGML_USE_OPENCL=False,
+            GGML_USE_CLBLAST=False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'win32'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'vulkan'
+
     def test_platform_gpu_backend_linux_uses_gpu_offload_probe(self):
         """Linux backend detection should map positive runtime probes to CUDA."""
         fake_llama = SimpleNamespace(
@@ -879,6 +895,23 @@ class TestModelManager:
         fake_llama = SimpleNamespace(
             GGML_USE_CUDA=False,
             GGML_USE_METAL=True,
+            GGML_USE_VULKAN=False,
+            GGML_USE_OPENCL=False,
+            GGML_USE_CLBLAST=False,
+            llama_supports_gpu_offload=None,
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            assert ModelManager._llama_gpu_offload_available() is True
+
+    def test_llama_gpu_offload_available_supports_vulkan_markers(self):
+        """GPU support probe should detect non-CUDA GPU marker builds."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            GGML_USE_VULKAN=True,
+            GGML_USE_OPENCL=False,
+            GGML_USE_CLBLAST=False,
             llama_supports_gpu_offload=None,
         )
 

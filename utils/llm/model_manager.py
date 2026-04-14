@@ -73,7 +73,31 @@ class ModelManager:
         }
 
     @staticmethod
-    def _platform_gpu_backend() -> Optional[str]:
+    def _runtime_backend_markers() -> Dict[str, bool]:
+        """Return runtime backend capability markers exposed by llama_cpp."""
+        try:
+            import llama_cpp
+        except Exception:
+            return {}
+
+        marker_map = {
+            'cuda': bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)),
+            'metal': bool(getattr(llama_cpp, 'GGML_USE_METAL', False)),
+            'vulkan': bool(getattr(llama_cpp, 'GGML_USE_VULKAN', False)),
+            'opencl': bool(getattr(llama_cpp, 'GGML_USE_OPENCL', False)),
+            'clblast': bool(getattr(llama_cpp, 'GGML_USE_CLBLAST', False)),
+        }
+        return {name: enabled for name, enabled in marker_map.items() if enabled}
+
+    @classmethod
+    def _platform_gpu_backend(cls) -> Optional[str]:
+        runtime_markers = cls._runtime_backend_markers()
+        if runtime_markers:
+            for backend in ('cuda', 'metal', 'vulkan', 'opencl', 'clblast'):
+                if runtime_markers.get(backend):
+                    return backend
+            return next(iter(runtime_markers.keys()))
+
         if sys.platform == 'darwin':
             return 'metal'
         if sys.platform.startswith('win'):
@@ -111,10 +135,62 @@ class ModelManager:
             except Exception:
                 return False
 
-        for marker in ('GGML_USE_CUDA', 'GGML_USE_METAL'):
+        for marker in (
+            'GGML_USE_CUDA',
+            'GGML_USE_METAL',
+            'GGML_USE_VULKAN',
+            'GGML_USE_OPENCL',
+            'GGML_USE_CLBLAST',
+        ):
             if bool(getattr(llama_cpp, marker, False)):
                 return True
         return False
+
+    @staticmethod
+    def _device_label_for_backend(backend: str) -> Optional[str]:
+        normalized = (backend or '').lower()
+        if normalized == 'cuda':
+            try:
+                import pynvml
+
+                pynvml.nvmlInit()
+                try:
+                    if int(pynvml.nvmlDeviceGetCount()) <= 0:
+                        return 'cuda:unknown'
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    name = pynvml.nvmlDeviceGetName(handle)
+                    if isinstance(name, bytes):
+                        name = name.decode('utf-8', errors='replace')
+                    return f'cuda:{str(name).strip()}'
+                finally:
+                    pynvml.nvmlShutdown()
+            except Exception:
+                return 'cuda:unknown'
+        if normalized == 'metal':
+            return 'metal:apple-gpu'
+        if normalized in {'vulkan', 'opencl', 'clblast'}:
+            return f'{normalized}:unknown'
+        if normalized == 'cpu':
+            return 'cpu'
+        return None
+
+    def _log_compute_summary(self, diagnostics: Dict[str, Any]) -> None:
+        backend_used = str(diagnostics.get('backend_used', 'unknown'))
+        n_gpu_layers = int(diagnostics.get('n_gpu_layers', 0))
+        device = self._device_label_for_backend(backend_used) or 'unknown'
+        offload = 'all' if n_gpu_layers < 0 else str(max(n_gpu_layers, 0))
+        kv_cache = 'gpu' if n_gpu_layers != 0 and backend_used != 'cpu' else 'cpu'
+        fallback_reason = diagnostics.get('fallback_reason') or '-'
+        self.log_info(
+            "Compute plan selected: "
+            f"requested={diagnostics.get('requested_mode')} "
+            f"effective={diagnostics.get('effective_mode')} "
+            f"backend={backend_used} "
+            f"device={device} "
+            f"offloaded_layers={offload} "
+            f"kv_cache={kv_cache} "
+            f"fallback={fallback_reason}"
+        )
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
@@ -406,6 +482,7 @@ class ModelManager:
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             self.last_compute_diagnostics = compute_plan
+                            self._log_compute_summary(compute_plan)
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

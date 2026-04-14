@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -210,11 +211,16 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
 
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
+    policy: SubprocessLogPolicy,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
+    let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
-        eprintln!("desktop.compute_node.stderr line={line}");
+        if filter.should_emit(&line) {
+            eprintln!("desktop.compute_node.stderr line={line}");
+        }
     }
+    filter.flush_summary();
     Ok(())
 }
 
@@ -340,8 +346,9 @@ pub async fn start_compute_node(
         };
     }
 
+    let log_policy = SubprocessLogPolicy::from_env();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_compute_node_stderr(stderr).await {
+        if let Err(err) = drain_compute_node_stderr(stderr, log_policy).await {
             eprintln!("desktop.compute_node.stderr_error error={err}");
         }
     });
@@ -509,7 +516,7 @@ mod tests {
             .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
-        drain_compute_node_stderr(stderr)
+        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
             .await
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");

@@ -18,7 +18,17 @@ if __package__ in (None, ""):
         sys.path.insert(0, script_dir)
 
 from path_bootstrap import ensure_runtime_import_paths
-from desktop_runtime_setup import ensure_desktop_llama_runtime
+
+try:
+    from desktop_runtime_setup import ensure_desktop_llama_runtime
+except ModuleNotFoundError:
+    def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
+        return {
+            "selected_backend": "cpu",
+            "detected_device": "cpu",
+            "runtime_action": "unavailable",
+            "fallback_reason": "desktop_runtime_setup module missing",
+        }
 
 ensure_runtime_import_paths(__file__)
 

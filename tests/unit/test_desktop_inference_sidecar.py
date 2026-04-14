@@ -435,6 +435,42 @@ def test_stream_content_ignores_invalid_chunks_and_stops_on_finish_reason(capsys
     assert events == [{'type': 'token', 'text': 'ok'}]
 
 
+def test_stream_content_records_token_count_when_requested(capsys):
+    inference_sidecar._stdin_lines = queue.Queue()
+    inference_sidecar._stdin_reader_started = True
+
+    chunks = iter(
+        [
+            {'choices': [{'delta': {'content': 'one'}, 'finish_reason': None}]},
+            {'choices': [{'delta': {'content': ' two'}, 'finish_reason': 'stop'}]},
+        ]
+    )
+    token_counts = []
+    text, canceled = inference_sidecar._stream_content(chunks, lambda chunk: chunk, token_counts)
+
+    assert canceled is False
+    assert text == 'one two'
+    assert token_counts == [2]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [{'type': 'token', 'text': 'one'}, {'type': 'token', 'text': ' two'}]
+
+
+def test_stream_content_records_token_count_on_cancel(capsys):
+    inference_sidecar._stdin_lines = queue.Queue()
+    inference_sidecar._stdin_reader_started = True
+    inference_sidecar._stdin_lines.put('{"type":"cancel"}')
+
+    chunks = iter([{'choices': [{'delta': {'content': 'ignored'}, 'finish_reason': None}]}])
+    token_counts = []
+    text, canceled = inference_sidecar._stream_content(chunks, lambda chunk: chunk, token_counts)
+
+    assert canceled is True
+    assert text == ''
+    assert token_counts == [0]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [{'type': 'canceled'}]
+
+
 def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, capsys):
     class EmptyLlm:
         def create_chat_completion(self, **kwargs):

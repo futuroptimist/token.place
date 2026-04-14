@@ -9,6 +9,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Tuple
 
@@ -53,6 +54,22 @@ def emit_error(code: str, message: str) -> int:
     return 1
 
 
+def emit_summary(label: str, **fields: Any) -> None:
+    summary_payload = {"label": label}
+    summary_payload.update({key: value for key, value in fields.items() if value is not None})
+    print(
+        f"desktop.inference.summary {json.dumps(summary_payload, separators=(',', ':'))}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def verbose_subprocess_logging_enabled() -> bool:
+    return os.getenv("TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS") == "1" or os.getenv(
+        "TOKEN_PLACE_VERBOSE_LLM_LOGS"
+    ) == "1"
+
+
 def cancel_requested() -> bool:
     _start_stdin_reader()
     while True:
@@ -92,12 +109,16 @@ def _fallback_normalize_chunk(chunk: Any) -> Dict[str, Any]:
 def _stream_content(
     completion: Iterable[Any],
     normalize_chunk: Callable[[Any], Dict[str, Any]],
+    token_counter: list[int] | None = None,
 ) -> Tuple[str, bool]:
     full_text = []
     emitted = False
+    token_events = 0
     for raw_chunk in completion:
         if cancel_requested():
             emit({"type": "canceled"})
+            if token_counter is not None:
+                token_counter.append(token_events)
             return "", True
 
         chunk = normalize_chunk(raw_chunk)
@@ -113,10 +134,13 @@ def _stream_content(
             full_text.append(text)
             emitted = True
             emit({"type": "token", "text": text})
+            token_events += 1
 
         if (choices[0] or {}).get("finish_reason"):
             break
 
+    if token_counter is not None:
+        token_counter.append(token_events)
     return "".join(full_text) if emitted else "", False
 
 
@@ -144,11 +168,26 @@ def run(args: argparse.Namespace) -> int:
     manager.model_path = args.model
     apply_compute_mode(manager, args.mode)
 
+    model_load_started_at = time.perf_counter()
     llm = manager.get_llm_instance()
+    model_load_elapsed_ms = int((time.perf_counter() - model_load_started_at) * 1000)
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
     diagnostics = compute_mode_diagnostics(manager)
+    model_name = Path(args.model).name
+    model_path_for_summary = args.model if verbose_subprocess_logging_enabled() else model_name
+    emit_summary(
+        "model_init",
+        model=model_name,
+        model_path=model_path_for_summary,
+        backend=diagnostics.get("backend_used"),
+        device=diagnostics.get("effective_mode"),
+        context_size=manager.config.get("model.context_size", 8192),
+        offloaded_layers=diagnostics.get("n_gpu_layers"),
+        load_time_ms=model_load_elapsed_ms,
+        fallback_reason=diagnostics.get("fallback_reason"),
+    )
     emit(
         {
             "type": "started",
@@ -171,6 +210,7 @@ def run(args: argparse.Namespace) -> int:
         "top_p": manager.config.get("model.top_p", 0.9),
         "stop": manager.config.get("model.stop_tokens", []),
     }
+    inference_started_at = time.perf_counter()
     try:
         completion = llm.create_chat_completion(
             **request_kwargs,
@@ -181,12 +221,17 @@ def run(args: argparse.Namespace) -> int:
 
     normalize_chunk = getattr(ModelManager, "_normalize_stream_chunk", _fallback_normalize_chunk)
 
+    token_events = 0
+    text = ""
     if isinstance(completion, dict):
         text = _extract_text_from_completion(completion)
         if text:
             emit({"type": "token", "text": text})
+            token_events += 1
     else:
-        text, canceled = _stream_content(completion, normalize_chunk)
+        token_counts: list[int] = []
+        text, canceled = _stream_content(completion, normalize_chunk, token_counts)
+        token_events = token_counts[0] if token_counts else 0
         if canceled:
             return 0
 
@@ -202,6 +247,25 @@ def run(args: argparse.Namespace) -> int:
             fallback_text = _extract_text_from_completion(fallback)
             if fallback_text:
                 emit({"type": "token", "text": fallback_text})
+                token_events = max(token_events, 1)
+                text = fallback_text
+
+    inference_elapsed_s = max(time.perf_counter() - inference_started_at, 1e-6)
+    prompt_chars_per_second = int(len(args.prompt) / inference_elapsed_s) if args.prompt else 0
+    eval_chars_per_second = int(len(text) / inference_elapsed_s) if text else 0
+    eval_tokens_per_second = round(token_events / inference_elapsed_s, 2) if token_events else 0
+    emit_summary(
+        "inference",
+        prompt_chars=len(args.prompt),
+        output_chars=len(text),
+        token_events=token_events,
+        eval_seconds=f"{inference_elapsed_s:.3f}",
+        throughput_summary=(
+            f"prompt_chars_per_s={prompt_chars_per_second};"
+            f"eval_chars_per_s={eval_chars_per_second};"
+            f"eval_tokens_per_s={eval_tokens_per_second}"
+        ),
+    )
 
     emit({"type": "done"})
     return 0

@@ -46,6 +46,98 @@ pub struct SidecarState {
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
+#[derive(Default, Debug)]
+struct StderrSummary {
+    backend: Option<String>,
+    device: Option<String>,
+    context_size: Option<String>,
+    offloaded_layers: Option<String>,
+    load_time: Option<String>,
+    prompt_throughput: Option<String>,
+    eval_throughput: Option<String>,
+    fallback_reason: Option<String>,
+    noisy_counts: [usize; 4],
+}
+
+fn raw_sidecar_logs_enabled() -> bool {
+    matches!(
+        std::env::var("TOKEN_PLACE_DESKTOP_VERBOSE_RAW_LOGS").as_deref(),
+        Ok("1")
+    )
+}
+
+fn looks_like_warning_or_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["error", "warn", "failed", "exception", "traceback", "fatal"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn noisy_pattern_bucket(line: &str) -> Option<usize> {
+    if line.contains("Dumping metadata keys/values") {
+        return Some(0);
+    }
+    if line.contains("is not marked as EOG") {
+        return Some(1);
+    }
+    if line.contains("load_tensors: layer") || line.contains("load_tensors: offloading layer") {
+        return Some(2);
+    }
+    if line.contains("repack:") {
+        return Some(3);
+    }
+    None
+}
+
+fn parse_summary_line(summary: &mut StderrSummary, line: &str) {
+    let compact = line.trim().replace('"', "'");
+    if summary.context_size.is_none() && line.contains("n_ctx") {
+        summary.context_size = Some(compact.clone());
+    }
+    if summary.offloaded_layers.is_none()
+        && line.to_ascii_lowercase().contains("offloaded")
+        && line.to_ascii_lowercase().contains("layers")
+    {
+        summary.offloaded_layers = Some(compact.clone());
+    }
+    if summary.load_time.is_none()
+        && (line.to_ascii_lowercase().contains("load time")
+            || line.to_ascii_lowercase().contains("loaded in")
+            || line.to_ascii_lowercase().contains("done in"))
+    {
+        summary.load_time = Some(compact.clone());
+    }
+    if summary.prompt_throughput.is_none()
+        && line.to_ascii_lowercase().contains("tokens per second")
+        && line.to_ascii_lowercase().contains("prompt")
+    {
+        summary.prompt_throughput = Some(compact.clone());
+    }
+    if summary.eval_throughput.is_none()
+        && line.to_ascii_lowercase().contains("tokens per second")
+        && line.to_ascii_lowercase().contains("eval")
+    {
+        summary.eval_throughput = Some(compact.clone());
+    }
+    if summary.backend.is_none()
+        && (line.contains("CUDA")
+            || line.contains("Metal")
+            || line.contains("CPU")
+            || line.to_ascii_lowercase().contains("backend"))
+    {
+        summary.backend = Some(compact.clone());
+    }
+    if summary.device.is_none()
+        && (line.to_ascii_lowercase().contains("using device")
+            || line.to_ascii_lowercase().contains("device"))
+    {
+        summary.device = Some(compact.clone());
+    }
+    if summary.fallback_reason.is_none() && line.to_ascii_lowercase().contains("falling back") {
+        summary.fallback_reason = Some(compact);
+    }
+}
+
 pub fn parse_event_line(line: &str) -> Result<SidecarEvent, serde_json::Error> {
     serde_json::from_str::<SidecarEvent>(line)
 }
@@ -67,12 +159,36 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
 async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     request_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StderrSummary> {
+    let show_raw = raw_sidecar_logs_enabled();
+    let mut summary = StderrSummary::default();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
+        parse_summary_line(&mut summary, &line);
+        if show_raw || looks_like_warning_or_error(&line) {
+            eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+            continue;
+        }
+        if let Some(bucket) = noisy_pattern_bucket(&line) {
+            summary.noisy_counts[bucket] += 1;
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
         eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
     }
-    Ok(())
+    if !show_raw {
+        eprintln!(
+            "desktop.sidecar.stderr_summary request_id={} metadata_dumps={} eog_spam={} layer_spam={} repack_spam={}",
+            request_id,
+            summary.noisy_counts[0],
+            summary.noisy_counts[1],
+            summary.noisy_counts[2],
+            summary.noisy_counts[3],
+        );
+    }
+    Ok(summary)
 }
 
 fn build_sidecar_command(
@@ -280,13 +396,11 @@ pub async fn start_sidecar(
 
     let request_id = request.request_id;
     let stderr_request_id = request_id.clone();
+    let stderr_model_path = request.model_path.clone();
+    let stderr_mode = format!("{:?}", request.mode).to_lowercase();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_sidecar_stderr(stderr, &stderr_request_id).await {
-            eprintln!(
-                "desktop.sidecar.stderr_error request_id={} error={}",
-                stderr_request_id, err
-            );
-        }
+        let summary = drain_sidecar_stderr(stderr, &stderr_request_id).await;
+        (stderr_request_id, stderr_model_path, stderr_mode, summary)
     });
 
     let mut reader = BufReader::new(stdout).lines();
@@ -314,11 +428,37 @@ pub async fn start_sidecar(
         }
     }
 
-    if let Err(err) = stderr_task.await {
-        eprintln!(
-            "desktop.sidecar.stderr_task_join_error request_id={} error={}",
-            request_id, err
-        );
+    match stderr_task.await {
+        Ok((stderr_request_id, model_path, mode, Ok(summary))) => {
+            if !raw_sidecar_logs_enabled() {
+                eprintln!(
+                    "desktop.sidecar.runtime_summary request_id={} model_path={} mode={} backend={} device={} context={} offload={} load_time={} prompt_tps={} eval_tps={} fallback_reason={}",
+                    stderr_request_id,
+                    model_path,
+                    mode,
+                    summary.backend.as_deref().unwrap_or("n/a"),
+                    summary.device.as_deref().unwrap_or("n/a"),
+                    summary.context_size.as_deref().unwrap_or("n/a"),
+                    summary.offloaded_layers.as_deref().unwrap_or("n/a"),
+                    summary.load_time.as_deref().unwrap_or("n/a"),
+                    summary.prompt_throughput.as_deref().unwrap_or("n/a"),
+                    summary.eval_throughput.as_deref().unwrap_or("n/a"),
+                    summary.fallback_reason.as_deref().unwrap_or("n/a"),
+                );
+            }
+        }
+        Ok((stderr_request_id, _, _, Err(err))) => {
+            eprintln!(
+                "desktop.sidecar.stderr_error request_id={} error={}",
+                stderr_request_id, err
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "desktop.sidecar.stderr_task_join_error request_id={} error={}",
+                request_id, err
+            );
+        }
     }
 
     let running_child = {

@@ -29,6 +29,11 @@ and fast local testing:
 - Set `TOKEN_PLACE_SIDECAR=/full/path/to/script.py` to explicitly override the
   sidecar command path (this takes precedence over
   `TOKEN_PLACE_USE_FAKE_SIDECAR`).
+- Default stderr forwarding now suppresses known low-value llama.cpp spam
+  (metadata dumps, control-token spam, per-layer offload chatter, and repack
+  spam) while still emitting warnings/errors and a concise runtime summary.
+- Set `TOKEN_PLACE_DESKTOP_VERBOSE_RAW_LOGS=1` to restore raw unfiltered
+  sidecar/compute-node stderr output for deep troubleshooting.
 
 ## Run locally
 

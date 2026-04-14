@@ -154,11 +154,24 @@ def run(args: argparse.Namespace) -> int:
             "type": "started",
             "requested_mode": diagnostics.get("requested_mode"),
             "effective_mode": diagnostics.get("effective_mode"),
+            "backend_available": diagnostics.get("backend_available"),
+            "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
             "n_gpu_layers": diagnostics.get("n_gpu_layers"),
             "fallback_reason": diagnostics.get("fallback_reason"),
         }
     )
+    summary = (
+        "desktop.inference.started "
+        f"requested={diagnostics.get('requested_mode')} "
+        f"effective={diagnostics.get('effective_mode')} "
+        f"backend_available={diagnostics.get('backend_available')} "
+        f"backend_selected={diagnostics.get('backend_selected')} "
+        f"backend_used={diagnostics.get('backend_used')} "
+        f"offload_layers={diagnostics.get('n_gpu_layers')} "
+        f"fallback={diagnostics.get('fallback_reason') or 'none'}"
+    )
+    print(summary, file=sys.stderr)
     if cancel_requested():
         emit({"type": "canceled"})
         return 0

@@ -44,6 +44,17 @@ npm run tauri dev
 - **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build.
 - CPU fallback mode is available in both cases.
 
+### Verifying effective llama.cpp backend selection
+
+To validate that Auto mode actually offloads to GPU (instead of silently staying on CPU), run:
+
+```bash
+python scripts/verify_llama_backend.py --model /path/to/model.gguf --mode auto
+```
+
+The command initializes the shared `ModelManager` runtime and prints JSON diagnostics that include
+`backend_available`, `backend_used`, `n_gpu_layers`, and `fallback_reason`.
+
 ## Privacy defaults
 
 - Prompt/response plaintext stays in-memory by default.

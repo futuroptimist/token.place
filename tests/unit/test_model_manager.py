@@ -856,6 +856,21 @@ class TestModelManager:
 
         assert backend == 'cuda'
 
+    def test_platform_gpu_backend_windows_returns_none_for_cpu_runtime(self):
+        """Windows should not report CUDA when llama_cpp runtime lacks GPU markers."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            GGML_USE_VULKAN=False,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'win32'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend is None
+
     def test_platform_gpu_backend_linux_returns_none_when_probe_raises(self):
         """Linux backend detection should fail closed when probe raises."""
 

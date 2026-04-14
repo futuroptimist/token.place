@@ -73,48 +73,97 @@ class ModelManager:
         }
 
     @staticmethod
-    def _platform_gpu_backend() -> Optional[str]:
-        if sys.platform == 'darwin':
-            return 'metal'
-        if sys.platform.startswith('win'):
-            return 'cuda'
-        if sys.platform.startswith('linux'):
-            try:
-                import llama_cpp
-            except Exception:
+    def _detect_primary_gpu_device(backend: str) -> Optional[str]:
+        if backend != 'cuda':
+            return None
+        try:
+            import pynvml
+        except Exception:
+            return None
+
+        try:
+            pynvml.nvmlInit()
+        except Exception:
+            return None
+
+        try:
+            count = int(pynvml.nvmlDeviceGetCount())
+            if count <= 0:
                 return None
-            if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
-                return 'cuda'
-            if bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
-                return 'metal'
-            supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
-            if callable(supports_gpu):
-                try:
-                    if bool(supports_gpu()):
-                        # Linux builds that expose GPU offload are expected to be CUDA.
-                        return 'cuda'
-                except Exception:
-                    return None
-        return None
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            raw_name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(raw_name, bytes):
+                return raw_name.decode('utf-8', errors='replace')
+            return str(raw_name)
+        except Exception:
+            return None
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
     @staticmethod
-    def _llama_gpu_offload_available() -> bool:
+    def _llama_runtime_capabilities() -> Dict[str, Any]:
+        capability_snapshot: Dict[str, Any] = {
+            'cuda': False,
+            'metal': False,
+            'vulkan': False,
+            'gpu_offload': False,
+            'system_info': '',
+        }
+
         try:
             import llama_cpp
         except Exception:
-            return False
+            return capability_snapshot
+
+        capability_snapshot['cuda'] = bool(getattr(llama_cpp, 'GGML_USE_CUDA', False))
+        capability_snapshot['metal'] = bool(getattr(llama_cpp, 'GGML_USE_METAL', False))
+        capability_snapshot['vulkan'] = bool(getattr(llama_cpp, 'GGML_USE_VULKAN', False))
 
         supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
         if callable(supports_gpu):
             try:
-                return bool(supports_gpu())
+                capability_snapshot['gpu_offload'] = bool(supports_gpu())
             except Exception:
-                return False
+                capability_snapshot['gpu_offload'] = False
+        else:
+            capability_snapshot['gpu_offload'] = bool(
+                capability_snapshot['cuda']
+                or capability_snapshot['metal']
+                or capability_snapshot['vulkan']
+            )
 
-        for marker in ('GGML_USE_CUDA', 'GGML_USE_METAL'):
-            if bool(getattr(llama_cpp, marker, False)):
-                return True
-        return False
+        system_info = getattr(llama_cpp, 'llama_print_system_info', None)
+        if callable(system_info):
+            try:
+                info = system_info()
+                capability_snapshot['system_info'] = str(info or '').strip()
+            except Exception:
+                capability_snapshot['system_info'] = ''
+
+        return capability_snapshot
+
+    @staticmethod
+    def _platform_gpu_backend() -> Optional[str]:
+        capabilities = ModelManager._llama_runtime_capabilities()
+        if capabilities.get('cuda'):
+            return 'cuda'
+        if capabilities.get('metal'):
+            return 'metal'
+        if capabilities.get('vulkan'):
+            return 'vulkan'
+        if capabilities.get('gpu_offload'):
+            if sys.platform == 'darwin':
+                return 'metal'
+            if sys.platform.startswith(('win', 'linux')):
+                return 'cuda'
+        return None
+
+    @staticmethod
+    def _llama_gpu_offload_available() -> bool:
+        return bool(ModelManager._llama_runtime_capabilities().get('gpu_offload'))
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
@@ -132,7 +181,7 @@ class ModelManager:
             ):
                 n_gpu_layers = 0
                 fallback_reason = (
-                    'no CUDA/Metal backend is supported on this platform'
+                    'no supported llama.cpp GPU backend is available in this runtime'
                     if backend_available == 'cpu'
                     else (
                         f'llama-cpp-python runtime does not expose {backend_available} '
@@ -161,7 +210,7 @@ class ModelManager:
             }
 
         if backend_available == 'cpu':
-            fallback_reason = 'no CUDA/Metal backend is supported on this platform'
+            fallback_reason = 'no supported llama.cpp GPU backend is available in this runtime'
         elif not gpu_runtime_supported:
             fallback_reason = (
                 f'llama-cpp-python runtime does not expose {backend_available} GPU offload support'
@@ -405,6 +454,35 @@ class ModelManager:
                                 chat_format=self.config.get('model.chat_format', 'llama-3')
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
+                            gpu_device = self._detect_primary_gpu_device(
+                                str(compute_plan.get('backend_used', 'cpu'))
+                            )
+                            runtime_capabilities = self._llama_runtime_capabilities()
+                            kv_cache_target = (
+                                compute_plan.get('backend_used')
+                                if n_gpu_layers != 0 and compute_plan.get('backend_used') != 'cpu'
+                                else 'cpu'
+                            )
+                            summary_parts = [
+                                f"requested={compute_plan.get('requested_mode')}",
+                                f"effective={compute_plan.get('effective_mode')}",
+                                f"backend={compute_plan.get('backend_used')}",
+                                f"backend_available={compute_plan.get('backend_available')}",
+                                f"offload_layers={n_gpu_layers}",
+                                f"kv_cache={kv_cache_target}",
+                                f"gpu_offload_supported={runtime_capabilities.get('gpu_offload')}",
+                            ]
+                            if gpu_device:
+                                summary_parts.append(f"device={gpu_device}")
+                            if runtime_capabilities.get('system_info'):
+                                summary_parts.append(
+                                    f"llama_system_info={runtime_capabilities.get('system_info')}"
+                                )
+                            if compute_plan.get('fallback_reason'):
+                                summary_parts.append(
+                                    f"fallback_reason={compute_plan.get('fallback_reason')}"
+                                )
+                            self.log_info("Llama backend summary: " + " ".join(summary_parts))
                             self.last_compute_diagnostics = compute_plan
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:

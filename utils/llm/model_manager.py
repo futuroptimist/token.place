@@ -46,6 +46,12 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     else:
         gpu_offload_supported = backend in {'cuda', 'metal'}
 
+    # Some llama_cpp builds can report runtime GPU offload support via probe
+    # without exposing GGML_USE_* backend markers. Preserve prior Linux behavior
+    # by inferring CUDA when offload is available and backend markers are absent.
+    if gpu_offload_supported and backend == 'cpu':
+        backend = 'metal' if sys.platform == 'darwin' else 'cuda'
+
     return {
         'backend': backend,
         'gpu_offload_supported': gpu_offload_supported,

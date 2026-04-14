@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
-from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks
+from desktop_gpu_packaging import LlamaCppInstallPlan, llama_cpp_install_plan_fallbacks
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class RuntimeProbe:
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
+PIP_INSTALL_TIMEOUT_SECONDS = 300
 
 
 def _probe_llama_runtime() -> RuntimeProbe:
@@ -125,17 +126,39 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "detected_device": before.detected_device,
         }
 
-    plans = llama_cpp_install_plan_fallbacks(
-        platform=sys.platform,
-        requirements_path=requirements_path,
-    )
+    try:
+        plans = llama_cpp_install_plan_fallbacks(
+            platform=sys.platform,
+            requirements_path=requirements_path,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        plans = _fallback_unpinned_plans(sys.platform)
+        fallback_setup_error = str(exc)
+    else:
+        fallback_setup_error = ""
+
+    last_install_error = ""
 
     for plan in plans:
         env = os.environ.copy()
         env.update(plan.pip_env())
         cmd = [sys.executable, "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec]
-        install = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
+        try:
+            install = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=PIP_INSTALL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            last_install_error = (
+                f"pip install timed out after {PIP_INSTALL_TIMEOUT_SECONDS}s for backend={plan.backend}"
+            )
+            continue
         if install.returncode != 0:
+            last_install_error = (install.stderr or install.stdout or "").strip()
             continue
 
         after = _probe_llama_runtime()
@@ -159,7 +182,81 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 
     return {
         "selected_backend": "cpu",
-        "fallback_reason": before.error or "unable to install a GPU-capable llama-cpp runtime",
+        "fallback_reason": (
+            before.error
+            or fallback_setup_error
+            or last_install_error
+            or "unable to install a GPU-capable llama-cpp runtime"
+        ),
         "runtime_action": "failed",
         "detected_device": "cpu",
     }
+
+
+def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
+    detected_platform = platform.lower()
+    if detected_platform.startswith("win"):
+        return [
+            LlamaCppInstallPlan(
+                platform=detected_platform,
+                backend="cuda",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+                extra_index_url="https://pypi.org/simple",
+                only_binary=True,
+                no_binary=False,
+            ),
+            LlamaCppInstallPlan(
+                platform=detected_platform,
+                backend="cpu",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=True,
+                no_binary=False,
+            ),
+        ]
+
+    if detected_platform == "darwin":
+        return [
+            LlamaCppInstallPlan(
+                platform=detected_platform,
+                backend="metal",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://abetlen.github.io/llama-cpp-python/whl/metal",
+                extra_index_url="https://pypi.org/simple",
+                only_binary=True,
+                no_binary=False,
+            ),
+            LlamaCppInstallPlan(
+                platform=detected_platform,
+                backend="metal",
+                package_spec="llama-cpp-python",
+                cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=False,
+                no_binary=True,
+            ),
+        ]
+
+    return [
+        LlamaCppInstallPlan(
+            platform=detected_platform,
+            backend="cpu",
+            package_spec="llama-cpp-python",
+            cmake_args=None,
+            force_cmake=False,
+            index_url=None,
+            extra_index_url=None,
+            only_binary=False,
+            no_binary=False,
+        )
+    ]

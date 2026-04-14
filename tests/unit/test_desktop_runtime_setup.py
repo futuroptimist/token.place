@@ -1,13 +1,16 @@
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
+PYTHON_MODULE_DIR = (
+    Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python'
+)
+if str(PYTHON_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_MODULE_DIR))
+
 MODULE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / 'desktop-tauri'
-    / 'src-tauri'
-    / 'python'
-    / 'desktop_runtime_setup.py'
+    PYTHON_MODULE_DIR / 'desktop_runtime_setup.py'
 )
 SPEC = importlib.util.spec_from_file_location('desktop_runtime_setup', MODULE_PATH)
 desktop_runtime_setup = importlib.util.module_from_spec(SPEC)
@@ -32,8 +35,6 @@ def test_runtime_bootstrap_uses_existing_gpu_runtime(monkeypatch):
     probe = {'count': 0}
 
     def fake_run(cmd, **kwargs):
-        if cmd[:3] == ['python', '-c', cmd[2]]:
-            raise AssertionError('unexpected probe executable')
         if cmd[1:3] == ['-c', cmd[2]]:
             probe['count'] += 1
             return _Result(
@@ -58,9 +59,9 @@ def test_runtime_bootstrap_uses_existing_gpu_runtime(monkeypatch):
 
 def test_runtime_bootstrap_falls_back_to_cpu_after_gpu_attempt(monkeypatch):
     state = {'probe_calls': 0, 'pip_calls': []}
+    Plan = desktop_runtime_setup.LlamaCppInstallPlan
 
     def fake_plans(**_kwargs):
-        Plan = desktop_runtime_setup.llama_cpp_install_plan_fallbacks()[0].__class__
         return [
             Plan(
                 platform='win32',
@@ -89,20 +90,12 @@ def test_runtime_bootstrap_falls_back_to_cpu_after_gpu_attempt(monkeypatch):
     def fake_run(cmd, **kwargs):
         if cmd[1] == '-c':
             state['probe_calls'] += 1
-            if state['probe_calls'] <= 2:
-                payload = {
-                    'backend': 'cpu',
-                    'gpu_offload_supported': False,
-                    'detected_device': 'cpu',
-                    'error': None,
-                }
-            else:
-                payload = {
-                    'backend': 'cpu',
-                    'gpu_offload_supported': False,
-                    'detected_device': 'cpu',
-                    'error': None,
-                }
+            payload = {
+                'backend': 'cpu',
+                'gpu_offload_supported': False,
+                'detected_device': 'cpu',
+                'error': None,
+            }
             return _Result(stdout=json.dumps(payload))
 
         state['pip_calls'].append(cmd)

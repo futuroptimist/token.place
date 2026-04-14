@@ -29,6 +29,10 @@ and fast local testing:
 - Set `TOKEN_PLACE_SIDECAR=/full/path/to/script.py` to explicitly override the
   sidecar command path (this takes precedence over
   `TOKEN_PLACE_USE_FAKE_SIDECAR`).
+- Set `TOKEN_PLACE_VERBOSE_LLAMA_LOGS=1` to disable desktop stderr filtering
+  and stream full raw llama.cpp output for troubleshooting. By default, desktop
+  suppresses known low-signal llama.cpp init spam while still showing
+  warnings/errors and concise runtime summaries.
 
 ## Run locally
 

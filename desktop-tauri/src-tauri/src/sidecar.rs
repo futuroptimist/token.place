@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::logging::SubprocessLogFilter;
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -22,15 +23,99 @@ pub struct InferenceRequest {
 #[serde(tag = "type")]
 pub enum SidecarEvent {
     #[serde(rename = "started")]
-    Started,
+    Started {
+        #[serde(default)]
+        model_path: Option<String>,
+        #[serde(default)]
+        model_name: Option<String>,
+        #[serde(default)]
+        backend_used: Option<String>,
+        #[serde(default)]
+        effective_mode: Option<String>,
+        #[serde(default)]
+        n_gpu_layers: Option<i64>,
+        #[serde(default)]
+        context_size: Option<i64>,
+        #[serde(default)]
+        load_ms: Option<f64>,
+        #[serde(default)]
+        fallback_reason: Option<String>,
+    },
     #[serde(rename = "token")]
     Token { text: String },
     #[serde(rename = "done")]
-    Done,
+    Done {
+        #[serde(default)]
+        prompt_tokens_estimate: Option<usize>,
+        #[serde(default)]
+        output_tokens_estimate: Option<usize>,
+        #[serde(default)]
+        tokens_per_second_estimate: Option<f64>,
+        #[serde(default)]
+        inference_ms: Option<f64>,
+    },
     #[serde(rename = "canceled")]
     Canceled,
     #[serde(rename = "error")]
     Error { code: String, message: String },
+}
+
+fn log_sidecar_started_summary(request_id: &str, event: &SidecarEvent) {
+    if let SidecarEvent::Started {
+        model_path,
+        model_name,
+        backend_used,
+        effective_mode,
+        n_gpu_layers,
+        context_size,
+        load_ms,
+        fallback_reason,
+    } = event
+    {
+        eprintln!(
+            "desktop.sidecar.summary request_id={} phase=model_init model={} path={} backend={} mode={} ctx={} offloaded_layers={} load_ms={} fallback_reason={}",
+            request_id,
+            model_name.as_deref().unwrap_or("unknown"),
+            model_path.as_deref().unwrap_or("unknown"),
+            backend_used.as_deref().unwrap_or("unknown"),
+            effective_mode.as_deref().unwrap_or("unknown"),
+            context_size.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into()),
+            n_gpu_layers
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            load_ms
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "unknown".into()),
+            fallback_reason.as_deref().unwrap_or("none"),
+        );
+    }
+}
+
+fn log_sidecar_done_summary(request_id: &str, event: &SidecarEvent) {
+    if let SidecarEvent::Done {
+        prompt_tokens_estimate,
+        output_tokens_estimate,
+        tokens_per_second_estimate,
+        inference_ms,
+    } = event
+    {
+        eprintln!(
+            "desktop.sidecar.summary request_id={} phase=inference prompt_tokens_est={} output_tokens_est={} throughput_tps_est={} inference_ms={}",
+            request_id,
+            prompt_tokens_estimate
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            output_tokens_estimate
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            tokens_per_second_estimate
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "unknown".into()),
+            inference_ms
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "unknown".into()),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,9 +153,36 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     request_id: &str,
 ) -> anyhow::Result<()> {
+    let mut filter = SubprocessLogFilter::default();
+    let mut timing_lines: Vec<String> = Vec::new();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+        if line.contains("llama_print_timings:") {
+            timing_lines.push(line.trim().to_string());
+        }
+        if let Some(filtered) = filter.classify_and_filter(&line) {
+            eprintln!("desktop.sidecar.stderr request_id={request_id} line={filtered}");
+        }
+    }
+    let verbose = filter.is_verbose();
+    let summary = filter.finish();
+    if !summary.suppressed_by_kind.is_empty() && !verbose {
+        let categories = summary
+            .suppressed_by_kind
+            .iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "desktop.sidecar.stderr_summary request_id={request_id} shown={} suppressed={} categories={}",
+            summary.shown_lines, summary.suppressed_lines, categories
+        );
+    }
+    if !timing_lines.is_empty() {
+        eprintln!(
+            "desktop.sidecar.llama_timing_summary request_id={request_id} {}",
+            timing_lines.join(" | ")
+        );
     }
     Ok(())
 }
@@ -297,6 +409,11 @@ pub async fn start_sidecar(
                 if matches!(event, SidecarEvent::Error { .. }) {
                     saw_error_event = true;
                 }
+                if matches!(event, SidecarEvent::Started { .. }) {
+                    log_sidecar_started_summary(&request_id, &event);
+                } else if matches!(event, SidecarEvent::Done { .. }) {
+                    log_sidecar_done_summary(&request_id, &event);
+                }
                 app.emit(
                     "inference_event",
                     UiInferenceEvent {
@@ -418,8 +535,12 @@ mod tests {
         let events = collect_events_from_stdout(stdout)
             .await
             .expect("collect events");
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Started { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Done { .. })));
     }
 
     #[tokio::test]
@@ -447,11 +568,15 @@ mod tests {
         let events = collect_events_from_stdout(stdout)
             .await
             .expect("collect events");
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Started { .. })));
         assert!(events
             .iter()
             .any(|e| matches!(e, SidecarEvent::Token { .. })));
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Done { .. })));
     }
 
     #[tokio::test]
@@ -487,9 +612,23 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                SidecarEvent::Started,
+                SidecarEvent::Started {
+                    model_path: None,
+                    model_name: None,
+                    backend_used: None,
+                    effective_mode: None,
+                    n_gpu_layers: None,
+                    context_size: None,
+                    load_ms: None,
+                    fallback_reason: None,
+                },
                 SidecarEvent::Token { text: "ok".into() },
-                SidecarEvent::Done
+                SidecarEvent::Done {
+                    prompt_tokens_estimate: None,
+                    output_tokens_estimate: None,
+                    tokens_per_second_estimate: None,
+                    inference_ms: None,
+                }
             ]
         );
     }

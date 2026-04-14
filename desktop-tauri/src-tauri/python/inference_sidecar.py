@@ -9,6 +9,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Tuple
 
@@ -144,7 +145,9 @@ def run(args: argparse.Namespace) -> int:
     manager.model_path = args.model
     apply_compute_mode(manager, args.mode)
 
+    model_load_started_at = time.perf_counter()
     llm = manager.get_llm_instance()
+    model_load_ms = (time.perf_counter() - model_load_started_at) * 1000.0
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
@@ -152,10 +155,14 @@ def run(args: argparse.Namespace) -> int:
     emit(
         {
             "type": "started",
+            "model_path": args.model,
+            "model_name": Path(args.model).name,
             "requested_mode": diagnostics.get("requested_mode"),
             "effective_mode": diagnostics.get("effective_mode"),
             "backend_used": diagnostics.get("backend_used"),
             "n_gpu_layers": diagnostics.get("n_gpu_layers"),
+            "context_size": manager.config.get("model.context_size", 8192),
+            "load_ms": model_load_ms,
             "fallback_reason": diagnostics.get("fallback_reason"),
         }
     )
@@ -172,6 +179,7 @@ def run(args: argparse.Namespace) -> int:
         "stop": manager.config.get("model.stop_tokens", []),
     }
     try:
+        inference_started_at = time.perf_counter()
         completion = llm.create_chat_completion(
             **request_kwargs,
             stream=True,
@@ -202,8 +210,25 @@ def run(args: argparse.Namespace) -> int:
             fallback_text = _extract_text_from_completion(fallback)
             if fallback_text:
                 emit({"type": "token", "text": fallback_text})
+                text = fallback_text
 
-    emit({"type": "done"})
+    inference_ms = (time.perf_counter() - inference_started_at) * 1000.0
+    prompt_tokens_estimate = len(args.prompt.split())
+    output_tokens_estimate = len(text.split()) if text else 0
+    throughput_tps = (
+        (output_tokens_estimate / (inference_ms / 1000.0))
+        if output_tokens_estimate > 0 and inference_ms > 0
+        else None
+    )
+    emit(
+        {
+            "type": "done",
+            "prompt_tokens_estimate": prompt_tokens_estimate,
+            "output_tokens_estimate": output_tokens_estimate,
+            "tokens_per_second_estimate": throughput_tps,
+            "inference_ms": inference_ms,
+        }
+    )
     return 0
 
 

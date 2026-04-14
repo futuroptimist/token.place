@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::logging::SubprocessLogFilter;
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -211,9 +212,26 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
 ) -> anyhow::Result<()> {
+    let mut filter = SubprocessLogFilter::default();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        eprintln!("desktop.compute_node.stderr line={line}");
+        if let Some(filtered) = filter.classify_and_filter(&line) {
+            eprintln!("desktop.compute_node.stderr line={filtered}");
+        }
+    }
+    let verbose = filter.is_verbose();
+    let summary = filter.finish();
+    if !summary.suppressed_by_kind.is_empty() && !verbose {
+        let categories = summary
+            .suppressed_by_kind
+            .iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "desktop.compute_node.stderr_summary shown={} suppressed={} categories={}",
+            summary.shown_lines, summary.suppressed_lines, categories
+        );
     }
     Ok(())
 }

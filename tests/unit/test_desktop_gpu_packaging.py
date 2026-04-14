@@ -180,3 +180,41 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
     assert plan.platform == "win32"
     assert plan.backend == "cuda"
     assert plan.only_binary is True
+
+
+def test_llama_cpp_install_plan_darwin_selects_metal_wheel_index():
+    plan = llama_cpp_install_plan(platform="darwin", requirements_path=ROOT / "requirements.txt")
+
+    assert plan.backend == "metal"
+    assert plan.package_spec.startswith("llama-cpp-python==")
+    assert plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/metal"
+    assert plan.extra_index_url == "https://pypi.org/simple"
+    assert plan.only_binary is True
+    assert plan.no_binary is False
+
+
+def test_non_desktop_platform_fallbacks_return_only_primary_plan():
+    plans = llama_cpp_install_plan_fallbacks(platform="freebsd13", requirements_path=ROOT / "requirements.txt")
+
+    assert len(plans) == 1
+    assert plans[0].platform == "freebsd13"
+    assert plans[0].backend == "cpu"
+
+
+def test_pip_env_omits_force_cmake_when_disabled():
+    plan = LlamaCppInstallPlan(
+        platform="darwin",
+        backend="metal",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_METAL=on",
+        force_cmake=False,
+    )
+
+    assert plan.pip_env() == {"CMAKE_ARGS": "-DGGML_METAL=on"}
+
+
+def test_requirement_spec_strips_spaces_around_version_pin(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("llama-cpp-python== 0.3.16 \n", encoding="utf-8")
+
+    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"

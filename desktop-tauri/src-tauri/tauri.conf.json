@@ -25,6 +25,8 @@
     "active": true,
     "targets": "all",
     "resources": [
+      "python/desktop_gpu_packaging.py",
+      "python/desktop_runtime_setup.py",
       "python/compute_node_bridge.py",
       "python/inference_sidecar.py",
       "python/model_bridge.py",

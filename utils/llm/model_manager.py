@@ -18,6 +18,48 @@ from utils.system import resource_monitor
 logger = logging.getLogger('model_manager')
 
 
+def detect_llama_runtime_capabilities() -> Dict[str, Any]:
+    """Return backend/offload capability details from the installed llama_cpp runtime."""
+    try:
+        import llama_cpp
+    except Exception as exc:
+        return {
+            'backend': 'missing',
+            'gpu_offload_supported': False,
+            'detected_device': 'none',
+            'error': str(exc),
+        }
+
+    backend = 'cpu'
+    if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
+        backend = 'cuda'
+    elif bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
+        backend = 'metal'
+
+    supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+    gpu_offload_supported = False
+    if callable(supports_gpu):
+        try:
+            gpu_offload_supported = bool(supports_gpu())
+        except Exception:
+            gpu_offload_supported = False
+    else:
+        gpu_offload_supported = backend in {'cuda', 'metal'}
+
+    # Some llama_cpp builds can report runtime GPU offload support via probe
+    # without exposing GGML_USE_* backend markers. Preserve prior Linux behavior
+    # by inferring CUDA when offload is available and backend markers are absent.
+    if gpu_offload_supported and backend == 'cpu':
+        backend = 'metal' if sys.platform == 'darwin' else 'cuda'
+
+    return {
+        'backend': backend,
+        'gpu_offload_supported': gpu_offload_supported,
+        'detected_device': backend if gpu_offload_supported else 'cpu',
+        'error': None,
+    }
+
+
 def llama_cpp_verbose_logging_enabled() -> bool:
     """Return whether raw llama.cpp verbose logging should be enabled."""
 
@@ -84,47 +126,16 @@ class ModelManager:
 
     @staticmethod
     def _platform_gpu_backend() -> Optional[str]:
-        if sys.platform == 'darwin':
-            return 'metal'
-        if sys.platform.startswith('win'):
-            return 'cuda'
-        if sys.platform.startswith('linux'):
-            try:
-                import llama_cpp
-            except Exception:
-                return None
-            if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
-                return 'cuda'
-            if bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
-                return 'metal'
-            supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
-            if callable(supports_gpu):
-                try:
-                    if bool(supports_gpu()):
-                        # Linux builds that expose GPU offload are expected to be CUDA.
-                        return 'cuda'
-                except Exception:
-                    return None
+        runtime = detect_llama_runtime_capabilities()
+        backend = str(runtime.get('backend') or 'cpu')
+        if backend in {'cuda', 'metal'}:
+            return backend
         return None
 
     @staticmethod
     def _llama_gpu_offload_available() -> bool:
-        try:
-            import llama_cpp
-        except Exception:
-            return False
-
-        supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
-        if callable(supports_gpu):
-            try:
-                return bool(supports_gpu())
-            except Exception:
-                return False
-
-        for marker in ('GGML_USE_CUDA', 'GGML_USE_METAL'):
-            if bool(getattr(llama_cpp, marker, False)):
-                return True
-        return False
+        runtime = detect_llama_runtime_capabilities()
+        return bool(runtime.get('gpu_offload_supported', False))
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
@@ -416,7 +427,28 @@ class ModelManager:
                                 verbose=llama_cpp_verbose_logging_enabled(),
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
+                            compute_plan['kv_cache_device'] = (
+                                compute_plan['backend_used']
+                                if n_gpu_layers < 0
+                                else ('cpu' if n_gpu_layers == 0 else 'partial')
+                            )
+                            compute_plan['offloaded_layers'] = (
+                                n_gpu_layers if n_gpu_layers >= 0 else 'all_supported_layers'
+                            )
+                            compute_plan['device_backend'] = compute_plan['backend_used']
+                            compute_plan['device_name'] = 'unreported'
                             self.last_compute_diagnostics = compute_plan
+                            self.log_info(
+                                "compute_runtime "
+                                f"requested={compute_plan['requested_mode']} "
+                                f"effective={compute_plan['effective_mode']} "
+                                f"backend={compute_plan['backend_used']} "
+                                f"device_backend={compute_plan['device_backend']} "
+                                f"device_name={compute_plan['device_name']} "
+                                f"offloaded_layers={compute_plan['offloaded_layers']} "
+                                f"kv_cache={compute_plan['kv_cache_device']} "
+                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
+                            )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

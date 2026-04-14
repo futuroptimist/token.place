@@ -38,11 +38,28 @@ npm ci
 npm run tauri dev
 ```
 
+During normal startup, desktop sidecars run a **probe-only** runtime check in
+`auto`/`gpu`/`hybrid` modes and emit:
+
+- `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
+- `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
+  layers, KV cache placement, and fallback reason)
+
+Normal inference requests do **not** mutate Python packages. For local desktop
+development, explicitly run one bootstrap start with
+`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=1` to allow a one-time
+`llama-cpp-python` install/repair attempt, then restart sidecars/app.
+
+Packaged builds should rely on pre-provisioned runtime dependencies and keep
+`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP` unset.
+
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
 - **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.
 - **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build.
-- CPU fallback mode is available in both cases.
+- CPU fallback mode is available in both cases, with explicit fallback details
+  surfaced in `desktop.runtime_setup ... fallback_reason=...` and
+  `compute_runtime ... fallback_reason=...`.
 
 ## Privacy defaults
 

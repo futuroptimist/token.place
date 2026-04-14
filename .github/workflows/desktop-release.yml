@@ -97,6 +97,10 @@ jobs:
 
           plans = llama_cpp_install_plan_fallbacks(platform=sys.platform, requirements_path=repo_root / "requirements.txt")
 
+          def _is_bad_zip_error(output: str) -> bool:
+              lower = output.lower()
+              return "bad crc-32" in lower or "badzipfile" in lower
+
           for plan_index, plan in enumerate(plans, start=1):
               install_args = plan.pip_install_args()
               command = [sys.executable, "-m", "pip", "install", *install_args, plan.package_spec]
@@ -112,17 +116,35 @@ jobs:
               if plan.pip_env():
                   print(f"Using build env: {plan.pip_env()}")
 
-              for attempt in range(1, 4):
-                  try:
-                      subprocess.check_call(command, env=env)
+              max_attempts = 3
+              for attempt in range(1, max_attempts + 1):
+                  result = subprocess.run(
+                      command,
+                      env=env,
+                      check=False,
+                      capture_output=True,
+                      text=True,
+                  )
+                  if result.returncode == 0:
                       raise SystemExit(0)
-                  except subprocess.CalledProcessError:
-                      if attempt >= 3:
-                          print(f"Install attempt {attempt} failed for plan {plan_index}.")
-                      else:
-                          print(f"Install attempt {attempt} failed, retrying...")
+
+                  combined_output = f"{result.stdout}\n{result.stderr}"
+                  print(combined_output)
+
+                  if _is_bad_zip_error(combined_output):
+                      print("Detected corrupted wheel archive (BadZip/CRC); switching to next fallback plan.")
+                      break
+
+                  if attempt >= max_attempts:
+                      print(f"Install attempt {attempt} failed for plan {plan_index}.")
+                  else:
+                      print(f"Install attempt {attempt} failed, retrying...")
 
               print(f"Falling back from plan {plan_index} to next candidate...")
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"],
+                  check=False,
+              )
 
           raise RuntimeError("Failed to install llama-cpp-python for all configured plans")
           PY

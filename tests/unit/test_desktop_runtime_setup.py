@@ -88,3 +88,109 @@ def test_runtime_bootstrap_explicitly_enabled_installs_and_requires_restart(monk
     assert result['selected_backend'] == 'cuda'
     assert 'restart sidecar' in result['fallback_reason']
     assert len(state['pip_calls']) == 1
+
+
+def test_runtime_bootstrap_returns_already_supported_when_gpu_runtime_is_present(monkeypatch):
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cuda',
+        gpu_offload_supported=True,
+        detected_device='nvidia',
+        error=None,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: probe)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu')
+
+    assert result['runtime_action'] == 'already_supported'
+    assert result['selected_backend'] == 'cuda'
+    assert result['detected_device'] == 'nvidia'
+
+
+def test_runtime_bootstrap_uses_unpinned_fallback_plans_when_requirements_missing(monkeypatch):
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cpu',
+        gpu_offload_supported=False,
+        detected_device='cpu',
+        error='probe says cpu',
+    )
+    calls = []
+
+    def fake_plan_fallbacks(**_kwargs):
+        raise FileNotFoundError('requirements.txt missing')
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return _Result(returncode=0)
+
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: probe)
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', fake_plan_fallbacks)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', type('S', (), {'platform': 'linux', 'executable': sys.executable}))
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert result['runtime_action'] == 'installed_cpu_fallback'
+    assert result['selected_backend'] == 'cpu'
+    assert calls
+
+
+def test_runtime_bootstrap_reports_timeout_and_install_errors(monkeypatch):
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cpu',
+        gpu_offload_supported=False,
+        detected_device='cpu',
+        error=None,
+    )
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://example.invalid/cuda',
+            extra_index_url=None,
+            only_binary=True,
+            no_binary=False,
+        ),
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cpu',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://example.invalid/cpu',
+            extra_index_url=None,
+            only_binary=True,
+            no_binary=False,
+        ),
+    ]
+    state = {'calls': 0}
+
+    def fake_run(_cmd, **_kwargs):
+        state['calls'] += 1
+        if state['calls'] == 1:
+            raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=1)
+        return _Result(returncode=1, stderr='wheel not found')
+
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: probe)
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert result['runtime_action'] == 'failed'
+    assert result['selected_backend'] == 'cpu'
+    assert result['fallback_reason'] == 'wheel not found'
+
+
+def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
+    win_plans = desktop_runtime_setup._fallback_unpinned_plans('win32')
+    darwin_plans = desktop_runtime_setup._fallback_unpinned_plans('darwin')
+    linux_plans = desktop_runtime_setup._fallback_unpinned_plans('linux')
+
+    assert [plan.backend for plan in win_plans] == ['cuda', 'cpu']
+    assert [plan.backend for plan in darwin_plans] == ['metal', 'metal']
+    assert [plan.backend for plan in linux_plans] == ['cpu']

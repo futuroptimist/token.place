@@ -921,6 +921,25 @@ class TestModelManager:
             assert ModelManager._platform_gpu_backend() == 'metal'
             assert ModelManager._llama_gpu_offload_available() is True
 
+    def test_detect_runtime_capabilities_reports_missing_module_error(self):
+        import builtins
+        from utils.llm import model_manager as mm
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == 'llama_cpp':
+                raise ModuleNotFoundError("No module named 'llama_cpp'")
+            return real_import(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=fake_import):
+            payload = mm.detect_llama_runtime_capabilities()
+
+        assert payload['backend'] == 'missing'
+        assert payload['gpu_offload_supported'] is False
+        assert payload['detected_device'] == 'none'
+        assert "No module named 'llama_cpp'" in payload['error']
+
     def test_compute_runtime_log_includes_backend_device_offload_and_fallback(self, model_manager):
         class FakeLlama:
             def __init__(self, **_kwargs):

@@ -593,3 +593,26 @@ class ComputeNodeRuntime:
     assert any(event.get('type') == 'started' for event in events)
     assert any(event.get('type') == 'stopped' for event in events)
     assert "No module named 'utils'" not in stdout
+
+
+def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch, tmp_path):
+    module_path = tmp_path / 'compute_node_bridge.py'
+    module_path.write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
+
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'desktop_runtime_setup':
+            raise ModuleNotFoundError("No module named 'desktop_runtime_setup'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+
+    spec = importlib.util.spec_from_file_location('compute_node_bridge_no_runtime_setup', module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    setup = module.ensure_desktop_llama_runtime('auto')
+    assert setup['runtime_action'] == 'unavailable'
+    assert 'module missing' in setup['fallback_reason']

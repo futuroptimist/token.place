@@ -141,3 +141,42 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
 
     assert plan.platform == "linux"
     assert plan.backend == "cpu"
+
+
+def test_windows_cpu_fallback_install_args_are_binary_only():
+    plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
+    cpu_fallback = plans[2]
+
+    assert cpu_fallback.pip_install_args() == [
+        "--upgrade",
+        "--no-cache-dir",
+        "--index-url",
+        "https://pypi.org/simple",
+        "--only-binary",
+        "llama-cpp-python",
+        "--prefer-binary",
+    ]
+
+
+def test_macos_source_fallback_install_args_force_source_build():
+    plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT / "requirements.txt")
+    source_fallback = plans[1]
+
+    assert source_fallback.pip_install_args() == [
+        "--upgrade",
+        "--no-cache-dir",
+        "--index-url",
+        "https://pypi.org/simple",
+        "--no-binary",
+        "llama-cpp-python",
+        "--prefer-binary",
+    ]
+
+
+def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
+    monkeypatch.setattr("desktop_gpu_packaging.sys.platform", "win32")
+    plan = llama_cpp_install_plan(requirements_path=ROOT / "requirements.txt")
+
+    assert plan.platform == "win32"
+    assert plan.backend == "cuda"
+    assert plan.only_binary is True

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from desktop_gpu_packaging import LlamaCppInstallPlan, llama_cpp_install_plan_fallbacks
+from utils.llm.model_manager import detect_llama_runtime_capabilities
 
 
 @dataclass(frozen=True)
@@ -23,70 +23,11 @@ class RuntimeProbe:
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
+ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
 
 
 def _probe_llama_runtime() -> RuntimeProbe:
-    probe_code = """
-import json
-
-try:
-    import llama_cpp
-except Exception as exc:
-    print(json.dumps({
-        "backend": "missing",
-        "gpu_offload_supported": False,
-        "detected_device": "none",
-        "error": str(exc),
-    }))
-    raise SystemExit(0)
-
-backend = "cpu"
-if bool(getattr(llama_cpp, "GGML_USE_CUDA", False)):
-    backend = "cuda"
-elif bool(getattr(llama_cpp, "GGML_USE_METAL", False)):
-    backend = "metal"
-
-supports = getattr(llama_cpp, "llama_supports_gpu_offload", None)
-gpu = False
-if callable(supports):
-    try:
-        gpu = bool(supports())
-    except Exception:
-        gpu = False
-else:
-    gpu = backend in {"cuda", "metal"}
-
-print(json.dumps({
-    "backend": backend,
-    "gpu_offload_supported": gpu,
-    "detected_device": backend if gpu else "cpu",
-    "error": None,
-}))
-""".strip()
-
-    result = subprocess.run(
-        [sys.executable, "-c", probe_code],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return RuntimeProbe(
-            backend="missing",
-            gpu_offload_supported=False,
-            detected_device="none",
-            error=(result.stderr or result.stdout or "probe failed").strip(),
-        )
-
-    try:
-        payload = json.loads(result.stdout.strip() or "{}")
-    except json.JSONDecodeError:
-        return RuntimeProbe(
-            backend="missing",
-            gpu_offload_supported=False,
-            detected_device="none",
-            error=(result.stdout or "invalid probe response").strip(),
-        )
+    payload = detect_llama_runtime_capabilities()
 
     return RuntimeProbe(
         backend=str(payload.get("backend", "cpu")),
@@ -97,7 +38,7 @@ print(json.dumps({
 
 
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
-    """Ensure desktop runs a GPU-capable llama-cpp runtime for GPU-preferring modes."""
+    """Probe runtime by default; install/repair only when explicit bootstrap env is enabled."""
 
     selected_mode = (mode or "auto").strip().lower()
     if selected_mode not in GPU_MODES:
@@ -107,16 +48,6 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "runtime_action": "skipped",
         }
 
-    if os.environ.get("TOKEN_PLACE_DESKTOP_SKIP_RUNTIME_BOOTSTRAP") == "1":
-        return {
-            "selected_backend": "cpu",
-            "fallback_reason": "runtime bootstrap disabled by env",
-            "runtime_action": "skipped",
-        }
-
-    target_root = repo_root or Path(__file__).resolve().parents[3]
-    requirements_path = target_root / "requirements.txt"
-
     before = _probe_llama_runtime()
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
         return {
@@ -125,6 +56,20 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "runtime_action": "already_supported",
             "detected_device": before.detected_device,
         }
+
+    if os.environ.get(ENABLE_BOOTSTRAP_ENV) != "1":
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"GPU runtime unavailable ({before.error or before.backend}); "
+                f"set {ENABLE_BOOTSTRAP_ENV}=1 for one-time bootstrap"
+            ),
+            "runtime_action": "probe_only",
+            "detected_device": before.detected_device or "cpu",
+        }
+
+    target_root = repo_root or Path(__file__).resolve().parents[3]
+    requirements_path = target_root / "requirements.txt"
 
     try:
         plans = llama_cpp_install_plan_fallbacks(
@@ -161,13 +106,12 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             last_install_error = (install.stderr or install.stdout or "").strip()
             continue
 
-        after = _probe_llama_runtime()
-        if after.gpu_offload_supported and after.backend in {"cuda", "metal"}:
+        if plan.backend in {"cuda", "metal"}:
             return {
-                "selected_backend": after.backend,
-                "fallback_reason": "",
-                "runtime_action": f"installed_{plan.backend}",
-                "detected_device": after.detected_device,
+                "selected_backend": plan.backend,
+                "fallback_reason": "bootstrap install complete; restart sidecar to activate runtime",
+                "runtime_action": f"installed_{plan.backend}_restart_required",
+                "detected_device": "cpu",
             }
 
         if plan.backend == "cpu":

@@ -907,3 +907,47 @@ class TestModelManager:
         assert hybrid_plan['backend_used'] == 'cuda'
         assert hybrid_plan['n_gpu_layers'] == 1
         assert hybrid_plan['fallback_reason'] is None
+
+    def test_shared_runtime_probe_drives_platform_and_offload_detection(self):
+        with patch(
+            'utils.llm.model_manager.detect_llama_runtime_capabilities',
+            return_value={
+                'backend': 'metal',
+                'gpu_offload_supported': True,
+                'detected_device': 'metal',
+                'error': None,
+            },
+        ):
+            assert ModelManager._platform_gpu_backend() == 'metal'
+            assert ModelManager._llama_gpu_offload_available() is True
+
+    def test_compute_runtime_log_includes_backend_device_offload_and_fallback(self, model_manager):
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                pass
+
+        log_lines = []
+        model_manager.requested_compute_mode = 'gpu'
+        model_manager.log_info = lambda message: log_lines.append(message)
+
+        with patch('llama_cpp.Llama', FakeLlama), \
+             patch.object(model_manager, '_resolve_compute_plan', return_value={
+                 'requested_mode': 'gpu',
+                 'effective_mode': 'cpu_fallback',
+                 'backend_available': 'cuda',
+                 'backend_selected': 'cuda',
+                 'backend_used': 'cpu',
+                 'n_gpu_layers': 0,
+                 'fallback_reason': 'runtime missing cuda support',
+             }):
+            llm = model_manager.get_llm_instance()
+
+        assert llm is not None
+        compute_logs = [line for line in log_lines if line.startswith('compute_runtime ')]
+        assert compute_logs
+        summary = compute_logs[-1]
+        assert 'backend=cpu' in summary
+        assert 'device_backend=cpu' in summary
+        assert 'offloaded_layers=0' in summary
+        assert 'kv_cache=cpu' in summary
+        assert 'fallback_reason=runtime missing cuda support' in summary

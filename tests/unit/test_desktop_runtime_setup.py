@@ -1,17 +1,13 @@
 import importlib.util
-import json
 import sys
 from pathlib import Path
 
-PYTHON_MODULE_DIR = (
-    Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python'
-)
-if str(PYTHON_MODULE_DIR) not in sys.path:
-    sys.path.insert(0, str(PYTHON_MODULE_DIR))
 
-MODULE_PATH = (
-    PYTHON_MODULE_DIR / 'desktop_runtime_setup.py'
-)
+PYTHON_MODULE_DIR = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python'
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+MODULE_PATH = PYTHON_MODULE_DIR / 'desktop_runtime_setup.py'
 SPEC = importlib.util.spec_from_file_location('desktop_runtime_setup', MODULE_PATH)
 desktop_runtime_setup = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
@@ -31,81 +27,61 @@ def test_skip_runtime_bootstrap_for_cpu_mode():
     assert result['selected_backend'] == 'cpu'
 
 
-def test_runtime_bootstrap_uses_existing_gpu_runtime(monkeypatch):
-    probe = {'count': 0}
+def test_probe_only_runtime_path_does_not_install_without_explicit_flag(monkeypatch):
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cpu',
+        gpu_offload_supported=False,
+        detected_device='cpu',
+        error=None,
+    )
+    pip_calls = []
 
-    def fake_run(cmd, **kwargs):
-        if cmd[1:3] == ['-c', cmd[2]]:
-            probe['count'] += 1
-            return _Result(
-                stdout=json.dumps(
-                    {
-                        'backend': 'cuda',
-                        'gpu_offload_supported': True,
-                        'detected_device': 'cuda',
-                        'error': None,
-                    }
-                )
-            )
-        raise AssertionError(f'unexpected command: {cmd}')
+    def fake_run(*_args, **_kwargs):
+        pip_calls.append(True)
+        return _Result(returncode=0)
 
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: probe)
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
-    assert result['runtime_action'] == 'already_supported'
-    assert result['selected_backend'] == 'cuda'
-    assert probe['count'] == 1
+    assert result['runtime_action'] == 'probe_only'
+    assert result['selected_backend'] == 'cpu'
+    assert desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert pip_calls == []
 
 
-def test_runtime_bootstrap_falls_back_to_cpu_after_gpu_attempt(monkeypatch):
-    state = {'probe_calls': 0, 'pip_calls': []}
-    Plan = desktop_runtime_setup.LlamaCppInstallPlan
+def test_runtime_bootstrap_explicitly_enabled_installs_and_requires_restart(monkeypatch):
+    state = {'pip_calls': []}
+    probe = desktop_runtime_setup.RuntimeProbe(
+        backend='cpu',
+        gpu_offload_supported=False,
+        detected_device='cpu',
+        error='cpu-only runtime',
+    )
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='win32',
+        backend='cuda',
+        package_spec='llama-cpp-python',
+        cmake_args=None,
+        force_cmake=False,
+        index_url='https://example.invalid/cuda',
+        extra_index_url=None,
+        only_binary=True,
+        no_binary=False,
+    )
 
-    def fake_plans(**_kwargs):
-        return [
-            Plan(
-                platform='win32',
-                backend='cuda',
-                package_spec='llama-cpp-python',
-                cmake_args=None,
-                force_cmake=False,
-                index_url='https://example.invalid/cuda',
-                extra_index_url=None,
-                only_binary=True,
-                no_binary=False,
-            ),
-            Plan(
-                platform='win32',
-                backend='cpu',
-                package_spec='llama-cpp-python',
-                cmake_args=None,
-                force_cmake=False,
-                index_url='https://pypi.org/simple',
-                extra_index_url=None,
-                only_binary=True,
-                no_binary=False,
-            ),
-        ]
-
-    def fake_run(cmd, **kwargs):
-        if cmd[1] == '-c':
-            state['probe_calls'] += 1
-            payload = {
-                'backend': 'cpu',
-                'gpu_offload_supported': False,
-                'detected_device': 'cpu',
-                'error': None,
-            }
-            return _Result(stdout=json.dumps(payload))
-
+    def fake_run(cmd, **_kwargs):
         state['pip_calls'].append(cmd)
         return _Result(returncode=0)
 
-    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', fake_plans)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: probe)
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
-    assert result['selected_backend'] == 'cpu'
-    assert result['runtime_action'] == 'installed_cpu_fallback'
-    assert 'GPU runtime unavailable' in result['fallback_reason']
-    assert len(state['pip_calls']) == 2
+    assert result['runtime_action'] == 'installed_cuda_restart_required'
+    assert result['selected_backend'] == 'cuda'
+    assert 'restart sidecar' in result['fallback_reason']
+    assert len(state['pip_calls']) == 1

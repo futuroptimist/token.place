@@ -17,6 +17,43 @@ from utils.system import resource_monitor
 # Configure logging
 logger = logging.getLogger('model_manager')
 
+
+def detect_llama_runtime_capabilities() -> Dict[str, Any]:
+    """Return backend/offload capability details from the installed llama_cpp runtime."""
+    try:
+        import llama_cpp
+    except Exception as exc:
+        return {
+            'backend': 'missing',
+            'gpu_offload_supported': False,
+            'detected_device': 'none',
+            'error': str(exc),
+        }
+
+    backend = 'cpu'
+    if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
+        backend = 'cuda'
+    elif bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
+        backend = 'metal'
+
+    supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+    gpu_offload_supported = False
+    if callable(supports_gpu):
+        try:
+            gpu_offload_supported = bool(supports_gpu())
+        except Exception:
+            gpu_offload_supported = False
+    else:
+        gpu_offload_supported = backend in {'cuda', 'metal'}
+
+    return {
+        'backend': backend,
+        'gpu_offload_supported': gpu_offload_supported,
+        'detected_device': backend if gpu_offload_supported else 'cpu',
+        'error': None,
+    }
+
+
 class ModelManager:
     """
     Manages LLM model downloading, initialization, and inference.
@@ -74,47 +111,16 @@ class ModelManager:
 
     @staticmethod
     def _platform_gpu_backend() -> Optional[str]:
-        if sys.platform == 'darwin':
-            return 'metal'
-        if sys.platform.startswith('win'):
-            return 'cuda'
-        if sys.platform.startswith('linux'):
-            try:
-                import llama_cpp
-            except Exception:
-                return None
-            if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
-                return 'cuda'
-            if bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
-                return 'metal'
-            supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
-            if callable(supports_gpu):
-                try:
-                    if bool(supports_gpu()):
-                        # Linux builds that expose GPU offload are expected to be CUDA.
-                        return 'cuda'
-                except Exception:
-                    return None
+        runtime = detect_llama_runtime_capabilities()
+        backend = str(runtime.get('backend') or 'cpu')
+        if backend in {'cuda', 'metal'}:
+            return backend
         return None
 
     @staticmethod
     def _llama_gpu_offload_available() -> bool:
-        try:
-            import llama_cpp
-        except Exception:
-            return False
-
-        supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
-        if callable(supports_gpu):
-            try:
-                return bool(supports_gpu())
-            except Exception:
-                return False
-
-        for marker in ('GGML_USE_CUDA', 'GGML_USE_METAL'):
-            if bool(getattr(llama_cpp, marker, False)):
-                return True
-        return False
+        runtime = detect_llama_runtime_capabilities()
+        return bool(runtime.get('gpu_offload_supported', False))
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()

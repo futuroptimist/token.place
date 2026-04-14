@@ -6,6 +6,7 @@ mod keygen;
 mod logging;
 mod python_runtime;
 mod sidecar;
+mod subprocess_log;
 
 use backend::{detect_backend_for, BackendInfo};
 use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};

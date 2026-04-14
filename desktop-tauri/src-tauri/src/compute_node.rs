@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::subprocess_log::{verbose_stderr_enabled, StderrDecision, StderrFilter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -211,9 +212,23 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
 ) -> anyhow::Result<()> {
+    if verbose_stderr_enabled() {
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await? {
+            eprintln!("desktop.compute_node.stderr line={line}");
+        }
+        return Ok(());
+    }
+
+    let mut filter = StderrFilter::new("compute_node", "component=bridge");
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        eprintln!("desktop.compute_node.stderr line={line}");
+        if let StderrDecision::Emit(message) = filter.classify(&line) {
+            eprintln!("{message}");
+        }
+    }
+    if let Some(summary) = filter.flush_summary() {
+        eprintln!("{summary}");
     }
     Ok(())
 }

@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Tuple
 
@@ -51,6 +53,29 @@ def emit(payload: Dict[str, Any]) -> None:
 def emit_error(code: str, message: str) -> int:
     emit({"type": "error", "code": code, "message": message})
     return 1
+
+
+def _desktop_verbose_logs_enabled() -> bool:
+    return os.getenv("TOKEN_PLACE_DESKTOP_VERBOSE_LOGS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _configure_desktop_logging() -> None:
+    if _desktop_verbose_logs_enabled():
+        return
+    logging.getLogger().setLevel(logging.WARNING)
+    logging.getLogger("model_manager").setLevel(logging.WARNING)
+
+
+def _estimate_token_count(text: str) -> int:
+    stripped = (text or "").strip()
+    if not stripped:
+        return 0
+    return len(stripped.split())
 
 
 def cancel_requested() -> bool:
@@ -128,6 +153,7 @@ def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> int:
+    _configure_desktop_logging()
     if not os.path.exists(args.model):
         return emit_error("bad_model", "model path not found")
 
@@ -144,18 +170,26 @@ def run(args: argparse.Namespace) -> int:
     manager.model_path = args.model
     apply_compute_mode(manager, args.mode)
 
+    init_start = time.perf_counter()
     llm = manager.get_llm_instance()
+    init_elapsed_ms = int((time.perf_counter() - init_start) * 1000)
     if llm is None:
         return emit_error("bad_model", "unable to initialize model runtime")
 
     diagnostics = compute_mode_diagnostics(manager)
+    model_name = Path(args.model).name
+    context_size = manager.config.get("model.context_size", 8192)
     emit(
         {
             "type": "started",
+            "model_path": args.model,
+            "model_name": model_name,
             "requested_mode": diagnostics.get("requested_mode"),
             "effective_mode": diagnostics.get("effective_mode"),
             "backend_used": diagnostics.get("backend_used"),
             "n_gpu_layers": diagnostics.get("n_gpu_layers"),
+            "context_size": context_size,
+            "load_ms": init_elapsed_ms,
             "fallback_reason": diagnostics.get("fallback_reason"),
         }
     )
@@ -171,6 +205,8 @@ def run(args: argparse.Namespace) -> int:
         "top_p": manager.config.get("model.top_p", 0.9),
         "stop": manager.config.get("model.stop_tokens", []),
     }
+    inference_start = time.perf_counter()
+    generated_text = ""
     try:
         completion = llm.create_chat_completion(
             **request_kwargs,
@@ -183,10 +219,12 @@ def run(args: argparse.Namespace) -> int:
 
     if isinstance(completion, dict):
         text = _extract_text_from_completion(completion)
+        generated_text = text
         if text:
             emit({"type": "token", "text": text})
     else:
         text, canceled = _stream_content(completion, normalize_chunk)
+        generated_text = text
         if canceled:
             return 0
 
@@ -200,10 +238,25 @@ def run(args: argparse.Namespace) -> int:
                 return emit_error("inference_failed", f"non-streaming completion failed: {exc}")
 
             fallback_text = _extract_text_from_completion(fallback)
+            generated_text = fallback_text
             if fallback_text:
                 emit({"type": "token", "text": fallback_text})
 
-    emit({"type": "done"})
+    inference_elapsed = max(time.perf_counter() - inference_start, 0.000001)
+    prompt_tokens_estimate = _estimate_token_count(args.prompt)
+    eval_tokens_estimate = _estimate_token_count(generated_text)
+    emit(
+        {
+            "type": "done",
+            "prompt_chars": len(args.prompt),
+            "output_chars": len(generated_text),
+            "prompt_tokens_estimate": prompt_tokens_estimate,
+            "eval_tokens_estimate": eval_tokens_estimate,
+            "prompt_tokens_per_second": round(prompt_tokens_estimate / inference_elapsed, 2),
+            "eval_tokens_per_second": round(eval_tokens_estimate / inference_elapsed, 2),
+            "inference_ms": int(inference_elapsed * 1000),
+        }
+    )
     return 0
 
 

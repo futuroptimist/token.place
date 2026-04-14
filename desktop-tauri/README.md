@@ -29,6 +29,11 @@ and fast local testing:
 - Set `TOKEN_PLACE_SIDECAR=/full/path/to/script.py` to explicitly override the
   sidecar command path (this takes precedence over
   `TOKEN_PLACE_USE_FAKE_SIDECAR`).
+- Desktop subprocess logging is concise by default: noisy llama.cpp startup lines
+  are filtered while warnings/errors are retained, and startup/inference summary
+  lines are emitted for operators.
+- Set `TOKEN_PLACE_DESKTOP_VERBOSE_LOGS=1` to disable filtering and restore raw
+  llama.cpp stderr output for troubleshooting.
 
 ## Run locally
 

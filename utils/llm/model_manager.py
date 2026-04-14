@@ -398,11 +398,16 @@ class ModelManager:
                                         )
 
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
+                            verbose_llama_logs = os.getenv(
+                                'TOKEN_PLACE_DESKTOP_VERBOSE_LOGS',
+                                '',
+                            ).strip().lower() in ('1', 'true', 'yes', 'on')
                             self.llm = Llama(
                                 model_path=self.model_path,
                                 n_gpu_layers=n_gpu_layers,
                                 n_ctx=self.config.get('model.context_size', 8192),
-                                chat_format=self.config.get('model.chat_format', 'llama-3')
+                                chat_format=self.config.get('model.chat_format', 'llama-3'),
+                                verbose=verbose_llama_logs,
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             self.last_compute_diagnostics = compute_plan

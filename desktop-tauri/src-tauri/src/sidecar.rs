@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::subprocess_log::{verbose_stderr_enabled, StderrDecision, StderrFilter};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -22,11 +23,45 @@ pub struct InferenceRequest {
 #[serde(tag = "type")]
 pub enum SidecarEvent {
     #[serde(rename = "started")]
-    Started,
+    Started {
+        #[serde(default)]
+        model_path: Option<String>,
+        #[serde(default)]
+        model_name: Option<String>,
+        #[serde(default)]
+        requested_mode: Option<String>,
+        #[serde(default)]
+        effective_mode: Option<String>,
+        #[serde(default)]
+        backend_used: Option<String>,
+        #[serde(default)]
+        n_gpu_layers: Option<i64>,
+        #[serde(default)]
+        context_size: Option<i64>,
+        #[serde(default)]
+        fallback_reason: Option<String>,
+        #[serde(default)]
+        load_ms: Option<u64>,
+    },
     #[serde(rename = "token")]
     Token { text: String },
     #[serde(rename = "done")]
-    Done,
+    Done {
+        #[serde(default)]
+        output_chars: Option<usize>,
+        #[serde(default)]
+        prompt_chars: Option<usize>,
+        #[serde(default)]
+        eval_tokens_estimate: Option<usize>,
+        #[serde(default)]
+        prompt_tokens_estimate: Option<usize>,
+        #[serde(default)]
+        eval_tokens_per_second: Option<f64>,
+        #[serde(default)]
+        prompt_tokens_per_second: Option<f64>,
+        #[serde(default)]
+        inference_ms: Option<u64>,
+    },
     #[serde(rename = "canceled")]
     Canceled,
     #[serde(rename = "error")]
@@ -68,9 +103,23 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     request_id: &str,
 ) -> anyhow::Result<()> {
+    if verbose_stderr_enabled() {
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await? {
+            eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+        }
+        return Ok(());
+    }
+
+    let mut filter = StderrFilter::new("sidecar", format!("request_id={request_id}"));
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+        if let StderrDecision::Emit(message) = filter.classify(&line) {
+            eprintln!("{message}");
+        }
+    }
+    if let Some(summary) = filter.flush_summary() {
+        eprintln!("{summary}");
     }
     Ok(())
 }
@@ -297,6 +346,59 @@ pub async fn start_sidecar(
                 if matches!(event, SidecarEvent::Error { .. }) {
                     saw_error_event = true;
                 }
+                match &event {
+                    SidecarEvent::Started {
+                        model_path,
+                        model_name,
+                        requested_mode,
+                        effective_mode,
+                        backend_used,
+                        n_gpu_layers,
+                        context_size,
+                        fallback_reason,
+                        load_ms,
+                    } => {
+                        let fallback = fallback_reason.as_deref().unwrap_or("none");
+                        eprintln!(
+                            "desktop.sidecar.summary request_id={} model_name={} model_path={} requested_mode={} effective_mode={} backend={} n_gpu_layers={} context_size={} load_ms={} fallback_reason={}",
+                            request_id,
+                            model_name.as_deref().unwrap_or("unknown"),
+                            model_path.as_deref().unwrap_or("unknown"),
+                            requested_mode.as_deref().unwrap_or("unknown"),
+                            effective_mode.as_deref().unwrap_or("unknown"),
+                            backend_used.as_deref().unwrap_or("unknown"),
+                            n_gpu_layers.map_or("unknown".into(), |value| value.to_string()),
+                            context_size.map_or("unknown".into(), |value| value.to_string()),
+                            load_ms.map_or("unknown".into(), |value| value.to_string()),
+                            fallback,
+                        );
+                    }
+                    SidecarEvent::Done {
+                        output_chars,
+                        prompt_chars,
+                        eval_tokens_estimate,
+                        prompt_tokens_estimate,
+                        eval_tokens_per_second,
+                        prompt_tokens_per_second,
+                        inference_ms,
+                    } => {
+                        let fmt = |value: Option<f64>| -> String {
+                            value.map_or_else(|| "unknown".into(), |v| format!("{v:.2}"))
+                        };
+                        eprintln!(
+                            "desktop.sidecar.summary request_id={} prompt_chars={} output_chars={} prompt_tokens_est={} eval_tokens_est={} prompt_tps={} eval_tps={} inference_ms={}",
+                            request_id,
+                            prompt_chars.map_or("unknown".into(), |value| value.to_string()),
+                            output_chars.map_or("unknown".into(), |value| value.to_string()),
+                            prompt_tokens_estimate.map_or("unknown".into(), |value| value.to_string()),
+                            eval_tokens_estimate.map_or("unknown".into(), |value| value.to_string()),
+                            fmt(*prompt_tokens_per_second),
+                            fmt(*eval_tokens_per_second),
+                            inference_ms.map_or("unknown".into(), |value| value.to_string()),
+                        );
+                    }
+                    _ => {}
+                }
                 app.emit(
                     "inference_event",
                     UiInferenceEvent {
@@ -418,8 +520,12 @@ mod tests {
         let events = collect_events_from_stdout(stdout)
             .await
             .expect("collect events");
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Started { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Done { .. })));
     }
 
     #[tokio::test]
@@ -447,11 +553,15 @@ mod tests {
         let events = collect_events_from_stdout(stdout)
             .await
             .expect("collect events");
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Started)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Started { .. })));
         assert!(events
             .iter()
             .any(|e| matches!(e, SidecarEvent::Token { .. })));
-        assert!(events.iter().any(|e| matches!(e, SidecarEvent::Done)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Done { .. })));
     }
 
     #[tokio::test]
@@ -487,9 +597,27 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                SidecarEvent::Started,
+                SidecarEvent::Started {
+                    model_path: None,
+                    model_name: None,
+                    requested_mode: None,
+                    effective_mode: None,
+                    backend_used: None,
+                    n_gpu_layers: None,
+                    context_size: None,
+                    fallback_reason: None,
+                    load_ms: None,
+                },
                 SidecarEvent::Token { text: "ok".into() },
-                SidecarEvent::Done
+                SidecarEvent::Done {
+                    output_chars: None,
+                    prompt_chars: None,
+                    eval_tokens_estimate: None,
+                    prompt_tokens_estimate: None,
+                    eval_tokens_per_second: None,
+                    prompt_tokens_per_second: None,
+                    inference_ms: None,
+                }
             ]
         );
     }

@@ -38,6 +38,12 @@ npm ci
 npm run tauri dev
 ```
 
+During startup, desktop sidecars now run a lightweight llama runtime bootstrap
+that prefers a GPU-capable `llama-cpp-python` build in `auto`/`gpu`/`hybrid`
+modes and logs the selected backend + fallback reason to stderr. Set
+`TOKEN_PLACE_DESKTOP_SKIP_RUNTIME_BOOTSTRAP=1` to disable this behavior for
+manual debugging.
+
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
 - **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.

@@ -405,7 +405,24 @@ class ModelManager:
                                 chat_format=self.config.get('model.chat_format', 'llama-3')
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
+                            compute_plan['kv_cache_device'] = (
+                                compute_plan['backend_used'] if n_gpu_layers != 0 else 'cpu'
+                            )
+                            compute_plan['offloaded_layers'] = (
+                                n_gpu_layers if n_gpu_layers >= 0 else 'all_supported_layers'
+                            )
+                            compute_plan['device_name'] = compute_plan['backend_used']
                             self.last_compute_diagnostics = compute_plan
+                            self.log_info(
+                                "compute_runtime "
+                                f"requested={compute_plan['requested_mode']} "
+                                f"effective={compute_plan['effective_mode']} "
+                                f"backend={compute_plan['backend_used']} "
+                                f"device={compute_plan['device_name']} "
+                                f"offloaded_layers={compute_plan['offloaded_layers']} "
+                                f"kv_cache={compute_plan['kv_cache_device']} "
+                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
+                            )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

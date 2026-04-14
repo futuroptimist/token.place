@@ -18,6 +18,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, script_dir)
 
 from path_bootstrap import ensure_runtime_import_paths
+from desktop_runtime_setup import ensure_desktop_llama_runtime
 
 ensure_runtime_import_paths(__file__)
 
@@ -88,6 +89,17 @@ def run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
+
+    runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    print(
+        "desktop.runtime_setup "
+        f"mode={args.mode} "
+        f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
+        f"device={runtime_setup.get('detected_device', 'cpu')} "
+        f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        file=sys.stderr,
+    )
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)

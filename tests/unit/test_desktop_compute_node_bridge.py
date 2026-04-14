@@ -391,6 +391,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
         return relay_url if prefer_cli else (env_override or relay_url)
 
     module.resolve_relay_url = _resolve_relay_url
+    module.compute_mode_diagnostics = lambda _model_manager: {}
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setenv('TOKENPLACE_RELAY_URL', 'https://token.place')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)

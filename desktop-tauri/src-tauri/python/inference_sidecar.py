@@ -109,14 +109,17 @@ def _fallback_normalize_chunk(chunk: Any) -> Dict[str, Any]:
 def _stream_content(
     completion: Iterable[Any],
     normalize_chunk: Callable[[Any], Dict[str, Any]],
-) -> Tuple[str, bool, int]:
+    token_counter: list[int] | None = None,
+) -> Tuple[str, bool]:
     full_text = []
     emitted = False
     token_events = 0
     for raw_chunk in completion:
         if cancel_requested():
             emit({"type": "canceled"})
-            return "", True, token_events
+            if token_counter is not None:
+                token_counter.append(token_events)
+            return "", True
 
         chunk = normalize_chunk(raw_chunk)
         choices = chunk.get("choices") or []
@@ -136,7 +139,9 @@ def _stream_content(
         if (choices[0] or {}).get("finish_reason"):
             break
 
-    return "".join(full_text) if emitted else "", False, token_events
+    if token_counter is not None:
+        token_counter.append(token_events)
+    return "".join(full_text) if emitted else "", False
 
 
 def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
@@ -224,7 +229,9 @@ def run(args: argparse.Namespace) -> int:
             emit({"type": "token", "text": text})
             token_events += 1
     else:
-        text, canceled, token_events = _stream_content(completion, normalize_chunk)
+        token_counts: list[int] = []
+        text, canceled = _stream_content(completion, normalize_chunk, token_counts)
+        token_events = token_counts[0] if token_counts else 0
         if canceled:
             return 0
 

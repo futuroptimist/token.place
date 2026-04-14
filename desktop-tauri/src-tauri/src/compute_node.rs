@@ -220,7 +220,6 @@ async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
             eprintln!("desktop.compute_node.stderr line={line}");
         }
     }
-    filter.flush_summary();
     Ok(())
 }
 

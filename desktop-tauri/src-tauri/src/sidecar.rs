@@ -71,13 +71,12 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     policy: SubprocessLogPolicy,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
-    let mut filter = SubprocessLogFilter::new("sidecar", policy);
+    let mut filter = SubprocessLogFilter::new("sidecar", policy).with_request_id(request_id);
     while let Some(line) = lines.next_line().await? {
         if filter.should_emit(&line) {
             eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
         }
     }
-    filter.flush_summary();
     Ok(())
 }
 

@@ -55,10 +55,19 @@ def emit_error(code: str, message: str) -> int:
 
 
 def emit_summary(label: str, **fields: Any) -> None:
-    summary_fields = " ".join(
-        f"{key}={value}" for key, value in fields.items() if value is not None
+    summary_payload = {"label": label}
+    summary_payload.update({key: value for key, value in fields.items() if value is not None})
+    print(
+        f"desktop.inference.summary {json.dumps(summary_payload, separators=(',', ':'))}",
+        file=sys.stderr,
+        flush=True,
     )
-    print(f"desktop.inference.summary {label} {summary_fields}", file=sys.stderr, flush=True)
+
+
+def verbose_subprocess_logging_enabled() -> bool:
+    return os.getenv("TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS") == "1" or os.getenv(
+        "TOKEN_PLACE_VERBOSE_LLM_LOGS"
+    ) == "1"
 
 
 def cancel_requested() -> bool:
@@ -162,10 +171,11 @@ def run(args: argparse.Namespace) -> int:
 
     diagnostics = compute_mode_diagnostics(manager)
     model_name = Path(args.model).name
+    model_path_for_summary = args.model if verbose_subprocess_logging_enabled() else model_name
     emit_summary(
         "model_init",
         model=model_name,
-        model_path=args.model,
+        model_path=model_path_for_summary,
         backend=diagnostics.get("backend_used"),
         device=diagnostics.get("effective_mode"),
         context_size=manager.config.get("model.context_size", 8192),

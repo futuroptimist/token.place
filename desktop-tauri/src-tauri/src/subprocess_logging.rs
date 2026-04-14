@@ -21,6 +21,7 @@ impl SubprocessLogPolicy {
 
 pub struct SubprocessLogFilter {
     source: &'static str,
+    request_id: Option<String>,
     policy: SubprocessLogPolicy,
     suppressed_counts: BTreeMap<&'static str, usize>,
     suppressed_total: usize,
@@ -30,10 +31,16 @@ impl SubprocessLogFilter {
     pub fn new(source: &'static str, policy: SubprocessLogPolicy) -> Self {
         Self {
             source,
+            request_id: None,
             policy,
             suppressed_counts: BTreeMap::new(),
             suppressed_total: 0,
         }
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
     }
 
     pub fn should_emit(&mut self, line: &str) -> bool {
@@ -41,11 +48,10 @@ impl SubprocessLogFilter {
             return true;
         }
 
-        if looks_actionable(line) {
-            return true;
-        }
-
         if let Some(pattern) = noisy_pattern(line) {
+            if looks_actionable(line) {
+                return true;
+            }
             self.suppressed_total += 1;
             *self.suppressed_counts.entry(pattern).or_default() += 1;
             return false;
@@ -64,10 +70,22 @@ impl SubprocessLogFilter {
             .map(|(pattern, count)| format!("{pattern}:{count}"))
             .collect::<Vec<_>>()
             .join(",");
-        eprintln!(
-            "desktop.subprocess.stderr_summary source={} suppressed_total={} patterns={}",
-            self.source, self.suppressed_total, breakdown
-        );
+        match &self.request_id {
+            Some(request_id) => eprintln!(
+                "desktop.subprocess.stderr_summary source={} request_id={} suppressed_total={} patterns={}",
+                self.source, request_id, self.suppressed_total, breakdown
+            ),
+            None => eprintln!(
+                "desktop.subprocess.stderr_summary source={} suppressed_total={} patterns={}",
+                self.source, self.suppressed_total, breakdown
+            ),
+        }
+    }
+}
+
+impl Drop for SubprocessLogFilter {
+    fn drop(&mut self) {
+        self.flush_summary();
     }
 }
 

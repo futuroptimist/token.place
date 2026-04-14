@@ -112,13 +112,31 @@ def llama_cpp_install_plan_fallbacks(
 
     if primary.platform.startswith("win"):
         # CUDA wheels may be unavailable for a given Python ABI on Windows.
-        # Fall back to PyPI's prebuilt CPU wheel to keep desktop CI/release
-        # buildable without requiring local native compilation toolchains.
+        # First, fall back to an unpinned CUDA wheel so CI can use the newest
+        # available CUDA binary (e.g. when requirements pin is newer than
+        # published CUDA wheels on the mirror index).
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="cuda",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url=primary.index_url,
+                extra_index_url=primary.extra_index_url,
+                only_binary=True,
+                no_binary=False,
+            )
+        )
+
+        # If CUDA wheels are unavailable entirely for this ABI, fall back to
+        # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
+        # without requiring local native compilation toolchains.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
                 backend="cpu",
-                package_spec=primary.package_spec,
+                package_spec="llama-cpp-python",
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",

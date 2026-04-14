@@ -18,7 +18,7 @@ from desktop_gpu_packaging import (
 
 def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    assert len(plans) == 2
+    assert len(plans) == 3
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
@@ -28,8 +28,17 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert gpu_plan.only_binary is True
     assert gpu_plan.pip_env() == {}
 
-    cpu_fallback = plans[1]
+    unpinned_cuda_fallback = plans[1]
+    assert unpinned_cuda_fallback.backend == "cuda"
+    assert unpinned_cuda_fallback.package_spec == "llama-cpp-python"
+    assert unpinned_cuda_fallback.index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    assert unpinned_cuda_fallback.extra_index_url == "https://pypi.org/simple"
+    assert unpinned_cuda_fallback.only_binary is True
+    assert unpinned_cuda_fallback.no_binary is False
+
+    cpu_fallback = plans[2]
     assert cpu_fallback.backend == "cpu"
+    assert cpu_fallback.package_spec == "llama-cpp-python"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
     assert cpu_fallback.extra_index_url is None
     assert cpu_fallback.only_binary is True

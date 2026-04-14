@@ -42,7 +42,22 @@ npm run tauri dev
 
 - **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.
 - **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build.
+  Desktop release/dev dependency resolution now attempts (in order): pinned CUDA
+  wheel, unpinned CUDA wheel, CUDA source build, then CPU fallback.
 - CPU fallback mode is available in both cases.
+
+### Verifying backend/offload at runtime
+
+Use the local prompt panel in `Auto` mode and inspect `desktop.sidecar.stderr`
+plus the `started` event payload:
+
+- `backend_available`, `backend_selected`, `backend_used`
+- `n_gpu_layers`
+- `kv_cache_target`
+- `fallback_reason` (present only when CPU fallback is used)
+
+`utils.llm.model_manager` also emits a single
+`llama_runtime_summary ...` log line when model initialization completes.
 
 ## Privacy defaults
 

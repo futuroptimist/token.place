@@ -799,6 +799,39 @@ class TestModelManager:
 
         assert backend == 'cuda'
 
+    def test_platform_gpu_backend_windows_uses_runtime_probe(self):
+        """Windows backend detection should fail closed for CPU-only runtimes."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            GGML_USE_VULKAN=False,
+            GGML_USE_CLBLAST=False,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'win32'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend is None
+
+    def test_probe_llama_runtime_prefers_cuda_marker(self):
+        """Runtime probe should return CUDA backend when marker is exposed."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=True,
+            GGML_USE_METAL=False,
+            GGML_USE_VULKAN=False,
+            GGML_USE_CLBLAST=False,
+            llama_supports_gpu_offload=lambda: True,
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            probe = ModelManager._probe_llama_runtime()
+
+        assert probe['backend'] == 'cuda'
+        assert probe['gpu_offload_available'] is True
+        assert probe['source'] == 'markers_or_probe'
+
     def test_llama_gpu_offload_available_returns_false_on_runtime_error(self):
         """GPU support probe should fail closed if llama_cpp probe raises."""
 

@@ -71,50 +71,67 @@ class ModelManager:
             'n_gpu_layers': self.default_n_gpu_layers,
             'fallback_reason': None,
         }
+        self.last_runtime_backend_probe = {
+            'backend': None,
+            'gpu_offload_available': False,
+            'device': None,
+            'source': 'uninitialized',
+        }
 
     @staticmethod
-    def _platform_gpu_backend() -> Optional[str]:
-        if sys.platform == 'darwin':
-            return 'metal'
-        if sys.platform.startswith('win'):
-            return 'cuda'
-        if sys.platform.startswith('linux'):
-            try:
-                import llama_cpp
-            except Exception:
-                return None
-            if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
-                return 'cuda'
-            if bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
-                return 'metal'
-            supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
-            if callable(supports_gpu):
-                try:
-                    if bool(supports_gpu()):
-                        # Linux builds that expose GPU offload are expected to be CUDA.
-                        return 'cuda'
-                except Exception:
-                    return None
-        return None
-
-    @staticmethod
-    def _llama_gpu_offload_available() -> bool:
+    def _probe_llama_runtime() -> Dict[str, Any]:
         try:
             import llama_cpp
         except Exception:
-            return False
+            return {
+                'backend': None,
+                'gpu_offload_available': False,
+                'device': None,
+                'source': 'llama_cpp_import_failed',
+            }
+
+        marker_map = (
+            ('GGML_USE_CUDA', 'cuda'),
+            ('GGML_USE_METAL', 'metal'),
+            ('GGML_USE_VULKAN', 'vulkan'),
+            ('GGML_USE_CLBLAST', 'opencl'),
+        )
+        marker_backends = [
+            backend for marker, backend in marker_map if bool(getattr(llama_cpp, marker, False))
+        ]
 
         supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+        probe_supported = False
         if callable(supports_gpu):
             try:
-                return bool(supports_gpu())
+                probe_supported = bool(supports_gpu())
             except Exception:
-                return False
+                probe_supported = False
 
-        for marker in ('GGML_USE_CUDA', 'GGML_USE_METAL'):
-            if bool(getattr(llama_cpp, marker, False)):
-                return True
-        return False
+        backend = marker_backends[0] if marker_backends else None
+        if backend is None and probe_supported:
+            if sys.platform == 'darwin':
+                backend = 'metal'
+            elif sys.platform.startswith('win'):
+                backend = 'cuda'
+            else:
+                backend = 'cuda'
+
+        return {
+            'backend': backend,
+            'gpu_offload_available': bool(marker_backends) or probe_supported,
+            'device': os.getenv('TOKEN_PLACE_GPU_DEVICE'),
+            'source': 'markers_or_probe',
+            'marker_backends': marker_backends,
+        }
+
+    @staticmethod
+    def _platform_gpu_backend() -> Optional[str]:
+        return ModelManager._probe_llama_runtime().get('backend')
+
+    @staticmethod
+    def _llama_gpu_offload_available() -> bool:
+        return bool(ModelManager._probe_llama_runtime().get('gpu_offload_available'))
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
@@ -375,6 +392,7 @@ class ModelManager:
                             from llama_cpp import Llama
 
                             compute_plan = self._resolve_compute_plan()
+                            runtime_probe = self._probe_llama_runtime()
                             n_gpu_layers = int(compute_plan['n_gpu_layers'])
                             if self.enforce_gpu_headroom and n_gpu_layers != 0:
                                 try:
@@ -406,6 +424,25 @@ class ModelManager:
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             self.last_compute_diagnostics = compute_plan
+                            self.last_runtime_backend_probe = runtime_probe
+                            kv_cache_target = (
+                                'gpu'
+                                if compute_plan.get('backend_used') != 'cpu' and n_gpu_layers != 0
+                                else 'cpu'
+                            )
+                            self.log_info(
+                                "llama_runtime_summary "
+                                f"requested={compute_plan.get('requested_mode')} "
+                                f"effective={compute_plan.get('effective_mode')} "
+                                f"backend_selected={compute_plan.get('backend_selected')} "
+                                f"backend_used={compute_plan.get('backend_used')} "
+                                f"backend_available={compute_plan.get('backend_available')} "
+                                f"runtime_gpu_support={runtime_probe.get('gpu_offload_available')} "
+                                f"device={runtime_probe.get('device') or 'unknown'} "
+                                f"offload_layers={n_gpu_layers} "
+                                f"kv_cache={kv_cache_target} "
+                                f"fallback_reason={compute_plan.get('fallback_reason') or 'none'}"
+                            )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

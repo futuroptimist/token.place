@@ -154,8 +154,16 @@ def run(args: argparse.Namespace) -> int:
             "type": "started",
             "requested_mode": diagnostics.get("requested_mode"),
             "effective_mode": diagnostics.get("effective_mode"),
+            "backend_available": diagnostics.get("backend_available"),
+            "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
             "n_gpu_layers": diagnostics.get("n_gpu_layers"),
+            "kv_cache_target": (
+                "gpu"
+                if diagnostics.get("backend_used") != "cpu"
+                and int(diagnostics.get("n_gpu_layers") or 0) != 0
+                else "cpu"
+            ),
             "fallback_reason": diagnostics.get("fallback_reason"),
         }
     )

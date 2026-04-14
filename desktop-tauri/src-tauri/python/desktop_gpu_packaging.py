@@ -129,9 +129,24 @@ def llama_cpp_install_plan_fallbacks(
             )
         )
 
-        # If CUDA wheels are unavailable entirely for this ABI, fall back to
-        # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
-        # without requiring local native compilation toolchains.
+        # If CUDA wheels are unavailable entirely for this ABI, fall back to a
+        # deterministic source build with CUDA enabled before considering CPU.
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="cuda",
+                package_spec="llama-cpp-python",
+                cmake_args="-DGGML_CUDA=on -DGGML_NATIVE=off",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=False,
+                no_binary=True,
+            )
+        )
+
+        # Final fallback keeps release/dev setup buildable on hosts where CUDA
+        # toolchains are unavailable.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,

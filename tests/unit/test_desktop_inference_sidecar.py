@@ -140,6 +140,9 @@ def test_run_streams_started_token_done_with_shared_runtime(tmp_path, capsys):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'token', 'token', 'done']
+    assert events[0]['backend_available'] == 'unknown'
+    assert events[0]['backend_selected'] == 'cpu'
+    assert events[0]['kv_cache_target'] == 'cpu'
     assert manager.default_n_gpu_layers == 0
 
 

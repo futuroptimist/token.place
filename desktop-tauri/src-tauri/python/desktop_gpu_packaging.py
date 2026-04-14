@@ -111,9 +111,9 @@ def llama_cpp_install_plan_fallbacks(
     plans = [primary]
 
     if primary.platform.startswith("win"):
-        # 0.3.16 CUDA indexes publish Linux wheels only; keep desktop CI/release
-        # buildable by falling back to a deterministic source build when CUDA
-        # wheels are unavailable for the current Python ABI.
+        # CUDA wheels may be unavailable for a given Python ABI on Windows.
+        # Fall back to PyPI's prebuilt CPU wheel to keep desktop CI/release
+        # buildable without requiring local native compilation toolchains.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -123,8 +123,8 @@ def llama_cpp_install_plan_fallbacks(
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
                 extra_index_url=None,
-                only_binary=False,
-                no_binary=True,
+                only_binary=True,
+                no_binary=False,
             )
         )
 

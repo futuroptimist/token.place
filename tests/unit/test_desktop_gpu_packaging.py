@@ -27,8 +27,8 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
     assert cpu_fallback.extra_index_url is None
-    assert cpu_fallback.only_binary is False
-    assert cpu_fallback.no_binary is True
+    assert cpu_fallback.only_binary is True
+    assert cpu_fallback.no_binary is False
 
 
 def test_macos_install_plan_requests_metal_then_source_fallback():

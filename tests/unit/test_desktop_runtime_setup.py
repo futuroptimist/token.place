@@ -5,12 +5,15 @@ from pathlib import Path
 
 PYTHON_MODULE_DIR = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python'
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(PYTHON_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_MODULE_DIR))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 MODULE_PATH = PYTHON_MODULE_DIR / 'desktop_runtime_setup.py'
 SPEC = importlib.util.spec_from_file_location('desktop_runtime_setup', MODULE_PATH)
 desktop_runtime_setup = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
+sys.modules['desktop_runtime_setup'] = desktop_runtime_setup
 SPEC.loader.exec_module(desktop_runtime_setup)
 
 

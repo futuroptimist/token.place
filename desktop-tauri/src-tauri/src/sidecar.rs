@@ -1,5 +1,6 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -67,10 +68,14 @@ pub async fn collect_events_from_stdout<R: tokio::io::AsyncRead + Unpin>(
 async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     request_id: &str,
+    policy: SubprocessLogPolicy,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
+    let mut filter = SubprocessLogFilter::new("sidecar", policy).with_request_id(request_id);
     while let Some(line) = lines.next_line().await? {
-        eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+        if filter.should_emit(&line) {
+            eprintln!("desktop.sidecar.stderr request_id={request_id} line={line}");
+        }
     }
     Ok(())
 }
@@ -280,8 +285,9 @@ pub async fn start_sidecar(
 
     let request_id = request.request_id;
     let stderr_request_id = request_id.clone();
+    let log_policy = SubprocessLogPolicy::from_env();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_sidecar_stderr(stderr, &stderr_request_id).await {
+        if let Err(err) = drain_sidecar_stderr(stderr, &stderr_request_id, log_policy).await {
             eprintln!(
                 "desktop.sidecar.stderr_error request_id={} error={}",
                 stderr_request_id, err
@@ -470,7 +476,7 @@ mod tests {
             .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
-        drain_sidecar_stderr(stderr, "test")
+        drain_sidecar_stderr(stderr, "test", SubprocessLogPolicy { verbose_raw: true })
             .await
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");

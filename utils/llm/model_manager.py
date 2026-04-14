@@ -60,6 +60,15 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     }
 
 
+def llama_cpp_verbose_logging_enabled() -> bool:
+    """Return whether raw llama.cpp verbose logging should be enabled."""
+
+    return (
+        os.getenv('TOKEN_PLACE_VERBOSE_LLM_LOGS') == '1'
+        or os.getenv('TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS') == '1'
+    )
+
+
 class ModelManager:
     """
     Manages LLM model downloading, initialization, and inference.
@@ -414,7 +423,8 @@ class ModelManager:
                                 model_path=self.model_path,
                                 n_gpu_layers=n_gpu_layers,
                                 n_ctx=self.config.get('model.context_size', 8192),
-                                chat_format=self.config.get('model.chat_format', 'llama-3')
+                                chat_format=self.config.get('model.chat_format', 'llama-3'),
+                                verbose=llama_cpp_verbose_logging_enabled(),
                             )
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['kv_cache_device'] = (

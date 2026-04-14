@@ -8,7 +8,12 @@ DESKTOP_PYTHON = ROOT / "desktop-tauri" / "src-tauri" / "python"
 if str(DESKTOP_PYTHON) not in sys.path:
     sys.path.insert(0, str(DESKTOP_PYTHON))
 
-from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks
+from desktop_gpu_packaging import (
+    LlamaCppInstallPlan,
+    llama_cpp_install_plan,
+    llama_cpp_install_plan_fallbacks,
+    llama_cpp_requirement_spec,
+)
 
 
 def test_windows_install_plan_requests_cuda_then_cpu_fallback():
@@ -61,3 +66,69 @@ def test_linux_install_plan_remains_cpu_default():
     assert plan.backend == "cpu"
     assert plan.pip_env() == {}
     assert plan.pip_install_args() == ["--upgrade", "--no-cache-dir"]
+
+
+def test_requirement_spec_parses_comments_and_blank_lines(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(
+        "# comment\n\n"
+        "numpy==2.0.0\n"
+        "llama-cpp-python==0.3.16\n",
+        encoding="utf-8",
+    )
+
+    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"
+
+
+def test_requirement_spec_accepts_underscore_package_name(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("llama_cpp_python==0.2.90\n", encoding="utf-8")
+
+    assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.2.90"
+
+
+def test_requirement_spec_raises_when_pin_missing(tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("numpy==2.0.0\n", encoding="utf-8")
+
+    try:
+        llama_cpp_requirement_spec(requirements)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "llama_cpp_python pin not found" in str(exc)
+
+
+def test_pip_install_args_include_index_and_binary_flags():
+    plan = LlamaCppInstallPlan(
+        platform="darwin",
+        backend="metal",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args=None,
+        force_cmake=False,
+        index_url="https://example.invalid/simple",
+        extra_index_url="https://pypi.org/simple",
+        only_binary=True,
+        no_binary=True,
+    )
+
+    assert plan.pip_install_args() == [
+        "--upgrade",
+        "--no-cache-dir",
+        "--index-url",
+        "https://example.invalid/simple",
+        "--extra-index-url",
+        "https://pypi.org/simple",
+        "--only-binary",
+        "llama-cpp-python",
+        "--no-binary",
+        "llama-cpp-python",
+        "--prefer-binary",
+    ]
+
+
+def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
+    monkeypatch.setattr("desktop_gpu_packaging.sys.platform", "linux")
+    plan = llama_cpp_install_plan(requirements_path=ROOT / "requirements.txt")
+
+    assert plan.platform == "linux"
+    assert plan.backend == "cpu"

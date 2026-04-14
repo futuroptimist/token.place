@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 # Add the project root to the path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -270,7 +271,9 @@ class TestModelManager:
         instance = MagicMock()
         mock_llama.return_value = instance
 
-        result = model_manager.get_llm_instance()
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            result = model_manager.get_llm_instance()
 
         assert result is instance
         mock_llama.assert_called_once()
@@ -295,7 +298,9 @@ class TestModelManager:
         instance = MagicMock()
         mock_llama.return_value = instance
 
-        result = model_manager.get_llm_instance()
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            result = model_manager.get_llm_instance()
 
         assert result is instance
         kwargs = mock_llama.call_args.kwargs
@@ -310,7 +315,9 @@ class TestModelManager:
         with patch('llama_cpp.Llama', return_value=instance, create=True) as mock_llama, \
              patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory') as mock_can_allocate, \
              patch('utils.llm.model_manager.os.path.exists', return_value=True), \
-             patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')):
+             patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')), \
+             patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
 
             result = model_manager.get_llm_instance()
 
@@ -746,3 +753,157 @@ class TestModelManager:
         stream_call, non_stream_call = mock_llm.create_chat_completion.call_args_list
         assert stream_call.kwargs['stream'] is True
         assert non_stream_call.kwargs['stream'] is False
+
+    def test_resolve_compute_plan_auto_falls_back_when_runtime_lacks_gpu(self, model_manager):
+        """Auto mode should downshift GPU layers when runtime support is missing."""
+        model_manager.requested_compute_mode = 'auto'
+        model_manager.default_n_gpu_layers = -1
+
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=False):
+            plan = model_manager._resolve_compute_plan()
+
+        assert plan['requested_mode'] == 'auto'
+        assert plan['effective_mode'] == 'cpu_fallback'
+        assert plan['backend_selected'] == 'cuda'
+        assert plan['backend_used'] == 'cpu'
+        assert plan['n_gpu_layers'] == 0
+        assert 'does not expose cuda GPU offload support' in plan['fallback_reason']
+
+    def test_resolve_compute_plan_auto_cpu_request_keeps_cpu(self, model_manager):
+        """Auto mode should stay on CPU when default GPU layers request CPU-only."""
+        model_manager.requested_compute_mode = 'auto'
+        model_manager.default_n_gpu_layers = 0
+
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            plan = model_manager._resolve_compute_plan()
+
+        assert plan['effective_mode'] == 'cpu'
+        assert plan['backend_selected'] == 'cpu'
+        assert plan['backend_used'] == 'cpu'
+        assert plan['n_gpu_layers'] == 0
+        assert plan['fallback_reason'] is None
+
+    def test_platform_gpu_backend_linux_detects_cuda_marker(self):
+        """Linux backend detection should use llama_cpp capability markers."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=True,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
+    def test_llama_gpu_offload_available_returns_false_on_runtime_error(self):
+        """GPU support probe should fail closed if llama_cpp probe raises."""
+
+        def _raise_runtime_error():
+            raise RuntimeError("probe failed")
+
+        fake_llama = SimpleNamespace(llama_supports_gpu_offload=_raise_runtime_error)
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            assert ModelManager._llama_gpu_offload_available() is False
+
+    def test_get_llm_instance_mock_mode_refreshes_compute_diagnostics(self, model_manager):
+        """Mock mode should persist diagnostics from resolved compute plan."""
+        model_manager.use_mock_llm = True
+        expected_plan = {
+            'requested_mode': 'hybrid',
+            'effective_mode': 'hybrid_cuda',
+            'backend_available': 'cuda',
+            'backend_selected': 'cuda',
+            'backend_used': 'cuda',
+            'n_gpu_layers': 24,
+            'fallback_reason': None,
+        }
+
+        with patch.object(model_manager, '_resolve_compute_plan', return_value=expected_plan):
+            llm = model_manager.get_llm_instance()
+
+        assert isinstance(llm, MagicMock)
+        assert model_manager.last_compute_diagnostics == expected_plan
+
+    def test_platform_gpu_backend_linux_detects_metal_marker(self):
+        """Linux backend detection should return Metal when CUDA is unavailable."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=True,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'metal'
+
+    def test_platform_gpu_backend_linux_uses_gpu_offload_probe(self):
+        """Linux backend detection should map positive runtime probes to CUDA."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=lambda: True,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
+    def test_platform_gpu_backend_linux_returns_none_when_probe_raises(self):
+        """Linux backend detection should fail closed when probe raises."""
+
+        def _raise_runtime_error():
+            raise RuntimeError("probe failed")
+
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=_raise_runtime_error,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend is None
+
+    def test_llama_gpu_offload_available_uses_marker_fallback(self):
+        """GPU support probe should fall back to GGML capability markers."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=True,
+            llama_supports_gpu_offload=None,
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            assert ModelManager._llama_gpu_offload_available() is True
+
+    def test_resolve_compute_plan_gpu_and_hybrid_success_paths(self, model_manager):
+        """Explicit gpu/hybrid requests should emit expected diagnostics."""
+        model_manager.requested_compute_mode = 'gpu'
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            gpu_plan = model_manager._resolve_compute_plan()
+
+        assert gpu_plan['effective_mode'] == 'cuda'
+        assert gpu_plan['backend_used'] == 'cuda'
+        assert gpu_plan['n_gpu_layers'] == -1
+        assert gpu_plan['fallback_reason'] is None
+
+        model_manager.requested_compute_mode = 'hybrid'
+        model_manager.hybrid_n_gpu_layers = -5
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            hybrid_plan = model_manager._resolve_compute_plan()
+
+        assert hybrid_plan['effective_mode'] == 'hybrid_cuda'
+        assert hybrid_plan['backend_used'] == 'cuda'
+        assert hybrid_plan['n_gpu_layers'] == 1
+        assert hybrid_plan['fallback_reason'] is None

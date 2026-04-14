@@ -133,6 +133,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     from utils.compute_node_runtime import (
         SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
         apply_compute_mode as _apply_compute_mode,
+        compute_mode_diagnostics as _compute_mode_diagnostics,
         normalize_compute_mode as _normalize_compute_mode,
     )
 
@@ -151,6 +152,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module.SUPPORTED_COMPUTE_MODES = _SUPPORTED_COMPUTE_MODES
     module.normalize_compute_mode = _normalize_compute_mode
     module.apply_compute_mode = _apply_compute_mode
+    module.compute_mode_diagnostics = _compute_mode_diagnostics
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
 
 
@@ -318,14 +320,15 @@ def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     assert apply_compute_mode(manager, 'auto') == 'auto'
     assert manager.default_n_gpu_layers == -1
 
-    assert apply_compute_mode(manager, 'metal') == 'metal'
-    assert manager.default_n_gpu_layers == -1
-
-    assert apply_compute_mode(manager, 'cuda') == 'cuda'
+    assert apply_compute_mode(manager, 'gpu') == 'gpu'
     assert manager.default_n_gpu_layers == -1
 
     assert apply_compute_mode(manager, 'cpu') == 'cpu'
     assert manager.default_n_gpu_layers == 0
+
+    manager.hybrid_n_gpu_layers = 9
+    assert apply_compute_mode(manager, 'hybrid') == 'hybrid'
+    assert manager.default_n_gpu_layers == 9
 
 
 def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
@@ -344,7 +347,7 @@ def test_run_normalizes_unknown_mode_to_auto_in_status(capsys, monkeypatch):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]['type'] == 'started'
-    assert events[0]['backend_mode'] == 'auto'
+    assert events[0]['requested_mode'] == 'auto'
 
 
 def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallbacks(monkeypatch):
@@ -388,6 +391,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
         return relay_url if prefer_cli else (env_override or relay_url)
 
     module.resolve_relay_url = _resolve_relay_url
+    module.compute_mode_diagnostics = lambda _model_manager: {}
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setenv('TOKENPLACE_RELAY_URL', 'https://token.place')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
@@ -450,7 +454,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'cuda'
+    assert captured['mode'] == 'gpu'
 
     monkeypatch.setattr(
         sys,
@@ -482,16 +486,29 @@ def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_pat
     (utils_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
-SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "cuda", "metal"}
+SUPPORTED_COMPUTE_MODES = {"auto", "cpu", "gpu", "hybrid"}
 
 
 def normalize_compute_mode(mode):
     mode = str(mode).lower()
+    mode = {"cuda": "gpu", "metal": "gpu"}.get(mode, mode)
     return mode if mode in SUPPORTED_COMPUTE_MODES else "auto"
 
 
 def apply_compute_mode(_model_manager, mode):
     return normalize_compute_mode(mode)
+
+
+def compute_mode_diagnostics(_model_manager):
+    return {
+        "requested_mode": "auto",
+        "effective_mode": "pending",
+        "backend_available": "unknown",
+        "backend_selected": "unknown",
+        "backend_used": "unknown",
+        "n_gpu_layers": -1,
+        "fallback_reason": None,
+    }
 
 
 def resolve_relay_url(relay_url, **_kwargs):

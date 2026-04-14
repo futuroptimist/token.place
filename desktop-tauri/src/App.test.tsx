@@ -37,7 +37,8 @@ describe('desktop app start failure handling', () => {
         return Promise.resolve({
           platform_label: 'macos',
           preferred_mode: 'auto',
-          display_label: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
         });
       }
       if (command === 'load_config') {
@@ -52,7 +53,12 @@ describe('desktop app start failure handling', () => {
           running: false,
           registered: false,
           active_relay_url: '',
-          backend_mode: 'auto',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
           model_path: '',
           last_error: null,
         });
@@ -88,14 +94,20 @@ describe('desktop app start failure handling', () => {
             ? {
                 platform_label: 'macos',
                 preferred_mode: 'auto',
-                display_label: 'auto',
+                available_backend: 'metal',
+                availability_label: 'Metal-capable platform (Apple Silicon)',
               }
             : command === 'get_compute_node_status'
               ? {
                   running: false,
                   registered: false,
                   active_relay_url: '',
-                  backend_mode: 'auto',
+                  requested_mode: 'auto',
+                  effective_mode: 'cpu',
+                  backend_available: 'unknown',
+                  backend_selected: 'cpu',
+                  backend_used: 'cpu',
+                  fallback_reason: null,
                   model_path: '',
                   last_error: null,
                 }
@@ -139,7 +151,8 @@ describe('desktop app start failure handling', () => {
         return Promise.resolve({
           platform_label: 'macos',
           preferred_mode: 'auto',
-          display_label: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
         });
       }
       if (command === 'load_config') {
@@ -154,7 +167,12 @@ describe('desktop app start failure handling', () => {
           running: false,
           registered: false,
           active_relay_url: '',
-          backend_mode: 'auto',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
           model_path: '',
           last_error: null,
         });

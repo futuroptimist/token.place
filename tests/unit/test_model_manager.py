@@ -827,3 +827,83 @@ class TestModelManager:
 
         assert isinstance(llm, MagicMock)
         assert model_manager.last_compute_diagnostics == expected_plan
+
+    def test_platform_gpu_backend_linux_detects_metal_marker(self):
+        """Linux backend detection should return Metal when CUDA is unavailable."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=True,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'metal'
+
+    def test_platform_gpu_backend_linux_uses_gpu_offload_probe(self):
+        """Linux backend detection should map positive runtime probes to CUDA."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=lambda: True,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
+    def test_platform_gpu_backend_linux_returns_none_when_probe_raises(self):
+        """Linux backend detection should fail closed when probe raises."""
+
+        def _raise_runtime_error():
+            raise RuntimeError("probe failed")
+
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=_raise_runtime_error,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend is None
+
+    def test_llama_gpu_offload_available_uses_marker_fallback(self):
+        """GPU support probe should fall back to GGML capability markers."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=True,
+            llama_supports_gpu_offload=None,
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            assert ModelManager._llama_gpu_offload_available() is True
+
+    def test_resolve_compute_plan_gpu_and_hybrid_success_paths(self, model_manager):
+        """Explicit gpu/hybrid requests should emit expected diagnostics."""
+        model_manager.requested_compute_mode = 'gpu'
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            gpu_plan = model_manager._resolve_compute_plan()
+
+        assert gpu_plan['effective_mode'] == 'cuda'
+        assert gpu_plan['backend_used'] == 'cuda'
+        assert gpu_plan['n_gpu_layers'] == -1
+        assert gpu_plan['fallback_reason'] is None
+
+        model_manager.requested_compute_mode = 'hybrid'
+        model_manager.hybrid_n_gpu_layers = -5
+        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
+             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+            hybrid_plan = model_manager._resolve_compute_plan()
+
+        assert hybrid_plan['effective_mode'] == 'hybrid_cuda'
+        assert hybrid_plan['backend_used'] == 'cuda'
+        assert hybrid_plan['n_gpu_layers'] == 1
+        assert hybrid_plan['fallback_reason'] is None

@@ -78,11 +78,11 @@ Desktop subprocess logs now default to high-signal output:
 
 - Known low-value llama.cpp noise (metadata dumps, control-token spam, per-layer assignment spam, tensor repack spam) is filtered at the Tauri stderr forwarding boundary.
 - Warnings and errors are always preserved in default mode.
-- The inference sidecar emits concise summary lines for model init and inference throughput.
+- The inference sidecar emits concise stderr summary lines for model init and prompt/eval throughput.
 
 To restore full raw subprocess output (including verbose llama.cpp logs), run desktop with either:
 
 - `TOKEN_PLACE_VERBOSE_LLM_LOGS=1`
 - `TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS=1`
 
-Both flags are opt-in and intended for troubleshooting.
+Both flags are equivalent opt-in toggles and intended for troubleshooting.

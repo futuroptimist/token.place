@@ -123,6 +123,27 @@ fn noisy_pattern(line: &str) -> Option<&'static str> {
     {
         return Some("metadata_kv");
     }
+    if line.contains("llama_context:") {
+        return Some("llama_context_init");
+    }
+    if line.contains("llama_kv_cache_unified:") {
+        return Some("kv_cache_init");
+    }
+    if line.contains("graph_reserve:") {
+        return Some("graph_reserve");
+    }
+    if line.contains("backend_ptrs.size") {
+        return Some("backend_enumeration");
+    }
+    if line.contains("CPU compute buffer size")
+        || line.contains("output buffer size")
+        || line.contains("KV buffer size")
+    {
+        return Some("buffer_sizes");
+    }
+    if line.contains("special tokens cache size") || line.contains("token to piece cache size") {
+        return Some("token_cache_sizes");
+    }
     None
 }
 
@@ -138,7 +159,16 @@ mod tests {
         assert!(!filter.should_emit("token '</s>' is not marked as EOG"));
         assert!(!filter.should_emit("load_tensors: layer 1 assigned to CPU"));
         assert!(!filter.should_emit("repack: f16 -> q8_0"));
-        assert_eq!(filter.suppressed_total, 4);
+        assert!(!filter.should_emit("llama_context: n_ctx = 8192"));
+        assert!(!filter.should_emit("llama_kv_cache_unified: creating unified KV cache"));
+        assert!(!filter.should_emit("graph_reserve: reserving graph for decoder"));
+        assert!(!filter.should_emit("backend_ptrs.size() = 2"));
+        assert!(!filter.should_emit("CPU compute buffer size = 1024.00 MiB"));
+        assert!(!filter.should_emit("output buffer size = 16.00 MiB"));
+        assert!(!filter.should_emit("KV buffer size = 512.00 MiB"));
+        assert!(!filter.should_emit("special tokens cache size = 256"));
+        assert!(!filter.should_emit("token to piece cache size = 32000"));
+        assert_eq!(filter.suppressed_total, 13);
     }
 
     #[test]
@@ -147,6 +177,8 @@ mod tests {
         let mut filter = SubprocessLogFilter::new("test", policy);
         assert!(filter.should_emit("WARNING llama_model_loader: Dumping metadata keys/values"));
         assert!(filter.should_emit("fallback reason: gpu init failed"));
+        assert!(filter.should_emit("error: llama_context: failed to initialize"));
+        assert!(filter.should_emit("warning: KV buffer size estimate may be inaccurate"));
     }
 
     #[test]

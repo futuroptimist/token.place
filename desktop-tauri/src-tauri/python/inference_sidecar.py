@@ -244,14 +244,20 @@ def run(args: argparse.Namespace) -> int:
                 text = fallback_text
 
     inference_elapsed_s = max(time.perf_counter() - inference_started_at, 1e-6)
-    approx_chars_per_second = int(len(text) / inference_elapsed_s) if text else 0
+    prompt_chars_per_second = int(len(args.prompt) / inference_elapsed_s) if args.prompt else 0
+    eval_chars_per_second = int(len(text) / inference_elapsed_s) if text else 0
+    eval_tokens_per_second = round(token_events / inference_elapsed_s, 2) if token_events else 0
     emit_summary(
         "inference",
         prompt_chars=len(args.prompt),
         output_chars=len(text),
         token_events=token_events,
         eval_seconds=f"{inference_elapsed_s:.3f}",
-        approx_chars_per_second=approx_chars_per_second,
+        throughput_summary=(
+            f"prompt_chars_per_s={prompt_chars_per_second};"
+            f"eval_chars_per_s={eval_chars_per_second};"
+            f"eval_tokens_per_s={eval_tokens_per_second}"
+        ),
     )
 
     emit({"type": "done"})

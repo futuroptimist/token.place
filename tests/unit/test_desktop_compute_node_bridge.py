@@ -707,10 +707,7 @@ class ComputeNodeRuntime:
     assert "No module named 'utils'" not in stdout
 
 
-def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch, tmp_path):
-    module_path = tmp_path / 'compute_node_bridge.py'
-    module_path.write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
-
+def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
@@ -720,10 +717,10 @@ def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch
 
     monkeypatch.setattr('builtins.__import__', fake_import)
 
-    spec = importlib.util.spec_from_file_location('compute_node_bridge_no_runtime_setup', module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
+    module = ModuleType('compute_node_bridge_no_runtime_setup')
+    module.__file__ = str(MODULE_PATH)
+    code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
+    exec(code, module.__dict__)
 
     setup = module.ensure_desktop_llama_runtime('auto')
     assert setup['runtime_action'] == 'unavailable'

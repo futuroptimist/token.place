@@ -261,3 +261,102 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 
     assert result['runtime_action'] == 'failed'
     assert result['fallback_reason'] == 'build failed'
+
+
+def test_probe_marks_error_when_subprocess_raises(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError('subprocess unavailable')
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _raise)
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+    assert probe.backend == 'missing'
+    assert probe.error == 'subprocess unavailable'
+
+
+def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    class _Result:
+        returncode = 9
+        stdout = ''
+        stderr = ''
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+    assert probe.backend == 'missing'
+    assert probe.error == 'probe subprocess failed with return code 9'
+
+
+def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    class _Result:
+        returncode = 0
+        stdout = 'not-json'
+        stderr = 'json parse failed'
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+    assert probe.backend == 'missing'
+    assert probe.error == 'json parse failed'
+    assert probe.llama_module_path == 'missing'
+
+
+def test_run_pip_install_success_failure_and_timeout(monkeypatch):
+    class _OkResult:
+        returncode = 0
+        stdout = 'ok output'
+        stderr = ''
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
+    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+    assert ok is True
+    assert output == 'ok output'
+
+    class _FailResult:
+        returncode = 1
+        stdout = 'fallback stdout'
+        stderr = 'real stderr'
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
+    ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
+    assert ok is False
+    assert output == 'real stderr'
+
+    def _timeout(*_args, **_kwargs):
+        raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
+    ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
+    assert ok is False
+    assert output == 'pip install timed out after 12s'
+
+
+def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    state_path = tmp_path / 'runtime_state.json'
+    monkeypatch.setattr(desktop_runtime_setup, '_runtime_state_path', lambda: state_path)
+    now = 2_000.0
+    monkeypatch.setattr(desktop_runtime_setup.time, 'time', lambda: now)
+
+    desktop_runtime_setup._record_source_repair_failure('build failed badly')
+    can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
+    assert can_retry is False
+    assert reason == 'build failed badly'
+
+    desktop_runtime_setup._clear_source_repair_failure()
+    state = json.loads(state_path.read_text(encoding='utf-8'))
+    assert sys.executable not in state.get('source_repair_failures', {})
+    monkeypatch.setattr(
+        desktop_runtime_setup.time,
+        'time',
+        lambda: now + desktop_runtime_setup.SOURCE_REPAIR_COOLDOWN_SECONDS + 1,
+    )
+    can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
+    assert can_retry is True
+    assert reason == ''

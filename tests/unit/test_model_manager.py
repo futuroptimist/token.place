@@ -965,8 +965,11 @@ class TestModelManager:
         compute_logs = [line for line in log_lines if line.startswith('compute_runtime ')]
         assert compute_logs
         summary = compute_logs[-1]
-        assert 'backend=cpu' in summary
+        assert 'backend_available=cuda' in summary
+        assert 'backend_used=cpu' in summary
         assert 'device_backend=cpu' in summary
         assert 'offloaded_layers=0' in summary
         assert 'kv_cache=cpu' in summary
+        assert 'python=' in summary
+        assert 'llama_module=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary

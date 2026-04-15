@@ -20,7 +20,7 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 
 try:
-    from desktop_runtime_setup import ensure_desktop_llama_runtime
+    from desktop_runtime_setup import ensure_desktop_llama_runtime, maybe_reexec_for_runtime_refresh
 except ModuleNotFoundError:
     def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
         return {
@@ -29,6 +29,9 @@ except ModuleNotFoundError:
             "runtime_action": "unavailable",
             "fallback_reason": "desktop_runtime_setup module missing",
         }
+
+    def maybe_reexec_for_runtime_refresh(_runtime_setup: Dict[str, str]) -> None:
+        return
 
 ensure_runtime_import_paths(__file__)
 
@@ -101,12 +104,15 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"python={runtime_setup.get('interpreter', sys.executable)} "
+        f"llama_module={runtime_setup.get('llama_module_path', 'missing')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )

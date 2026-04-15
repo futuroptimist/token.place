@@ -46,13 +46,17 @@ repair when the runtime is CPU-only. They emit:
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
+Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable the
+Windows auto-repair path and keep startup in probe-only mode (useful for
+packaging/troubleshooting while preserving normal CPU fallback diagnostics).
+
 When Windows CUDA repair is needed, desktop uses the same interpreter binary that
 launches the sidecar process (`sys.executable`) and applies the repo
 source-build recipe:
 
 - `CMAKE_ARGS=-DGGML_CUDA=on`
 - `FORCE_CMAKE=1`
-- `pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose`
+- `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
 
 After a successful repair, the sidecar automatically re-execs once so the active
 process immediately uses the repaired runtime (no manual restart/environment flag required).
@@ -120,7 +124,9 @@ python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path
 
 It prints:
 
-- `sys.executable` / `sys.prefix`
-- `llama_cpp.__file__`
-- backend markers and offload support
-- ModelManager diagnostics before/after init
+- Shared runtime probe fields (`backend`, `gpu_offload_supported`,
+  `detected_device`, `interpreter`, `prefix`, `llama_module_path`)
+- `compute_runtime_*` summaries using stable fields
+  (`requested`, `effective`, `backend_available`, `backend_used`,
+  `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
+  `fallback_reason`, `interpreter`, `llama_module_path`)

@@ -970,6 +970,6 @@ class TestModelManager:
         assert 'device_backend=cpu' in summary
         assert 'offloaded_layers=0' in summary
         assert 'kv_cache=cpu' in summary
-        assert 'python=' in summary
-        assert 'llama_module=' in summary
+        assert 'interpreter=' in summary
+        assert 'llama_module_path=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary

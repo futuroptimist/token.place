@@ -33,49 +33,34 @@ GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
+DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
-import json, sys
-payload = {
-    "backend": "cpu",
-    "gpu_offload_supported": False,
-    "detected_device": "cpu",
-    "interpreter": sys.executable,
-    "prefix": sys.prefix,
-    "llama_module_path": "missing",
-    "error": None,
-}
-try:
-    import llama_cpp
-    payload["llama_module_path"] = getattr(llama_cpp, "__file__", "unknown") or "unknown"
-    backend = "cpu"
-    if bool(getattr(llama_cpp, "GGML_USE_CUDA", False)):
-        backend = "cuda"
-    elif bool(getattr(llama_cpp, "GGML_USE_METAL", False)):
-        backend = "metal"
-    supports_gpu = getattr(llama_cpp, "llama_supports_gpu_offload", None)
-    if callable(supports_gpu):
-        try:
-            payload["gpu_offload_supported"] = bool(supports_gpu())
-        except Exception:
-            payload["gpu_offload_supported"] = False
-    else:
-        payload["gpu_offload_supported"] = backend in {"cuda", "metal"}
-    if payload["gpu_offload_supported"] and backend == "cpu":
-        backend = "metal" if sys.platform == "darwin" else "cuda"
-    payload["backend"] = backend
-    payload["detected_device"] = backend if payload["gpu_offload_supported"] else "cpu"
-except Exception as exc:
-    payload["backend"] = "missing"
-    payload["detected_device"] = "none"
-    payload["error"] = str(exc)
+import json
+import sys
+from pathlib import Path
+
+repo_root = Path.cwd()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from utils.llm.model_manager import detect_llama_runtime_capabilities
+
+payload = detect_llama_runtime_capabilities()
 print(json.dumps(payload))
 """.strip()
 
 
 def _probe_llama_runtime() -> RuntimeProbe:
+    repo_root = Path(__file__).resolve().parents[3]
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    pythonpath_entries = [str(repo_root)]
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     try:
         result = subprocess.run(
             cmd,
@@ -83,6 +68,8 @@ def _probe_llama_runtime() -> RuntimeProbe:
             capture_output=True,
             text=True,
             timeout=30,
+            cwd=str(repo_root),
+            env=env,
         )
     except Exception as exc:
         return RuntimeProbe(
@@ -279,6 +266,16 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "fallback_reason": (
                 f"GPU runtime unavailable ({before.error or before.backend}); "
                 "desktop auto-repair is currently Windows-focused"
+            ),
+            "runtime_action": "probe_only",
+            **_probe_result_payload(before),
+        }
+
+    if os.getenv(DISABLE_BOOTSTRAP_ENV) == "1":
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"desktop runtime bootstrap disabled by {DISABLE_BOOTSTRAP_ENV}=1"
             ),
             "runtime_action": "probe_only",
             **_probe_result_payload(before),

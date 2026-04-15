@@ -22,16 +22,16 @@ def main() -> int:
 
     from utils.llm.model_manager import detect_llama_runtime_capabilities
 
-    payload = {
-        'sys.executable': sys.executable,
-        'sys.prefix': sys.prefix,
-    }
-
     runtime = detect_llama_runtime_capabilities()
-    payload['llama_cpp.__file__'] = runtime.get('llama_module_path', 'missing')
-    payload['GGML_USE_CUDA'] = runtime.get('backend') == 'cuda'
-    payload['GGML_USE_METAL'] = runtime.get('backend') == 'metal'
-    payload['llama_supports_gpu_offload'] = runtime.get('gpu_offload_supported', False)
+    payload = {
+        'backend': runtime.get('backend', 'missing'),
+        'gpu_offload_supported': runtime.get('gpu_offload_supported', False),
+        'detected_device': runtime.get('detected_device', 'none'),
+        'interpreter': runtime.get('interpreter', sys.executable),
+        'prefix': runtime.get('prefix', sys.prefix),
+        'llama_module_path': runtime.get('llama_module_path', 'missing'),
+        'error': runtime.get('error'),
+    }
 
     try:
         from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
@@ -41,16 +41,44 @@ def main() -> int:
         if args.model:
             manager.model_path = args.model
         apply_compute_mode(manager, args.mode)
-        payload['compute_plan_pre_init'] = compute_mode_diagnostics(manager)
+        pre_init = compute_mode_diagnostics(manager)
+        payload['compute_runtime_pre_init'] = {
+            'requested': pre_init.get('requested_mode'),
+            'effective': pre_init.get('effective_mode'),
+            'backend_available': pre_init.get('backend_available'),
+            'backend_used': pre_init.get('backend_used'),
+            'device_backend': pre_init.get('backend_used'),
+            'device_name': 'unreported',
+            'offloaded_layers': pre_init.get('n_gpu_layers'),
+            'kv_cache': 'unknown_pre_init',
+            'fallback_reason': pre_init.get('fallback_reason'),
+            'interpreter': payload['interpreter'],
+            'llama_module_path': payload['llama_module_path'],
+        }
 
         if args.model and os.path.exists(args.model):
             manager.get_llm_instance()
-            payload['compute_plan_post_init'] = compute_mode_diagnostics(manager)
+            post_init = compute_mode_diagnostics(manager)
+            payload['compute_runtime_post_init'] = {
+                'requested': post_init.get('requested_mode'),
+                'effective': post_init.get('effective_mode'),
+                'backend_available': post_init.get('backend_available'),
+                'backend_used': post_init.get('backend_used'),
+                'device_backend': post_init.get('device_backend'),
+                'device_name': post_init.get('device_name'),
+                'offloaded_layers': post_init.get('offloaded_layers'),
+                'kv_cache': post_init.get('kv_cache_device'),
+                'fallback_reason': post_init.get('fallback_reason'),
+                'interpreter': payload['interpreter'],
+                'llama_module_path': payload['llama_module_path'],
+            }
         else:
-            payload['compute_plan_post_init'] = 'skipped (provide --model <gguf> to initialize Llama)'
+            payload['compute_runtime_post_init'] = (
+                'skipped (provide --model <gguf> to initialize Llama)'
+            )
     except ModuleNotFoundError as exc:
-        payload['compute_plan_pre_init'] = f'skipped (missing dependency: {exc})'
-        payload['compute_plan_post_init'] = 'skipped'
+        payload['compute_runtime_pre_init'] = f'skipped (missing dependency: {exc})'
+        payload['compute_runtime_post_init'] = 'skipped'
 
     print(json.dumps(payload, indent=2))
     return 0

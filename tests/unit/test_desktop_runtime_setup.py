@@ -124,6 +124,51 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
     assert called['guard'] == '1'
 
 
+def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')
+    invoked = {'source_repair': False}
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_windows_cuda_source_repair',
+        lambda _requirements_path: (invoked.update(source_repair=True), '') and (False, 'unexpected call'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
+
+    assert result['runtime_action'] == 'probe_only'
+    assert desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert invoked['source_repair'] is False
+
+
+def test_windows_runtime_bootstrap_success_reexec_is_guarded_to_one_attempt(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: next(probes))
+    monkeypatch.setattr(
+        desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (True, 'ok')
+    )
+    exec_calls = {'count': 0}
+    monkeypatch.setattr(
+        desktop_runtime_setup.os,
+        'execve',
+        lambda *_args: exec_calls.update(count=exec_calls['count'] + 1),
+    )
+    monkeypatch.delenv(desktop_runtime_setup.REEXEC_GUARD_ENV, raising=False)
+
+    runtime_setup = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
+    desktop_runtime_setup.maybe_reexec_for_runtime_refresh(runtime_setup)
+    monkeypatch.setenv(desktop_runtime_setup.REEXEC_GUARD_ENV, '1')
+    desktop_runtime_setup.maybe_reexec_for_runtime_refresh(runtime_setup)
+
+    assert runtime_setup['runtime_action'] == 'installed_cuda_reexec'
+    assert exec_calls['count'] == 1
+
+
 def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     win_plans = desktop_runtime_setup._fallback_unpinned_plans('win32')
     darwin_plans = desktop_runtime_setup._fallback_unpinned_plans('darwin')

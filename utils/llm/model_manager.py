@@ -452,8 +452,8 @@ class ModelManager:
                                 f"device_name={compute_plan['device_name']} "
                                 f"offloaded_layers={compute_plan['offloaded_layers']} "
                                 f"kv_cache={compute_plan['kv_cache_device']} "
-                                f"python={runtime_identity.get('interpreter', sys.executable)} "
-                                f"llama_module={runtime_identity.get('llama_module_path', 'unknown')} "
+                                f"interpreter={runtime_identity.get('interpreter', sys.executable)} "
+                                f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
                             self.log_info("Llama model initialized successfully.")

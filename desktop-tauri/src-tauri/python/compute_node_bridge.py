@@ -107,7 +107,10 @@ def run(args: argparse.Namespace) -> int:
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'} "
+        f"python={runtime_setup.get('python_executable', sys.executable)} "
+        f"llama_cpp={runtime_setup.get('llama_cpp_path', 'unknown')} "
+        f"install={runtime_setup.get('install_summary') or 'none'}",
         file=sys.stderr,
     )
 

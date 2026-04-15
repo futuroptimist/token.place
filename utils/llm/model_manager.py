@@ -392,8 +392,8 @@ class ModelManager:
                         return None
                     else:
                         try:
-                            # Dynamically import Llama only when needed
-                            from llama_cpp import Llama
+                            # Dynamically import llama_cpp only when needed.
+                            import llama_cpp
 
                             compute_plan = self._resolve_compute_plan()
                             n_gpu_layers = int(compute_plan['n_gpu_layers'])
@@ -419,7 +419,7 @@ class ModelManager:
                                         )
 
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
-                            self.llm = Llama(
+                            self.llm = llama_cpp.Llama(
                                 model_path=self.model_path,
                                 n_gpu_layers=n_gpu_layers,
                                 n_ctx=self.config.get('model.context_size', 8192),
@@ -437,17 +437,25 @@ class ModelManager:
                             )
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
+                            if llama_cpp_verbose_logging_enabled():
+                                compute_plan['python_executable'] = sys.executable
+                                compute_plan['llama_cpp_path'] = str(
+                                    getattr(llama_cpp, '__file__', 'unknown')
+                                )
                             self.last_compute_diagnostics = compute_plan
                             self.log_info(
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "
                                 f"effective={compute_plan['effective_mode']} "
+                                f"backend_available={compute_plan['backend_available']} "
                                 f"backend={compute_plan['backend_used']} "
                                 f"device_backend={compute_plan['device_backend']} "
                                 f"device_name={compute_plan['device_name']} "
                                 f"offloaded_layers={compute_plan['offloaded_layers']} "
                                 f"kv_cache={compute_plan['kv_cache_device']} "
-                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
+                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'} "
+                                f"python={compute_plan.get('python_executable', 'redacted')} "
+                                f"llama_cpp={compute_plan.get('llama_cpp_path', 'redacted')}"
                             )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:

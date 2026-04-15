@@ -38,20 +38,23 @@ npm ci
 npm run tauri dev
 ```
 
-During normal startup, desktop sidecars run a **probe-only** runtime check in
-`auto`/`gpu`/`hybrid` modes and emit:
+During startup, desktop sidecars verify runtime capability in the exact Python
+interpreter used to run the sidecar (`sys.executable`) and emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
-Normal inference requests do **not** mutate Python packages. For local desktop
-development, explicitly run one bootstrap start with
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=1` to allow a one-time
-`llama-cpp-python` install/repair attempt, then restart sidecars/app.
+On Windows in `auto`/`gpu`/`hybrid` modes, if the probe reports a CPU-only
+`llama-cpp-python` runtime, desktop now attempts an automatic runtime repair in
+that same interpreter using the canonical source-reinstall recipe:
 
-Packaged builds should rely on pre-provisioned runtime dependencies and keep
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP` unset.
+- `CMAKE_ARGS=-DGGML_CUDA=on`
+- `FORCE_CMAKE=1`
+- `python -m pip install --force-reinstall --upgrade --no-cache-dir --verbose llama-cpp-python`
+
+Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to force probe-only mode
+for troubleshooting.
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
@@ -60,6 +63,17 @@ Packaged builds should rely on pre-provisioned runtime dependencies and keep
 - CPU fallback mode is available in both cases, with explicit fallback details
   surfaced in `desktop.runtime_setup ... fallback_reason=...` and
   `compute_runtime ... fallback_reason=...`.
+
+### Manual runtime verification helper
+
+Use the sidecar interpreter directly to confirm the active runtime wiring:
+
+```bash
+python src-tauri/python/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
+```
+
+The helper prints `sys.executable`, `llama_cpp.__file__`, backend markers, GPU
+offload probe state, and `ModelManager` post-init diagnostics.
 
 ## Privacy defaults
 

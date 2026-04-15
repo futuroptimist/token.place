@@ -6,11 +6,16 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
-from desktop_gpu_packaging import LlamaCppInstallPlan, llama_cpp_install_plan_fallbacks
+from desktop_gpu_packaging import (
+    LlamaCppInstallPlan,
+    llama_cpp_install_plan_fallbacks,
+    llama_cpp_requirement_spec,
+)
 
 
 @dataclass(frozen=True)
@@ -26,7 +31,9 @@ class RuntimeProbe:
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
+PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
+SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
 import json, sys
@@ -89,8 +96,20 @@ def _probe_llama_runtime() -> RuntimeProbe:
         )
 
     stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0 or not stdout:
+        return RuntimeProbe(
+            backend="missing",
+            gpu_offload_supported=False,
+            detected_device="none",
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path="missing",
+            error=stderr or f"probe subprocess failed with return code {result.returncode}",
+        )
+
     try:
-        payload = json.loads(stdout) if stdout else {}
+        payload = json.loads(stdout)
     except json.JSONDecodeError:
         payload = {
             "backend": "missing",
@@ -99,7 +118,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
             "interpreter": sys.executable,
             "prefix": sys.prefix,
             "llama_module_path": "missing",
-            "error": (result.stderr or "").strip() or "probe parse failure",
+            "error": stderr or "probe parse failure",
         }
 
     return RuntimeProbe(
@@ -113,7 +132,12 @@ def _probe_llama_runtime() -> RuntimeProbe:
     )
 
 
-def _run_pip_install(cmd: list[str], env: dict[str, str]) -> tuple[bool, str]:
+def _run_pip_install(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    timeout_seconds: int = PIP_INSTALL_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
     try:
         install = subprocess.run(
             cmd,
@@ -121,10 +145,10 @@ def _run_pip_install(cmd: list[str], env: dict[str, str]) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             env=env,
-            timeout=PIP_INSTALL_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-        return False, f"pip install timed out after {PIP_INSTALL_TIMEOUT_SECONDS}s"
+        return False, f"pip install timed out after {timeout_seconds}s"
 
     if install.returncode == 0:
         return True, (install.stdout or "").strip()
@@ -132,22 +156,22 @@ def _run_pip_install(cmd: list[str], env: dict[str, str]) -> tuple[bool, str]:
     return False, (install.stderr or install.stdout or "").strip()
 
 
-def _windows_cuda_source_repair() -> tuple[bool, str]:
+def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
     env["FORCE_CMAKE"] = "1"
+    package_spec = llama_cpp_requirement_spec(requirements_path)
     cmd = [
         sys.executable,
         "-m",
         "pip",
         "install",
-        "llama-cpp-python",
+        package_spec,
         "--force-reinstall",
-        "--upgrade",
         "--no-cache-dir",
         "--verbose",
     ]
-    return _run_pip_install(cmd, env)
+    return _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
 
 
 def _summarize_install_error(raw: str) -> str:
@@ -161,9 +185,57 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
     return {
         "detected_device": probe.detected_device or "cpu",
         "interpreter": probe.interpreter,
+        "prefix": probe.prefix,
         "interpreter_prefix": probe.prefix,
         "llama_module_path": probe.llama_module_path,
     }
+
+
+def _runtime_state_path() -> Path:
+    return Path.home() / ".token_place_desktop_runtime_state.json"
+
+
+def _load_runtime_state() -> dict:
+    path = _runtime_state_path()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_runtime_state(state: dict) -> None:
+    path = _runtime_state_path()
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _should_attempt_source_repair() -> tuple[bool, str]:
+    state = _load_runtime_state()
+    failures = state.get("source_repair_failures", {})
+    entry = failures.get(sys.executable, {})
+    last_failed_at = float(entry.get("last_failed_at", 0))
+    now = time.time()
+    if now - last_failed_at >= SOURCE_REPAIR_COOLDOWN_SECONDS:
+        return True, ""
+    retry_in_seconds = int(SOURCE_REPAIR_COOLDOWN_SECONDS - (now - last_failed_at))
+    return False, entry.get("reason") or f"source repair cooldown active ({retry_in_seconds}s remaining)"
+
+
+def _record_source_repair_failure(reason: str) -> None:
+    state = _load_runtime_state()
+    failures = state.setdefault("source_repair_failures", {})
+    failures[sys.executable] = {
+        "last_failed_at": time.time(),
+        "reason": reason,
+    }
+    _save_runtime_state(state)
+
+
+def _clear_source_repair_failure() -> None:
+    state = _load_runtime_state()
+    failures = state.get("source_repair_failures", {})
+    if sys.executable in failures:
+        failures.pop(sys.executable, None)
+        _save_runtime_state(state)
 
 
 def maybe_reexec_for_runtime_refresh(runtime_setup: Dict[str, str]) -> None:
@@ -173,7 +245,10 @@ def maybe_reexec_for_runtime_refresh(runtime_setup: Dict[str, str]) -> None:
         return
     env = os.environ.copy()
     env[REEXEC_GUARD_ENV] = "1"
-    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    except OSError:
+        return
 
 
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
@@ -209,26 +284,34 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    last_error = ""
-    source_ok, source_log = _windows_cuda_source_repair()
-    if source_ok:
-        after = _probe_llama_runtime()
-        if after.gpu_offload_supported and after.backend == "cuda":
-            return {
-                "selected_backend": "cuda",
-                "fallback_reason": "installed CUDA runtime; re-executing sidecar",
-                "runtime_action": "installed_cuda_reexec",
-                **_probe_result_payload(after),
-            }
-        last_error = (
-            "CUDA source reinstall completed but runtime still CPU-only; "
-            "check CUDA toolkit/build tools"
-        )
-    else:
-        last_error = _summarize_install_error(source_log)
-
     target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
+    last_error = ""
+
+    should_repair, repair_skip_reason = _should_attempt_source_repair()
+    if should_repair:
+        source_ok, source_log = _windows_cuda_source_repair(requirements_path)
+        if source_ok:
+            _clear_source_repair_failure()
+            after = _probe_llama_runtime()
+            if after.gpu_offload_supported and after.backend == "cuda":
+                return {
+                    "selected_backend": "cuda",
+                    "fallback_reason": "installed CUDA runtime; re-executing sidecar",
+                    "runtime_action": "installed_cuda_reexec",
+                    **_probe_result_payload(after),
+                }
+            last_error = (
+                "CUDA source reinstall completed but runtime still CPU-only; "
+                "check CUDA toolkit/build tools"
+            )
+            _record_source_repair_failure(last_error)
+        else:
+            last_error = _summarize_install_error(source_log)
+            _record_source_repair_failure(last_error)
+    else:
+        last_error = repair_skip_reason
+
     try:
         plans = llama_cpp_install_plan_fallbacks(
             platform=sys.platform,

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -46,9 +47,14 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
 
 def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
     probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: next(probes))
-    monkeypatch.setattr(desktop_runtime_setup, '_windows_cuda_source_repair', lambda: (True, 'ok'))
+    monkeypatch.setattr(
+        desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (True, 'ok')
+    )
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
 
@@ -72,8 +78,12 @@ def test_runtime_bootstrap_noop_when_gpu_runtime_is_already_present(monkeypatch)
 
 def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
-    monkeypatch.setattr(desktop_runtime_setup, '_windows_cuda_source_repair', lambda: (False, 'compile failed'))
+    monkeypatch.setattr(
+        desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (False, 'compile failed')
+    )
     plans = [
         desktop_runtime_setup.LlamaCppInstallPlan(
             platform='win32',
@@ -128,15 +138,81 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     captured = {}
 
-    def fake_run(cmd, env):
+    def fake_run(cmd, env, timeout_seconds):
         captured['cmd'] = cmd
         captured['env'] = env
+        captured['timeout_seconds'] = timeout_seconds
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
-    ok, _ = desktop_runtime_setup._windows_cuda_source_repair()
+    ok, _ = desktop_runtime_setup._windows_cuda_source_repair(Path.cwd() / 'requirements.txt')
 
     assert ok is True
     assert captured['cmd'][:3] == [sys.executable, '-m', 'pip']
+    assert captured['cmd'][4].startswith('llama-cpp-python==')
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_CUDA=on'
     assert captured['env']['FORCE_CMAKE'] == '1'
+    assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+
+
+def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    class _Result:
+        returncode = 1
+        stdout = ''
+        stderr = 'probe failed'
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+    assert probe.backend == 'missing'
+    assert probe.error == 'probe failed'
+
+
+def test_maybe_reexec_for_runtime_refresh_skips_when_guard_set(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    called = {'execve': False}
+    monkeypatch.setattr(desktop_runtime_setup.os, 'execve', lambda *_args: called.update(execve=True))
+    monkeypatch.setenv(desktop_runtime_setup.REEXEC_GUARD_ENV, '1')
+
+    desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
+
+    assert called['execve'] is False
+
+
+def test_maybe_reexec_for_runtime_refresh_handles_execve_oserror(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    def _raise(*_args):
+        raise OSError('denied')
+
+    monkeypatch.setattr(desktop_runtime_setup.os, 'execve', _raise)
+    monkeypatch.delenv(desktop_runtime_setup.REEXEC_GUARD_ENV, raising=False)
+
+    desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
+
+
+def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    state_path = tmp_path / 'runtime_state.json'
+    monkeypatch.setattr(desktop_runtime_setup, '_runtime_state_path', lambda: state_path)
+    now = 1_000.0
+    monkeypatch.setattr(desktop_runtime_setup.time, 'time', lambda: now)
+    state_path.write_text(
+        json.dumps(
+            {
+                'source_repair_failures': {
+                    sys.executable: {'last_failed_at': now - 30, 'reason': 'build failed'}
+                }
+            }
+        ),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert result['runtime_action'] == 'failed'
+    assert result['fallback_reason'] == 'build failed'

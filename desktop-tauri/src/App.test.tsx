@@ -269,6 +269,36 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('keeps running state healthy when started and status events are healthy', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        last_error: null,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

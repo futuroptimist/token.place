@@ -156,6 +156,8 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
             'backend_selected': 'cpu' if normalized == 'cpu' else 'unknown',
             'backend_used': 'cpu' if normalized == 'cpu' else 'unknown',
             'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'offloaded_layers': model_manager.default_n_gpu_layers,
+            'kv_cache_device': 'cpu' if normalized == 'cpu' else 'gpu',
             'fallback_reason': None,
         }
         return normalized
@@ -175,6 +177,8 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
                 'backend_selected': 'cpu',
                 'backend_used': 'cpu',
                 'n_gpu_layers': 0,
+                'offloaded_layers': 0,
+                'kv_cache_device': 'cpu',
                 'fallback_reason': None,
             }
         return {
@@ -184,6 +188,8 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
             'backend_selected': 'unknown',
             'backend_used': 'unknown',
             'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'offloaded_layers': model_manager.default_n_gpu_layers,
+            'kv_cache_device': 'gpu',
             'fallback_reason': None,
         }
 
@@ -253,6 +259,9 @@ def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeyp
     assert event_types[0] == 'started'
     assert 'status' in event_types
     assert event_types[-1] == 'stopped'
+    started = events[0]
+    assert started['offloaded_layers'] == 0
+    assert started['kv_cache_device'] == 'cpu'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
 
@@ -533,7 +542,9 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     assert status == 1
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
-    assert 'bridge failure:' in payload['message']
+    assert payload['message'].startswith(
+        'compute-node bridge exited before emitting a startup event:'
+    )
 
 
 def test_main_normalizes_mode_before_run(monkeypatch):

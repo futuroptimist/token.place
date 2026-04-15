@@ -242,6 +242,34 @@ fn bridge_exit_error(
     ))
 }
 
+fn finalize_bridge_exit(
+    status: &mut ComputeNodeStatus,
+    exit_status: std::process::ExitStatus,
+    saw_startup_event: bool,
+    saw_error_event: bool,
+) -> Option<Value> {
+    status.running = false;
+    status.registered = false;
+
+    let exit_error = bridge_exit_error(exit_status, saw_startup_event);
+    if status.last_error.is_none() {
+        status.last_error = exit_error.clone();
+    }
+
+    if saw_error_event {
+        return None;
+    }
+
+    exit_error.map(|last_error| {
+        serde_json::json!({
+            "type": "error",
+            "running": false,
+            "registered": false,
+            "last_error": last_error,
+        })
+    })
+}
+
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
@@ -425,29 +453,18 @@ pub async fn start_compute_node(
 
     if let Some(mut running_child) = running_child {
         let exit_status = running_child.wait().await?;
-        let exit_error = bridge_exit_error(exit_status, saw_startup_event);
-
-        {
+        let exit_payload = {
             let mut status = state.status.lock().await;
-            status.running = false;
-            status.registered = false;
-            if status.last_error.is_none() {
-                status.last_error = exit_error.clone();
-            }
-        }
+            finalize_bridge_exit(
+                &mut status,
+                exit_status,
+                saw_startup_event,
+                saw_error_event,
+            )
+        };
 
-        if let Some(last_error) = exit_error {
-            if !saw_error_event {
-                app.emit(
-                    "compute_node_event",
-                    serde_json::json!({
-                        "type": "error",
-                        "running": false,
-                        "registered": false,
-                        "last_error": last_error,
-                    }),
-                )?;
-            }
+        if let Some(payload) = exit_payload {
+            app.emit("compute_node_event", payload)?;
         }
     } else {
         let mut status = state.status.lock().await;
@@ -621,6 +638,40 @@ mod tests {
         assert!(exit_status.success());
 
         assert!(bridge_exit_error(exit_status, true).is_none());
+    }
+
+    #[test]
+    fn finalize_bridge_exit_emits_ui_error_payload_when_clean_exit_happens_before_startup_event() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+
+        let payload = finalize_bridge_exit(&mut status, exit_status, false, false)
+            .expect("error payload should be emitted");
+
+        assert!(!status.running);
+        assert!(!status.registered);
+        let last_error = status
+            .last_error
+            .as_deref()
+            .expect("status last_error should be set");
+        assert!(last_error.contains("before emitting a startup event"));
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
+        assert_eq!(
+            payload.get("running").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            payload.get("registered").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            payload.get("last_error").and_then(Value::as_str),
+            Some(last_error)
+        );
     }
 
     #[test]

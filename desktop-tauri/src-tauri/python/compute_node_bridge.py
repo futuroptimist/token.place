@@ -40,6 +40,7 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 
 
 def _start_stdin_reader() -> None:
@@ -156,6 +157,8 @@ def run(args: argparse.Namespace) -> int:
             "backend_available": diagnostics.get("backend_available"),
             "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
             "model_path": args.model,
             "last_error": None,
@@ -199,6 +202,10 @@ def run(args: argparse.Namespace) -> int:
                     "backend_available": diagnostics.get("backend_available"),
                     "backend_selected": diagnostics.get("backend_selected"),
                     "backend_used": diagnostics.get("backend_used"),
+                    "offloaded_layers": diagnostics.get(
+                        "offloaded_layers", diagnostics.get("n_gpu_layers")
+                    ),
+                    "kv_cache_device": diagnostics.get("kv_cache_device"),
                     "fallback_reason": diagnostics.get("fallback_reason"),
                     "model_path": args.model,
                     "last_error": last_error,
@@ -223,6 +230,8 @@ def run(args: argparse.Namespace) -> int:
             "backend_available": diagnostics.get("backend_available"),
             "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
             "model_path": args.model,
             "last_error": None,
@@ -245,7 +254,7 @@ def main() -> int:
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
-        emit({"type": "error", "message": f"bridge failure: {exc}"})
+        emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})
         return 1
 
 

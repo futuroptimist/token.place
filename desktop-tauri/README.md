@@ -142,5 +142,6 @@ It prints:
   ```bash
   python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\\path\\to\\model.gguf
   ```
-  Pass means desktop-side diagnostics report CUDA availability/usage with GPU offload and
-  non-CPU KV cache. Fail means the desktop app would also fail to use the GPU path.
+  Pass means desktop-side diagnostics and `compute_node_bridge.py` `started` events both report
+  CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
+  startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.

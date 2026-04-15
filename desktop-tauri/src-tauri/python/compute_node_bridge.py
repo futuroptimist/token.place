@@ -30,7 +30,9 @@ except ModuleNotFoundError:
             "fallback_reason": "desktop_runtime_setup module missing",
         }
 
-    def maybe_reexec_for_runtime_refresh(_runtime_setup: Dict[str, str]) -> None:
+    def maybe_reexec_for_runtime_refresh(
+        _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
+    ) -> None:
         return
 
 ensure_runtime_import_paths(__file__)
@@ -38,6 +40,7 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 
 
 def _start_stdin_reader() -> None:
@@ -89,6 +92,20 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    maybe_reexec_for_runtime_refresh(runtime_setup, allow_reexec=False)
+    print(
+        "desktop.runtime_setup "
+        f"mode={args.mode} "
+        f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
+        f"device={runtime_setup.get('detected_device', 'cpu')} "
+        f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
+        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        file=sys.stderr,
+    )
+
     try:
         from utils.compute_node_runtime import (
             apply_compute_mode,
@@ -102,20 +119,6 @@ def run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
-
-    runtime_setup = ensure_desktop_llama_runtime(args.mode)
-    maybe_reexec_for_runtime_refresh(runtime_setup)
-    print(
-        "desktop.runtime_setup "
-        f"mode={args.mode} "
-        f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
-        f"device={runtime_setup.get('detected_device', 'cpu')} "
-        f"action={runtime_setup.get('runtime_action', 'none')} "
-        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
-        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
-        file=sys.stderr,
-    )
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
@@ -154,6 +157,8 @@ def run(args: argparse.Namespace) -> int:
             "backend_available": diagnostics.get("backend_available"),
             "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
             "model_path": args.model,
             "last_error": None,
@@ -197,6 +202,10 @@ def run(args: argparse.Namespace) -> int:
                     "backend_available": diagnostics.get("backend_available"),
                     "backend_selected": diagnostics.get("backend_selected"),
                     "backend_used": diagnostics.get("backend_used"),
+                    "offloaded_layers": diagnostics.get(
+                        "offloaded_layers", diagnostics.get("n_gpu_layers")
+                    ),
+                    "kv_cache_device": diagnostics.get("kv_cache_device"),
                     "fallback_reason": diagnostics.get("fallback_reason"),
                     "model_path": args.model,
                     "last_error": last_error,
@@ -221,6 +230,8 @@ def run(args: argparse.Namespace) -> int:
             "backend_available": diagnostics.get("backend_available"),
             "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
             "model_path": args.model,
             "last_error": None,
@@ -243,7 +254,7 @@ def main() -> int:
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
-        emit({"type": "error", "message": f"bridge failure: {exc}"})
+        emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})
         return 1
 
 

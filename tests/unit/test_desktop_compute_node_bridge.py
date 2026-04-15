@@ -26,6 +26,8 @@ class FakeModelManager:
     def __init__(self):
         self.model_path = ''
         self.default_n_gpu_layers = -1
+        self.requested_compute_mode = 'auto'
+        self.last_compute_diagnostics = None
 
 
 class FakeRelayClient:
@@ -130,14 +132,67 @@ class IncompatibleRelayRuntime(FakeRuntime):
 
 
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
-    from utils.compute_node_runtime import (
-        SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
-        apply_compute_mode as _apply_compute_mode,
-        compute_mode_diagnostics as _compute_mode_diagnostics,
-        normalize_compute_mode as _normalize_compute_mode,
-    )
-
     module = ModuleType('utils.compute_node_runtime')
+
+    supported_modes = {'auto', 'cpu', 'gpu', 'hybrid'}
+
+    def _normalize_compute_mode(mode):
+        normalized = {'cuda': 'gpu', 'metal': 'gpu'}.get(str(mode).lower(), str(mode).lower())
+        return normalized if normalized in supported_modes else 'auto'
+
+    def _apply_compute_mode(model_manager, mode):
+        normalized = _normalize_compute_mode(mode)
+        model_manager.requested_compute_mode = normalized
+        if normalized == 'cpu':
+            model_manager.default_n_gpu_layers = 0
+        elif normalized == 'hybrid':
+            model_manager.default_n_gpu_layers = getattr(model_manager, 'hybrid_n_gpu_layers', 24)
+        else:
+            model_manager.default_n_gpu_layers = -1
+        model_manager.last_compute_diagnostics = {
+            'requested_mode': normalized,
+            'effective_mode': 'cpu' if normalized == 'cpu' else 'pending',
+            'backend_available': 'unknown',
+            'backend_selected': 'cpu' if normalized == 'cpu' else 'unknown',
+            'backend_used': 'cpu' if normalized == 'cpu' else 'unknown',
+            'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'offloaded_layers': model_manager.default_n_gpu_layers,
+            'kv_cache_device': 'cpu' if normalized == 'cpu' else 'gpu',
+            'fallback_reason': None,
+        }
+        return normalized
+
+    def _compute_mode_diagnostics(model_manager):
+        requested_mode = _normalize_compute_mode(
+            getattr(model_manager, 'requested_compute_mode', 'auto')
+        )
+        runtime = getattr(model_manager, 'last_compute_diagnostics', None)
+        if isinstance(runtime, dict) and runtime.get('requested_mode') == requested_mode:
+            return dict(runtime)
+        if requested_mode == 'cpu':
+            return {
+                'requested_mode': requested_mode,
+                'effective_mode': 'cpu',
+                'backend_available': 'unknown',
+                'backend_selected': 'cpu',
+                'backend_used': 'cpu',
+                'n_gpu_layers': 0,
+                'offloaded_layers': 0,
+                'kv_cache_device': 'cpu',
+                'fallback_reason': None,
+            }
+        return {
+            'requested_mode': requested_mode,
+            'effective_mode': 'pending',
+            'backend_available': 'unknown',
+            'backend_selected': 'unknown',
+            'backend_used': 'unknown',
+            'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'offloaded_layers': model_manager.default_n_gpu_layers,
+            'kv_cache_device': 'gpu',
+            'fallback_reason': None,
+        }
+
     module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
         relay_url=relay_url,
         relay_port=relay_port,
@@ -149,11 +204,28 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
-    module.SUPPORTED_COMPUTE_MODES = _SUPPORTED_COMPUTE_MODES
+    module.SUPPORTED_COMPUTE_MODES = supported_modes
     module.normalize_compute_mode = _normalize_compute_mode
     module.apply_compute_mode = _apply_compute_mode
     module.compute_mode_diagnostics = _compute_mode_diagnostics
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'skipped',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+            'fallback_reason': '',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
 
 
 def _reset_cancel_queue():
@@ -187,6 +259,9 @@ def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeyp
     assert event_types[0] == 'started'
     assert 'status' in event_types
     assert event_types[-1] == 'stopped'
+    started = events[0]
+    assert started['offloaded_layers'] == 0
+    assert started['kv_cache_device'] == 'cpu'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
 
@@ -212,6 +287,37 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
     assert 'failed to initialize model runtime' in payload['message']
+
+
+def test_run_disables_runtime_reexec_to_avoid_pre_startup_exit(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    reexec_flags = []
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {'runtime_action': 'installed_cuda_reexec'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: reexec_flags.append(allow_reexec),
+    )
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert reexec_flags == [False]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'stopped'
 
 
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
@@ -313,7 +419,8 @@ def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, mo
     assert status_events[0]['last_error'] == 'failed to process relay request'
 
 
-def test_apply_compute_mode_supports_gpu_and_cpu_modes():
+def test_apply_compute_mode_supports_gpu_and_cpu_modes(monkeypatch):
+    _install_fake_runtime_module(monkeypatch)
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode
 
@@ -435,7 +542,9 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     assert status == 1
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
-    assert 'bridge failure:' in payload['message']
+    assert payload['message'].startswith(
+        'compute-node bridge exited before emitting a startup event:'
+    )
 
 
 def test_main_normalizes_mode_before_run(monkeypatch):
@@ -445,6 +554,9 @@ def test_main_normalizes_mode_before_run(monkeypatch):
         captured['mode'] = args.mode
         return 0
 
+    module = ModuleType('utils.compute_node_runtime')
+    module.normalize_compute_mode = lambda mode: {'cuda': 'gpu'}.get(str(mode).lower(), 'auto')
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
     monkeypatch.setattr(
         sys,
@@ -595,10 +707,7 @@ class ComputeNodeRuntime:
     assert "No module named 'utils'" not in stdout
 
 
-def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch, tmp_path):
-    module_path = tmp_path / 'compute_node_bridge.py'
-    module_path.write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
-
+def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch):
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
@@ -608,11 +717,12 @@ def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch
 
     monkeypatch.setattr('builtins.__import__', fake_import)
 
-    spec = importlib.util.spec_from_file_location('compute_node_bridge_no_runtime_setup', module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
+    module = ModuleType('compute_node_bridge_no_runtime_setup')
+    module.__file__ = str(MODULE_PATH)
+    code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
+    exec(code, module.__dict__)
 
     setup = module.ensure_desktop_llama_runtime('auto')
     assert setup['runtime_action'] == 'unavailable'
     assert 'module missing' in setup['fallback_reason']
+    assert module.maybe_reexec_for_runtime_refresh(setup, allow_reexec=False) is None

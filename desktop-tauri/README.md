@@ -130,3 +130,18 @@ It prints:
   (`requested`, `effective`, `backend_available`, `backend_used`,
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
+
+### Regression and smoke tests
+
+- Operator startup regression coverage (bridge startup event + surfaced errors):
+  ```bash
+  pytest -q --noconftest tests/unit/test_desktop_compute_node_bridge.py
+  npm --prefix desktop-tauri run test -- src/App.test.tsx
+  ```
+- Local Windows + NVIDIA GPU viability smoke test (same desktop Python/runtime path):
+  ```bash
+  python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\\path\\to\\model.gguf
+  ```
+  Pass means desktop-side diagnostics and `compute_node_bridge.py` `started` events both report
+  CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
+  startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.

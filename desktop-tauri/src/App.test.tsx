@@ -199,6 +199,106 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('surfaces bridge startup exits through compute_node_event errors', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'start_compute_node') {
+        return Promise.resolve(undefined);
+      }
+      if (command === 'detect_backend') {
+        return Promise.resolve({
+          platform_label: 'macos',
+          preferred_mode: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
+        });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          active_relay_url: '',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '',
+          last_error: null,
+        });
+      }
+      return Promise.resolve({
+        canonical_family_url: 'https://example.test/models',
+        filename: 'model.gguf',
+        url: 'https://example.test/model.gguf',
+        models_dir: '/tmp',
+        resolved_model_path: '/tmp/model.gguf',
+        exists: true,
+        size_bytes: 1,
+      });
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        last_error:
+          'compute-node bridge exited with status 0 before emitting a startup event',
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Last error:/).textContent).toContain(
+      'before emitting a startup event'
+    );
+  });
+
+  it('keeps running state healthy when started and status events are healthy', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        last_error: null,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

@@ -3,6 +3,8 @@ use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -209,6 +211,65 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
+    if let Some(code) = exit_status.code() {
+        return code.to_string();
+    }
+    #[cfg(unix)]
+    if let Some(signal) = exit_status.signal() {
+        return format!("signal {signal}");
+    }
+    format!("{exit_status:?}")
+}
+
+fn bridge_exit_error(
+    exit_status: std::process::ExitStatus,
+    saw_startup_event: bool,
+) -> Option<String> {
+    let status_label = bridge_exit_status_label(exit_status);
+    if !saw_startup_event {
+        return Some(format!(
+            "compute-node bridge exited with status {status_label} before emitting a startup \
+             event; see desktop.compute_node.stderr logs"
+        ));
+    }
+    if exit_status.success() {
+        return None;
+    }
+    Some(format!(
+        "compute-node bridge exited with status {status_label}; \
+         see desktop.compute_node.stderr logs"
+    ))
+}
+
+fn finalize_bridge_exit(
+    status: &mut ComputeNodeStatus,
+    exit_status: std::process::ExitStatus,
+    saw_startup_event: bool,
+    saw_error_event: bool,
+) -> Option<Value> {
+    status.running = false;
+    status.registered = false;
+
+    let exit_error = bridge_exit_error(exit_status, saw_startup_event);
+    if status.last_error.is_none() {
+        status.last_error = exit_error.clone();
+    }
+
+    if saw_error_event {
+        return None;
+    }
+
+    exit_error.map(|last_error| {
+        serde_json::json!({
+            "type": "error",
+            "running": false,
+            "registered": false,
+            "last_error": last_error,
+        })
+    })
+}
+
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
@@ -354,11 +415,17 @@ pub async fn start_compute_node(
 
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_error_event = false;
+    let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
-                if payload.get("type").and_then(Value::as_str) == Some("error") {
-                    saw_error_event = true;
+                if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
+                    if event_type == "error" {
+                        saw_error_event = true;
+                    }
+                    if event_type == "started" || event_type == "status" {
+                        saw_startup_event = true;
+                    }
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -386,33 +453,18 @@ pub async fn start_compute_node(
 
     if let Some(mut running_child) = running_child {
         let exit_status = running_child.wait().await?;
-
-        {
+        let exit_payload = {
             let mut status = state.status.lock().await;
-            status.running = false;
-            status.registered = false;
-            if !exit_status.success() && status.last_error.is_none() {
-                status.last_error = Some(format!(
-                    "compute-node bridge exited with status {exit_status}; \
-                     see desktop.compute_node.stderr logs"
-                ));
-            }
-        }
-        *state.stdin.lock().await = None;
+            finalize_bridge_exit(
+                &mut status,
+                exit_status,
+                saw_startup_event,
+                saw_error_event,
+            )
+        };
 
-        if !exit_status.success() && !saw_error_event {
-            app.emit(
-                "compute_node_event",
-                serde_json::json!({
-                    "type": "error",
-                    "running": false,
-                    "registered": false,
-                    "last_error": format!(
-                        "compute-node bridge exited with status {exit_status}; \
-                         see desktop.compute_node.stderr logs"
-                    ),
-                }),
-            )?;
+        if let Some(payload) = exit_payload {
+            app.emit("compute_node_event", payload)?;
         }
     } else {
         let mut status = state.status.lock().await;
@@ -473,9 +525,28 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::{NamedTempFile, TempDir};
+    use std::process::Command as StdCommand;
+    use std::process::ExitStatus;
+    use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    fn success_exit_status() -> ExitStatus {
+        #[cfg(windows)]
+        {
+            StdCommand::new("cmd")
+                .args(["/C", "exit", "0"])
+                .status()
+                .expect("status")
+        }
+        #[cfg(not(windows))]
+        {
+            StdCommand::new("sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .expect("status")
+        }
+    }
 
     #[tokio::test]
     async fn malformed_stdout_lines_are_ignored_without_blocking_valid_events() {
@@ -501,18 +572,23 @@ mod tests {
 
     #[tokio::test]
     async fn drain_compute_node_stderr_reads_all_lines() {
-        let script = NamedTempFile::new().expect("temp script");
-        std::fs::write(
-            script.path(),
-            "#!/usr/bin/env python3\nimport sys\nprint('bridge-failure', file=sys.stderr)\n",
-        )
-        .expect("write script");
-
-        let mut child = Command::new("python3")
-            .arg(script.path())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn stderr script");
+        let mut child = {
+            #[cfg(windows)]
+            {
+                let mut command = Command::new("cmd");
+                command.args(["/C", "echo bridge-failure 1>&2"]);
+                command
+            }
+            #[cfg(not(windows))]
+            {
+                let mut command = Command::new("sh");
+                command.args(["-c", "echo bridge-failure 1>&2"]);
+                command
+            }
+        }
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
         drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
@@ -542,6 +618,60 @@ mod tests {
         );
         assert_eq!(status.active_relay_url, request.relay_base_url);
         assert_eq!(status.model_path, request.model_path);
+    }
+
+    #[test]
+    fn bridge_exit_error_reports_missing_startup_event_even_on_clean_exit() {
+        let exit_status = success_exit_status();
+        assert!(exit_status.success());
+
+        let last_error = bridge_exit_error(exit_status, false);
+        assert!(last_error.is_some());
+        assert!(last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("before emitting a startup event")));
+    }
+
+    #[test]
+    fn bridge_exit_error_is_none_after_started_event_and_clean_exit() {
+        let exit_status = success_exit_status();
+        assert!(exit_status.success());
+
+        assert!(bridge_exit_error(exit_status, true).is_none());
+    }
+
+    #[test]
+    fn finalize_bridge_exit_emits_ui_error_payload_when_clean_exit_happens_before_startup_event() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+
+        let payload = finalize_bridge_exit(&mut status, exit_status, false, false)
+            .expect("error payload should be emitted");
+
+        assert!(!status.running);
+        assert!(!status.registered);
+        let last_error = status
+            .last_error
+            .as_deref()
+            .expect("status last_error should be set");
+        assert!(last_error.contains("before emitting a startup event"));
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
+        assert_eq!(
+            payload.get("running").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            payload.get("registered").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            payload.get("last_error").and_then(Value::as_str),
+            Some(last_error)
+        );
     }
 
     #[test]

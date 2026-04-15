@@ -56,6 +56,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'backend': backend,
         'gpu_offload_supported': gpu_offload_supported,
         'detected_device': backend if gpu_offload_supported else 'cpu',
+        'interpreter': sys.executable,
+        'prefix': sys.prefix,
+        'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),
         'error': None,
     }
 
@@ -438,15 +441,19 @@ class ModelManager:
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
                             self.last_compute_diagnostics = compute_plan
+                            runtime_identity = detect_llama_runtime_capabilities()
                             self.log_info(
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "
                                 f"effective={compute_plan['effective_mode']} "
-                                f"backend={compute_plan['backend_used']} "
+                                f"backend_available={compute_plan['backend_available']} "
+                                f"backend_used={compute_plan['backend_used']} "
                                 f"device_backend={compute_plan['device_backend']} "
                                 f"device_name={compute_plan['device_name']} "
                                 f"offloaded_layers={compute_plan['offloaded_layers']} "
                                 f"kv_cache={compute_plan['kv_cache_device']} "
+                                f"interpreter={runtime_identity.get('interpreter', sys.executable)} "
+                                f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
                             self.log_info("Llama model initialized successfully.")

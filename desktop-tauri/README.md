@@ -38,20 +38,28 @@ npm ci
 npm run tauri dev
 ```
 
-During normal startup, desktop sidecars run a **probe-only** runtime check in
-`auto`/`gpu`/`hybrid` modes and emit:
+During normal startup, desktop sidecars probe the active sidecar interpreter and, on
+Windows in `auto`/`gpu`/`hybrid` modes, automatically run a one-time CUDA runtime
+repair when the runtime is CPU-only. They emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
-Normal inference requests do **not** mutate Python packages. For local desktop
-development, explicitly run one bootstrap start with
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=1` to allow a one-time
-`llama-cpp-python` install/repair attempt, then restart sidecars/app.
+Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable the
+Windows auto-repair path and keep startup in probe-only mode (useful for
+packaging/troubleshooting while preserving normal CPU fallback diagnostics).
 
-Packaged builds should rely on pre-provisioned runtime dependencies and keep
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP` unset.
+When Windows CUDA repair is needed, desktop uses the same interpreter binary that
+launches the sidecar process (`sys.executable`) and applies the repo
+source-build recipe:
+
+- `CMAKE_ARGS=-DGGML_CUDA=on`
+- `FORCE_CMAKE=1`
+- `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+
+After a successful repair, the sidecar automatically re-execs once so the active
+process immediately uses the repaired runtime (no manual restart/environment flag required).
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
@@ -103,3 +111,22 @@ To restore full raw subprocess output (including verbose llama.cpp logs), run de
 - `TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS=1`
 
 Both flags are equivalent opt-in toggles and intended for troubleshooting.
+
+
+### Manual runtime verification
+
+Use the helper below to print authoritative runtime wiring details from the same
+Python environment used by desktop sidecars:
+
+```bash
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
+```
+
+It prints:
+
+- Shared runtime probe fields (`backend`, `gpu_offload_supported`,
+  `detected_device`, `interpreter`, `prefix`, `llama_module_path`)
+- `compute_runtime_*` summaries using stable fields
+  (`requested`, `effective`, `backend_available`, `backend_used`,
+  `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
+  `fallback_reason`, `interpreter`, `llama_module_path`)

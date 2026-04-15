@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
-from desktop_gpu_packaging import LlamaCppInstallPlan, llama_cpp_install_plan_fallbacks
-from utils.llm.model_manager import detect_llama_runtime_capabilities
+from desktop_gpu_packaging import (
+    LlamaCppInstallPlan,
+    llama_cpp_install_plan_fallbacks,
+    llama_cpp_requirement_spec,
+)
 
 
 @dataclass(frozen=True)
@@ -18,122 +23,331 @@ class RuntimeProbe:
     backend: str
     gpu_offload_supported: bool
     detected_device: str
+    interpreter: str
+    prefix: str
+    llama_module_path: str
     error: Optional[str] = None
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
-ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
+PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
+REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
+DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
+SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
+
+_PROBE_SNIPPET = """
+import json
+import sys
+from pathlib import Path
+
+repo_root = Path.cwd()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from utils.llm.model_manager import detect_llama_runtime_capabilities
+
+payload = detect_llama_runtime_capabilities()
+print(json.dumps(payload))
+""".strip()
 
 
 def _probe_llama_runtime() -> RuntimeProbe:
-    payload = detect_llama_runtime_capabilities()
+    repo_root = Path(__file__).resolve().parents[3]
+    cmd = [sys.executable, "-c", _PROBE_SNIPPET]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    pythonpath_entries = [str(repo_root)]
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(repo_root),
+            env=env,
+        )
+    except Exception as exc:
+        return RuntimeProbe(
+            backend="missing",
+            gpu_offload_supported=False,
+            detected_device="none",
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path="missing",
+            error=str(exc),
+        )
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0 or not stdout:
+        return RuntimeProbe(
+            backend="missing",
+            gpu_offload_supported=False,
+            detected_device="none",
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path="missing",
+            error=stderr or f"probe subprocess failed with return code {result.returncode}",
+        )
+
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        payload = {
+            "backend": "missing",
+            "gpu_offload_supported": False,
+            "detected_device": "none",
+            "interpreter": sys.executable,
+            "prefix": sys.prefix,
+            "llama_module_path": "missing",
+            "error": stderr or "probe parse failure",
+        }
 
     return RuntimeProbe(
         backend=str(payload.get("backend", "cpu")),
         gpu_offload_supported=bool(payload.get("gpu_offload_supported", False)),
         detected_device=str(payload.get("detected_device", "cpu")),
+        interpreter=str(payload.get("interpreter", sys.executable)),
+        prefix=str(payload.get("prefix", sys.prefix)),
+        llama_module_path=str(payload.get("llama_module_path", "missing")),
         error=payload.get("error"),
     )
 
 
+def _run_pip_install(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    timeout_seconds: int = PIP_INSTALL_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    try:
+        install = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"pip install timed out after {timeout_seconds}s"
+
+    if install.returncode == 0:
+        return True, (install.stdout or "").strip()
+
+    return False, (install.stderr or install.stdout or "").strip()
+
+
+def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
+    env = os.environ.copy()
+    env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
+    env["FORCE_CMAKE"] = "1"
+    package_spec = llama_cpp_requirement_spec(requirements_path)
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        package_spec,
+        "--force-reinstall",
+        "--no-cache-dir",
+        "--verbose",
+    ]
+    return _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+
+
+def _summarize_install_error(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return "install failed"
+    return text.splitlines()[-1][:240]
+
+
+def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
+    return {
+        "detected_device": probe.detected_device or "cpu",
+        "interpreter": probe.interpreter,
+        "prefix": probe.prefix,
+        "interpreter_prefix": probe.prefix,
+        "llama_module_path": probe.llama_module_path,
+    }
+
+
+def _runtime_state_path() -> Path:
+    return Path.home() / ".token_place_desktop_runtime_state.json"
+
+
+def _load_runtime_state() -> dict:
+    path = _runtime_state_path()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_runtime_state(state: dict) -> None:
+    path = _runtime_state_path()
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _should_attempt_source_repair() -> tuple[bool, str]:
+    state = _load_runtime_state()
+    failures = state.get("source_repair_failures", {})
+    entry = failures.get(sys.executable, {})
+    last_failed_at = float(entry.get("last_failed_at", 0))
+    now = time.time()
+    if now - last_failed_at >= SOURCE_REPAIR_COOLDOWN_SECONDS:
+        return True, ""
+    retry_in_seconds = int(SOURCE_REPAIR_COOLDOWN_SECONDS - (now - last_failed_at))
+    return False, entry.get("reason") or f"source repair cooldown active ({retry_in_seconds}s remaining)"
+
+
+def _record_source_repair_failure(reason: str) -> None:
+    state = _load_runtime_state()
+    failures = state.setdefault("source_repair_failures", {})
+    failures[sys.executable] = {
+        "last_failed_at": time.time(),
+        "reason": reason,
+    }
+    _save_runtime_state(state)
+
+
+def _clear_source_repair_failure() -> None:
+    state = _load_runtime_state()
+    failures = state.get("source_repair_failures", {})
+    if sys.executable in failures:
+        failures.pop(sys.executable, None)
+        _save_runtime_state(state)
+
+
+def maybe_reexec_for_runtime_refresh(runtime_setup: Dict[str, str]) -> None:
+    if runtime_setup.get("runtime_action") != "installed_cuda_reexec":
+        return
+    if os.environ.get(REEXEC_GUARD_ENV) == "1":
+        return
+    env = os.environ.copy()
+    env[REEXEC_GUARD_ENV] = "1"
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    except OSError:
+        return
+
+
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
-    """Probe runtime by default; install/repair only when explicit bootstrap env is enabled."""
+    """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
+    before = _probe_llama_runtime()
+
     if selected_mode not in GPU_MODES:
         return {
             "selected_backend": "cpu",
             "fallback_reason": "cpu mode explicitly selected",
             "runtime_action": "skipped",
+            **_probe_result_payload(before),
         }
 
-    before = _probe_llama_runtime()
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
         return {
             "selected_backend": before.backend,
             "fallback_reason": "",
             "runtime_action": "already_supported",
-            "detected_device": before.detected_device,
+            **_probe_result_payload(before),
         }
 
-    if os.environ.get(ENABLE_BOOTSTRAP_ENV) != "1":
+    if not sys.platform.startswith("win"):
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
                 f"GPU runtime unavailable ({before.error or before.backend}); "
-                f"set {ENABLE_BOOTSTRAP_ENV}=1 for one-time bootstrap"
+                "desktop auto-repair is currently Windows-focused"
             ),
             "runtime_action": "probe_only",
-            "detected_device": before.detected_device or "cpu",
+            **_probe_result_payload(before),
+        }
+
+    if os.getenv(DISABLE_BOOTSTRAP_ENV) == "1":
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"desktop runtime bootstrap disabled by {DISABLE_BOOTSTRAP_ENV}=1"
+            ),
+            "runtime_action": "probe_only",
+            **_probe_result_payload(before),
         }
 
     target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
+    last_error = ""
+
+    should_repair, repair_skip_reason = _should_attempt_source_repair()
+    if should_repair:
+        source_ok, source_log = _windows_cuda_source_repair(requirements_path)
+        if source_ok:
+            _clear_source_repair_failure()
+            after = _probe_llama_runtime()
+            if after.gpu_offload_supported and after.backend == "cuda":
+                return {
+                    "selected_backend": "cuda",
+                    "fallback_reason": "installed CUDA runtime; re-executing sidecar",
+                    "runtime_action": "installed_cuda_reexec",
+                    **_probe_result_payload(after),
+                }
+            last_error = (
+                "CUDA source reinstall completed but runtime still CPU-only; "
+                "check CUDA toolkit/build tools"
+            )
+            _record_source_repair_failure(last_error)
+        else:
+            last_error = _summarize_install_error(source_log)
+            _record_source_repair_failure(last_error)
+    else:
+        last_error = repair_skip_reason
 
     try:
         plans = llama_cpp_install_plan_fallbacks(
             platform=sys.platform,
             requirements_path=requirements_path,
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError):
         plans = _fallback_unpinned_plans(sys.platform)
-        fallback_setup_error = str(exc)
-    else:
-        fallback_setup_error = ""
-
-    last_install_error = ""
 
     for plan in plans:
         env = os.environ.copy()
         env.update(plan.pip_env())
         cmd = [sys.executable, "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec]
-        try:
-            install = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=PIP_INSTALL_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            last_install_error = (
-                f"pip install timed out after {PIP_INSTALL_TIMEOUT_SECONDS}s for backend={plan.backend}"
-            )
-            continue
-        if install.returncode != 0:
-            last_install_error = (install.stderr or install.stdout or "").strip()
+        ok, log_output = _run_pip_install(cmd, env)
+        if not ok:
+            last_error = _summarize_install_error(log_output)
             continue
 
-        if plan.backend in {"cuda", "metal"}:
+        after = _probe_llama_runtime()
+        if after.gpu_offload_supported and after.backend in {"cuda", "metal"}:
             return {
-                "selected_backend": plan.backend,
-                "fallback_reason": "bootstrap install complete; restart sidecar to activate runtime",
-                "runtime_action": f"installed_{plan.backend}_restart_required",
-                "detected_device": "cpu",
+                "selected_backend": after.backend,
+                "fallback_reason": "installed GPU runtime; re-executing sidecar",
+                "runtime_action": "installed_cuda_reexec",
+                **_probe_result_payload(after),
             }
 
         if plan.backend == "cpu":
             return {
                 "selected_backend": "cpu",
-                "fallback_reason": (
-                    "GPU runtime unavailable after install attempts; using CPU wheel fallback"
-                ),
+                "fallback_reason": "GPU runtime unavailable after repair; using CPU runtime",
                 "runtime_action": "installed_cpu_fallback",
-                "detected_device": "cpu",
+                **_probe_result_payload(after),
             }
 
     return {
         "selected_backend": "cpu",
-        "fallback_reason": (
-            before.error
-            or fallback_setup_error
-            or last_install_error
-            or "unable to install a GPU-capable llama-cpp runtime"
-        ),
+        "fallback_reason": before.error or last_error or "unable to install a GPU-capable runtime",
         "runtime_action": "failed",
-        "detected_device": "cpu",
+        **_probe_result_payload(before),
     }
 
 

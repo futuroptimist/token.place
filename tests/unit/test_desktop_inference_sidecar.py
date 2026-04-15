@@ -405,7 +405,7 @@ def test_extract_text_from_completion_handles_empty_choices():
 
 def test_normalize_chunk_fallback_handles_typeerror_and_unknown_shape():
     class WithBadDict:
-        def dict(self, required):  # pragma: no cover - signature intentionally incompatible
+        def dict(self, _required):  # pragma: no cover - signature intentionally incompatible
             return {'choices': []}
 
     class UnknownShape:
@@ -491,3 +491,40 @@ def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, cap
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'done']
+
+def test_run_reexecs_after_runtime_repair(tmp_path, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'runtime_action': 'installed_cuda_restart_required',
+            'selected_backend': 'cuda',
+            'python_executable': sys.executable,
+        },
+    )
+
+    called = {}
+
+    def fake_execve(executable, argv, env):
+        called['executable'] = executable
+        called['argv'] = argv
+        called['env'] = env
+        raise SystemExit(0)
+
+    monkeypatch.delenv(inference_sidecar.RUNTIME_REEXEC_ENV, raising=False)
+    monkeypatch.setattr(inference_sidecar.os, 'execve', fake_execve)
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    with pytest.raises(SystemExit):
+        inference_sidecar.run(args)
+
+    assert called['executable'] == sys.executable
+    assert called['argv'][0] == sys.executable
+    assert called['env'][inference_sidecar.RUNTIME_REEXEC_ENV] == '1'

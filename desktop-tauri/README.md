@@ -38,20 +38,38 @@ npm ci
 npm run tauri dev
 ```
 
-During normal startup, desktop sidecars run a **probe-only** runtime check in
+During normal startup, desktop sidecars run a runtime check in
 `auto`/`gpu`/`hybrid` modes and emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
-Normal inference requests do **not** mutate Python packages. For local desktop
-development, explicitly run one bootstrap start with
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=1` to allow a one-time
-`llama-cpp-python` install/repair attempt, then restart sidecars/app.
+On Windows desktop builds, `auto`/`gpu`/`hybrid` now attempt a one-time
+`llama-cpp-python` CUDA repair automatically in the same interpreter used by
+the sidecar (`sys.executable`) when the active runtime is CPU-only. The repair
+uses the canonical README recipe:
 
-Packaged builds should rely on pre-provisioned runtime dependencies and keep
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP` unset.
+```powershell
+$env:CMAKE_ARGS = "-DGGML_CUDA=on"
+$env:FORCE_CMAKE=1
+pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose
+```
+
+The sidecar then re-execs itself once so the repaired runtime is immediately
+active for the same launch.
+
+Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to force probe-only
+behavior.
+
+For manual runtime verification, run:
+
+```bash
+python desktop-tauri/src-tauri/python/verify_llama_runtime.py auto
+```
+
+This prints `sys.executable`, `llama_cpp.__file__`, backend markers,
+`llama_supports_gpu_offload`, and `ModelManager` compute diagnostics.
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 

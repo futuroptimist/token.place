@@ -616,3 +616,46 @@ def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch
     setup = module.ensure_desktop_llama_runtime('auto')
     assert setup['runtime_action'] == 'unavailable'
     assert 'module missing' in setup['fallback_reason']
+
+def test_run_reexecs_after_runtime_repair(monkeypatch, tmp_path):
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+    _install_fake_runtime_module(monkeypatch)
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'runtime_action': 'installed_cuda_restart_required',
+            'selected_backend': 'cuda',
+            'python_executable': sys.executable,
+        },
+    )
+
+    called = {}
+
+    def fake_execve(executable, argv, env):
+        called['executable'] = executable
+        called['argv'] = argv
+        called['env'] = env
+        raise SystemExit(0)
+
+    monkeypatch.delenv(compute_node_bridge.RUNTIME_REEXEC_ENV, raising=False)
+    monkeypatch.setattr(compute_node_bridge.os, 'execve', fake_execve)
+
+    args = SimpleNamespace(
+        model=str(model_path),
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    try:
+        compute_node_bridge.run(args)
+        assert False, 'expected SystemExit from fake_execve'
+    except SystemExit:
+        pass
+
+    assert called['executable'] == sys.executable
+    assert called['argv'][0] == sys.executable
+    assert called['env'][compute_node_bridge.RUNTIME_REEXEC_ENV] == '1'

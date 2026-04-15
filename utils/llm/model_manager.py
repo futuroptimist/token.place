@@ -28,6 +28,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             'gpu_offload_supported': False,
             'detected_device': 'none',
             'error': str(exc),
+            'python_executable': sys.executable,
+            'python_prefix': sys.prefix,
+            'llama_cpp_module_path': '',
         }
 
     backend = 'cpu'
@@ -57,6 +60,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'gpu_offload_supported': gpu_offload_supported,
         'detected_device': backend if gpu_offload_supported else 'cpu',
         'error': None,
+        'python_executable': sys.executable,
+        'python_prefix': sys.prefix,
+        'llama_cpp_module_path': str(getattr(llama_cpp, '__file__', '')),
     }
 
 
@@ -442,6 +448,7 @@ class ModelManager:
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "
                                 f"effective={compute_plan['effective_mode']} "
+                                f"backend_available={compute_plan['backend_available']} "
                                 f"backend={compute_plan['backend_used']} "
                                 f"device_backend={compute_plan['device_backend']} "
                                 f"device_name={compute_plan['device_name']} "
@@ -449,6 +456,14 @@ class ModelManager:
                                 f"kv_cache={compute_plan['kv_cache_device']} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
+                            if llama_cpp_verbose_logging_enabled():
+                                runtime = detect_llama_runtime_capabilities()
+                                self.log_info(
+                                    "compute_runtime_paths "
+                                    f"python={runtime.get('python_executable') or sys.executable} "
+                                    f"prefix={runtime.get('python_prefix') or sys.prefix} "
+                                    f"llama_cpp={runtime.get('llama_cpp_module_path') or 'unknown'}"
+                                )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

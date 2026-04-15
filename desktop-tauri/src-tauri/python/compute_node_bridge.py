@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -35,6 +36,7 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+RUNTIME_REEXEC_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 
 
 def _start_stdin_reader() -> None:
@@ -101,13 +103,21 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    if (
+        str(runtime_setup.get("runtime_action", "")).endswith("_restart_required")
+        and os.environ.get(RUNTIME_REEXEC_ENV) != "1"
+    ):
+        restart_env = os.environ.copy()
+        restart_env[RUNTIME_REEXEC_ENV] = "1"
+        os.execve(sys.executable, [sys.executable, __file__, *sys.argv[1:]], restart_env)
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'} "
+        f"python={runtime_setup.get('python_executable') or sys.executable}",
         file=sys.stderr,
     )
 

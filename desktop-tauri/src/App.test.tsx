@@ -199,6 +199,31 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('surfaces emitted compute-node startup errors instead of silent running bounce-back', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        last_error:
+          'compute-node bridge exited with status 0 before emitting startup events',
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Last error:/).textContent).toContain(
+      'before emitting startup events'
+    );
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

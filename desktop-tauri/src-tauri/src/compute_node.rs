@@ -209,6 +209,29 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+fn bridge_exit_error_message(
+    exit_status: std::process::ExitStatus,
+    saw_error_event: bool,
+    saw_startup_event: bool,
+) -> Option<String> {
+    if saw_error_event {
+        return None;
+    }
+    if !saw_startup_event {
+        return Some(format!(
+            "compute-node bridge exited with status {exit_status} before emitting startup events; \
+             see desktop.compute_node.stderr logs"
+        ));
+    }
+    if !exit_status.success() {
+        return Some(format!(
+            "compute-node bridge exited with status {exit_status}; \
+             see desktop.compute_node.stderr logs"
+        ));
+    }
+    None
+}
+
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
@@ -354,11 +377,14 @@ pub async fn start_compute_node(
 
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_error_event = false;
+    let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
-                if payload.get("type").and_then(Value::as_str) == Some("error") {
-                    saw_error_event = true;
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("error") => saw_error_event = true,
+                    Some("started") | Some("status") => saw_startup_event = true,
+                    _ => {}
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -391,26 +417,23 @@ pub async fn start_compute_node(
             let mut status = state.status.lock().await;
             status.running = false;
             status.registered = false;
-            if !exit_status.success() && status.last_error.is_none() {
-                status.last_error = Some(format!(
-                    "compute-node bridge exited with status {exit_status}; \
-                     see desktop.compute_node.stderr logs"
-                ));
+            if status.last_error.is_none() {
+                status.last_error =
+                    bridge_exit_error_message(exit_status, saw_error_event, saw_startup_event);
             }
         }
         *state.stdin.lock().await = None;
 
-        if !exit_status.success() && !saw_error_event {
+        if let Some(last_error) =
+            bridge_exit_error_message(exit_status, saw_error_event, saw_startup_event)
+        {
             app.emit(
                 "compute_node_event",
                 serde_json::json!({
                     "type": "error",
                     "running": false,
                     "registered": false,
-                    "last_error": format!(
-                        "compute-node bridge exited with status {exit_status}; \
-                         see desktop.compute_node.stderr logs"
-                    ),
+                    "last_error": last_error,
                 }),
             )?;
         }
@@ -542,6 +565,29 @@ mod tests {
         );
         assert_eq!(status.active_relay_url, request.relay_base_url);
         assert_eq!(status.model_path, request.model_path);
+    }
+
+    #[test]
+    fn bridge_exit_error_message_reports_successful_early_exit_without_startup_event() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(0);
+        let message = bridge_exit_error_message(status, false, false).expect("error message");
+        assert!(message.contains("before emitting startup events"));
+    }
+
+    #[test]
+    fn bridge_exit_error_message_ignores_non_error_after_started_success() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(0);
+        assert!(bridge_exit_error_message(status, false, true).is_none());
     }
 
     #[test]

@@ -20,7 +20,7 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 
 try:
-    from desktop_runtime_setup import ensure_desktop_llama_runtime, maybe_reexec_for_runtime_refresh
+    from desktop_runtime_setup import ensure_desktop_llama_runtime
 except ModuleNotFoundError:
     def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
         return {
@@ -29,9 +29,6 @@ except ModuleNotFoundError:
             "runtime_action": "unavailable",
             "fallback_reason": "desktop_runtime_setup module missing",
         }
-
-    def maybe_reexec_for_runtime_refresh(_runtime_setup: Dict[str, str]) -> None:
-        return
 
 ensure_runtime_import_paths(__file__)
 
@@ -104,7 +101,15 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
-    maybe_reexec_for_runtime_refresh(runtime_setup)
+    if runtime_setup.get("runtime_action") == "installed_cuda_reexec":
+        runtime_setup = dict(runtime_setup)
+        runtime_setup["runtime_action"] = "installed_cuda_pending_restart"
+        fallback_reason = runtime_setup.get("fallback_reason") or ""
+        runtime_setup["fallback_reason"] = (
+            f"{fallback_reason}; restart operator to activate the repaired CUDA runtime"
+            if fallback_reason
+            else "restart operator to activate the repaired CUDA runtime"
+        )
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "

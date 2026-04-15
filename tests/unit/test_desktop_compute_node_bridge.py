@@ -214,6 +214,36 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert 'failed to initialize model runtime' in payload['message']
 
 
+def test_run_does_not_reexec_when_runtime_setup_requests_refresh(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'nvidia',
+            'runtime_action': 'installed_cuda_reexec',
+            'interpreter': sys.executable,
+            'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+            'fallback_reason': 'installed GPU runtime; re-executing sidecar',
+        },
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

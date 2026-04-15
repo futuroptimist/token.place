@@ -130,3 +130,23 @@ It prints:
   (`requested`, `effective`, `backend_available`, `backend_used`,
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
+
+### Regression tests and local GPU smoke test
+
+Run the focused operator startup regression coverage from repo root:
+
+```bash
+pytest -q --noconftest tests/unit/test_desktop_compute_node_bridge.py
+cargo test -p desktop-tauri compute_node
+npm --prefix desktop-tauri run test -- src/App.test.tsx
+```
+
+On a Windows machine with an NVIDIA GPU, run the local desktop-path smoke test:
+
+```bash
+python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\path\to\model.gguf
+```
+
+This script uses the same desktop sidecar bootstrap/runtime helpers and fails
+when `backend_available`/`backend_used` are not `cuda`, offloaded layers are not
+positive, or KV cache still reports CPU-only placement.

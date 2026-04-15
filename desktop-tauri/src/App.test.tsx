@@ -199,6 +199,52 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('keeps operator running after started event and surfaces actionable startup-exit errors', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        active_relay_url: 'https://token.place',
+        requested_mode: 'auto',
+        effective_mode: 'cpu',
+        backend_available: 'cuda',
+        backend_selected: 'cuda',
+        backend_used: 'cuda',
+        model_path: '/tmp/model.gguf',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Running:/).textContent).toContain('yes')
+    );
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        message:
+          'compute-node bridge exited before emitting startup events (started/status)',
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Running:/).textContent).toContain('no')
+    );
+    expect(screen.getByText(/Last error:/).textContent).toContain(
+      'before emitting startup events'
+    );
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

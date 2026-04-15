@@ -104,7 +104,16 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
-    maybe_reexec_for_runtime_refresh(runtime_setup)
+    if runtime_setup.get("runtime_action") == "installed_cuda_reexec":
+        fallback_reason = runtime_setup.get("fallback_reason") or ""
+        runtime_setup["runtime_action"] = "installed_cuda_restart_required"
+        runtime_setup["fallback_reason"] = (
+            f"{fallback_reason}; restart operator to enable refreshed runtime"
+            if fallback_reason
+            else "restart operator to enable refreshed runtime"
+        )
+    else:
+        maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "

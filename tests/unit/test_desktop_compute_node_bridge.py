@@ -313,6 +313,55 @@ def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, mo
     assert status_events[0]['last_error'] == 'failed to process relay request'
 
 
+def test_run_avoids_reexec_in_operator_mode_and_emits_startup_events(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    reexec_calls = {'count': 0}
+
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'installed_cuda_reexec',
+            'fallback_reason': 'installed CUDA runtime; re-executing sidecar',
+            'interpreter': sys.executable,
+            'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _runtime_setup: reexec_calls.update(count=reexec_calls['count'] + 1),
+    )
+
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert reexec_calls['count'] == 0
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert any(event['type'] == 'status' for event in events)
+    stderr_output = captured.err
+    assert 'action=installed_cuda_restart_required' in stderr_output
+
+
 def test_apply_compute_mode_supports_gpu_and_cpu_modes():
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode

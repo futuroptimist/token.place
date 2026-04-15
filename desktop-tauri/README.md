@@ -130,3 +130,33 @@ It prints:
   (`requested`, `effective`, `backend_available`, `backend_used`,
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
+
+### Operator startup regression checks
+
+Run focused regression coverage for the desktop operator startup flow:
+
+```bash
+pytest -q --noconftest tests/unit/test_desktop_compute_node_bridge.py
+npm --prefix desktop-tauri run test -- src/App.test.tsx
+```
+
+The UI/operator regression coverage asserts both paths:
+
+- successful `started`/`status` events keep Running as `yes`
+- startup/bridge failure emits actionable `last_error` text instead of a silent bounce
+
+### Windows/NVIDIA local smoke test
+
+Run this manually on a Windows machine with an NVIDIA GPU to validate the same
+runtime/bootstrap path used by desktop sidecars:
+
+```bash
+python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\\path\\to\\model.gguf
+```
+
+This smoke test fails when desktop's GPU path would fail too. A pass requires:
+
+- authoritative interpreter and `llama_cpp` module path are present
+- `backend_available=cuda` and `backend_used=cuda` after initialization
+- nonzero GPU offload layers
+- KV cache placement is not CPU-only

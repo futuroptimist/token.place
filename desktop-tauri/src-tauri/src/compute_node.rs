@@ -354,11 +354,18 @@ pub async fn start_compute_node(
 
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_error_event = false;
+    let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
-                if payload.get("type").and_then(Value::as_str) == Some("error") {
-                    saw_error_event = true;
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("error") => {
+                        saw_error_event = true;
+                    }
+                    Some("started") | Some("status") => {
+                        saw_startup_event = true;
+                    }
+                    _ => {}
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -391,28 +398,39 @@ pub async fn start_compute_node(
             let mut status = state.status.lock().await;
             status.running = false;
             status.registered = false;
-            if !exit_status.success() && status.last_error.is_none() {
-                status.last_error = Some(format!(
-                    "compute-node bridge exited with status {exit_status}; \
-                     see desktop.compute_node.stderr logs"
-                ));
+            if status.last_error.is_none() {
+                if !saw_startup_event {
+                    status.last_error = Some(format!(
+                        "compute-node bridge exited before emitting startup events \
+                         (started/status). Exit status: {exit_status}. \
+                         See desktop.compute_node.stderr logs."
+                    ));
+                } else if !exit_status.success() {
+                    status.last_error = Some(format!(
+                        "compute-node bridge exited with status {exit_status}; \
+                         see desktop.compute_node.stderr logs"
+                    ));
+                }
             }
         }
         *state.stdin.lock().await = None;
 
-        if !exit_status.success() && !saw_error_event {
-            app.emit(
-                "compute_node_event",
-                serde_json::json!({
-                    "type": "error",
-                    "running": false,
-                    "registered": false,
-                    "last_error": format!(
-                        "compute-node bridge exited with status {exit_status}; \
-                         see desktop.compute_node.stderr logs"
-                    ),
-                }),
-            )?;
+        if !saw_error_event {
+            let last_error = {
+                let status = state.status.lock().await;
+                status.last_error.clone()
+            };
+            if let Some(last_error) = last_error {
+                app.emit(
+                    "compute_node_event",
+                    serde_json::json!({
+                        "type": "error",
+                        "running": false,
+                        "registered": false,
+                        "last_error": last_error,
+                    }),
+                )?;
+            }
         }
     } else {
         let mut status = state.status.lock().await;

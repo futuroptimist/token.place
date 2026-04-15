@@ -25,6 +25,14 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _offloaded_layer_count(value: Any) -> int:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == 'all_supported_layers':
+            return 1
+    return int(value or 0)
+
+
 def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, Any]:
     from desktop_runtime_setup import ensure_desktop_llama_runtime
     from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
@@ -76,7 +84,7 @@ def main() -> int:
 
         _require(payload['backend_available'] == 'cuda', 'backend_available is not cuda')
         _require(payload['backend_used'] == 'cuda', 'backend_used is not cuda')
-        _require(int(payload.get('offloaded_layers') or 0) > 0, 'offloaded_layers must be > 0')
+        _require(_offloaded_layer_count(payload.get('offloaded_layers')) > 0, 'offloaded_layers must be > 0')
         kv_cache = str(payload.get('kv_cache_device') or '').lower()
         _require(kv_cache not in {'', 'cpu'}, 'kv_cache_device indicates CPU-only execution')
         return 0

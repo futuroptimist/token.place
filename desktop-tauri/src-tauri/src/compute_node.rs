@@ -3,6 +3,8 @@ use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -209,10 +211,25 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
-fn bridge_exit_error(exit_status: std::process::ExitStatus, saw_startup_event: bool) -> Option<String> {
+fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
+    if let Some(code) = exit_status.code() {
+        return code.to_string();
+    }
+    #[cfg(unix)]
+    if let Some(signal) = exit_status.signal() {
+        return format!("signal {signal}");
+    }
+    format!("{exit_status:?}")
+}
+
+fn bridge_exit_error(
+    exit_status: std::process::ExitStatus,
+    saw_startup_event: bool,
+) -> Option<String> {
+    let status_label = bridge_exit_status_label(exit_status);
     if !saw_startup_event {
         return Some(format!(
-            "compute-node bridge exited with status {exit_status} before emitting a startup \
+            "compute-node bridge exited with status {status_label} before emitting a startup \
              event; see desktop.compute_node.stderr logs"
         ));
     }
@@ -220,7 +237,7 @@ fn bridge_exit_error(exit_status: std::process::ExitStatus, saw_startup_event: b
         return None;
     }
     Some(format!(
-        "compute-node bridge exited with status {exit_status}; \
+        "compute-node bridge exited with status {status_label}; \
          see desktop.compute_node.stderr logs"
     ))
 }
@@ -408,18 +425,18 @@ pub async fn start_compute_node(
 
     if let Some(mut running_child) = running_child {
         let exit_status = running_child.wait().await?;
+        let exit_error = bridge_exit_error(exit_status, saw_startup_event);
 
         {
             let mut status = state.status.lock().await;
             status.running = false;
             status.registered = false;
             if status.last_error.is_none() {
-                status.last_error = bridge_exit_error(exit_status, saw_startup_event);
+                status.last_error = exit_error.clone();
             }
         }
-        *state.stdin.lock().await = None;
 
-        if let Some(last_error) = bridge_exit_error(exit_status, saw_startup_event) {
+        if let Some(last_error) = exit_error {
             if !saw_error_event {
                 app.emit(
                     "compute_node_event",
@@ -491,10 +508,28 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::{NamedTempFile, TempDir};
+    use std::process::Command as StdCommand;
+    use std::process::ExitStatus;
+    use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
-    use std::process::Command as StdCommand;
+
+    fn success_exit_status() -> ExitStatus {
+        #[cfg(windows)]
+        {
+            StdCommand::new("cmd")
+                .args(["/C", "exit", "0"])
+                .status()
+                .expect("status")
+        }
+        #[cfg(not(windows))]
+        {
+            StdCommand::new("sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .expect("status")
+        }
+    }
 
     #[tokio::test]
     async fn malformed_stdout_lines_are_ignored_without_blocking_valid_events() {
@@ -520,18 +555,23 @@ mod tests {
 
     #[tokio::test]
     async fn drain_compute_node_stderr_reads_all_lines() {
-        let script = NamedTempFile::new().expect("temp script");
-        std::fs::write(
-            script.path(),
-            "#!/usr/bin/env python3\nimport sys\nprint('bridge-failure', file=sys.stderr)\n",
-        )
-        .expect("write script");
-
-        let mut child = Command::new("python3")
-            .arg(script.path())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn stderr script");
+        let mut child = {
+            #[cfg(windows)]
+            {
+                let mut command = Command::new("cmd");
+                command.args(["/C", "echo bridge-failure 1>&2"]);
+                command
+            }
+            #[cfg(not(windows))]
+            {
+                let mut command = Command::new("sh");
+                command.args(["-c", "echo bridge-failure 1>&2"]);
+                command
+            }
+        }
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
         drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
@@ -565,11 +605,7 @@ mod tests {
 
     #[test]
     fn bridge_exit_error_reports_missing_startup_event_even_on_clean_exit() {
-        let exit_status = StdCommand::new("python3")
-            .arg("-c")
-            .arg("pass")
-            .status()
-            .expect("status");
+        let exit_status = success_exit_status();
         assert!(exit_status.success());
 
         let last_error = bridge_exit_error(exit_status, false);
@@ -581,11 +617,7 @@ mod tests {
 
     #[test]
     fn bridge_exit_error_is_none_after_started_event_and_clean_exit() {
-        let exit_status = StdCommand::new("python3")
-            .arg("-c")
-            .arg("pass")
-            .status()
-            .expect("status");
+        let exit_status = success_exit_status();
         assert!(exit_status.success());
 
         assert!(bridge_exit_error(exit_status, true).is_none());

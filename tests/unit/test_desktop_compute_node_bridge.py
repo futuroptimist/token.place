@@ -26,6 +26,8 @@ class FakeModelManager:
     def __init__(self):
         self.model_path = ''
         self.default_n_gpu_layers = -1
+        self.requested_compute_mode = 'auto'
+        self.last_compute_diagnostics = None
 
 
 class FakeRelayClient:
@@ -140,20 +142,44 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
 
     def _apply_compute_mode(model_manager, mode):
         normalized = _normalize_compute_mode(mode)
+        model_manager.requested_compute_mode = normalized
         if normalized == 'cpu':
             model_manager.default_n_gpu_layers = 0
         elif normalized == 'hybrid':
             model_manager.default_n_gpu_layers = getattr(model_manager, 'hybrid_n_gpu_layers', 24)
         else:
             model_manager.default_n_gpu_layers = -1
+        model_manager.last_compute_diagnostics = {
+            'requested_mode': normalized,
+            'effective_mode': 'cpu' if normalized == 'cpu' else 'pending',
+            'backend_available': 'unknown',
+            'backend_selected': 'cpu' if normalized == 'cpu' else 'unknown',
+            'backend_used': 'cpu' if normalized == 'cpu' else 'unknown',
+            'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'fallback_reason': None,
+        }
         return normalized
 
     def _compute_mode_diagnostics(model_manager):
-        requested_mode = _normalize_compute_mode(getattr(model_manager, 'default_mode', 'auto'))
-        effective_mode = 'cpu' if model_manager.default_n_gpu_layers == 0 else 'pending'
+        requested_mode = _normalize_compute_mode(
+            getattr(model_manager, 'requested_compute_mode', 'auto')
+        )
+        runtime = getattr(model_manager, 'last_compute_diagnostics', None)
+        if isinstance(runtime, dict) and runtime.get('requested_mode') == requested_mode:
+            return dict(runtime)
+        if requested_mode == 'cpu':
+            return {
+                'requested_mode': requested_mode,
+                'effective_mode': 'cpu',
+                'backend_available': 'unknown',
+                'backend_selected': 'cpu',
+                'backend_used': 'cpu',
+                'n_gpu_layers': 0,
+                'fallback_reason': None,
+            }
         return {
             'requested_mode': requested_mode,
-            'effective_mode': effective_mode,
+            'effective_mode': 'pending',
             'backend_available': 'unknown',
             'backend_selected': 'unknown',
             'backend_used': 'unknown',

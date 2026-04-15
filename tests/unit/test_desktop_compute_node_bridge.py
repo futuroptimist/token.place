@@ -728,3 +728,4 @@ def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch
     setup = module.ensure_desktop_llama_runtime('auto')
     assert setup['runtime_action'] == 'unavailable'
     assert 'module missing' in setup['fallback_reason']
+    assert module.maybe_reexec_for_runtime_refresh(setup, allow_reexec=False) is None

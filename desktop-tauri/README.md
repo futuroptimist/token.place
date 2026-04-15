@@ -58,8 +58,10 @@ source-build recipe:
 - `FORCE_CMAKE=1`
 - `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
 
-After a successful repair, the sidecar automatically re-execs once so the active
-process immediately uses the repaired runtime (no manual restart/environment flag required).
+After a successful repair, the local inference sidecar automatically re-execs once so the
+active process immediately uses the repaired runtime (no manual restart/environment flag
+required). The compute-node bridge keeps startup in-process and surfaces a structured startup
+error if refreshed runtime activation still fails.
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
@@ -130,3 +132,24 @@ It prints:
   (`requested`, `effective`, `backend_available`, `backend_used`,
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
+
+### Regression tests for operator startup
+
+Run the targeted regression checks that cover startup event flow and the desktop UI state
+transition:
+
+```bash
+pytest -q --noconftest tests/unit/test_desktop_compute_node_bridge.py
+cd desktop-tauri && npm run test -- App.test.tsx
+```
+
+### Local Windows/NVIDIA operator smoke test
+
+On a Windows machine with an NVIDIA GPU and a local GGUF model, run:
+
+```bash
+python desktop-tauri/scripts/windows_nvidia_operator_smoke.py --model C:\\path\\to\\model.gguf
+```
+
+The command passes only when the same desktop operator bridge path can initialize in `auto` mode
+with CUDA (`backend_available=cuda`, `backend_used=cuda`, non-zero offload, and non-CPU KV cache).

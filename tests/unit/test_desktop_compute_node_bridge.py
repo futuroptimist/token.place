@@ -212,6 +212,45 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
     assert 'failed to initialize model runtime' in payload['message']
+    assert 'runtime_action=' in payload['message']
+
+
+def test_run_suppresses_reexec_paths_and_emits_started_event(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'runtime_action': 'installed_cuda_reexec',
+            'fallback_reason': '',
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'interpreter': sys.executable,
+            'llama_module_path': '/tmp/llama_cpp/__init__.py',
+        },
+    )
+    reexec_called = {'value': False}
+
+    def _fake_reexec(_setup):
+        reexec_called['value'] = True
+
+    monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', _fake_reexec)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert reexec_called['value'] is False
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[0]['running'] is True
 
 
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):

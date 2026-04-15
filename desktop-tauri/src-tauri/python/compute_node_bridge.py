@@ -104,7 +104,17 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
-    maybe_reexec_for_runtime_refresh(runtime_setup)
+    if runtime_setup.get("runtime_action") == "installed_cuda_reexec":
+        runtime_setup = {
+            **runtime_setup,
+            "runtime_action": "installed_cuda_restart_required",
+            "fallback_reason": (
+                runtime_setup.get("fallback_reason")
+                or "CUDA runtime installed; restart operator to activate refreshed interpreter"
+            ),
+        }
+    else:
+        maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
@@ -132,10 +142,15 @@ def run(args: argparse.Namespace) -> int:
     apply_compute_mode(runtime.model_manager, args.mode)
 
     if not runtime.ensure_model_ready():
+        setup_reason = runtime_setup.get("fallback_reason") or "none"
         emit(
             {
                 "type": "error",
-                "message": "failed to initialize model runtime",
+                "message": (
+                    "failed to initialize model runtime "
+                    f"(runtime_action={runtime_setup.get('runtime_action', 'none')}, "
+                    f"reason={setup_reason})"
+                ),
                 "active_relay_url": runtime.relay_client.relay_url,
             }
         )
@@ -155,6 +170,8 @@ def run(args: argparse.Namespace) -> int:
             "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
             "fallback_reason": diagnostics.get("fallback_reason"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
             "model_path": args.model,
             "last_error": None,
         }
@@ -198,6 +215,10 @@ def run(args: argparse.Namespace) -> int:
                     "backend_selected": diagnostics.get("backend_selected"),
                     "backend_used": diagnostics.get("backend_used"),
                     "fallback_reason": diagnostics.get("fallback_reason"),
+                    "offloaded_layers": diagnostics.get(
+                        "offloaded_layers", diagnostics.get("n_gpu_layers")
+                    ),
+                    "kv_cache_device": diagnostics.get("kv_cache_device"),
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -222,6 +243,8 @@ def run(args: argparse.Namespace) -> int:
             "backend_selected": diagnostics.get("backend_selected"),
             "backend_used": diagnostics.get("backend_used"),
             "fallback_reason": diagnostics.get("fallback_reason"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
             "model_path": args.model,
             "last_error": None,
         }

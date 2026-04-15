@@ -353,10 +353,12 @@ pub async fn start_compute_node(
     });
 
     let mut lines = BufReader::new(stdout).lines();
+    let mut saw_structured_event = false;
     let mut saw_error_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
+                saw_structured_event = true;
                 if payload.get("type").and_then(Value::as_str) == Some("error") {
                     saw_error_event = true;
                 }
@@ -391,7 +393,12 @@ pub async fn start_compute_node(
             let mut status = state.status.lock().await;
             status.running = false;
             status.registered = false;
-            if !exit_status.success() && status.last_error.is_none() {
+            if !saw_structured_event && status.last_error.is_none() {
+                status.last_error = Some(format!(
+                    "compute-node bridge exited with status {exit_status} before emitting \
+                     startup events; see desktop.compute_node.stderr logs"
+                ));
+            } else if !exit_status.success() && status.last_error.is_none() {
                 status.last_error = Some(format!(
                     "compute-node bridge exited with status {exit_status}; \
                      see desktop.compute_node.stderr logs"
@@ -400,7 +407,20 @@ pub async fn start_compute_node(
         }
         *state.stdin.lock().await = None;
 
-        if !exit_status.success() && !saw_error_event {
+        if !saw_structured_event && !saw_error_event {
+            app.emit(
+                "compute_node_event",
+                serde_json::json!({
+                    "type": "error",
+                    "running": false,
+                    "registered": false,
+                    "last_error": format!(
+                        "compute-node bridge exited with status {exit_status} before \
+                         emitting startup events; see desktop.compute_node.stderr logs"
+                    ),
+                }),
+            )?;
+        } else if !exit_status.success() && !saw_error_event {
             app.emit(
                 "compute_node_event",
                 serde_json::json!({

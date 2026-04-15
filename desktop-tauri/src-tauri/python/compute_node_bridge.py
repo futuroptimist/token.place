@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -20,8 +21,10 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 
 try:
-    from desktop_runtime_setup import ensure_desktop_llama_runtime
+    from desktop_runtime_setup import ensure_desktop_llama_runtime, RUNTIME_REEXEC_ENV
 except ModuleNotFoundError:
+    RUNTIME_REEXEC_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXEC"
+
     def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
         return {
             "selected_backend": "cpu",
@@ -107,9 +110,22 @@ def run(args: argparse.Namespace) -> int:
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"python={runtime_setup.get('python_executable', sys.executable)} "
+        f"llama_cpp={runtime_setup.get('llama_cpp_path', 'unknown')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    if (
+        runtime_setup.get("runtime_action", "").endswith("_reexec_required")
+        and os.environ.get(RUNTIME_REEXEC_ENV) != "1"
+    ):
+        os.environ[RUNTIME_REEXEC_ENV] = "1"
+        print(
+            "desktop.runtime_setup_reexec reason=runtime_install "
+            f"python={sys.executable} action={runtime_setup.get('runtime_action')}",
+            file=sys.stderr,
+        )
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)

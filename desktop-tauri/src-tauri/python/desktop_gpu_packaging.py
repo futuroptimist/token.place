@@ -20,9 +20,13 @@ class LlamaCppInstallPlan:
     extra_index_url: str | None = None
     only_binary: bool = False
     no_binary: bool = False
+    force_reinstall: bool = False
+    verbose: bool = False
 
     def pip_install_args(self) -> list[str]:
         args = ["--upgrade", "--no-cache-dir"]
+        if self.force_reinstall:
+            args.append("--force-reinstall")
         if self.index_url:
             args.extend(["--index-url", self.index_url])
         if self.extra_index_url:
@@ -33,6 +37,8 @@ class LlamaCppInstallPlan:
             args.extend(["--no-binary", "llama-cpp-python"])
         if self.index_url or self.extra_index_url:
             args.append("--prefer-binary")
+        if self.verbose:
+            args.append("--verbose")
         return args
 
     def pip_env(self) -> dict[str, str]:

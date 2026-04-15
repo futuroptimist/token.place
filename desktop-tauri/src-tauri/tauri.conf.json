@@ -29,6 +29,7 @@
       "python/desktop_runtime_setup.py",
       "python/compute_node_bridge.py",
       "python/inference_sidecar.py",
+      "python/runtime_verify.py",
       "python/model_bridge.py",
       "python/path_bootstrap.py",
       "../../utils",

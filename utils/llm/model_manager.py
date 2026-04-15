@@ -27,6 +27,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             'backend': 'missing',
             'gpu_offload_supported': False,
             'detected_device': 'none',
+            'python_executable': sys.executable,
+            'python_prefix': sys.prefix,
+            'llama_cpp_path': 'missing',
             'error': str(exc),
         }
 
@@ -56,6 +59,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'backend': backend,
         'gpu_offload_supported': gpu_offload_supported,
         'detected_device': backend if gpu_offload_supported else 'cpu',
+        'python_executable': sys.executable,
+        'python_prefix': sys.prefix,
+        'llama_cpp_path': str(getattr(llama_cpp, '__file__', 'unknown')),
         'error': None,
     }
 
@@ -437,11 +443,15 @@ class ModelManager:
                             )
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
+                            runtime_probe = detect_llama_runtime_capabilities()
+                            compute_plan['python_executable'] = runtime_probe.get('python_executable')
+                            compute_plan['llama_cpp_path'] = runtime_probe.get('llama_cpp_path')
                             self.last_compute_diagnostics = compute_plan
                             self.log_info(
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "
                                 f"effective={compute_plan['effective_mode']} "
+                                f"backend_available={compute_plan['backend_available']} "
                                 f"backend={compute_plan['backend_used']} "
                                 f"device_backend={compute_plan['device_backend']} "
                                 f"device_name={compute_plan['device_name']} "
@@ -449,6 +459,12 @@ class ModelManager:
                                 f"kv_cache={compute_plan['kv_cache_device']} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
+                            if llama_cpp_verbose_logging_enabled():
+                                self.log_info(
+                                    "compute_runtime_python "
+                                    f"executable={compute_plan['python_executable']} "
+                                    f"llama_cpp={compute_plan['llama_cpp_path']}"
+                                )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)

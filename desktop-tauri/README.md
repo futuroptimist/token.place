@@ -38,20 +38,37 @@ npm ci
 npm run tauri dev
 ```
 
-During normal startup, desktop sidecars run a **probe-only** runtime check in
+During normal startup, desktop sidecars now run an **auto-repair** runtime check in
 `auto`/`gpu`/`hybrid` modes and emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
-Normal inference requests do **not** mutate Python packages. For local desktop
-development, explicitly run one bootstrap start with
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=1` to allow a one-time
-`llama-cpp-python` install/repair attempt, then restart sidecars/app.
+On Windows hosts in GPU-preferring modes, desktop attempts a one-time
+`llama-cpp-python` CUDA repair in the **same interpreter used by the sidecar**
+when the current runtime probes as CPU-only. The primary repair path follows
+the root README CUDA recipe (`CMAKE_ARGS=-DGGML_CUDA=on`, `FORCE_CMAKE=1`,
+`pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose`).
+If a process reload is required after install, the sidecar re-execs itself once
+so the repaired runtime is active in the same launch.
 
-Packaged builds should rely on pre-provisioned runtime dependencies and keep
-`TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP` unset.
+Set `TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=0` only if you need to
+disable automatic runtime repair for troubleshooting.
+
+### Manual runtime verification helper
+
+Use the packaged sidecar interpreter to verify the active runtime paths:
+
+```bash
+python src-tauri/python/runtime_verify.py --mode auto
+```
+
+Optional model-init verification (prints post-init `ModelManager` diagnostics):
+
+```bash
+python src-tauri/python/runtime_verify.py --mode auto --model /path/to/model.gguf
+```
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 

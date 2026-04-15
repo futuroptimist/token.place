@@ -18,12 +18,16 @@ class RuntimeProbe:
     backend: str
     gpu_offload_supported: bool
     detected_device: str
+    python_executable: str
+    python_prefix: str
+    llama_cpp_path: str
     error: Optional[str] = None
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
+RUNTIME_REEXEC_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXEC"
 
 
 def _probe_llama_runtime() -> RuntimeProbe:
@@ -33,12 +37,15 @@ def _probe_llama_runtime() -> RuntimeProbe:
         backend=str(payload.get("backend", "cpu")),
         gpu_offload_supported=bool(payload.get("gpu_offload_supported", False)),
         detected_device=str(payload.get("detected_device", "cpu")),
+        python_executable=str(payload.get("python_executable") or sys.executable),
+        python_prefix=str(payload.get("python_prefix") or sys.prefix),
+        llama_cpp_path=str(payload.get("llama_cpp_path") or "missing"),
         error=payload.get("error"),
     )
 
 
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
-    """Probe runtime by default; install/repair only when explicit bootstrap env is enabled."""
+    """Ensure desktop sidecars run with a GPU-capable llama-cpp runtime when possible."""
 
     selected_mode = (mode or "auto").strip().lower()
     if selected_mode not in GPU_MODES:
@@ -46,6 +53,9 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "selected_backend": "cpu",
             "fallback_reason": "cpu mode explicitly selected",
             "runtime_action": "skipped",
+            "python_executable": sys.executable,
+            "python_prefix": sys.prefix,
+            "llama_cpp_path": "not_loaded",
         }
 
     before = _probe_llama_runtime()
@@ -55,32 +65,35 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "fallback_reason": "",
             "runtime_action": "already_supported",
             "detected_device": before.detected_device,
+            "python_executable": before.python_executable,
+            "python_prefix": before.python_prefix,
+            "llama_cpp_path": before.llama_cpp_path,
         }
-
-    if os.environ.get(ENABLE_BOOTSTRAP_ENV) != "1":
+    if os.environ.get(ENABLE_BOOTSTRAP_ENV) == "0":
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
                 f"GPU runtime unavailable ({before.error or before.backend}); "
-                f"set {ENABLE_BOOTSTRAP_ENV}=1 for one-time bootstrap"
+                f"{ENABLE_BOOTSTRAP_ENV}=0 disables automatic bootstrap"
             ),
-            "runtime_action": "probe_only",
+            "runtime_action": "bootstrap_disabled",
             "detected_device": before.detected_device or "cpu",
+            "python_executable": before.python_executable,
+            "python_prefix": before.python_prefix,
+            "llama_cpp_path": before.llama_cpp_path,
         }
 
     target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
 
     try:
-        plans = llama_cpp_install_plan_fallbacks(
-            platform=sys.platform,
-            requirements_path=requirements_path,
-        )
+        plans = llama_cpp_install_plan_fallbacks(platform=sys.platform, requirements_path=requirements_path)
     except (FileNotFoundError, ValueError) as exc:
         plans = _fallback_unpinned_plans(sys.platform)
         fallback_setup_error = str(exc)
     else:
         fallback_setup_error = ""
+    plans = _prioritized_repair_plans(plans, sys.platform)
 
     last_install_error = ""
 
@@ -106,12 +119,25 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             last_install_error = (install.stderr or install.stdout or "").strip()
             continue
 
+        after = _probe_llama_runtime()
         if plan.backend in {"cuda", "metal"}:
+            activated_now = after.gpu_offload_supported and after.backend in {"cuda", "metal"}
             return {
-                "selected_backend": plan.backend,
-                "fallback_reason": "bootstrap install complete; restart sidecar to activate runtime",
-                "runtime_action": f"installed_{plan.backend}_restart_required",
-                "detected_device": "cpu",
+                "selected_backend": after.backend if activated_now else plan.backend,
+                "fallback_reason": (
+                    ""
+                    if activated_now
+                    else "bootstrap install complete; restarting sidecar to activate runtime"
+                ),
+                "runtime_action": (
+                    f"installed_{plan.backend}_active"
+                    if activated_now
+                    else f"installed_{plan.backend}_reexec_required"
+                ),
+                "detected_device": after.detected_device,
+                "python_executable": after.python_executable,
+                "python_prefix": after.python_prefix,
+                "llama_cpp_path": after.llama_cpp_path,
             }
 
         if plan.backend == "cpu":
@@ -122,6 +148,9 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                 ),
                 "runtime_action": "installed_cpu_fallback",
                 "detected_device": "cpu",
+                "python_executable": after.python_executable,
+                "python_prefix": after.python_prefix,
+                "llama_cpp_path": after.llama_cpp_path,
             }
 
     return {
@@ -134,7 +163,32 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         ),
         "runtime_action": "failed",
         "detected_device": "cpu",
+        "python_executable": before.python_executable,
+        "python_prefix": before.python_prefix,
+        "llama_cpp_path": before.llama_cpp_path,
     }
+
+
+def _prioritized_repair_plans(
+    plans: list[LlamaCppInstallPlan],
+    platform: str,
+) -> list[LlamaCppInstallPlan]:
+    if not platform.lower().startswith("win"):
+        return plans
+    source_plan = LlamaCppInstallPlan(
+        platform=platform.lower(),
+        backend="cuda",
+        package_spec="llama-cpp-python",
+        cmake_args="-DGGML_CUDA=on",
+        force_cmake=True,
+        index_url=None,
+        extra_index_url=None,
+        only_binary=False,
+        no_binary=True,
+        force_reinstall=True,
+        verbose=True,
+    )
+    return [source_plan, *plans]
 
 
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:

@@ -214,6 +214,42 @@ def test_run_handles_dict_completion_payload(tmp_path, capsys):
     assert events[1]['text'] == 'dict response'
 
 
+def test_run_reexecs_after_runtime_install_when_requested(tmp_path, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'nvidia',
+            'runtime_action': 'installed_cuda_reexec_required',
+            'fallback_reason': '',
+            'python_executable': sys.executable,
+            'llama_cpp_path': 'site-packages/llama_cpp/__init__.py',
+        },
+    )
+
+    called = {}
+
+    def fake_execv(executable, argv):
+        called['executable'] = executable
+        called['argv'] = argv
+        raise SystemExit(0)
+
+    monkeypatch.setattr(inference_sidecar.os, 'execv', fake_execv)
+    monkeypatch.delenv(inference_sidecar.RUNTIME_REEXEC_ENV, raising=False)
+
+    with pytest.raises(SystemExit):
+        inference_sidecar.run(args)
+
+    assert called['executable'] == sys.executable
+    assert called['argv'][1:] == sys.argv
+
+
 def test_run_normalizes_unknown_mode_to_auto_gpu_default(tmp_path, capsys):
     _reset_cancel_queue()
     model_path = tmp_path / 'model.gguf'
@@ -405,7 +441,7 @@ def test_extract_text_from_completion_handles_empty_choices():
 
 def test_normalize_chunk_fallback_handles_typeerror_and_unknown_shape():
     class WithBadDict:
-        def dict(self, required):  # pragma: no cover - signature intentionally incompatible
+        def dict(self, _required):  # pragma: no cover - signature intentionally incompatible
             return {'choices': []}
 
     class UnknownShape:

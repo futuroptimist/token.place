@@ -225,7 +225,11 @@ def _clear_source_repair_failure() -> None:
         _save_runtime_state(state)
 
 
-def maybe_reexec_for_runtime_refresh(runtime_setup: Dict[str, str]) -> None:
+def maybe_reexec_for_runtime_refresh(
+    runtime_setup: Dict[str, str], *, allow_reexec: bool = True
+) -> None:
+    if not allow_reexec:
+        return
     if runtime_setup.get("runtime_action") != "installed_cuda_reexec":
         return
     if os.environ.get(REEXEC_GUARD_ENV) == "1":

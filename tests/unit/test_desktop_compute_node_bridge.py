@@ -130,14 +130,37 @@ class IncompatibleRelayRuntime(FakeRuntime):
 
 
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
-    from utils.compute_node_runtime import (
-        SUPPORTED_COMPUTE_MODES as _SUPPORTED_COMPUTE_MODES,
-        apply_compute_mode as _apply_compute_mode,
-        compute_mode_diagnostics as _compute_mode_diagnostics,
-        normalize_compute_mode as _normalize_compute_mode,
-    )
-
     module = ModuleType('utils.compute_node_runtime')
+
+    supported_modes = {'auto', 'cpu', 'gpu', 'hybrid'}
+
+    def _normalize_compute_mode(mode):
+        normalized = {'cuda': 'gpu', 'metal': 'gpu'}.get(str(mode).lower(), str(mode).lower())
+        return normalized if normalized in supported_modes else 'auto'
+
+    def _apply_compute_mode(model_manager, mode):
+        normalized = _normalize_compute_mode(mode)
+        if normalized == 'cpu':
+            model_manager.default_n_gpu_layers = 0
+        elif normalized == 'hybrid':
+            model_manager.default_n_gpu_layers = getattr(model_manager, 'hybrid_n_gpu_layers', 24)
+        else:
+            model_manager.default_n_gpu_layers = -1
+        return normalized
+
+    def _compute_mode_diagnostics(model_manager):
+        requested_mode = _normalize_compute_mode(getattr(model_manager, 'default_mode', 'auto'))
+        effective_mode = 'cpu' if model_manager.default_n_gpu_layers == 0 else 'pending'
+        return {
+            'requested_mode': requested_mode,
+            'effective_mode': effective_mode,
+            'backend_available': 'unknown',
+            'backend_selected': 'unknown',
+            'backend_used': 'unknown',
+            'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'fallback_reason': None,
+        }
+
     module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
         relay_url=relay_url,
         relay_port=relay_port,
@@ -149,11 +172,28 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     )
     module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
-    module.SUPPORTED_COMPUTE_MODES = _SUPPORTED_COMPUTE_MODES
+    module.SUPPORTED_COMPUTE_MODES = supported_modes
     module.normalize_compute_mode = _normalize_compute_mode
     module.apply_compute_mode = _apply_compute_mode
     module.compute_mode_diagnostics = _compute_mode_diagnostics
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'skipped',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+            'fallback_reason': '',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
 
 
 def _reset_cancel_queue():
@@ -212,6 +252,37 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
     assert 'failed to initialize model runtime' in payload['message']
+
+
+def test_run_disables_runtime_reexec_to_avoid_pre_startup_exit(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    reexec_flags = []
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {'runtime_action': 'installed_cuda_reexec'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: reexec_flags.append(allow_reexec),
+    )
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert reexec_flags == [False]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'stopped'
 
 
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
@@ -313,7 +384,8 @@ def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, mo
     assert status_events[0]['last_error'] == 'failed to process relay request'
 
 
-def test_apply_compute_mode_supports_gpu_and_cpu_modes():
+def test_apply_compute_mode_supports_gpu_and_cpu_modes(monkeypatch):
+    _install_fake_runtime_module(monkeypatch)
     manager = FakeModelManager()
     from utils.compute_node_runtime import apply_compute_mode
 
@@ -445,6 +517,9 @@ def test_main_normalizes_mode_before_run(monkeypatch):
         captured['mode'] = args.mode
         return 0
 
+    module = ModuleType('utils.compute_node_runtime')
+    module.normalize_compute_mode = lambda mode: {'cuda': 'gpu'}.get(str(mode).lower(), 'auto')
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
     monkeypatch.setattr(
         sys,

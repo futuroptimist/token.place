@@ -209,6 +209,22 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     }
 }
 
+fn bridge_exit_error(exit_status: std::process::ExitStatus, saw_startup_event: bool) -> Option<String> {
+    if !saw_startup_event {
+        return Some(format!(
+            "compute-node bridge exited with status {exit_status} before emitting a startup \
+             event; see desktop.compute_node.stderr logs"
+        ));
+    }
+    if exit_status.success() {
+        return None;
+    }
+    Some(format!(
+        "compute-node bridge exited with status {exit_status}; \
+         see desktop.compute_node.stderr logs"
+    ))
+}
+
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
@@ -354,11 +370,17 @@ pub async fn start_compute_node(
 
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_error_event = false;
+    let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
-                if payload.get("type").and_then(Value::as_str) == Some("error") {
-                    saw_error_event = true;
+                if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
+                    if event_type == "error" {
+                        saw_error_event = true;
+                    }
+                    if event_type == "started" || event_type == "status" {
+                        saw_startup_event = true;
+                    }
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -391,28 +413,24 @@ pub async fn start_compute_node(
             let mut status = state.status.lock().await;
             status.running = false;
             status.registered = false;
-            if !exit_status.success() && status.last_error.is_none() {
-                status.last_error = Some(format!(
-                    "compute-node bridge exited with status {exit_status}; \
-                     see desktop.compute_node.stderr logs"
-                ));
+            if status.last_error.is_none() {
+                status.last_error = bridge_exit_error(exit_status, saw_startup_event);
             }
         }
         *state.stdin.lock().await = None;
 
-        if !exit_status.success() && !saw_error_event {
-            app.emit(
-                "compute_node_event",
-                serde_json::json!({
-                    "type": "error",
-                    "running": false,
-                    "registered": false,
-                    "last_error": format!(
-                        "compute-node bridge exited with status {exit_status}; \
-                         see desktop.compute_node.stderr logs"
-                    ),
-                }),
-            )?;
+        if let Some(last_error) = bridge_exit_error(exit_status, saw_startup_event) {
+            if !saw_error_event {
+                app.emit(
+                    "compute_node_event",
+                    serde_json::json!({
+                        "type": "error",
+                        "running": false,
+                        "registered": false,
+                        "last_error": last_error,
+                    }),
+                )?;
+            }
         }
     } else {
         let mut status = state.status.lock().await;
@@ -476,6 +494,7 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+    use std::process::Command as StdCommand;
 
     #[tokio::test]
     async fn malformed_stdout_lines_are_ignored_without_blocking_valid_events() {
@@ -542,6 +561,34 @@ mod tests {
         );
         assert_eq!(status.active_relay_url, request.relay_base_url);
         assert_eq!(status.model_path, request.model_path);
+    }
+
+    #[test]
+    fn bridge_exit_error_reports_missing_startup_event_even_on_clean_exit() {
+        let exit_status = StdCommand::new("python3")
+            .arg("-c")
+            .arg("pass")
+            .status()
+            .expect("status");
+        assert!(exit_status.success());
+
+        let last_error = bridge_exit_error(exit_status, false);
+        assert!(last_error.is_some());
+        assert!(last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("before emitting a startup event")));
+    }
+
+    #[test]
+    fn bridge_exit_error_is_none_after_started_event_and_clean_exit() {
+        let exit_status = StdCommand::new("python3")
+            .arg("-c")
+            .arg("pass")
+            .status()
+            .expect("status");
+        assert!(exit_status.success());
+
+        assert!(bridge_exit_error(exit_status, true).is_none());
     }
 
     #[test]

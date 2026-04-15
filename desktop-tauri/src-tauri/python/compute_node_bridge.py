@@ -30,7 +30,9 @@ except ModuleNotFoundError:
             "fallback_reason": "desktop_runtime_setup module missing",
         }
 
-    def maybe_reexec_for_runtime_refresh(_runtime_setup: Dict[str, str]) -> None:
+    def maybe_reexec_for_runtime_refresh(
+        _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
+    ) -> None:
         return
 
 ensure_runtime_import_paths(__file__)
@@ -89,6 +91,20 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    runtime_setup = ensure_desktop_llama_runtime(args.mode)
+    maybe_reexec_for_runtime_refresh(runtime_setup, allow_reexec=False)
+    print(
+        "desktop.runtime_setup "
+        f"mode={args.mode} "
+        f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
+        f"device={runtime_setup.get('detected_device', 'cpu')} "
+        f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
+        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        file=sys.stderr,
+    )
+
     try:
         from utils.compute_node_runtime import (
             apply_compute_mode,
@@ -102,20 +118,6 @@ def run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
-
-    runtime_setup = ensure_desktop_llama_runtime(args.mode)
-    maybe_reexec_for_runtime_refresh(runtime_setup)
-    print(
-        "desktop.runtime_setup "
-        f"mode={args.mode} "
-        f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
-        f"device={runtime_setup.get('detected_device', 'cpu')} "
-        f"action={runtime_setup.get('runtime_action', 'none')} "
-        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
-        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
-        file=sys.stderr,
-    )
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)

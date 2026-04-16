@@ -167,6 +167,8 @@ def test_bootstrap_preserves_repo_utils_imports_while_preventing_llama_shadowing
         monkeypatch.chdir(repo_root)
         sys.path[:] = ['', str(site_packages)]
         path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        for module_name in ("utils", "utils.llm", "utils.llm.model_manager", "llama_cpp"):
+            sys.modules.pop(module_name, None)
 
         from utils.llm import model_manager  # noqa: PLC0415
 

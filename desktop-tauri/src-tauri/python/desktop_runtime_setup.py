@@ -46,6 +46,9 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from utils.llm.model_manager import detect_llama_runtime_capabilities
+# NOTE: detect_llama_runtime_capabilities must keep `import llama_cpp` lazy
+# (inside the function body). We sanitize sys.path below before that import
+# runs so site-packages can win over a repo-local llama_cpp.py shim.
 
 repo_root_resolved = str(repo_root.resolve())
 sanitized = []
@@ -196,7 +199,9 @@ def _is_repo_local_llama_module(module_path: str, repo_root: Path) -> bool:
     if not module:
         return False
     try:
-        return str(Path(module).resolve()) == _repo_llama_shim_path(repo_root)
+        resolved_module = os.path.normcase(str(Path(module).resolve())).casefold()
+        repo_shim = os.path.normcase(_repo_llama_shim_path(repo_root)).casefold()
+        return resolved_module == repo_shim
     except OSError:
         return False
 

@@ -419,3 +419,13 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
     can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
     assert can_retry is True
     assert reason == ''
+
+
+def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
+    repo_root = tmp_path / 'RepoRoot'
+    repo_root.mkdir(parents=True)
+    shim = repo_root / 'llama_cpp.py'
+    shim.write_text('# shim\n', encoding='utf-8')
+
+    module_path = str(shim.resolve()).upper()
+    assert desktop_runtime_setup._is_repo_local_llama_module(module_path, repo_root) is True

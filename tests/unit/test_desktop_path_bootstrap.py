@@ -108,7 +108,29 @@ def test_bootstrap_keeps_repo_root_importable_without_shadowing_llama_cpp(
         sys.path.insert(0, '')
         path_bootstrap.ensure_runtime_import_paths(str(script))
         assert str(repo_root) in sys.path
-        assert sys.path.index(str(repo_root)) > 0
+        repo_index = sys.path.index(str(repo_root))
+        site_packages_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry]
+        if site_packages_indices:
+            assert repo_index < min(site_packages_indices)
         assert '' not in sys.path
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_bootstrap_readds_explicit_cwd_when_only_empty_entry_present(tmp_path, path_bootstrap, monkeypatch):
+    script = tmp_path / 'repo' / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    repo_root = tmp_path / 'repo'
+    (repo_root / 'utils').mkdir(parents=True)
+    (repo_root / 'llama_cpp.py').write_text('# shim\n', encoding='utf-8')
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        monkeypatch.chdir(repo_root)
+        sys.path[:] = ['']
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert '' not in sys.path
+        assert str(repo_root.resolve()) in sys.path
     finally:
         sys.path[:] = original_sys_path

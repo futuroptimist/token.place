@@ -182,3 +182,28 @@ def test_bootstrap_preserves_repo_utils_imports_while_preventing_llama_shadowing
         sys.path[:] = original_sys_path
         sys.modules.clear()
         sys.modules.update(original_modules)
+
+
+def test_bootstrap_adds_resolved_cwd_when_candidate_uses_non_resolved_path(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    repo_root = tmp_path / 'repo'
+    script = repo_root / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    aliased_repo = tmp_path / 'alias' / '..' / 'repo'
+    (repo_root / 'utils').mkdir(parents=True)
+    (repo_root / 'llama_cpp.py').write_text('# shim\n', encoding='utf-8')
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        monkeypatch.chdir(repo_root)
+        monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(aliased_repo))
+        sys.path[:] = ['', str(tmp_path / 'venv' / 'site-packages')]
+
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+
+        assert '' not in sys.path
+        assert str(repo_root.resolve()) in sys.path
+    finally:
+        sys.path[:] = original_sys_path

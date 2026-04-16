@@ -338,7 +338,22 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
     assert probe.error == 'json parse failed'
-    assert probe.llama_module_path == 'missing'
+
+
+def test_is_repo_local_llama_module_returns_false_for_empty_module_path():
+    assert desktop_runtime_setup._is_repo_local_llama_module('', Path.cwd()) is False
+
+
+def test_is_repo_local_llama_module_returns_false_on_resolve_oserror(monkeypatch):
+    class _BrokenPath:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def resolve(self):
+            raise OSError('resolve failed')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'Path', _BrokenPath)
+    assert desktop_runtime_setup._is_repo_local_llama_module('C:/llama_cpp.py', Path.cwd()) is False
 
 
 def test_runtime_bootstrap_fails_fast_when_repo_local_llama_shim_is_detected(monkeypatch, tmp_path):

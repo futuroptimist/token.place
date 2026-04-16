@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -36,6 +37,7 @@ except ModuleNotFoundError:
         return
 
 ensure_runtime_import_paths(__file__)
+os.environ.setdefault("TOKEN_PLACE_STRICT_LLAMA_IMPORT", "1")
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

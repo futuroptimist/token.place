@@ -17,9 +17,14 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
+    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+    if str(python_root) not in sys.path:
+        sys.path.insert(0, str(python_root))
+    os.environ.setdefault('TOKEN_PLACE_STRICT_LLAMA_IMPORT', '1')
 
+    from desktop_runtime_setup import llama_cpp_path_is_repo_shim, llama_cpp_shadowing_error
     from utils.llm.model_manager import detect_llama_runtime_capabilities
 
     runtime = detect_llama_runtime_capabilities()
@@ -32,6 +37,11 @@ def main() -> int:
         'llama_module_path': runtime.get('llama_module_path', 'missing'),
         'error': runtime.get('error'),
     }
+    if llama_cpp_path_is_repo_shim(payload['llama_module_path'], repo_root=repo_root):
+        payload['error'] = llama_cpp_shadowing_error(payload['llama_module_path'], repo_root=repo_root)
+        payload['status'] = 'failed'
+        print(json.dumps(payload, indent=2))
+        return 2
 
     try:
         from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics

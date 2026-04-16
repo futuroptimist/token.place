@@ -7,6 +7,7 @@ import logging
 import requests
 import json
 import sys
+import importlib
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -16,12 +17,73 @@ from utils.system import resource_monitor
 
 # Configure logging
 logger = logging.getLogger('model_manager')
+STRICT_LLAMA_IMPORT_ENV = 'TOKEN_PLACE_STRICT_LLAMA_IMPORT'
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _repo_llama_shim_path() -> Path:
+    return _repo_root() / 'llama_cpp.py'
+
+
+def _llama_cpp_module_is_repo_shim(module: Any) -> bool:
+    module_path = getattr(module, '__file__', '')
+    if not module_path:
+        return False
+    try:
+        return Path(module_path).resolve() == _repo_llama_shim_path().resolve()
+    except OSError:
+        return False
+
+
+def _path_entry_points_to_repo_shim(entry: str) -> bool:
+    try:
+        if not entry:
+            return False
+        candidate = (Path(entry).resolve() / 'llama_cpp.py').resolve()
+        return candidate == _repo_llama_shim_path().resolve()
+    except OSError:
+        return False
+
+
+def _import_llama_cpp_runtime() -> Any:
+    strict = os.getenv(STRICT_LLAMA_IMPORT_ENV) == '1'
+    if not strict:
+        return importlib.import_module('llama_cpp')
+
+    original_sys_path = list(sys.path)
+    filtered_sys_path = [
+        path_entry
+        for path_entry in original_sys_path
+        if not _path_entry_points_to_repo_shim(path_entry)
+    ]
+    if not filtered_sys_path:
+        filtered_sys_path = original_sys_path
+
+    existing = sys.modules.get('llama_cpp')
+    if existing is not None and _llama_cpp_module_is_repo_shim(existing):
+        sys.modules.pop('llama_cpp', None)
+
+    try:
+        sys.path[:] = filtered_sys_path
+        module = importlib.import_module('llama_cpp')
+    finally:
+        sys.path[:] = original_sys_path
+
+    if _llama_cpp_module_is_repo_shim(module):
+        raise RuntimeError(
+            f"resolved repo-local llama_cpp shim at {_repo_llama_shim_path()} "
+            f"while {STRICT_LLAMA_IMPORT_ENV}=1; expected installed llama-cpp-python package"
+        )
+    return module
 
 
 def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     """Return backend/offload capability details from the installed llama_cpp runtime."""
     try:
-        import llama_cpp
+        llama_cpp = _import_llama_cpp_runtime()
     except Exception as exc:
         return {
             'backend': 'missing',

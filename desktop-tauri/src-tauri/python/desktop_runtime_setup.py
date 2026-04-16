@@ -34,6 +34,7 @@ PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
+STRICT_LLAMA_IMPORT_ENV = "TOKEN_PLACE_STRICT_LLAMA_IMPORT"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
@@ -61,6 +62,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    env[STRICT_LLAMA_IMPORT_ENV] = "1"
     try:
         result = subprocess.run(
             cmd,
@@ -116,6 +118,35 @@ def _probe_llama_runtime() -> RuntimeProbe:
         prefix=str(payload.get("prefix", sys.prefix)),
         llama_module_path=str(payload.get("llama_module_path", "missing")),
         error=payload.get("error"),
+    )
+
+
+def _repo_local_llama_cpp_shim_path(*, repo_root: Optional[Path] = None) -> Path:
+    root = repo_root or Path(__file__).resolve().parents[3]
+    return root / "llama_cpp.py"
+
+
+def llama_cpp_path_is_repo_shim(
+    llama_module_path: str, *, repo_root: Optional[Path] = None
+) -> bool:
+    if not llama_module_path or llama_module_path == "missing":
+        return False
+    try:
+        return Path(llama_module_path).resolve() == _repo_local_llama_cpp_shim_path(
+            repo_root=repo_root
+        ).resolve()
+    except OSError:
+        return False
+
+
+def llama_cpp_shadowing_error(
+    llama_module_path: str, *, repo_root: Optional[Path] = None
+) -> str:
+    shim_path = _repo_local_llama_cpp_shim_path(repo_root=repo_root)
+    return (
+        "desktop runtime resolved llama_cpp to repo-local shim "
+        f"({llama_module_path}); expected installed llama-cpp-python package "
+        f"under site-packages. Remove shim shadowing from import path ({shim_path})."
     )
 
 
@@ -247,6 +278,17 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 
     selected_mode = (mode or "auto").strip().lower()
     before = _probe_llama_runtime()
+    target_root = repo_root or Path(__file__).resolve().parents[3]
+
+    if llama_cpp_path_is_repo_shim(before.llama_module_path, repo_root=target_root):
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": llama_cpp_shadowing_error(
+                before.llama_module_path, repo_root=target_root
+            ),
+            "runtime_action": "failed_shadowed_llama_cpp",
+            **_probe_result_payload(before),
+        }
 
     if selected_mode not in GPU_MODES:
         return {
@@ -285,7 +327,6 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
     last_error = ""
 
@@ -295,6 +336,15 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         if source_ok:
             _clear_source_repair_failure()
             after = _probe_llama_runtime()
+            if llama_cpp_path_is_repo_shim(after.llama_module_path, repo_root=target_root):
+                return {
+                    "selected_backend": "cpu",
+                    "fallback_reason": llama_cpp_shadowing_error(
+                        after.llama_module_path, repo_root=target_root
+                    ),
+                    "runtime_action": "failed_shadowed_llama_cpp",
+                    **_probe_result_payload(after),
+                }
             if after.gpu_offload_supported and after.backend == "cuda":
                 return {
                     "selected_backend": "cuda",
@@ -331,6 +381,15 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             continue
 
         after = _probe_llama_runtime()
+        if llama_cpp_path_is_repo_shim(after.llama_module_path, repo_root=target_root):
+            return {
+                "selected_backend": "cpu",
+                "fallback_reason": llama_cpp_shadowing_error(
+                    after.llama_module_path, repo_root=target_root
+                ),
+                "runtime_action": "failed_shadowed_llama_cpp",
+                **_probe_result_payload(after),
+            }
         if after.gpu_offload_supported and after.backend in {"cuda", "metal"}:
             return {
                 "selected_backend": after.backend,

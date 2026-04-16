@@ -36,10 +36,15 @@ def _offloaded_layer_count(value: Any) -> int:
 
 def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, Any]:
     from desktop_runtime_setup import ensure_desktop_llama_runtime
+    from desktop_runtime_setup import llama_cpp_path_is_repo_shim, llama_cpp_shadowing_error
     from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
     from utils.llm.model_manager import get_model_manager
 
     runtime_setup = ensure_desktop_llama_runtime(mode)
+    repo_root = _repo_root()
+    llama_module_path = runtime_setup.get('llama_module_path', 'missing')
+    if llama_cpp_path_is_repo_shim(llama_module_path, repo_root=repo_root):
+        raise RuntimeError(llama_cpp_shadowing_error(llama_module_path, repo_root=repo_root))
 
     manager = get_model_manager()
     manager.model_path = model_path
@@ -104,6 +109,7 @@ def main() -> int:
 
     repo_root = _repo_root()
     python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    os.environ.setdefault('TOKEN_PLACE_STRICT_LLAMA_IMPORT', '1')
     for entry in (str(repo_root), str(python_root)):
         if entry not in sys.path:
             sys.path.insert(0, entry)

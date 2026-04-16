@@ -131,6 +131,13 @@ It prints:
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
 
+Runtime verification now fails fast when `llama_module_path` resolves to the
+repo-local shim (`.../token.place/llama_cpp.py`), because that shadowed import
+cannot expose CUDA/Metal offload support. Expected good paths resolve to the
+installed `llama-cpp-python` package under the active interpreter's
+`site-packages` directory (for example
+`.../.venv/Lib/site-packages/llama_cpp/__init__.py` on Windows).
+
 ### Regression and smoke tests
 
 - Operator startup regression coverage (bridge startup event + surfaced errors):

@@ -215,6 +215,24 @@ def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
     assert probe.error == 'probe failed'
 
 
+def test_probe_sets_strict_llama_import_env(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = '{}'
+        stderr = ''
+
+    def fake_run(*_args, **kwargs):
+        captured['env'] = kwargs.get('env', {})
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+    _ = desktop_runtime_setup._probe_llama_runtime()
+    assert captured['env'][desktop_runtime_setup.STRICT_LLAMA_IMPORT_ENV] == '1'
+
+
 def test_maybe_reexec_for_runtime_refresh_skips_when_guard_set(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     called = {'execve': False}
@@ -261,6 +279,31 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 
     assert result['runtime_action'] == 'failed'
     assert result['fallback_reason'] == 'build failed'
+
+
+def test_runtime_bootstrap_fails_fast_when_llama_cpp_is_repo_shim(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    repo_root = Path('/tmp/token.place')
+    shim_path = str(repo_root / 'llama_cpp.py')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda: desktop_runtime_setup.RuntimeProbe(
+            backend='cpu',
+            gpu_offload_supported=False,
+            detected_device='cpu',
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path=shim_path,
+            error=None,
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=repo_root)
+
+    assert result['runtime_action'] == 'failed_shadowed_llama_cpp'
+    assert 'repo-local shim' in result['fallback_reason']
+    assert 'site-packages' in result['fallback_reason']
 
 
 def test_probe_marks_error_when_subprocess_raises(monkeypatch):

@@ -973,3 +973,15 @@ class TestModelManager:
         assert 'interpreter=' in summary
         assert 'llama_module_path=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary
+
+    def test_detect_runtime_capabilities_strict_mode_rejects_repo_shim(self, monkeypatch):
+        from utils.llm import model_manager as mm
+
+        shim_module = SimpleNamespace(__file__=str(Path.cwd() / 'llama_cpp.py'))
+        monkeypatch.setenv(mm.STRICT_LLAMA_IMPORT_ENV, '1')
+        monkeypatch.setattr(mm.importlib, 'import_module', lambda _name: shim_module)
+
+        payload = mm.detect_llama_runtime_capabilities()
+
+        assert payload['backend'] == 'missing'
+        assert 'repo-local llama_cpp shim' in payload['error']

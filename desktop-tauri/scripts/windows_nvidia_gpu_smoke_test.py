@@ -34,6 +34,13 @@ def _offloaded_layer_count(value: Any) -> int:
     return int(value or 0)
 
 
+def _is_repo_local_llama_shim(module_path: str, repo_root: Path) -> bool:
+    try:
+        return Path(module_path).resolve() == (repo_root / 'llama_cpp.py').resolve()
+    except Exception:
+        return False
+
+
 def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, Any]:
     from desktop_runtime_setup import ensure_desktop_llama_runtime
     from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
@@ -104,9 +111,11 @@ def main() -> int:
 
     repo_root = _repo_root()
     python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
-    for entry in (str(repo_root), str(python_root)):
-        if entry not in sys.path:
-            sys.path.insert(0, entry)
+    if str(python_root) not in sys.path:
+        sys.path.insert(0, str(python_root))
+    from path_bootstrap import ensure_runtime_import_paths
+
+    ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
     try:
         diagnostics = _load_compute_runtime_diagnostics(args.model, args.mode)
@@ -121,6 +130,10 @@ def main() -> int:
             'fallback_reason': diagnostics.get('fallback_reason'),
         }
         print(json.dumps(payload, indent=2))
+        _require(
+            not _is_repo_local_llama_shim(payload.get('llama_module_path', ''), repo_root),
+            'llama_module_path points to repo-local llama_cpp.py shim; expected installed package',
+        )
 
         _require(payload['backend_available'] == 'cuda', 'backend_available is not cuda')
         _require(payload['backend_used'] == 'cuda', 'backend_used is not cuda')

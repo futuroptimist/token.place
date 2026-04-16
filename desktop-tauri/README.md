@@ -131,6 +131,15 @@ It prints:
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
 
+Path sanity check for `llama_module_path`:
+
+- **Bad (shadowed shim):** `<repo-root>/llama_cpp.py`
+  (example: `C:\\Users\\<you>\\token.place\\llama_cpp.py`)
+- **Good (installed package):** interpreter `site-packages` path
+  (example: `...\\Lib\\site-packages\\llama_cpp\\__init__.py`)
+
+The verifier exits non-zero when `llama_module_path` points at the repo-local shim.
+
 ### Regression and smoke tests
 
 - Operator startup regression coverage (bridge startup event + surfaced errors):

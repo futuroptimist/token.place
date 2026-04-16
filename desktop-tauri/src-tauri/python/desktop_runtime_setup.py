@@ -42,8 +42,15 @@ import sys
 from pathlib import Path
 
 repo_root = Path.cwd()
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+repo_root_str = str(repo_root)
+sanitized_sys_path = []
+for entry in sys.path:
+    candidate = Path(entry or ".").resolve()
+    if candidate == repo_root:
+        continue
+    sanitized_sys_path.append(entry)
+sys.path[:] = sanitized_sys_path
+sys.path.append(repo_root_str)
 
 from utils.llm.model_manager import detect_llama_runtime_capabilities
 
@@ -52,14 +59,31 @@ print(json.dumps(payload))
 """.strip()
 
 
+def _is_repo_local_llama_shim(module_path: str, repo_root: Path) -> bool:
+    try:
+        resolved_module_path = Path(module_path).resolve()
+    except Exception:
+        return False
+    return resolved_module_path == (repo_root / "llama_cpp.py").resolve()
+
+
 def _probe_llama_runtime() -> RuntimeProbe:
     repo_root = Path(__file__).resolve().parents[3]
+    python_module_dir = Path(__file__).resolve().parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_entries = [str(repo_root)]
-    if existing_pythonpath:
-        pythonpath_entries.append(existing_pythonpath)
+    existing_pythonpath = env.get("PYTHONPATH", "").split(os.pathsep) if env.get("PYTHONPATH") else []
+    pythonpath_entries = [str(python_module_dir)]
+    for entry in existing_pythonpath:
+        if not entry:
+            continue
+        try:
+            if Path(entry).resolve() == repo_root:
+                continue
+        except Exception:
+            pass
+        if entry not in pythonpath_entries:
+            pythonpath_entries.append(entry)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     try:
         result = subprocess.run(
@@ -68,7 +92,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=str(repo_root),
+            cwd=str(python_module_dir),
             env=env,
         )
     except Exception as exc:
@@ -108,7 +132,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
             "error": stderr or "probe parse failure",
         }
 
-    return RuntimeProbe(
+    probe = RuntimeProbe(
         backend=str(payload.get("backend", "cpu")),
         gpu_offload_supported=bool(payload.get("gpu_offload_supported", False)),
         detected_device=str(payload.get("detected_device", "cpu")),
@@ -117,6 +141,21 @@ def _probe_llama_runtime() -> RuntimeProbe:
         llama_module_path=str(payload.get("llama_module_path", "missing")),
         error=payload.get("error"),
     )
+    if _is_repo_local_llama_shim(probe.llama_module_path, repo_root):
+        return RuntimeProbe(
+            backend="missing",
+            gpu_offload_supported=False,
+            detected_device="none",
+            interpreter=probe.interpreter,
+            prefix=probe.prefix,
+            llama_module_path=probe.llama_module_path,
+            error=(
+                "llama_cpp import shadowed by repo-local shim "
+                f"({probe.llama_module_path}); remove repo root from import precedence "
+                "and use the installed llama-cpp-python package from the sidecar interpreter"
+            ),
+        )
+    return probe
 
 
 def _run_pip_install(
@@ -246,7 +285,15 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
+    target_root = repo_root or Path(__file__).resolve().parents[3]
     before = _probe_llama_runtime()
+    if _is_repo_local_llama_shim(before.llama_module_path, target_root):
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": before.error or "llama_cpp import shadowed by repo-local shim",
+            "runtime_action": "shadowed_import",
+            **_probe_result_payload(before),
+        }
 
     if selected_mode not in GPU_MODES:
         return {
@@ -285,7 +332,6 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
     last_error = ""
 

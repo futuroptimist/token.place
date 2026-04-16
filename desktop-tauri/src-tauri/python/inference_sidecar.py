@@ -21,7 +21,7 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 from desktop_runtime_setup import ensure_desktop_llama_runtime, maybe_reexec_for_runtime_refresh
 
-ensure_runtime_import_paths(__file__)
+ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

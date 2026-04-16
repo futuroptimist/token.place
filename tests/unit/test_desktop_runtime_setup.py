@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -305,6 +306,89 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
     assert probe.backend == 'missing'
     assert probe.error == 'json parse failed'
     assert probe.llama_module_path == 'missing'
+
+
+def test_probe_detects_repo_local_llama_cpp_shadowing(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    repo_root = Path(__file__).resolve().parents[2]
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'cpu',
+                'gpu_offload_supported': False,
+                'detected_device': 'cpu',
+                'interpreter': sys.executable,
+                'prefix': sys.prefix,
+                'llama_module_path': str(repo_root / 'llama_cpp.py'),
+                'error': None,
+            }
+        )
+        stderr = ''
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+    assert probe.backend == 'missing'
+    assert 'shadowed by repo-local shim' in (probe.error or '')
+
+
+def test_probe_sanitizes_pythonpath_for_subprocess(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {}
+    repo_root = Path(__file__).resolve().parents[2]
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': sys.executable,
+                'prefix': sys.prefix,
+                'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+                'error': None,
+            }
+        )
+        stderr = ''
+
+    def _fake_run(*args, **kwargs):
+        captured['cwd'] = kwargs.get('cwd')
+        captured['env'] = kwargs.get('env', {})
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _fake_run)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join([str(repo_root), '/tmp/other-path']))
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+
+    assert probe.backend == 'cuda'
+    assert captured['cwd'].endswith('desktop-tauri/src-tauri/python')
+    pythonpath_entries = captured['env']['PYTHONPATH'].split(os.pathsep)
+    assert str(repo_root) not in pythonpath_entries
+    assert '/tmp/other-path' in pythonpath_entries
+
+
+def test_runtime_bootstrap_fails_fast_when_repo_local_shim_is_detected(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    repo_root = Path(__file__).resolve().parents[2]
+    shadowed_probe = desktop_runtime_setup.RuntimeProbe(
+        backend='missing',
+        gpu_offload_supported=False,
+        detected_device='none',
+        interpreter=sys.executable,
+        prefix=sys.prefix,
+        llama_module_path=str(repo_root / 'llama_cpp.py'),
+        error='llama_cpp import shadowed by repo-local shim',
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: shadowed_probe)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=repo_root)
+
+    assert result['runtime_action'] == 'shadowed_import'
+    assert 'shadowed by repo-local shim' in result['fallback_reason']
 
 
 def test_run_pip_install_success_failure_and_timeout(monkeypatch):

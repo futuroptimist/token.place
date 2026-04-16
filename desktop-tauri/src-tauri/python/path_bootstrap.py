@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 
-def ensure_runtime_import_paths(script_file: str) -> None:
+def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = False) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
     script_path = Path(script_file).resolve()
@@ -38,7 +38,28 @@ def ensure_runtime_import_paths(script_file: str) -> None:
             if candidate_str not in valid_candidates:
                 valid_candidates.append(candidate_str)
 
-    # Preserve candidate priority: first valid candidate should be first on sys.path.
-    for candidate_str in reversed(valid_candidates):
+    if not avoid_llama_cpp_shadowing:
+        # Preserve candidate priority: first valid candidate should be first on sys.path.
+        for candidate_str in reversed(valid_candidates):
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+        return
+
+    safe_candidates: list[str] = []
+    shim_candidates: list[str] = []
+    for candidate_str in valid_candidates:
+        if (Path(candidate_str) / "llama_cpp.py").is_file():
+            shim_candidates.append(candidate_str)
+        else:
+            safe_candidates.append(candidate_str)
+
+    # Keep non-shim runtime modules importable with highest priority.
+    for candidate_str in reversed(safe_candidates):
         if candidate_str not in sys.path:
             sys.path.insert(0, candidate_str)
+
+    # Keep shim-containing roots importable, but behind installed site-packages.
+    for candidate_str in shim_candidates:
+        while candidate_str in sys.path:
+            sys.path.remove(candidate_str)
+        sys.path.append(candidate_str)

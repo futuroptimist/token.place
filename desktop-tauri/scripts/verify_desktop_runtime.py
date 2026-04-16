@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 
 
+def _is_repo_local_llama_shim(module_path: str, repo_root: Path) -> bool:
+    try:
+        return Path(module_path).resolve() == (repo_root / 'llama_cpp.py').resolve()
+    except Exception:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Verify desktop llama runtime wiring')
     parser.add_argument('--mode', default='auto')
@@ -17,20 +24,31 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    if str(python_root) not in sys.path:
+        sys.path.insert(0, str(python_root))
+    from path_bootstrap import ensure_runtime_import_paths
 
+    ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+
+    from desktop_runtime_setup import ensure_desktop_llama_runtime
     from utils.llm.model_manager import detect_llama_runtime_capabilities
 
+    runtime_setup = ensure_desktop_llama_runtime(args.mode, repo_root=repo_root)
     runtime = detect_llama_runtime_capabilities()
     payload = {
-        'backend': runtime.get('backend', 'missing'),
+        'backend': runtime_setup.get('selected_backend', runtime.get('backend', 'missing')),
         'gpu_offload_supported': runtime.get('gpu_offload_supported', False),
-        'detected_device': runtime.get('detected_device', 'none'),
-        'interpreter': runtime.get('interpreter', sys.executable),
-        'prefix': runtime.get('prefix', sys.prefix),
-        'llama_module_path': runtime.get('llama_module_path', 'missing'),
-        'error': runtime.get('error'),
+        'detected_device': runtime_setup.get('detected_device', runtime.get('detected_device', 'none')),
+        'interpreter': runtime_setup.get('interpreter', runtime.get('interpreter', sys.executable)),
+        'prefix': runtime_setup.get('prefix', runtime.get('prefix', sys.prefix)),
+        'llama_module_path': runtime_setup.get(
+            'llama_module_path',
+            runtime.get('llama_module_path', 'missing'),
+        ),
+        'runtime_action': runtime_setup.get('runtime_action', 'unknown'),
+        'fallback_reason': runtime_setup.get('fallback_reason', ''),
+        'error': runtime_setup.get('fallback_reason') or runtime.get('error'),
     }
 
     try:
@@ -80,8 +98,17 @@ def main() -> int:
         payload['compute_runtime_pre_init'] = f'skipped (missing dependency: {exc})'
         payload['compute_runtime_post_init'] = 'skipped'
 
+    if _is_repo_local_llama_shim(payload['llama_module_path'], repo_root):
+        payload['error'] = (
+            'llama_cpp import shadowed by repo-local shim; expected installed '
+            'llama-cpp-python package path under site-packages'
+        )
+        payload['shadowing_detected'] = True
+    else:
+        payload['shadowing_detected'] = False
+
     print(json.dumps(payload, indent=2))
-    return 0
+    return 1 if payload['shadowing_detected'] else 0
 
 
 if __name__ == '__main__':

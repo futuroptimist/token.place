@@ -89,3 +89,20 @@ def test_bootstrap_prefers_explicit_env_import_root(tmp_path, path_bootstrap, mo
         assert sys.path.index(str(explicit_root)) == 0
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_avoids_llama_cpp_shadowing_when_requested(tmp_path, path_bootstrap):
+    script = tmp_path / 'repo' / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    repo_root = tmp_path / 'repo'
+    (repo_root / 'utils').mkdir(parents=True)
+    (repo_root / 'llama_cpp.py').write_text('# local shim\n', encoding='utf-8')
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(repo_root))
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        assert sys.path[-1] == str(repo_root)
+    finally:
+        sys.path[:] = original_sys_path

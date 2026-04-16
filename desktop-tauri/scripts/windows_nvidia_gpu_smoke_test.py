@@ -34,6 +34,15 @@ def _offloaded_layer_count(value: Any) -> int:
     return int(value or 0)
 
 
+def _is_repo_local_llama_module_path(module_path: str, repo_root: Path) -> bool:
+    if not module_path:
+        return False
+    try:
+        return Path(module_path).resolve() == (repo_root / 'llama_cpp.py').resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
 def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, Any]:
     from desktop_runtime_setup import ensure_desktop_llama_runtime
     from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
@@ -122,6 +131,11 @@ def main() -> int:
         }
         print(json.dumps(payload, indent=2))
 
+        _require(
+            not _is_repo_local_llama_module_path(payload['llama_module_path'], repo_root),
+            'llama_module_path resolved to repo-local llama_cpp.py instead of installed '
+            'llama-cpp-python package',
+        )
         _require(payload['backend_available'] == 'cuda', 'backend_available is not cuda')
         _require(payload['backend_used'] == 'cuda', 'backend_used is not cuda')
         _require(_offloaded_layer_count(payload.get('offloaded_layers')) > 0, 'offloaded_layers must be > 0')

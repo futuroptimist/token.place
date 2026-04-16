@@ -307,6 +307,79 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
     assert probe.llama_module_path == 'missing'
 
 
+def test_probe_reads_shadow_flag_from_payload(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'missing',
+                'gpu_offload_supported': False,
+                'detected_device': 'none',
+                'interpreter': 'python',
+                'prefix': 'prefix',
+                'llama_module_path': str(REPO_ROOT / 'llama_cpp.py'),
+                'shadowed_by_repo_shim': True,
+                'error': 'shadowed import',
+            }
+        )
+        stderr = ''
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _Result())
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+    assert probe.shadowed_by_repo_shim is True
+    assert probe.llama_module_path.endswith('llama_cpp.py')
+
+
+def test_probe_subprocess_sets_pythonpath_and_repo_cwd(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps({'backend': 'cpu'})
+        stderr = ''
+
+    def _fake_run(cmd, check, capture_output, text, timeout, cwd, env):
+        captured['cmd'] = cmd
+        captured['cwd'] = cwd
+        captured['pythonpath'] = env.get('PYTHONPATH', '')
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _fake_run)
+
+    desktop_runtime_setup._probe_llama_runtime()
+
+    assert captured['cmd'][:2] == [sys.executable, '-c']
+    assert captured['cwd'] == str(REPO_ROOT)
+    assert str(REPO_ROOT) in captured['pythonpath'].split(desktop_runtime_setup.os.pathsep)
+
+
+def test_runtime_bootstrap_fails_fast_when_llama_import_is_shadowed(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda: desktop_runtime_setup.RuntimeProbe(
+            backend='cpu',
+            gpu_offload_supported=False,
+            detected_device='cpu',
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path=str(REPO_ROOT / 'llama_cpp.py'),
+            shadowed_by_repo_shim=True,
+            error='shadowed import',
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert result['runtime_action'] == 'failed'
+    assert 'shadowed by repo-local llama_cpp.py' in result['fallback_reason']
+
+
 def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     class _OkResult:
         returncode = 0

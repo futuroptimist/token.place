@@ -10,6 +10,15 @@ import sys
 from pathlib import Path
 
 
+def _is_repo_local_llama_module_path(module_path: str, repo_root: Path) -> bool:
+    if not module_path:
+        return False
+    try:
+        return Path(module_path).resolve() == (repo_root / 'llama_cpp.py').resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Verify desktop llama runtime wiring')
     parser.add_argument('--mode', default='auto')
@@ -32,6 +41,16 @@ def main() -> int:
         'llama_module_path': runtime.get('llama_module_path', 'missing'),
         'error': runtime.get('error'),
     }
+    if _is_repo_local_llama_module_path(payload['llama_module_path'], repo_root):
+        payload['error'] = (
+            'llama_cpp import resolved to repo-local llama_cpp.py; '
+            'desktop verifier requires installed llama-cpp-python package path '
+            '(site-packages) in the sidecar interpreter'
+        )
+        payload['compute_runtime_pre_init'] = 'skipped'
+        payload['compute_runtime_post_init'] = 'skipped'
+        print(json.dumps(payload, indent=2))
+        return 1
 
     try:
         from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics

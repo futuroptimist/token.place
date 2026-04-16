@@ -131,6 +131,15 @@ It prints:
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
 
+The verifier output is authoritative for desktop sidecars. A **bad** shadowed
+path looks like:
+
+- `llama_module_path: C:\\...\\token.place\\llama_cpp.py`
+
+A **good** path points to the installed package code (typically under
+`site-packages`, e.g. `...\\Lib\\site-packages\\llama_cpp\\__init__.py`) for
+the sidecar interpreter.
+
 ### Regression and smoke tests
 
 - Operator startup regression coverage (bridge startup event + surfaced errors):

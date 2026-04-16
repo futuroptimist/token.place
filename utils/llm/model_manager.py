@@ -7,6 +7,7 @@ import logging
 import requests
 import json
 import sys
+import importlib
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -18,16 +19,80 @@ from utils.system import resource_monitor
 logger = logging.getLogger('model_manager')
 
 
+def _repo_local_llama_shim_path() -> Path:
+    return Path(__file__).resolve().parents[2] / 'llama_cpp.py'
+
+
+def _is_repo_local_llama_module_path(module_path: str) -> bool:
+    if not module_path:
+        return False
+    try:
+        return Path(module_path).resolve() == _repo_local_llama_shim_path().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _import_llama_cpp_prefer_installed_package() -> Any:
+    """Import llama_cpp while preventing repo-local shim shadowing."""
+    repo_root = _repo_local_llama_shim_path().parent.resolve()
+    original_sys_path = list(sys.path)
+    filtered_sys_path: list[str] = []
+    for entry in original_sys_path:
+        if entry == '':
+            resolved = Path.cwd().resolve()
+        else:
+            try:
+                resolved = Path(entry).resolve()
+            except (OSError, RuntimeError):
+                resolved = None
+        if resolved == repo_root:
+            continue
+        filtered_sys_path.append(entry)
+
+    existing_module = sys.modules.get('llama_cpp')
+    existing_module_path = str(getattr(existing_module, '__file__', '') or '')
+    if _is_repo_local_llama_module_path(existing_module_path):
+        sys.modules.pop('llama_cpp', None)
+
+    try:
+        sys.path[:] = filtered_sys_path
+        importlib.invalidate_caches()
+        import llama_cpp  # type: ignore
+    finally:
+        sys.path[:] = original_sys_path
+
+    return llama_cpp
+
+
 def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     """Return backend/offload capability details from the installed llama_cpp runtime."""
     try:
-        import llama_cpp
+        llama_cpp = _import_llama_cpp_prefer_installed_package()
     except Exception as exc:
         return {
             'backend': 'missing',
             'gpu_offload_supported': False,
             'detected_device': 'none',
+            'llama_module_path': 'missing',
             'error': str(exc),
+            'shadowed_by_repo_shim': False,
+        }
+
+    llama_module_path = str(getattr(llama_cpp, '__file__', 'unknown') or 'unknown')
+    if _is_repo_local_llama_module_path(llama_module_path):
+        return {
+            'backend': 'missing',
+            'gpu_offload_supported': False,
+            'detected_device': 'none',
+            'interpreter': sys.executable,
+            'prefix': sys.prefix,
+            'llama_module_path': llama_module_path,
+            'error': (
+                'llama_cpp import resolved to repo-local llama_cpp.py shim; '
+                'desktop runtime requires installed llama-cpp-python package '
+                '(site-packages) in the sidecar interpreter'
+            ),
+            'shadowed_by_repo_shim': True,
         }
 
     backend = 'cpu'
@@ -58,8 +123,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'detected_device': backend if gpu_offload_supported else 'cpu',
         'interpreter': sys.executable,
         'prefix': sys.prefix,
-        'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),
+        'llama_module_path': llama_module_path,
         'error': None,
+        'shadowed_by_repo_shim': False,
     }
 
 

@@ -9,7 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
@@ -26,6 +26,7 @@ class RuntimeProbe:
     interpreter: str
     prefix: str
     llama_module_path: str
+    shadowed_by_repo_shim: bool = False
     error: Optional[str] = None
 
 
@@ -79,6 +80,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
             interpreter=sys.executable,
             prefix=sys.prefix,
             llama_module_path="missing",
+            shadowed_by_repo_shim=False,
             error=str(exc),
         )
 
@@ -92,6 +94,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
             interpreter=sys.executable,
             prefix=sys.prefix,
             llama_module_path="missing",
+            shadowed_by_repo_shim=False,
             error=stderr or f"probe subprocess failed with return code {result.returncode}",
         )
 
@@ -115,8 +118,18 @@ def _probe_llama_runtime() -> RuntimeProbe:
         interpreter=str(payload.get("interpreter", sys.executable)),
         prefix=str(payload.get("prefix", sys.prefix)),
         llama_module_path=str(payload.get("llama_module_path", "missing")),
+        shadowed_by_repo_shim=bool(payload.get("shadowed_by_repo_shim", False)),
         error=payload.get("error"),
     )
+
+
+def _is_repo_local_llama_module_path(module_path: str, *, repo_root: Path) -> bool:
+    if not module_path:
+        return False
+    try:
+        return Path(module_path).resolve() == (repo_root / "llama_cpp.py").resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def _run_pip_install(
@@ -168,13 +181,14 @@ def _summarize_install_error(raw: str) -> str:
     return text.splitlines()[-1][:240]
 
 
-def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
+def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
     return {
         "detected_device": probe.detected_device or "cpu",
         "interpreter": probe.interpreter,
         "prefix": probe.prefix,
         "interpreter_prefix": probe.prefix,
         "llama_module_path": probe.llama_module_path,
+        "shadowed_by_repo_shim": probe.shadowed_by_repo_shim,
     }
 
 
@@ -246,13 +260,30 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
+    target_root = repo_root or Path(__file__).resolve().parents[3]
     before = _probe_llama_runtime()
+    shadowed_by_repo_shim = before.shadowed_by_repo_shim or _is_repo_local_llama_module_path(
+        before.llama_module_path,
+        repo_root=target_root,
+    )
 
     if selected_mode not in GPU_MODES:
         return {
             "selected_backend": "cpu",
             "fallback_reason": "cpu mode explicitly selected",
             "runtime_action": "skipped",
+            **_probe_result_payload(before),
+        }
+
+    if shadowed_by_repo_shim:
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                "llama_cpp import shadowed by repo-local llama_cpp.py; "
+                "use the sidecar interpreter where installed llama-cpp-python "
+                "is importable from site-packages"
+            ),
+            "runtime_action": "failed",
             **_probe_result_payload(before),
         }
 
@@ -285,7 +316,6 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
     last_error = ""
 

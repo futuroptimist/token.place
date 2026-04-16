@@ -50,6 +50,12 @@ def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, A
     return diagnostics
 
 
+def _is_repo_llama_shim(module_path: str, repo_root: Path) -> bool:
+    if not module_path:
+        return False
+    return str(Path(module_path).resolve()).lower() == str((repo_root / 'llama_cpp.py').resolve()).lower()
+
+
 def _run_bridge_oneshot(model_path: str, mode: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     repo_root = _repo_root()
     python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
@@ -107,6 +113,9 @@ def main() -> int:
     for entry in (str(repo_root), str(python_root)):
         if entry not in sys.path:
             sys.path.insert(0, entry)
+    from path_bootstrap import ensure_runtime_import_paths
+
+    ensure_runtime_import_paths(__file__)
 
     try:
         diagnostics = _load_compute_runtime_diagnostics(args.model, args.mode)
@@ -122,6 +131,10 @@ def main() -> int:
         }
         print(json.dumps(payload, indent=2))
 
+        _require(
+            not _is_repo_llama_shim(str(payload.get('llama_module_path') or ''), repo_root),
+            'llama_module_path resolved to repo-local llama_cpp.py shim; expected site-packages package',
+        )
         _require(payload['backend_available'] == 'cuda', 'backend_available is not cuda')
         _require(payload['backend_used'] == 'cuda', 'backend_used is not cuda')
         _require(_offloaded_layer_count(payload.get('offloaded_layers')) > 0, 'offloaded_layers must be > 0')
@@ -140,6 +153,10 @@ def main() -> int:
             )
         )
         _require(bool(started), 'compute_node_bridge.py did not emit a started event')
+        _require(
+            not _is_repo_llama_shim(str(started.get('llama_module_path') or ''), repo_root),
+            'bridge started.llama_module_path resolved to repo-local llama_cpp.py shim',
+        )
         _require(started.get('backend_available') == 'cuda', 'bridge started.backend_available is not cuda')
         _require(started.get('backend_used') == 'cuda', 'bridge started.backend_used is not cuda')
         _require(

@@ -291,6 +291,40 @@ def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
     assert probe.error == 'probe subprocess failed with return code 9'
 
 
+def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': sys.executable,
+                'prefix': sys.prefix,
+                'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+            }
+        )
+        stderr = ''
+
+    def _fake_run(cmd, **kwargs):
+        captured['cmd'] = cmd
+        captured['env'] = kwargs.get('env', {})
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _fake_run)
+    probe = desktop_runtime_setup._probe_llama_runtime()
+
+    assert probe.backend == 'cuda'
+    assert "Path(entry or \".\").resolve()" in desktop_runtime_setup._PROBE_SNIPPET
+    assert captured['cmd'][:2] == [sys.executable, '-c']
+    assert captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)[0] == str(
+        Path(__file__).resolve().parents[2]
+    )
+
+
 def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
@@ -305,6 +339,31 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
     assert probe.backend == 'missing'
     assert probe.error == 'json parse failed'
     assert probe.llama_module_path == 'missing'
+
+
+def test_runtime_bootstrap_fails_fast_when_repo_local_llama_shim_is_detected(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    repo_root = tmp_path / 'repo'
+    repo_root.mkdir(parents=True)
+    (repo_root / 'llama_cpp.py').write_text('# shim\n', encoding='utf-8')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda: desktop_runtime_setup.RuntimeProbe(
+            backend='cpu',
+            gpu_offload_supported=False,
+            detected_device='cpu',
+            interpreter=sys.executable,
+            prefix=sys.prefix,
+            llama_module_path=str((repo_root / 'llama_cpp.py').resolve()),
+            error=None,
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=repo_root)
+
+    assert result['runtime_action'] == 'shadowed_repo_llama_cpp'
+    assert 'repo-local shim' in result['fallback_reason']
 
 
 def test_run_pip_install_success_failure_and_timeout(monkeypatch):

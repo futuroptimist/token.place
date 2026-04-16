@@ -89,3 +89,26 @@ def test_bootstrap_prefers_explicit_env_import_root(tmp_path, path_bootstrap, mo
         assert sys.path.index(str(explicit_root)) == 0
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_keeps_repo_root_importable_without_shadowing_llama_cpp(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    script = tmp_path / 'repo' / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    repo_root = tmp_path / 'repo'
+    (repo_root / 'utils').mkdir(parents=True)
+    (repo_root / 'llama_cpp.py').write_text('# shim\n', encoding='utf-8')
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        monkeypatch.chdir(repo_root)
+        # Simulate startup from repo root so `''` would shadow llama_cpp.
+        sys.path.insert(0, '')
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert str(repo_root) in sys.path
+        assert sys.path.index(str(repo_root)) > 0
+        assert '' not in sys.path
+    finally:
+        sys.path[:] = original_sys_path

@@ -42,3 +42,24 @@ def ensure_runtime_import_paths(script_file: str) -> None:
     for candidate_str in reversed(valid_candidates):
         if candidate_str not in sys.path:
             sys.path.insert(0, candidate_str)
+
+    # Prevent repo-local `llama_cpp.py` from shadowing installed llama-cpp-python.
+    for candidate_str in valid_candidates:
+        candidate = Path(candidate_str)
+        if not (candidate / "llama_cpp.py").is_file():
+            continue
+
+        # Keep the repo import root available, but place it behind site-packages so
+        # `import llama_cpp` resolves to the installed package.
+        while candidate_str in sys.path:
+            sys.path.remove(candidate_str)
+        sys.path.append(candidate_str)
+
+        cwd = str(Path.cwd().resolve())
+        if candidate.resolve() == Path.cwd().resolve():
+            while "" in sys.path:
+                sys.path.remove("")
+            if cwd in sys.path:
+                while cwd in sys.path:
+                    sys.path.remove(cwd)
+                sys.path.append(cwd)

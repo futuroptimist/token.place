@@ -160,6 +160,8 @@ def run(args: argparse.Namespace) -> int:
             "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
             "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
+            "interpreter": runtime_setup.get("interpreter", sys.executable),
+            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
             "last_error": None,
         }
@@ -207,6 +209,8 @@ def run(args: argparse.Namespace) -> int:
                     ),
                     "kv_cache_device": diagnostics.get("kv_cache_device"),
                     "fallback_reason": diagnostics.get("fallback_reason"),
+                    "interpreter": runtime_setup.get("interpreter", sys.executable),
+                    "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
                     "model_path": args.model,
                     "last_error": last_error,
                 }
@@ -233,6 +237,8 @@ def run(args: argparse.Namespace) -> int:
             "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
             "kv_cache_device": diagnostics.get("kv_cache_device"),
             "fallback_reason": diagnostics.get("fallback_reason"),
+            "interpreter": runtime_setup.get("interpreter", sys.executable),
+            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
             "last_error": None,
         }

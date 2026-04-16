@@ -18,13 +18,12 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parents[2]
     python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
-    for entry in (str(python_root), str(repo_root)):
-        if entry not in sys.path:
-            sys.path.insert(0, entry)
+    if str(python_root) not in sys.path:
+        sys.path.insert(0, str(python_root))
 
     from path_bootstrap import ensure_runtime_import_paths
 
-    ensure_runtime_import_paths(__file__)
+    ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
     repo_llama_shim = str((repo_root / 'llama_cpp.py').resolve())
 
     from utils.llm.model_manager import detect_llama_runtime_capabilities

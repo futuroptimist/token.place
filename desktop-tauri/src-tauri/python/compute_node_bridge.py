@@ -35,7 +35,7 @@ except ModuleNotFoundError:
     ) -> None:
         return
 
-ensure_runtime_import_paths(__file__)
+ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

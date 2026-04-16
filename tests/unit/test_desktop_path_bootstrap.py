@@ -106,12 +106,12 @@ def test_bootstrap_keeps_repo_root_importable_without_shadowing_llama_cpp(
         monkeypatch.chdir(repo_root)
         # Simulate startup from repo root so `''` would shadow llama_cpp.
         sys.path.insert(0, '')
-        path_bootstrap.ensure_runtime_import_paths(str(script))
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
         assert str(repo_root) in sys.path
         repo_index = sys.path.index(str(repo_root))
         site_packages_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry]
         if site_packages_indices:
-            assert repo_index < min(site_packages_indices)
+            assert repo_index > max(site_packages_indices)
         assert '' not in sys.path
     finally:
         sys.path[:] = original_sys_path
@@ -129,8 +129,54 @@ def test_bootstrap_readds_explicit_cwd_when_only_empty_entry_present(tmp_path, p
     try:
         monkeypatch.chdir(repo_root)
         sys.path[:] = ['']
-        path_bootstrap.ensure_runtime_import_paths(str(script))
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
         assert '' not in sys.path
         assert str(repo_root.resolve()) in sys.path
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_preserves_repo_utils_imports_while_preventing_llama_shadowing(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    repo_root = tmp_path / 'repo'
+    script = repo_root / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    site_packages = tmp_path / 'venv' / 'Lib' / 'site-packages'
+    utils_pkg = repo_root / 'utils'
+    llm_pkg = utils_pkg / 'llm'
+
+    llm_pkg.mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    (utils_pkg / '__init__.py').write_text('', encoding='utf-8')
+    (llm_pkg / '__init__.py').write_text('', encoding='utf-8')
+    (llm_pkg / 'model_manager.py').write_text(
+        'import importlib\n'
+        'def initialize_model_runtime():\n'
+        '    module = importlib.import_module("llama_cpp")\n'
+        '    return module.__file__\n',
+        encoding='utf-8',
+    )
+    (repo_root / 'llama_cpp.py').write_text('SOURCE = "repo-shim"\n', encoding='utf-8')
+    (site_packages / 'llama_cpp.py').write_text('SOURCE = "site-packages"\n', encoding='utf-8')
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    original_modules = dict(sys.modules)
+    try:
+        monkeypatch.chdir(repo_root)
+        sys.path[:] = ['', str(site_packages)]
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+
+        from utils.llm import model_manager  # noqa: PLC0415
+
+        llama_module_path = Path(model_manager.initialize_model_runtime()).resolve()
+        imported_utils_path = Path(model_manager.__file__).resolve()
+
+        assert imported_utils_path.is_relative_to(repo_root.resolve())
+        assert llama_module_path == (site_packages / 'llama_cpp.py').resolve()
+        assert llama_module_path != (repo_root / 'llama_cpp.py').resolve()
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.clear()
+        sys.modules.update(original_modules)

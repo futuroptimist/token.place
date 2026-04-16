@@ -126,6 +126,8 @@ The verifier exits non-zero if `llama_module_path` points at the repo-local shim
 (`.../token.place/llama_cpp.py`). A healthy runtime should resolve
 `llama_module_path` to the installed `llama-cpp-python` package path (for
 example `.../site-packages/llama_cpp/__init__.py`).
+When this shadowing is detected, the stable runtime action is
+`shadowed_repo_llama_cpp` in both verifier and smoke-test diagnostics.
 
 It prints:
 

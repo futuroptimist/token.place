@@ -17,11 +17,19 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    if str(python_root) not in sys.path:
+        sys.path.insert(0, str(python_root))
+
+    from path_bootstrap import ensure_runtime_import_paths
+
+    ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+    repo_llama_shim = str((repo_root / 'llama_cpp.py').resolve())
 
     from utils.llm.model_manager import detect_llama_runtime_capabilities
+    from desktop_runtime_setup import ensure_desktop_llama_runtime
 
+    runtime_setup = ensure_desktop_llama_runtime(args.mode, repo_root=repo_root)
     runtime = detect_llama_runtime_capabilities()
     payload = {
         'backend': runtime.get('backend', 'missing'),
@@ -31,7 +39,14 @@ def main() -> int:
         'prefix': runtime.get('prefix', sys.prefix),
         'llama_module_path': runtime.get('llama_module_path', 'missing'),
         'error': runtime.get('error'),
+        'runtime_setup': runtime_setup,
     }
+    if str(payload['llama_module_path']).lower() == repo_llama_shim.lower():
+        payload['error'] = (
+            'llama_cpp resolved to repo-local shim '
+            f'({payload["llama_module_path"]}); expected installed llama-cpp-python module '
+            'under site-packages'
+        )
 
     try:
         from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
@@ -81,6 +96,10 @@ def main() -> int:
         payload['compute_runtime_post_init'] = 'skipped'
 
     print(json.dumps(payload, indent=2))
+    if str(payload['llama_module_path']).lower() == repo_llama_shim.lower():
+        return 1
+    if runtime_setup.get('runtime_action') == 'shadowed_repo_llama_cpp':
+        return 1
     return 0
 
 

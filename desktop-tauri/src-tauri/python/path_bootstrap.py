@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 from pathlib import Path
 
 
-def ensure_runtime_import_paths(script_file: str) -> None:
+def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
     script_path = Path(script_file).resolve()
@@ -42,3 +42,34 @@ def ensure_runtime_import_paths(script_file: str) -> None:
     for candidate_str in reversed(valid_candidates):
         if candidate_str not in sys.path:
             sys.path.insert(0, candidate_str)
+
+    if not avoid_llama_cpp_shadowing:
+        return
+
+    # Keep repo roots importable for `utils.*` / `config` while avoiding local
+    # llama_cpp.py shim precedence over site-packages.
+    for candidate_str in valid_candidates:
+        candidate = Path(candidate_str)
+        if not (candidate / "llama_cpp.py").is_file():
+            continue
+
+        cwd = str(Path.cwd().resolve())
+        if candidate.resolve() == Path.cwd().resolve():
+            while "" in sys.path:
+                sys.path.remove("")
+            while cwd in sys.path:
+                sys.path.remove(cwd)
+            # Preserve an explicit resolved cwd path when candidate/cwd differ
+            # by symlink representation.
+            if cwd != candidate_str:
+                sys.path.append(cwd)
+
+        while candidate_str in sys.path:
+            sys.path.remove(candidate_str)
+
+        preferred_index = len(sys.path)
+        for idx, entry in enumerate(sys.path):
+            normalized = str(entry).replace("\\", "/").lower()
+            if "site-packages" in normalized or "dist-packages" in normalized:
+                preferred_index = idx + 1
+        sys.path.insert(preferred_index, candidate_str)

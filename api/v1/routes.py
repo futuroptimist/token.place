@@ -6,6 +6,7 @@ This module follows OpenAI API conventions to serve as a drop-in replacement.
 from flask import Blueprint, request, jsonify
 import base64
 import time
+import zlib
 import json
 import uuid
 import logging
@@ -538,31 +539,9 @@ def list_models():
         log_info("API request: GET /models")
         models = get_models_info()
 
-        # Transform to OpenAI format
-        formatted_models = []
-        for model in models:
-            formatted_models.append({
-                "id": model["id"],
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "token.place",
-                "permission": [{
-                    "id": f"modelperm-{model['id']}",
-                    "object": "model_permission",
-                    "created": int(time.time()),
-                    "allow_create_engine": False,
-                    "allow_sampling": True,
-                    "allow_logprobs": True,
-                    "allow_search_indices": False,
-                    "allow_view": True,
-                    "allow_fine_tuning": False,
-                    "organization": "*",
-                    "group": None,
-                    "is_blocking": False
-                }],
-                "root": model["id"],
-                "parent": None
-            })
+        # Transform to OpenAI format with deterministic `created` values so
+        # /api/v1 and /v1 aliases produce byte-for-byte equivalent payloads.
+        formatted_models = [_format_openai_model_payload(model) for model in models]
 
         log_info(f"Returning {len(formatted_models)} models")
         return jsonify({
@@ -656,28 +635,7 @@ def get_model(model_id):
             )
 
         log_info(f"Returning model details for {model_id}")
-        return jsonify({
-            "id": model["id"],
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "token.place",
-            "permission": [{
-                "id": f"modelperm-{model['id']}",
-                "object": "model_permission",
-                "created": int(time.time()),
-                "allow_create_engine": False,
-                "allow_sampling": True,
-                "allow_logprobs": True,
-                "allow_search_indices": False,
-                "allow_view": True,
-                "allow_fine_tuning": False,
-                "organization": "*",
-                "group": None,
-                "is_blocking": False
-            }],
-            "root": model["id"],
-            "parent": None
-        })
+        return jsonify(_format_openai_model_payload(model))
     except Exception as e:
         log_error(f"Error in get_model endpoint for model {model_id}")
         return format_error_response(f"Internal server error: {str(e)}")
@@ -933,6 +891,42 @@ def create_completion():
     log_info("API request: POST /completions")
     data = request.get_json()
     return _handle_text_completion_request(data)
+
+
+def _stable_openai_model_created(model_id: str) -> int:
+    """Return a deterministic pseudo-created timestamp for OpenAI model payloads."""
+
+    # Keep model metadata stable across alias/canonical route calls, while still
+    # returning a realistic epoch-like integer.
+    return 1_700_000_000 + (zlib.crc32(model_id.encode("utf-8")) % 31_536_000)
+
+
+def _format_openai_model_payload(model: dict[str, str]) -> dict[str, object]:
+    """Build a stable OpenAI-compatible model payload."""
+
+    created_ts = _stable_openai_model_created(model["id"])
+    return {
+        "id": model["id"],
+        "object": "model",
+        "created": created_ts,
+        "owned_by": "token.place",
+        "permission": [{
+            "id": f"modelperm-{model['id']}",
+            "object": "model_permission",
+            "created": created_ts,
+            "allow_create_engine": False,
+            "allow_sampling": True,
+            "allow_logprobs": True,
+            "allow_search_indices": False,
+            "allow_view": True,
+            "allow_fine_tuning": False,
+            "organization": "*",
+            "group": None,
+            "is_blocking": False
+        }],
+        "root": model["id"],
+        "parent": None
+    }
 
 
 @v1_bp.route('/health', methods=['GET'])

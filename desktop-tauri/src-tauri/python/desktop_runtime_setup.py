@@ -46,6 +46,18 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from utils.llm.model_manager import detect_llama_runtime_capabilities
+# NOTE: detect_llama_runtime_capabilities must keep `import llama_cpp` lazy
+# (inside the function body). We sanitize sys.path below before that import
+# runs so site-packages can win over a repo-local llama_cpp.py shim.
+
+repo_root_resolved = str(repo_root.resolve())
+sanitized = []
+for entry in sys.path:
+    resolved_entry = str(Path(entry or ".").resolve())
+    if resolved_entry == repo_root_resolved:
+        continue
+    sanitized.append(entry)
+sys.path[:] = sanitized
 
 payload = detect_llama_runtime_capabilities()
 print(json.dumps(payload))
@@ -178,6 +190,22 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
     }
 
 
+def _repo_llama_shim_path(repo_root: Path) -> str:
+    return str((repo_root / "llama_cpp.py").resolve())
+
+
+def _is_repo_local_llama_module(module_path: str, repo_root: Path) -> bool:
+    module = str(module_path or "").strip()
+    if not module:
+        return False
+    try:
+        resolved_module = os.path.normcase(str(Path(module).resolve())).casefold()
+        repo_shim = os.path.normcase(_repo_llama_shim_path(repo_root)).casefold()
+        return resolved_module == repo_shim
+    except OSError:
+        return False
+
+
 def _runtime_state_path() -> Path:
     return Path.home() / ".token_place_desktop_runtime_state.json"
 
@@ -246,7 +274,19 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
+    target_root = (repo_root or Path(__file__).resolve().parents[3]).resolve()
     before = _probe_llama_runtime()
+    if _is_repo_local_llama_module(before.llama_module_path, target_root):
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                "llama_cpp import shadowed by repo-local shim "
+                f"({before.llama_module_path}); remove repo root from import precedence "
+                "or run via desktop sidecar bootstrap so site-packages llama-cpp-python is used"
+            ),
+            "runtime_action": "shadowed_repo_llama_cpp",
+            **_probe_result_payload(before),
+        }
 
     if selected_mode not in GPU_MODES:
         return {
@@ -285,7 +325,6 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    target_root = repo_root or Path(__file__).resolve().parents[3]
     requirements_path = target_root / "requirements.txt"
     last_error = ""
 

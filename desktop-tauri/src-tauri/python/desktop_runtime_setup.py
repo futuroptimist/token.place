@@ -159,7 +159,7 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
     env["FORCE_CMAKE"] = "1"
-    package_spec = llama_cpp_requirement_spec(requirements_path)
+    package_spec = _llama_cpp_package_spec(requirements_path)
     cmd = [
         sys.executable,
         "-m",
@@ -171,6 +171,13 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
         "--verbose",
     ]
     return _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+
+
+def _llama_cpp_package_spec(requirements_path: Path) -> str:
+    try:
+        return llama_cpp_requirement_spec(requirements_path)
+    except (FileNotFoundError, OSError, ValueError):
+        return "llama-cpp-python"
 
 
 def _summarize_install_error(raw: str) -> str:
@@ -326,6 +333,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         }
 
     requirements_path = target_root / "requirements.txt"
+    requirements_available = requirements_path.is_file()
     last_error = ""
 
     should_repair, repair_skip_reason = _should_attempt_source_repair()
@@ -353,11 +361,15 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         last_error = repair_skip_reason
 
     try:
-        plans = llama_cpp_install_plan_fallbacks(
-            platform=sys.platform,
-            requirements_path=requirements_path,
+        plans = (
+            llama_cpp_install_plan_fallbacks(
+                platform=sys.platform,
+                requirements_path=requirements_path,
+            )
+            if requirements_available
+            else _fallback_unpinned_plans(sys.platform)
         )
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, OSError, ValueError):
         plans = _fallback_unpinned_plans(sys.platform)
 
     for plan in plans:

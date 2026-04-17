@@ -200,6 +200,21 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
 
 
+def test_llama_cpp_package_spec_prefers_pinned_requirement_when_present(tmp_path):
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama-cpp-python==0.3.7\n', encoding='utf-8')
+
+    assert (
+        desktop_runtime_setup._llama_cpp_package_spec(requirements_path)
+        == 'llama-cpp-python==0.3.7'
+    )
+
+
+def test_llama_cpp_package_spec_falls_back_when_requirements_missing(tmp_path):
+    missing_requirements = tmp_path / 'requirements.txt'
+    assert desktop_runtime_setup._llama_cpp_package_spec(missing_requirements) == 'llama-cpp-python'
+
+
 def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
@@ -261,6 +276,49 @@ def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
 
     assert result['runtime_action'] == 'failed'
     assert result['fallback_reason'] == 'build failed'
+
+
+def test_windows_packaged_layout_without_requirements_uses_safe_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    repo_root = tmp_path / 'AppData' / 'token-place-runtime'
+    repo_root.mkdir(parents=True)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_windows_cuda_source_repair',
+        lambda _requirements_path: (False, 'compile failed'),
+    )
+
+    fallback_plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cpu',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://pypi.org/simple',
+            extra_index_url=None,
+            only_binary=True,
+            no_binary=False,
+        )
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: fallback_plans)
+
+    called = {'fallback_from_requirements': False}
+
+    def _unexpected_fallbacks(**_kwargs):
+        called['fallback_from_requirements'] = True
+        return []
+
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', _unexpected_fallbacks)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=repo_root)
+
+    assert result['runtime_action'] == 'installed_cpu_fallback'
+    assert called['fallback_from_requirements'] is False
 
 
 def test_probe_marks_error_when_subprocess_raises(monkeypatch):

@@ -842,6 +842,22 @@ class TestModelManager:
 
         assert backend == 'metal'
 
+    def test_platform_gpu_backend_detects_cuda_marker_from_nested_llama_cpp_module(self):
+        """Backend probe should honor GGML markers exposed on llama_cpp.llama_cpp."""
+        nested = SimpleNamespace(GGML_USE_CUDA=True, GGML_USE_METAL=False)
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            llama_cpp=nested,
+            __file__=str(Path(__file__).resolve()),
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            payload = ModelManager._platform_gpu_backend()
+
+        assert payload == 'cuda'
+
     def test_platform_gpu_backend_linux_uses_gpu_offload_probe(self):
         """Linux backend detection should map positive runtime probes to CUDA."""
         fake_llama = SimpleNamespace(
@@ -939,6 +955,45 @@ class TestModelManager:
         assert payload['gpu_offload_supported'] is False
         assert payload['detected_device'] == 'none'
         assert "No module named 'llama_cpp'" in payload['error']
+
+    def test_detect_runtime_capabilities_uses_nested_gpu_probe_when_top_level_missing(self):
+        from utils.llm import model_manager as mm
+
+        nested = SimpleNamespace(llama_supports_gpu_offload=lambda: True)
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            llama_cpp=nested,
+            __file__=str(Path(__file__).resolve()),
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            payload = mm.detect_llama_runtime_capabilities()
+
+        assert payload['backend'] == 'cuda'
+        assert payload['gpu_offload_supported'] is True
+
+    def test_detect_runtime_capabilities_uses_packaged_ggml_cuda_library_hint(self, tmp_path):
+        from utils.llm import model_manager as mm
+
+        pkg_dir = tmp_path / 'llama_cpp'
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / '__init__.py').write_text('', encoding='utf-8')
+        (pkg_dir / 'ggml-cuda.dll').write_text('binary-placeholder', encoding='utf-8')
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            __file__=str(pkg_dir / '__init__.py'),
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            payload = mm.detect_llama_runtime_capabilities()
+
+        assert payload['backend'] == 'cuda'
+        assert payload['gpu_offload_supported'] is True
+        assert payload['detected_device'] == 'cuda'
 
     def test_compute_runtime_log_includes_backend_device_offload_and_fallback(self, model_manager):
         class FakeLlama:

@@ -56,7 +56,7 @@ source-build recipe:
 
 - `CMAKE_ARGS=-DGGML_CUDA=on`
 - `FORCE_CMAKE=1`
-- `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+- `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --upgrade --no-cache-dir --no-binary llama-cpp-python --verbose`
 
 After a successful repair, the sidecar automatically re-execs once so the active
 process immediately uses the repaired runtime (no manual restart/environment flag required).

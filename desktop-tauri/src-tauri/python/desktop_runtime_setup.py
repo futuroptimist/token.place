@@ -35,6 +35,7 @@ PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
+WINDOWS_CUDA_WHEEL_SUPPORTED_PYTHON = {(3, 10), (3, 11), (3, 12)}
 
 _PROBE_SNIPPET = """
 import json
@@ -177,8 +178,11 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
         "pip",
         "install",
         package_spec,
+        "--upgrade",
         "--force-reinstall",
         "--no-cache-dir",
+        "--no-binary",
+        "llama-cpp-python",
         "--verbose",
     ]
     return _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
@@ -219,6 +223,15 @@ def _is_repo_local_llama_module(module_path: str, repo_root: Path) -> bool:
 
 def _runtime_state_path() -> Path:
     return Path.home() / ".token_place_desktop_runtime_state.json"
+
+
+def _windows_cuda_wheel_supported_python() -> bool:
+    version_info = getattr(sys, "version_info", None)
+    if version_info is None:
+        return True
+    major = int(getattr(version_info, "major", 0))
+    minor = int(getattr(version_info, "minor", 0))
+    return (major, minor) in WINDOWS_CUDA_WHEEL_SUPPORTED_PYTHON
 
 
 def _load_runtime_state() -> dict:
@@ -371,6 +384,20 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     except (FileNotFoundError, ValueError):
         plans = _fallback_unpinned_plans(sys.platform)
 
+    cuda_wheels_supported = _windows_cuda_wheel_supported_python()
+    if sys.platform.startswith("win") and not cuda_wheels_supported:
+        version_info = getattr(sys, "version_info", None)
+        active_major = int(getattr(version_info, "major", 0))
+        active_minor = int(getattr(version_info, "minor", 0))
+        supported_versions = ", ".join(
+            f"{major}.{minor}" for major, minor in sorted(WINDOWS_CUDA_WHEEL_SUPPORTED_PYTHON)
+        )
+        last_error = (
+            f"Windows CUDA wheels are published for Python versions {supported_versions}; "
+            f"active interpreter is {active_major}.{active_minor}"
+        )
+        plans = [plan for plan in plans if plan.backend != "cuda"]
+
     for plan in plans:
         env = os.environ.copy()
         env.update(plan.pip_env())
@@ -390,9 +417,12 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             }
 
         if plan.backend == "cpu":
+            fallback_reason = "GPU runtime unavailable after repair; using CPU runtime"
+            if last_error:
+                fallback_reason = f"{fallback_reason} ({last_error})"
             return {
                 "selected_backend": "cpu",
-                "fallback_reason": "GPU runtime unavailable after repair; using CPU runtime",
+                "fallback_reason": fallback_reason,
                 "runtime_action": "installed_cpu_fallback",
                 **_probe_result_payload(after),
             }

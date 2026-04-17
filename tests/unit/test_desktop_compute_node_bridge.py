@@ -356,6 +356,54 @@ def test_run_continues_when_runtime_setup_reports_missing_packaged_requirements(
     assert '[Errno 2]' not in json.dumps(events)
 
 
+def test_run_surfaces_gpu_capable_startup_status_fields(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'already_supported',
+            'fallback_reason': '',
+            'interpreter': sys.executable,
+            'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        },
+    )
+    runtime_module = sys.modules['utils.compute_node_runtime']
+    runtime_module.compute_mode_diagnostics = lambda _manager: {
+        'requested_mode': 'auto',
+        'effective_mode': 'cuda',
+        'backend_available': 'cuda',
+        'backend_selected': 'cuda',
+        'backend_used': 'cuda',
+        'offloaded_layers': -1,
+        'n_gpu_layers': -1,
+        'kv_cache_device': 'cuda',
+        'fallback_reason': None,
+    }
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    started = events[0]
+    assert started['type'] == 'started'
+    assert started['effective_mode'] == 'cuda'
+    assert started['backend_used'] == 'cuda'
+    assert started['offloaded_layers'] == -1
+    assert started['kv_cache_device'] == 'cuda'
+    assert started['fallback_reason'] is None
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

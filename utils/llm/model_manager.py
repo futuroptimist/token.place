@@ -30,13 +30,48 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             'error': str(exc),
         }
 
+    def _backend_marker(module: Any, attr: str) -> bool:
+        return bool(getattr(module, attr, False))
+
+    def _first_backend_marker() -> Optional[str]:
+        candidates: list[Any] = [llama_cpp]
+        nested = getattr(llama_cpp, 'llama_cpp', None)
+        if nested is not None:
+            candidates.append(nested)
+
+        for module in candidates:
+            if _backend_marker(module, 'GGML_USE_CUDA'):
+                return 'cuda'
+            if _backend_marker(module, 'GGML_USE_METAL'):
+                return 'metal'
+        return None
+
+    def _package_file_backend_hint() -> Optional[str]:
+        module_path = Path(str(getattr(llama_cpp, '__file__', '') or ''))
+        if not module_path:
+            return None
+        package_dir = module_path.parent
+        if not package_dir.is_dir():
+            return None
+        for candidate in package_dir.rglob('*'):
+            if not candidate.is_file():
+                continue
+            name = candidate.name.lower()
+            if 'ggml-cuda' in name:
+                return 'cuda'
+            if 'ggml-metal' in name:
+                return 'metal'
+        return None
+
     backend = 'cpu'
-    if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
-        backend = 'cuda'
-    elif bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
-        backend = 'metal'
+    marker_backend = _first_backend_marker()
+    if marker_backend:
+        backend = marker_backend
 
     supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
+    if not callable(supports_gpu):
+        nested = getattr(llama_cpp, 'llama_cpp', None)
+        supports_gpu = getattr(nested, 'llama_supports_gpu_offload', None)
     gpu_offload_supported = False
     if callable(supports_gpu):
         try:
@@ -45,6 +80,12 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             gpu_offload_supported = False
     else:
         gpu_offload_supported = backend in {'cuda', 'metal'}
+
+    if backend == 'cpu':
+        file_backend_hint = _package_file_backend_hint()
+        if file_backend_hint in {'cuda', 'metal'}:
+            backend = file_backend_hint
+            gpu_offload_supported = True
 
     # Some llama_cpp builds can report runtime GPU offload support via probe
     # without exposing GGML_USE_* backend markers. Preserve prior Linux behavior

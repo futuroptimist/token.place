@@ -23,6 +23,7 @@ class _SysStub:
     executable = sys.executable
     prefix = sys.prefix
     argv = [str(MODULE_PATH)]
+    version_info = sys.version_info
 
 
 def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
@@ -195,9 +196,65 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     assert ok is True
     assert captured['cmd'][:3] == [sys.executable, '-m', 'pip']
     assert captured['cmd'][4].startswith('llama-cpp-python==')
+    assert '--upgrade' in captured['cmd']
+    assert '--no-binary' in captured['cmd']
+    assert 'llama-cpp-python' in captured['cmd']
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_CUDA=on'
     assert captured['env']['FORCE_CMAKE'] == '1'
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+
+
+def test_runtime_bootstrap_skips_windows_cuda_wheel_attempts_for_unsupported_python(monkeypatch):
+    class _UnsupportedPythonSys:
+        platform = 'win32'
+        executable = sys.executable
+        prefix = sys.prefix
+        argv = [str(MODULE_PATH)]
+        version_info = type('VersionInfo', (), {'major': 3, 'minor': 13})()
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _UnsupportedPythonSys)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://abetlen.github.io/llama-cpp-python/whl/cu124',
+            extra_index_url='https://pypi.org/simple',
+            only_binary=True,
+            no_binary=False,
+        ),
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cpu',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://pypi.org/simple',
+            extra_index_url=None,
+            only_binary=True,
+            no_binary=False,
+        ),
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    installs = []
+
+    def _fake_install(cmd, _env, *, timeout_seconds=desktop_runtime_setup.PIP_INSTALL_TIMEOUT_SECONDS):
+        installs.append(cmd)
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _fake_install)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert result['runtime_action'] == 'installed_cpu_fallback'
+    assert 'Python versions 3.10, 3.11, 3.12' in result['fallback_reason']
+    assert 'active interpreter is 3.13' in result['fallback_reason']
+    assert len(installs) == 1
+    assert installs[0][-1] == 'llama-cpp-python'
 
 
 def test_windows_source_repair_returns_actionable_message_when_requirements_missing(tmp_path):

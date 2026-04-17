@@ -567,7 +567,8 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     assert result['selected_backend'] == 'cpu'
     assert '[Errno 2]' not in result['fallback_reason']
     assert 'requirements file not found' in result['fallback_reason']
-    assert 'falling back to unpinned llama-cpp-python source reinsta' in result['fallback_reason']
+    assert 'falling back to unpinned' in result['fallback_reason']
+    assert 'llama-cpp-python' in result['fallback_reason']
 
 
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):

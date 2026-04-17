@@ -10,7 +10,7 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,package-lock.json,desktop/package-lock.json,*.svg,webapp/static/js/*"]
+        args: ["--ignore-words", "dict/allow.txt", "--skip", "*.lock,package-lock.json,desktop/package-lock.json,desktop-tauri/package-lock.json,*.svg,webapp/static/js/*"]
   - repo: https://github.com/jendrikseipp/vulture
     rev: v2.14
     hooks:

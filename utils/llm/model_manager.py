@@ -30,10 +30,30 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             'error': str(exc),
         }
 
+    def _marker_enabled(module: Any, markers: Iterable[str]) -> bool:
+        for marker in markers:
+            try:
+                if bool(getattr(module, marker, False)):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # Newer llama-cpp-python builds can expose backend markers either on the
+    # top-level module or the nested extension module. Keep this probe tolerant
+    # to naming drift across releases.
+    nested_module = getattr(llama_cpp, 'llama_cpp', None)
     backend = 'cpu'
-    if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
+    if _marker_enabled(llama_cpp, ('GGML_USE_CUDA', 'GGML_CUDA', 'GGML_USE_CUBLAS')) or (
+        nested_module
+        and _marker_enabled(
+            nested_module, ('GGML_USE_CUDA', 'GGML_CUDA', 'GGML_USE_CUBLAS')
+        )
+    ):
         backend = 'cuda'
-    elif bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
+    elif _marker_enabled(llama_cpp, ('GGML_USE_METAL', 'GGML_METAL')) or (
+        nested_module and _marker_enabled(nested_module, ('GGML_USE_METAL', 'GGML_METAL'))
+    ):
         backend = 'metal'
 
     supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)

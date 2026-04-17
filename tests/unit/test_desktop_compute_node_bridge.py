@@ -356,6 +356,73 @@ def test_run_continues_when_runtime_setup_reports_missing_packaged_requirements(
     assert '[Errno 2]' not in json.dumps(events)
 
 
+def test_run_emits_gpu_capable_status_when_runtime_and_model_diagnostics_report_cuda(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'already_supported',
+            'fallback_reason': '',
+            'interpreter': sys.executable,
+            'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+        },
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        'utils.compute_node_runtime',
+        ModuleType('utils.compute_node_runtime'),
+    )
+    runtime_module = sys.modules['utils.compute_node_runtime']
+    runtime_module.ComputeNodeRuntimeConfig = lambda relay_url, relay_port, **kwargs: SimpleNamespace(
+        relay_url=relay_url, relay_port=relay_port, **kwargs
+    )
+    runtime_module.ComputeNodeRuntime = FakeRuntime
+    runtime_module.is_legacy_relay_payload = (
+        lambda payload: {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(payload)
+    )
+    runtime_module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
+    runtime_module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    runtime_module.SUPPORTED_COMPUTE_MODES = {'auto', 'cpu', 'gpu', 'hybrid'}
+    runtime_module.normalize_compute_mode = lambda mode: mode
+    runtime_module.apply_compute_mode = lambda manager, mode: setattr(
+        manager, 'requested_compute_mode', mode
+    ) or mode
+    runtime_module.compute_mode_diagnostics = lambda _manager: {
+        'requested_mode': 'auto',
+        'effective_mode': 'cuda',
+        'backend_available': 'cuda',
+        'backend_selected': 'cuda',
+        'backend_used': 'cuda',
+        'offloaded_layers': -1,
+        'kv_cache_device': 'cuda',
+        'fallback_reason': None,
+    }
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    started = events[0]
+    assert started['type'] == 'started'
+    assert started['effective_mode'] == 'cuda'
+    assert started['backend_available'] == 'cuda'
+    assert started['backend_used'] == 'cuda'
+    assert started['llama_module_path'].endswith('llama_cpp/__init__.py')
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

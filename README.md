@@ -474,6 +474,10 @@ The next steps need to be executed in the same virtual environment you set up ab
 
 This will replace the llama-cpp-python you installed via `pip install -r requirements.txt` and will instruct it to use [cuBLAS](https://docs.nvidia.com/cuda/cublas/index.html).
 
+For the desktop Tauri compute-node path, runtime bootstrap follows the same contract:
+it first tries a CUDA wheel, then an unpinned CUDA wheel, then a CUDA source build
+with `CMAKE_ARGS=-DGGML_CUDA=on` and `FORCE_CMAKE=1`, and only then falls back to CPU.
+
 **if you're using Command Prompt**
 
 ```

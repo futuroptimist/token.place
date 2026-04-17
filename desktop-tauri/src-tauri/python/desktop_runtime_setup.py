@@ -422,6 +422,17 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
             ),
             LlamaCppInstallPlan(
                 platform=detected_platform,
+                backend="cuda",
+                package_spec="llama-cpp-python",
+                cmake_args="-DGGML_CUDA=on",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=False,
+                no_binary=True,
+            ),
+            LlamaCppInstallPlan(
+                platform=detected_platform,
                 backend="cpu",
                 package_spec="llama-cpp-python",
                 cmake_args=None,

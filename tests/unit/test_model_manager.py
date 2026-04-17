@@ -799,6 +799,24 @@ class TestModelManager:
 
         assert backend == 'cuda'
 
+    def test_platform_gpu_backend_detects_nested_cuda_marker_variants(self):
+        """Backend detection should accept CUDA markers on nested llama_cpp module."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_cpp=SimpleNamespace(
+                GGML_CUDA=True,
+                GGML_USE_CUBLAS=False,
+            ),
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'win32'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
     def test_llama_gpu_offload_available_returns_false_on_runtime_error(self):
         """GPU support probe should fail closed if llama_cpp probe raises."""
 
@@ -884,6 +902,24 @@ class TestModelManager:
 
         with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
             assert ModelManager._llama_gpu_offload_available() is True
+
+    def test_detect_runtime_capabilities_accepts_top_level_ggml_cuda_marker(self):
+        from utils.llm import model_manager as mm
+
+        fake_llama = SimpleNamespace(
+            GGML_CUDA=True,
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            __file__='C:/Python/site-packages/llama_cpp/__init__.py',
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            payload = mm.detect_llama_runtime_capabilities()
+
+        assert payload['backend'] == 'cuda'
+        assert payload['gpu_offload_supported'] is True
+        assert payload['detected_device'] == 'cuda'
 
     def test_resolve_compute_plan_gpu_and_hybrid_success_paths(self, model_manager):
         """Explicit gpu/hybrid requests should emit expected diagnostics."""

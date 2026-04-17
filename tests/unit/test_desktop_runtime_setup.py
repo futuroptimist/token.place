@@ -174,9 +174,55 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     darwin_plans = desktop_runtime_setup._fallback_unpinned_plans('darwin')
     linux_plans = desktop_runtime_setup._fallback_unpinned_plans('linux')
 
-    assert [plan.backend for plan in win_plans] == ['cuda', 'cpu']
+    assert [plan.backend for plan in win_plans] == ['cuda', 'cuda', 'cpu']
+    assert win_plans[1].force_cmake is True
+    assert win_plans[1].cmake_args == '-DGGML_CUDA=on'
     assert [plan.backend for plan in darwin_plans] == ['metal', 'metal']
     assert [plan.backend for plan in linux_plans] == ['cpu']
+
+
+def test_windows_runtime_bootstrap_uses_cuda_source_fallback_when_wheels_unavailable(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    repo_root = Path.cwd()
+    assert (repo_root / 'requirements.txt').exists()
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: next(probes))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://abetlen.github.io/llama-cpp-python/whl/cu124',
+            extra_index_url='https://pypi.org/simple',
+            only_binary=True,
+            no_binary=False,
+        ),
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python',
+            cmake_args='-DGGML_CUDA=on',
+            force_cmake=True,
+            index_url='https://pypi.org/simple',
+            extra_index_url=None,
+            only_binary=False,
+            no_binary=True,
+        ),
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
+    pip_results = iter([(False, 'wheel missing for cp313'), (True, 'built from source with cuda')])
+    monkeypatch.setattr(
+        desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: next(pip_results)
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=repo_root)
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert result['selected_backend'] == 'cuda'
 
 
 def test_windows_source_repair_uses_active_interpreter(monkeypatch):

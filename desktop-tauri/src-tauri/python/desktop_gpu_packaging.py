@@ -129,6 +129,22 @@ def llama_cpp_install_plan_fallbacks(
             )
         )
 
+        # If no compatible CUDA wheels exist (common with new Python ABIs),
+        # try a source build with CUDA explicitly enabled before giving up.
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="cuda",
+                package_spec="llama-cpp-python",
+                cmake_args="-DGGML_CUDA=on",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                extra_index_url=None,
+                only_binary=False,
+                no_binary=True,
+            )
+        )
+
         # If CUDA wheels are unavailable entirely for this ABI, fall back to
         # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
         # without requiring local native compilation toolchains.

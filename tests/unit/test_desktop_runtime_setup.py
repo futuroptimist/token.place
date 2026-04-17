@@ -62,6 +62,30 @@ def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch)
     assert result['selected_backend'] == 'cuda'
 
 
+def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stays_cpu(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    captured = {}
+
+    def fake_record(reason):
+        captured['reason'] = reason
+
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', fake_record)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_windows_cuda_source_repair',
+        lambda _requirements_path: (True, 'line one\nfinal pip status (metadata warning)'),
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert result['runtime_action'] == 'failed'
+    assert 'source repair detail: final pip status (metadata warning)' in result['fallback_reason']
+    assert 'source repair detail: final pip status (metadata warning)' in captured['reason']
+
+
 def test_runtime_bootstrap_noop_when_gpu_runtime_is_already_present(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setattr(
@@ -179,8 +203,10 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     assert [plan.backend for plan in linux_plans] == ['cpu']
 
 
-def test_windows_source_repair_uses_active_interpreter(monkeypatch):
+def test_windows_source_repair_uses_active_interpreter(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    requirements_path = tmp_path / 'requirements.txt'
+    requirements_path.write_text('llama_cpp_python==0.3.16\n', encoding='utf-8')
     captured = {}
 
     def fake_run(cmd, env, timeout_seconds):
@@ -190,11 +216,19 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
         return True, 'ok'
 
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
-    ok, _ = desktop_runtime_setup._windows_cuda_source_repair(Path.cwd() / 'requirements.txt')
+    ok, _ = desktop_runtime_setup._windows_cuda_source_repair(requirements_path)
 
     assert ok is True
     assert captured['cmd'][:3] == [sys.executable, '-m', 'pip']
-    assert captured['cmd'][4].startswith('llama-cpp-python==')
+    assert captured['cmd'][3] == 'install'
+    assert captured['cmd'][4:9] == [
+        '--force-reinstall',
+        '--no-cache-dir',
+        '--no-binary',
+        'llama-cpp-python',
+        '--verbose',
+    ]
+    assert captured['cmd'][9].startswith('llama-cpp-python==')
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_CUDA=on'
     assert captured['env']['FORCE_CMAKE'] == '1'
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
@@ -217,7 +251,7 @@ def test_windows_source_repair_returns_actionable_message_when_requirements_miss
     assert 'requirements file not found' in reason
     assert 'falling back to unpinned llama-cpp-python source reinstall' in reason
     assert str(missing_requirements) in reason
-    assert captured['cmd'][4] == 'llama-cpp-python'
+    assert captured['cmd'][9] == 'llama-cpp-python'
 
 
 def test_windows_source_repair_returns_actionable_message_when_requirement_is_unreadable(monkeypatch, tmp_path):
@@ -236,6 +270,21 @@ def test_windows_source_repair_returns_actionable_message_when_requirement_is_un
     assert 'falling back to unpinned source reinstall' in reason
     assert str(unreadable_requirements) in reason
     assert 'permission denied' in reason
+
+
+def test_windows_source_repair_preserves_metadata_warning_in_last_line(monkeypatch, tmp_path):
+    missing_requirements = tmp_path / 'missing-requirements.txt'
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'line one\nfinal pip error line'),
+    )
+
+    ok, reason = desktop_runtime_setup._windows_cuda_source_repair(missing_requirements)
+
+    assert ok is False
+    assert 'requirements file not found at' in reason.splitlines()[-1]
+    assert 'falling back to unpinned llama-cpp-python source reinstall' in reason.splitlines()[-1]
 
 
 def test_windows_source_repair_returns_actionable_message_when_requirement_is_invalid(monkeypatch, tmp_path):
@@ -518,7 +567,7 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     assert result['selected_backend'] == 'cpu'
     assert '[Errno 2]' not in result['fallback_reason']
     assert 'requirements file not found' in result['fallback_reason']
-    assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
+    assert 'falling back to unpinned llama-cpp-python source reinsta' in result['fallback_reason']
 
 
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):

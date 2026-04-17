@@ -191,15 +191,24 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
         "-m",
         "pip",
         "install",
-        package_spec,
         "--force-reinstall",
         "--no-cache-dir",
+        "--no-binary",
+        "llama-cpp-python",
         "--verbose",
+        package_spec,
     ]
     ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
-    if metadata_warning:
-        return ok, f"{metadata_warning}; {output or 'pip install completed'}"
-    return ok, output
+    if not metadata_warning:
+        return ok, output
+
+    detail = (output or "").strip()
+    if not detail:
+        return ok, metadata_warning
+
+    lines = detail.splitlines()
+    lines[-1] = f"{lines[-1]} ({metadata_warning})"
+    return ok, "\n".join(lines)
 
 
 def _summarize_install_error(raw: str) -> str:
@@ -370,10 +379,13 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                     "runtime_action": "installed_cuda_reexec",
                     **_probe_result_payload(after),
                 }
+            source_detail = _summarize_install_error(source_log)
             last_error = (
                 "CUDA source reinstall completed but runtime still CPU-only; "
                 "check CUDA toolkit/build tools"
             )
+            if source_detail and source_detail != "install failed":
+                last_error = f"{last_error}; source repair detail: {source_detail}"
             _record_source_repair_failure(last_error)
         else:
             last_error = _summarize_install_error(source_log)

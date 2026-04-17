@@ -332,7 +332,8 @@ def test_run_continues_when_runtime_setup_reports_missing_packaged_requirements(
             'runtime_action': 'failed',
             'fallback_reason': (
                 'requirements file not found at '
-                'C:/Users/danie/AppData/requirements.txt; skipping pinned CUDA source reinstall'
+                'C:/Users/testuser/AppData/Local/token.place/requirements.txt; '
+                'skipping pinned CUDA source reinstall'
             ),
             'interpreter': sys.executable,
             'llama_module_path': 'missing',

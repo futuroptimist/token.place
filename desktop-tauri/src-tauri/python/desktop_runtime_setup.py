@@ -159,7 +159,18 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
     env["FORCE_CMAKE"] = "1"
-    package_spec = llama_cpp_requirement_spec(requirements_path)
+    try:
+        package_spec = llama_cpp_requirement_spec(requirements_path)
+    except FileNotFoundError:
+        return (
+            False,
+            f"requirements file not found at {requirements_path}; skipping pinned CUDA source reinstall",
+        )
+    except (OSError, ValueError) as exc:
+        return (
+            False,
+            f"unable to resolve pinned llama-cpp-python requirement from {requirements_path}: {exc}",
+        )
     cmd = [
         sys.executable,
         "-m",

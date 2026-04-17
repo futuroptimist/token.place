@@ -200,6 +200,47 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
 
 
+def test_windows_source_repair_returns_actionable_message_when_requirements_missing(tmp_path):
+    missing_requirements = tmp_path / 'AppData' / 'requirements.txt'
+    ok, reason = desktop_runtime_setup._windows_cuda_source_repair(missing_requirements)
+
+    assert ok is False
+    assert 'requirements file not found' in reason
+    assert str(missing_requirements) in reason
+
+
+def test_windows_source_repair_returns_actionable_message_when_requirement_is_unreadable(monkeypatch, tmp_path):
+    unreadable_requirements = tmp_path / 'AppData' / 'requirements.txt'
+
+    def _raise_unreadable(_requirements_path):
+        raise OSError('permission denied')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_requirement_spec', _raise_unreadable)
+
+    ok, reason = desktop_runtime_setup._windows_cuda_source_repair(unreadable_requirements)
+
+    assert ok is False
+    assert 'unable to resolve pinned llama-cpp-python requirement' in reason
+    assert str(unreadable_requirements) in reason
+    assert 'permission denied' in reason
+
+
+def test_windows_source_repair_returns_actionable_message_when_requirement_is_invalid(monkeypatch, tmp_path):
+    invalid_requirements = tmp_path / 'AppData' / 'requirements.txt'
+
+    def _raise_invalid(_requirements_path):
+        raise ValueError('missing pinned llama-cpp-python requirement')
+
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_requirement_spec', _raise_invalid)
+
+    ok, reason = desktop_runtime_setup._windows_cuda_source_repair(invalid_requirements)
+
+    assert ok is False
+    assert 'unable to resolve pinned llama-cpp-python requirement' in reason
+    assert str(invalid_requirements) in reason
+    assert 'missing pinned llama-cpp-python requirement' in reason
+
+
 def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
@@ -434,6 +475,24 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
     can_retry, reason = desktop_runtime_setup._should_attempt_source_repair()
     assert can_retry is True
     assert reason == ''
+
+
+def test_windows_packaged_layout_without_requirements_falls_back_without_exception(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
+
+    packaged_root = tmp_path / 'Users' / 'danie' / 'AppData' / 'Local' / 'token.place'
+    packaged_root.mkdir(parents=True)
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
+
+    assert result['runtime_action'] == 'failed'
+    assert result['selected_backend'] == 'cpu'
+    assert '[Errno 2]' not in result['fallback_reason']
+    assert 'requirements file not found' in result['fallback_reason']
 
 
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):

@@ -159,7 +159,13 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
     env["FORCE_CMAKE"] = "1"
-    package_spec = llama_cpp_requirement_spec(requirements_path)
+    package_spec = "llama-cpp-python"
+    try:
+        package_spec = llama_cpp_requirement_spec(requirements_path)
+    except (FileNotFoundError, OSError, ValueError):
+        # Packaged desktop layouts may not ship a repo-root requirements.txt.
+        # Degrade gracefully to an unpinned source reinstall in that case.
+        package_spec = "llama-cpp-python"
     cmd = [
         sys.executable,
         "-m",

@@ -200,6 +200,27 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
 
 
+def test_windows_source_repair_falls_back_to_unpinned_when_requirements_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {}
+
+    def fake_run(cmd, env, timeout_seconds):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        captured['timeout_seconds'] = timeout_seconds
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
+    ok, _ = desktop_runtime_setup._windows_cuda_source_repair(tmp_path / 'requirements.txt')
+
+    assert ok is True
+    assert captured['cmd'][:3] == [sys.executable, '-m', 'pip']
+    assert captured['cmd'][4] == 'llama-cpp-python'
+    assert captured['env']['CMAKE_ARGS'] == '-DGGML_CUDA=on'
+    assert captured['env']['FORCE_CMAKE'] == '1'
+    assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+
+
 def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
@@ -444,3 +465,28 @@ def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
 
     module_path = str(shim.resolve()).upper()
     assert desktop_runtime_setup._is_repo_local_llama_module(module_path, repo_root) is True
+
+
+def test_windows_packaged_layout_without_requirements_uses_safe_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+
+    pip_calls = []
+
+    def fake_run(cmd, env, timeout_seconds=desktop_runtime_setup.PIP_INSTALL_TIMEOUT_SECONDS):
+        pip_calls.append(cmd)
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
+    packaged_root = tmp_path / 'AppData' / 'token.place'
+    packaged_root.mkdir(parents=True)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
+
+    assert result['runtime_action'] == 'installed_cpu_fallback'
+    assert result['selected_backend'] == 'cpu'
+    assert 'No such file or directory' not in result['fallback_reason']
+    assert any(cmd[4] == 'llama-cpp-python' for cmd in pip_calls)

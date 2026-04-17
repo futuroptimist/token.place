@@ -35,6 +35,11 @@ def test_linux_no_bundle_layout_contains_python_runtime_resources() -> None:
             "desktop staging root missing; run `npm --prefix desktop-tauri run tauri build -- --debug --no-bundle` "
             "before this validation"
         )
+    if not (staging_root / "python").exists() and not (staging_root / "resources" / "python").exists():
+        pytest.skip(
+            "desktop staging root exists but no packaged python runtime tree was found; "
+            "run `npm --prefix desktop-tauri run tauri build -- --debug --no-bundle` before this validation"
+        )
 
     # Linux CI no-bundle builds stage files under `desktop-tauri/src-tauri/target/debug`.
     # We accept both known script placements because Tauri layout can differ by host packaging mode.

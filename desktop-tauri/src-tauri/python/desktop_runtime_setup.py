@@ -32,18 +32,28 @@ class RuntimeProbe:
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
+INSTALL_ERROR_SUMMARY_MAX_LEN = 512
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
 import json
+import os
 import sys
 from pathlib import Path
 
-repo_root = Path.cwd()
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
+if python_root and python_root not in sys.path:
+    sys.path.insert(0, python_root)
+
+bootstrap_script = os.environ.get("TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT", "").strip()
+if bootstrap_script:
+    from path_bootstrap import ensure_runtime_import_paths
+
+    ensure_runtime_import_paths(bootstrap_script, avoid_llama_cpp_shadowing=True)
+
+repo_root = Path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd())).resolve()
 
 from utils.llm.model_manager import detect_llama_runtime_capabilities
 # NOTE: detect_llama_runtime_capabilities must keep `import llama_cpp` lazy
@@ -66,13 +76,17 @@ print(json.dumps(payload))
 
 def _probe_llama_runtime() -> RuntimeProbe:
     repo_root = Path(__file__).resolve().parents[3]
+    python_root = Path(__file__).resolve().parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_entries = [str(repo_root)]
+    pythonpath_entries = [str(python_root), str(repo_root)]
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
+    env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(Path(__file__).resolve())
+    env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
     try:
         result = subprocess.run(
             cmd,
@@ -159,36 +173,50 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
     env["FORCE_CMAKE"] = "1"
+    package_spec = "llama-cpp-python"
+    metadata_warning = ""
     try:
         package_spec = llama_cpp_requirement_spec(requirements_path)
     except FileNotFoundError:
-        return (
-            False,
-            f"requirements file not found at {requirements_path}; skipping pinned CUDA source reinstall",
+        metadata_warning = (
+            f"requirements file not found at {requirements_path}; "
+            "falling back to unpinned llama-cpp-python source reinstall"
         )
     except (OSError, ValueError) as exc:
-        return (
-            False,
-            f"unable to resolve pinned llama-cpp-python requirement from {requirements_path}: {exc}",
+        metadata_warning = (
+            "unable to resolve pinned llama-cpp-python requirement from "
+            f"{requirements_path}: {exc}; falling back to unpinned source reinstall"
         )
     cmd = [
         sys.executable,
         "-m",
         "pip",
         "install",
-        package_spec,
         "--force-reinstall",
         "--no-cache-dir",
+        "--no-binary",
+        "llama-cpp-python",
         "--verbose",
+        package_spec,
     ]
-    return _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    if not metadata_warning:
+        return ok, output
+
+    detail = (output or "").strip()
+    if not detail:
+        return ok, metadata_warning
+
+    lines = detail.splitlines()
+    lines[-1] = f"{lines[-1]} ({metadata_warning})"
+    return ok, "\n".join(lines)
 
 
 def _summarize_install_error(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return "install failed"
-    return text.splitlines()[-1][:240]
+    return text.splitlines()[-1][:INSTALL_ERROR_SUMMARY_MAX_LEN]
 
 
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
@@ -352,10 +380,13 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                     "runtime_action": "installed_cuda_reexec",
                     **_probe_result_payload(after),
                 }
+            source_detail = _summarize_install_error(source_log)
             last_error = (
                 "CUDA source reinstall completed but runtime still CPU-only; "
                 "check CUDA toolkit/build tools"
             )
+            if source_detail and source_detail != "install failed":
+                last_error = f"{last_error}; source repair detail: {source_detail}"
             _record_source_repair_failure(last_error)
         else:
             last_error = _summarize_install_error(source_log)

@@ -320,6 +320,41 @@ def test_run_disables_runtime_reexec_to_avoid_pre_startup_exit(capsys, monkeypat
     assert events[-1]['type'] == 'stopped'
 
 
+def test_run_continues_when_runtime_setup_reports_missing_packaged_requirements(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': (
+                'requirements file not found at '
+                'C:/Users/danie/AppData/requirements.txt; skipping pinned CUDA source reinstall'
+            ),
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'stopped'
+    assert '[Errno 2]' not in json.dumps(events)
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

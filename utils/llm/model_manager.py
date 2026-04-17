@@ -31,9 +31,21 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         }
 
     backend = 'cpu'
-    if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
+    cuda_markers = (
+        'GGML_USE_CUDA',
+        'GGML_CUDA',
+        'LLAMA_CUDA',
+        'GGML_USE_CUBLAS',
+        'LLAMA_CUBLAS',
+    )
+    metal_markers = (
+        'GGML_USE_METAL',
+        'GGML_METAL',
+        'LLAMA_METAL',
+    )
+    if any(bool(getattr(llama_cpp, marker, False)) for marker in cuda_markers):
         backend = 'cuda'
-    elif bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
+    elif any(bool(getattr(llama_cpp, marker, False)) for marker in metal_markers):
         backend = 'metal'
 
     supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)

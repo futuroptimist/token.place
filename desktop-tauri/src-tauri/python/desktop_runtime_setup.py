@@ -38,12 +38,21 @@ SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
 import json
+import os
 import sys
 from pathlib import Path
 
-repo_root = Path.cwd()
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
+if python_root and python_root not in sys.path:
+    sys.path.insert(0, python_root)
+
+bootstrap_script = os.environ.get("TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT", "").strip()
+if bootstrap_script:
+    from path_bootstrap import ensure_runtime_import_paths
+
+    ensure_runtime_import_paths(bootstrap_script, avoid_llama_cpp_shadowing=True)
+
+repo_root = Path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd())).resolve()
 
 from utils.llm.model_manager import detect_llama_runtime_capabilities
 # NOTE: detect_llama_runtime_capabilities must keep `import llama_cpp` lazy
@@ -66,13 +75,17 @@ print(json.dumps(payload))
 
 def _probe_llama_runtime() -> RuntimeProbe:
     repo_root = Path(__file__).resolve().parents[3]
+    python_root = Path(__file__).resolve().parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_entries = [str(repo_root)]
+    pythonpath_entries = [str(python_root), str(repo_root)]
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
+    env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(Path(__file__).resolve())
+    env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
     try:
         result = subprocess.run(
             cmd,
@@ -159,17 +172,19 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     env = os.environ.copy()
     env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
     env["FORCE_CMAKE"] = "1"
+    package_spec = "llama-cpp-python"
+    metadata_warning = ""
     try:
         package_spec = llama_cpp_requirement_spec(requirements_path)
     except FileNotFoundError:
-        return (
-            False,
-            f"requirements file not found at {requirements_path}; skipping pinned CUDA source reinstall",
+        metadata_warning = (
+            f"requirements file not found at {requirements_path}; "
+            "falling back to unpinned llama-cpp-python source reinstall"
         )
     except (OSError, ValueError) as exc:
-        return (
-            False,
-            f"unable to resolve pinned llama-cpp-python requirement from {requirements_path}: {exc}",
+        metadata_warning = (
+            "unable to resolve pinned llama-cpp-python requirement from "
+            f"{requirements_path}: {exc}; falling back to unpinned source reinstall"
         )
     cmd = [
         sys.executable,
@@ -181,7 +196,10 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
         "--no-cache-dir",
         "--verbose",
     ]
-    return _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    if metadata_warning:
+        return ok, f"{metadata_warning}; {output or 'pip install completed'}"
+    return ok, output
 
 
 def _summarize_install_error(raw: str) -> str:

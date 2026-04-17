@@ -200,13 +200,24 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
 
 
-def test_windows_source_repair_returns_actionable_message_when_requirements_missing(tmp_path):
+def test_windows_source_repair_returns_actionable_message_when_requirements_missing(monkeypatch, tmp_path):
     missing_requirements = tmp_path / 'AppData' / 'requirements.txt'
+    captured = {}
+
+    def fake_run(cmd, env, timeout_seconds):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        captured['timeout_seconds'] = timeout_seconds
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', fake_run)
     ok, reason = desktop_runtime_setup._windows_cuda_source_repair(missing_requirements)
 
-    assert ok is False
+    assert ok is True
     assert 'requirements file not found' in reason
+    assert 'falling back to unpinned llama-cpp-python source reinstall' in reason
     assert str(missing_requirements) in reason
+    assert captured['cmd'][4] == 'llama-cpp-python'
 
 
 def test_windows_source_repair_returns_actionable_message_when_requirement_is_unreadable(monkeypatch, tmp_path):
@@ -217,10 +228,12 @@ def test_windows_source_repair_returns_actionable_message_when_requirement_is_un
 
     monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_requirement_spec', _raise_unreadable)
 
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
     ok, reason = desktop_runtime_setup._windows_cuda_source_repair(unreadable_requirements)
 
-    assert ok is False
+    assert ok is True
     assert 'unable to resolve pinned llama-cpp-python requirement' in reason
+    assert 'falling back to unpinned source reinstall' in reason
     assert str(unreadable_requirements) in reason
     assert 'permission denied' in reason
 
@@ -233,10 +246,12 @@ def test_windows_source_repair_returns_actionable_message_when_requirement_is_in
 
     monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_requirement_spec', _raise_invalid)
 
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
     ok, reason = desktop_runtime_setup._windows_cuda_source_repair(invalid_requirements)
 
-    assert ok is False
+    assert ok is True
     assert 'unable to resolve pinned llama-cpp-python requirement' in reason
+    assert 'falling back to unpinned source reinstall' in reason
     assert str(invalid_requirements) in reason
     assert 'missing pinned llama-cpp-python requirement' in reason
 
@@ -359,10 +374,15 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     probe = desktop_runtime_setup._probe_llama_runtime()
 
     assert probe.backend == 'cuda'
+    assert 'ensure_runtime_import_paths' in desktop_runtime_setup._PROBE_SNIPPET
     assert "Path(entry or \".\").resolve()" in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
-    assert captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)[0] == str(
-        Path(__file__).resolve().parents[2]
+    assert captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)[:2] == [
+        str(PYTHON_MODULE_DIR),
+        str(Path(__file__).resolve().parents[2]),
+    ]
+    assert captured['env']['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith(
+        'desktop_runtime_setup.py'
     )
 
 
@@ -482,6 +502,11 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'simulated pip source build failure'),
+    )
     monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
     monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
 
@@ -493,6 +518,7 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     assert result['selected_backend'] == 'cpu'
     assert '[Errno 2]' not in result['fallback_reason']
     assert 'requirements file not found' in result['fallback_reason']
+    assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
 
 
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):

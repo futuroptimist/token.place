@@ -799,6 +799,21 @@ class TestModelManager:
 
         assert backend == 'cuda'
 
+    def test_platform_gpu_backend_linux_detects_cuda_legacy_markers(self):
+        """Backend detection should honor legacy/new CUDA marker variants."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_CUDA=True,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
     def test_llama_gpu_offload_available_returns_false_on_runtime_error(self):
         """GPU support probe should fail closed if llama_cpp probe raises."""
 
@@ -833,6 +848,21 @@ class TestModelManager:
         fake_llama = SimpleNamespace(
             GGML_USE_CUDA=False,
             GGML_USE_METAL=True,
+            llama_supports_gpu_offload=lambda: False,
+        )
+
+        with patch('utils.llm.model_manager.sys.platform', 'linux'), \
+             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'metal'
+
+    def test_platform_gpu_backend_linux_detects_metal_legacy_marker(self):
+        """Backend detection should honor legacy/new Metal marker variants."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            GGML_METAL=True,
             llama_supports_gpu_offload=lambda: False,
         )
 

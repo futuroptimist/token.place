@@ -200,6 +200,25 @@ def test_windows_source_repair_uses_active_interpreter(monkeypatch):
     assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
 
 
+def test_windows_source_repair_returns_structured_error_when_requirements_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {'called': False}
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (captured.update(called=True), 'unexpected') and (True, 'unexpected'),
+    )
+
+    ok, message = desktop_runtime_setup._windows_cuda_source_repair(
+        tmp_path / 'appdata-runtime' / 'requirements.txt'
+    )
+
+    assert ok is False
+    assert captured['called'] is False
+    assert 'requirements pin unavailable for CUDA source repair' in message
+    assert 'requirements.txt' in message
+
+
 def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
 
@@ -444,3 +463,34 @@ def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
 
     module_path = str(shim.resolve()).upper()
     assert desktop_runtime_setup._is_repo_local_llama_module(module_path, repo_root) is True
+
+
+def test_windows_packaged_layout_without_requirements_falls_back_without_crashing(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+    packaged_root = tmp_path / 'Users' / 'danie' / 'AppData' / 'Local' / 'token.place'
+    packaged_root.mkdir(parents=True)
+
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cpu',
+            package_spec='llama-cpp-python',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://pypi.org/simple',
+            extra_index_url=None,
+            only_binary=True,
+            no_binary=False,
+        )
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
+
+    assert result['runtime_action'] == 'installed_cpu_fallback'
+    assert result['selected_backend'] == 'cpu'
+    assert '[Errno 2] No such file or directory' not in result['fallback_reason']

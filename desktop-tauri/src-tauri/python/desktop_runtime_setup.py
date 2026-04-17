@@ -32,6 +32,7 @@ class RuntimeProbe:
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
+INSTALL_ERROR_SUMMARY_MAX_LEN = 512
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -215,7 +216,7 @@ def _summarize_install_error(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return "install failed"
-    return text.splitlines()[-1][:240]
+    return text.splitlines()[-1][:INSTALL_ERROR_SUMMARY_MAX_LEN]
 
 
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:

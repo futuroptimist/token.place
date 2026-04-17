@@ -15,7 +15,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
-from utils.llm.model_manager import ModelManager
+from utils.llm.model_manager import ModelManager, detect_llama_runtime_capabilities
 
 
 class _ToDictOnly:
@@ -841,6 +841,50 @@ class TestModelManager:
             backend = ModelManager._platform_gpu_backend()
 
         assert backend == 'metal'
+
+    def test_platform_gpu_backend_uses_nested_cuda_marker_aliases(self):
+        """Backend detection should support nested marker aliases from newer bindings."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            llama_cpp=SimpleNamespace(GGML_CUDA=True),
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
+    def test_platform_gpu_backend_uses_low_level_cuda_symbols_when_markers_missing(self):
+        """Backend detection should use low-level CUDA symbols when markers are absent."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            llama_cpp=SimpleNamespace(ggml_backend_cuda_init=lambda: None),
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            backend = ModelManager._platform_gpu_backend()
+
+        assert backend == 'cuda'
+
+    def test_detect_runtime_capabilities_reports_cuda_without_gpu_offload_callable(self):
+        """Runtime capability probe should still mark CUDA as available without callable probe."""
+        fake_llama = SimpleNamespace(
+            GGML_USE_CUDA=False,
+            GGML_USE_METAL=False,
+            llama_supports_gpu_offload=None,
+            llama_cpp=SimpleNamespace(ggml_backend_cuda_init=lambda: None),
+        )
+
+        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+            payload = detect_llama_runtime_capabilities()
+
+        assert payload['backend'] == 'cuda'
+        assert payload['gpu_offload_supported'] is True
+        assert payload['detected_device'] == 'cuda'
 
     def test_platform_gpu_backend_linux_uses_gpu_offload_probe(self):
         """Linux backend detection should map positive runtime probes to CUDA."""

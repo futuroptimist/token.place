@@ -18,7 +18,7 @@ from desktop_gpu_packaging import (
 
 def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    assert len(plans) == 3
+    assert len(plans) == 4
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
@@ -36,7 +36,18 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert unpinned_cuda_fallback.only_binary is True
     assert unpinned_cuda_fallback.no_binary is False
 
-    cpu_fallback = plans[2]
+    source_cuda_fallback = plans[2]
+    assert source_cuda_fallback.backend == "cuda"
+    assert source_cuda_fallback.package_spec == "llama-cpp-python"
+    assert source_cuda_fallback.index_url == "https://pypi.org/simple"
+    assert source_cuda_fallback.only_binary is False
+    assert source_cuda_fallback.no_binary is True
+    assert source_cuda_fallback.pip_env() == {
+        "CMAKE_ARGS": "-DGGML_CUDA=on",
+        "FORCE_CMAKE": "1",
+    }
+
+    cpu_fallback = plans[3]
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.package_spec == "llama-cpp-python"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
@@ -145,7 +156,7 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
 
 def test_windows_cpu_fallback_install_args_are_binary_only():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    cpu_fallback = plans[2]
+    cpu_fallback = plans[3]
 
     assert cpu_fallback.pip_install_args() == [
         "--upgrade",
@@ -153,6 +164,21 @@ def test_windows_cpu_fallback_install_args_are_binary_only():
         "--index-url",
         "https://pypi.org/simple",
         "--only-binary",
+        "llama-cpp-python",
+        "--prefer-binary",
+    ]
+
+
+def test_windows_source_fallback_install_args_force_source_build():
+    plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
+    source_fallback = plans[2]
+
+    assert source_fallback.pip_install_args() == [
+        "--upgrade",
+        "--no-cache-dir",
+        "--index-url",
+        "https://pypi.org/simple",
+        "--no-binary",
         "llama-cpp-python",
         "--prefer-binary",
     ]

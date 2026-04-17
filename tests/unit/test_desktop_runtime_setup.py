@@ -174,7 +174,7 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     darwin_plans = desktop_runtime_setup._fallback_unpinned_plans('darwin')
     linux_plans = desktop_runtime_setup._fallback_unpinned_plans('linux')
 
-    assert [plan.backend for plan in win_plans] == ['cuda', 'cpu']
+    assert [plan.backend for plan in win_plans] == ['cuda', 'cuda', 'cpu']
     assert [plan.backend for plan in darwin_plans] == ['metal', 'metal']
     assert [plan.backend for plan in linux_plans] == ['cpu']
 

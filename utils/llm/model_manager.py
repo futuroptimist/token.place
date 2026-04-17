@@ -18,6 +18,30 @@ from utils.system import resource_monitor
 logger = logging.getLogger('model_manager')
 
 
+def _llama_backend_marker_enabled(llama_cpp_module: Any, names: Iterable[str]) -> bool:
+    """Return True when any backend marker name is present and truthy."""
+    for name in names:
+        if bool(getattr(llama_cpp_module, name, False)):
+            return True
+    nested = getattr(llama_cpp_module, "llama_cpp", None)
+    if nested is not None:
+        for name in names:
+            if bool(getattr(nested, name, False)):
+                return True
+    return False
+
+
+def _llama_backend_symbol_present(llama_cpp_module: Any, prefixes: Iterable[str]) -> bool:
+    """Best-effort probe for backend-specific low-level symbols."""
+    nested = getattr(llama_cpp_module, "llama_cpp", None)
+    symbol_holders = [holder for holder in (llama_cpp_module, nested) if holder is not None]
+    for holder in symbol_holders:
+        for prefix in prefixes:
+            if any(name.startswith(prefix) for name in dir(holder)):
+                return True
+    return False
+
+
 def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     """Return backend/offload capability details from the installed llama_cpp runtime."""
     try:
@@ -31,9 +55,11 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         }
 
     backend = 'cpu'
-    if bool(getattr(llama_cpp, 'GGML_USE_CUDA', False)):
+    if _llama_backend_marker_enabled(llama_cpp, ('GGML_USE_CUDA', 'GGML_CUDA', 'LLAMA_CUDA')):
         backend = 'cuda'
-    elif bool(getattr(llama_cpp, 'GGML_USE_METAL', False)):
+    elif _llama_backend_marker_enabled(
+        llama_cpp, ('GGML_USE_METAL', 'GGML_METAL', 'LLAMA_METAL')
+    ):
         backend = 'metal'
 
     supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
@@ -45,6 +71,20 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             gpu_offload_supported = False
     else:
         gpu_offload_supported = backend in {'cuda', 'metal'}
+
+    # Some llama_cpp builds expose CUDA/Metal only via low-level symbols under
+    # llama_cpp.llama_cpp while omitting top-level GGML_* markers.
+    if backend == 'cpu' and _llama_backend_symbol_present(
+        llama_cpp, ('ggml_backend_cuda', 'llama_backend_cuda')
+    ):
+        backend = 'cuda'
+    elif backend == 'cpu' and _llama_backend_symbol_present(
+        llama_cpp, ('ggml_backend_metal', 'llama_backend_metal')
+    ):
+        backend = 'metal'
+
+    if backend in {'cuda', 'metal'}:
+        gpu_offload_supported = True if callable(supports_gpu) is False else gpu_offload_supported
 
     # Some llama_cpp builds can report runtime GPU offload support via probe
     # without exposing GGML_USE_* backend markers. Preserve prior Linux behavior

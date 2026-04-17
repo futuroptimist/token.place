@@ -289,6 +289,56 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert 'failed to initialize model runtime' in payload['message']
 
 
+def test_run_surfaces_gpu_capable_runtime_status_payload(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'already_supported',
+            'interpreter': sys.executable,
+            'llama_module_path': 'C:/Python/Lib/site-packages/llama_cpp/__init__.py',
+            'fallback_reason': '',
+        },
+    )
+
+    module = sys.modules['utils.compute_node_runtime']
+    module.compute_mode_diagnostics = lambda _manager: {
+        'requested_mode': 'auto',
+        'effective_mode': 'cuda',
+        'backend_available': 'cuda',
+        'backend_selected': 'cuda',
+        'backend_used': 'cuda',
+        'n_gpu_layers': -1,
+        'offloaded_layers': -1,
+        'kv_cache_device': 'cuda',
+        'fallback_reason': None,
+    }
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    started = events[0]
+    assert started['type'] == 'started'
+    assert started['effective_mode'] == 'cuda'
+    assert started['backend_available'] == 'cuda'
+    assert started['backend_used'] == 'cuda'
+    assert started['offloaded_layers'] == -1
+    assert started['fallback_reason'] is None
+    assert started['llama_module_path'].endswith('llama_cpp/__init__.py')
+
+
 def test_run_disables_runtime_reexec_to_avoid_pre_startup_exit(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -60,6 +61,52 @@ def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch)
 
     assert result['runtime_action'] == 'installed_cuda_reexec'
     assert result['selected_backend'] == 'cuda'
+
+
+def test_runtime_root_prefers_token_place_python_import_root(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'resources'
+    (runtime_root / 'utils').mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+
+    assert resolved == runtime_root.resolve()
+
+
+def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'bundle_root'
+    (runtime_root / 'utils').mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': 'python',
+                'prefix': 'prefix',
+                'llama_module_path': 'site-packages/llama_cpp/__init__.py',
+            }
+        )
+        stderr = ''
+
+    def fake_run(cmd, **kwargs):
+        captured['cmd'] = cmd
+        captured['cwd'] = kwargs['cwd']
+        captured['env'] = kwargs['env']
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+
+    assert probe.backend == 'cuda'
+    assert Path(captured['cwd']) == runtime_root.resolve()
+    pythonpath_entries = captured['env']['PYTHONPATH'].split(os.pathsep)
+    assert str(runtime_root.resolve()) in pythonpath_entries
 
 
 def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stays_cpu(monkeypatch):

@@ -4,7 +4,10 @@ Model manager module for handling LLM model downloading, initialization and infe
 import os
 import time
 import logging
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - exercised via desktop probe import path
+    requests = None
 import json
 import sys
 from pathlib import Path
@@ -286,7 +289,17 @@ class ModelManager:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        response = requests.get(url, stream=True, timeout=self.download_timeout)
+        requests_module = requests
+        if requests_module is None:
+            try:
+                import importlib
+
+                requests_module = importlib.import_module('requests')
+            except ModuleNotFoundError:
+                self.log_error('Error: requests dependency missing; unable to download model.')
+                return False
+
+        response = requests_module.get(url, stream=True, timeout=self.download_timeout)
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")

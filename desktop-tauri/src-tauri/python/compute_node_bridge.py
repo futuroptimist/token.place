@@ -43,6 +43,14 @@ _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 
 
+def log_stderr(event: str, **fields: Any) -> None:
+    payload = " ".join(f"{key}={fields[key]}" for key in sorted(fields))
+    if payload:
+        print(f"desktop.compute_node_bridge.{event} {payload}", file=sys.stderr)
+    else:
+        print(f"desktop.compute_node_bridge.{event}", file=sys.stderr)
+
+
 def _start_stdin_reader() -> None:
     global _stdin_reader_started
     with _stdin_reader_lock:
@@ -92,6 +100,13 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    log_stderr(
+        "startup",
+        relay_url=args.relay_url,
+        relay_port=args.relay_port,
+        mode=args.mode,
+        model=args.model,
+    )
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -122,6 +137,7 @@ def run(args: argparse.Namespace) -> int:
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
+    log_stderr("relay_target", relay_url=relay_url, relay_port=relay_port)
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
@@ -133,16 +149,8 @@ def run(args: argparse.Namespace) -> int:
 
     runtime.model_manager.model_path = args.model
     apply_compute_mode(runtime.model_manager, args.mode)
-
-    if not runtime.ensure_model_ready():
-        emit(
-            {
-                "type": "error",
-                "message": "failed to initialize model runtime",
-                "active_relay_url": runtime.relay_client.relay_url,
-            }
-        )
-        return 1
+    model_ready = False
+    model_init_attempted = False
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     last_error: Optional[str] = None
@@ -163,17 +171,37 @@ def run(args: argparse.Namespace) -> int:
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
+            "model_runtime_ready": model_ready,
             "last_error": None,
         }
     )
 
     try:
         while not stop_requested():
+            log_stderr("poll.begin", active_relay_url=runtime.relay_client.relay_url)
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
             registered = "error" not in relay_response and (legacy_payload or heartbeat_ack)
+            log_stderr(
+                "poll.result",
+                active_relay_url=active_relay_url,
+                registered=registered,
+                has_error="error" in relay_response,
+                has_legacy_payload=legacy_payload,
+                heartbeat_ack=heartbeat_ack,
+            )
+
+            if not model_ready and (not model_init_attempted or legacy_payload):
+                model_init_attempted = True
+                log_stderr("model_init.begin", model=args.model, mode=args.mode)
+                model_ready = runtime.ensure_model_ready()
+                if model_ready:
+                    log_stderr("model_init.success")
+                else:
+                    last_error = "failed to initialize model runtime"
+                    log_stderr("model_init.failed", error=last_error)
 
             if not registered:
                 if "error" in relay_response:
@@ -184,11 +212,18 @@ def run(args: argparse.Namespace) -> int:
                         "operator; update relay.py to repo HEAD"
                     )
             elif legacy_payload:
-                processed = runtime.process_relay_request(relay_response)
-                if not processed:
-                    last_error = "failed to process relay request"
+                if not model_ready:
+                    last_error = "model runtime is not ready; cannot process relay request"
+                    log_stderr("request.skipped", reason=last_error)
                 else:
-                    last_error = None
+                    log_stderr("request.process.begin")
+                    processed = runtime.process_relay_request(relay_response)
+                    if not processed:
+                        last_error = "failed to process relay request"
+                        log_stderr("request.process.failed", error=last_error)
+                    else:
+                        last_error = None
+                        log_stderr("request.process.success")
             else:
                 last_error = None
 
@@ -212,11 +247,13 @@ def run(args: argparse.Namespace) -> int:
                     "interpreter": runtime_setup.get("interpreter", sys.executable),
                     "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
                     "model_path": args.model,
+                    "model_runtime_ready": model_ready,
                     "last_error": last_error,
                 }
             )
 
             wait_seconds = float(relay_response.get("next_ping_in_x_seconds", 1))
+            log_stderr("poll.sleep", seconds=wait_seconds)
             if _sleep_with_cancel(wait_seconds):
                 break
     finally:

@@ -274,6 +274,13 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
             return False
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingRuntime)
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -283,10 +290,13 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     )
     status = compute_node_bridge.run(args)
 
-    assert status == 1
-    payload = json.loads(capsys.readouterr().out.strip())
-    assert payload['type'] == 'error'
-    assert 'failed to initialize model runtime' in payload['message']
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert status_events[0]['model_runtime_ready'] is False
+    assert status_events[0]['registered'] is True
 
 
 def test_run_allows_runtime_reexec_when_cuda_runtime_is_repaired(capsys, monkeypatch):

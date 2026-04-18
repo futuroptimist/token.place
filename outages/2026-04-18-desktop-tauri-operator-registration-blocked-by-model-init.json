@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-operator-registration-blocked-by-model-init",
+  "summary": "Desktop Tauri operator startup gated relay polling behind model initialization, causing operators to remain unregistered when model readiness was slow or failed.",
+  "impact": "Desktop compute nodes could appear running but fail to register against relay.py, preventing relay-routed inference.",
+  "fix": "Updated compute_node_bridge.py to enter relay polling/registration before model readiness, lazily initialize model runtime, and emit detailed phase-level diagnostics plus model_runtime_ready status metadata.",
+  "lessons": "Relay registration and model runtime readiness must be decoupled and independently observable in logs and status events."
+}

@@ -289,7 +289,7 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert 'failed to initialize model runtime' in payload['message']
 
 
-def test_run_disables_runtime_reexec_to_avoid_pre_startup_exit(capsys, monkeypatch):
+def test_run_allows_runtime_reexec_when_cuda_runtime_is_repaired(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)
     reexec_flags = []
@@ -314,7 +314,7 @@ def test_run_disables_runtime_reexec_to_avoid_pre_startup_exit(capsys, monkeypat
     status = compute_node_bridge.run(args)
 
     assert status == 0
-    assert reexec_flags == [False]
+    assert reexec_flags == [True]
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]['type'] == 'started'
     assert events[-1]['type'] == 'stopped'

@@ -12,6 +12,19 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Always run `pre-commit run --all-files` before pushing. This executes
   `./run_all_tests.sh` and mirrors CI.
 
+## Desktop GPU acceleration (llama_cpp_python)
+- For desktop-tauri GPU modes (`auto`, `gpu`, `hybrid`), treat GPU-capable
+  `llama-cpp-python` builds as a release requirement, not an optimization.
+- Follow the hardware acceleration section in `README.md` when (re)building
+  local runtimes:
+  - **Windows + NVIDIA/CUDA:** ensure CUDA-enabled builds (`CMAKE_ARGS=-DGGML_CUDA=on`,
+    `FORCE_CMAKE=1`) and verify runtime reports CUDA usage.
+  - **macOS Apple Silicon:** ensure Metal-enabled builds
+    (`CMAKE_ARGS=-DGGML_METAL=on`) and verify runtime reports Metal usage.
+- For desktop changes that touch Python runtime bootstrapping, packaging, or
+  sidecar launch, include regression coverage that asserts GPU mode does not
+  silently fall back to CPU when GPU runtime support is expected.
+
 ## Coding Conventions
 - New JavaScript should be written in **TypeScript** using functional React
   components and hooks.

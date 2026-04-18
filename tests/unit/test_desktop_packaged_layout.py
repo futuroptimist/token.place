@@ -58,6 +58,7 @@ def test_linux_no_bundle_layout_contains_python_runtime_resources() -> None:
         ("python/path_bootstrap.py", "resources/python/path_bootstrap.py"),
         "python/path_bootstrap.py",
     )
+    _assert_any_exists(staging_root, ("requirements.txt", "resources/requirements.txt"), "requirements.txt")
     _assert_any_exists(staging_root, ("utils", "resources/utils"), "utils/")
     _assert_any_exists(staging_root, ("config.py", "resources/config.py"), "config.py")
 

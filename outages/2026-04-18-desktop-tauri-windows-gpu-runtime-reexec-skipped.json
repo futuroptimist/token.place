@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-windows-gpu-runtime-reexec-skipped",
+  "summary": "Desktop-tauri operator mode on Windows could keep using a CPU-only llama-cpp runtime even after successful CUDA runtime repair because compute_node_bridge.py explicitly disabled the required post-install re-exec step.",
+  "impact": "Windows 11 + NVIDIA operators could observe persistent CPU fallback in desktop operator mode, resulting in reduced throughput/latency and confusing diagnostics after runtime repair attempts.",
+  "fix": "Updated compute_node_bridge.py to honor maybe_reexec_for_runtime_refresh(...) with re-exec enabled, aligned bridge behavior with inference_sidecar.py and desktop runtime documentation, and added regression/e2e contract tests that assert CUDA-backed startup expectations for the Windows smoke-test path.",
+  "lessons": "When runtime repair mutates native Python dependencies in-process, all sidecar entrypoints must share the same re-exec contract; diverging behavior between smoke-test and operator paths creates hidden CPU fallback regressions."
+}

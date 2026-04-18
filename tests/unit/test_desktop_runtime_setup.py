@@ -570,6 +570,75 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
 
 
+def test_resolve_requirements_path_prefers_packaged_resources_when_repo_root_missing(tmp_path):
+    target_root = tmp_path / 'token-place-installed'
+    packaged_requirements = target_root / 'resources' / 'requirements.txt'
+    packaged_requirements.parent.mkdir(parents=True)
+    packaged_requirements.write_text('llama-cpp-python==0.3.16\n', encoding='utf-8')
+
+    resolved = desktop_runtime_setup._resolve_requirements_path(target_root)
+
+    assert resolved == packaged_requirements
+
+
+def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_unpinned_fallback(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
+    captured = {}
+
+    def _capture_plans(*, platform, requirements_path):
+        captured['platform'] = platform
+        captured['requirements_path'] = requirements_path
+        return []
+
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', _capture_plans)
+    packaged_root = tmp_path / 'AppData' / 'Local' / 'token.place'
+    packaged_requirements = packaged_root / 'resources' / 'requirements.txt'
+    packaged_requirements.parent.mkdir(parents=True)
+    packaged_requirements.write_text('llama-cpp-python==0.3.16\n', encoding='utf-8')
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
+
+    assert result['runtime_action'] == 'failed'
+    assert captured['platform'] == 'win32'
+    assert captured['requirements_path'] == packaged_requirements
+
+
+def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python==0.3.16',
+            cmake_args=None,
+            force_cmake=False,
+            index_url='https://abetlen.github.io/llama-cpp-python/whl/cu124',
+            extra_index_url='https://pypi.org/simple',
+            only_binary=True,
+            no_binary=False,
+        )
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    captured = {}
+
+    def _capture_run(cmd, env, timeout_seconds=desktop_runtime_setup.PIP_INSTALL_TIMEOUT_SECONDS):
+        captured['cmd'] = cmd
+        return False, 'failed'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
+
+    desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert captured['cmd'][:5] == [sys.executable, '-m', 'pip', 'install', '--force-reinstall']
+
+
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
     repo_root = tmp_path / 'RepoRoot'
     repo_root.mkdir(parents=True)

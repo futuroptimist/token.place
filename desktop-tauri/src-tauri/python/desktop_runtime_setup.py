@@ -309,6 +309,18 @@ def maybe_reexec_for_runtime_refresh(
         return
 
 
+
+
+def _resolve_requirements_path(target_root: Path) -> Path:
+    candidates = [
+        target_root / "requirements.txt",
+        target_root / "resources" / "requirements.txt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
@@ -364,7 +376,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    requirements_path = target_root / "requirements.txt"
+    requirements_path = _resolve_requirements_path(target_root)
     last_error = ""
 
     should_repair, repair_skip_reason = _should_attempt_source_repair()
@@ -405,7 +417,15 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     for plan in plans:
         env = os.environ.copy()
         env.update(plan.pip_env())
-        cmd = [sys.executable, "-m", "pip", "install", *plan.pip_install_args(), plan.package_spec]
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            *plan.pip_install_args(),
+            plan.package_spec,
+        ]
         ok, log_output = _run_pip_install(cmd, env)
         if not ok:
             last_error = _summarize_install_error(log_output)

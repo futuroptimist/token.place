@@ -93,7 +93,7 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 def run(args: argparse.Namespace) -> int:
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
-    maybe_reexec_for_runtime_refresh(runtime_setup, allow_reexec=False)
+    maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "

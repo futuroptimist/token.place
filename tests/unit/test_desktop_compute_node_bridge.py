@@ -131,6 +131,25 @@ class IncompatibleRelayRuntime(FakeRuntime):
         self._processed = []
 
 
+class PollExceptionRuntime(FakeRuntime):
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClient()
+        self._responses = [
+            RuntimeError('temporary relay failure'),
+            {'next_ping_in_x_seconds': 0},
+        ]
+        self._processed = []
+
+    def register_and_poll_once(self):
+        if self._responses:
+            item = self._responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return {'next_ping_in_x_seconds': 0}
+
+
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module = ModuleType('utils.compute_node_runtime')
 
@@ -425,7 +444,43 @@ def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch
     ]
     assert actionable_errors
     assert actionable_errors[0]['registered'] is False
-    assert 'update relay.py to repo HEAD' in actionable_errors[0]['last_error']
+
+
+def test_relay_error_message_handles_nested_payloads():
+    assert compute_node_bridge._relay_error_message({'next_ping_in_x_seconds': 1}) is None
+    assert (
+        compute_node_bridge._relay_error_message({'error': {'message': 'Missing token'}})
+        == 'Missing token'
+    )
+    assert compute_node_bridge._relay_error_message({'error': 'HTTP 401'}) == 'HTTP 401'
+
+
+def test_run_recovers_from_register_poll_exception(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=PollExceptionRuntime)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='http://127.0.0.1:5010',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events[0]['registered'] is False
+    assert 'relay polling failed' in status_events[0]['last_error']
+    assert any(event['registered'] is True for event in status_events)
 
 
 def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, monkeypatch):

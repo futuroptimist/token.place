@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -41,6 +42,58 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
+
+
+
+
+def _log_bridge(stage: str, **fields: Any) -> None:
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    message = f"desktop.compute_node.bridge stage={stage}"
+    if details:
+        message = f"{message} {details}"
+    print(message, file=sys.stderr)
+
+
+def _relay_error_message(relay_response: Any) -> Optional[str]:
+    if not isinstance(relay_response, dict):
+        return f"invalid relay response type: {type(relay_response).__name__}"
+
+    if "error" not in relay_response:
+        return None
+
+    error_payload = relay_response.get("error")
+    if error_payload in (None, ""):
+        return None
+
+    if isinstance(error_payload, dict):
+        nested = error_payload.get("message")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+
+    if isinstance(error_payload, str):
+        candidate = error_payload.strip()
+        return candidate or "relay registration failed"
+
+    return str(error_payload)
+
+
+def _summarize_relay_response(relay_response: Any) -> str:
+    if not isinstance(relay_response, dict):
+        return f"type={type(relay_response).__name__}"
+
+    interesting = {
+        "next_ping_in_x_seconds": relay_response.get("next_ping_in_x_seconds"),
+        "has_legacy_payload": bool(
+            {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(
+                relay_response
+            )
+        ),
+        "keys": sorted(relay_response.keys()),
+    }
+    error_message = _relay_error_message(relay_response)
+    if error_message:
+        interesting["error"] = error_message
+    return json.dumps(interesting, sort_keys=True)
 
 
 def _start_stdin_reader() -> None:
@@ -92,6 +145,13 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    _log_bridge(
+        "startup",
+        model=args.model,
+        mode=args.mode,
+        relay_url=args.relay_url,
+        relay_port=args.relay_port,
+    )
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -122,6 +182,7 @@ def run(args: argparse.Namespace) -> int:
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
+    _log_bridge("relay_target_resolved", relay_url=relay_url, relay_port=relay_port)
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
@@ -132,8 +193,10 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
-    apply_compute_mode(runtime.model_manager, args.mode)
+    selected_mode = apply_compute_mode(runtime.model_manager, args.mode)
+    _log_bridge("compute_mode_applied", requested_mode=selected_mode)
 
+    _log_bridge("model_runtime_initializing", model_path=args.model)
     if not runtime.ensure_model_ready():
         emit(
             {
@@ -142,8 +205,10 @@ def run(args: argparse.Namespace) -> int:
                 "active_relay_url": runtime.relay_client.relay_url,
             }
         )
+        _log_bridge("model_runtime_failed", model_path=args.model)
         return 1
 
+    _log_bridge("model_runtime_ready", model_path=args.model)
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     last_error: Optional[str] = None
     emit(
@@ -169,26 +234,48 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         while not stop_requested():
-            relay_response = runtime.register_and_poll_once()
+            try:
+                relay_response = runtime.register_and_poll_once()
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                relay_response = {"error": f"relay polling failed: {exc}", "next_ping_in_x_seconds": 1}
+                _log_bridge(
+                    "relay_poll_exception",
+                    error=exc,
+                    traceback=traceback.format_exc(limit=1).strip().replace("\n", " | "),
+                )
+
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
-            heartbeat_ack = "next_ping_in_x_seconds" in relay_response
-            registered = "error" not in relay_response and (legacy_payload or heartbeat_ack)
+            heartbeat_ack = isinstance(relay_response, dict) and (
+                "next_ping_in_x_seconds" in relay_response
+            )
+            relay_error = _relay_error_message(relay_response)
+            registered = relay_error is None and (legacy_payload or heartbeat_ack)
+
+            _log_bridge(
+                "relay_poll_result",
+                relay_url=active_relay_url,
+                registered=registered,
+                summary=_summarize_relay_response(relay_response),
+            )
 
             if not registered:
-                if "error" in relay_response:
-                    last_error = str(relay_response.get("error", "relay registration failed"))
+                if relay_error:
+                    last_error = relay_error
                 else:
                     last_error = (
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
             elif legacy_payload:
+                _log_bridge("relay_request_received", relay_url=active_relay_url)
                 processed = runtime.process_relay_request(relay_response)
                 if not processed:
                     last_error = "failed to process relay request"
+                    _log_bridge("relay_request_process_failed", relay_url=active_relay_url)
                 else:
                     last_error = None
+                    _log_bridge("relay_request_processed", relay_url=active_relay_url)
             else:
                 last_error = None
 
@@ -216,11 +303,19 @@ def run(args: argparse.Namespace) -> int:
                 }
             )
 
-            wait_seconds = float(relay_response.get("next_ping_in_x_seconds", 1))
+            wait_seconds = 1.0
+            if isinstance(relay_response, dict):
+                try:
+                    wait_seconds = float(relay_response.get("next_ping_in_x_seconds", 1))
+                except (TypeError, ValueError):
+                    wait_seconds = 1.0
             if _sleep_with_cancel(wait_seconds):
+                _log_bridge("shutdown_requested")
                 break
     finally:
+        _log_bridge("runtime_stopping")
         runtime.stop()
+        _log_bridge("runtime_stopped")
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(

@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-operator-relay-registration-diagnostics",
+  "summary": "Desktop operator sessions could remain in an unregistered state without actionable bridge-side diagnostics, making relay handshake failures difficult to distinguish from protocol drift or transient connectivity issues.",
+  "impact": "Operators saw `Registered: no` after clicking Start operator even when relay.py was running, and the desktop command window lacked enough checkpoint logging to quickly isolate whether failures came from relay connectivity, auth rejection, runtime startup, or polling exceptions.",
+  "fix": "Added structured bridge stderr checkpoints for startup, relay target resolution, llama runtime setup, model initialization, relay poll results, legacy payload processing, and shutdown; hardened relay polling loop with exception-to-status recovery and improved relay error extraction to surface nested error payload messages.",
+  "lessons": "Desktop operator diagnostics should log every relay and runtime boundary transition so registration regressions can be triaged from one command window without attaching a debugger."
+}

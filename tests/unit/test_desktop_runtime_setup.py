@@ -74,6 +74,17 @@ def test_runtime_root_prefers_token_place_python_import_root(monkeypatch, tmp_pa
     assert resolved == runtime_root.resolve()
 
 
+def test_runtime_root_prefers_token_place_python_import_root_with_config_py(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'token-place-root'
+    runtime_root.mkdir(parents=True)
+    (runtime_root / 'config.py').write_text('# config marker\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+
+    assert resolved == runtime_root.resolve()
+
+
 def test_runtime_root_with_invalid_env_var_warns_and_falls_back(monkeypatch, capsys):
     monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '/tmp/not-a-runtime-root')
     monkeypatch.setattr(desktop_runtime_setup, '__file__', '/tmp/token-place/python/desktop_runtime_setup.py')
@@ -81,6 +92,26 @@ def test_runtime_root_with_invalid_env_var_warns_and_falls_back(monkeypatch, cap
     captured = capsys.readouterr()
     assert 'TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root' in captured.err
     assert resolved == Path('/').resolve()
+
+
+def test_runtime_root_ignores_existing_but_invalid_env_path_and_falls_back_to_marker_ancestor(
+    monkeypatch, tmp_path, capsys
+):
+    bad_env_root = tmp_path / 'existing-but-invalid'
+    bad_env_root.mkdir(parents=True)
+    discovered_root = tmp_path / 'token-place-like'
+    (discovered_root / 'utils').mkdir(parents=True)
+    script_path = discovered_root / 'desktop-tauri' / 'src-tauri' / 'python' / 'desktop_runtime_setup.py'
+    script_path.parent.mkdir(parents=True)
+    script_path.write_text('# fake script path for discovery\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(bad_env_root))
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', str(script_path))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+    captured = capsys.readouterr()
+
+    assert 'TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root' in captured.err
+    assert resolved == discovered_root.resolve()
 
 
 def test_runtime_root_fallback_does_not_raise_for_shallow_script_path(monkeypatch):
@@ -97,6 +128,34 @@ def test_probe_runtime_reraises_internal_type_error(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', bad_probe)
     with pytest.raises(TypeError, match='internal type mismatch'):
         desktop_runtime_setup._probe_runtime(Path.cwd())
+
+
+def test_ensure_runtime_uses_custom_repo_root_for_initial_probe_and_post_repair_reprobe(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.delenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (True, 'ok')
+    )
+    custom_root = tmp_path / 'custom-runtime-root'
+    custom_root.mkdir(parents=True)
+    probe_calls = []
+    probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
+
+    def _probe_runtime(runtime_root):
+        probe_calls.append(Path(runtime_root))
+        return next(probes)
+
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', _probe_runtime)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=custom_root)
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert probe_calls == [custom_root.resolve(), custom_root.resolve()]
 
 
 def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monkeypatch, tmp_path):

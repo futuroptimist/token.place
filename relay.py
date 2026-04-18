@@ -887,11 +887,25 @@ def serve(host: str, port: int) -> None:
     ctx.push()
 
     shutdown_requested = threading.Event()
+    shutdown_dispatched = threading.Event()
+
+    def _dispatch_server_shutdown() -> None:
+        """Request server shutdown without blocking the signal handler thread."""
+
+        if shutdown_dispatched.is_set():
+            return
+        shutdown_dispatched.set()
+        threading.Thread(
+            target=server.shutdown,
+            name="relay-server-shutdown",
+            daemon=True,
+        ).start()
 
     def _handle_signal(signum, _frame):
         LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
+        DRAINING.set()
         shutdown_requested.set()
-        server.shutdown()
+        _dispatch_server_shutdown()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -911,7 +925,10 @@ def serve(host: str, port: int) -> None:
         ctx.pop()
         LOGGER.info(
             "relay.shutdown",
-            extra={"requested": shutdown_requested.is_set()},
+            extra={
+                "requested": shutdown_requested.is_set(),
+                "dispatched": shutdown_dispatched.is_set(),
+            },
         )
 
 

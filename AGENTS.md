@@ -12,6 +12,14 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Always run `pre-commit run --all-files` before pushing. This executes
   `./run_all_tests.sh` and mirrors CI.
 
+## Critical build guidance (`llama_cpp_python` / `llama-cpp-python`)
+- For any development or troubleshooting involving `llama_cpp_python` /
+  `llama-cpp-python`, treat `README.md#hardware-acceleration` as the canonical
+  instructions.
+- GPU-capable installs are platform-specific (Windows CUDA/cuBLAS, macOS Metal,
+  Linux OpenBLAS) and require the documented `CMAKE_ARGS` + `FORCE_CMAKE=1`
+  force-reinstall flow; do **not** substitute generic `pip install` guidance.
+
 ## Coding Conventions
 - New JavaScript should be written in **TypeScript** using functional React
   components and hooks.

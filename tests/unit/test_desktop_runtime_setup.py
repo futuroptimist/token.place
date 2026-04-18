@@ -570,6 +570,46 @@ def test_windows_packaged_layout_without_requirements_falls_back_without_excepti
     assert 'falling back to unpinned llama-cpp-python source reinstall' in result['fallback_reason']
 
 
+def test_windows_packaged_layout_prefers_resources_requirements_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [])
+
+    captured = {}
+
+    def _fake_repair(requirements_path):
+        captured['requirements_path'] = str(requirements_path)
+        return False, 'compile failed'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_windows_cuda_source_repair', _fake_repair)
+
+    packaged_root = tmp_path / 'token.place'
+    resources = packaged_root / 'resources'
+    resources.mkdir(parents=True)
+    (resources / 'requirements.txt').write_text(
+        "llama-cpp-python==0.3.16\n",
+        encoding='utf-8',
+    )
+
+    desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=packaged_root)
+
+    assert captured['requirements_path'].endswith('/resources/requirements.txt')
+
+
+def test_resolve_requirements_path_supports_packaged_layouts(tmp_path):
+    root = tmp_path / 'bundle-root'
+    root.mkdir()
+    assert desktop_runtime_setup._resolve_requirements_path(root) == (root / 'requirements.txt')
+
+    resources = root / 'resources'
+    resources.mkdir()
+    (resources / 'requirements.txt').write_text("llama-cpp-python==0.3.16\n", encoding='utf-8')
+    assert desktop_runtime_setup._resolve_requirements_path(root) == (resources / 'requirements.txt')
+
+
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
     repo_root = tmp_path / 'RepoRoot'
     repo_root.mkdir(parents=True)

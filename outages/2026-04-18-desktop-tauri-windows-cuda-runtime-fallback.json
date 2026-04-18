@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-windows-cuda-runtime-fallback",
+  "summary": "Windows desktop GPU-preferred sessions frequently initialized on CPU because packaged runtime repair lacked the pinned requirements metadata and install-plan ordering favored wheel-only CUDA attempts before a deterministic CUDA source build.",
+  "impact": "Windows 11 + NVIDIA desktop operators often ran CPU-only inference in auto/gpu modes, reducing performance and confidence in desktop release GPU readiness.",
+  "fix": "Bundled requirements.txt into desktop resources, taught runtime setup to resolve packaged requirements paths, reordered Windows llama-cpp-python plans to attempt CUDA source build first (CMAKE_ARGS/FORCE_CMAKE with --no-binary) before CUDA wheel fallbacks, and added regression plus e2e-style contract tests for packaging/runtime expectations.",
+  "lessons": "Desktop GPU support depends on both runtime metadata availability and deterministic install ordering; packaged apps must carry pinned dependency metadata and treat CPU fallback in GPU-preferred modes as a release-risk signal requiring explicit smoke-test validation on real Windows NVIDIA hardware."
+}

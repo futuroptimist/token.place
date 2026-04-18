@@ -73,11 +73,12 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="cuda",
             package_spec=package_spec,
-            cmake_args=None,
-            force_cmake=False,
-            index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
-            extra_index_url="https://pypi.org/simple",
-            only_binary=True,
+            cmake_args="-DGGML_CUDA=on",
+            force_cmake=True,
+            index_url="https://pypi.org/simple",
+            extra_index_url=None,
+            only_binary=False,
+            no_binary=True,
         )
 
     if detected_platform == "darwin":
@@ -111,10 +112,24 @@ def llama_cpp_install_plan_fallbacks(
     plans = [primary]
 
     if primary.platform.startswith("win"):
-        # CUDA wheels may be unavailable for a given Python ABI on Windows.
-        # First, fall back to an unpinned CUDA wheel so CI can use the newest
-        # available CUDA binary (e.g. when requirements pin is newer than
-        # published CUDA wheels on the mirror index).
+        # CUDA source builds can fail on user machines without Visual Studio
+        # Build Tools / CUDA Toolkit. Fall back to CUDA wheels where possible.
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="cuda",
+                package_spec=primary.package_spec,
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+                extra_index_url="https://pypi.org/simple",
+                only_binary=True,
+                no_binary=False,
+            )
+        )
+
+        # If the pinned version is unavailable on the CUDA wheel index, try an
+        # unpinned CUDA wheel before giving up to CPU-only fallback.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -122,8 +137,8 @@ def llama_cpp_install_plan_fallbacks(
                 package_spec="llama-cpp-python",
                 cmake_args=None,
                 force_cmake=False,
-                index_url=primary.index_url,
-                extra_index_url=primary.extra_index_url,
+                index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+                extra_index_url="https://pypi.org/simple",
                 only_binary=True,
                 no_binary=False,
             )

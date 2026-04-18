@@ -60,6 +60,11 @@ def test_linux_no_bundle_layout_contains_python_runtime_resources() -> None:
     )
     _assert_any_exists(staging_root, ("utils", "resources/utils"), "utils/")
     _assert_any_exists(staging_root, ("config.py", "resources/config.py"), "config.py")
+    _assert_any_exists(
+        staging_root,
+        ("requirements.txt", "resources/requirements.txt"),
+        "requirements.txt",
+    )
 
 
 if __name__ == "__main__":

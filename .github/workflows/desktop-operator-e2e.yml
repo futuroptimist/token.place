@@ -10,6 +10,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
+      - 'tests/e2e/test_windows_gpu_runtime_contract.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -25,6 +26,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
+      - 'tests/e2e/test_windows_gpu_runtime_contract.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -94,6 +96,9 @@ jobs:
 
       - name: Run packaged operator bridge e2e
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
+      - name: Run Windows GPU runtime contract e2e
+        run: python -m pytest -q tests/e2e/test_windows_gpu_runtime_contract.py
 
       - name: Upload desktop e2e logs on failure
         if: failure()

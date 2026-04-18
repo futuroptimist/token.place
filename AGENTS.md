@@ -17,6 +17,17 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
   components and hooks.
 - Use **Tailwind CSS** for styling and keep custom CSS minimal.
 
+## Hardware acceleration (llama-cpp-python)
+- Follow the canonical setup instructions in
+  [`README.md#hardware-acceleration`](README.md#hardware-acceleration) when
+  working on desktop/server runtime packaging and diagnostics.
+- For **Windows 11 + NVIDIA GPUs**, expect CUDA source builds to set
+  `CMAKE_ARGS=-DGGML_CUDA=on` and `FORCE_CMAKE=1` so `llama-cpp-python` is
+  built with CUDA offload support instead of CPU-only defaults.
+- Keep `n_gpu_layers` semantics intact (`-1` full offload, `0` CPU-only,
+  positive values for hybrid) and ensure diagnostics clearly report
+  `backend_available`, `backend_used`, and fallback reasons.
+
 ## Agents
 
 ### Code Linter Agent

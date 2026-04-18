@@ -249,6 +249,22 @@ def _runtime_state_path() -> Path:
     return Path.home() / ".token_place_desktop_runtime_state.json"
 
 
+def _resolve_requirements_path(target_root: Path) -> Path:
+    """Return best-effort requirements path for repo and packaged desktop layouts."""
+
+    candidates = (
+        target_root / "requirements.txt",
+        target_root / "resources" / "requirements.txt",
+        target_root / "Resources" / "requirements.txt",
+        target_root / "_up_" / "requirements.txt",
+        target_root / "_up_" / "_up_" / "requirements.txt",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
 def _load_runtime_state() -> dict:
     path = _runtime_state_path()
     try:
@@ -364,7 +380,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    requirements_path = target_root / "requirements.txt"
+    requirements_path = _resolve_requirements_path(target_root)
     last_error = ""
 
     should_repair, repair_skip_reason = _should_attempt_source_repair()

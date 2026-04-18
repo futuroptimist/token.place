@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from desktop_gpu_packaging import (
+    CUDA_WHEEL_INDEXES,
     LlamaCppInstallPlan,
     llama_cpp_install_plan_fallbacks,
     llama_cpp_requirement_spec,
@@ -439,18 +440,21 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()
     if detected_platform.startswith("win"):
-        return [
+        plans = [
             LlamaCppInstallPlan(
                 platform=detected_platform,
                 backend="cuda",
                 package_spec="llama-cpp-python",
                 cmake_args=None,
                 force_cmake=False,
-                index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
-                extra_index_url="https://pypi.org/simple",
+                index_url=index_url,
+                extra_index_url=None,
                 only_binary=True,
                 no_binary=False,
-            ),
+            )
+            for index_url in CUDA_WHEEL_INDEXES
+        ]
+        plans.append(
             LlamaCppInstallPlan(
                 platform=detected_platform,
                 backend="cpu",
@@ -461,8 +465,9 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
                 extra_index_url=None,
                 only_binary=True,
                 no_binary=False,
-            ),
-        ]
+            )
+        )
+        return plans
 
     if detected_platform == "darwin":
         return [

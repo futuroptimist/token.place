@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-windows-gpu-fallback",
+  "summary": "Desktop Tauri Windows GPU startup could silently settle on CPU because CUDA wheel fallback logic only targeted a single wheel channel and unpinned fallback allowed PyPI CPU wheel selection.",
+  "impact": "Windows 11 operators with NVIDIA GPUs could complete startup in CPU mode even when GPU mode was requested, reducing performance and obscuring whether llama-cpp-python CUDA support was actually active.",
+  "fix": "Expanded Windows CUDA wheel fallback coverage across multiple wheel channels, prevented unpinned CUDA recovery from pulling CPU wheels through PyPI extra-index fallback, documented hardware acceleration requirements in AGENTS.md, and added unit/e2e regression tests for fallback ordering and CUDA runtime activation expectations.",
+  "lessons": "GPU-capable packaging paths must prefer deterministic CUDA-only installation candidates, and desktop startup must continuously test/report backend-selection contracts so CPU fallback cannot masquerade as successful GPU enablement."
+}

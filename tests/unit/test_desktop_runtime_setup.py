@@ -198,7 +198,13 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     darwin_plans = desktop_runtime_setup._fallback_unpinned_plans('darwin')
     linux_plans = desktop_runtime_setup._fallback_unpinned_plans('linux')
 
-    assert [plan.backend for plan in win_plans] == ['cuda', 'cpu']
+    assert len(win_plans) == len(desktop_runtime_setup.CUDA_WHEEL_INDEXES) + 1
+    assert [plan.backend for plan in win_plans[:-1]] == ['cuda'] * len(
+        desktop_runtime_setup.CUDA_WHEEL_INDEXES
+    )
+    assert [plan.index_url for plan in win_plans[:-1]] == list(desktop_runtime_setup.CUDA_WHEEL_INDEXES)
+    assert all(plan.extra_index_url is None for plan in win_plans[:-1])
+    assert win_plans[-1].backend == 'cpu'
     assert [plan.backend for plan in darwin_plans] == ['metal', 'metal']
     assert [plan.backend for plan in linux_plans] == ['cpu']
 

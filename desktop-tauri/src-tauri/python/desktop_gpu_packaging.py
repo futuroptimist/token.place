@@ -6,6 +6,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+CUDA_WHEEL_INDEXES = (
+    "https://abetlen.github.io/llama-cpp-python/whl/cu128",
+    "https://abetlen.github.io/llama-cpp-python/whl/cu126",
+    "https://abetlen.github.io/llama-cpp-python/whl/cu125",
+    "https://abetlen.github.io/llama-cpp-python/whl/cu124",
+)
+
 
 @dataclass(frozen=True)
 class LlamaCppInstallPlan:
@@ -75,7 +82,7 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args=None,
             force_cmake=False,
-            index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
+            index_url=CUDA_WHEEL_INDEXES[0],
             extra_index_url="https://pypi.org/simple",
             only_binary=True,
         )
@@ -111,23 +118,41 @@ def llama_cpp_install_plan_fallbacks(
     plans = [primary]
 
     if primary.platform.startswith("win"):
+        # Try additional CUDA wheel channels in descending recency order because
+        # wheels for a given Python ABI can land on newer CUDA channels first.
+        for cuda_index in CUDA_WHEEL_INDEXES[1:]:
+            plans.append(
+                LlamaCppInstallPlan(
+                    platform=primary.platform,
+                    backend="cuda",
+                    package_spec=primary.package_spec,
+                    cmake_args=None,
+                    force_cmake=False,
+                    index_url=cuda_index,
+                    extra_index_url="https://pypi.org/simple",
+                    only_binary=True,
+                    no_binary=False,
+                )
+            )
+
         # CUDA wheels may be unavailable for a given Python ABI on Windows.
         # First, fall back to an unpinned CUDA wheel so CI can use the newest
         # available CUDA binary (e.g. when requirements pin is newer than
         # published CUDA wheels on the mirror index).
-        plans.append(
-            LlamaCppInstallPlan(
-                platform=primary.platform,
-                backend="cuda",
-                package_spec="llama-cpp-python",
-                cmake_args=None,
-                force_cmake=False,
-                index_url=primary.index_url,
-                extra_index_url=primary.extra_index_url,
-                only_binary=True,
-                no_binary=False,
+        for cuda_index in CUDA_WHEEL_INDEXES:
+            plans.append(
+                LlamaCppInstallPlan(
+                    platform=primary.platform,
+                    backend="cuda",
+                    package_spec="llama-cpp-python",
+                    cmake_args=None,
+                    force_cmake=False,
+                    index_url=cuda_index,
+                    extra_index_url=None,
+                    only_binary=True,
+                    no_binary=False,
+                )
             )
-        )
 
         # If CUDA wheels are unavailable entirely for this ABI, fall back to
         # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable

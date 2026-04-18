@@ -9,6 +9,7 @@ if str(DESKTOP_PYTHON) not in sys.path:
     sys.path.insert(0, str(DESKTOP_PYTHON))
 
 from desktop_gpu_packaging import (
+    CUDA_WHEEL_INDEXES,
     LlamaCppInstallPlan,
     llama_cpp_install_plan,
     llama_cpp_install_plan_fallbacks,
@@ -18,25 +19,36 @@ from desktop_gpu_packaging import (
 
 def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    assert len(plans) == 3
+    assert len(plans) == 1 + (len(CUDA_WHEEL_INDEXES) - 1) + len(CUDA_WHEEL_INDEXES) + 1
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
     assert gpu_plan.package_spec.startswith("llama-cpp-python==")
-    assert gpu_plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    assert gpu_plan.index_url == CUDA_WHEEL_INDEXES[0]
     assert gpu_plan.extra_index_url == "https://pypi.org/simple"
     assert gpu_plan.only_binary is True
     assert gpu_plan.pip_env() == {}
 
-    unpinned_cuda_fallback = plans[1]
-    assert unpinned_cuda_fallback.backend == "cuda"
-    assert unpinned_cuda_fallback.package_spec == "llama-cpp-python"
-    assert unpinned_cuda_fallback.index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
-    assert unpinned_cuda_fallback.extra_index_url == "https://pypi.org/simple"
-    assert unpinned_cuda_fallback.only_binary is True
-    assert unpinned_cuda_fallback.no_binary is False
+    pinned_cuda_fallbacks = plans[1 : len(CUDA_WHEEL_INDEXES)]
+    assert [plan.package_spec for plan in pinned_cuda_fallbacks] == [gpu_plan.package_spec] * len(
+        pinned_cuda_fallbacks
+    )
+    assert [plan.index_url for plan in pinned_cuda_fallbacks] == list(CUDA_WHEEL_INDEXES[1:])
+    assert all(plan.extra_index_url == "https://pypi.org/simple" for plan in pinned_cuda_fallbacks)
 
-    cpu_fallback = plans[2]
+    unpinned_start = len(CUDA_WHEEL_INDEXES)
+    unpinned_end = unpinned_start + len(CUDA_WHEEL_INDEXES)
+    unpinned_cuda_fallbacks = plans[unpinned_start:unpinned_end]
+    assert [plan.backend for plan in unpinned_cuda_fallbacks] == ["cuda"] * len(CUDA_WHEEL_INDEXES)
+    assert [plan.package_spec for plan in unpinned_cuda_fallbacks] == ["llama-cpp-python"] * len(
+        CUDA_WHEEL_INDEXES
+    )
+    assert [plan.index_url for plan in unpinned_cuda_fallbacks] == list(CUDA_WHEEL_INDEXES)
+    assert all(plan.extra_index_url is None for plan in unpinned_cuda_fallbacks)
+    assert all(plan.only_binary is True for plan in unpinned_cuda_fallbacks)
+    assert all(plan.no_binary is False for plan in unpinned_cuda_fallbacks)
+
+    cpu_fallback = plans[-1]
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.package_spec == "llama-cpp-python"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
@@ -145,7 +157,7 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
 
 def test_windows_cpu_fallback_install_args_are_binary_only():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    cpu_fallback = plans[2]
+    cpu_fallback = plans[-1]
 
     assert cpu_fallback.pip_install_args() == [
         "--upgrade",
@@ -180,6 +192,16 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
     assert plan.platform == "win32"
     assert plan.backend == "cuda"
     assert plan.only_binary is True
+
+
+def test_windows_unpinned_cuda_fallbacks_do_not_use_extra_index():
+    plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
+    unpinned = [
+        plan for plan in plans if plan.backend == "cuda" and plan.package_spec == "llama-cpp-python"
+    ]
+
+    assert [plan.index_url for plan in unpinned] == list(CUDA_WHEEL_INDEXES)
+    assert all(plan.extra_index_url is None for plan in unpinned)
 
 
 def test_llama_cpp_install_plan_darwin_selects_metal_wheel_index():

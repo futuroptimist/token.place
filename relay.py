@@ -888,10 +888,21 @@ def serve(host: str, port: int) -> None:
 
     shutdown_requested = threading.Event()
 
+    def _shutdown_server_async() -> None:
+        thread = threading.Thread(
+            target=server.shutdown,
+            name="relay-server-shutdown",
+            daemon=True,
+        )
+        thread.start()
+
     def _handle_signal(signum, _frame):
         LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
+        DRAINING.set()
+        if shutdown_requested.is_set():
+            return
         shutdown_requested.set()
-        server.shutdown()
+        _shutdown_server_async()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

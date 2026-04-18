@@ -256,6 +256,7 @@ class TestRelayClient:
         mock_post.assert_called_once_with(
             'http://localhost:5000/sink',
             json={'server_public_key': 'mock_public_key_b64'},
+            proxies={'http': None, 'https': None},
             timeout=relay_client._request_timeout
         )
 
@@ -737,8 +738,17 @@ class TestRelayClient:
         mock_post.assert_called_once_with(
             'http://localhost:5000/source',
             json=expected_payload,
+            proxies={'http': None, 'https': None},
             timeout=relay_client._request_timeout
         )
+
+    def test_request_kwargs_for_target_disables_proxy_for_loopback(self, relay_client):
+        kwargs = relay_client._request_kwargs_for_target('http://127.0.0.1:5000')
+        assert kwargs == {'proxies': {'http': None, 'https': None}}
+
+    def test_request_kwargs_for_target_keeps_network_targets_default(self, relay_client):
+        kwargs = relay_client._request_kwargs_for_target('https://token.place')
+        assert kwargs == {}
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_rejects_mismatched_bound_client_key(

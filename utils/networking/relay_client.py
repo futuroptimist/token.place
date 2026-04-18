@@ -430,6 +430,17 @@ class RelayClient:
             return {}
         return {"X-Relay-Server-Token": self._registration_token}
 
+    def _request_kwargs_for_target(self, relay_url: str) -> Dict[str, Any]:
+        """Return per-target request kwargs (for example proxy bypass on loopback)."""
+
+        if not self._is_local_url(relay_url):
+            return {}
+
+        # Avoid routing loopback relay requests through system HTTP(S) proxies.
+        # This is especially important on desktop hosts where global proxy env
+        # variables are frequently configured by enterprise tooling.
+        return {'proxies': {'http': None, 'https': None}}
+
     def start(self):
         """Start the polling loop by setting stop_polling to False"""
         self.stop_polling = False
@@ -478,6 +489,7 @@ class RelayClient:
                 response = requests.post(
                     f'{candidate_url}/sink',
                     timeout=timeout,
+                    **self._request_kwargs_for_target(candidate_url),
                     **request_kwargs,
                 )
 
@@ -600,6 +612,7 @@ class RelayClient:
                 stream_response = requests.post(
                     f'{self.relay_url}/stream/source',
                     timeout=timeout,
+                    **self._request_kwargs_for_target(self.relay_url),
                     **request_kwargs,
                 )
                 if stream_response.status_code != 200:
@@ -642,6 +655,7 @@ class RelayClient:
             source_response = requests.post(
                 f'{self.relay_url}/source',
                 timeout=timeout,
+                **self._request_kwargs_for_target(self.relay_url),
                 **request_kwargs
             )
 

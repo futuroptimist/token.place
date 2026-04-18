@@ -82,6 +82,12 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def log_debug(message: str) -> None:
+    """Emit bridge diagnostics to stderr for the desktop command-line window."""
+
+    print(f"desktop.compute_node.bridge {message}", file=sys.stderr, flush=True)
+
+
 def _sleep_with_cancel(seconds: float) -> bool:
     deadline = time.time() + max(seconds, 0)
     while time.time() < deadline:
@@ -92,10 +98,13 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    log_debug(
+        f"startup model={args.model} mode={args.mode} relay_url={args.relay_url} relay_port={args.relay_port}"
+    )
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
-    print(
-        "desktop.runtime_setup "
+    log_debug(
+        "runtime_setup "
         f"mode={args.mode} "
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
         f"device={runtime_setup.get('detected_device', 'cpu')} "
@@ -103,7 +112,6 @@ def run(args: argparse.Namespace) -> int:
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
         f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
-        file=sys.stderr,
     )
 
     try:
@@ -122,6 +130,7 @@ def run(args: argparse.Namespace) -> int:
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
+    log_debug(f"relay_target resolved_url={relay_url} resolved_port={relay_port}")
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
@@ -132,9 +141,12 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
+    log_debug(f"model_path configured model={runtime.model_manager.model_path}")
     apply_compute_mode(runtime.model_manager, args.mode)
+    log_debug(f"compute_mode_applied requested={args.mode}")
 
     if not runtime.ensure_model_ready():
+        log_debug("model_ready failed")
         emit(
             {
                 "type": "error",
@@ -143,8 +155,20 @@ def run(args: argparse.Namespace) -> int:
             }
         )
         return 1
+    log_debug("model_ready success")
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
+    log_debug(
+        "llama_diagnostics "
+        f"requested_mode={diagnostics.get('requested_mode')} "
+        f"effective_mode={diagnostics.get('effective_mode')} "
+        f"backend_available={diagnostics.get('backend_available')} "
+        f"backend_selected={diagnostics.get('backend_selected')} "
+        f"backend_used={diagnostics.get('backend_used')} "
+        f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
+        f"kv_cache_device={diagnostics.get('kv_cache_device')} "
+        f"fallback_reason={diagnostics.get('fallback_reason') or 'none'}"
+    )
     last_error: Optional[str] = None
     emit(
         {
@@ -169,26 +193,40 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         while not stop_requested():
+            log_debug("relay_poll begin")
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
             registered = "error" not in relay_response and (legacy_payload or heartbeat_ack)
+            log_debug(
+                "relay_poll result "
+                f"active_relay_url={active_relay_url} "
+                f"registered={registered} "
+                f"legacy_payload={legacy_payload} "
+                f"heartbeat_ack={heartbeat_ack} "
+                f"keys={sorted(relay_response.keys())}"
+            )
 
             if not registered:
                 if "error" in relay_response:
                     last_error = str(relay_response.get("error", "relay registration failed"))
+                    log_debug(f"relay_poll registration_error error={last_error}")
                 else:
                     last_error = (
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
+                    log_debug("relay_poll incompatible_response")
             elif legacy_payload:
+                log_debug("relay_request processing legacy payload")
                 processed = runtime.process_relay_request(relay_response)
                 if not processed:
                     last_error = "failed to process relay request"
+                    log_debug("relay_request processing_failed")
                 else:
                     last_error = None
+                    log_debug("relay_request processing_succeeded")
             else:
                 last_error = None
 
@@ -217,10 +255,14 @@ def run(args: argparse.Namespace) -> int:
             )
 
             wait_seconds = float(relay_response.get("next_ping_in_x_seconds", 1))
+            log_debug(f"relay_poll sleep seconds={wait_seconds}")
             if _sleep_with_cancel(wait_seconds):
+                log_debug("relay_poll cancellation_requested")
                 break
     finally:
+        log_debug("runtime.stop begin")
         runtime.stop()
+        log_debug("runtime.stop complete")
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(
@@ -258,8 +300,10 @@ def main() -> int:
         from utils.compute_node_runtime import normalize_compute_mode
 
         args.mode = normalize_compute_mode(args.mode)
+        log_debug(f"args_normalized mode={args.mode}")
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
+        log_debug(f"fatal_error error={exc}")
         emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})
         return 1
 

@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-operator-relay-registration-stalled",
+  "summary": "Desktop Start operator sessions could remain unregistered because loopback relay requests could inherit environment proxies instead of connecting directly to localhost, while command-line diagnostics were too limited to isolate the failure point quickly.",
+  "impact": "Operators could not reliably register with relay.py (especially on loopback) and had limited visibility into startup, registration, and llama runtime state during failures.",
+  "fix": "Bypassed HTTP(S) proxies for loopback relay targets in RelayClient and expanded compute-node bridge stderr diagnostics to cover startup parameters, runtime/llama setup, relay poll outcomes, registration errors, relay request handling, and shutdown flow.",
+  "lessons": "Desktop relay transport must explicitly handle loopback/proxy interactions, and every critical bridge-to-relay and llama runtime step should emit actionable diagnostics in the desktop command window."
+}

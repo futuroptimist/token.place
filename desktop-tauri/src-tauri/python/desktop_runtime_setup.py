@@ -74,8 +74,36 @@ print(json.dumps(payload))
 """.strip()
 
 
-def _probe_llama_runtime() -> RuntimeProbe:
-    repo_root = Path(__file__).resolve().parents[3]
+def _resolve_runtime_root(*, repo_root: Optional[Path] = None) -> Path:
+    if repo_root is not None:
+        return repo_root.resolve()
+
+    explicit_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    if explicit_root:
+        candidate = Path(explicit_root).resolve()
+        if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
+            return candidate
+        print(
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root "
+            f"({candidate}); expected utils/ or config.py. Falling back to auto-detection.",
+            file=sys.stderr,
+        )
+
+    script_path = Path(__file__).resolve()
+    for candidate in script_path.parents:
+        if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
+            return candidate
+
+    parents = script_path.parents
+    if len(parents) > 3:
+        return parents[3]
+    if parents:
+        return parents[-1]
+    return script_path.parent
+
+
+def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe:
+    repo_root = _resolve_runtime_root(repo_root=runtime_root)
     python_root = Path(__file__).resolve().parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
@@ -143,6 +171,18 @@ def _probe_llama_runtime() -> RuntimeProbe:
         llama_module_path=str(payload.get("llama_module_path", "missing")),
         error=payload.get("error"),
     )
+
+
+def _probe_runtime(runtime_root: Path) -> RuntimeProbe:
+    try:
+        return _probe_llama_runtime(runtime_root=runtime_root)
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword argument" in message and "runtime_root" in message:
+            # Backward-compatible path for tests that monkeypatch _probe_llama_runtime
+            # with callables that do not accept keyword arguments.
+            return _probe_llama_runtime()
+        raise
 
 
 def _run_pip_install(
@@ -253,13 +293,16 @@ def _load_runtime_state() -> dict:
     path = _runtime_state_path()
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
 
 def _save_runtime_state(state: dict) -> None:
     path = _runtime_state_path()
-    path.write_text(json.dumps(state), encoding="utf-8")
+    try:
+        path.write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        return
 
 
 def _should_attempt_source_repair() -> tuple[bool, str]:
@@ -308,9 +351,6 @@ def maybe_reexec_for_runtime_refresh(
     except OSError:
         return
 
-
-
-
 def _resolve_requirements_path(target_root: Path) -> Path:
     candidates = [
         target_root / "requirements.txt",
@@ -321,12 +361,13 @@ def _resolve_requirements_path(target_root: Path) -> Path:
             return candidate
     return candidates[0]
 
+
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
-    target_root = (repo_root or Path(__file__).resolve().parents[3]).resolve()
-    before = _probe_llama_runtime()
+    target_root = _resolve_runtime_root(repo_root=repo_root)
+    before = _probe_runtime(target_root)
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {
             "selected_backend": "cpu",
@@ -384,7 +425,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         source_ok, source_log = _windows_cuda_source_repair(requirements_path)
         if source_ok:
             _clear_source_repair_failure()
-            after = _probe_llama_runtime()
+            after = _probe_runtime(target_root)
             if after.gpu_offload_supported and after.backend == "cuda":
                 return {
                     "selected_backend": "cuda",
@@ -431,7 +472,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             last_error = _summarize_install_error(log_output)
             continue
 
-        after = _probe_llama_runtime()
+        after = _probe_runtime(target_root)
         if after.gpu_offload_supported and after.backend in {"cuda", "metal"}:
             return {
                 "selected_backend": after.backend,

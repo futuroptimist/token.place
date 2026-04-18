@@ -1,8 +1,10 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
+import pytest
 
 PYTHON_MODULE_DIR = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python'
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,7 +41,7 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
 
 def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
-    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('cpu')
     assert result['runtime_action'] == 'skipped'
     assert result['selected_backend'] == 'cpu'
@@ -51,7 +53,7 @@ def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch)
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
     monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
     probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
-    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     monkeypatch.setattr(
         desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (True, 'ok')
     )
@@ -60,6 +62,136 @@ def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch)
 
     assert result['runtime_action'] == 'installed_cuda_reexec'
     assert result['selected_backend'] == 'cuda'
+
+
+def test_runtime_root_prefers_token_place_python_import_root(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'resources'
+    (runtime_root / 'utils').mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+
+    assert resolved == runtime_root.resolve()
+
+
+def test_runtime_root_prefers_token_place_python_import_root_with_config_py(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'token-place-root'
+    runtime_root.mkdir(parents=True)
+    (runtime_root / 'config.py').write_text('# config marker\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+
+    assert resolved == runtime_root.resolve()
+
+
+def test_runtime_root_with_invalid_env_var_warns_and_falls_back(monkeypatch, capsys):
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '/tmp/not-a-runtime-root')
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', '/tmp/token-place/python/desktop_runtime_setup.py')
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+    captured = capsys.readouterr()
+    assert 'TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root' in captured.err
+    assert resolved == Path('/').resolve()
+
+
+def test_runtime_root_ignores_existing_but_invalid_env_path_and_falls_back_to_marker_ancestor(
+    monkeypatch, tmp_path, capsys
+):
+    bad_env_root = tmp_path / 'existing-but-invalid'
+    bad_env_root.mkdir(parents=True)
+    discovered_root = tmp_path / 'token-place-like'
+    (discovered_root / 'utils').mkdir(parents=True)
+    script_path = discovered_root / 'desktop-tauri' / 'src-tauri' / 'python' / 'desktop_runtime_setup.py'
+    script_path.parent.mkdir(parents=True)
+    script_path.write_text('# fake script path for discovery\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(bad_env_root))
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', str(script_path))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+    captured = capsys.readouterr()
+
+    assert 'TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root' in captured.err
+    assert resolved == discovered_root.resolve()
+
+
+def test_runtime_root_fallback_does_not_raise_for_shallow_script_path(monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', '/desktop_runtime_setup.py')
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+    assert resolved == Path('/').resolve()
+
+
+def test_probe_runtime_reraises_internal_type_error(monkeypatch):
+    def bad_probe(*, runtime_root=None):
+        raise TypeError('internal type mismatch')
+
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', bad_probe)
+    with pytest.raises(TypeError, match='internal type mismatch'):
+        desktop_runtime_setup._probe_runtime(Path.cwd())
+
+
+def test_ensure_runtime_uses_custom_repo_root_for_initial_probe_and_post_repair_reprobe(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.delenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (True, 'ok')
+    )
+    custom_root = tmp_path / 'custom-runtime-root'
+    custom_root.mkdir(parents=True)
+    probe_calls = []
+    probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
+
+    def _probe_runtime(runtime_root):
+        probe_calls.append(Path(runtime_root))
+        return next(probes)
+
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_runtime', _probe_runtime)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=custom_root)
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert probe_calls == [custom_root.resolve(), custom_root.resolve()]
+
+
+def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'bundle_root'
+    (runtime_root / 'utils').mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'cuda',
+                'gpu_offload_supported': True,
+                'detected_device': 'cuda',
+                'interpreter': 'python',
+                'prefix': 'prefix',
+                'llama_module_path': 'site-packages/llama_cpp/__init__.py',
+            }
+        )
+        stderr = ''
+
+    def fake_run(cmd, **kwargs):
+        captured['cmd'] = cmd
+        captured['cwd'] = kwargs['cwd']
+        captured['env'] = kwargs['env']
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', fake_run)
+
+    probe = desktop_runtime_setup._probe_llama_runtime()
+
+    assert probe.backend == 'cuda'
+    assert Path(captured['cwd']) == runtime_root.resolve()
+    pythonpath_entries = captured['env']['PYTHONPATH'].split(os.pathsep)
+    assert str(runtime_root.resolve()) in pythonpath_entries
 
 
 def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stays_cpu(monkeypatch):
@@ -71,7 +203,7 @@ def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stay
         captured['reason'] = reason
 
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', fake_record)
-    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
     monkeypatch.setattr(
         desktop_runtime_setup,
         '_windows_cuda_source_repair',
@@ -91,7 +223,7 @@ def test_runtime_bootstrap_noop_when_gpu_runtime_is_already_present(monkeypatch)
     monkeypatch.setattr(
         desktop_runtime_setup,
         '_probe_llama_runtime',
-        lambda: _probe(backend='cuda', gpu=True, device='nvidia'),
+        lambda **_: _probe(backend='cuda', gpu=True, device='nvidia'),
     )
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu')
@@ -104,7 +236,7 @@ def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
-    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
     monkeypatch.setattr(
         desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (False, 'compile failed')
     )
@@ -150,7 +282,7 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
 
 def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
-    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
     monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')
     invoked = {'source_repair': False}
     monkeypatch.setattr(
@@ -172,7 +304,7 @@ def test_windows_runtime_bootstrap_success_reexec_is_guarded_to_one_attempt(monk
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
     monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
     probes = iter([_probe(), _probe(backend='cuda', gpu=True, device='cuda')])
-    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     monkeypatch.setattr(
         desktop_runtime_setup, '_windows_cuda_source_repair', lambda _requirements_path: (True, 'ok')
     )

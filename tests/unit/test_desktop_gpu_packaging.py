@@ -74,7 +74,7 @@ def test_linux_install_plan_remains_cpu_default():
     plan = plans[0]
     assert plan.backend == "cpu"
     assert plan.pip_env() == {}
-    assert plan.pip_install_args() == ["--upgrade", "--no-cache-dir"]
+    assert plan.pip_install_args() == ["--force-reinstall", "--upgrade", "--no-cache-dir"]
 
 
 def test_requirement_spec_parses_comments_and_blank_lines(tmp_path):
@@ -121,6 +121,7 @@ def test_pip_install_args_include_index_and_binary_flags():
     )
 
     assert plan.pip_install_args() == [
+        "--force-reinstall",
         "--upgrade",
         "--no-cache-dir",
         "--index-url",
@@ -148,6 +149,7 @@ def test_windows_cpu_fallback_install_args_are_binary_only():
     cpu_fallback = plans[2]
 
     assert cpu_fallback.pip_install_args() == [
+        "--force-reinstall",
         "--upgrade",
         "--no-cache-dir",
         "--index-url",
@@ -163,6 +165,7 @@ def test_macos_source_fallback_install_args_force_source_build():
     source_fallback = plans[1]
 
     assert source_fallback.pip_install_args() == [
+        "--force-reinstall",
         "--upgrade",
         "--no-cache-dir",
         "--index-url",

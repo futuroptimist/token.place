@@ -55,3 +55,19 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 ### Prompt Agent
 - **When:** you run `flywheel prompt`
 - **Does:** generate context-aware prompts for Codex or other LLM assistants
+
+## Hardware acceleration (`llama_cpp_python`)
+
+- Follow [`README.md#hardware-acceleration`](README.md#hardware-acceleration)
+  when enabling desktop/server GPU support.
+- On Windows + NVIDIA, run these in the same virtualenv used by token.place:
+  - Command Prompt:
+    - `set CMAKE_ARGS=-DGGML_CUDA=on`
+    - `set FORCE_CMAKE=1`
+  - PowerShell:
+    - `$env:CMAKE_ARGS="-DGGML_CUDA=on"`
+    - `$env:FORCE_CMAKE=1`
+  - Then reinstall:
+    - `pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir --verbose`
+- Keep `n_gpu_layers` non-zero (typically `-1` for full offload) when GPU/hybrid
+  execution is expected.

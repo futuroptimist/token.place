@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-windows-gpu-runtime-cpu-fallback",
+  "summary": "Desktop-tauri Windows GPU bootstrap could remain CPU-only because the wheel repair path installed llama-cpp-python without --force-reinstall, allowing pip to keep an already-installed CPU wheel of the same version.",
+  "impact": "Windows 11 NVIDIA users could choose auto/gpu/hybrid but still run inference on CPU, resulting in lower throughput and higher latency.",
+  "fix": "Added --force-reinstall to desktop llama-cpp-python wheel install plans and added regression/e2e contract tests that assert CUDA reinstall attempts replace existing CPU wheels before CPU fallback.",
+  "lessons": "GPU bootstrap/install contracts must force replacement when binary capability is encoded by wheel variant rather than version number; tests should verify command flags and repair sequencing."
+}

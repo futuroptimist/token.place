@@ -20,9 +20,10 @@ class LlamaCppInstallPlan:
     extra_index_url: str | None = None
     only_binary: bool = False
     no_binary: bool = False
+    force_reinstall: bool = True
 
     def pip_install_args(self) -> list[str]:
-        args = ["--upgrade", "--no-cache-dir"]
+        args = ["--force-reinstall", "--upgrade", "--no-cache-dir"]
         if self.index_url:
             args.extend(["--index-url", self.index_url])
         if self.extra_index_url:

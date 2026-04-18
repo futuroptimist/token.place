@@ -130,6 +130,43 @@ def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
     assert result['selected_backend'] == 'cpu'
 
 
+def test_runtime_bootstrap_uses_force_reinstall_for_wheel_repair_plans(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        'llama_cpp_install_plan_fallbacks',
+        lambda **_kwargs: [
+            desktop_runtime_setup.LlamaCppInstallPlan(
+                platform='win32',
+                backend='cuda',
+                package_spec='llama-cpp-python==0.3.16',
+                cmake_args=None,
+                force_cmake=False,
+                index_url='https://abetlen.github.io/llama-cpp-python/whl/cu124',
+                extra_index_url='https://pypi.org/simple',
+                only_binary=True,
+                no_binary=False,
+            )
+        ],
+    )
+    captured = {}
+
+    def _run_pip(cmd, env, timeout_seconds=0):
+        captured['cmd'] = cmd
+        return False, 'simulated pip failure'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _run_pip)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
+
+    assert result['runtime_action'] == 'failed'
+    install_cmd = captured['cmd']
+    assert install_cmd[:4] == [sys.executable, '-m', 'pip', 'install']
+    assert '--force-reinstall' in install_cmd
+
+
 def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     called = {}

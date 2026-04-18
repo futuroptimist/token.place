@@ -55,11 +55,6 @@ if bootstrap_script:
 
 repo_root = Path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd())).resolve()
 
-from utils.llm.model_manager import detect_llama_runtime_capabilities
-# NOTE: detect_llama_runtime_capabilities must keep `import llama_cpp` lazy
-# (inside the function body). We sanitize sys.path below before that import
-# runs so site-packages can win over a repo-local llama_cpp.py shim.
-
 repo_root_resolved = str(repo_root.resolve())
 sanitized = []
 for entry in sys.path:
@@ -69,7 +64,57 @@ for entry in sys.path:
     sanitized.append(entry)
 sys.path[:] = sanitized
 
-payload = detect_llama_runtime_capabilities()
+try:
+    import llama_cpp
+except Exception as exc:
+    payload = {
+        "backend": "missing",
+        "gpu_offload_supported": False,
+        "detected_device": "none",
+        "error": str(exc),
+    }
+else:
+    backend = "cpu"
+    cuda_markers = (
+        "GGML_USE_CUDA",
+        "GGML_CUDA",
+        "LLAMA_CUDA",
+        "GGML_USE_CUBLAS",
+        "LLAMA_CUBLAS",
+    )
+    metal_markers = (
+        "GGML_USE_METAL",
+        "GGML_METAL",
+        "LLAMA_METAL",
+    )
+    if any(bool(getattr(llama_cpp, marker, False)) for marker in cuda_markers):
+        backend = "cuda"
+    elif any(bool(getattr(llama_cpp, marker, False)) for marker in metal_markers):
+        backend = "metal"
+
+    supports_gpu = getattr(llama_cpp, "llama_supports_gpu_offload", None)
+    gpu_offload_supported = False
+    if callable(supports_gpu):
+        try:
+            gpu_offload_supported = bool(supports_gpu())
+        except Exception:
+            gpu_offload_supported = False
+    else:
+        gpu_offload_supported = backend in {"cuda", "metal"}
+
+    if gpu_offload_supported and backend == "cpu":
+        backend = "metal" if sys.platform == "darwin" else "cuda"
+
+    payload = {
+        "backend": backend,
+        "gpu_offload_supported": gpu_offload_supported,
+        "detected_device": backend if gpu_offload_supported else "cpu",
+        "interpreter": sys.executable,
+        "prefix": sys.prefix,
+        "llama_module_path": getattr(llama_cpp, "__file__", "unknown"),
+        "error": None,
+    }
+
 print(json.dumps(payload))
 """.strip()
 

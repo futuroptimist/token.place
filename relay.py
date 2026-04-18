@@ -891,7 +891,13 @@ def serve(host: str, port: int) -> None:
     def _handle_signal(signum, _frame):
         LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
         shutdown_requested.set()
-        server.shutdown()
+        # BaseServer.shutdown() must be invoked from a different thread than
+        # serve_forever() to avoid deadlocking while handling SIGINT/SIGTERM.
+        threading.Thread(
+            target=server.shutdown,
+            name="relay-shutdown",
+            daemon=True,
+        ).start()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

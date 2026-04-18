@@ -1,10 +1,12 @@
 import pytest
 import time
 import base64
+from types import SimpleNamespace
 from flask import Flask
 import sys
 import os
 from datetime import datetime, timedelta
+from unittest.mock import Mock
 
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -19,6 +21,7 @@ from relay import (
     streaming_sessions,
     streaming_sessions_by_client,
 )
+import relay
 
 # Generate dummy keys for testing
 # (You might want to use the generate_keys function from encrypt.py if needed)
@@ -358,6 +361,53 @@ def test_livez_remains_alive_when_draining(client):
 
     assert response.status_code == 200
     assert response.get_json()["status"] == "alive"
+
+
+def test_serve_signal_handler_runs_shutdown_off_main_thread(monkeypatch):
+    """Signal handler should request shutdown without deadlocking."""
+    fake_server = SimpleNamespace(
+        shutdown=Mock(),
+        serve_forever=Mock(),
+    )
+    fake_ctx = SimpleNamespace(push=Mock(), pop=Mock())
+
+    def fake_make_server(_host, _port, _app, threaded):
+        assert threaded is True
+        return fake_server
+
+    handlers = {}
+
+    def fake_signal(sig, handler):
+        handlers[sig] = handler
+
+    started = []
+
+    class _ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            self._target = target
+            self.name = name
+            self.daemon = daemon
+            started.append(self)
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(relay, "make_server", fake_make_server)
+    monkeypatch.setattr(relay.app, "app_context", lambda: fake_ctx)
+    monkeypatch.setattr(relay.signal, "signal", fake_signal)
+    monkeypatch.setattr(relay.threading, "Thread", _ImmediateThread)
+
+    def _trigger_signal():
+        handlers[relay.signal.SIGINT](relay.signal.SIGINT, None)
+
+    fake_server.serve_forever.side_effect = _trigger_signal
+
+    relay.serve("127.0.0.1", 5010)
+
+    fake_server.shutdown.assert_called_once_with()
+    assert len(started) == 1
+    assert started[0].name == "relay-shutdown"
+    assert started[0].daemon is True
 
 # --- Test /source ---
 

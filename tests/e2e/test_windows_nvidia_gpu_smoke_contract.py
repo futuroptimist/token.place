@@ -14,17 +14,30 @@ MODULE_PATH = (
     / 'windows_nvidia_gpu_smoke_test.py'
 )
 SPEC = importlib.util.spec_from_file_location('windows_nvidia_gpu_smoke_test', MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None, (
+    f'Could not load {MODULE_PATH} — ensure desktop-tauri/scripts/ is present in the repo'
+)
 windows_gpu_smoke = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
 SPEC.loader.exec_module(windows_gpu_smoke)
+
+
+def _make_repo_root_with_bootstrap(tmp_path: Path) -> Path:
+    repo_root = tmp_path / 'repo'
+    python_root = repo_root / 'desktop-tauri' / 'src-tauri' / 'python'
+    python_root.mkdir(parents=True)
+    (python_root / 'path_bootstrap.py').write_text(
+        'def ensure_runtime_import_paths(*_args, **_kwargs):\n'
+        '    return None\n',
+        encoding='utf-8',
+    )
+    (repo_root / 'llama_cpp.py').write_text('# shim\n', encoding='utf-8')
+    return repo_root
 
 
 def test_main_accepts_runtime_reexec_and_cuda_bridge_started(monkeypatch, tmp_path):
     model_path = tmp_path / 'model.gguf'
     model_path.write_text('stub', encoding='utf-8')
-    repo_root = tmp_path / 'repo'
-    repo_root.mkdir()
-    (repo_root / 'llama_cpp.py').write_text('# shim\n', encoding='utf-8')
+    repo_root = _make_repo_root_with_bootstrap(tmp_path)
 
     monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
     monkeypatch.setattr(windows_gpu_smoke, '_repo_root', lambda: repo_root)
@@ -67,8 +80,7 @@ def test_main_accepts_runtime_reexec_and_cuda_bridge_started(monkeypatch, tmp_pa
 def test_main_fails_when_bridge_reports_cpu_fallback(monkeypatch, tmp_path):
     model_path = tmp_path / 'model.gguf'
     model_path.write_text('stub', encoding='utf-8')
-    repo_root = tmp_path / 'repo'
-    repo_root.mkdir()
+    repo_root = _make_repo_root_with_bootstrap(tmp_path)
 
     monkeypatch.setattr(windows_gpu_smoke.sys, 'platform', 'win32')
     monkeypatch.setattr(windows_gpu_smoke, '_repo_root', lambda: repo_root)

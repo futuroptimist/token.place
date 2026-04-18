@@ -889,9 +889,7 @@ def serve(host: str, port: int) -> None:
     shutdown_requested = threading.Event()
 
     def _handle_signal(signum, _frame):
-        LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
-        shutdown_requested.set()
-        server.shutdown()
+        _request_relay_shutdown(server, shutdown_requested, signum)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -913,6 +911,30 @@ def serve(host: str, port: int) -> None:
             "relay.shutdown",
             extra={"requested": shutdown_requested.is_set()},
         )
+
+
+def _shutdown_server_async(server: Any) -> threading.Thread:
+    """Invoke server.shutdown() on a background daemon thread."""
+
+    thread = threading.Thread(
+        target=server.shutdown,
+        name="relay-server-shutdown",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _request_relay_shutdown(server: Any, shutdown_requested: threading.Event, signum: int) -> None:
+    """Initiate relay shutdown after receiving an OS signal."""
+
+    if shutdown_requested.is_set():
+        return
+
+    LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
+    DRAINING.set()
+    shutdown_requested.set()
+    _shutdown_server_async(server)
 
 
 def main(argv: list[str] | None = None) -> None:

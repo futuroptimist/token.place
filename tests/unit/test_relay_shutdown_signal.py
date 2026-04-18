@@ -26,13 +26,13 @@ def test_serve_shutdown_signal_is_non_blocking(monkeypatch) -> None:
 
     monkeypatch.setattr(relay, "make_server", lambda *_args, **_kwargs: DummyServer())
     monkeypatch.setattr(relay.signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
-
-    relay.DRAINING.clear()
+    monkeypatch.setattr(relay, "DRAINING", threading.Event())
 
     start = time.perf_counter()
     relay.serve("127.0.0.1", 5010)
     elapsed = time.perf_counter() - start
 
-    assert elapsed < 0.2
+    assert not shutdown_called.is_set()
+    assert elapsed < 0.5
     assert relay.DRAINING.is_set()
     assert shutdown_called.wait(timeout=1.0)

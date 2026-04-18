@@ -887,17 +887,26 @@ def serve(host: str, port: int) -> None:
     ctx.push()
 
     shutdown_requested = threading.Event()
+    shutdown_thread: threading.Thread | None = None
 
     def _shutdown_server_async() -> None:
-        thread = threading.Thread(
-            target=server.shutdown,
+        nonlocal shutdown_thread
+
+        def _shutdown_server() -> None:
+            try:
+                server.shutdown()
+            except Exception:  # pragma: no cover - defensive logging path
+                LOGGER.exception("relay.shutdown.error")
+
+        shutdown_thread = threading.Thread(
+            target=_shutdown_server,
             name="relay-server-shutdown",
-            daemon=True,
+            daemon=False,
         )
-        thread.start()
+        shutdown_thread.start()
 
     def _handle_signal(signum, _frame):
-        LOGGER.info("relay.shutdown_signal", extra={"signal": signum})
+        LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
         DRAINING.set()
         if shutdown_requested.is_set():
             return
@@ -919,6 +928,8 @@ def serve(host: str, port: int) -> None:
     try:
         server.serve_forever()
     finally:
+        if shutdown_thread is not None:
+            shutdown_thread.join(timeout=1.0)
         ctx.pop()
         LOGGER.info(
             "relay.shutdown",

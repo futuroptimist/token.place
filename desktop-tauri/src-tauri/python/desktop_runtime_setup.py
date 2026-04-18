@@ -83,13 +83,23 @@ def _resolve_runtime_root(*, repo_root: Optional[Path] = None) -> Path:
         candidate = Path(explicit_root).resolve()
         if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
             return candidate
+        print(
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root "
+            f"({candidate}); expected utils/ or config.py. Falling back to auto-detection.",
+            file=sys.stderr,
+        )
 
     script_path = Path(__file__).resolve()
     for candidate in script_path.parents:
         if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
             return candidate
 
-    return script_path.parents[3]
+    parents = script_path.parents
+    if len(parents) > 3:
+        return parents[3]
+    if parents:
+        return parents[-1]
+    return script_path.parent
 
 
 def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe:
@@ -166,10 +176,13 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
 def _probe_runtime(runtime_root: Path) -> RuntimeProbe:
     try:
         return _probe_llama_runtime(runtime_root=runtime_root)
-    except TypeError:
-        # Backward-compatible path for tests that monkeypatch _probe_llama_runtime
-        # with callables that do not accept keyword arguments.
-        return _probe_llama_runtime()
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword argument" in message and "runtime_root" in message:
+            # Backward-compatible path for tests that monkeypatch _probe_llama_runtime
+            # with callables that do not accept keyword arguments.
+            return _probe_llama_runtime()
+        raise
 
 
 def _run_pip_install(
@@ -338,9 +351,6 @@ def maybe_reexec_for_runtime_refresh(
     except OSError:
         return
 
-
-
-
 def _resolve_requirements_path(target_root: Path) -> Path:
     candidates = [
         target_root / "requirements.txt",
@@ -350,6 +360,7 @@ def _resolve_requirements_path(target_root: Path) -> Path:
         if candidate.exists():
             return candidate
     return candidates[0]
+
 
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""

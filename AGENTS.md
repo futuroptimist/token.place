@@ -17,6 +17,15 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
   components and hooks.
 - Use **Tailwind CSS** for styling and keep custom CSS minimal.
 
+## Critical build guidance (`llama_cpp_python` / `llama-cpp-python`)
+- For any development or troubleshooting involving `llama_cpp_python`, treat
+  [`README.md#hardware-acceleration`](README.md#hardware-acceleration) as the
+  canonical source of truth.
+- GPU acceleration setup is platform-specific (Windows CUDA/cuBLAS, macOS
+  Metal, Linux OpenBLAS) and requires the documented force-reinstall flow with
+  the correct `CMAKE_ARGS` + `FORCE_CMAKE` values; do **not** provide generic
+  `pip install llama-cpp-python` guidance.
+
 ## Agents
 
 ### Code Linter Agent

@@ -74,19 +74,42 @@ print(json.dumps(payload))
 """.strip()
 
 
+def _resolve_runtime_root() -> Path:
+    explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    if explicit_import_root:
+        candidate = Path(explicit_import_root).resolve()
+        if candidate.exists():
+            return candidate
+
+    script_path = Path(__file__).resolve()
+    candidates = [
+        script_path.parents[3] if len(script_path.parents) > 3 else None,
+        script_path.parent.parent,
+        script_path.parent.parent / "resources",
+        script_path.parent.parent / "Resources",
+    ]
+    for candidate in candidates:
+        if candidate is None or not candidate.exists():
+            continue
+        if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
+            return candidate.resolve()
+
+    return script_path.parents[3] if len(script_path.parents) > 3 else script_path.parent.parent
+
+
 def _probe_llama_runtime() -> RuntimeProbe:
-    repo_root = Path(__file__).resolve().parents[3]
+    runtime_root = _resolve_runtime_root()
     python_root = Path(__file__).resolve().parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_entries = [str(python_root), str(repo_root)]
+    pythonpath_entries = [str(python_root), str(runtime_root)]
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(Path(__file__).resolve())
-    env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
+    env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(runtime_root)
     try:
         result = subprocess.run(
             cmd,
@@ -94,7 +117,7 @@ def _probe_llama_runtime() -> RuntimeProbe:
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=str(repo_root),
+            cwd=str(runtime_root),
             env=env,
         )
     except Exception as exc:
@@ -325,7 +348,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
-    target_root = (repo_root or Path(__file__).resolve().parents[3]).resolve()
+    target_root = (repo_root or _resolve_runtime_root()).resolve()
     before = _probe_llama_runtime()
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {

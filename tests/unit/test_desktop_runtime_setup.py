@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -647,3 +648,49 @@ def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
 
     module_path = str(shim.resolve()).upper()
     assert desktop_runtime_setup._is_repo_local_llama_module(module_path, repo_root) is True
+
+
+def test_resolve_runtime_root_prefers_explicit_import_root_env(monkeypatch, tmp_path):
+    explicit_root = tmp_path / 'token-place-runtime'
+    explicit_root.mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(explicit_root))
+
+    resolved = desktop_runtime_setup._resolve_runtime_root()
+
+    assert resolved == explicit_root.resolve()
+
+
+def test_probe_uses_resolved_runtime_root_for_pythonpath_and_cwd(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'resources'
+    runtime_root.mkdir(parents=True)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda: runtime_root)
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                'backend': 'cpu',
+                'gpu_offload_supported': False,
+                'detected_device': 'cpu',
+                'interpreter': sys.executable,
+                'prefix': sys.prefix,
+                'llama_module_path': 'missing',
+                'error': None,
+            }
+        )
+        stderr = ''
+
+    def _capture_run(*_args, **kwargs):
+        captured['cwd'] = kwargs['cwd']
+        captured['env'] = kwargs['env']
+        return _Result()
+
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _capture_run)
+
+    desktop_runtime_setup._probe_llama_runtime()
+
+    assert captured['cwd'] == str(runtime_root)
+    assert captured['env']['TOKEN_PLACE_PROBE_REPO_ROOT'] == str(runtime_root)
+    assert captured['env']['PYTHONPATH'].split(os.pathsep)[1] == str(runtime_root)

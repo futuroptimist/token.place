@@ -323,9 +323,9 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
+    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     {
         let mut child_slot = state.child.lock().await;
         if child_slot
@@ -440,6 +440,7 @@ pub async fn start_compute_node(
             last_error: None,
         };
     }
+    drop(_lifecycle_lock);
 
     let log_policy = SubprocessLogPolicy::from_env();
     let stderr_task = tokio::spawn(async move {
@@ -481,6 +482,7 @@ pub async fn start_compute_node(
         eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
     }
 
+    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     let running_child = {
         let mut child_slot = state.child.lock().await;
         child_slot.take()
@@ -502,13 +504,12 @@ pub async fn start_compute_node(
         status.registered = false;
     }
     *state.stdin.lock().await = None;
+    drop(_lifecycle_lock);
 
     Ok(())
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
-
     if let Some(stdin) = state.stdin.lock().await.as_mut() {
         stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
         stdin.flush().await?;
@@ -522,11 +523,14 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         };
 
         if child.try_wait()?.is_some() {
-            *child_lock = None;
-            *state.stdin.lock().await = None;
-            let mut status = state.status.lock().await;
-            status.running = false;
-            status.registered = false;
+            {
+                let _lifecycle_lock = state.lifecycle_lock.lock().await;
+                *child_lock = None;
+                *state.stdin.lock().await = None;
+                let mut status = state.status.lock().await;
+                status.running = false;
+                status.registered = false;
+            }
             return Ok(());
         }
 
@@ -542,9 +546,10 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
     }
 
-    *state.child.lock().await = None;
-    *state.stdin.lock().await = None;
     {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
+        *state.child.lock().await = None;
+        *state.stdin.lock().await = None;
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
@@ -560,6 +565,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+    use tokio::time::{timeout, Duration as TokioDuration};
 
     fn success_exit_status() -> ExitStatus {
         #[cfg(windows)]
@@ -626,6 +632,72 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_does_not_wait_on_lifecycle_lock() {
+        let state = ComputeNodeState::default();
+        let lifecycle_guard = state.lifecycle_lock.lock().await;
+
+        timeout(
+            TokioDuration::from_millis(200),
+            stop_compute_node(state.clone()),
+        )
+        .await
+        .expect("stop should not block on lifecycle lock")
+        .expect("stop should succeed with empty state");
+        drop(lifecycle_guard);
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_sends_cancel_and_updates_stopped_status() {
+        let mut child = {
+            #[cfg(windows)]
+            {
+                let mut command = Command::new("python");
+                command.args([
+                    "-c",
+                    "import sys\nline=sys.stdin.readline().strip()\nraise SystemExit(0 if line == '{\"type\":\"cancel\"}' else 1)",
+                ]);
+                command
+            }
+            #[cfg(not(windows))]
+            {
+                let mut command = Command::new("sh");
+                command.args([
+                    "-c",
+                    "read line; [ \"$line\" = '{\"type\":\"cancel\"}' ]",
+                ]);
+                command
+            }
+        }
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn cancel test child");
+
+        let stdin = child.stdin.take().expect("stdin");
+        let state = ComputeNodeState::default();
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+        }
+
+        timeout(
+            TokioDuration::from_secs(2),
+            stop_compute_node(state.clone()),
+        )
+        .await
+        .expect("stop should not hang")
+        .expect("stop should succeed");
+
+        let status = state.status.lock().await.clone();
+        assert!(!status.running);
+        assert!(!status.registered);
+        assert!(state.child.lock().await.is_none());
+        assert!(state.stdin.lock().await.is_none());
     }
 
     #[test]

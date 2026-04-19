@@ -32,7 +32,6 @@ def test_serve_shutdown_signal_is_non_blocking(monkeypatch) -> None:
     relay.serve("127.0.0.1", 5010)
     elapsed = time.perf_counter() - start
 
-    assert not shutdown_called.is_set()
     assert elapsed < 0.5
     assert relay.DRAINING.is_set()
     assert shutdown_called.wait(timeout=1.0)

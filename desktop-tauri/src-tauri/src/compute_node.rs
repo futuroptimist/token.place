@@ -1,5 +1,8 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::python_runtime::{
+    configure_runtime_bootstrap_env, resolve_python_launcher, resolve_runtime_import_root,
+    PythonLauncher,
+};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -343,6 +346,7 @@ pub async fn start_compute_node(
         }
     };
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -455,12 +459,7 @@ pub async fn start_compute_node(
         let exit_status = running_child.wait().await?;
         let exit_payload = {
             let mut status = state.status.lock().await;
-            finalize_bridge_exit(
-                &mut status,
-                exit_status,
-                saw_startup_event,
-                saw_error_event,
-            )
+            finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
         };
 
         if let Some(payload) = exit_payload {
@@ -660,10 +659,7 @@ mod tests {
             .expect("status last_error should be set");
         assert!(last_error.contains("before emitting a startup event"));
         assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
-        assert_eq!(
-            payload.get("running").and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(payload.get("running").and_then(Value::as_bool), Some(false));
         assert_eq!(
             payload.get("registered").and_then(Value::as_bool),
             Some(false)

@@ -42,6 +42,7 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
+GPU_PREFERRED_MODES = {"auto", "gpu", "hybrid"}
 
 
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
@@ -171,6 +172,24 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    if (
+        sys.platform.startswith("win")
+        and args.mode in GPU_PREFERRED_MODES
+        and runtime_setup.get("selected_backend") == "cpu"
+        and runtime_setup.get("runtime_action") in {"failed", "installed_cpu_fallback", "probe_only"}
+    ):
+        reason = runtime_setup.get("fallback_reason") or "unknown GPU runtime provisioning failure"
+        emit(
+            {
+                "type": "error",
+                "message": (
+                    "GPU runtime provisioning failed for Windows desktop launch; "
+                    f"requested mode={args.mode}, action={runtime_setup.get('runtime_action')}, "
+                    f"reason={reason}. Switch to CPU mode or repair CUDA runtime."
+                ),
+            }
+        )
+        return 1
 
     try:
         from utils.compute_node_runtime import (

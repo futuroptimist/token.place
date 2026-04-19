@@ -1,5 +1,8 @@
+use crate::backend::ComputeMode;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
@@ -182,20 +185,53 @@ pub fn resolve_runtime_import_root(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+}
+
+pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
+    cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        && matches!(
+            mode,
+            ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+        )
+}
+
+pub fn configure_runtime_bootstrap_env(command: &mut tokio::process::Command, mode: &ComputeMode) {
+    if should_enable_runtime_bootstrap(mode) {
+        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
+
+    #[test]
+    fn bootstrap_env_is_enabled_for_gpu_like_modes_on_windows_x64_only() {
+        let auto = should_enable_runtime_bootstrap(&ComputeMode::Auto);
+        let gpu = should_enable_runtime_bootstrap(&ComputeMode::Gpu);
+        let hybrid = should_enable_runtime_bootstrap(&ComputeMode::Hybrid);
+        let cpu = should_enable_runtime_bootstrap(&ComputeMode::Cpu);
+
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert!(auto);
+            assert!(gpu);
+            assert!(hybrid);
+        } else {
+            assert!(!auto);
+            assert!(!gpu);
+            assert!(!hybrid);
+        }
+        assert!(!cpu);
+    }
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -356,8 +392,13 @@ mod tests {
     #[test]
     fn resolve_runtime_import_root_detects_nested_up_layout() {
         let temp = TempDir::new().expect("tempdir");
-        let script = temp.path().join("resources").join("python").join("model_bridge.py");
-        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        let script = temp
+            .path()
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script dir");
         std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
         let import_root = temp.path().join("resources").join("_up_").join("_up_");
         std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");

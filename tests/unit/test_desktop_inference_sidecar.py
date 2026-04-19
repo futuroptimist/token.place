@@ -323,6 +323,37 @@ def test_run_emits_runtime_unavailable_when_model_manager_missing(tmp_path, caps
     assert event['code'] == 'runtime_unavailable'
 
 
+def test_run_emits_gpu_runtime_unavailable_when_windows_gpu_provisioning_fails(
+    tmp_path, capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+    _install_fake_manager_module(FakeManager())
+
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': 'CUDA build failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    event = json.loads(capsys.readouterr().out.strip())
+    assert event['type'] == 'error'
+    assert event['code'] == 'gpu_runtime_unavailable'
+    assert 'CUDA build failed' in event['message']
+
+
 def test_run_emits_bad_model_when_runtime_returns_no_llm(tmp_path, capsys):
     _reset_cancel_queue()
     model_path = tmp_path / 'model.gguf'

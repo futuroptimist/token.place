@@ -26,6 +26,7 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+GPU_PREFERRED_MODES = {"auto", "gpu", "hybrid"}
 
 
 def _start_stdin_reader() -> None:
@@ -178,6 +179,19 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    if (
+        sys.platform.startswith("win")
+        and args.mode in GPU_PREFERRED_MODES
+        and runtime_setup.get("selected_backend") == "cpu"
+        and runtime_setup.get("runtime_action") in {"failed", "installed_cpu_fallback", "probe_only"}
+    ):
+        reason = runtime_setup.get("fallback_reason") or "unknown GPU runtime provisioning failure"
+        return emit_error(
+            "gpu_runtime_unavailable",
+            "GPU runtime provisioning failed for Windows desktop launch; "
+            f"requested mode={args.mode}, action={runtime_setup.get('runtime_action')}, "
+            f"reason={reason}. Switch to CPU mode or repair CUDA runtime.",
+        )
 
     manager = get_model_manager()
     manager.model_path = args.model

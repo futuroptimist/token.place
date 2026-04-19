@@ -903,3 +903,39 @@ def test_sanitize_relay_target_redacts_credentials_query_and_fragment():
 def test_sanitize_relay_target_returns_unknown_for_invalid_values():
     assert compute_node_bridge._sanitize_relay_target(None) == 'unknown'
     assert compute_node_bridge._sanitize_relay_target('not-a-valid-url') == 'unknown'
+
+
+def test_run_emits_error_when_windows_gpu_provisioning_fails(monkeypatch, capsys):
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime)
+    _reset_cancel_queue()
+    monkeypatch.setattr(compute_node_bridge.sys, 'platform', 'win32')
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': 'CUDA wheel install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
+
+    args = SimpleNamespace(
+        model='model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert events
+    assert events[0]['type'] == 'error'
+    assert 'CUDA wheel install failed' in events[0]['message']

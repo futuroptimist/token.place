@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 if __package__ in (None, ""):
     script_dir = str(Path(__file__).resolve().parent)
@@ -41,6 +42,71 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
+
+
+def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
+    """Return a normalized relay error message if the response includes one."""
+
+    raw_error = relay_response.get("error")
+    if raw_error is None:
+        return None
+    if isinstance(raw_error, str):
+        normalized = raw_error.strip()
+        return normalized or None
+    if not raw_error:
+        return None
+    return str(raw_error)
+
+
+def _sanitize_relay_target(relay_url: Any) -> str:
+    """Return a redacted relay target that never includes userinfo/query/fragment."""
+
+    if not isinstance(relay_url, str):
+        return "unknown"
+
+    parsed = urlsplit(relay_url.strip())
+    if not parsed.scheme or not parsed.hostname:
+        return "unknown"
+
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit((parsed.scheme, f"{parsed.hostname}{port}", "", "", ""))
+
+
+def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
+    """Return a compact summary string for relay registration diagnostics."""
+
+    if not isinstance(relay_response, dict):
+        return f"non-dict response type={type(relay_response).__name__}"
+
+    keys = sorted(relay_response.keys())
+    has_payload = all(
+        key in relay_response for key in ("client_public_key", "chat_history", "cipherkey", "iv")
+    )
+    has_heartbeat = "next_ping_in_x_seconds" in relay_response
+    relay_error = _relay_error_message(relay_response)
+    wait_seconds = relay_response.get("next_ping_in_x_seconds", "missing")
+
+    return (
+        f"keys={keys} has_legacy_payload={has_payload} "
+        f"has_heartbeat={has_heartbeat} wait={wait_seconds} "
+        f"error={relay_error or 'none'}"
+    )
+
+
+def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
+    """Return a compact runtime diagnostics summary for stderr logging."""
+
+    return (
+        "desktop.compute_node_bridge.runtime_state "
+        f"requested_mode={diagnostics.get('requested_mode')} "
+        f"effective_mode={diagnostics.get('effective_mode')} "
+        f"backend_selected={diagnostics.get('backend_selected')} "
+        f"backend_used={diagnostics.get('backend_used')} "
+        f"backend_available={diagnostics.get('backend_available')} "
+        f"fallback_reason={diagnostics.get('fallback_reason') or 'none'} "
+        f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
+        f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
+    )
 
 
 def _start_stdin_reader() -> None:
@@ -122,6 +188,18 @@ def run(args: argparse.Namespace) -> int:
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
+    print(
+        "desktop.compute_node_bridge.start "
+        f"model={args.model} mode={args.mode} "
+        f"relay_url={_sanitize_relay_target(relay_url)} "
+        f"relay_port={relay_port if relay_port is not None else 'none'}",
+        file=sys.stderr,
+    )
+    print(
+        "desktop.compute_node_bridge.relay_target.resolved "
+        f"relay={_sanitize_relay_target(relay_url)}",
+        file=sys.stderr,
+    )
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
@@ -134,6 +212,7 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.model_path = args.model
     apply_compute_mode(runtime.model_manager, args.mode)
 
+    print("desktop.compute_node_bridge.model_init.start", file=sys.stderr)
     if not runtime.ensure_model_ready():
         emit(
             {
@@ -142,9 +221,12 @@ def run(args: argparse.Namespace) -> int:
                 "active_relay_url": runtime.relay_client.relay_url,
             }
         )
+        print("desktop.compute_node_bridge.model_init.failed", file=sys.stderr)
         return 1
 
+    print("desktop.compute_node_bridge.model_init.ready", file=sys.stderr)
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
+    print(_runtime_diagnostics_summary(diagnostics), file=sys.stderr)
     last_error: Optional[str] = None
     emit(
         {
@@ -173,22 +255,44 @@ def run(args: argparse.Namespace) -> int:
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
-            registered = "error" not in relay_response and (legacy_payload or heartbeat_ack)
+            relay_error = _relay_error_message(relay_response)
+            registered = relay_error is None and (legacy_payload or heartbeat_ack)
+
+            print(
+                "desktop.compute_node_bridge.relay_poll "
+                f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
+                f"legacy_payload={legacy_payload} heartbeat_ack={heartbeat_ack} "
+                f"summary={_relay_response_summary(relay_response)}",
+                file=sys.stderr,
+            )
 
             if not registered:
-                if "error" in relay_response:
-                    last_error = str(relay_response.get("error", "relay registration failed"))
+                if relay_error is not None:
+                    last_error = relay_error
                 else:
                     last_error = (
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
             elif legacy_payload:
+                print(
+                    "desktop.compute_node_bridge.process_request.start "
+                    f"stream={relay_response.get('stream') is True}",
+                    file=sys.stderr,
+                )
                 processed = runtime.process_relay_request(relay_response)
                 if not processed:
                     last_error = "failed to process relay request"
+                    print(
+                        "desktop.compute_node_bridge.process_request.failed",
+                        file=sys.stderr,
+                    )
                 else:
                     last_error = None
+                    print(
+                        "desktop.compute_node_bridge.process_request.ok",
+                        file=sys.stderr,
+                    )
             else:
                 last_error = None
 
@@ -220,6 +324,7 @@ def run(args: argparse.Namespace) -> int:
             if _sleep_with_cancel(wait_seconds):
                 break
     finally:
+        print("desktop.compute_node_bridge.stop", file=sys.stderr)
         runtime.stop()
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)

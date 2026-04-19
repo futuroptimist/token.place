@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-18",
+  "slug": "desktop-tauri-operator-relay-registration-regression",
+  "summary": "Desktop operator registration could remain false when relay heartbeats included a nullable error field, and subprocess stderr lacked sufficient diagnostics to explain registration/runtime state transitions.",
+  "impact": "Desktop users saw Running=yes but Registered=no and had limited visibility into relay handshake and llama runtime setup progress.",
+  "fix": "Normalized relay error handling to treat null/empty error fields as non-errors when heartbeat responses are present, and added detailed compute-node bridge stderr logs for startup args, model init, relay polling summaries, request processing outcomes, and shutdown lifecycle.",
+  "lessons": "Operator registration logic must distinguish nullable metadata from actionable errors, and desktop child-process logs should include explicit, structured milestones for relay handshakes and llama runtime setup/invocation."
+}

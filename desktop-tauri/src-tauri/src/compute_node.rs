@@ -323,10 +323,10 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
         if child_slot
             .as_mut()
@@ -395,14 +395,15 @@ pub async fn start_compute_node(
         Ok(child) => child,
         Err(err) => {
             {
+                let _lifecycle_lock = state.lifecycle_lock.lock().await;
                 let mut status = state.status.lock().await;
                 *status = startup_failure_status(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
                 );
+                *state.child.lock().await = None;
+                *state.stdin.lock().await = None;
             }
-            *state.child.lock().await = None;
-            *state.stdin.lock().await = None;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
     };
@@ -421,6 +422,7 @@ pub async fn start_compute_node(
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
 
     {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
         *child_slot = Some(child);
         let mut stdin_slot = state.stdin.lock().await;
@@ -482,6 +484,7 @@ pub async fn start_compute_node(
     }
 
     let running_child = {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
         child_slot.take()
     };
@@ -501,14 +504,15 @@ pub async fn start_compute_node(
         status.running = false;
         status.registered = false;
     }
-    *state.stdin.lock().await = None;
+    {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
+        *state.stdin.lock().await = None;
+    }
 
     Ok(())
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
-
     if let Some(stdin) = state.stdin.lock().await.as_mut() {
         stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
         stdin.flush().await?;
@@ -522,11 +526,15 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         };
 
         if child.try_wait()?.is_some() {
-            *child_lock = None;
+            drop(child_lock);
+            let _lifecycle_lock = state.lifecycle_lock.lock().await;
+            *state.child.lock().await = None;
             *state.stdin.lock().await = None;
-            let mut status = state.status.lock().await;
-            status.running = false;
-            status.registered = false;
+            {
+                let mut status = state.status.lock().await;
+                status.running = false;
+                status.registered = false;
+            }
             return Ok(());
         }
 
@@ -542,6 +550,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
     }
 
+    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     *state.child.lock().await = None;
     *state.stdin.lock().await = None;
     {
@@ -626,6 +635,19 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_does_not_wait_on_lifecycle_lock() {
+        let state = ComputeNodeState::default();
+        let lifecycle_guard = state.lifecycle_lock.lock().await;
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), stop_compute_node(state.clone()))
+                .await;
+
+        assert!(result.is_ok(), "stop should not block on lifecycle lock");
+        drop(lifecycle_guard);
     }
 
     #[test]

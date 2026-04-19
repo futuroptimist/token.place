@@ -421,26 +421,48 @@ pub async fn start_compute_node(
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
 
-    {
+    let mut pending_child = Some(child);
+    let mut pending_stdin = Some(stdin);
+    let installed = {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
-        *child_slot = Some(child);
-        let mut stdin_slot = state.stdin.lock().await;
-        *stdin_slot = Some(stdin);
-        let mut status = state.status.lock().await;
-        *status = ComputeNodeStatus {
-            running: true,
-            registered: false,
-            active_relay_url: request.relay_base_url.clone(),
-            requested_mode: format!("{:?}", request.mode).to_lowercase(),
-            effective_mode: "cpu".into(),
-            backend_available: "unknown".into(),
-            backend_selected: "cpu".into(),
-            backend_used: "cpu".into(),
-            fallback_reason: None,
-            model_path: request.model_path.clone(),
-            last_error: None,
-        };
+        if child_slot
+            .as_mut()
+            .is_some_and(|existing| existing.try_wait().ok().flatten().is_none())
+        {
+            false
+        } else {
+            *child_slot = pending_child.take();
+            let mut stdin_slot = state.stdin.lock().await;
+            *stdin_slot = pending_stdin.take();
+            let mut status = state.status.lock().await;
+            *status = ComputeNodeStatus {
+                running: true,
+                registered: false,
+                active_relay_url: request.relay_base_url.clone(),
+                requested_mode: format!("{:?}", request.mode).to_lowercase(),
+                effective_mode: "cpu".into(),
+                backend_available: "unknown".into(),
+                backend_selected: "cpu".into(),
+                backend_used: "cpu".into(),
+                fallback_reason: None,
+                model_path: request.model_path.clone(),
+                last_error: None,
+            };
+            true
+        }
+    };
+
+    if !installed {
+        if let Some(mut abandoned_stdin) = pending_stdin.take() {
+            let _ = abandoned_stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+            let _ = abandoned_stdin.flush().await;
+        }
+        if let Some(mut abandoned_child) = pending_child.take() {
+            let _ = abandoned_child.kill().await;
+            let _ = abandoned_child.wait().await;
+        }
+        anyhow::bail!("compute node already running; stop it before starting a new session");
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
@@ -513,46 +535,40 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    if let Some(stdin) = state.stdin.lock().await.as_mut() {
-        stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
-        stdin.flush().await?;
+    let mut stdin_handle = {
+        let mut stdin_lock = state.stdin.lock().await;
+        stdin_lock.take()
+    };
+    if let Some(stdin) = stdin_handle.as_mut() {
+        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+        let _ = stdin.flush().await;
     }
 
-    let mut should_kill = false;
+    let mut owned_child = None;
     for _ in 0..20 {
-        let mut child_lock = state.child.lock().await;
-        let Some(child) = child_lock.as_mut() else {
+        if let Some(child) = state.child.lock().await.take() {
+            owned_child = Some(child);
             break;
-        };
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
-        if child.try_wait()?.is_some() {
-            drop(child_lock);
-            let _lifecycle_lock = state.lifecycle_lock.lock().await;
-            *state.child.lock().await = None;
-            *state.stdin.lock().await = None;
-            {
-                let mut status = state.status.lock().await;
-                status.running = false;
-                status.registered = false;
+    if let Some(mut child) = owned_child {
+        let mut exited = child.try_wait()?.is_some();
+        for _ in 0..20 {
+            if exited {
+                break;
             }
-            return Ok(());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            exited = child.try_wait()?.is_some();
         }
 
-        should_kill = true;
-        drop(child_lock);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    if should_kill {
-        let mut child_lock = state.child.lock().await;
-        if let Some(child) = child_lock.as_mut() {
+        if !exited {
             let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
-    *state.child.lock().await = None;
-    *state.stdin.lock().await = None;
     {
         let mut status = state.status.lock().await;
         status.running = false;

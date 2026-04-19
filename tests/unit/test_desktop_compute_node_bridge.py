@@ -667,9 +667,7 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     assert status == 1
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
-    assert payload['message'].startswith(
-        'compute-node bridge exited before emitting a startup event:'
-    )
+    assert payload['message'].startswith('runtime unavailable:')
 
 
 def test_main_normalizes_mode_before_run(monkeypatch):

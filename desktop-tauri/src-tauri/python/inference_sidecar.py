@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 if __package__ in (None, ""):
     script_dir = str(Path(__file__).resolve().parent)
@@ -26,6 +26,18 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "gpu", "hybrid"})
+LEGACY_COMPUTE_MODE_ALIASES = {"cuda": "gpu", "metal": "gpu"}
+
+
+def normalize_compute_mode(mode: Optional[str]) -> str:
+    """Normalize compute mode without importing the shared runtime package early."""
+
+    selected = (mode or "auto").strip().lower()
+    selected = LEGACY_COMPUTE_MODE_ALIASES.get(selected, selected)
+    if selected in SUPPORTED_COMPUTE_MODES:
+        return selected
+    return "auto"
 
 
 def _start_stdin_reader() -> None:
@@ -156,15 +168,6 @@ def run(args: argparse.Namespace) -> int:
     if not os.path.exists(args.model):
         return emit_error("bad_model", "model path not found")
 
-    try:
-        from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
-        from utils.llm.model_manager import ModelManager, get_model_manager
-    except ModuleNotFoundError as exc:
-        return emit_error(
-            "runtime_unavailable",
-            f"Missing Python dependency for local inference ({exc}).",
-        )
-
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -178,6 +181,15 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+
+    try:
+        from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
+        from utils.llm.model_manager import ModelManager, get_model_manager
+    except ModuleNotFoundError as exc:
+        return emit_error(
+            "runtime_unavailable",
+            f"Missing Python dependency for local inference ({exc}).",
+        )
 
     manager = get_model_manager()
     manager.model_path = args.model
@@ -293,8 +305,6 @@ def main() -> int:
     parser.add_argument("--prompt", required=True)
     args = parser.parse_args()
     try:
-        from utils.compute_node_runtime import normalize_compute_mode
-
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort error handling

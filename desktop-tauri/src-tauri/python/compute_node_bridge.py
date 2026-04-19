@@ -42,6 +42,18 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
+SUPPORTED_COMPUTE_MODES = frozenset({"auto", "cpu", "gpu", "hybrid"})
+LEGACY_COMPUTE_MODE_ALIASES = {"cuda": "gpu", "metal": "gpu"}
+
+
+def normalize_compute_mode(mode: Optional[str]) -> str:
+    """Normalize compute mode without importing the shared runtime package early."""
+
+    selected = (mode or "auto").strip().lower()
+    selected = LEGACY_COMPUTE_MODE_ALIASES.get(selected, selected)
+    if selected in SUPPORTED_COMPUTE_MODES:
+        return selected
+    return "auto"
 
 
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
@@ -360,8 +372,6 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        from utils.compute_node_runtime import normalize_compute_mode
-
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling

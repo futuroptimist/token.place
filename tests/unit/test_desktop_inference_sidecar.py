@@ -318,8 +318,10 @@ def test_run_cancels_during_streaming_after_started(tmp_path, capsys):
     assert [event['type'] for event in events] == ['started', 'canceled']
 
 
-def test_main_emits_inference_failed_when_compute_runtime_missing(capsys, monkeypatch):
+def test_main_emits_runtime_unavailable_when_compute_runtime_missing(tmp_path, capsys, monkeypatch):
     real_import = __import__
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
 
     def fake_import(name, *args, **kwargs):
         if name == 'utils.compute_node_runtime':
@@ -333,7 +335,7 @@ def test_main_emits_inference_failed_when_compute_runtime_missing(capsys, monkey
         [
             'inference_sidecar.py',
             '--model',
-            '/tmp/model.gguf',
+            str(model_path),
             '--mode',
             'auto',
             '--prompt',
@@ -346,8 +348,8 @@ def test_main_emits_inference_failed_when_compute_runtime_missing(capsys, monkey
     assert status == 1
     event = json.loads(capsys.readouterr().out.strip())
     assert event['type'] == 'error'
-    assert event['code'] == 'inference_failed'
-    assert 'bridge failure:' in event['message']
+    assert event['code'] == 'runtime_unavailable'
+    assert "Missing Python dependency for local inference" in event['message']
 
 
 def test_main_normalizes_mode_before_run(monkeypatch):

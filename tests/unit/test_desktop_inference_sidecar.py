@@ -615,7 +615,13 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path,
             'llama_module_path': 'missing',
         },
     )
-    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+    runtime_setup_module = sys.modules['desktop_runtime_setup']
+
+    class _WinSysStub:
+        platform = 'win32'
+        executable = sys.executable
+
+    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
@@ -629,6 +635,53 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path,
             'message': (
                 'GPU provisioning failed for desktop Windows launch '
                 '(mode=auto, action=failed): cuda wheel install failed. '
+                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+            ),
+        }
+    ]
+
+
+def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'shadowed_repo_llama_cpp',
+            'fallback_reason': 'llama_cpp import shadowed by repo-local shim',
+            'interpreter': sys.executable,
+            'llama_module_path': 'repo/llama_cpp.py',
+        },
+    )
+    runtime_setup_module = sys.modules['desktop_runtime_setup']
+
+    class _WinSysStub:
+        platform = 'win32'
+        executable = sys.executable
+
+    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'code': 'gpu_runtime_unavailable',
+            'message': (
+                'GPU provisioning failed for desktop Windows launch '
+                '(mode=auto, action=shadowed_repo_llama_cpp): '
+                'llama_cpp import shadowed by repo-local shim. '
                 'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
             ),
         }

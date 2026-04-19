@@ -321,6 +321,37 @@ def test_windows_runtime_bootstrap_defaults_to_probe_only_without_opt_in(monkeyp
     assert invoked['source_repair'] is False
 
 
+def test_desktop_gpu_runtime_failure_message_ignores_probe_only(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message(
+        'auto',
+        {
+            'selected_backend': 'cpu',
+            'runtime_action': 'probe_only',
+            'fallback_reason': 'runtime bootstrap not enabled',
+        },
+    )
+
+    assert message is None
+
+
+def test_desktop_gpu_runtime_failure_message_flags_shadowed_repo_runtime(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message(
+        'auto',
+        {
+            'selected_backend': 'cpu',
+            'runtime_action': 'shadowed_repo_llama_cpp',
+            'fallback_reason': 'llama_cpp import shadowed by repo-local shim',
+        },
+    )
+
+    assert message is not None
+    assert 'action=shadowed_repo_llama_cpp' in message
+
+
 def test_windows_runtime_bootstrap_success_reexec_is_guarded_to_one_attempt(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')

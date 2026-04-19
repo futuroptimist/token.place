@@ -366,6 +366,7 @@ def test_run_continues_when_runtime_setup_reports_missing_packaged_requirements(
         },
     )
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'linux')
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -437,7 +438,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
             'llama_module_path': 'missing',
         },
     )
-    monkeypatch.setattr(compute_node_bridge.sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -455,6 +456,46 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
             'message': (
                 'GPU provisioning failed for desktop Windows launch '
                 '(mode=auto, action=failed): cuda wheel install failed. '
+                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+            ),
+        }
+    ]
+
+
+def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'shadowed_repo_llama_cpp',
+            'fallback_reason': 'llama_cpp import shadowed by repo-local shim',
+            'interpreter': sys.executable,
+            'llama_module_path': 'repo/llama_cpp.py',
+        },
+    )
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'message': (
+                'GPU provisioning failed for desktop Windows launch '
+                '(mode=auto, action=shadowed_repo_llama_cpp): '
+                'llama_cpp import shadowed by repo-local shim. '
                 'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
             ),
         }

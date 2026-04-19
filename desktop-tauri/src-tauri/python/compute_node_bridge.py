@@ -21,8 +21,15 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 
 try:
-    from desktop_runtime_setup import ensure_desktop_llama_runtime, maybe_reexec_for_runtime_refresh
+    from desktop_runtime_setup import (
+        desktop_gpu_runtime_failure_message,
+        ensure_desktop_llama_runtime,
+        maybe_reexec_for_runtime_refresh,
+    )
 except ModuleNotFoundError:
+    def desktop_gpu_runtime_failure_message(_mode: str, _runtime_setup: Dict[str, str]) -> None:
+        return None
+
     def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
         return {
             "selected_backend": "cpu",
@@ -42,7 +49,6 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
-GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 
 
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
@@ -110,23 +116,6 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
     )
 
 
-def _desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, Any]) -> str | None:
-    if sys.platform != "win32" or mode not in GPU_MODES:
-        return None
-    selected_backend = str(runtime_setup.get("selected_backend", "cpu")).lower()
-    runtime_action = str(runtime_setup.get("runtime_action", "none")).lower()
-    if selected_backend != "cpu":
-        return None
-    if runtime_action not in {"failed", "installed_cpu_fallback", "probe_only", "unavailable"}:
-        return None
-    reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
-    return (
-        "GPU provisioning failed for desktop Windows launch "
-        f"(mode={mode}, action={runtime_action}): {reason}. "
-        "Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support."
-    )
-
-
 def _start_stdin_reader() -> None:
     global _stdin_reader_started
     with _stdin_reader_lock:
@@ -189,7 +178,7 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
-    gpu_runtime_error = _desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
+    gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
     if gpu_runtime_error:
         emit({"type": "error", "message": gpu_runtime_error})
         return 1

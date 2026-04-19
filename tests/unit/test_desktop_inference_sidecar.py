@@ -617,13 +617,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path,
             'llama_module_path': 'missing',
         },
     )
-    runtime_setup_module = sys.modules['desktop_runtime_setup']
-
-    class _WinSysStub:
-        platform = 'win32'
-        executable = sys.executable
-
-    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
@@ -663,13 +657,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(tmp_path, cap
             'llama_module_path': 'repo/llama_cpp.py',
         },
     )
-    runtime_setup_module = sys.modules['desktop_runtime_setup']
-
-    class _WinSysStub:
-        platform = 'win32'
-        executable = sys.executable
-
-    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)

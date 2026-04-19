@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
@@ -506,57 +506,6 @@ pub async fn start_compute_node(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
-        let mut command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
-
-        assert_eq!(
-            command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
-            Some("1")
-        );
-    }
-
-    #[test]
-    fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
-        let mut cpu_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
-        assert_eq!(
-            command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
-            None
-        );
-
-        let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
-        let previous = std::env::var(disable_key).ok();
-        // SAFETY: This unit test mutates process env in a tightly scoped block and restores it.
-        unsafe {
-            std::env::set_var(disable_key, "1");
-        }
-        let mut disabled_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut disabled_command, &ComputeMode::Gpu);
-        if let Some(value) = previous {
-            // SAFETY: restore prior process env for test isolation.
-            unsafe {
-                std::env::set_var(disable_key, value);
-            }
-        } else {
-            // SAFETY: restore prior process env for test isolation.
-            unsafe {
-                std::env::remove_var(disable_key);
-            }
-        }
-
-        assert_eq!(
-            command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
-            None
-        );
-    }
-}
-
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     let _lifecycle_lock = state.lifecycle_lock.lock().await;
 
@@ -830,5 +779,51 @@ mod tests {
         assert!(candidates.iter().any(|candidate| {
             candidate.ends_with("_up_/resources/python/compute_node_bridge.py")
         }));
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
+        let mut command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
+
+        assert_eq!(
+            command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
+        let mut cpu_command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
+        assert_eq!(
+            command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
+
+        let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+        let previous = std::env::var(disable_key).ok();
+        // SAFETY: This unit test mutates process env in a tightly scoped block and restores it.
+        unsafe {
+            std::env::set_var(disable_key, "1");
+        }
+        let mut disabled_command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut disabled_command, &ComputeMode::Gpu);
+        if let Some(value) = previous {
+            // SAFETY: restore prior process env for test isolation.
+            unsafe {
+                std::env::set_var(disable_key, value);
+            }
+        } else {
+            // SAFETY: restore prior process env for test isolation.
+            unsafe {
+                std::env::remove_var(disable_key);
+            }
+        }
+
+        assert_eq!(
+            command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
     }
 }

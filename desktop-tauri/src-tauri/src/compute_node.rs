@@ -323,9 +323,8 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
+    let lifecycle_lock = state.lifecycle_lock.lock().await;
     {
         let mut child_slot = state.child.lock().await;
         if child_slot
@@ -440,6 +439,7 @@ pub async fn start_compute_node(
             last_error: None,
         };
     }
+    drop(lifecycle_lock);
 
     let log_policy = SubprocessLogPolicy::from_env();
     let stderr_task = tokio::spawn(async move {
@@ -507,8 +507,6 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
-
     if let Some(stdin) = state.stdin.lock().await.as_mut() {
         stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
         stdin.flush().await?;
@@ -560,6 +558,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+    use tokio::time::timeout;
 
     fn success_exit_status() -> ExitStatus {
         #[cfg(windows)]
@@ -626,6 +625,47 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_sends_cancel_without_waiting_for_lifecycle_lock() {
+        let temp = TempDir::new().expect("tempdir");
+        let cancel_path = temp.path().join("cancel.jsonl");
+        let script = format!(
+            "IFS= read -r line; printf '%s' \"$line\" > '{}'",
+            cancel_path.display()
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bridge stub");
+        let stdin = child.stdin.take().expect("stdin");
+
+        let state = ComputeNodeState::default();
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+        }
+
+        let lifecycle_guard = state.lifecycle_lock.lock().await;
+        timeout(Duration::from_secs(3), stop_compute_node(state.clone()))
+            .await
+            .expect("stop should not block on lifecycle lock")
+            .expect("stop should succeed");
+        drop(lifecycle_guard);
+
+        let cancel_line = std::fs::read_to_string(&cancel_path).expect("cancel payload");
+        assert_eq!(cancel_line, "{\"type\":\"cancel\"}");
+        let status = state.status.lock().await;
+        assert!(!status.running);
+        assert!(!status.registered);
     }
 
     #[test]

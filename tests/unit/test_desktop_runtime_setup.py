@@ -49,6 +49,7 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
 
 def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
     monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
@@ -134,6 +135,7 @@ def test_ensure_runtime_uses_custom_repo_root_for_initial_probe_and_post_repair_
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.delenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, raising=False)
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
@@ -196,6 +198,7 @@ def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monk
 
 def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stays_cpu(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     captured = {}
 
@@ -232,8 +235,28 @@ def test_runtime_bootstrap_noop_when_gpu_runtime_is_already_present(monkeypatch)
     assert result['selected_backend'] == 'cuda'
 
 
+def test_windows_runtime_bootstrap_is_probe_only_by_default(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.delenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
+    invoked = {'source_repair': False}
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_windows_cuda_source_repair',
+        lambda _requirements_path: (invoked.update(source_repair=True), '') and (False, 'unexpected call'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
+
+    assert result['runtime_action'] == 'probe_only'
+    assert desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert invoked['source_repair'] is False
+
+
 def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
@@ -282,6 +305,7 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
 
 def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
     monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')
     invoked = {'source_repair': False}
@@ -300,6 +324,7 @@ def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
 
 def test_windows_runtime_bootstrap_success_reexec_is_guarded_to_one_attempt(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
     monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
@@ -477,6 +502,7 @@ def test_maybe_reexec_for_runtime_refresh_handles_execve_oserror(monkeypatch):
 
 def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     state_path = tmp_path / 'runtime_state.json'
     monkeypatch.setattr(desktop_runtime_setup, '_runtime_state_path', lambda: state_path)
     now = 1_000.0
@@ -680,6 +706,7 @@ def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp
 
 def test_windows_packaged_layout_without_requirements_falls_back_without_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
     monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
@@ -717,6 +744,7 @@ def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
     monkeypatch.setattr(desktop_runtime_setup, '_fallback_unpinned_plans', lambda _platform: [])
@@ -742,6 +770,7 @@ def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_
 
 def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda: _probe())
     monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
     plans = [

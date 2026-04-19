@@ -38,17 +38,17 @@ npm ci
 npm run tauri dev
 ```
 
-During normal startup, desktop sidecars probe the active sidecar interpreter and, on
-Windows in `auto`/`gpu`/`hybrid` modes, automatically run a one-time CUDA runtime
-repair when the runtime is CPU-only. They emit:
+During normal startup, desktop sidecars probe the active sidecar interpreter and
+emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
-Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable the
-Windows auto-repair path and keep startup in probe-only mode (useful for
-packaging/troubleshooting while preserving normal CPU fallback diagnostics).
+By default, startup is probe-only (no install/repair work before first structured
+events). Set `TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP=1` to opt into Windows
+runtime repair/install during startup for `auto`/`gpu`/`hybrid` mode. You can still
+force probe-only mode with `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1`.
 
 When Windows CUDA repair is needed, desktop uses the same interpreter binary that
 launches the sidecar process (`sys.executable`) and applies the repo

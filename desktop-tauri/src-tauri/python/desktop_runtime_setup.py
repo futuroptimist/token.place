@@ -35,6 +35,7 @@ PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 INSTALL_ERROR_SUMMARY_MAX_LEN = 512
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
+ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
@@ -412,6 +413,17 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "selected_backend": "cpu",
             "fallback_reason": (
                 f"desktop runtime bootstrap disabled by {DISABLE_BOOTSTRAP_ENV}=1"
+            ),
+            "runtime_action": "probe_only",
+            **_probe_result_payload(before),
+        }
+
+    if os.getenv(ENABLE_BOOTSTRAP_ENV) != "1":
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                "desktop runtime bootstrap skipped during normal startup; set "
+                f"{ENABLE_BOOTSTRAP_ENV}=1 to allow runtime repair/install"
             ),
             "runtime_action": "probe_only",
             **_probe_result_payload(before),

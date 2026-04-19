@@ -440,11 +440,20 @@ def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     status = compute_node_bridge.run(args)
 
     assert status == 0
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
     assert status_events[0]['registered'] is True
     assert status_events[0]['last_error'] is None
+    stderr = output.err
+    assert 'desktop.compute_node_bridge.start' in stderr
+    assert 'desktop.compute_node_bridge.relay_target.resolved' in stderr
+    assert 'desktop.compute_node_bridge.model_init.start' in stderr
+    assert 'desktop.compute_node_bridge.model_init.ready' in stderr
+    assert 'desktop.compute_node_bridge.runtime_state' in stderr
+    assert 'desktop.compute_node_bridge.relay_poll' in stderr
+    assert 'desktop.compute_node_bridge.stop' in stderr
 
 
 def test_run_treats_false_error_heartbeat_as_registered(capsys, monkeypatch):

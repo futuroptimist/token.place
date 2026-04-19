@@ -93,6 +93,22 @@ def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
     )
 
 
+def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
+    """Return a compact runtime diagnostics summary for stderr logging."""
+
+    return (
+        "desktop.compute_node_bridge.runtime_state "
+        f"requested_mode={diagnostics.get('requested_mode')} "
+        f"effective_mode={diagnostics.get('effective_mode')} "
+        f"backend_selected={diagnostics.get('backend_selected')} "
+        f"backend_used={diagnostics.get('backend_used')} "
+        f"backend_available={diagnostics.get('backend_available')} "
+        f"fallback_reason={diagnostics.get('fallback_reason') or 'none'} "
+        f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
+        f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
+    )
+
+
 def _start_stdin_reader() -> None:
     global _stdin_reader_started
     with _stdin_reader_lock:
@@ -179,6 +195,11 @@ def run(args: argparse.Namespace) -> int:
         f"relay_port={relay_port if relay_port is not None else 'none'}",
         file=sys.stderr,
     )
+    print(
+        "desktop.compute_node_bridge.relay_target.resolved "
+        f"relay={_sanitize_relay_target(relay_url)}",
+        file=sys.stderr,
+    )
 
     runtime = ComputeNodeRuntime(
         ComputeNodeRuntimeConfig(
@@ -205,6 +226,7 @@ def run(args: argparse.Namespace) -> int:
 
     print("desktop.compute_node_bridge.model_init.ready", file=sys.stderr)
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
+    print(_runtime_diagnostics_summary(diagnostics), file=sys.stderr)
     last_error: Optional[str] = None
     emit(
         {

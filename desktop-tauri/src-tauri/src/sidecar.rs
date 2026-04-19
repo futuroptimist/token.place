@@ -1,5 +1,8 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::python_runtime::{
+    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
+    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -213,6 +216,12 @@ fn configure_runtime_pythonpath(command: &mut Command, sidecar_path: &str) {
     }
 }
 
+fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
+    if should_enable_runtime_bootstrap(mode) {
+        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
+    }
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -250,6 +259,7 @@ pub async fn start_sidecar(
 
     let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
     configure_runtime_pythonpath(&mut sidecar_command, &sidecar_script);
+    configure_runtime_bootstrap_env(&mut sidecar_command, &request.mode);
 
     let mut child = sidecar_command
         .arg("--model")

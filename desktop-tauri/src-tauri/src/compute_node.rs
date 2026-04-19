@@ -1,5 +1,8 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::python_runtime::{
+    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
+    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -143,6 +146,12 @@ fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, brid
                 command.env("PYTHONPATH", import_root);
             }
         }
+    }
+}
+
+fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
+    if should_enable_runtime_bootstrap(mode) {
+        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
     }
 }
 
@@ -343,6 +352,7 @@ pub async fn start_compute_node(
         }
     };
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
 
     let spawn_result = bridge_command
         .arg("--model")

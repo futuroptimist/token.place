@@ -422,6 +422,45 @@ def test_run_probe_only_runtime_setup_does_not_trigger_repair_reexec(capsys, mon
     assert reexec_calls == [('probe_only', True)]
 
 
+def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': 'cuda wheel install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(compute_node_bridge.sys, 'platform', 'win32')
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'message': (
+                'GPU provisioning failed for desktop Windows launch '
+                '(mode=auto, action=failed): cuda wheel install failed. '
+                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+            ),
+        }
+    ]
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

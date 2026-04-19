@@ -26,6 +26,7 @@ ensure_runtime_import_paths(__file__)
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 
 
 def _start_stdin_reader() -> None:
@@ -53,6 +54,23 @@ def emit(payload: Dict[str, Any]) -> None:
 def emit_error(code: str, message: str) -> int:
     emit({"type": "error", "code": code, "message": message})
     return 1
+
+
+def _desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, Any]) -> str | None:
+    if sys.platform != "win32" or mode not in GPU_MODES:
+        return None
+    selected_backend = str(runtime_setup.get("selected_backend", "cpu")).lower()
+    runtime_action = str(runtime_setup.get("runtime_action", "none")).lower()
+    if selected_backend != "cpu":
+        return None
+    if runtime_action not in {"failed", "installed_cpu_fallback", "probe_only", "unavailable"}:
+        return None
+    reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
+    return (
+        "GPU provisioning failed for desktop Windows launch "
+        f"(mode={mode}, action={runtime_action}): {reason}. "
+        "Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support."
+    )
 
 
 def emit_summary(label: str, **fields: Any) -> None:
@@ -178,6 +196,9 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    gpu_runtime_error = _desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
+    if gpu_runtime_error:
+        return emit_error("gpu_runtime_unavailable", gpu_runtime_error)
 
     manager = get_model_manager()
     manager.model_path = args.model

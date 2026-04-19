@@ -593,3 +593,43 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     assert 'desktop.runtime_setup' in captured.err
     assert 'action=probe_only' in captured.err
     assert repair_calls == {'source': 0, 'retry_gate': 0}
+
+
+def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': 'cuda wheel install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'code': 'gpu_runtime_unavailable',
+            'message': (
+                'GPU provisioning failed for desktop Windows launch '
+                '(mode=auto, action=failed): cuda wheel install failed. '
+                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+            ),
+        }
+    ]

@@ -73,10 +73,12 @@ def create_packaged_layout(tmp_root: Path) -> Path:
 
 
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
-    if not hasattr(stdout, "read"):
+    if not hasattr(stdout, "readline"):
         return
+
+    readline = stdout.readline
     while True:
-        chunk = stdout.read(4096)
+        chunk = readline()
         if not chunk:
             return
         output_queue.put(chunk)

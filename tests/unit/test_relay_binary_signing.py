@@ -1,16 +1,39 @@
+import base64
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from utils import signing
 from utils.signing import relay_signature
 
 
+def _write_signed_artifact(tmp_path: Path):
+    artifact = tmp_path / "relay.py"
+    artifact.write_text("print(\"relay\")\n", encoding="utf-8")
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    signature_bytes = private_key.sign(artifact.read_bytes())
+    signature_path = tmp_path / "relay.py.sig"
+    signature_path.write_bytes(base64.b64encode(signature_bytes) + b"\n")
+
+    public_key_path = tmp_path / "relay_signing_public_key.pem"
+    public_key_path.write_bytes(
+        public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+    return artifact, signature_path, public_key_path
+
+
 @pytest.mark.unit
-def test_relay_release_signature_verifies():
-    relay_script = Path('relay.py')
-    signature_file = Path('config/signing/relay.py.sig')
-    public_key_file = Path('config/signing/relay_signing_public_key.pem')
+def test_relay_release_signature_verifies(tmp_path):
+    relay_script, signature_file, public_key_file = _write_signed_artifact(tmp_path)
 
     assert relay_signature.verify_file_signature(
         relay_script,
@@ -21,11 +44,9 @@ def test_relay_release_signature_verifies():
 
 @pytest.mark.unit
 def test_relay_signature_rejects_tampering(tmp_path):
-    relay_script = Path('relay.py')
-    tampered_copy = tmp_path / 'relay.py'
+    relay_script, signature_file, public_key_file = _write_signed_artifact(tmp_path)
+    tampered_copy = tmp_path / 'relay_tampered.py'
     tampered_copy.write_bytes(relay_script.read_bytes() + b"\n# tampered\n")
-    signature_file = Path('config/signing/relay.py.sig')
-    public_key_file = Path('config/signing/relay_signing_public_key.pem')
 
     assert not relay_signature.verify_file_signature(
         tampered_copy,
@@ -60,9 +81,7 @@ def test_load_signature_rejects_invalid_base64(tmp_path):
 
 @pytest.mark.unit
 def test_cli_reports_success(capsys, tmp_path):
-    artifact = Path("relay.py")
-    signature = Path("config/signing/relay.py.sig")
-    public_key = Path("config/signing/relay_signing_public_key.pem")
+    artifact, signature, public_key = _write_signed_artifact(tmp_path)
 
     exit_code = relay_signature.main(
         [str(artifact), str(signature), "--public-key", str(public_key)]
@@ -76,12 +95,11 @@ def test_cli_reports_success(capsys, tmp_path):
 
 @pytest.mark.unit
 def test_cli_reports_failure(capsys, tmp_path):
-    artifact = Path("relay.py")
-    tampered_copy = tmp_path / "relay.py"
+    artifact, signature, public_key = _write_signed_artifact(tmp_path)
+    tampered_copy = tmp_path / "relay_tampered.py"
     tampered_copy.write_bytes(artifact.read_bytes() + b"\ntampered\n")
-    signature = Path("config/signing/relay.py.sig")
 
-    exit_code = relay_signature.main([str(tampered_copy), str(signature)])
+    exit_code = relay_signature.main([str(tampered_copy), str(signature), "--public-key", str(public_key)])
 
     captured = capsys.readouterr()
     assert exit_code == 1

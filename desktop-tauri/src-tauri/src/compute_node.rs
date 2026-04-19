@@ -87,6 +87,8 @@ fn bridge_script_candidates(
                     .join("compute_node_bridge.py"),
             );
             candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
+            candidates.push(exe_dir.join("resources").join("compute_node_bridge.py"));
+            candidates.push(exe_dir.join("compute_node_bridge.py"));
             if let Some(parent_dir) = exe_dir.parent() {
                 candidates.push(
                     parent_dir
@@ -100,11 +102,14 @@ fn bridge_script_candidates(
                         .join("python")
                         .join("compute_node_bridge.py"),
                 );
+                candidates.push(parent_dir.join("Resources").join("compute_node_bridge.py"));
+                candidates.push(parent_dir.join("resources").join("compute_node_bridge.py"));
             }
         }
     }
 
     candidates.push(manifest_dir.join("python").join("compute_node_bridge.py"));
+    candidates.push(manifest_dir.join("compute_node_bridge.py"));
     candidates
 }
 
@@ -351,6 +356,17 @@ pub async fn start_compute_node(
         None
     };
 
+    if is_python_script(&bridge_script) && !Path::new(&bridge_script).is_file() {
+        let err = anyhow::anyhow!(
+            "compute-node bridge script not found at resolved path: {bridge_script}"
+        );
+        {
+            let mut status = state.status.lock().await;
+            *status = startup_failure_status(&request, err.to_string());
+        }
+        return Err(err);
+    }
+
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
@@ -475,12 +491,7 @@ pub async fn start_compute_node(
         let exit_status = running_child.wait().await?;
         let exit_payload = {
             let mut status = state.status.lock().await;
-            finalize_bridge_exit(
-                &mut status,
-                exit_status,
-                saw_startup_event,
-                saw_error_event,
-            )
+            finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
         };
 
         if let Some(payload) = exit_payload {
@@ -515,7 +526,10 @@ mod tests {
     fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
         let mut cpu_command = Command::new("python");
         configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
-        assert_eq!(command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV), None);
+        assert_eq!(
+            command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
 
         let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
         let previous = std::env::var(disable_key).ok();
@@ -728,10 +742,7 @@ mod tests {
             .expect("status last_error should be set");
         assert!(last_error.contains("before emitting a startup event"));
         assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
-        assert_eq!(
-            payload.get("running").and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(payload.get("running").and_then(Value::as_bool), Some(false));
         assert_eq!(
             payload.get("registered").and_then(Value::as_bool),
             Some(false)
@@ -761,8 +772,17 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.ends_with("Resources/python/compute_node_bridge.py")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("resources/compute_node_bridge.py")));
         assert_eq!(
             candidates.last().expect("manifest candidate"),
+            &manifest_dir.join("compute_node_bridge.py")
+        );
+        assert_eq!(
+            candidates
+                .get(candidates.len().saturating_sub(2))
+                .expect("manifest python candidate"),
             &manifest_dir.join("python").join("compute_node_bridge.py")
         );
     }
@@ -802,5 +822,22 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), resources_bridge);
+    }
+
+    #[test]
+    fn first_existing_script_supports_flattened_resource_layout() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("bin");
+        let resources_dir = exe_dir.join("resources");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+
+        let flattened_bridge = resources_dir.join("compute_node_bridge.py");
+        std::fs::write(&flattened_bridge, "print('flat')\n").expect("write flat bridge");
+
+        let exe_path = exe_dir.join("token.place.exe");
+        let candidates = bridge_script_candidates(Some(&exe_path), temp.path());
+        let resolved = first_existing_script(candidates).expect("resolved bridge path");
+
+        assert_eq!(Path::new(&resolved), flattened_bridge);
     }
 }

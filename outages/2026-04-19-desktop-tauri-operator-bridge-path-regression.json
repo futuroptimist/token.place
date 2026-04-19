@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-19",
+  "slug": "desktop-tauri-operator-bridge-path-regression",
+  "summary": "Windows packaged desktop operator startup could resolve the compute-node bridge path to an unusable location, leading Python to fail with '__main__' module lookup errors and preventing relay registration.",
+  "impact": "Users clicking Start operator saw Running briefly flip back to no while Registered never became yes, blocking local relay connectivity from the desktop app.",
+  "fix": "Expanded compute-node bridge script candidate resolution to include nested and flattened packaged resource layouts, added pre-spawn script existence validation for deterministic startup errors, and extended packaged-operator e2e coverage to run both layout variants.",
+  "lessons": "Desktop packaging path assumptions drift over time; operator startup must validate script paths before spawn and regression tests must cover multiple packaged resource layouts."
+}

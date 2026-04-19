@@ -47,9 +47,9 @@ def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: flo
     raise RuntimeError(f"relay did not become live on port {port}: {last_error}")
 
 
-def create_packaged_layout(tmp_root: Path) -> Path:
+def create_packaged_layout(tmp_root: Path, *, flatten_python_resources: bool) -> Path:
     resources_root = tmp_root / "resources"
-    python_dir = resources_root / "python"
+    python_dir = resources_root if flatten_python_resources else resources_root / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
 
     for filename in (
@@ -71,13 +71,98 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
+def run_packaged_bridge_flow(bridge_script: Path, relay_port: int, env: dict[str, str], cwd: Path) -> None:
+    bridge: subprocess.Popen[bytes] | None = None
+    bridge_output = ""
+    selector: selectors.BaseSelector | None = None
+    try:
+        bridge = subprocess.Popen(  # noqa: S603
+            [
+                sys.executable,
+                str(bridge_script),
+                "--model",
+                "mock.gguf",
+                "--mode",
+                "cpu",
+                "--relay-url",
+                f"http://127.0.0.1:{relay_port}",
+            ],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+        )
+
+        assert bridge.stdout is not None
+        assert bridge.stdin is not None
+
+        os.set_blocking(bridge.stdout.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(bridge.stdout, selectors.EVENT_READ)
+
+        saw_started = False
+        buffered = ""
+        deadline = time.time() + 20
+
+        while time.time() < deadline:
+            timeout = max(0.0, min(0.25, deadline - time.time()))
+            events = selector.select(timeout=timeout)
+            if not events and bridge.poll() is not None:
+                break
+
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    continue
+                text = chunk.decode("utf-8", errors="replace")
+                bridge_output += text
+                buffered += text
+
+                while "\n" in buffered:
+                    line, buffered = buffered.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("type") == "error":
+                        raise RuntimeError(f"bridge emitted error event: {payload}")
+                    if payload.get("type") == "started" and payload.get("running") is True:
+                        saw_started = True
+                        bridge.stdin.write(b'{"type":"cancel"}\n')
+                        bridge.stdin.flush()
+                        break
+
+            if saw_started:
+                break
+
+        if not saw_started:
+            raise RuntimeError(
+                "bridge did not emit started/running event; output="
+                f"{bridge_output[-2000:]}"
+            )
+
+        bridge.wait(timeout=20)
+        if bridge.returncode != 0:
+            raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
+    finally:
+        if selector is not None:
+            selector.close()
+        if bridge is not None and bridge.poll() is None:
+            bridge.kill()
+
+
 def main() -> int:
     relay_port = reserve_free_port()
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
-        bridge_script = create_packaged_layout(Path(tmpdir))
+        tmp_root = Path(tmpdir)
 
         relay = subprocess.Popen(  # noqa: S603
             [
@@ -96,90 +181,18 @@ def main() -> int:
             text=True,
         )
 
-        bridge: subprocess.Popen[bytes] | None = None
-        bridge_output = ""
-        selector: selectors.BaseSelector | None = None
         try:
             wait_for_livez(relay, relay_port)
-            bridge = subprocess.Popen(  # noqa: S603
-                [
-                    sys.executable,
-                    str(bridge_script),
-                    "--model",
-                    "mock.gguf",
-                    "--mode",
-                    "cpu",
-                    "--relay-url",
-                    f"http://127.0.0.1:{relay_port}",
-                ],
-                cwd=tmpdir,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=False,
+            nested_bridge = create_packaged_layout(tmp_root / "nested", flatten_python_resources=False)
+            run_packaged_bridge_flow(nested_bridge, relay_port, env, tmp_root)
+
+            flattened_bridge = create_packaged_layout(
+                tmp_root / "flattened",
+                flatten_python_resources=True,
             )
-
-            assert bridge.stdout is not None
-            assert bridge.stdin is not None
-
-            os.set_blocking(bridge.stdout.fileno(), False)
-            selector = selectors.DefaultSelector()
-            selector.register(bridge.stdout, selectors.EVENT_READ)
-
-            saw_started = False
-            buffered = ""
-            deadline = time.time() + 20
-
-            while time.time() < deadline:
-                timeout = max(0.0, min(0.25, deadline - time.time()))
-                events = selector.select(timeout=timeout)
-                if not events and bridge.poll() is not None:
-                    break
-
-                for key, _ in events:
-                    chunk = os.read(key.fileobj.fileno(), 4096)
-                    if not chunk:
-                        continue
-                    text = chunk.decode("utf-8", errors="replace")
-                    bridge_output += text
-                    buffered += text
-
-                    while "\n" in buffered:
-                        line, buffered = buffered.split("\n", 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            payload = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if payload.get("type") == "error":
-                            raise RuntimeError(f"bridge emitted error event: {payload}")
-                        if payload.get("type") == "started" and payload.get("running") is True:
-                            saw_started = True
-                            bridge.stdin.write(b'{"type":"cancel"}\n')
-                            bridge.stdin.flush()
-                            break
-
-                if saw_started:
-                    break
-
-            if not saw_started:
-                raise RuntimeError(
-                    "bridge did not emit started/running event; output="
-                    f"{bridge_output[-2000:]}"
-                )
-
-            bridge.wait(timeout=20)
-            if bridge.returncode != 0:
-                raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
+            run_packaged_bridge_flow(flattened_bridge, relay_port, env, tmp_root)
 
         finally:
-            if selector is not None:
-                selector.close()
-            if bridge is not None and bridge.poll() is None:
-                bridge.kill()
             if relay.poll() is None:
                 relay.kill()
 

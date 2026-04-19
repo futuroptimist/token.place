@@ -593,3 +593,34 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     assert 'desktop.runtime_setup' in captured.err
     assert 'action=probe_only' in captured.err
     assert repair_calls == {'source': 0, 'retry_gate': 0}
+
+
+def test_run_emits_gpu_provisioning_error_for_windows_cuda_probe_failure(
+    tmp_path, capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+    _install_fake_manager_module(FakeManager())
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cuda',
+            'runtime_action': 'failed',
+            'fallback_reason': 'pip install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32', raising=False)
+
+    status = inference_sidecar.run(SimpleNamespace(model=str(model_path), mode='auto', prompt='h'))
+
+    assert status == 1
+    event = json.loads(capsys.readouterr().out.strip())
+    assert event['type'] == 'error'
+    assert event['code'] == 'gpu_provisioning_failed'
+    assert 'pip install failed' in event['message']

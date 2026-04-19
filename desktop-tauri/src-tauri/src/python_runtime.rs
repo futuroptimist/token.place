@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::backend::ComputeMode;
+
+pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
+pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
     pub program: String,
@@ -182,20 +187,50 @@ pub fn resolve_runtime_import_root(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+}
+
+pub fn should_enable_runtime_bootstrap(
+    mode: &ComputeMode,
+    target_os: &str,
+    target_arch: &str,
+    disable_env: Option<&str>,
+) -> bool {
+    if disable_env == Some("1") {
+        return false;
+    }
+    if target_os != "windows" || target_arch != "x86_64" {
+        return false;
+    }
+    matches!(
+        mode,
+        ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+    )
+}
+
+pub fn configure_runtime_bootstrap_env(command: &mut tokio::process::Command, mode: &ComputeMode) {
+    let disable = std::env::var(DISABLE_RUNTIME_BOOTSTRAP_ENV).ok();
+    if should_enable_runtime_bootstrap(
+        mode,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        disable.as_deref(),
+    ) {
+        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -230,6 +265,60 @@ mod tests {
         assert!(is_python_3_version("Python 3.12.1", ""));
         assert!(is_python_3_version("", "Python 3.11.9"));
         assert!(!is_python_3_version("Python 2.7.18", ""));
+    }
+
+    #[test]
+    fn runtime_bootstrap_enabled_for_windows_gpu_modes() {
+        assert!(should_enable_runtime_bootstrap(
+            &ComputeMode::Auto,
+            "windows",
+            "x86_64",
+            None
+        ));
+        assert!(should_enable_runtime_bootstrap(
+            &ComputeMode::Gpu,
+            "windows",
+            "x86_64",
+            None
+        ));
+        assert!(should_enable_runtime_bootstrap(
+            &ComputeMode::Hybrid,
+            "windows",
+            "x86_64",
+            None
+        ));
+    }
+
+    #[test]
+    fn runtime_bootstrap_disabled_for_cpu_or_non_windows_targets() {
+        assert!(!should_enable_runtime_bootstrap(
+            &ComputeMode::Cpu,
+            "windows",
+            "x86_64",
+            None
+        ));
+        assert!(!should_enable_runtime_bootstrap(
+            &ComputeMode::Auto,
+            "linux",
+            "x86_64",
+            None
+        ));
+        assert!(!should_enable_runtime_bootstrap(
+            &ComputeMode::Auto,
+            "windows",
+            "aarch64",
+            None
+        ));
+    }
+
+    #[test]
+    fn runtime_bootstrap_respects_disable_env() {
+        assert!(!should_enable_runtime_bootstrap(
+            &ComputeMode::Auto,
+            "windows",
+            "x86_64",
+            Some("1")
+        ));
     }
 
     #[test]
@@ -356,8 +445,13 @@ mod tests {
     #[test]
     fn resolve_runtime_import_root_detects_nested_up_layout() {
         let temp = TempDir::new().expect("tempdir");
-        let script = temp.path().join("resources").join("python").join("model_bridge.py");
-        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        let script = temp
+            .path()
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script dir");
         std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
         let import_root = temp.path().join("resources").join("_up_").join("_up_");
         std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");

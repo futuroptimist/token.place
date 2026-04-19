@@ -152,6 +152,29 @@ def _extract_text_from_completion(completion: Dict[str, Any]) -> str:
     return message.get("content", "") if isinstance(message, dict) else ""
 
 
+def _gpu_provisioning_failure_message(mode: str, runtime_setup: Dict[str, Any]) -> Optional[str]:
+    selected_mode = (mode or "auto").strip().lower()
+    runtime_action = str(runtime_setup.get("runtime_action") or "").strip().lower()
+    detected_device = str(runtime_setup.get("detected_device") or "").strip().lower()
+    selected_backend = str(runtime_setup.get("selected_backend") or "").strip().lower()
+    fallback_reason = runtime_setup.get("fallback_reason") or "unknown"
+    if selected_mode not in {"auto", "gpu", "hybrid"}:
+        return None
+    if not sys.platform.startswith("win"):
+        return None
+    if detected_device not in {"cuda", "nvidia", "gpu"}:
+        return None
+    if selected_backend in {"cuda", "metal"}:
+        return None
+    if runtime_action not in {"failed", "installed_cpu_fallback", "probe_only"}:
+        return None
+    return (
+        "GPU runtime provisioning failed for Windows CUDA mode "
+        f"(action={runtime_action}, fallback_reason={fallback_reason}). "
+        "Verify CUDA toolkit/build tools and retry."
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     if not os.path.exists(args.model):
         return emit_error("bad_model", "model path not found")
@@ -178,6 +201,9 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    provisioning_error = _gpu_provisioning_failure_message(args.mode, runtime_setup)
+    if provisioning_error:
+        return emit_error("gpu_provisioning_failed", provisioning_error)
 
     manager = get_model_manager()
     manager.model_path = args.model

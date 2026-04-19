@@ -108,6 +108,28 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
         f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
     )
 
+def _gpu_provisioning_failure_message(mode: str, runtime_setup: Dict[str, Any]) -> Optional[str]:
+    selected_mode = (mode or "auto").strip().lower()
+    runtime_action = str(runtime_setup.get("runtime_action") or "").strip().lower()
+    detected_device = str(runtime_setup.get("detected_device") or "").strip().lower()
+    selected_backend = str(runtime_setup.get("selected_backend") or "").strip().lower()
+    fallback_reason = runtime_setup.get("fallback_reason") or "unknown"
+    if selected_mode not in {"auto", "gpu", "hybrid"}:
+        return None
+    if not sys.platform.startswith("win"):
+        return None
+    if detected_device not in {"cuda", "nvidia", "gpu"}:
+        return None
+    if selected_backend in {"cuda", "metal"}:
+        return None
+    if runtime_action not in {"failed", "installed_cpu_fallback", "probe_only"}:
+        return None
+    return (
+        "GPU runtime provisioning failed for Windows CUDA mode "
+        f"(action={runtime_action}, fallback_reason={fallback_reason}). "
+        "Verify CUDA toolkit/build tools and retry."
+    )
+
 
 def _start_stdin_reader() -> None:
     global _stdin_reader_started
@@ -171,6 +193,10 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    provisioning_error = _gpu_provisioning_failure_message(args.mode, runtime_setup)
+    if provisioning_error:
+        emit({"type": "error", "message": provisioning_error})
+        return 1
 
     try:
         from utils.compute_node_runtime import (

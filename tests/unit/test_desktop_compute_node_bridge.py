@@ -422,6 +422,46 @@ def test_run_probe_only_runtime_setup_does_not_trigger_repair_reexec(capsys, mon
     assert reexec_calls == [('probe_only', True)]
 
 
+def test_run_emits_error_when_windows_cuda_provisioning_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cuda',
+            'runtime_action': 'failed',
+            'fallback_reason': 'pip install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    monkeypatch.setattr(compute_node_bridge.sys, 'platform', 'win32', raising=False)
+    status = compute_node_bridge.run(
+        SimpleNamespace(
+            model='/tmp/model.gguf',
+            mode='auto',
+            relay_url='https://token.place',
+            relay_port=None,
+        )
+    )
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'message': (
+                'GPU runtime provisioning failed for Windows CUDA mode '
+                '(action=failed, fallback_reason=pip install failed). '
+                'Verify CUDA toolkit/build tools and retry.'
+            ),
+        }
+    ]
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

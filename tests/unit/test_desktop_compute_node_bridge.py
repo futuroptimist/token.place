@@ -502,6 +502,71 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
     ]
 
 
+def test_run_windows_gpu_mode_accepts_bootstrap_enabled_cuda_runtime(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda:0',
+            'runtime_action': 'installed',
+            'fallback_reason': '',
+            'interpreter': sys.executable,
+            'llama_module_path': 'site-packages/llama_cpp',
+        },
+    )
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'stopped'
+
+
+def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'probe_only',
+            'fallback_reason': 'bootstrap disabled by TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP', '1')
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'stopped'
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

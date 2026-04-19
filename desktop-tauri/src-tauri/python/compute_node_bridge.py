@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 if __package__ in (None, ""):
     script_dir = str(Path(__file__).resolve().parent)
@@ -52,7 +53,23 @@ def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
     if isinstance(raw_error, str):
         normalized = raw_error.strip()
         return normalized or None
+    if not raw_error:
+        return None
     return str(raw_error)
+
+
+def _sanitize_relay_target(relay_url: Any) -> str:
+    """Return a redacted relay target that never includes userinfo/query/fragment."""
+
+    if not isinstance(relay_url, str):
+        return "unknown"
+
+    parsed = urlsplit(relay_url.strip())
+    if not parsed.scheme or not parsed.hostname:
+        return "unknown"
+
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit((parsed.scheme, f"{parsed.hostname}{port}", "", "", ""))
 
 
 def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
@@ -157,7 +174,9 @@ def run(args: argparse.Namespace) -> int:
     relay_port = resolve_relay_port(args.relay_port, relay_url)
     print(
         "desktop.compute_node_bridge.start "
-        f"model={args.model} mode={args.mode} relay_url={relay_url} relay_port={relay_port or 'none'}",
+        f"model={args.model} mode={args.mode} "
+        f"relay_url={_sanitize_relay_target(relay_url)} "
+        f"relay_port={relay_port if relay_port is not None else 'none'}",
         file=sys.stderr,
     )
 
@@ -219,7 +238,7 @@ def run(args: argparse.Namespace) -> int:
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
-                f"relay={active_relay_url} registered={registered} "
+                f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"legacy_payload={legacy_payload} heartbeat_ack={heartbeat_ack} "
                 f"summary={_relay_response_summary(relay_response)}",
                 file=sys.stderr,

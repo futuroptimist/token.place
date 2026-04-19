@@ -144,6 +144,19 @@ class IncompatibleRelayRuntime(FakeRuntime):
         self._processed = []
 
 
+class FalseErrorHeartbeatRuntime(FakeRuntime):
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClient()
+        self._responses = [
+            {
+                'next_ping_in_x_seconds': 0,
+                'error': False,
+            },
+        ]
+        self._processed = []
+
+
 def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module = ModuleType('utils.compute_node_runtime')
 
@@ -407,7 +420,6 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     assert any(event.get('registered') is True for event in status_events)
 
 
-
 def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=NullErrorHeartbeatRuntime)
@@ -433,6 +445,34 @@ def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     assert status_events
     assert status_events[0]['registered'] is True
     assert status_events[0]['last_error'] is None
+
+
+def test_run_treats_false_error_heartbeat_as_registered(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FalseErrorHeartbeatRuntime)
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert status_events[0]['registered'] is True
+    assert status_events[0]['last_error'] is None
+
 
 def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch):
     _reset_cancel_queue()
@@ -802,3 +842,15 @@ def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch
     assert setup['runtime_action'] == 'unavailable'
     assert 'module missing' in setup['fallback_reason']
     assert module.maybe_reexec_for_runtime_refresh(setup, allow_reexec=False) is None
+
+
+def test_sanitize_relay_target_redacts_credentials_query_and_fragment():
+    sanitized = compute_node_bridge._sanitize_relay_target(
+        'https://user:pass@token.place:8443/sink?token=abc#debug'
+    )
+    assert sanitized == 'https://token.place:8443'
+
+
+def test_sanitize_relay_target_returns_unknown_for_invalid_values():
+    assert compute_node_bridge._sanitize_relay_target(None) == 'unknown'
+    assert compute_node_bridge._sanitize_relay_target('not-a-valid-url') == 'unknown'

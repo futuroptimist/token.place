@@ -323,16 +323,15 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
-        if child_slot
-            .as_mut()
-            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
-        {
-            anyhow::bail!("compute node already running; stop it before starting a new session");
+        if let Some(child) = child_slot.as_mut() {
+            if child.try_wait()?.is_none() {
+                anyhow::bail!("compute node already running; stop it before starting a new session");
+            }
         }
         *child_slot = None;
         *state.stdin.lock().await = None;
@@ -421,7 +420,13 @@ pub async fn start_compute_node(
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
 
     {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
+        if let Some(existing_child) = child_slot.as_mut() {
+            if existing_child.try_wait()?.is_none() {
+                anyhow::bail!("compute node already running; stop it before starting a new session");
+            }
+        }
         *child_slot = Some(child);
         let mut stdin_slot = state.stdin.lock().await;
         *stdin_slot = Some(stdin);
@@ -507,8 +512,6 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
-
     if let Some(stdin) = state.stdin.lock().await.as_mut() {
         stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
         stdin.flush().await?;
@@ -626,6 +629,22 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_does_not_wait_on_lifecycle_lock() {
+        let state = ComputeNodeState::default();
+        let lifecycle_guard = state.lifecycle_lock.lock().await;
+
+        let stop_result = tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_compute_node(state.clone()),
+        )
+        .await;
+
+        drop(lifecycle_guard);
+        assert!(stop_result.is_ok(), "stop should not block on lifecycle lock");
+        assert!(stop_result.expect("timeout result").is_ok());
     }
 
     #[test]

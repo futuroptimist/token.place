@@ -35,10 +35,11 @@ def _offloaded_layer_count(value: Any) -> int:
 
 
 def _load_compute_runtime_diagnostics(model_path: str, mode: str) -> dict[str, Any]:
-    from desktop_runtime_setup import ensure_desktop_llama_runtime
+    from desktop_runtime_setup import ENABLE_BOOTSTRAP_ENV, ensure_desktop_llama_runtime
     from utils.compute_node_runtime import apply_compute_mode, compute_mode_diagnostics
     from utils.llm.model_manager import get_model_manager
 
+    os.environ.setdefault(ENABLE_BOOTSTRAP_ENV, '1')
     runtime_setup = ensure_desktop_llama_runtime(mode)
 
     manager = get_model_manager()

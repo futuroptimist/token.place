@@ -27,7 +27,10 @@ def main() -> int:
     repo_llama_shim = str((repo_root / 'llama_cpp.py').resolve())
 
     from utils.llm.model_manager import detect_llama_runtime_capabilities
-    from desktop_runtime_setup import ensure_desktop_llama_runtime
+    from desktop_runtime_setup import ENABLE_BOOTSTRAP_ENV, ensure_desktop_llama_runtime
+
+    # This manual verification flow is an explicit runtime-repair entrypoint.
+    os.environ.setdefault(ENABLE_BOOTSTRAP_ENV, '1')
 
     runtime_setup = ensure_desktop_llama_runtime(args.mode, repo_root=repo_root)
     runtime = detect_llama_runtime_capabilities()

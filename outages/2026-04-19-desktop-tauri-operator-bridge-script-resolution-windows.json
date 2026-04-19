@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-19",
+  "slug": "desktop-tauri-operator-bridge-script-resolution-windows",
+  "summary": "Desktop operator startup could regress on Windows packaged installs when compute_node_bridge.py was not resolved from runtime resources, causing the bridge process to terminate before registration and leaving the UI in Running=no / Registered=no.",
+  "impact": "Windows desktop operators could not connect to local relays after clicking Start operator, blocking operator bring-up and relay-backed inference validation.",
+  "fix": "Updated desktop-tauri compute-node bridge resolution to include runtime resource_dir candidates and Windows updater resource layouts, plus added CI coverage on windows-latest for packaged operator e2e and strengthened packaged e2e assertions to require registered=true before shutdown.",
+  "lessons": "Packaged desktop path resolution must be validated against runtime resource locations (including updater layouts), and operator e2e tests must assert relay registration, not only process startup."
+}

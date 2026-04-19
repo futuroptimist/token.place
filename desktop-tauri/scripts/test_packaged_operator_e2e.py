@@ -128,6 +128,7 @@ def main() -> int:
             selector.register(bridge.stdout, selectors.EVENT_READ)
 
             saw_started = False
+            saw_registered = False
             buffered = ""
             deadline = time.time() + 20
 
@@ -158,16 +159,24 @@ def main() -> int:
                             raise RuntimeError(f"bridge emitted error event: {payload}")
                         if payload.get("type") == "started" and payload.get("running") is True:
                             saw_started = True
+                        if payload.get("registered") is True:
+                            saw_registered = True
+                        if saw_started and saw_registered:
                             bridge.stdin.write(b'{"type":"cancel"}\n')
                             bridge.stdin.flush()
                             break
 
-                if saw_started:
+                if saw_started and saw_registered:
                     break
 
             if not saw_started:
                 raise RuntimeError(
                     "bridge did not emit started/running event; output="
+                    f"{bridge_output[-2000:]}"
+                )
+            if not saw_registered:
+                raise RuntimeError(
+                    "bridge never reported registered=true (relay connection missing); output="
                     f"{bridge_output[-2000:]}"
                 )
 

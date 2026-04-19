@@ -89,11 +89,16 @@ class FakeLongStreamLlm:
 @pytest.fixture(autouse=True)
 def restore_model_manager_module():
     original = sys.modules.get('utils.llm.model_manager')
+    original_compute_runtime = sys.modules.get('utils.compute_node_runtime')
     yield
     if original is None:
         sys.modules.pop('utils.llm.model_manager', None)
     else:
         sys.modules['utils.llm.model_manager'] = original
+    if original_compute_runtime is None:
+        sys.modules.pop('utils.compute_node_runtime', None)
+    else:
+        sys.modules['utils.compute_node_runtime'] = original_compute_runtime
 
 
 def _install_fake_manager_module(manager):
@@ -107,6 +112,41 @@ def _install_fake_manager_module(manager):
 
     module.ModelManager = _ModelManager
     sys.modules['utils.llm.model_manager'] = module
+
+    compute_module = ModuleType('utils.compute_node_runtime')
+    supported_modes = {'auto', 'cpu', 'gpu', 'hybrid'}
+    aliases = {'cuda': 'gpu', 'metal': 'gpu'}
+
+    def _normalize(mode):
+        normalized = aliases.get(str(mode).lower(), str(mode).lower())
+        return normalized if normalized in supported_modes else 'auto'
+
+    def _apply_compute_mode(model_manager, mode):
+        normalized = _normalize(mode)
+        if normalized == 'cpu':
+            model_manager.default_n_gpu_layers = 0
+        elif normalized == 'hybrid':
+            model_manager.default_n_gpu_layers = 24
+        else:
+            model_manager.default_n_gpu_layers = -1
+        model_manager.requested_compute_mode = normalized
+        return normalized
+
+    def _compute_mode_diagnostics(model_manager):
+        requested_mode = getattr(model_manager, 'requested_compute_mode', 'auto')
+        effective_mode = 'cpu' if requested_mode == 'cpu' else 'gpu'
+        return {
+            'requested_mode': requested_mode,
+            'effective_mode': effective_mode,
+            'backend_used': effective_mode,
+            'n_gpu_layers': model_manager.default_n_gpu_layers,
+            'fallback_reason': None,
+        }
+
+    compute_module.normalize_compute_mode = _normalize
+    compute_module.apply_compute_mode = _apply_compute_mode
+    compute_module.compute_mode_diagnostics = _compute_mode_diagnostics
+    sys.modules['utils.compute_node_runtime'] = compute_module
 
 
 def _reset_cancel_queue():
@@ -352,6 +392,7 @@ def test_main_emits_inference_failed_when_compute_runtime_missing(capsys, monkey
 
 def test_main_normalizes_mode_before_run(monkeypatch):
     captured = {}
+    _install_fake_manager_module(FakeManager())
 
     def fake_run(args):
         captured['mode'] = args.mode
@@ -491,3 +532,64 @@ def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, cap
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event['type'] for event in events] == ['started', 'done']
+
+
+def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_work(
+    tmp_path, capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    runtime_setup_module = sys.modules['desktop_runtime_setup']
+
+    class _WinSysStub:
+        platform = 'win32'
+        executable = sys.executable
+
+    probe = runtime_setup_module.RuntimeProbe(
+        backend='cpu',
+        detected_device='cpu',
+        gpu_offload_supported=False,
+        error='missing cuda runtime',
+        interpreter=sys.executable,
+        llama_module_path='missing',
+        prefix='',
+    )
+    repair_calls = {'source': 0, 'retry_gate': 0}
+
+    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
+    monkeypatch.delenv(runtime_setup_module.DISABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.delenv(runtime_setup_module.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(runtime_setup_module, '_probe_llama_runtime', lambda **_: probe)
+    monkeypatch.setattr(
+        runtime_setup_module,
+        '_windows_cuda_source_repair',
+        lambda _requirements_path: (
+            repair_calls.__setitem__('source', repair_calls['source'] + 1) or True,
+            'ok',
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_setup_module,
+        '_should_attempt_source_repair',
+        lambda: (
+            repair_calls.__setitem__('retry_gate', repair_calls['retry_gate'] + 1) or True,
+            '',
+        ),
+    )
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'done'
+    assert 'desktop.runtime_setup' in captured.err
+    assert 'action=probe_only' in captured.err
+    assert repair_calls == {'source': 0, 'retry_gate': 0}

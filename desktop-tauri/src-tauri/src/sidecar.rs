@@ -1,5 +1,8 @@
 use crate::backend::ComputeMode;
-use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
+use crate::python_runtime::{
+    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
+    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -213,6 +216,22 @@ fn configure_runtime_pythonpath(command: &mut Command, sidecar_path: &str) {
     }
 }
 
+fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
+    if should_enable_runtime_bootstrap(mode) {
+        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
+    }
+}
+
+#[cfg(test)]
+fn command_env_value(command: &Command, key: &str) -> Option<String> {
+    command
+        .as_std()
+        .get_envs()
+        .find_map(|(env_key, value)| (env_key == key).then_some(value))
+        .flatten()
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -250,6 +269,7 @@ pub async fn start_sidecar(
 
     let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
     configure_runtime_pythonpath(&mut sidecar_command, &sidecar_script);
+    configure_runtime_bootstrap_env(&mut sidecar_command, &request.mode);
 
     let mut child = sidecar_command
         .arg("--model")
@@ -353,6 +373,54 @@ pub async fn start_sidecar(
 
     *state.stdin.lock().await = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
+        let mut command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Auto);
+
+        assert_eq!(
+            command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
+        let mut cpu_command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
+        assert_eq!(command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV), None);
+
+        let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+        let previous = std::env::var(disable_key).ok();
+        // SAFETY: This unit test mutates process env in a tightly scoped block and restores it.
+        unsafe {
+            std::env::set_var(disable_key, "1");
+        }
+        let mut disabled_command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut disabled_command, &ComputeMode::Auto);
+        if let Some(value) = previous {
+            // SAFETY: restore prior process env for test isolation.
+            unsafe {
+                std::env::set_var(disable_key, value);
+            }
+        } else {
+            // SAFETY: restore prior process env for test isolation.
+            unsafe {
+                std::env::remove_var(disable_key);
+            }
+        }
+
+        assert_eq!(
+            command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
+    }
 }
 
 pub async fn cancel_sidecar(state: SidecarState) -> anyhow::Result<()> {

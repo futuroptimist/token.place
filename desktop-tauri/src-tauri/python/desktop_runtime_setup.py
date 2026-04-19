@@ -30,6 +30,9 @@ class RuntimeProbe:
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
+GPU_RUNTIME_FATAL_ACTIONS = frozenset(
+    {"failed", "installed_cpu_fallback", "shadowed_repo_llama_cpp", "unavailable"}
+)
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 INSTALL_ERROR_SUMMARY_MAX_LEN = 512
@@ -351,6 +354,26 @@ def maybe_reexec_for_runtime_refresh(
         os.execve(sys.executable, [sys.executable, *sys.argv], env)
     except OSError:
         return
+
+
+def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]) -> str | None:
+    """Return fatal runtime bootstrap diagnostics for Windows desktop GPU launch modes."""
+
+    if sys.platform != "win32" or mode not in GPU_MODES:
+        return None
+
+    selected_backend = str(runtime_setup.get("selected_backend", "cpu")).lower()
+    runtime_action = str(runtime_setup.get("runtime_action", "none")).lower()
+    if selected_backend != "cpu" or runtime_action not in GPU_RUNTIME_FATAL_ACTIONS:
+        return None
+
+    reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
+    return (
+        "GPU provisioning failed for desktop Windows launch "
+        f"(mode={mode}, action={runtime_action}): {reason}. "
+        "Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support."
+    )
+
 
 def _resolve_requirements_path(target_root: Path) -> Path:
     candidates = [

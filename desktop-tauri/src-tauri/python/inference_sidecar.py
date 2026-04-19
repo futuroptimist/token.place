@@ -19,7 +19,11 @@ if __package__ in (None, ""):
         sys.path.insert(0, script_dir)
 
 from path_bootstrap import ensure_runtime_import_paths
-from desktop_runtime_setup import ensure_desktop_llama_runtime, maybe_reexec_for_runtime_refresh
+from desktop_runtime_setup import (
+    desktop_gpu_runtime_failure_message,
+    ensure_desktop_llama_runtime,
+    maybe_reexec_for_runtime_refresh,
+)
 
 ensure_runtime_import_paths(__file__)
 
@@ -178,6 +182,9 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
+    if gpu_runtime_error:
+        return emit_error("gpu_runtime_unavailable", gpu_runtime_error)
 
     manager = get_model_manager()
     manager.model_path = args.model

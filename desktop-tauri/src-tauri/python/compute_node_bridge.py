@@ -21,8 +21,15 @@ if __package__ in (None, ""):
 from path_bootstrap import ensure_runtime_import_paths
 
 try:
-    from desktop_runtime_setup import ensure_desktop_llama_runtime, maybe_reexec_for_runtime_refresh
+    from desktop_runtime_setup import (
+        desktop_gpu_runtime_failure_message,
+        ensure_desktop_llama_runtime,
+        maybe_reexec_for_runtime_refresh,
+    )
 except ModuleNotFoundError:
+    def desktop_gpu_runtime_failure_message(_mode: str, _runtime_setup: Dict[str, str]) -> None:
+        return None
+
     def ensure_desktop_llama_runtime(_mode: str) -> Dict[str, str]:
         return {
             "selected_backend": "cpu",
@@ -171,6 +178,10 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
+    if gpu_runtime_error:
+        emit({"type": "error", "message": gpu_runtime_error})
+        return 1
 
     try:
         from utils.compute_node_runtime import (

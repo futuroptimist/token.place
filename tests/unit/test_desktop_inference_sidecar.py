@@ -531,7 +531,9 @@ def test_run_done_without_token_when_stream_and_fallback_are_empty(tmp_path, cap
 
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [event['type'] for event in events] == ['started', 'done']
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'done'
+    assert all(event['type'] != 'error' for event in events)
 
 
 def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_work(
@@ -593,3 +595,151 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     assert 'desktop.runtime_setup' in captured.err
     assert 'action=probe_only' in captured.err
     assert repair_calls == {'source': 0, 'retry_gate': 0}
+
+
+def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': 'cuda wheel install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'code': 'gpu_runtime_unavailable',
+            'message': (
+                'GPU provisioning failed for desktop Windows launch '
+                '(mode=auto, action=failed): cuda wheel install failed. '
+                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+            ),
+        }
+    ]
+
+
+def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'shadowed_repo_llama_cpp',
+            'fallback_reason': 'llama_cpp import shadowed by repo-local shim',
+            'interpreter': sys.executable,
+            'llama_module_path': 'repo/llama_cpp.py',
+        },
+    )
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == [
+        {
+            'type': 'error',
+            'code': 'gpu_runtime_unavailable',
+            'message': (
+                'GPU provisioning failed for desktop Windows launch '
+                '(mode=auto, action=shadowed_repo_llama_cpp): '
+                'llama_cpp import shadowed by repo-local shim. '
+                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+            ),
+        }
+    ]
+
+
+def test_run_windows_gpu_mode_accepts_bootstrap_enabled_cuda_runtime(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda:0',
+            'runtime_action': 'installed',
+            'fallback_reason': '',
+            'interpreter': sys.executable,
+            'llama_module_path': 'site-packages/llama_cpp',
+        },
+    )
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'done'
+    assert all(event['type'] != 'error' for event in events)
+
+
+def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(
+    tmp_path, capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'probe_only',
+            'fallback_reason': 'bootstrap disabled by TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP', '1')
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+    assert events[-1]['type'] == 'done'
+    assert all(event['type'] != 'error' for event in events)

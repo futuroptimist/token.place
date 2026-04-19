@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::backend::ComputeMode;
+
+pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
+pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
     pub program: String,
@@ -187,6 +192,35 @@ pub fn resolve_runtime_import_root(
     })
 }
 
+fn mode_requests_gpu(mode: &ComputeMode) -> bool {
+    matches!(mode, ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid)
+}
+
+fn should_enable_runtime_bootstrap_for(
+    target_os: &str,
+    target_arch: &str,
+    mode: &ComputeMode,
+    bootstrap_disabled: bool,
+) -> bool {
+    target_os == "windows"
+        && target_arch == "x86_64"
+        && mode_requests_gpu(mode)
+        && !bootstrap_disabled
+}
+
+pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
+    let bootstrap_disabled = std::env::var(DISABLE_RUNTIME_BOOTSTRAP_ENV)
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false);
+
+    should_enable_runtime_bootstrap_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        mode,
+        bootstrap_disabled,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +398,45 @@ mod tests {
 
         let resolved = resolve_runtime_import_root(Some(&script), Path::new("/missing"));
         assert_eq!(resolved.as_deref(), Some(import_root.as_path()));
+    }
+
+    #[test]
+    fn runtime_bootstrap_only_enabled_for_windows_x64_gpu_modes() {
+        assert!(should_enable_runtime_bootstrap_for(
+            "windows",
+            "x86_64",
+            &ComputeMode::Auto,
+            false
+        ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "windows",
+            "x86_64",
+            &ComputeMode::Gpu,
+            false
+        ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "windows",
+            "x86_64",
+            &ComputeMode::Hybrid,
+            false
+        ));
+        assert!(!should_enable_runtime_bootstrap_for(
+            "windows",
+            "x86_64",
+            &ComputeMode::Cpu,
+            false
+        ));
+        assert!(!should_enable_runtime_bootstrap_for(
+            "linux",
+            "x86_64",
+            &ComputeMode::Gpu,
+            false
+        ));
+        assert!(!should_enable_runtime_bootstrap_for(
+            "windows",
+            "x86_64",
+            &ComputeMode::Gpu,
+            true
+        ));
     }
 }

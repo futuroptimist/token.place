@@ -317,6 +317,33 @@ def wait_for_start_operator_enabled(
         ) from exc
 
 
+def assert_operator_status_stable(
+    driver: webdriver.Remote,
+    *,
+    stable_seconds: float,
+) -> None:
+    """Verify Running/Registered remain yes for a continuous window."""
+
+    deadline = time.time() + stable_seconds
+    while time.time() < deadline:
+        running_text = (
+            driver.find_element(By.XPATH, "//p[contains(.,'Running:')]//strong")
+            .text.strip()
+            .lower()
+        )
+        registered_text = (
+            driver.find_element(By.XPATH, "//p[contains(.,'Registered:')]//strong")
+            .text.strip()
+            .lower()
+        )
+        if running_text != "yes" or registered_text != "yes":
+            raise AssertionError(
+                "operator status became unstable during hold window: "
+                f"running={running_text} registered={registered_text}"
+            )
+        time.sleep(0.25)
+
+
 def assert_relay_roundtrip(
     relay_url: str,
     relay_log: Path,
@@ -523,6 +550,7 @@ def main() -> int:
                 "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
             )
         )
+        assert_operator_status_stable(driver, stable_seconds=25.0)
 
         prompt = driver.find_element(
             By.XPATH,

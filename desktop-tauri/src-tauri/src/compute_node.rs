@@ -104,6 +104,16 @@ fn bridge_script_candidates(
         }
     }
 
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(
+            cwd.join("resources")
+                .join("python")
+                .join("compute_node_bridge.py"),
+        );
+        candidates.push(cwd.join("python").join("compute_node_bridge.py"));
+        candidates.push(cwd.join("compute_node_bridge.py"));
+    }
+
     candidates.push(manifest_dir.join("python").join("compute_node_bridge.py"));
     candidates
 }
@@ -765,6 +775,32 @@ mod tests {
             candidates.last().expect("manifest candidate"),
             &manifest_dir.join("python").join("compute_node_bridge.py")
         );
+    }
+
+    #[test]
+    fn bridge_script_candidates_include_current_working_directory_locations() {
+        let temp = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("original cwd");
+        std::env::set_current_dir(temp.path()).expect("set cwd");
+
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let candidates = bridge_script_candidates(None, &manifest_dir);
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("resources/python/compute_node_bridge.py")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("python/compute_node_bridge.py")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("compute_node_bridge.py")));
     }
 
     #[test]

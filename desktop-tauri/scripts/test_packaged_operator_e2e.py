@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
+import queue
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.request import urlopen
@@ -71,6 +72,18 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
+def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
+    if not hasattr(stdout, "readline"):
+        return
+
+    readline = stdout.readline
+    while True:
+        chunk = readline()
+        if not chunk:
+            return
+        output_queue.put(chunk)
+
+
 def main() -> int:
     relay_port = reserve_free_port()
     env = os.environ.copy()
@@ -98,7 +111,7 @@ def main() -> int:
 
         bridge: subprocess.Popen[bytes] | None = None
         bridge_output = ""
-        selector: selectors.BaseSelector | None = None
+        output_queue: queue.Queue[bytes] | None = None
         try:
             wait_for_livez(relay, relay_port)
             bridge = subprocess.Popen(  # noqa: S603
@@ -123,51 +136,62 @@ def main() -> int:
             assert bridge.stdout is not None
             assert bridge.stdin is not None
 
-            os.set_blocking(bridge.stdout.fileno(), False)
-            selector = selectors.DefaultSelector()
-            selector.register(bridge.stdout, selectors.EVENT_READ)
+            output_queue = queue.Queue()
+            threading.Thread(
+                target=enqueue_bridge_stdout,
+                args=(bridge.stdout, output_queue),
+                daemon=True,
+            ).start()
 
             saw_started = False
+            saw_registered = False
             buffered = ""
             deadline = time.time() + 20
 
             while time.time() < deadline:
                 timeout = max(0.0, min(0.25, deadline - time.time()))
-                events = selector.select(timeout=timeout)
-                if not events and bridge.poll() is not None:
-                    break
+                try:
+                    chunk = output_queue.get(timeout=timeout)
+                except queue.Empty:
+                    if bridge.poll() is not None:
+                        break
+                    continue
 
-                for key, _ in events:
-                    chunk = os.read(key.fileobj.fileno(), 4096)
-                    if not chunk:
+                text = chunk.decode("utf-8", errors="replace")
+                bridge_output += text
+                buffered += text
+
+                while "\n" in buffered:
+                    line, buffered = buffered.split("\n", 1)
+                    line = line.strip()
+                    if not line:
                         continue
-                    text = chunk.decode("utf-8", errors="replace")
-                    bridge_output += text
-                    buffered += text
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("type") == "error":
+                        raise RuntimeError(f"bridge emitted error event: {payload}")
+                    if payload.get("type") == "started" and payload.get("running") is True:
+                        saw_started = True
+                    if payload.get("registered") is True:
+                        saw_registered = True
+                    if saw_started and saw_registered:
+                        bridge.stdin.write(b'{"type":"cancel"}\n')
+                        bridge.stdin.flush()
+                        break
 
-                    while "\n" in buffered:
-                        line, buffered = buffered.split("\n", 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            payload = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if payload.get("type") == "error":
-                            raise RuntimeError(f"bridge emitted error event: {payload}")
-                        if payload.get("type") == "started" and payload.get("running") is True:
-                            saw_started = True
-                            bridge.stdin.write(b'{"type":"cancel"}\n')
-                            bridge.stdin.flush()
-                            break
-
-                if saw_started:
+                if saw_started and saw_registered:
                     break
 
             if not saw_started:
                 raise RuntimeError(
                     "bridge did not emit started/running event; output="
+                    f"{bridge_output[-2000:]}"
+                )
+            if not saw_registered:
+                raise RuntimeError(
+                    "bridge never reported registered=true (relay connection missing); output="
                     f"{bridge_output[-2000:]}"
                 )
 
@@ -176,8 +200,6 @@ def main() -> int:
                 raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
 
         finally:
-            if selector is not None:
-                selector.close()
             if bridge is not None and bridge.poll() is None:
                 bridge.kill()
             if relay.poll() is None:

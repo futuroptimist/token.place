@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
@@ -75,8 +75,14 @@ fn is_python_script(path: &str) -> bool {
 fn bridge_script_candidates(
     exe_path: Option<&Path>,
     manifest_dir: &Path,
+    resource_dir: Option<&Path>,
 ) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
+
+    if let Some(resource_dir) = resource_dir {
+        candidates.push(resource_dir.join("python").join("compute_node_bridge.py"));
+        candidates.push(resource_dir.join("compute_node_bridge.py"));
+    }
 
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
@@ -88,6 +94,13 @@ fn bridge_script_candidates(
             );
             candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
             if let Some(parent_dir) = exe_dir.parent() {
+                candidates.push(
+                    parent_dir
+                        .join("_up_")
+                        .join("resources")
+                        .join("python")
+                        .join("compute_node_bridge.py"),
+                );
                 candidates.push(
                     parent_dir
                         .join("Resources")
@@ -108,10 +121,12 @@ fn bridge_script_candidates(
     candidates
 }
 
-fn resolve_bridge_script() -> String {
+fn resolve_bridge_script(app: &AppHandle) -> String {
     let exe_path = std::env::current_exe().ok();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let candidates = bridge_script_candidates(exe_path.as_deref(), manifest_dir);
+    let resource_dir = app.path().resource_dir().ok();
+    let candidates =
+        bridge_script_candidates(exe_path.as_deref(), manifest_dir, resource_dir.as_deref());
 
     if let Some(path) = first_existing_script(candidates) {
         return path;
@@ -323,7 +338,7 @@ pub async fn start_compute_node(
         *state.stdin.lock().await = None;
     }
 
-    let bridge_script = resolve_bridge_script();
+    let bridge_script = resolve_bridge_script(&app);
     let launcher = if is_python_script(&bridge_script) {
         match tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
             .await
@@ -475,12 +490,7 @@ pub async fn start_compute_node(
         let exit_status = running_child.wait().await?;
         let exit_payload = {
             let mut status = state.status.lock().await;
-            finalize_bridge_exit(
-                &mut status,
-                exit_status,
-                saw_startup_event,
-                saw_error_event,
-            )
+            finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
         };
 
         if let Some(payload) = exit_payload {
@@ -494,54 +504,6 @@ pub async fn start_compute_node(
     *state.stdin.lock().await = None;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
-        let mut command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
-
-        assert_eq!(
-            command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
-            Some("1")
-        );
-    }
-
-    #[test]
-    fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
-        let mut cpu_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
-        assert_eq!(command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV), None);
-
-        let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
-        let previous = std::env::var(disable_key).ok();
-        // SAFETY: This unit test mutates process env in a tightly scoped block and restores it.
-        unsafe {
-            std::env::set_var(disable_key, "1");
-        }
-        let mut disabled_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut disabled_command, &ComputeMode::Gpu);
-        if let Some(value) = previous {
-            // SAFETY: restore prior process env for test isolation.
-            unsafe {
-                std::env::set_var(disable_key, value);
-            }
-        } else {
-            // SAFETY: restore prior process env for test isolation.
-            unsafe {
-                std::env::remove_var(disable_key);
-            }
-        }
-
-        assert_eq!(
-            command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
-            None
-        );
-    }
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
@@ -728,10 +690,7 @@ mod tests {
             .expect("status last_error should be set");
         assert!(last_error.contains("before emitting a startup event"));
         assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
-        assert_eq!(
-            payload.get("running").and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(payload.get("running").and_then(Value::as_bool), Some(false));
         assert_eq!(
             payload.get("registered").and_then(Value::as_bool),
             Some(false)
@@ -753,7 +712,7 @@ mod tests {
             .join("repo")
             .join("desktop-tauri")
             .join("src-tauri");
-        let candidates = bridge_script_candidates(Some(&exe_path), &manifest_dir);
+        let candidates = bridge_script_candidates(Some(&exe_path), &manifest_dir, None);
 
         assert!(candidates
             .iter()
@@ -777,7 +736,7 @@ mod tests {
         std::fs::write(&bridge, "print('ok')\n").expect("write bridge");
 
         let exe_path = exe_dir.join("token.place.exe");
-        let candidates = bridge_script_candidates(Some(&exe_path), temp.path());
+        let candidates = bridge_script_candidates(Some(&exe_path), temp.path(), None);
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), bridge);
@@ -798,9 +757,73 @@ mod tests {
         std::fs::write(&resources_bridge, "print('resources')\n").expect("write resources bridge");
 
         let exe_path = exe_dir.join("token.place");
-        let candidates = bridge_script_candidates(Some(&exe_path), temp.path());
+        let candidates = bridge_script_candidates(Some(&exe_path), temp.path(), None);
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), resources_bridge);
+    }
+
+    #[test]
+    fn bridge_script_candidates_include_runtime_resource_and_windows_updater_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let resource_dir = temp.path().join("runtime-resources");
+        let exe_dir = temp.path().join("Local").join("token.place");
+        let exe_path = exe_dir.join("token.place.exe");
+        let candidates =
+            bridge_script_candidates(Some(&exe_path), temp.path(), Some(&resource_dir));
+
+        assert_eq!(
+            candidates.first().expect("first candidate"),
+            &resource_dir.join("python").join("compute_node_bridge.py")
+        );
+        assert!(candidates.iter().any(|candidate| {
+            candidate.ends_with("_up_/resources/python/compute_node_bridge.py")
+        }));
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
+        let mut command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
+
+        assert_eq!(
+            command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
+        let mut cpu_command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
+        assert_eq!(
+            command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
+
+        let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
+        let previous = std::env::var(disable_key).ok();
+        // SAFETY: This unit test mutates process env in a tightly scoped block and restores it.
+        unsafe {
+            std::env::set_var(disable_key, "1");
+        }
+        let mut disabled_command = Command::new("python");
+        configure_runtime_bootstrap_env(&mut disabled_command, &ComputeMode::Gpu);
+        if let Some(value) = previous {
+            // SAFETY: restore prior process env for test isolation.
+            unsafe {
+                std::env::set_var(disable_key, value);
+            }
+        } else {
+            // SAFETY: restore prior process env for test isolation.
+            unsafe {
+                std::env::remove_var(disable_key);
+            }
+        }
+
+        assert_eq!(
+            command_env_value(&disabled_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
     }
 }

@@ -25,6 +25,8 @@ ensure_runtime_import_paths(__file__)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
+REQUIRE_GPU_RUNTIME_ENV = "TOKEN_PLACE_DESKTOP_REQUIRE_GPU_RUNTIME"
+GPU_MODES = {"auto", "gpu", "hybrid"}
 _stdin_reader_lock = threading.Lock()
 
 
@@ -178,6 +180,25 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    runtime_action = runtime_setup.get("runtime_action", "none")
+    if (
+        os.getenv(REQUIRE_GPU_RUNTIME_ENV) == "1"
+        and str(args.mode).lower() in GPU_MODES
+        and runtime_action != "unavailable"
+    ):
+        selected_backend = runtime_setup.get("selected_backend", "cpu")
+        if runtime_action in {"failed", "installed_cpu_fallback", "probe_only"} or (
+            selected_backend == "cpu"
+        ):
+            fallback_reason = runtime_setup.get("fallback_reason") or "unknown runtime failure"
+            return emit_error(
+                "gpu_runtime_unavailable",
+                (
+                    "GPU runtime provisioning failed during desktop launch. "
+                    f"action={runtime_action}; reason={fallback_reason}. "
+                    "Switch to CPU mode or repair CUDA-enabled llama-cpp-python."
+                ),
+            )
 
     manager = get_model_manager()
     manager.model_path = args.model

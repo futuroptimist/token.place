@@ -593,3 +593,34 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     assert 'desktop.runtime_setup' in captured.err
     assert 'action=probe_only' in captured.err
     assert repair_calls == {'source': 0, 'retry_gate': 0}
+
+
+def test_run_emits_actionable_error_when_desktop_requires_gpu_runtime(tmp_path, capsys, monkeypatch):
+    _reset_cancel_queue()
+    model_path = tmp_path / 'model.gguf'
+    model_path.write_text('fake-model')
+    manager = FakeManager()
+    _install_fake_manager_module(manager)
+    monkeypatch.setenv(inference_sidecar.REQUIRE_GPU_RUNTIME_ENV, '1')
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'probe_only',
+            'fallback_reason': 'bootstrap was not enabled',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+
+    args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
+    status = inference_sidecar.run(args)
+
+    assert status == 1
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['type'] == 'error'
+    assert payload['code'] == 'gpu_runtime_unavailable'
+    assert 'bootstrap was not enabled' in payload['message']
+    monkeypatch.delenv(inference_sidecar.REQUIRE_GPU_RUNTIME_ENV, raising=False)

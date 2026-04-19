@@ -1,6 +1,7 @@
 mod backend;
 mod compute_node;
 mod config;
+mod desktop_runtime_bootstrap;
 mod forward;
 mod keygen;
 mod logging;

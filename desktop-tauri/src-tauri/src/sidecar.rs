@@ -1,4 +1,7 @@
 use crate::backend::ComputeMode;
+use crate::desktop_runtime_bootstrap::{
+    should_provision_gpu_runtime, ENABLE_BOOTSTRAP_ENV, REQUIRE_GPU_RUNTIME_ENV,
+};
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -213,6 +216,13 @@ fn configure_runtime_pythonpath(command: &mut Command, sidecar_path: &str) {
     }
 }
 
+fn configure_runtime_bootstrap(command: &mut Command, mode: &ComputeMode) {
+    if should_provision_gpu_runtime(mode) {
+        command.env(ENABLE_BOOTSTRAP_ENV, "1");
+        command.env(REQUIRE_GPU_RUNTIME_ENV, "1");
+    }
+}
+
 pub async fn start_sidecar(
     app: AppHandle,
     state: SidecarState,
@@ -250,6 +260,7 @@ pub async fn start_sidecar(
 
     let mut sidecar_command = build_sidecar_command(&sidecar_script, launcher)?;
     configure_runtime_pythonpath(&mut sidecar_command, &sidecar_script);
+    configure_runtime_bootstrap(&mut sidecar_command, &request.mode);
 
     let mut child = sidecar_command
         .arg("--model")
@@ -560,5 +571,29 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved sidecar path");
 
         assert_eq!(Path::new(&resolved), resources_sidecar);
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_sets_desktop_gpu_env_for_auto_mode() {
+        let mut command = Command::new("python3");
+        configure_runtime_bootstrap(&mut command, &ComputeMode::Auto);
+        let envs: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|value| (k.to_owned(), value.to_owned())))
+            .collect();
+
+        if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(ENABLE_BOOTSTRAP_ENV)),
+                Some(&std::ffi::OsString::from("1"))
+            );
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(REQUIRE_GPU_RUNTIME_ENV)),
+                Some(&std::ffi::OsString::from("1"))
+            );
+        } else {
+            assert!(!envs.contains_key(std::ffi::OsStr::new(ENABLE_BOOTSTRAP_ENV)));
+        }
     }
 }

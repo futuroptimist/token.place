@@ -422,6 +422,38 @@ def test_run_probe_only_runtime_setup_does_not_trigger_repair_reexec(capsys, mon
     assert reexec_calls == [('probe_only', True)]
 
 
+def test_run_emits_actionable_error_when_desktop_requires_gpu_runtime(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setenv(compute_node_bridge.REQUIRE_GPU_RUNTIME_ENV, '1')
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'failed',
+            'fallback_reason': 'CUDA wheel install failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['type'] == 'error'
+    assert 'GPU runtime provisioning failed during desktop launch' in payload['message']
+    assert 'CUDA wheel install failed' in payload['message']
+
+
 def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)

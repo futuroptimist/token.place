@@ -1,4 +1,7 @@
 use crate::backend::ComputeMode;
+use crate::desktop_runtime_bootstrap::{
+    should_provision_gpu_runtime, ENABLE_BOOTSTRAP_ENV, REQUIRE_GPU_RUNTIME_ENV,
+};
 use crate::python_runtime::{resolve_python_launcher, resolve_runtime_import_root, PythonLauncher};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -143,6 +146,13 @@ fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, brid
                 command.env("PYTHONPATH", import_root);
             }
         }
+    }
+}
+
+fn configure_runtime_bootstrap(command: &mut Command, mode: &ComputeMode) {
+    if should_provision_gpu_runtime(mode) {
+        command.env(ENABLE_BOOTSTRAP_ENV, "1");
+        command.env(REQUIRE_GPU_RUNTIME_ENV, "1");
     }
 }
 
@@ -343,6 +353,7 @@ pub async fn start_compute_node(
         }
     };
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    configure_runtime_bootstrap(&mut bridge_command, &request.mode);
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -396,10 +407,10 @@ pub async fn start_compute_node(
             registered: false,
             active_relay_url: request.relay_base_url.clone(),
             requested_mode: format!("{:?}", request.mode).to_lowercase(),
-            effective_mode: "cpu".into(),
+            effective_mode: "pending".into(),
             backend_available: "unknown".into(),
-            backend_selected: "cpu".into(),
-            backend_used: "cpu".into(),
+            backend_selected: "unknown".into(),
+            backend_used: "unknown".into(),
             fallback_reason: None,
             model_path: request.model_path.clone(),
             last_error: None,
@@ -455,12 +466,7 @@ pub async fn start_compute_node(
         let exit_status = running_child.wait().await?;
         let exit_payload = {
             let mut status = state.status.lock().await;
-            finalize_bridge_exit(
-                &mut status,
-                exit_status,
-                saw_startup_event,
-                saw_error_event,
-            )
+            finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
         };
 
         if let Some(payload) = exit_payload {
@@ -660,10 +666,7 @@ mod tests {
             .expect("status last_error should be set");
         assert!(last_error.contains("before emitting a startup event"));
         assert_eq!(payload.get("type").and_then(Value::as_str), Some("error"));
-        assert_eq!(
-            payload.get("running").and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(payload.get("running").and_then(Value::as_bool), Some(false));
         assert_eq!(
             payload.get("registered").and_then(Value::as_bool),
             Some(false)
@@ -734,5 +737,29 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved bridge path");
 
         assert_eq!(Path::new(&resolved), resources_bridge);
+    }
+
+    #[test]
+    fn configure_runtime_bootstrap_sets_desktop_gpu_env_for_hybrid_mode() {
+        let mut command = Command::new("python3");
+        configure_runtime_bootstrap(&mut command, &ComputeMode::Hybrid);
+        let envs: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|value| (k.to_owned(), value.to_owned())))
+            .collect();
+
+        if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(ENABLE_BOOTSTRAP_ENV)),
+                Some(&std::ffi::OsString::from("1"))
+            );
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(REQUIRE_GPU_RUNTIME_ENV)),
+                Some(&std::ffi::OsString::from("1"))
+            );
+        } else {
+            assert!(!envs.contains_key(std::ffi::OsStr::new(ENABLE_BOOTSTRAP_ENV)));
+        }
     }
 }

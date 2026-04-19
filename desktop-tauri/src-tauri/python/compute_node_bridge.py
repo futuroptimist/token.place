@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -40,6 +41,8 @@ ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
+REQUIRE_GPU_RUNTIME_ENV = "TOKEN_PLACE_DESKTOP_REQUIRE_GPU_RUNTIME"
+GPU_MODES = {"auto", "gpu", "hybrid"}
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 
@@ -171,6 +174,28 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    runtime_action = runtime_setup.get("runtime_action", "none")
+    if (
+        os.getenv(REQUIRE_GPU_RUNTIME_ENV) == "1"
+        and str(args.mode).lower() in GPU_MODES
+        and runtime_action != "unavailable"
+    ):
+        selected_backend = runtime_setup.get("selected_backend", "cpu")
+        if runtime_action in {"failed", "installed_cpu_fallback", "probe_only"} or (
+            selected_backend == "cpu"
+        ):
+            fallback_reason = runtime_setup.get("fallback_reason") or "unknown runtime failure"
+            emit(
+                {
+                    "type": "error",
+                    "message": (
+                        "GPU runtime provisioning failed during desktop launch. "
+                        f"action={runtime_action}; reason={fallback_reason}. "
+                        "Switch to CPU mode or repair CUDA-enabled llama-cpp-python."
+                    ),
+                }
+            )
+            return 1
 
     try:
         from utils.compute_node_runtime import (

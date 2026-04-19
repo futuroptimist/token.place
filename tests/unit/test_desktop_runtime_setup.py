@@ -530,6 +530,37 @@ def test_maybe_reexec_for_runtime_refresh_handles_execve_oserror(monkeypatch):
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
 
 
+def test_maybe_reexec_for_runtime_refresh_replaces_directory_argv_with_script_hint(
+    monkeypatch, tmp_path
+):
+    class _DirectoryArgvSysStub:
+        platform = 'win32'
+        executable = sys.executable
+        prefix = sys.prefix
+        argv = [str(tmp_path), '--mode', 'auto']
+
+    script_path = tmp_path / 'compute_node_bridge.py'
+    script_path.write_text('print("ok")\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _DirectoryArgvSysStub)
+    monkeypatch.delenv(desktop_runtime_setup.REEXEC_GUARD_ENV, raising=False)
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_REEXEC_SCRIPT', str(script_path))
+
+    called: dict[str, object] = {}
+
+    def fake_execve(prog, argv, env):
+        called['prog'] = prog
+        called['argv'] = argv
+        called['guard'] = env.get(desktop_runtime_setup.REEXEC_GUARD_ENV)
+
+    monkeypatch.setattr(desktop_runtime_setup.os, 'execve', fake_execve)
+
+    desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
+
+    assert called['prog'] == sys.executable
+    assert called['guard'] == '1'
+    assert called['argv'] == [sys.executable, str(script_path), '--mode', 'auto']
+
+
 def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')

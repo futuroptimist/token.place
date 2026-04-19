@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-19",
+  "slug": "desktop-tauri-runtime-reexec-main-module-launch-failure",
+  "summary": "Desktop-tauri operator startup on Windows could re-exec Python with a directory argv, causing a '__main__' module launch failure and operator exit before relay registration.",
+  "impact": "Users saw Start operator briefly run and then stop with Running=no, Registered=no, and no relay connection on localhost.",
+  "fix": "Added a TOKEN_PLACE_DESKTOP_REEXEC_SCRIPT hint in desktop entrypoints, hardened maybe_reexec_for_runtime_refresh(...) to replace directory argv[0] with the script hint, and added unit + desktop UI e2e regression coverage for post-start stability and __main__ failures.",
+  "lessons": "When process re-exec is part of runtime bootstrap, argv must be validated and normalized; inherited argv values from desktop launchers can be structurally invalid for Python script relaunch."
+}

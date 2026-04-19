@@ -348,10 +348,16 @@ def maybe_reexec_for_runtime_refresh(
         return
     if os.environ.get(REEXEC_GUARD_ENV) == "1":
         return
+    script_hint = os.environ.get("TOKEN_PLACE_DESKTOP_REEXEC_SCRIPT", "").strip()
+    reexec_argv = [sys.executable, *sys.argv]
+    if len(sys.argv) > 0:
+        script_candidate = Path(sys.argv[0]).expanduser()
+        if script_candidate.is_dir() and script_hint and Path(script_hint).is_file():
+            reexec_argv = [sys.executable, script_hint, *sys.argv[1:]]
     env = os.environ.copy()
     env[REEXEC_GUARD_ENV] = "1"
     try:
-        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+        os.execve(sys.executable, reexec_argv, env)
     except OSError:
         return
 

@@ -20,6 +20,7 @@ TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
 WEBDRIVER_URL = "http://127.0.0.1:4444"
 LOGS_DIR = REPO_ROOT / ".desktop-e2e-logs"
 BOOTSTRAP_LOG = LOGS_DIR / "bootstrap.log"
+RUNNING_STABILITY_WINDOW_SECONDS = 25
 
 # Ensure diagnostics artifact directory exists before fragile bootstrap/import steps.
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -523,6 +524,23 @@ def main() -> int:
                 "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
             )
         )
+        time.sleep(RUNNING_STABILITY_WINDOW_SECONDS)
+        running_after_window = driver.find_element(
+            By.XPATH,
+            "//p[contains(.,'Running:')]//strong",
+        ).text
+        registered_after_window = driver.find_element(
+            By.XPATH,
+            "//p[contains(.,'Registered:')]//strong",
+        ).text
+        assert running_after_window.strip().lower() == "yes", (
+            "operator stopped during post-start stability window "
+            f"({RUNNING_STABILITY_WINDOW_SECONDS}s)"
+        )
+        assert registered_after_window.strip().lower() == "yes", (
+            "operator became unregistered during post-start stability window "
+            f"({RUNNING_STABILITY_WINDOW_SECONDS}s)"
+        )
 
         prompt = driver.find_element(
             By.XPATH,
@@ -547,6 +565,9 @@ def main() -> int:
         )
         assert "importerror" not in lowered_last_error, (
             f"Last error still indicates import failure: {last_error_text}"
+        )
+        assert "can't find '__main__' module" not in lowered_last_error, (
+            f"Last error still indicates Python __main__ launch failure: {last_error_text}"
         )
         assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
     except TimeoutException as exc:

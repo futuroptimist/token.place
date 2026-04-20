@@ -3,6 +3,9 @@ import json
 import pytest
 from playwright.sync_api import Page
 import time
+import textwrap
+
+from encrypt import encrypt
 
 # This test now implicitly uses the `setup_servers` and `page` fixtures
 # defined in tests/conftest.py
@@ -164,12 +167,23 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         assert isinstance(request_json.get("client_public_key"), str) and request_json[
             "client_public_key"
         ]
-        assert isinstance(request_json.get("messages"), dict)
 
-        route.fulfill(
-            status=200,
-            headers={"Content-Type": "application/json"},
-            body=json.dumps(
+        encrypted_request = request_json.get("messages")
+        assert isinstance(encrypted_request, dict)
+        assert isinstance(encrypted_request.get("ciphertext"), str) and encrypted_request["ciphertext"]
+        assert isinstance(encrypted_request.get("cipherkey"), str) and encrypted_request["cipherkey"]
+        assert isinstance(encrypted_request.get("iv"), str) and encrypted_request["iv"]
+
+        client_public_key_pem = "\n".join(
+            [
+                "-----BEGIN PUBLIC KEY-----",
+                *textwrap.wrap(request_json["client_public_key"], 64),
+                "-----END PUBLIC KEY-----",
+            ]
+        ).encode("utf-8")
+
+        encrypted_response_body, encrypted_key, iv = encrypt(
+            json.dumps(
                 {
                     "choices": [
                         {
@@ -179,6 +193,23 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
                             }
                         }
                     ]
+                }
+            ).encode("utf-8"),
+            client_public_key_pem,
+            use_pkcs1v15=True,
+        )
+
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "encrypted": True,
+                    "data": {
+                        "ciphertext": base64.b64encode(encrypted_response_body["ciphertext"]).decode("utf-8"),
+                        "cipherkey": base64.b64encode(encrypted_key).decode("utf-8"),
+                        "iv": base64.b64encode(iv).decode("utf-8"),
+                    },
                 }
             ),
         )

@@ -56,6 +56,19 @@ make k8s-deploy    # deploy manifests
 
 ## Development Workflow
 
+### API boundary guardrail (v0.1.0)
+
+For the current rollout phase, **API v1 must be fully stabilized before relay-path API v2 work**.
+
+- Keep desktop-tauri app network/API traffic on **API v1 only**.
+- Keep `relay.py`, relay landing-page chat (`static/index.html` + `static/chat.js`),
+  and `server.py` on **API v1 only**.
+- Do **not** add relay-path `stream=true` behavior in `v0.1.0`; relay-path streaming is
+  a non-goal for this phase.
+- API v2 enablement for relay-path traffic is deferred until after API v1 launches on sugarkube.
+- Desktop local prompt smoke tests may still use local `llama_cpp_python` streaming, because
+  that path is local-only and not relay/API traffic.
+
 ### Running the server
 
 ```bash

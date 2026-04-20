@@ -1,8 +1,8 @@
 {
   "date": "2026-04-20",
   "slug": "relay-landing-chat-api-v1-key-format-regression",
-  "summary": "Relay landing-page chat at / regressed after API v1 key-format migration because static/chat.js consumed public_key as direct PEM while the API returned Base64-encoded PEM bytes, causing browser encryption bootstrap to fail and chat completions to fall back to generic error messaging.",
+  "summary": "Relay landing-page chat at / regressed after API v1 key-format migration because static/chat.js consumed public_key as direct PEM while the API returned Base64-encoded PEM bytes; a first patch normalized keys but incorrectly kept relay-path /api/v2 streaming-first behavior before /api/v1.",
   "impact": "Users running local relay mode could not complete end-to-end landing-page chat conversations, blocking validation of the primary browser chat journey.",
-  "fix": "Normalized API public keys in static/chat.js to support both direct PEM and Base64-encoded PEM, and added an e2e regression that validates successful landing-page response rendering through v1 fallback when v2 streaming fails.",
-  "lessons": "Browser crypto bootstrapping must enforce explicit key-format normalization and regression tests should include key-format compatibility plus v2->v1 chat fallback coverage."
+  "fix": "Normalized API public keys in static/chat.js, removed relay-path /api/v2 streaming attempts from landing chat send flow, and enforced API v1-only non-streaming relay chat coverage in e2e/unit tests.",
+  "lessons": "Browser crypto bootstrapping must enforce explicit key-format normalization, and relay-path chat tests/docs must lock in API v1-only non-streaming behavior until API v1 launch on sugarkube is complete."
 }

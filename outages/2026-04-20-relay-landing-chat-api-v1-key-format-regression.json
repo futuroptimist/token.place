@@ -1,8 +1,8 @@
 {
   "date": "2026-04-20",
   "slug": "relay-landing-chat-api-v1-key-format-regression",
-  "summary": "Relay landing-page chat at / regressed after API v1 key-format migration because static/chat.js consumed public_key as direct PEM while the API returned Base64-encoded PEM bytes, causing browser encryption bootstrap to fail and chat completions to fall back to generic error messaging.",
-  "impact": "Users running local relay mode could not complete end-to-end landing-page chat conversations, blocking validation of the primary browser chat journey.",
-  "fix": "Normalized API public keys in static/chat.js to support both direct PEM and Base64-encoded PEM, and added an e2e regression that validates successful landing-page response rendering through v1 fallback when v2 streaming fails.",
-  "lessons": "Browser crypto bootstrapping must enforce explicit key-format normalization and regression tests should include key-format compatibility plus v2->v1 chat fallback coverage."
+  "summary": "The first fix corrected server public-key normalization but left relay landing chat on a v2-streaming-first browser path and did not normalize API v1 response encryption input for browser-formatted client_public_key values.",
+  "impact": "Relay landing-page chat still produced no real assistant response in local relay mode; browser logs showed v2 streaming noise and API v1 returned 500 Failed to encrypt response.",
+  "fix": "Forced relay landing chat to API v1-only non-streaming behavior, normalized API v1 client_public_key values into PEM before encryption, and added regressions that fail if relay landing chat reintroduces v2/streaming dependencies.",
+  "lessons": "Fixes must align with architecture boundaries (v0.1.0 relay path is API v1-only, non-streaming) and browser key-format contracts must be verified end-to-end for encrypted responses."
 }

@@ -5,6 +5,7 @@ Encryption manager for token.place API v1
 import json
 import base64
 import logging
+import textwrap
 from typing import Dict, Any, Union, Optional
 
 from encrypt import generate_keys, encrypt, decrypt
@@ -16,6 +17,38 @@ except ImportError:
     RSA_KEY_SIZE = 2048
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_client_public_key_bytes(client_public_key: Union[str, bytes]) -> bytes:
+    """Normalize client public key input to PEM bytes accepted by ``encrypt.encrypt``."""
+
+    if isinstance(client_public_key, bytes):
+        key_bytes = client_public_key
+    else:
+        cleaned = client_public_key.strip()
+        if "-----BEGIN" in cleaned:
+            return cleaned.encode("utf-8")
+
+        decoded = base64.b64decode(cleaned)
+        if b"-----BEGIN" in decoded:
+            return decoded
+
+        der_b64 = base64.b64encode(decoded).decode("ascii")
+        lines = textwrap.wrap(der_b64, 64)
+        pem = "\n".join(
+            ["-----BEGIN PUBLIC KEY-----", *lines, "-----END PUBLIC KEY-----", ""]
+        )
+        return pem.encode("utf-8")
+
+    if b"-----BEGIN" in key_bytes:
+        return key_bytes
+
+    der_b64 = base64.b64encode(bytes(key_bytes)).decode("ascii")
+    lines = textwrap.wrap(der_b64, 64)
+    pem = "\n".join(
+        ["-----BEGIN PUBLIC KEY-----", *lines, "-----END PUBLIC KEY-----", ""]
+    )
+    return pem.encode("utf-8")
 
 
 class EncryptionManager:
@@ -50,12 +83,10 @@ class EncryptionManager:
             # Convert data to JSON
             json_data = json.dumps(data).encode('utf-8')
 
-            # Make sure client_public_key is bytes
-            if isinstance(client_public_key, str):
-                client_public_key = base64.b64decode(client_public_key)
+            normalized_client_public_key = _normalize_client_public_key_bytes(client_public_key)
 
             # Encrypt the data
-            ciphertext_dict, cipherkey, iv = encrypt(json_data, client_public_key)
+            ciphertext_dict, cipherkey, iv = encrypt(json_data, normalized_client_public_key)
 
             # Encode to base64 for JSON
             ciphertext_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')

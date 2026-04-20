@@ -599,8 +599,8 @@ new Vue({
 
         // Send a message to the server using the new API
         async sendMessageApi() {
-            if (!this.serverPublicKey) {
-                console.error('Server public key not available');
+            if (!this.serverPublicKey || !this.clientPublicKey) {
+                console.error('Server/client public keys are not available');
                 return null;
             }
 
@@ -1127,13 +1127,7 @@ new Vue({
             });
 
             try {
-                const historySnapshot = this.chatHistory.slice();
-                const streamed = await this.sendStreamingMessage(historySnapshot);
-                if (streamed) {
-                    return;
-                }
-
-                // Send the message via the API
+                // Relay landing-page chat is API v1-only and non-streaming for v0.1.0.
                 let response = await this.sendMessageApi();
 
                 // Process the response

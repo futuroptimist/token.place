@@ -43,6 +43,32 @@ new Vue({
                 this.isTouchInput = false;
             }
         },
+        normalizeServerPublicKey(rawKey) {
+            if (typeof rawKey !== 'string') {
+                return null;
+            }
+
+            const trimmed = rawKey.trim();
+            if (!trimmed) {
+                return null;
+            }
+
+            if (trimmed.includes('-----BEGIN')) {
+                return trimmed;
+            }
+
+            try {
+                const decoded = atob(trimmed).trim();
+                if (decoded.includes('-----BEGIN')) {
+                    return decoded;
+                }
+            } catch (error) {
+                console.warn('Server public key is not Base64-encoded PEM:', error);
+            }
+
+            return null;
+        },
+
         getServerPublicKey() {
             // Fetch the server's public key from the API
             return fetch('/api/v1/public-key')
@@ -53,8 +79,9 @@ new Vue({
                     throw new Error('Failed to fetch server public key');
                 })
                 .then(data => {
-                    if (data && data.public_key) {
-                        this.serverPublicKey = data.public_key;
+                    const normalizedKey = this.normalizeServerPublicKey(data && data.public_key);
+                    if (normalizedKey) {
+                        this.serverPublicKey = normalizedKey;
                     } else {
                         console.error('Unexpected server public key format:', data);
                     }

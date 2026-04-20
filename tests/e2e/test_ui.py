@@ -1,3 +1,4 @@
+import base64
 import json
 import pytest
 from playwright.sync_api import Page
@@ -123,3 +124,77 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
 
     # Ensure raw HTML isn't rendered unsanitized
     assert assistant_message.locator("script").count() == 0
+
+
+def test_landing_chat_accepts_base64_public_key_and_falls_back_to_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Landing chat should accept API v1 Base64 keys and still render a reply."""
+
+    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+
+    def handle_public_key(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": server_public_key_b64}),
+        )
+
+    def handle_stream_fail(route):
+        route.fulfill(
+            status=500,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": {"message": "stream unavailable"}}),
+        )
+
+    def handle_v1_chat(route):
+        request_json = route.request.post_data_json
+        assert request_json.get("encrypted") is True
+        assert isinstance(request_json.get("client_public_key"), str) and request_json[
+            "client_public_key"
+        ]
+        assert isinstance(request_json.get("messages"), dict)
+
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Relay chat path restored.",
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    page.route("**/api/v1/public-key", handle_public_key)
+    page.route("**/api/v2/chat/completions", handle_stream_fail)
+    page.route("**/api/v1/chat/completions", handle_v1_chat)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("hello")
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "Relay chat path restored." in assistant_message.inner_text()
+    assert "Sorry, I encountered an issue generating a response." not in page.content()

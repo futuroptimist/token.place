@@ -2,6 +2,20 @@
 
 Thank you for your interest in contributing to token.place! This document provides guidelines and instructions to help you get started with development.
 
+## API rollout boundary (v0.1.0)
+
+> **Do not miss this:** token.place is API v1-first right now. API v2 is not launch-ready yet.
+
+Until API v1 is fully launched on sugarkube, the following must stay **API v1-only**:
+- desktop-tauri network/API calls,
+- `relay.py`,
+- relay landing-page chat UI (`static/index.html` + `static/chat.js`),
+- `server.py` API traffic.
+
+For relay-path traffic in `v0.1.0`, streaming is a non-goal. Do not implement v2/SSE relay-path
+chat as a primary path or fallback chain. Desktop local prompt smoke-test streaming via local
+`llama_cpp_python` is still allowed because it is local-only and not relay/API traffic.
+
 ## Development Environment Setup
 
 ### Prerequisites

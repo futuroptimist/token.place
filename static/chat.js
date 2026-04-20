@@ -167,12 +167,11 @@ new Vue({
             }
         },
 
-        // Extract the Base64 content from PEM format
-        extractBase64(pemString) {
-            return pemString
-                .replace(/-----BEGIN.*?-----/, '')
-                .replace(/-----END.*?-----/, '')
-                .replace(/\s/g, '');
+        encodeClientPublicKeyForApi() {
+            if (typeof this.clientPublicKey !== 'string' || !this.clientPublicKey.trim()) {
+                throw new Error('Client public key is unavailable');
+            }
+            return btoa(this.clientPublicKey);
         },
 
         escapeHtml(value) {
@@ -619,7 +618,7 @@ new Vue({
                 const payload = {
                     model: "llama-3-8b-instruct",
                     encrypted: true,
-                    client_public_key: this.extractBase64(this.clientPublicKey),
+                    client_public_key: this.encodeClientPublicKeyForApi(),
                     messages: encryptedData
                 };
 
@@ -900,7 +899,7 @@ new Vue({
                     model: 'llama-3-8b-instruct',
                     encrypted: true,
                     stream: true,
-                    client_public_key: this.extractBase64(this.clientPublicKey),
+                    client_public_key: this.encodeClientPublicKeyForApi(),
                     messages: encryptedHistory
                 };
 
@@ -1127,13 +1126,7 @@ new Vue({
             });
 
             try {
-                const historySnapshot = this.chatHistory.slice();
-                const streamed = await this.sendStreamingMessage(historySnapshot);
-                if (streamed) {
-                    return;
-                }
-
-                // Send the message via the API
+                // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
                 let response = await this.sendMessageApi();
 
                 // Process the response

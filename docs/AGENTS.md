@@ -33,8 +33,19 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 - Treat repository-root `server.py` as the canonical compute-node entrypoint.
 - Keep `server/server_app.py` as compatibility-only shim behavior.
 - Keep sugarkube/k3s scope relay-only (`relay.py`) in short-to-medium-term planning.
-- Keep desktop/server parity work on the legacy relay sink/source contract until explicitly
-  approved API v1 distributed migration phase.
+
+### API boundary for `v0.1.0` (must-follow)
+
+- API v2 is deferred until **after** API v1 is fully launched on sugarkube.
+- Until that launch happens, the following traffic must be **API v1-only**:
+  - desktop-tauri network/API calls,
+  - `relay.py`,
+  - relay landing-page chat UI served by `relay.py` (`static/index.html` + `static/chat.js`),
+  - `server.py` API traffic.
+- Relay-path traffic in `v0.1.0` is **non-streaming by design**. Do not add v2 or SSE paths for
+  the landing-page relay chat flow.
+- Desktop prompt smoke tests may still use local `llama_cpp_python` streaming because that path is
+  local-only and not relay/API traffic.
 
 ## Documentation
 

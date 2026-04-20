@@ -316,3 +316,21 @@ def test_compute_node_runtime_stop_delegates_to_relay_client():
 
     runtime.stop()
     relay_client.stop.assert_called_once_with()
+
+
+def test_compute_node_runtime_stop_is_best_effort_when_relay_stop_fails():
+    relay_client = MagicMock()
+    relay_client.stop.side_effect = RuntimeError("shutdown failure")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    runtime.stop()
+    relay_client.stop.assert_called_once_with()

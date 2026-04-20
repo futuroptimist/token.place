@@ -121,3 +121,61 @@ def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch
     finally:
         for name in MODULES_TO_CLEAR:
             sys.modules.pop(name, None)
+
+
+def test_unregister_requires_registration_token(relay_module) -> None:
+    """/unregister should enforce token auth parity with /sink and /source."""
+
+    relay_module.known_servers.clear()
+    client = relay_module.app.test_client()
+
+    client.post(
+        "/sink",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert "abc" in relay_module.known_servers
+
+    unauthorised = client.post("/unregister", json={"server_public_key": "abc"})
+    assert unauthorised.status_code == 401
+    assert "abc" in relay_module.known_servers
+
+    authorised = client.post(
+        "/unregister",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert authorised.status_code == 200
+    assert authorised.get_json()["removed"] is True
+    assert "abc" not in relay_module.known_servers
+
+
+def test_unregister_removes_server_and_diagnostics_immediately(relay_module) -> None:
+    """Relay diagnostics should no longer list a server right after /unregister."""
+
+    relay_module.known_servers.clear()
+    relay_module.client_inference_requests.clear()
+    client = relay_module.app.test_client()
+    headers = {"X-Relay-Server-Token": "unit-token"}
+
+    server_key = "server-a"
+    client.post("/sink", json={"server_public_key": server_key}, headers=headers)
+    relay_module.client_inference_requests[server_key] = [{"chat_history": "queued"}]
+
+    before = client.get("/relay/diagnostics")
+    before_payload = before.get_json()
+    assert before_payload["total_registered_compute_nodes"] == 1
+
+    response = client.post(
+        "/unregister",
+        json={"server_public_key": server_key},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.get_json()["removed"] is True
+    assert relay_module.client_inference_requests.get(server_key) is None
+
+    after = client.get("/relay/diagnostics")
+    after_payload = after.get_json()
+    assert after_payload["registered_compute_nodes"] == []
+    assert after_payload["total_registered_compute_nodes"] == 0

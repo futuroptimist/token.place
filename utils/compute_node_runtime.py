@@ -284,5 +284,7 @@ class ComputeNodeRuntime:
 
     def stop(self) -> None:
         """Stop relay polling and network activity."""
-
-        self.relay_client.stop()
+        try:
+            self.relay_client.stop()
+        except Exception:
+            _log_error("Failed to stop relay client cleanly", exc_info=True)

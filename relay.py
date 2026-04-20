@@ -389,9 +389,32 @@ def _evict_stale_servers() -> list[str]:
     for server_public_key, payload in list(known_servers.items()):
         if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
             continue
-        known_servers.pop(server_public_key, None)
+        _remove_server_state(server_public_key)
         evicted.append(server_public_key)
     return evicted
+
+
+def _remove_server_state(server_public_key: str) -> bool:
+    """Remove relay state for a compute node key and return whether it was known."""
+
+    removed = known_servers.pop(server_public_key, None) is not None
+    client_inference_requests.pop(server_public_key, None)
+
+    with stream_lock:
+        stale_sessions = [
+            session_id
+            for session_id, session in streaming_sessions.items()
+            if session.get("server_public_key") == server_public_key
+        ]
+        for session_id in stale_sessions:
+            session = streaming_sessions.pop(session_id, None)
+            if not session:
+                continue
+            client_public_key = session.get("client_public_key")
+            if client_public_key:
+                streaming_sessions_by_client.pop(client_public_key, None)
+
+    return removed
 
 
 def _live_server_diagnostics() -> list[dict[str, Any]]:
@@ -811,6 +834,30 @@ def source():
         'iv': iv
     }
     return jsonify({'message': 'Response received and queued for client'}), 200
+
+
+@app.route('/unregister', methods=['POST'])
+def unregister():
+    """Remove a compute node registration and per-node queueing state."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    server_public_key = data.get('server_public_key')
+    if not server_public_key:
+        return jsonify({'error': 'Invalid public key'}), 400
+
+    removed = _remove_server_state(server_public_key)
+    return jsonify({
+        'message': 'Server unregistered' if removed else 'Server not registered',
+        'server_public_key': server_public_key,
+        'removed': removed,
+    }), 200
 
 
 @app.route('/stream/source', methods=['POST'])

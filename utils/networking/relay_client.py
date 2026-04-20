@@ -435,9 +435,51 @@ class RelayClient:
         self.stop_polling = False
 
     def stop(self):
-        """Stop the polling loop by setting stop_polling to True"""
+        """Stop polling and best-effort unregister this compute node."""
         log_info("Stopping relay polling")
         self.stop_polling = True
+        try:
+            self.unregister_from_relay()
+        except Exception as exc:  # pragma: no cover - defensive shutdown guard
+            log_error("Unexpected unregister failure during shutdown: {}", str(exc), exc_info=True)
+
+    def unregister_from_relay(self) -> bool:
+        """Best-effort removal of this compute node from relay registration state."""
+
+        public_key = getattr(self.crypto_manager, "public_key_b64", None)
+        if not public_key:
+            log_error("Skipping relay unregister because compute-node public key is missing")
+            return False
+
+        relay_indexes = [self._active_relay_index]
+        relay_indexes.extend(
+            index for index in range(len(self._relay_urls)) if index != self._active_relay_index
+        )
+
+        headers = self._auth_headers()
+        for index in relay_indexes:
+            relay_url = self._relay_urls[index]
+            try:
+                request_kwargs = {
+                    "json": {"server_public_key": public_key},
+                    "timeout": self._request_timeout,
+                }
+                if headers:
+                    request_kwargs["headers"] = headers
+                response = requests.post(f"{relay_url}/unregister", **request_kwargs)
+                if response.status_code == 200:
+                    self._active_relay_index = index
+                    log_info("Successfully unregistered compute node from relay {}", relay_url)
+                    return True
+                log_error(
+                    "Relay unregister failed at {} with status {}",
+                    relay_url,
+                    response.status_code,
+                )
+            except requests.RequestException as exc:
+                log_error("Relay unregister request failed at {}: {}", relay_url, str(exc), exc_info=True)
+
+        return False
 
     def ping_relay(self) -> Dict[str, Any]:
         """

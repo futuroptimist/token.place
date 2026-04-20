@@ -153,6 +153,13 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
             body=json.dumps({"public_key": server_public_key_b64}),
         )
 
+    def handle_next_server(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"server_public_key": server_public_key_b64}),
+        )
+
     def handle_v1_chat(route):
         request_json = route.request.post_data_json
         assert request_json.get("encrypted") is True
@@ -208,6 +215,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         route.fulfill(status=500, body="v2 should not be called")
 
     page.route("**/api/v1/public-key", handle_public_key)
+    page.route("**/next_server", handle_next_server)
     page.route("**/api/v2/chat/completions", record_v2_request)
     page.route("**/api/v1/chat/completions", handle_v1_chat)
 

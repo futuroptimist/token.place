@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-20",
+  "slug": "relay-landing-page-chat-api-v1-regression",
+  "summary": "Relay landing-page chat regressed after API v1 migration because encrypted response session keys were wrapped with OAEP while the browser client expected PKCS#1 v1.5, causing client-side decrypt failures and generic assistant error fallbacks.",
+  "impact": "Users could no longer complete a real chat message/response flow from the relay landing page at / in local v0.1.0 mode.",
+  "fix": "Switched API encrypted response key wrapping and v2 encrypted streaming first-chunk key wrapping to PKCS#1 v1.5 compatibility mode for browser clients, and added regression tests that verify PKCS#1 v1.5 decryptability of returned session keys.",
+  "lessons": "Browser crypto compatibility (padding mode) must be validated end-to-end whenever encryption helpers change, especially for landing-page chat paths that rely on JSEncrypt."
+}

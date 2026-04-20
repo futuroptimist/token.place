@@ -5,6 +5,8 @@ from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 
 from relay import app as relay_app
 from api.v1 import routes as v1_routes
@@ -191,6 +193,12 @@ def test_v2_encrypted_streaming_emits_encrypted_chunks(client, monkeypatch):
         if index == 0:
             assert "cipherkey" in payload_body
             encrypted_key_bytes = base64.b64decode(payload_body["cipherkey"])
+            private_key = serialization.load_pem_private_key(client_private_key, password=None)
+            decrypted_session_key_b64 = private_key.decrypt(
+                encrypted_key_bytes,
+                asymmetric_padding.PKCS1v15(),
+            )
+            assert isinstance(base64.b64decode(decrypted_session_key_b64), bytes)
         else:
             assert "cipherkey" not in payload_body
             encrypted_key_bytes = None

@@ -680,6 +680,7 @@ def create_chat_completion():
                                     plaintext_bytes,
                                     client_public_key_bytes,
                                     session=stream_session,
+                                    use_pkcs1v15=True,
                                 )
                             except Exception:
                                 log_error("Failed to encrypt streaming chunk", exc_info=True)

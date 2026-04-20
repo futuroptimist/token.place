@@ -8,6 +8,8 @@ import importlib
 import inspect
 from unittest.mock import MagicMock, patch
 from encrypt import encrypt, decrypt, generate_keys, decrypt_stream_chunk
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 import sys
 import os
 
@@ -1130,6 +1132,62 @@ def test_chat_completion_unexpected_exception(client, monkeypatch):
     resp = client.post('/api/v1/chat/completions', json=payload)
     assert resp.status_code == 500
     assert 'Internal server error' in resp.get_json()['error']['message']
+
+
+def test_v1_encrypted_response_uses_pkcs1v15_cipherkey_for_browser_compat(client, monkeypatch):
+    """Encrypted API responses should use PKCS#1 v1.5 RSA wrapping for landing-page compatibility."""
+
+    class _Provider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            assert model_id == "llama-3-8b-instruct"
+            assert messages[-1]["content"] == "hello"
+            return {"role": "assistant", "content": "hi from compute"}
+
+    monkeypatch.setattr("api.v1.routes.get_api_v1_compute_provider", lambda: _Provider())
+
+    server_key_response = client.get("/api/v1/public-key")
+    assert server_key_response.status_code == 200
+    server_public_key = base64.b64decode(server_key_response.get_json()["public_key"])
+
+    client_private_key, client_public_key = generate_keys()
+    encrypted_messages, encrypted_key, iv = encrypt(
+        json.dumps([{"role": "user", "content": "hello"}]).encode("utf-8"),
+        server_public_key,
+        use_pkcs1v15=True,
+    )
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "encrypted": True,
+        "client_public_key": base64.b64encode(client_public_key).decode("ascii"),
+        "messages": {
+            "ciphertext": base64.b64encode(encrypted_messages["ciphertext"]).decode("ascii"),
+            "cipherkey": base64.b64encode(encrypted_key).decode("ascii"),
+            "iv": base64.b64encode(iv).decode("ascii"),
+        },
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["encrypted"] is True
+
+    encrypted_response = body["data"]
+    cipherkey_bytes = base64.b64decode(encrypted_response["cipherkey"])
+    private_key = serialization.load_pem_private_key(client_private_key, password=None)
+    decrypted_session_key_b64 = private_key.decrypt(cipherkey_bytes, asymmetric_padding.PKCS1v15())
+    assert isinstance(base64.b64decode(decrypted_session_key_b64), bytes)
+
+    decrypted_body = decrypt(
+        {
+            "ciphertext": base64.b64decode(encrypted_response["ciphertext"]),
+            "iv": base64.b64decode(encrypted_response["iv"]),
+        },
+        cipherkey_bytes,
+        client_private_key,
+    )
+    parsed = json.loads(decrypted_body.decode("utf-8"))
+    assert parsed["choices"][0]["message"]["content"] == "hi from compute"
 
 
 def test_completions_invalid_body(client):

@@ -123,3 +123,22 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
 
     # Ensure raw HTML isn't rendered unsanitized
     assert assistant_message.locator("script").count() == 0
+
+
+def test_landing_page_chat_round_trip_with_local_api_v1_stack(page: Page, base_url: str, setup_servers):
+    """The relay landing page should send a prompt and render a real assistant reply."""
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("Say hello from the landing page")
+    page.locator("button", has_text="Send").click()
+
+    assistant_messages = page.locator(".assistant-message")
+    assistant_messages.last.wait_for(state="visible", timeout=30000)
+
+    assistant_text = assistant_messages.last.inner_text().strip()
+    assert assistant_text
+    assert "Sorry, I encountered an issue generating a response" not in assistant_text
+    assert "Sorry, an error occurred while sending your message" not in assistant_text

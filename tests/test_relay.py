@@ -53,6 +53,25 @@ def test_inference_endpoint_removed(client):
     response = client.post("/inference", json={})
     assert response.status_code == 404
 
+
+def test_root_page_includes_relay_only_localhost_notice(client):
+    """Relay root should explain relay-only localhost mode instead of a broken chat promise."""
+    response = client.get("/")
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Chat demo is unavailable in relay-only localhost mode" in body
+    assert "/relay/diagnostics" in body
+    assert "/sink" in body
+
+
+def test_chat_js_contains_relay_only_localhost_detection(client):
+    """Client script should detect relay-only localhost mode and fail closed."""
+    response = client.get("/static/chat.js")
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "detectRelayOnlyLocalMode" in body
+    assert "isRelayOnlyLocalMode" in body
+
 # --- Test /next_server ---
 
 def test_next_server_no_servers(client):

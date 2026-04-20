@@ -8,11 +8,19 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        activeStreamController: null
+        activeStreamController: null,
+        isRelayOnlyLocalMode: false
     },
-    mounted() {
+    async mounted() {
         this.detectTouchInput();
-        this.getServerPublicKey().then(() => {
+        await this.detectRelayOnlyLocalMode();
+        if (this.isRelayOnlyLocalMode) {
+            return;
+        }
+        this.getServerPublicKey().then((loaded) => {
+            if (!loaded) {
+                return;
+            }
             this.generateClientKeys();
         });
         this.$nextTick(() => {
@@ -20,6 +28,39 @@ new Vue({
         });
     },
     methods: {
+        isLocalhostRuntime() {
+            if (typeof window === 'undefined' || !window.location) {
+                return false;
+            }
+            const hostname = window.location.hostname;
+            return hostname === 'localhost'
+                || hostname === '127.0.0.1'
+                || hostname === '::1';
+        },
+        async detectRelayOnlyLocalMode() {
+            if (!this.isLocalhostRuntime()) {
+                return;
+            }
+
+            const requestOptions = {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+                cache: 'no-store'
+            };
+
+            try {
+                const [publicKeyResponse, relayDiagnosticsResponse] = await Promise.all([
+                    fetch('/api/v1/public-key', requestOptions),
+                    fetch('/relay/diagnostics', requestOptions)
+                ]);
+
+                const missingPublicKeyApi = publicKeyResponse.status === 404;
+                const relayDiagnosticsAvailable = relayDiagnosticsResponse.ok;
+                this.isRelayOnlyLocalMode = missingPublicKeyApi && relayDiagnosticsAvailable;
+            } catch (error) {
+                console.warn('Unable to detect relay-only localhost mode:', error);
+            }
+        },
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -55,12 +96,15 @@ new Vue({
                 .then(data => {
                     if (data && data.public_key) {
                         this.serverPublicKey = data.public_key;
+                        return true;
                     } else {
                         console.error('Unexpected server public key format:', data);
+                        return false;
                     }
                 })
                 .catch(error => {
                     console.error('Error fetching server public key:', error);
+                    return false;
                 });
         },
         generateClientKeys() {
@@ -1087,6 +1131,9 @@ new Vue({
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
+            if (this.isRelayOnlyLocalMode) {
+                return;
+            }
             if (!messageContent || !this.serverPublicKey || this.isGeneratingResponse) {
                 return;
             }

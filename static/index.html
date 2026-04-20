@@ -306,6 +306,29 @@
         body.light-mode .api-endpoint {
             border-left-color: #007bff;
         }
+
+        .relay-mode-notice {
+            border: 1px solid #3a3a3a;
+            border-radius: 12px;
+            padding: 16px;
+            background-color: #1b1b1b;
+            margin-bottom: 16px;
+        }
+
+        .relay-mode-notice h3 {
+            margin-top: 0;
+        }
+
+        .relay-mode-notice ul {
+            margin-top: 12px;
+            margin-bottom: 0;
+            padding-left: 20px;
+        }
+
+        body.light-mode .relay-mode-notice {
+            background-color: #f8f9fa;
+            border-color: #d0d7de;
+        }
     </style>
 </head>
 <body class="dark-mode">
@@ -316,7 +339,19 @@
         <hr>
 
         <h2>Try it out:</h2>
-        <div class="chat-container" v-cloak>
+        <div v-if="isRelayOnlyLocalMode" class="relay-mode-notice" v-cloak>
+            <h3>Chat demo is unavailable in relay-only localhost mode</h3>
+            <p>
+                This relay root is online, but browser chat testing is not wired in this mode.
+                Use the links below to verify relay health and registration instead.
+            </p>
+            <ul>
+                <li><strong>Relay status:</strong> <a href="/relay/diagnostics" target="_blank" rel="noopener noreferrer">/relay/diagnostics</a></li>
+                <li><strong>Compute registration:</strong> POST heartbeats to <code>/sink</code></li>
+                <li><strong>Local chat smoke tests:</strong> use the desktop app</li>
+            </ul>
+        </div>
+        <div v-else class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>

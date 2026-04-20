@@ -666,6 +666,55 @@ mod tests {
         drop(lifecycle_guard);
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_stops_running_child_with_cancel_message() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let observed_cancel_path = temp.path().join("observed-cancel.json");
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; [ \"$line\" = '{\"type\":\"cancel\"}' ]",
+                "sh",
+                observed_cancel_path
+                    .to_str()
+                    .expect("cancel path should be valid UTF-8"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cancel observer bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+        }
+
+        let stop_result =
+            tokio::time::timeout(Duration::from_secs(2), stop_compute_node(state.clone())).await;
+        assert!(stop_result.is_ok(), "stop should complete without hanging");
+        stop_result
+            .expect("timeout result")
+            .expect("stop should succeed");
+
+        let observed_cancel = std::fs::read_to_string(&observed_cancel_path)
+            .expect("cancel message should be recorded");
+        assert_eq!(observed_cancel, "{\"type\":\"cancel\"}");
+        assert!(state.child.lock().await.is_none(), "child handle should be cleared");
+        assert!(state.stdin.lock().await.is_none(), "stdin handle should be cleared");
+
+        let final_status = state.status.lock().await.clone();
+        assert!(!final_status.running);
+        assert!(!final_status.registered);
+    }
+
     #[test]
     fn startup_failure_status_records_resolver_error_and_not_running() {
         let request = ComputeNodeRequest {

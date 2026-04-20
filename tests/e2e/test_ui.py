@@ -1,7 +1,11 @@
+import base64
 import json
 import pytest
 from playwright.sync_api import Page
 import time
+import textwrap
+
+from encrypt import encrypt
 
 # This test now implicitly uses the `setup_servers` and `page` fixtures
 # defined in tests/conftest.py
@@ -123,3 +127,116 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
 
     # Ensure raw HTML isn't rendered unsanitized
     assert assistant_message.locator("script").count() == 0
+
+
+def test_landing_chat_accepts_base64_public_key_and_falls_back_to_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Landing chat should accept API v1 Base64 keys and still render a reply."""
+
+    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+
+    def handle_public_key(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": server_public_key_b64}),
+        )
+
+    def handle_stream_fail(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": {"message": "stream unavailable"}}),
+        )
+
+    def handle_v1_chat(route):
+        request_json = route.request.post_data_json
+        assert request_json.get("encrypted") is True
+        assert isinstance(request_json.get("client_public_key"), str) and request_json[
+            "client_public_key"
+        ]
+
+        encrypted_request = request_json.get("messages")
+        assert isinstance(encrypted_request, dict)
+        assert isinstance(encrypted_request.get("ciphertext"), str) and encrypted_request["ciphertext"]
+        assert isinstance(encrypted_request.get("cipherkey"), str) and encrypted_request["cipherkey"]
+        assert isinstance(encrypted_request.get("iv"), str) and encrypted_request["iv"]
+
+        client_public_key_pem = "\n".join(
+            [
+                "-----BEGIN PUBLIC KEY-----",
+                *textwrap.wrap(request_json["client_public_key"], 64),
+                "-----END PUBLIC KEY-----",
+            ]
+        ).encode("utf-8")
+
+        encrypted_response_body, encrypted_key, iv = encrypt(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Relay chat path restored.",
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8"),
+            client_public_key_pem,
+            use_pkcs1v15=True,
+        )
+
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "encrypted": True,
+                    "data": {
+                        "ciphertext": base64.b64encode(encrypted_response_body["ciphertext"]).decode("utf-8"),
+                        "cipherkey": base64.b64encode(encrypted_key).decode("utf-8"),
+                        "iv": base64.b64encode(iv).decode("utf-8"),
+                    },
+                }
+            ),
+        )
+
+    page.route("**/api/v1/public-key", handle_public_key)
+    page.route("**/api/v2/chat/completions", handle_stream_fail)
+    page.route("**/api/v1/chat/completions", handle_v1_chat)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("hello")
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    page.wait_for_function(
+        """
+        ({ selector, expectedText }) => {
+            const nodes = document.querySelectorAll(selector);
+            if (!nodes.length) return false;
+            const latest = nodes[nodes.length - 1];
+            return latest.textContent.includes(expectedText);
+        }
+        """,
+        arg={"selector": ".assistant-message", "expectedText": "Relay chat path restored."},
+    )
+    assert "Relay chat path restored." in assistant_message.inner_text()
+    assert "Sorry, I encountered an issue generating a response." not in page.content()

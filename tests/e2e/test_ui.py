@@ -1,3 +1,4 @@
+import base64
 import json
 import pytest
 from playwright.sync_api import Page
@@ -69,6 +70,61 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
     # Verify app has initialized
     assert page.locator("#app").count() > 0, "Vue app should be initialized"
     print("✓ Vue app initialization verified")
+
+
+def test_send_message_with_base64_public_key(page: Page, base_url: str, setup_servers):
+    """Landing page chat should work when API v1 returns a base64-encoded public key."""
+
+    public_key_pem = """-----BEGIN PUBLIC KEY-----
+MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBANfdlv9h2X4xVZW7eo87nxP8E1TqYQf7
+FRwqjJH8Vbo0YX5xTL6qv4d4pClwK8X+6I9BJ2R8Bf4S8vQhF8gZKwkCAwEAAQ==
+-----END PUBLIC KEY-----"""
+    encoded_public_key = base64.b64encode(public_key_pem.encode("utf-8")).decode("ascii")
+
+    requests_seen = {"v2": 0}
+
+    def handle_public_key(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": encoded_public_key}),
+        )
+
+    def handle_streaming_request(route):
+        requests_seen["v2"] += 1
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Relay chat restored",
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    page.route("**/api/v1/public-key", handle_public_key)
+    page.route("**/api/v2/chat/completions", handle_streaming_request)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("hello relay")
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+
+    assert requests_seen["v2"] == 1
+    assert "Relay chat restored" in assistant_message.inner_text()
+
 
 # Add more E2E tests here as the UI evolves
 

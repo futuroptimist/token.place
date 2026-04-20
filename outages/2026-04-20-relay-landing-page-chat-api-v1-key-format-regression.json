@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-20",
+  "slug": "relay-landing-page-chat-api-v1-key-format-regression",
+  "summary": "The relay landing-page chat UI at '/' regressed after API v1 key serialization changes: the browser client treated /api/v1/public-key as raw PEM even when API v1 returned base64-encoded PEM, causing encryption setup failure and generic assistant error fallbacks.",
+  "impact": "Users running local relay flows could no longer send and receive real chat responses from the landing page, breaking primary homepage chat validation in v0.1.0 architecture.",
+  "fix": "Normalized public key handling in static/chat.js to accept both raw PEM and base64-encoded PEM from /api/v1/public-key, and added a focused Playwright UI regression test that verifies end-to-end landing-page chat request/response behavior with base64 key payloads.",
+  "lessons": "Client crypto bootstrap logic must tolerate API-safe key serialization formats and regression tests should assert actual landing-page send/receive behavior, not just page render success."
+}

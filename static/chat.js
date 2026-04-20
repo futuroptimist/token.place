@@ -54,7 +54,7 @@ new Vue({
                 })
                 .then(data => {
                     if (data && data.public_key) {
-                        this.serverPublicKey = data.public_key;
+                        this.serverPublicKey = this.normalizePublicKey(data.public_key);
                     } else {
                         console.error('Unexpected server public key format:', data);
                     }
@@ -62,6 +62,28 @@ new Vue({
                 .catch(error => {
                     console.error('Error fetching server public key:', error);
                 });
+        },
+
+        normalizePublicKey(publicKeyValue) {
+            if (typeof publicKeyValue !== 'string') {
+                return null;
+            }
+
+            const trimmed = publicKeyValue.trim();
+            if (!trimmed) {
+                return null;
+            }
+
+            if (trimmed.includes('BEGIN PUBLIC KEY')) {
+                return trimmed;
+            }
+
+            try {
+                return atob(trimmed);
+            } catch (error) {
+                console.error('Failed to decode server public key from base64:', error);
+                return null;
+            }
         },
         generateClientKeys() {
             const crypt = new JSEncrypt({ default_key_size: 2048 });

@@ -294,6 +294,7 @@ class ComputeNodeRuntime:
     def stop(self) -> None:
         """Stop relay polling and network activity."""
         try:
+            self.relay_client.stop()
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn):
                 if not unregister_fn():
@@ -303,5 +304,3 @@ class ComputeNodeRuntime:
                 "Relay unregister request raised during shutdown; continuing stop",
                 exc_info=True,
             )
-        finally:
-            self.relay_client.stop()

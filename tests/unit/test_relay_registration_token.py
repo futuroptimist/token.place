@@ -197,3 +197,37 @@ def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch
     finally:
         for name in MODULES_TO_CLEAR:
             sys.modules.pop(name, None)
+
+
+def test_evict_stale_servers_cleans_up_queue_and_stream_state(relay_module) -> None:
+    """TTL eviction should use unregister cleanup so per-server state is removed."""
+
+    relay_module.known_servers.clear()
+    relay_module.client_inference_requests.clear()
+    relay_module.streaming_sessions.clear()
+    relay_module.streaming_sessions_by_client.clear()
+
+    relay_module.known_servers["stale-server"] = {
+        "public_key": "stale-server",
+        "last_ping": 0.0,
+        "last_ping_duration": 10,
+    }
+    relay_module.client_inference_requests["stale-server"] = [{"chat_history": "cipher"}]
+    relay_module.streaming_sessions["session-stale"] = {
+        "session_id": "session-stale",
+        "server_public_key": "stale-server",
+        "client_public_key": "client-stale",
+        "chunks": [],
+        "status": "open",
+        "created_at": 0,
+        "updated_at": 0,
+    }
+    relay_module.streaming_sessions_by_client["client-stale"] = "session-stale"
+
+    evicted = relay_module._evict_stale_servers()
+
+    assert evicted == ["stale-server"]
+    assert "stale-server" not in relay_module.known_servers
+    assert "stale-server" not in relay_module.client_inference_requests
+    assert "session-stale" not in relay_module.streaming_sessions
+    assert "client-stale" not in relay_module.streaming_sessions_by_client

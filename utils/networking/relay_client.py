@@ -443,6 +443,7 @@ class RelayClient:
         """Best-effort unregister call for graceful compute-node shutdown."""
 
         last_error: Optional[str] = None
+        had_success = False
 
         for offset in range(len(self._relay_urls)):
             index = (self._active_relay_index + offset) % len(self._relay_urls)
@@ -450,22 +451,21 @@ class RelayClient:
             try:
                 request_kwargs = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
                 }
                 headers = self._auth_headers()
                 if headers:
                     request_kwargs['headers'] = headers
 
-                timeout = request_kwargs.pop('timeout', self._request_timeout)
                 response = requests.post(
                     f'{candidate_url}/unregister',
-                    timeout=timeout,
+                    timeout=self._request_timeout,
                     **request_kwargs,
                 )
                 if response.status_code == 200:
                     self._active_relay_index = index
                     log_info("Unregistered compute node from relay {}", candidate_url)
-                    return True
+                    had_success = True
+                    continue
 
                 last_error = f"HTTP {response.status_code}"
                 log_error(
@@ -489,6 +489,9 @@ class RelayClient:
                     last_error,
                     exc_info=True,
                 )
+
+        if had_success:
+            return True
 
         if last_error:
             log_error("Unable to unregister compute node from relay: {}", last_error)

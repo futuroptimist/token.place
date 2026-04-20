@@ -389,8 +389,8 @@ def _evict_stale_servers() -> list[str]:
     for server_public_key, payload in list(known_servers.items()):
         if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
             continue
-        known_servers.pop(server_public_key, None)
-        evicted.append(server_public_key)
+        if _unregister_server(server_public_key):
+            evicted.append(server_public_key)
     return evicted
 
 

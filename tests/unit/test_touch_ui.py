@@ -14,3 +14,13 @@ def test_chat_js_defines_touch_detection_hook():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "isTouchInput" in chat_js, "chat.js must expose touch detection state"
     assert "detectTouchInput" in chat_js, "chat.js must implement touch detection helper"
+
+
+def test_landing_chat_js_avoids_relay_v2_streaming_path():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "/api/v2/chat/completions" not in chat_js, (
+        "landing chat must not call relay v2 chat completions endpoint"
+    )
+    assert "sendStreamingMessage(" not in chat_js, (
+        "landing chat must not include streaming relay send helper call chain"
+    )

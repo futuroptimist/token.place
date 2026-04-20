@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 import pytest
 
+import relay
 from relay import app
 from api.v1 import compute_provider, routes
 from api.v1.models import ModelError
@@ -69,6 +70,49 @@ def test_openai_alias_get_model(client):
     api_resp = client.get(f'/api/v1/models/{model_id}').get_json()
     alias_resp = client.get(f'/v1/models/{model_id}').get_json()
     assert api_resp == alias_resp
+
+
+def test_relay_unregister_requires_operator_access(client, monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "ensure_operator_access",
+        lambda *_args, **_kwargs: routes.format_error_response(
+            "forbidden",
+            error_type="invalid_request_error",
+            status_code=403,
+        ),
+    )
+
+    response = client.post("/api/v1/relay/unregister", json={"server_public_key": "abc"})
+
+    assert response.status_code == 403
+    assert response.get_json()["error"]["message"] == "forbidden"
+
+
+def test_relay_unregister_removes_node_from_diagnostics(client, monkeypatch):
+    monkeypatch.setattr(routes, "ensure_operator_access", lambda *_args, **_kwargs: None)
+    relay.known_servers.clear()
+    relay.known_servers["abc"] = {"public_key": "abc", "last_ping": routes.time.time(), "last_ping_duration": 10}
+
+    before = client.get("/relay/diagnostics")
+    assert before.get_json()["registered_compute_nodes"][0]["server_public_key"] == "abc"
+
+    response = client.post("/api/v1/relay/unregister", json={"server_public_key": "abc"})
+
+    assert response.status_code == 200
+    assert response.get_json() == {"message": "Server unregistered", "removed": True}
+    after = client.get("/relay/diagnostics")
+    assert after.get_json()["registered_compute_nodes"] == []
+    relay.known_servers.clear()
+
+
+def test_relay_unregister_openai_alias_delegates(client, monkeypatch):
+    monkeypatch.setattr(routes, "relay_unregister", lambda: routes.format_error_response("ok", status_code=200))
+
+    response = client.post("/v1/relay/unregister")
+
+    assert response.status_code == 200
+    assert response.get_json()["error"]["message"] == "ok"
 
 
 def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):

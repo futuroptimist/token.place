@@ -163,6 +163,42 @@ def test_list_server_providers_error(client, monkeypatch):
     assert payload["error"]["code"] == "provider_registry_unavailable"
 
 
+def test_relay_unregister_requires_operator_access(client, monkeypatch):
+    monkeypatch.setattr(
+        v2_routes,
+        "ensure_operator_access",
+        lambda *_args, **_kwargs: v2_routes.format_error_response(
+            "forbidden",
+            error_type="invalid_request_error",
+            status_code=403,
+        ),
+    )
+
+    response = client.post("/api/v2/relay/unregister", json={"server_public_key": "abc"})
+
+    assert response.status_code == 403
+    assert response.get_json()["error"]["message"] == "forbidden"
+
+
+def test_relay_unregister_removes_node_from_diagnostics(client, monkeypatch):
+    import relay
+
+    relay.known_servers.clear()
+    monkeypatch.setattr(v2_routes, "ensure_operator_access", lambda *_args, **_kwargs: None)
+    relay.known_servers["abc"] = {"public_key": "abc", "last_ping": v2_routes.time.time(), "last_ping_duration": 10}
+
+    before = client.get("/relay/diagnostics")
+    assert before.get_json()["registered_compute_nodes"][0]["server_public_key"] == "abc"
+
+    response = client.post("/api/v2/relay/unregister", json={"server_public_key": "abc"})
+
+    assert response.status_code == 200
+    assert response.get_json() == {"message": "Server unregistered", "removed": True}
+    after = client.get("/relay/diagnostics")
+    assert after.get_json()["registered_compute_nodes"] == []
+    relay.known_servers.clear()
+
+
 def test_get_service_name_defaults_to_module_constant(monkeypatch):
     """When no override is configured the module constant should be returned."""
 
@@ -835,6 +871,7 @@ def test_openai_alias_routes_delegate(client, monkeypatch):
     monkeypatch.setattr(v2_routes, "list_models", record("list_models"))
     monkeypatch.setattr(v2_routes, "get_model", record("get_model"))
     monkeypatch.setattr(v2_routes, "get_public_key", record("get_public_key"))
+    monkeypatch.setattr(v2_routes, "relay_unregister", record("relay_unregister"))
     monkeypatch.setattr(v2_routes, "create_chat_completion", record("create_chat_completion"))
     monkeypatch.setattr(v2_routes, "create_completion", record("create_completion"))
     monkeypatch.setattr(v2_routes, "health_check", record("health_check"))
@@ -842,6 +879,7 @@ def test_openai_alias_routes_delegate(client, monkeypatch):
     client.get("/v2/models")
     client.get("/v2/models/alpha")
     client.get("/v2/public-key")
+    client.post("/v2/relay/unregister")
     client.post("/v2/chat/completions")
     client.post("/v2/completions")
     client.get("/v2/health")
@@ -850,6 +888,7 @@ def test_openai_alias_routes_delegate(client, monkeypatch):
         "list_models",
         "get_model",
         "get_public_key",
+        "relay_unregister",
         "create_chat_completion",
         "create_completion",
         "health_check",

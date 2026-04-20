@@ -439,6 +439,61 @@ class RelayClient:
         log_info("Stopping relay polling")
         self.stop_polling = True
 
+    def unregister_from_relay(self) -> bool:
+        """Best-effort unregister call for graceful compute-node shutdown."""
+
+        last_error: Optional[str] = None
+
+        for offset in range(len(self._relay_urls)):
+            index = (self._active_relay_index + offset) % len(self._relay_urls)
+            candidate_url = self._relay_urls[index]
+            try:
+                request_kwargs = {
+                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'timeout': self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs['headers'] = headers
+
+                timeout = request_kwargs.pop('timeout', self._request_timeout)
+                response = requests.post(
+                    f'{candidate_url}/unregister',
+                    timeout=timeout,
+                    **request_kwargs,
+                )
+                if response.status_code == 200:
+                    self._active_relay_index = index
+                    log_info("Unregistered compute node from relay {}", candidate_url)
+                    return True
+
+                last_error = f"HTTP {response.status_code}"
+                log_error(
+                    "Failed to unregister compute node from {}: {}",
+                    candidate_url,
+                    last_error,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                log_error(
+                    "Error unregistering compute node from {}: {}",
+                    candidate_url,
+                    last_error,
+                    exc_info=True,
+                )
+            except Exception as exc:  # pragma: no cover - unexpected edge cases
+                last_error = str(exc)
+                log_error(
+                    "Unexpected error unregistering compute node from {}: {}",
+                    candidate_url,
+                    last_error,
+                    exc_info=True,
+                )
+
+        if last_error:
+            log_error("Unable to unregister compute node from relay: {}", last_error)
+        return False
+
     def ping_relay(self) -> Dict[str, Any]:
         """
         Send a ping to the relay server to register this server and check for client requests.

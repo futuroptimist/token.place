@@ -32,6 +32,15 @@ def _log_error(message: str, *, exc_info: bool = False) -> None:
         logger.error(message, exc_info=exc_info)
 
 
+def _log_warning(message: str, *, exc_info: bool = False) -> None:
+    """Mirror server logging behavior (suppressed in production)."""
+
+    from config import get_config
+
+    if not get_config().is_production:
+        logger.warning(message, exc_info=exc_info)
+
+
 @dataclass(frozen=True)
 class ComputeNodeRuntimeConfig:
     """Runtime configuration shared by all compute-node hosts."""
@@ -284,5 +293,15 @@ class ComputeNodeRuntime:
 
     def stop(self) -> None:
         """Stop relay polling and network activity."""
-
-        self.relay_client.stop()
+        try:
+            unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
+            if callable(unregister_fn):
+                if not unregister_fn():
+                    _log_warning("Relay unregister request failed during shutdown")
+        except Exception:
+            _log_warning(
+                "Relay unregister request raised during shutdown; continuing stop",
+                exc_info=True,
+            )
+        finally:
+            self.relay_client.stop()

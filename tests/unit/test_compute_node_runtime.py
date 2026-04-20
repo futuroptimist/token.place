@@ -315,4 +315,25 @@ def test_compute_node_runtime_stop_delegates_to_relay_client():
     )
 
     runtime.stop()
+    relay_client.unregister_from_relay.assert_called_once_with()
+    relay_client.stop.assert_called_once_with()
+
+
+def test_compute_node_runtime_stop_continues_when_unregister_raises():
+    relay_client = MagicMock()
+    relay_client.unregister_from_relay.side_effect = RuntimeError("network down")
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    runtime.stop()
+
+    relay_client.unregister_from_relay.assert_called_once_with()
     relay_client.stop.assert_called_once_with()

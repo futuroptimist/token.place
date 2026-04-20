@@ -238,6 +238,59 @@ class TestRelayClient:
         assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_success(self, mock_post, relay_client):
+        """Unregister should post to /unregister and return True on success."""
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        result = relay_client.unregister_from_relay()
+
+        assert result is True
+        mock_post.assert_called_once_with(
+            'http://localhost:5000/unregister',
+            json={'server_public_key': 'mock_public_key_b64'},
+            timeout=relay_client._request_timeout,
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_uses_registration_token(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Registration token headers should be forwarded to unregister calls."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.server_registration_token': 'alpha-token',
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://localhost",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        assert client.unregister_from_relay() is True
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):
         """Test successful ping to relay."""
         # Setup mock response

@@ -8,18 +8,45 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        activeStreamController: null
+        activeStreamController: null,
+        chatAvailable: true,
+        chatAvailabilityReason: ''
     },
     mounted() {
         this.detectTouchInput();
-        this.getServerPublicKey().then(() => {
-            this.generateClientKeys();
-        });
+        this.initializeChatAvailability();
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
     },
     methods: {
+        async initializeChatAvailability() {
+            const publicKeyLoaded = await this.getServerPublicKey();
+            if (publicKeyLoaded) {
+                this.chatAvailable = true;
+                this.chatAvailabilityReason = '';
+                this.generateClientKeys();
+                return;
+            }
+
+            this.chatAvailable = false;
+            if (this.isLoopbackHost()) {
+                this.chatAvailabilityReason =
+                    'Local relay-only mode is active on localhost, so the root page cannot run the public chat demo endpoints.';
+                return;
+            }
+            this.chatAvailabilityReason =
+                'The relay root page could not initialize chat because /api/v1/public-key is unavailable.';
+        },
+
+        isLoopbackHost() {
+            if (typeof window === 'undefined' || !window.location) {
+                return false;
+            }
+            const host = (window.location.hostname || '').toLowerCase();
+            return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+        },
+
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -50,17 +77,18 @@ new Vue({
                     if (response.ok) {
                         return response.json();
                     }
-                    throw new Error('Failed to fetch server public key');
+                    return null;
                 })
                 .then(data => {
                     if (data && data.public_key) {
                         this.serverPublicKey = data.public_key;
-                    } else {
-                        console.error('Unexpected server public key format:', data);
+                        return true;
                     }
+                    return false;
                 })
                 .catch(error => {
                     console.error('Error fetching server public key:', error);
+                    return false;
                 });
         },
         generateClientKeys() {
@@ -1087,7 +1115,7 @@ new Vue({
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
-            if (!messageContent || !this.serverPublicKey || this.isGeneratingResponse) {
+            if (!this.chatAvailable || !messageContent || !this.serverPublicKey || this.isGeneratingResponse) {
                 return;
             }
 

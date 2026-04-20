@@ -140,6 +140,28 @@
         .send-button:hover {
             background-color: #ffffff;
         }
+        .relay-status-panel {
+            margin: 10px 0 20px 0;
+            padding: 14px 16px;
+            border-radius: 6px;
+            border: 1px solid rgba(255, 165, 0, 0.6);
+            background-color: rgba(255, 165, 0, 0.12);
+        }
+        .relay-status-panel h3 {
+            margin-top: 0;
+            margin-bottom: 8px;
+        }
+        .relay-status-panel p {
+            margin: 8px 0;
+            padding: 0;
+        }
+        .relay-status-panel ul {
+            margin: 8px 0 0 20px;
+            padding: 0;
+        }
+        .relay-status-panel li {
+            margin-bottom: 6px;
+        }
         .mode-toggle-container {
             display: flex;
             justify-content: center;
@@ -271,6 +293,10 @@
         body.light-mode .send-button:hover {
             background-color: #0056b3;
         }
+        body.light-mode .relay-status-panel {
+            border-color: rgba(255, 140, 0, 0.6);
+            background-color: rgba(255, 165, 0, 0.2);
+        }
 
         body.light-mode a {
             color: #007bff;
@@ -317,6 +343,17 @@
 
         <h2>Try it out:</h2>
         <div class="chat-container" v-cloak>
+            <div v-if="!chatAvailable" class="relay-status-panel">
+                <h3>Chat demo unavailable in this relay mode</h3>
+                <p>{{ chatAvailabilityReason }}</p>
+                <ul>
+                    <li>Relay process status: <strong>up</strong> (this page loaded from the relay root).</li>
+                    <li>Operator registration and heartbeat endpoint: <code>/sink</code>.</li>
+                    <li>Relay diagnostics: <a href="/relay/diagnostics">/relay/diagnostics</a>.</li>
+                    <li>Local end-to-end smoke testing belongs in the desktop app.</li>
+                </ul>
+            </div>
+            <template v-else>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>
@@ -343,6 +380,7 @@
                     Send
                 </button>
             </div>
+            </template>
         </div>
 
         <hr>

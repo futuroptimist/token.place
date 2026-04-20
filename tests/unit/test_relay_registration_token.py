@@ -121,3 +121,34 @@ def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch
     finally:
         for name in MODULES_TO_CLEAR:
             sys.modules.pop(name, None)
+
+
+def test_unregister_requires_registration_token(relay_module) -> None:
+    """/unregister should enforce the same registration token auth as /sink and /source."""
+
+    client = relay_module.app.test_client()
+    relay_module.known_servers.clear()
+    relay_module.known_servers["abc"] = {
+        "public_key": "abc",
+        "last_ping": relay_module.datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    unauthorised = client.post("/unregister", json={"server_public_key": "abc"})
+    assert unauthorised.status_code == 401
+
+    payload = unauthorised.get_json()
+    assert payload == {
+        "error": {
+            "code": 401,
+            "message": "Missing or invalid relay server token",
+        }
+    }
+
+    authorised = client.post(
+        "/unregister",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert authorised.status_code == 200
+    assert authorised.get_json() == {"message": "Server unregistered"}

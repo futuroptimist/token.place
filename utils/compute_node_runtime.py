@@ -286,3 +286,11 @@ class ComputeNodeRuntime:
         """Stop relay polling and network activity."""
 
         self.relay_client.stop()
+        try:
+            unregistered = self.relay_client.unregister_from_relay()
+            if unregistered:
+                _log_info("Relay unregister completed")
+            else:
+                _log_error("Relay unregister did not succeed on any configured relay target")
+        except Exception:
+            _log_error("Relay unregister failed during shutdown", exc_info=True)

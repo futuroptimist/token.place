@@ -146,9 +146,14 @@ E2E_SERVER_PORT = 8010
 E2E_RELAY_PORT = 5010
 E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
+FOCUSED_RELAY_E2E_NODEIDS = {
+    "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
+}
 
 @pytest.fixture(scope="module")
-def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None, None]:
+def setup_servers(
+    request: pytest.FixtureRequest,
+) -> Generator[Tuple[subprocess.Popen, Optional[subprocess.Popen]], None, None]:
     """
     Start the server and relay processes for end-to-end testing.
 
@@ -159,7 +164,12 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
     4. Yields the processes
     5. Cleans up the processes after tests
     """
-    if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1":
+    selected_nodeids = {item.nodeid for item in request.session.items}
+    focused_e2e_only = bool(selected_nodeids) and selected_nodeids.issubset(
+        FOCUSED_RELAY_E2E_NODEIDS
+    )
+
+    if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:
         pytest.skip(
             "Relay/server registration smoke tests are disabled by default; "
             "set RUN_RELAY_REGISTRATION_TESTS=1 to enable.",
@@ -205,6 +215,13 @@ def setup_servers() -> Generator[Tuple[subprocess.Popen, subprocess.Popen], None
         print(f"Relay stdout: {stdout}")
         print(f"Relay stderr: {stderr}")
         pytest.skip("Relay server failed to start")
+
+    if focused_e2e_only:
+        print("Focused relay e2e mode enabled: skipping server registration bootstrap")
+        yield relay_process, None
+        relay_process.terminate()
+        relay_process.wait(timeout=5)
+        return
 
     # Start the server with mock LLM enabled via environment variable
     # Note: server.py doesn't accept --use_mock_llm flag, it uses the environment variable
@@ -288,7 +305,7 @@ def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], 
     """
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=True)
-    context = browser.new_context()
+    context = browser.new_context(ignore_https_errors=True)
 
     # Add console log handler
     context.on("console", print_console_message)
@@ -329,7 +346,7 @@ def browser_matrix(request) -> Generator[Tuple[str, Page], None, None]:
         with sync_playwright() as playwright:
             browser_launcher = getattr(playwright, browser_name)
             browser = browser_launcher.launch(headless=True)
-            context = browser.new_context()
+            context = browser.new_context(ignore_https_errors=True)
             context.on("console", print_console_message)
 
             page = context.new_page()

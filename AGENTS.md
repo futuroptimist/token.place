@@ -12,6 +12,14 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Always run `pre-commit run --all-files` before pushing. This executes
   `./run_all_tests.sh` and mirrors CI.
 
+## Codex focused verification bootstrap
+- For Codex follow-up verification tasks, install focused dependencies with
+  `pip install -r config/requirements_codex_verification.txt`.
+- To bootstrap in one step (including Playwright Chromium), run
+  `./scripts/bootstrap_focused_verification.sh`.
+- This codex-specific requirements surface is intended for verification tasks
+  and complements (does not replace) the standard project dependency setup.
+
 ## Desktop GPU acceleration (llama_cpp_python)
 - For desktop-tauri GPU modes (`auto`, `gpu`, `hybrid`), treat GPU-capable
   `llama-cpp-python` builds as a release requirement, not an optimization.

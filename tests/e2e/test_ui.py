@@ -3,7 +3,6 @@ import json
 import pytest
 from playwright.sync_api import Page
 import time
-import textwrap
 
 from encrypt import encrypt
 
@@ -129,12 +128,12 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     assert assistant_message.locator("script").count() == 0
 
 
-def test_landing_chat_accepts_base64_public_key_and_falls_back_to_v1(
+def test_landing_chat_uses_api_v1_only_non_streaming(
     page: Page,
     base_url: str,
     setup_servers,
 ):
-    """Landing chat should accept API v1 Base64 keys and still render a reply."""
+    """Landing chat must stay on API v1 JSON chat completions only."""
 
     server_public_key_pem = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
@@ -154,11 +153,11 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
             body=json.dumps({"public_key": server_public_key_b64}),
         )
 
-    def handle_stream_fail(route):
+    def handle_next_server(route):
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"error": {"message": "stream unavailable"}}),
+            body=json.dumps({"server_public_key": server_public_key_b64}),
         )
 
     def handle_v1_chat(route):
@@ -174,13 +173,8 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         assert isinstance(encrypted_request.get("cipherkey"), str) and encrypted_request["cipherkey"]
         assert isinstance(encrypted_request.get("iv"), str) and encrypted_request["iv"]
 
-        client_public_key_pem = "\n".join(
-            [
-                "-----BEGIN PUBLIC KEY-----",
-                *textwrap.wrap(request_json["client_public_key"], 64),
-                "-----END PUBLIC KEY-----",
-            ]
-        ).encode("utf-8")
+        client_public_key_pem = base64.b64decode(request_json["client_public_key"], validate=True)
+        assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
 
         encrypted_response_body, encrypted_key, iv = encrypt(
             json.dumps(
@@ -214,8 +208,15 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
             ),
         )
 
+    v2_requests = []
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.fulfill(status=500, body="v2 should not be called")
+
     page.route("**/api/v1/public-key", handle_public_key)
-    page.route("**/api/v2/chat/completions", handle_stream_fail)
+    page.route("**/next_server", handle_next_server)
+    page.route("**/api/v2/chat/completions", record_v2_request)
     page.route("**/api/v1/chat/completions", handle_v1_chat)
 
     page.goto(base_url)
@@ -240,3 +241,4 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     )
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
+    assert v2_requests == []

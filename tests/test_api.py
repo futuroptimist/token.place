@@ -178,6 +178,9 @@ def test_get_public_key(client):
     data = response.get_json()
     assert 'public_key' in data
     assert len(data['public_key']) > 0
+    assert 'public_key_pem' in data
+    assert data['public_key_pem'].startswith("-----BEGIN PUBLIC KEY-----")
+    assert data['public_key_pem'].endswith("-----END PUBLIC KEY-----")
 
 
 def test_server_provider_directory(client):

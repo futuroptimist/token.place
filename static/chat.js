@@ -53,8 +53,13 @@ new Vue({
                     throw new Error('Failed to fetch server public key');
                 })
                 .then(data => {
-                    if (data && data.public_key) {
-                        this.serverPublicKey = data.public_key;
+                    const candidateKey = data && (
+                        data.public_key_pem
+                        || data.public_key
+                    );
+                    const normalizedKey = this.normalizeServerPublicKey(candidateKey);
+                    if (normalizedKey) {
+                        this.serverPublicKey = normalizedKey;
                     } else {
                         console.error('Unexpected server public key format:', data);
                     }
@@ -62,6 +67,36 @@ new Vue({
                 .catch(error => {
                     console.error('Error fetching server public key:', error);
                 });
+        },
+        normalizeServerPublicKey(value) {
+            if (typeof value !== 'string') {
+                return null;
+            }
+
+            const trimmed = value.trim();
+            if (!trimmed) {
+                return null;
+            }
+
+            if (trimmed.includes('-----BEGIN PUBLIC KEY-----')) {
+                return trimmed;
+            }
+
+            const cleanedBase64 = trimmed.replace(/\s+/g, '');
+            if (!/^[A-Za-z0-9+/=]+$/.test(cleanedBase64)) {
+                return null;
+            }
+
+            const chunkedLines = cleanedBase64.match(/.{1,64}/g);
+            if (!Array.isArray(chunkedLines) || chunkedLines.length === 0) {
+                return null;
+            }
+
+            return [
+                '-----BEGIN PUBLIC KEY-----',
+                chunkedLines.join('\n'),
+                '-----END PUBLIC KEY-----'
+            ].join('\n');
         },
         generateClientKeys() {
             const crypt = new JSEncrypt({ default_key_size: 2048 });

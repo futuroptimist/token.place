@@ -259,7 +259,10 @@ def _public_key_response(log_label: str | None = None):
         if log_label is None:
             log_label = f"{request.method.upper()} {request.path}"
         log_info(f"API request: {log_label}")
-        return jsonify({'public_key': encryption_manager.public_key_b64})
+        public_key_b64 = encryption_manager.public_key_b64
+        wrapped_lines = "\n".join(public_key_b64[i:i + 64] for i in range(0, len(public_key_b64), 64))
+        public_key_pem = f"-----BEGIN PUBLIC KEY-----\n{wrapped_lines}\n-----END PUBLIC KEY-----"
+        return jsonify({'public_key': public_key_b64, 'public_key_pem': public_key_pem})
     except Exception:
         log_error("Error in get_public_key endpoint", exc_info=True)
         return format_error_response(

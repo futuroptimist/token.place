@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-20",
+  "slug": "relay-landing-chat-api-v1-public-key-format-regression",
+  "summary": "Relay landing-page chat at / failed after API v1 key-format migration because the browser expected a PEM public key while /api/v1/public-key returned base64 DER, causing client-side encryption and chat completion requests to fail.",
+  "impact": "Users running local relay and compute-node flows could not complete landing-page chat round-trips and only saw fallback error messaging.",
+  "fix": "Normalized server public keys to PEM in static/chat.js, added a public_key_pem field to API v1/v2 public-key responses while keeping public_key for compatibility, and added regression tests for both API response shape and landing-page key-normalization behavior.",
+  "lessons": "Browser encryption clients are sensitive to key serialization format changes; API migrations must include compatibility fields or client normalization, plus targeted regression coverage for landing-page chat UX."
+}

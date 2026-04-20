@@ -58,7 +58,8 @@ new Vue({
             }
 
             try {
-                const decoded = atob(trimmed).trim();
+                const cleanedBase64 = trimmed.replace(/\s+/g, '');
+                const decoded = atob(cleanedBase64).trim();
                 if (decoded.includes('-----BEGIN')) {
                     return decoded;
                 }

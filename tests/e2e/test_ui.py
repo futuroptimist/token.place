@@ -153,7 +153,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     def handle_stream_fail(route):
         route.fulfill(
-            status=500,
+            status=200,
             headers={"Content-Type": "application/json"},
             body=json.dumps({"error": {"message": "stream unavailable"}}),
         )
@@ -196,5 +196,16 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     assistant_message = page.locator(".assistant-message").last
     assistant_message.wait_for(state="visible")
+    page.wait_for_function(
+        """
+        ({ selector, expectedText }) => {
+            const nodes = document.querySelectorAll(selector);
+            if (!nodes.length) return false;
+            const latest = nodes[nodes.length - 1];
+            return latest.textContent.includes(expectedText);
+        }
+        """,
+        arg={"selector": ".assistant-message", "expectedText": "Relay chat path restored."},
+    )
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()

@@ -439,6 +439,36 @@ class RelayClient:
         log_info("Stopping relay polling")
         self.stop_polling = True
 
+    def unregister(self) -> bool:
+        """Best-effort compute-node unregister request."""
+
+        payload = {'server_public_key': self.crypto_manager.public_key_b64}
+        request_kwargs: Dict[str, Any] = {
+            'json': payload,
+            'timeout': self._request_timeout,
+        }
+        headers = self._auth_headers()
+        if headers:
+            request_kwargs['headers'] = headers
+
+        try:
+            timeout = request_kwargs.pop('timeout', self._request_timeout)
+            response = requests.post(
+                f'{self.relay_url}/unregister',
+                timeout=timeout,
+                **request_kwargs,
+            )
+            if response.status_code != 200:
+                log_error("Error from relay /unregister: status {}", response.status_code)
+                return False
+            return True
+        except requests.RequestException as exc:
+            log_error("Failed to unregister relay compute node: {}", str(exc), exc_info=True)
+            return False
+        except Exception as exc:  # pragma: no cover - defensive path
+            log_error("Unexpected unregister failure: {}", str(exc), exc_info=True)
+            return False
+
     def ping_relay(self) -> Dict[str, Any]:
         """
         Send a ping to the relay server to register this server and check for client requests.

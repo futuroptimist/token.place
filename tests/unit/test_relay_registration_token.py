@@ -90,6 +90,30 @@ def test_source_requires_registration_token(relay_module) -> None:
     assert queued == {"message": "Response received and queued for client"}
 
 
+def test_unregister_requires_registration_token(relay_module) -> None:
+    """/unregister should require the server token when registration auth is enabled."""
+
+    relay_module.known_servers.clear()
+    relay_module.known_servers["abc"] = {
+        "public_key": "abc",
+        "last_ping": relay_module.datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client = relay_module.app.test_client()
+
+    unauthorised = client.post("/unregister", json={"server_public_key": "abc"})
+    assert unauthorised.status_code == 401
+
+    authorised = client.post(
+        "/unregister",
+        json={"server_public_key": "abc"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert authorised.status_code == 200
+    assert authorised.get_json() == {"message": "Server unregistered"}
+    assert "abc" not in relay_module.known_servers
+
+
 def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Plural env var should allow any listed registration token."""
 

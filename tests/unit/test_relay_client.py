@@ -316,6 +316,52 @@ class TestRelayClient:
         assert result['error'] == "HTTP 500"
         assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_posts_server_public_key(self, mock_post, relay_client):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        assert relay_client.unregister() is True
+        mock_post.assert_called_once_with(
+            'http://localhost:5000/unregister',
+            json={'server_public_key': 'mock_public_key_b64'},
+            timeout=relay_client._request_timeout,
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_uses_registration_token_header(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.server_registration_token': 'alpha-token',
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url='http://localhost',
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        assert client.unregister() is True
+        mock_post.assert_called_once()
+        assert mock_post.call_args.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+
     def test_ping_relay_failover_to_additional_servers(
         self,
         mock_crypto_manager,

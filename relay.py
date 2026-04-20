@@ -407,6 +407,29 @@ def _live_server_diagnostics() -> list[dict[str, Any]]:
     return diagnostics
 
 
+def _purge_server_state(server_public_key: str) -> None:
+    """Remove relay state associated with a compute node."""
+
+    known_servers.pop(server_public_key, None)
+    client_inference_requests.pop(server_public_key, None)
+
+    with stream_lock:
+        stale_session_ids = [
+            session_id
+            for session_id, session in streaming_sessions.items()
+            if session.get("server_public_key") == server_public_key
+        ]
+        for session_id in stale_session_ids:
+            session = streaming_sessions.pop(session_id, None)
+            if not session:
+                continue
+            client_public_key = session.get("client_public_key")
+            if client_public_key:
+                mapped = streaming_sessions_by_client.get(client_public_key)
+                if mapped == session_id:
+                    streaming_sessions_by_client.pop(client_public_key, None)
+
+
 def _can_resolve_gpu_host(hostname: str) -> bool:
     try:
         socket.getaddrinfo(hostname, None)
@@ -785,6 +808,26 @@ def sink():
             response_data['batch'] = batch
 
     return jsonify(response_data)
+
+
+@app.route('/unregister', methods=['POST'])
+def unregister():
+    """Explicitly remove a compute node from relay registration."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    public_key = data.get('server_public_key')
+    if not isinstance(public_key, str) or not public_key.strip():
+        return jsonify({'error': 'Invalid public key'}), 400
+
+    _purge_server_state(public_key)
+    return jsonify({'message': 'Server unregistered'}), 200
 
 @app.route('/source', methods=['POST'])
 def source():

@@ -285,4 +285,10 @@ class ComputeNodeRuntime:
     def stop(self) -> None:
         """Stop relay polling and network activity."""
 
+        unregister = getattr(self.relay_client, "unregister", None)
+        if callable(unregister):
+            if unregister():
+                _log_info("Relay compute node unregistered")
+            else:
+                _log_error("Relay compute node unregister failed; continuing shutdown")
         self.relay_client.stop()

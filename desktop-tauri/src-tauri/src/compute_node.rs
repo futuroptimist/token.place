@@ -323,10 +323,10 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
         if child_slot
             .as_mut()
@@ -395,14 +395,15 @@ pub async fn start_compute_node(
         Ok(child) => child,
         Err(err) => {
             {
+                let _lifecycle_lock = state.lifecycle_lock.lock().await;
                 let mut status = state.status.lock().await;
                 *status = startup_failure_status(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
                 );
+                *state.child.lock().await = None;
+                *state.stdin.lock().await = None;
             }
-            *state.child.lock().await = None;
-            *state.stdin.lock().await = None;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
     };
@@ -420,25 +421,48 @@ pub async fn start_compute_node(
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing compute-node bridge stdin"))?;
 
-    {
+    let mut pending_child = Some(child);
+    let mut pending_stdin = Some(stdin);
+    let installed = {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
-        *child_slot = Some(child);
-        let mut stdin_slot = state.stdin.lock().await;
-        *stdin_slot = Some(stdin);
-        let mut status = state.status.lock().await;
-        *status = ComputeNodeStatus {
-            running: true,
-            registered: false,
-            active_relay_url: request.relay_base_url.clone(),
-            requested_mode: format!("{:?}", request.mode).to_lowercase(),
-            effective_mode: "cpu".into(),
-            backend_available: "unknown".into(),
-            backend_selected: "cpu".into(),
-            backend_used: "cpu".into(),
-            fallback_reason: None,
-            model_path: request.model_path.clone(),
-            last_error: None,
-        };
+        if child_slot
+            .as_mut()
+            .is_some_and(|existing| existing.try_wait().ok().flatten().is_none())
+        {
+            false
+        } else {
+            *child_slot = pending_child.take();
+            let mut stdin_slot = state.stdin.lock().await;
+            *stdin_slot = pending_stdin.take();
+            let mut status = state.status.lock().await;
+            *status = ComputeNodeStatus {
+                running: true,
+                registered: false,
+                active_relay_url: request.relay_base_url.clone(),
+                requested_mode: format!("{:?}", request.mode).to_lowercase(),
+                effective_mode: "cpu".into(),
+                backend_available: "unknown".into(),
+                backend_selected: "cpu".into(),
+                backend_used: "cpu".into(),
+                fallback_reason: None,
+                model_path: request.model_path.clone(),
+                last_error: None,
+            };
+            true
+        }
+    };
+
+    if !installed {
+        if let Some(mut abandoned_stdin) = pending_stdin.take() {
+            let _ = abandoned_stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+            let _ = abandoned_stdin.flush().await;
+        }
+        if let Some(mut abandoned_child) = pending_child.take() {
+            let _ = abandoned_child.kill().await;
+            let _ = abandoned_child.wait().await;
+        }
+        anyhow::bail!("compute node already running; stop it before starting a new session");
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
@@ -482,6 +506,7 @@ pub async fn start_compute_node(
     }
 
     let running_child = {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
         let mut child_slot = state.child.lock().await;
         child_slot.take()
     };
@@ -501,49 +526,49 @@ pub async fn start_compute_node(
         status.running = false;
         status.registered = false;
     }
-    *state.stdin.lock().await = None;
+    {
+        let _lifecycle_lock = state.lifecycle_lock.lock().await;
+        *state.stdin.lock().await = None;
+    }
 
     Ok(())
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let _lifecycle_lock = state.lifecycle_lock.lock().await;
-
-    if let Some(stdin) = state.stdin.lock().await.as_mut() {
-        stdin.write_all(b"{\"type\":\"cancel\"}\n").await?;
-        stdin.flush().await?;
+    let mut stdin_handle = {
+        let mut stdin_lock = state.stdin.lock().await;
+        stdin_lock.take()
+    };
+    if let Some(stdin) = stdin_handle.as_mut() {
+        let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
+        let _ = stdin.flush().await;
     }
 
-    let mut should_kill = false;
+    let mut owned_child = None;
     for _ in 0..20 {
-        let mut child_lock = state.child.lock().await;
-        let Some(child) = child_lock.as_mut() else {
+        if let Some(child) = state.child.lock().await.take() {
+            owned_child = Some(child);
             break;
-        };
-
-        if child.try_wait()?.is_some() {
-            *child_lock = None;
-            *state.stdin.lock().await = None;
-            let mut status = state.status.lock().await;
-            status.running = false;
-            status.registered = false;
-            return Ok(());
         }
-
-        should_kill = true;
-        drop(child_lock);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    if should_kill {
-        let mut child_lock = state.child.lock().await;
-        if let Some(child) = child_lock.as_mut() {
+    if let Some(mut child) = owned_child {
+        let mut exited = child.try_wait()?.is_some();
+        for _ in 0..20 {
+            if exited {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            exited = child.try_wait()?.is_some();
+        }
+
+        if !exited {
             let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 
-    *state.child.lock().await = None;
-    *state.stdin.lock().await = None;
     {
         let mut status = state.status.lock().await;
         status.running = false;
@@ -626,6 +651,68 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_does_not_wait_on_lifecycle_lock() {
+        let state = ComputeNodeState::default();
+        let lifecycle_guard = state.lifecycle_lock.lock().await;
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), stop_compute_node(state.clone()))
+                .await;
+
+        assert!(result.is_ok(), "stop should not block on lifecycle lock");
+        drop(lifecycle_guard);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_compute_node_stops_running_child_with_cancel_message() {
+        let state = ComputeNodeState::default();
+        let temp = TempDir::new().expect("tempdir");
+        let observed_cancel_path = temp.path().join("observed-cancel.json");
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; [ \"$line\" = '{\"type\":\"cancel\"}' ]",
+                "sh",
+                observed_cancel_path
+                    .to_str()
+                    .expect("cancel path should be valid UTF-8"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cancel observer bridge");
+        let child_stdin = child.stdin.take().expect("child stdin");
+
+        *state.child.lock().await = Some(child);
+        *state.stdin.lock().await = Some(child_stdin);
+        {
+            let mut status = state.status.lock().await;
+            status.running = true;
+            status.registered = true;
+        }
+
+        let stop_result =
+            tokio::time::timeout(Duration::from_secs(2), stop_compute_node(state.clone())).await;
+        assert!(stop_result.is_ok(), "stop should complete without hanging");
+        stop_result
+            .expect("timeout result")
+            .expect("stop should succeed");
+
+        let observed_cancel = std::fs::read_to_string(&observed_cancel_path)
+            .expect("cancel message should be recorded");
+        assert_eq!(observed_cancel, "{\"type\":\"cancel\"}");
+        assert!(state.child.lock().await.is_none(), "child handle should be cleared");
+        assert!(state.stdin.lock().await.is_none(), "stdin handle should be cleared");
+
+        let final_status = state.status.lock().await.clone();
+        assert!(!final_status.running);
+        assert!(!final_status.registered);
     }
 
     #[test]

@@ -389,8 +389,8 @@ def _evict_stale_servers() -> list[str]:
     for server_public_key, payload in list(known_servers.items()):
         if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
             continue
-        known_servers.pop(server_public_key, None)
-        evicted.append(server_public_key)
+        if _unregister_server(server_public_key):
+            evicted.append(server_public_key)
     return evicted
 
 
@@ -405,6 +405,31 @@ def _live_server_diagnostics() -> list[dict[str, Any]]:
         })
     diagnostics.sort(key=lambda node: node["server_public_key"])
     return diagnostics
+
+
+def _unregister_server(server_public_key: str) -> bool:
+    """Remove a compute node and associated per-server queue/session state."""
+
+    removed = known_servers.pop(server_public_key, None) is not None
+    client_inference_requests.pop(server_public_key, None)
+
+    with stream_lock:
+        stale_session_ids = [
+            session_id
+            for session_id, session in streaming_sessions.items()
+            if session.get("server_public_key") == server_public_key
+        ]
+        for session_id in stale_session_ids:
+            session = streaming_sessions.pop(session_id, None)
+            if not session:
+                continue
+            client_public_key = session.get("client_public_key")
+            if client_public_key:
+                mapped_session_id = streaming_sessions_by_client.get(client_public_key)
+                if mapped_session_id == session_id:
+                    streaming_sessions_by_client.pop(client_public_key, None)
+
+    return removed
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -785,6 +810,26 @@ def sink():
             response_data['batch'] = batch
 
     return jsonify(response_data)
+
+
+@app.route('/unregister', methods=['POST'])
+def unregister():
+    """Explicitly unregister a compute node and clear relay queue/session state."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    public_key = data.get('server_public_key')
+    if not isinstance(public_key, str) or not public_key.strip():
+        return jsonify({'error': 'Invalid public key'}), 400
+
+    removed = _unregister_server(public_key)
+    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
 
 @app.route('/source', methods=['POST'])
 def source():

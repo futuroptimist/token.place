@@ -238,6 +238,100 @@ class TestRelayClient:
         assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_success(self, mock_post, relay_client):
+        """Unregister should post to /unregister and return True on success."""
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        result = relay_client.unregister_from_relay()
+
+        assert result is True
+        mock_post.assert_called_once_with(
+            'http://localhost:5000/unregister',
+            json={'server_public_key': 'mock_public_key_b64'},
+            timeout=relay_client._request_timeout,
+        )
+
+    def test_unregister_from_relay_attempts_all_configured_relays(
+        self,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Unregister should attempt all relay targets before returning."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.additional_servers': ['http://backup-relay:6000'],
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://primary-relay",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        success_response = MagicMock()
+        success_response.status_code = 200
+        failure_response = MagicMock()
+        failure_response.status_code = 503
+        failure_response.text = "Service unavailable"
+
+        with patch('utils.networking.relay_client.requests.post') as mock_post:
+            mock_post.side_effect = [success_response, failure_response]
+            assert client.unregister_from_relay() is True
+
+        requested_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert requested_urls == [
+            'http://primary-relay:5000/unregister',
+            'http://backup-relay:6000/unregister',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_uses_registration_token(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Registration token headers should be forwarded to unregister calls."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.server_registration_token': 'alpha-token',
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://localhost",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        assert client.unregister_from_relay() is True
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):
         """Test successful ping to relay."""
         # Setup mock response

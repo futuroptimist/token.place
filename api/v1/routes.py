@@ -864,6 +864,46 @@ def relay_server_nodes():
     return jsonify(payload)
 
 
+def _relay_unregister_response(log_label: str | None = None):
+    """Remove a registered relay compute node by public key."""
+
+    if log_label is None:
+        log_label = f"{request.method.upper()} {request.path}"
+    log_info(f"API request: {log_label}")
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return format_error_response(
+            "Invalid request data",
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+
+    public_key = data.get("server_public_key")
+    if not isinstance(public_key, str) or not public_key.strip():
+        return format_error_response(
+            "Invalid public key",
+            error_type="invalid_request_error",
+            param="server_public_key",
+            status_code=400,
+        )
+
+    import relay
+
+    removed = relay._unregister_server(public_key.strip())
+    return jsonify({"message": "Server unregistered", "removed": removed})
+
+
+@v1_bp.route('/relay/unregister', methods=['POST'])
+def relay_unregister():
+    """Allow operators to explicitly unregister a compute node."""
+
+    auth_error = ensure_operator_access(format_error_response, log_warning)
+    if auth_error:
+        return auth_error
+    return _relay_unregister_response()
+
+
 @v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion():
     """
@@ -972,6 +1012,12 @@ def get_public_key_openai():
 @openai_v1_bp.route('/public-key/rotate', methods=['POST'])
 def rotate_public_key_openai():
     return rotate_public_key()
+
+
+@openai_v1_bp.route('/relay/unregister', methods=['POST'])
+def relay_unregister_openai():
+    return relay_unregister()
+
 
 @openai_v1_bp.route('/chat/completions', methods=['POST'])
 def create_chat_completion_openai():

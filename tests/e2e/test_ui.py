@@ -129,12 +129,12 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     assert assistant_message.locator("script").count() == 0
 
 
-def test_landing_chat_accepts_base64_public_key_and_falls_back_to_v1(
+def test_landing_chat_uses_v1_only_non_streaming(
     page: Page,
     base_url: str,
     setup_servers,
 ):
-    """Landing chat should accept API v1 Base64 keys and still render a reply."""
+    """Landing chat should use API v1 only and still render a reply."""
 
     server_public_key_pem = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
@@ -154,16 +154,20 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
             body=json.dumps({"public_key": server_public_key_b64}),
         )
 
-    def handle_stream_fail(route):
+    v2_attempts = []
+
+    def handle_v2_fail_fast(route):
+        v2_attempts.append(route.request.url)
         route.fulfill(
-            status=200,
+            status=500,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"error": {"message": "stream unavailable"}}),
+            body=json.dumps({"error": {"message": "relay landing chat must not call API v2"}}),
         )
 
     def handle_v1_chat(route):
         request_json = route.request.post_data_json
         assert request_json.get("encrypted") is True
+        assert request_json.get("stream") in (None, False)
         assert isinstance(request_json.get("client_public_key"), str) and request_json[
             "client_public_key"
         ]
@@ -215,7 +219,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         )
 
     page.route("**/api/v1/public-key", handle_public_key)
-    page.route("**/api/v2/chat/completions", handle_stream_fail)
+    page.route("**/api/v2/chat/completions", handle_v2_fail_fast)
     page.route("**/api/v1/chat/completions", handle_v1_chat)
 
     page.goto(base_url)
@@ -240,3 +244,4 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     )
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
+    assert not v2_attempts

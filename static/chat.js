@@ -1127,14 +1127,8 @@ new Vue({
             });
 
             try {
-                const historySnapshot = this.chatHistory.slice();
-                const streamed = await this.sendStreamingMessage(historySnapshot);
-                if (streamed) {
-                    return;
-                }
-
-                // Send the message via the API
-                let response = await this.sendMessageApi();
+                // Relay-path chat is API v1-only and non-streaming in v0.1.0.
+                const response = await this.sendMessageApi();
 
                 // Process the response
                 if (response) {

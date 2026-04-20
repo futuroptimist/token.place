@@ -21,6 +21,22 @@ def test_encrypt_message_roundtrip():
     assert json.loads(plaintext.decode()) == data
 
 
+def test_encrypt_message_accepts_pem_client_key_string():
+    manager = EncryptionManager()
+    client_priv, client_pub = generate_keys()
+    data = {"hello": "world"}
+
+    enc = manager.encrypt_message(data, client_pub.decode("utf-8"))
+    assert enc and enc["encrypted"] is True
+
+    plaintext = decrypt(
+        {"ciphertext": base64.b64decode(enc["ciphertext"]), "iv": base64.b64decode(enc["iv"])},
+        base64.b64decode(enc["cipherkey"]),
+        client_priv,
+    )
+    assert json.loads(plaintext.decode()) == data
+
+
 def test_decrypt_message_success():
     manager = EncryptionManager()
     data = {"foo": 1}

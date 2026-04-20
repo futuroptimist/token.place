@@ -12,6 +12,18 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Always run `pre-commit run --all-files` before pushing. This executes
   `./run_all_tests.sh` and mirrors CI.
 
+## API rollout guardrail (v0.1.0)
+- Until API v1 is fully launched on sugarkube, keep relay-path/network traffic API v1-only
+  for:
+  - Desktop Tauri app network/API calls
+  - `relay.py`
+  - landing-page chat served by `relay.py`
+  - `server.py`
+- API v2 is deferred for relay-path traffic until after the API v1 sugarkube launch.
+- Relay-path streaming is a non-goal in v0.1.0.
+- Desktop local prompt smoke-test streaming via local `llama_cpp_python` remains allowed
+  because it is local-only and outside relay/API traffic.
+
 ## Desktop GPU acceleration (llama_cpp_python)
 - For desktop-tauri GPU modes (`auto`, `gpu`, `hybrid`), treat GPU-capable
   `llama-cpp-python` builds as a release requirement, not an optimization.

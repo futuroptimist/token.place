@@ -18,6 +18,24 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_client_public_key_bytes(client_public_key: Union[str, bytes]) -> bytes:
+    """Accept client keys as PEM text, base64 DER text, or bytes."""
+
+    if isinstance(client_public_key, bytes):
+        return client_public_key
+
+    if not isinstance(client_public_key, str):
+        raise TypeError(
+            f"Unsupported client public key type: {type(client_public_key).__name__}"
+        )
+
+    cleaned = client_public_key.strip()
+    if "-----BEGIN" in cleaned:
+        return cleaned.encode("utf-8")
+
+    return base64.b64decode("".join(cleaned.split()))
+
+
 class EncryptionManager:
     """
     Manages encryption/decryption operations for the API
@@ -50,9 +68,7 @@ class EncryptionManager:
             # Convert data to JSON
             json_data = json.dumps(data).encode('utf-8')
 
-            # Make sure client_public_key is bytes
-            if isinstance(client_public_key, str):
-                client_public_key = base64.b64decode(client_public_key)
+            client_public_key = _normalize_client_public_key_bytes(client_public_key)
 
             # Encrypt the data
             ciphertext_dict, cipherkey, iv = encrypt(json_data, client_public_key)

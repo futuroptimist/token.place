@@ -116,6 +116,14 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
     )
 
 
+def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
+    """Return True when diagnostics indicate the repo-local llama_cpp.py shim."""
+    if not isinstance(module_path, str) or not module_path.strip():
+        return False
+    resolved = Path(module_path).resolve()
+    return resolved.name == "llama_cpp.py" and (resolved.parent / "relay.py").is_file()
+
+
 def _start_stdin_reader() -> None:
     global _stdin_reader_started
     with _stdin_reader_lock:
@@ -176,6 +184,14 @@ def run(args: argparse.Namespace) -> int:
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
         f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        file=sys.stderr,
+    )
+    repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
+        runtime_setup.get("llama_module_path", "")
+    )
+    print(
+        "desktop.runtime_setup.import_guard "
+        f"repo_llama_cpp_shim_imported={repo_llama_cpp_shim_imported}",
         file=sys.stderr,
     )
     gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
@@ -255,6 +271,8 @@ def run(args: argparse.Namespace) -> int:
             "fallback_reason": diagnostics.get("fallback_reason"),
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+            "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
+            "use_mock_llm": bool(runtime.model_manager.use_mock_llm),
             "model_path": args.model,
             "last_error": None,
         }

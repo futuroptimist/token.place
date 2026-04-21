@@ -144,12 +144,15 @@ class FallbackApiV1ComputeProvider:
 
 
 @lru_cache(maxsize=8)
-def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1ComputeProvider:
+def _build_api_v1_compute_provider(
+    mode: str, distributed_url: str, distributed_fallback_enabled: bool
+) -> ApiV1ComputeProvider:
     """Create a compute provider for the normalized environment inputs."""
 
     local_provider = LocalApiV1ComputeProvider()
 
     if mode != "distributed":
+        logger.info("api_v1.compute_provider.selected provider=local mode=%s", mode)
         return local_provider
 
     if not distributed_url:
@@ -160,6 +163,21 @@ def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1Comp
         return local_provider
 
     distributed_provider = DistributedApiV1ComputeProvider(base_url=distributed_url)
+    if not distributed_fallback_enabled:
+        logger.info(
+            "api_v1.compute_provider.selected provider=distributed mode=%s "
+            "fallback_enabled=false target=%s",
+            mode,
+            distributed_url.rstrip("/"),
+        )
+        return distributed_provider
+
+    logger.info(
+        "api_v1.compute_provider.selected provider=distributed_with_local_fallback "
+        "mode=%s fallback_enabled=true target=%s",
+        mode,
+        distributed_url.rstrip("/"),
+    )
     return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
 
 
@@ -168,4 +186,8 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
 
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
     distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
-    return _build_api_v1_compute_provider(mode, distributed_url)
+    distributed_fallback_enabled = (
+        os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)

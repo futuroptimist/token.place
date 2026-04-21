@@ -251,7 +251,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
 
 @pytest.mark.e2e
-def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
+def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     page: Page,
     base_url: str,
     setup_servers,
@@ -259,16 +259,21 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
     """
     Validate relay landing chat end-to-end through the desktop compute-node bridge.
 
-    This test intentionally avoids route mocking so CI verifies the real wiring:
+    This test intentionally avoids route mocking so it verifies the real wiring:
     browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
     """
+    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
+        pytest.skip(
+            "Real desktop inference e2e is disabled by default; "
+            "set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to run this test."
+        )
 
     relay_process, _ = setup_servers
     assert relay_process is not None
 
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"
+    test_env["USE_MOCK_LLM"] = "0"
 
     bridge_process = subprocess.Popen(
         [
@@ -349,6 +354,12 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
 
             if event_type == "started":
                 started = bool(payload.get("running"))
+                assert payload.get("use_mock_llm") is False
+                assert payload.get("llama_repo_stub_imported") is False
+                llama_module_path = payload.get("llama_module_path", "")
+                assert isinstance(llama_module_path, str) and llama_module_path
+                assert not llama_module_path.endswith("/llama_cpp.py")
+                assert not llama_module_path.endswith("\\llama_cpp.py")
             if event_type == "status" and payload.get("registered") is True:
                 registered = True
                 break
@@ -384,6 +395,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         )
 
         assistant_text = assistant_message.inner_text()
+        assert assistant_text.strip() != "stub"
         assert "capital" in assistant_text.lower()
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()

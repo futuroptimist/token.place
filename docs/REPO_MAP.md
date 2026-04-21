@@ -49,5 +49,6 @@ near-term, and target architecture.
 - [k3s sugarkube (staging)](k3s-sugarkube-staging.md)
 - [k3s sugarkube (prod)](k3s-sugarkube-prod.md)
 - [relay deploy notes](relay-deploy.md)
+- [Outage: 2026-04-20 relay API v1 chat regression](outages/2026-04-20-relay-api-v1-chat-regression.md)
 
 Use these together with the roadmap doc when planning implementation prompts 1–7.

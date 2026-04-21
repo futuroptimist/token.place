@@ -1,10 +1,19 @@
 import base64
 import json
+import os
+import socket
+import subprocess
+import sys
+import threading
 import pytest
 from playwright.sync_api import Page
 import time
 
+from flask import Flask, jsonify, request
+from werkzeug.serving import make_server
+
 from encrypt import encrypt
+from utils.crypto_helpers import CryptoClient
 
 # This test now implicitly uses the `setup_servers` and `page` fixtures
 # defined in tests/conftest.py
@@ -242,3 +251,161 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
     assert v2_requests == []
+
+
+def _find_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_http_ready(url: str, timeout_seconds: float = 20.0) -> None:
+    import requests
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            response = requests.get(url, timeout=1.0)
+            if response.ok:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(0.25)
+    raise AssertionError(f"Timed out waiting for HTTP readiness: {url}")
+
+
+def _wait_for_relay_server_registration(relay_url: str, timeout_seconds: float = 30.0) -> None:
+    import requests
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            response = requests.get(f"{relay_url}/next_server", timeout=1.0)
+            data = response.json()
+            if isinstance(data, dict) and isinstance(data.get("server_public_key"), str):
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+    raise AssertionError("Desktop bridge did not register with relay in time")
+
+
+def test_landing_chat_e2e_round_trip_via_relay_and_desktop_bridge(browser_matrix):
+    """Verify relay landing chat reaches desktop compute bridge over API v1 (non-streaming)."""
+    _, page = browser_matrix
+
+    relay_port = _find_open_port()
+    adapter_port = _find_open_port()
+    relay_url = f"http://127.0.0.1:{relay_port}"
+
+    adapter_app = Flask(__name__)
+
+    @adapter_app.route("/api/v1/chat/completions", methods=["POST"])
+    def adapter_chat_completion():
+        payload = request.get_json(silent=True) or {}
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return jsonify({"error": {"message": "messages must be a list"}}), 400
+
+        client = CryptoClient(relay_url)
+        response_history = client.send_chat_message(messages, max_retries=8)
+        if not isinstance(response_history, list) or not response_history:
+            return jsonify({"error": {"message": "relay round trip failed"}}), 502
+
+        assistant = response_history[-1]
+        if not isinstance(assistant, dict):
+            return jsonify({"error": {"message": "invalid relay response format"}}), 502
+
+        return jsonify(
+            {
+                "id": "chatcmpl-relay-desktop-e2e",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": payload.get("model", "llama-3-8b-instruct"),
+                "choices": [{"index": 0, "message": assistant, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
+
+    adapter_server = make_server("127.0.0.1", adapter_port, adapter_app, threaded=True)
+    adapter_thread = threading.Thread(target=adapter_server.serve_forever, daemon=True)
+    adapter_thread.start()
+
+    relay_env = os.environ.copy()
+    relay_env["TOKEN_PLACE_ENV"] = "testing"
+    relay_env["USE_MOCK_LLM"] = "1"
+    relay_env["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "distributed"
+    relay_env["TOKENPLACE_DISTRIBUTED_COMPUTE_URL"] = f"http://127.0.0.1:{adapter_port}"
+
+    relay_proc = subprocess.Popen(
+        [sys.executable, "relay.py", "--host", "127.0.0.1", "--port", str(relay_port), "--use_mock_llm"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=relay_env,
+    )
+
+    bridge_env = os.environ.copy()
+    bridge_env["TOKEN_PLACE_ENV"] = "testing"
+    bridge_env["USE_MOCK_LLM"] = "1"
+    bridge_proc = subprocess.Popen(
+        [
+            sys.executable,
+            "desktop-tauri/src-tauri/python/compute_node_bridge.py",
+            "--model",
+            "mock-model.gguf",
+            "--mode",
+            "cpu",
+            "--relay-url",
+            relay_url,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=bridge_env,
+    )
+
+    try:
+        _wait_for_http_ready(f"{relay_url}/healthz")
+        _wait_for_relay_server_registration(relay_url)
+
+        v2_requests = []
+        page.on(
+            "request",
+            lambda req: v2_requests.append(req.url)
+            if "/api/v2/chat/completions" in req.url
+            else None,
+        )
+
+        page.goto(relay_url)
+        page.wait_for_load_state("networkidle")
+        page.locator("textarea").first.fill("What is the capital of France?")
+        page.locator("button", has_text="Send").click()
+
+        assistant_message = page.locator(".assistant-message").last
+        assistant_message.wait_for(state="visible")
+        page.wait_for_function(
+            """
+            ({ selector, expectedText }) => {
+                const nodes = document.querySelectorAll(selector);
+                if (!nodes.length) return false;
+                const latest = nodes[nodes.length - 1];
+                return latest.textContent.includes(expectedText);
+            }
+            """,
+            arg={
+                "selector": ".assistant-message",
+                "expectedText": "Mock Response: The capital of France is Paris.",
+            },
+        )
+        assert "Mock Response: The capital of France is Paris." in assistant_message.inner_text()
+        assert v2_requests == []
+    finally:
+        for proc in (bridge_proc, relay_proc):
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        adapter_server.shutdown()
+        adapter_thread.join(timeout=5)

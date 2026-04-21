@@ -18,6 +18,17 @@ from utils.system import resource_monitor
 logger = logging.getLogger('model_manager')
 
 
+def _looks_like_repo_llama_shim(module_path: Optional[str]) -> bool:
+    """Return True when runtime imported the repository-local llama_cpp shim."""
+
+    if not module_path:
+        return False
+    normalized = Path(module_path).resolve().as_posix().lower()
+    if not normalized.endswith("/llama_cpp.py"):
+        return False
+    return "/site-packages/" not in normalized and "/dist-packages/" not in normalized
+
+
 def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     """Return backend/offload capability details from the installed llama_cpp runtime."""
     try:
@@ -454,6 +465,13 @@ class ModelManager:
                             compute_plan['device_name'] = 'unreported'
                             self.last_compute_diagnostics = compute_plan
                             runtime_identity = detect_llama_runtime_capabilities()
+                            if _looks_like_repo_llama_shim(
+                                runtime_identity.get('llama_module_path')
+                            ):
+                                raise RuntimeError(
+                                    "Detected repository-local llama_cpp.py shim in runtime import path; "
+                                    "refusing to start real inference runtime."
+                                )
                             self.log_info(
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "

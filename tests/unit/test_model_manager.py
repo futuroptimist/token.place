@@ -361,6 +361,27 @@ class TestModelManager:
             assert llm is not None
             assert llm == mock_llama
 
+    def test_get_llm_instance_rejects_repo_llama_shim(self, model_manager):
+        """Real runtime fails closed when llama_cpp resolves to the repo shim."""
+        fake_runtime_identity = {
+            'backend': 'cpu',
+            'gpu_offload_supported': False,
+            'detected_device': 'cpu',
+            'interpreter': sys.executable,
+            'prefix': sys.prefix,
+            'llama_module_path': str(Path.cwd() / 'llama_cpp.py'),
+            'error': None,
+        }
+        model_manager.use_mock_llm = False
+        model_manager.llm = None
+
+        with patch('os.path.exists', return_value=True), \
+             patch('llama_cpp.Llama', return_value=MagicMock(), create=True), \
+             patch('utils.llm.model_manager.detect_llama_runtime_capabilities', return_value=fake_runtime_identity):
+            llm = model_manager.get_llm_instance()
+
+        assert llm is None
+
     @patch('os.path.exists')
     def test_get_llm_instance_real_mode_no_model(self, mock_exists, model_manager):
         """Test get_llm_instance in real mode when the model file doesn't exist."""

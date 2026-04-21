@@ -251,16 +251,16 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
 
 @pytest.mark.e2e
-def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
+def test_landing_chat_round_trip_with_desktop_bridge_mock_plumbing_api_v1(
     page: Page,
     base_url: str,
     setup_servers,
 ):
     """
-    Validate relay landing chat end-to-end through the desktop compute-node bridge.
+    Validate relay landing chat mock plumbing through desktop compute-node bridge wiring.
 
-    This test intentionally avoids route mocking so CI verifies the real wiring:
-    browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
+    This test intentionally runs with USE_MOCK_LLM=1 and validates queue/bridge
+    registration plumbing only (not real llama.cpp inference).
     """
 
     relay_process, _ = setup_servers
@@ -269,6 +269,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
     test_env["USE_MOCK_LLM"] = "1"
+    test_env["TOKENPLACE_ENABLE_REPO_LLAMA_CPP_STUB"] = "1"
 
     bridge_process = subprocess.Popen(
         [
@@ -384,7 +385,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         )
 
         assistant_text = assistant_message.inner_text()
-        assert "capital" in assistant_text.lower()
+        assert "mock response" in assistant_text.lower()
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
 
@@ -406,6 +407,139 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
             except (BrokenPipeError, ValueError):
                 pass
 
+        try:
+            bridge_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bridge_process.kill()
+
+
+@pytest.mark.e2e
+def test_landing_chat_round_trip_with_desktop_bridge_real_inference_api_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """
+    Validate real desktop inference wiring without mock mode.
+
+    This test is environment-gated because it requires a real llama-cpp-python
+    runtime + model and a relay deployment that serves /api/v1 endpoints for
+    the landing page origin.
+    """
+
+    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
+        pytest.skip("Set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to run real desktop inference e2e")
+
+    relay_process, _ = setup_servers
+    assert relay_process is not None
+
+    test_env = os.environ.copy()
+    test_env["TOKEN_PLACE_ENV"] = "testing"
+    test_env["USE_MOCK_LLM"] = "0"
+    test_env.pop("TOKENPLACE_ENABLE_REPO_LLAMA_CPP_STUB", None)
+
+    bridge_process = subprocess.Popen(
+        [
+            sys.executable,
+            "desktop-tauri/src-tauri/python/compute_node_bridge.py",
+            "--model",
+            os.environ.get("E2E_REAL_LLAMACPP_MODEL_PATH", os.path.join(tempfile.gettempdir(), "missing.gguf")),
+            "--mode",
+            os.environ.get("E2E_REAL_LLAMACPP_MODE", "cpu"),
+            "--relay-url",
+            base_url,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=test_env,
+    )
+
+    stdout_queue: "queue.Queue[str]" = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def _drain_stream(stream, output_queue=None, collector=None):
+        for stream_line in iter(stream.readline, ""):
+            if output_queue is not None:
+                output_queue.put(stream_line)
+            if collector is not None:
+                collector.append(stream_line)
+
+    threading.Thread(target=_drain_stream, args=(bridge_process.stdout, stdout_queue, None), daemon=True).start()
+    threading.Thread(target=_drain_stream, args=(bridge_process.stderr, None, stderr_lines), daemon=True).start()
+
+    v1_requests = []
+    v2_requests = []
+
+    def record_v1_request(route):
+        v1_requests.append(route.request)
+        route.continue_()
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.continue_()
+
+    page.route("**/api/v1/chat/completions", record_v1_request)
+    page.route("**/api/v2/chat/completions", record_v2_request)
+
+    try:
+        start_deadline = time.time() + 30
+        started_payload = None
+        registered = False
+
+        while time.time() < start_deadline:
+            try:
+                line = stdout_queue.get(timeout=0.5)
+            except queue.Empty:
+                if bridge_process.poll() is not None:
+                    raise AssertionError(
+                        f"desktop bridge exited early rc={bridge_process.returncode}\n{''.join(stderr_lines)}"
+                    )
+                continue
+
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if payload.get("type") == "started":
+                started_payload = payload
+            if payload.get("type") == "status" and payload.get("registered") is True:
+                registered = True
+                break
+            if payload.get("type") == "error":
+                raise AssertionError(f"desktop bridge error event: {payload}")
+
+        assert started_payload is not None
+        assert started_payload.get("use_mock_llm") is False
+        assert started_payload.get("llama_repo_stub_imported") is False
+        assert registered
+
+        page.goto(base_url)
+        page.wait_for_load_state("networkidle")
+
+        textarea = page.locator("textarea").first
+        textarea.fill("hello from real desktop inference")
+        page.locator("button", has_text="Send").click()
+
+        assistant_message = page.locator(".assistant-message").last
+        assistant_message.wait_for(state="visible")
+        assistant_text = assistant_message.inner_text().strip()
+
+        assert assistant_text
+        assert assistant_text != "stub"
+        assert "Mock Response" not in assistant_text
+        assert len(v1_requests) >= 1
+        assert v2_requests == []
+    finally:
+        if bridge_process.stdin:
+            try:
+                bridge_process.stdin.write(json.dumps({"type": "cancel"}) + "\n")
+                bridge_process.stdin.flush()
+                bridge_process.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
         try:
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:

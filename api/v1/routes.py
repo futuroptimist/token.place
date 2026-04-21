@@ -33,7 +33,11 @@ from api.v1.models import (
     generate_response as _generate_response,
     get_model_instance as _get_model_instance,
 )
-from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
+from api.v1.compute_provider import (
+    ComputeProviderError,
+    get_api_v1_compute_provider,
+    get_api_v1_compute_provider_diagnostics,
+)
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_model_name as _validate_model_name,
@@ -321,6 +325,16 @@ def _handle_chat_completion_request(data):
 
         log_info(f"Generating response using model {model_id}")
         provider = get_api_v1_compute_provider()
+        provider_diag = get_api_v1_compute_provider_diagnostics()
+        log_info(
+            "api_v1.compute_route provider_mode=%s distributed_url=%s fallback=%s use_mock_llm=%s"
+            % (
+                provider_diag.get("mode"),
+                provider_diag.get("distributed_url_configured"),
+                provider_diag.get("distributed_fallback_enabled"),
+                os.environ.get("USE_MOCK_LLM", "0"),
+            )
+        )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -380,9 +394,13 @@ def _handle_chat_completion_request(data):
                     status_code=500,
                 )
 
-            return jsonify({"encrypted": True, "data": encrypted_response})
+            response = jsonify({"encrypted": True, "data": encrypted_response})
+            response.headers["X-Tokenplace-Api-V1-Provider"] = provider_diag.get("mode", "local")
+            return response
 
-        return jsonify(response_data)
+        response = jsonify(response_data)
+        response.headers["X-Tokenplace-Api-V1-Provider"] = provider_diag.get("mode", "local")
+        return response
 
     except ValidationError as e:
         return format_error_response(

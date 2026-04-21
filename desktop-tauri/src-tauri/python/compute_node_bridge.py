@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import time
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -167,6 +168,10 @@ def _sleep_with_cancel(seconds: float) -> bool:
 def run(args: argparse.Namespace) -> int:
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
+    use_mock_llm = bool(os.environ.get('USE_MOCK_LLM') == '1')
+    llama_module_path = str(runtime_setup.get('llama_module_path', 'missing'))
+    repo_llama_stub = llama_module_path.replace('\\', '/').endswith('/llama_cpp.py')
+
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
@@ -174,7 +179,9 @@ def run(args: argparse.Namespace) -> int:
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
-        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
+        f"llama_module_path={llama_module_path} "
+        f"llama_repo_stub_imported={repo_llama_stub} "
+        f"use_mock_llm={use_mock_llm} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
@@ -257,6 +264,8 @@ def run(args: argparse.Namespace) -> int:
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
             "last_error": None,
+            "use_mock_llm": use_mock_llm,
+            "llama_repo_stub_imported": repo_llama_stub,
         }
     )
 
@@ -328,6 +337,8 @@ def run(args: argparse.Namespace) -> int:
                     "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
                     "model_path": args.model,
                     "last_error": last_error,
+            "use_mock_llm": use_mock_llm,
+            "llama_repo_stub_imported": repo_llama_stub,
                 }
             )
 
@@ -357,6 +368,8 @@ def run(args: argparse.Namespace) -> int:
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
             "last_error": None,
+            "use_mock_llm": use_mock_llm,
+            "llama_repo_stub_imported": repo_llama_stub,
         }
     )
     return 0

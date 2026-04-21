@@ -150,6 +150,39 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
 }
 
+
+def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bool:
+    """
+    Return True when this run intentionally targets the relay landing-page smoke test.
+
+    Prefer selected nodeids when available and fall back to invocation args so
+    the gate keeps working across pytest selection behavior changes.
+    """
+    selected_nodeids = {item.nodeid for item in request.session.items}
+    if selected_nodeids and selected_nodeids.issubset(FOCUSED_RELAY_E2E_NODEIDS):
+        return True
+
+    invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
+    target_name = "landing_chat_uses_api_v1_only_non_streaming"
+    target_path = "tests/e2e/test_ui.py"
+
+    # Support direct nodeid invocation, e.g.
+    # `pytest tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming`.
+    if any(arg in FOCUSED_RELAY_E2E_NODEIDS for arg in invocation_args):
+        return True
+
+    # Focused fallback is intentionally strict: only treat the exact
+    # `tests/e2e/test_ui.py -k landing_chat_uses_api_v1_only_non_streaming`
+    # shape as focused so other relay registration e2e paths stay gated.
+    if target_path not in invocation_args:
+        return False
+
+    for i, arg in enumerate(invocation_args):
+        if arg == "-k" and i + 1 < len(invocation_args) and invocation_args[i + 1] == target_name:
+            return True
+
+    return False
+
 @pytest.fixture(scope="module")
 def setup_servers(
     request: pytest.FixtureRequest,
@@ -164,11 +197,11 @@ def setup_servers(
     4. Yields the processes
     5. Cleans up the processes after tests
     """
-    selected_nodeids = {item.nodeid for item in request.session.items}
-    focused_e2e_only = bool(selected_nodeids) and selected_nodeids.issubset(
-        FOCUSED_RELAY_E2E_NODEIDS
-    )
+    focused_e2e_only = _is_focused_relay_landing_chat_request(request)
 
+    # Fixes the Codex-focused skip case where this guard skipped runs when
+    # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not
+    # recognize `tests/e2e/test_ui.py -k landing_chat_uses_api_v1_only_non_streaming`.
     if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:
         pytest.skip(
             "Relay/server registration smoke tests are disabled by default; "

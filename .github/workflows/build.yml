@@ -1,6 +1,17 @@
 name: Build relay container image
 
 on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker/relay/**
+      - relay.py
+      - config/**
+      - api/**
+      - utils/**
+      - static/**
+      - config/requirements_relay.txt
+      - .github/workflows/build.yml
   push:
     branches:
       - main

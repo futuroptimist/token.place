@@ -1,4 +1,3 @@
-import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -98,7 +97,23 @@ def test_get_provider_disables_local_fallback_when_configured(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
     monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
 
-    importlib.reload(compute_provider)
-    provider = compute_provider.get_api_v1_compute_provider()
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
 
-    assert isinstance(provider, DistributedApiV1ComputeProvider)
+        assert isinstance(provider, DistributedApiV1ComputeProvider)
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        with pytest.raises(ComputeProviderError, match="requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL"):
+            compute_provider.get_api_v1_compute_provider()
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()

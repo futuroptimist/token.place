@@ -45,6 +45,8 @@ except ModuleNotFoundError:
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
+from utils.llm.model_manager import _is_repo_llama_cpp_shim as model_manager_is_repo_llama_cpp_shim
+
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
@@ -118,10 +120,7 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     """Return True when diagnostics indicate the repo-local llama_cpp.py shim."""
-    if not isinstance(module_path, str) or not module_path.strip():
-        return False
-    resolved = Path(module_path).resolve()
-    return resolved.name == "llama_cpp.py" and (resolved.parent / "relay.py").is_file()
+    return model_manager_is_repo_llama_cpp_shim(module_path)
 
 
 def _start_stdin_reader() -> None:

@@ -37,6 +37,7 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True):
     llama_module_path = getattr(llama_cpp, '__file__', None)
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
+        sys.modules.pop('llama_cpp', None)
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."

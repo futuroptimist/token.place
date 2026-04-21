@@ -156,9 +156,23 @@ def _build_api_v1_compute_provider(
         return local_provider
 
     if not distributed_url:
+        if not distributed_fallback_enabled:
+            message = (
+                "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed requires "
+                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL when "
+                "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK is disabled"
+            )
+            logger.error(
+                "%s (fallback_enabled=%s)",
+                message,
+                distributed_fallback_enabled,
+            )
+            raise ComputeProviderError(message)
         logger.warning(
             "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed set without "
-            "TOKENPLACE_DISTRIBUTED_COMPUTE_URL; using local fallback"
+            "TOKENPLACE_DISTRIBUTED_COMPUTE_URL; using local fallback "
+            "(fallback_enabled=%s)",
+            distributed_fallback_enabled,
         )
         return local_provider
 

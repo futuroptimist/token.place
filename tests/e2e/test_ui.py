@@ -242,3 +242,51 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
     assert v2_requests == []
+
+
+def test_landing_chat_live_relay_server_round_trip_api_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Exercise relay-served landing chat against live relay+server wiring (API v1 only)."""
+
+    v1_requests = []
+    v2_requests = []
+
+    def capture_v1(route):
+        v1_requests.append(route.request.url)
+        route.continue_()
+
+    def capture_v2(route):
+        v2_requests.append(route.request.url)
+        route.continue_()
+
+    page.route("**/api/v1/chat/completions", capture_v1)
+    page.route("**/api/v2/chat/completions", capture_v2)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("Please confirm this path uses API v1")
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible", timeout=15000)
+    page.wait_for_function(
+        """
+        ({ selector, expectedText }) => {
+            const nodes = document.querySelectorAll(selector);
+            if (!nodes.length) return false;
+            const latest = nodes[nodes.length - 1];
+            return latest.textContent.includes(expectedText);
+        }
+        """,
+        arg={"selector": ".assistant-message", "expectedText": "Mock Response: The capital of France is Paris."},
+        timeout=15000,
+    )
+
+    assert "Mock Response: The capital of France is Paris." in assistant_message.inner_text()
+    assert v1_requests, "expected at least one API v1 chat request"
+    assert v2_requests == []

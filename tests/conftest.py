@@ -150,6 +150,30 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
 }
 
+
+def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bool:
+    """
+    Return True when this run intentionally targets the relay landing-page smoke test.
+
+    Prefer selected nodeids when available and fall back to invocation args so
+    the gate keeps working across pytest selection behavior changes.
+    """
+    selected_nodeids = {item.nodeid for item in request.session.items}
+    if selected_nodeids and selected_nodeids.issubset(FOCUSED_RELAY_E2E_NODEIDS):
+        return True
+
+    invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
+    if "tests/e2e/test_ui.py" not in invocation_args:
+        return False
+
+    if (
+        "-k" in invocation_args
+        and "landing_chat_uses_api_v1_only_non_streaming" in invocation_args
+    ):
+        return True
+
+    return any(arg in FOCUSED_RELAY_E2E_NODEIDS for arg in invocation_args)
+
 @pytest.fixture(scope="module")
 def setup_servers(
     request: pytest.FixtureRequest,
@@ -164,10 +188,7 @@ def setup_servers(
     4. Yields the processes
     5. Cleans up the processes after tests
     """
-    selected_nodeids = {item.nodeid for item in request.session.items}
-    focused_e2e_only = bool(selected_nodeids) and selected_nodeids.issubset(
-        FOCUSED_RELAY_E2E_NODEIDS
-    )
+    focused_e2e_only = _is_focused_relay_landing_chat_request(request)
 
     if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:
         pytest.skip(

@@ -150,6 +150,12 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
 }
 
+
+def _normalize_nodeid(nodeid: str) -> str:
+    """Normalize pytest nodeids by stripping parametrization suffixes."""
+    return nodeid.split("[", 1)[0]
+
+
 @pytest.fixture(scope="module")
 def setup_servers(
     request: pytest.FixtureRequest,
@@ -164,7 +170,7 @@ def setup_servers(
     4. Yields the processes
     5. Cleans up the processes after tests
     """
-    selected_nodeids = {item.nodeid for item in request.session.items}
+    selected_nodeids = {_normalize_nodeid(item.nodeid) for item in request.session.items}
     focused_e2e_only = bool(selected_nodeids) and selected_nodeids.issubset(
         FOCUSED_RELAY_E2E_NODEIDS
     )

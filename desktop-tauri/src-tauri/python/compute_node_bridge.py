@@ -105,6 +105,7 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
 
     return (
         "desktop.compute_node_bridge.runtime_state "
+        f"mock_mode={diagnostics.get('mock_mode')} "
         f"requested_mode={diagnostics.get('requested_mode')} "
         f"effective_mode={diagnostics.get('effective_mode')} "
         f"backend_selected={diagnostics.get('backend_selected')} "
@@ -167,6 +168,8 @@ def _sleep_with_cancel(seconds: float) -> bool:
 def run(args: argparse.Namespace) -> int:
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
+    llama_module_path = str(runtime_setup.get("llama_module_path", "missing"))
+    repo_llama_shim = llama_module_path.replace("\\", "/").lower().endswith("/llama_cpp.py")
     print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
@@ -174,7 +177,8 @@ def run(args: argparse.Namespace) -> int:
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
-        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
+        f"llama_module_path={llama_module_path} "
+        f"repo_llama_shim={repo_llama_shim} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
@@ -237,6 +241,7 @@ def run(args: argparse.Namespace) -> int:
 
     print("desktop.compute_node_bridge.model_init.ready", file=sys.stderr)
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
+    diagnostics["mock_mode"] = bool(getattr(runtime.model_manager, "use_mock_llm", False))
     print(_runtime_diagnostics_summary(diagnostics), file=sys.stderr)
     last_error: Optional[str] = None
     emit(
@@ -256,6 +261,7 @@ def run(args: argparse.Namespace) -> int:
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
+            "mock_mode": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
             "last_error": None,
         }
     )
@@ -308,6 +314,7 @@ def run(args: argparse.Namespace) -> int:
                 last_error = None
 
             diagnostics = compute_mode_diagnostics(runtime.model_manager)
+            diagnostics["mock_mode"] = bool(getattr(runtime.model_manager, "use_mock_llm", False))
             emit(
                 {
                     "type": "status",
@@ -327,6 +334,7 @@ def run(args: argparse.Namespace) -> int:
                     "interpreter": runtime_setup.get("interpreter", sys.executable),
                     "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
                     "model_path": args.model,
+                    "mock_mode": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
                     "last_error": last_error,
                 }
             )
@@ -339,6 +347,7 @@ def run(args: argparse.Namespace) -> int:
         runtime.stop()
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
+    diagnostics["mock_mode"] = bool(getattr(runtime.model_manager, "use_mock_llm", False))
     emit(
         {
             "type": "stopped",
@@ -356,6 +365,7 @@ def run(args: argparse.Namespace) -> int:
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
+            "mock_mode": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
             "last_error": None,
         }
     )

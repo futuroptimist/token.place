@@ -320,6 +320,12 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
+        log_info(
+            "API v1 chat provider request "
+            f"mode={os.environ.get('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'auto')} "
+            f"distributed_url_set={bool(os.environ.get('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', '').strip())} "
+            f"mock_mode={os.environ.get('USE_MOCK_LLM') == '1'}"
+        )
         provider = get_api_v1_compute_provider()
         assistant_message = provider.complete_chat(
             model_id=model_id,
@@ -469,6 +475,12 @@ def _handle_text_completion_request(data):
             )
 
         log_info(f"Generating response using model {model_id}")
+        log_info(
+            "API v1 completion provider request "
+            f"mode={os.environ.get('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'auto')} "
+            f"distributed_url_set={bool(os.environ.get('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', '').strip())} "
+            f"mock_mode={os.environ.get('USE_MOCK_LLM') == '1'}"
+        )
         provider = get_api_v1_compute_provider()
         assistant_message = provider.complete_chat(
             model_id=model_id,

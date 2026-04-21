@@ -1,8 +1,4 @@
-"""Compute provider abstraction for API v1 request handling.
-
-This module allows API v1 routes to target either local llama execution or a
-remote distributed compute-node endpoint while preserving a local fallback.
-"""
+"""Compute provider abstraction for API v1 request handling."""
 
 from __future__ import annotations
 
@@ -143,13 +139,41 @@ class FallbackApiV1ComputeProvider:
             )
 
 
+@dataclass(frozen=True)
+class StrictDistributedApiV1ComputeProvider:
+    """Distributed-only provider that refuses silent local fallback."""
+
+    primary: ApiV1ComputeProvider
+
+    def complete_chat(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return self.primary.complete_chat(
+            model_id=model_id,
+            messages=messages,
+            options=options,
+        )
+
+
 @lru_cache(maxsize=8)
-def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1ComputeProvider:
+def _build_api_v1_compute_provider(
+    mode: str,
+    distributed_url: str,
+    allow_local_fallback: bool,
+) -> ApiV1ComputeProvider:
     """Create a compute provider for the normalized environment inputs."""
 
     local_provider = LocalApiV1ComputeProvider()
 
+    if mode == "auto":
+        mode = "distributed" if distributed_url else "local"
+
     if mode != "distributed":
+        logger.info("api.v1.compute_provider.selected provider=local mode=%s", mode)
         return local_provider
 
     if not distributed_url:
@@ -160,12 +184,28 @@ def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1Comp
         return local_provider
 
     distributed_provider = DistributedApiV1ComputeProvider(base_url=distributed_url)
-    return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
+    logger.info(
+        "api.v1.compute_provider.selected provider=distributed "
+        "distributed_url=%s local_fallback=%s",
+        distributed_url.rstrip("/"),
+        allow_local_fallback,
+    )
+    if allow_local_fallback:
+        return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
+    return StrictDistributedApiV1ComputeProvider(primary=distributed_provider)
 
 
 def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     """Resolve the active provider based on environment configuration."""
 
-    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
+    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "auto").strip().lower()
     distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
-    return _build_api_v1_compute_provider(mode, distributed_url)
+    if "TOKENPLACE_API_V1_DISTRIBUTED_ALLOW_LOCAL_FALLBACK" in os.environ:
+        allow_local_fallback = (
+            os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_ALLOW_LOCAL_FALLBACK") == "1"
+        )
+    else:
+        # Preserve explicit distributed mode behavior while making auto-distributed
+        # fail closed by default for relay/desktop wiring validation.
+        allow_local_fallback = mode == "distributed"
+    return _build_api_v1_compute_provider(mode, distributed_url, allow_local_fallback)

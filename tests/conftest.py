@@ -146,9 +146,15 @@ E2E_SERVER_PORT = 8010
 E2E_RELAY_PORT = 5010
 E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
-FOCUSED_RELAY_E2E_NODEIDS = {
+FOCUSED_RELAY_E2E_NODEID_SUFFIXES = (
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
-}
+)
+
+
+def _is_focused_relay_e2e_nodeid(nodeid: str) -> bool:
+    """Return True when the selected nodeid targets the focused relay landing-page e2e."""
+    normalized = nodeid.replace('\\', '/')
+    return any(normalized.endswith(suffix) for suffix in FOCUSED_RELAY_E2E_NODEID_SUFFIXES)
 
 @pytest.fixture(scope="module")
 def setup_servers(
@@ -165,8 +171,8 @@ def setup_servers(
     5. Cleans up the processes after tests
     """
     selected_nodeids = {item.nodeid for item in request.session.items}
-    focused_e2e_only = bool(selected_nodeids) and selected_nodeids.issubset(
-        FOCUSED_RELAY_E2E_NODEIDS
+    focused_e2e_only = bool(selected_nodeids) and all(
+        _is_focused_relay_e2e_nodeid(nodeid) for nodeid in selected_nodeids
     )
 
     if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:

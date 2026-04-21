@@ -55,7 +55,13 @@ class EncryptionManager:
                 client_public_key = base64.b64decode(client_public_key)
 
             # Encrypt the data
-            ciphertext_dict, cipherkey, iv = encrypt(json_data, client_public_key)
+            # API v1 browser clients (landing-page chat) use JSEncrypt, which expects
+            # PKCS#1 v1.5-wrapped session keys for RSA decrypt compatibility.
+            ciphertext_dict, cipherkey, iv = encrypt(
+                json_data,
+                client_public_key,
+                use_pkcs1v15=True,
+            )
 
             # Encode to base64 for JSON
             ciphertext_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')

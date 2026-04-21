@@ -29,3 +29,5 @@ Local relay validation of the core browser chat journey was broken. Users and de
 - Keep relay landing-page chat tests asserting no `/api/v2/chat/completions` traffic.
 - Keep architecture docs explicit that relay-path traffic in `v0.1.0` is API v1-only and non-streaming.
 - Treat browser/client key-format mismatches as outage-level regressions whenever API encryption contracts change.
+- See also: `outages/2026-04-20-relay-api-v1-chat-round-trip-regression.md` for the
+  integration-coverage follow-up that added real relay+desktop bridge+browser CI coverage.

@@ -1,6 +1,9 @@
 import base64
 import json
+import os
 import pytest
+import subprocess
+import sys
 from playwright.sync_api import Page
 import time
 
@@ -242,3 +245,111 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
     assert v2_requests == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """
+    Validate relay landing chat end-to-end through the desktop compute-node bridge.
+
+    This test intentionally avoids route mocking so CI verifies the real wiring:
+    browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
+    """
+
+    relay_process, _ = setup_servers
+    assert relay_process is not None
+
+    test_env = os.environ.copy()
+    test_env["TOKEN_PLACE_ENV"] = "testing"
+    test_env["USE_MOCK_LLM"] = "1"
+
+    bridge_process = subprocess.Popen(
+        [
+            sys.executable,
+            "desktop-tauri/src-tauri/python/compute_node_bridge.py",
+            "--model",
+            "/tmp/mock-model.gguf",
+            "--mode",
+            "cpu",
+            "--relay-url",
+            base_url,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=test_env,
+    )
+
+    try:
+        start_deadline = time.time() + 25
+        registered = False
+        started = False
+
+        while time.time() < start_deadline:
+            line = bridge_process.stdout.readline()
+            if not line:
+                if bridge_process.poll() is not None:
+                    stderr_output = bridge_process.stderr.read()
+                    raise AssertionError(
+                        f"desktop bridge exited early rc={bridge_process.returncode}\n{stderr_output}"
+                    )
+                time.sleep(0.1)
+                continue
+
+            payload = json.loads(line)
+            event_type = payload.get("type")
+
+            if event_type == "started":
+                started = bool(payload.get("running"))
+            if event_type == "status" and payload.get("registered") is True:
+                registered = True
+                break
+            if event_type == "error":
+                raise AssertionError(f"desktop bridge error event: {payload}")
+
+        assert started, "desktop bridge did not emit a started event"
+        assert registered, "desktop bridge never reported relay registration"
+
+        page.goto(base_url)
+        page.wait_for_load_state("networkidle")
+
+        textarea = page.locator("textarea").first
+        textarea.fill("hello relay + desktop bridge")
+        page.locator("button", has_text="Send").click()
+
+        assistant_message = page.locator(".assistant-message").last
+        assistant_message.wait_for(state="visible")
+
+        page.wait_for_function(
+            """
+            ({ selector, expectedText }) => {
+                const nodes = document.querySelectorAll(selector);
+                if (!nodes.length) return false;
+                const latest = nodes[nodes.length - 1];
+                return latest.textContent.includes(expectedText);
+            }
+            """,
+            arg={
+                "selector": ".assistant-message",
+                "expectedText": "Paris",
+            },
+        )
+
+        assert "Paris" in assistant_message.inner_text()
+        assert "Sorry, I encountered an issue generating a response." not in page.content()
+        assert "Unknown streaming error" not in page.content()
+    finally:
+        if bridge_process.stdin:
+            bridge_process.stdin.write(json.dumps({"type": "cancel"}) + "\n")
+            bridge_process.stdin.flush()
+            bridge_process.stdin.close()
+
+        try:
+            bridge_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bridge_process.kill()

@@ -41,3 +41,17 @@ def test_decrypt_message_error(monkeypatch):
     monkeypatch.setattr("api.v1.encryption.decrypt", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     out = manager.decrypt_message({"ciphertext": b"x", "iv": b"y"}, b"k")
     assert out is None
+
+
+def test_encrypt_message_uses_pkcs1v15_for_browser_compat(monkeypatch):
+    manager = EncryptionManager()
+    captured = {}
+
+    def _fake_encrypt(payload, public_key, **kwargs):
+        captured["kwargs"] = kwargs
+        return {"ciphertext": b"cipher", "iv": b"iv"}, b"key", b"iv"
+
+    monkeypatch.setattr("api.v1.encryption.encrypt", _fake_encrypt)
+    out = manager.encrypt_message({"hello": "world"}, manager.public_key_b64)
+    assert out is not None
+    assert captured["kwargs"].get("use_pkcs1v15") is True

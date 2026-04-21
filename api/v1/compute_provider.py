@@ -116,7 +116,7 @@ class DistributedApiV1ComputeProvider:
 
 @dataclass(frozen=True)
 class FallbackApiV1ComputeProvider:
-    """Wrap distributed execution with local fallback for migration safety."""
+    """Wrap distributed execution with optional local fallback."""
 
     primary: ApiV1ComputeProvider
     fallback: ApiV1ComputeProvider
@@ -144,23 +144,35 @@ class FallbackApiV1ComputeProvider:
 
 
 @lru_cache(maxsize=8)
-def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1ComputeProvider:
+def _build_api_v1_compute_provider(
+    mode: str,
+    distributed_url: str,
+    allow_fallback: bool,
+) -> ApiV1ComputeProvider:
     """Create a compute provider for the normalized environment inputs."""
 
     local_provider = LocalApiV1ComputeProvider()
 
     if mode != "distributed":
+        logger.info("api_v1.compute_provider.selected mode=%s provider=local", mode)
         return local_provider
 
     if not distributed_url:
         logger.warning(
             "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed set without "
-            "TOKENPLACE_DISTRIBUTED_COMPUTE_URL; using local fallback"
+            "TOKENPLACE_DISTRIBUTED_COMPUTE_URL; using local provider"
         )
         return local_provider
 
     distributed_provider = DistributedApiV1ComputeProvider(base_url=distributed_url)
-    return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
+    if allow_fallback:
+        logger.warning(
+            "api_v1.compute_provider.selected mode=distributed provider=distributed+local_fallback"
+        )
+        return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
+
+    logger.info("api_v1.compute_provider.selected mode=distributed provider=distributed")
+    return distributed_provider
 
 
 def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
@@ -168,4 +180,21 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
 
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
     distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
-    return _build_api_v1_compute_provider(mode, distributed_url)
+    allow_fallback = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    return _build_api_v1_compute_provider(mode, distributed_url, allow_fallback)
+
+
+def get_api_v1_compute_provider_diagnostics() -> Dict[str, str]:
+    """Return compact provider-selection diagnostics for API v1 request logging."""
+
+    return {
+        "mode": os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower() or "local",
+        "distributed_url_configured": "1"
+        if bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip())
+        else "0",
+        "distributed_fallback_enabled": "1"
+        if os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
+        else "0",
+    }

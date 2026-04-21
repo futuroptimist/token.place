@@ -18,16 +18,45 @@ from utils.system import resource_monitor
 logger = logging.getLogger('model_manager')
 
 
-def detect_llama_runtime_capabilities() -> Dict[str, Any]:
-    """Return backend/offload capability details from the installed llama_cpp runtime."""
+def _repo_llama_stub_path() -> Path:
+    return (Path(__file__).resolve().parents[2] / 'llama_cpp.py').resolve()
+
+
+def _is_repo_llama_stub(module_file: str | None) -> bool:
+    if not module_file:
+        return False
+    try:
+        return Path(module_file).resolve() == _repo_llama_stub_path()
+    except Exception:
+        return False
+
+
+def _llama_runtime_identity() -> Dict[str, Any]:
     try:
         import llama_cpp
     except Exception as exc:
+        return {'module': None, 'module_path': None, 'import_error': str(exc), 'repo_stub': False}
+
+    module_path = getattr(llama_cpp, '__file__', None)
+    return {
+        'module': llama_cpp,
+        'module_path': module_path,
+        'import_error': None,
+        'repo_stub': _is_repo_llama_stub(module_path),
+    }
+
+
+def detect_llama_runtime_capabilities() -> Dict[str, Any]:
+    """Return backend/offload capability details from the installed llama_cpp runtime."""
+    identity = _llama_runtime_identity()
+    llama_cpp = identity.get('module')
+    if llama_cpp is None:
         return {
             'backend': 'missing',
             'gpu_offload_supported': False,
             'detected_device': 'none',
-            'error': str(exc),
+            'llama_repo_stub_imported': False,
+            'error': identity.get('import_error'),
         }
 
     backend = 'cpu'
@@ -70,7 +99,8 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'detected_device': backend if gpu_offload_supported else 'cpu',
         'interpreter': sys.executable,
         'prefix': sys.prefix,
-        'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),
+        'llama_module_path': identity.get('module_path') or 'unknown',
+        'llama_repo_stub_imported': bool(identity.get('repo_stub')),
         'error': None,
     }
 
@@ -408,6 +438,18 @@ class ModelManager:
                     else:
                         try:
                             # Dynamically import Llama only when needed
+                            runtime_identity = _llama_runtime_identity()
+                            if runtime_identity.get('module') is None:
+                                raise RuntimeError(
+                                    f"Failed to import llama_cpp runtime: {runtime_identity.get('import_error')}"
+                                )
+                            if runtime_identity.get('repo_stub') and os.getenv(
+                                'TOKENPLACE_ALLOW_REPO_LLAMA_SHIM', '0'
+                            ) != '1':
+                                raise RuntimeError(
+                                    'Refusing to initialize runtime with repo-local llama_cpp.py shim '
+                                    '(set TOKENPLACE_ALLOW_REPO_LLAMA_SHIM=1 only for isolated tests)'
+                                )
                             from llama_cpp import Llama
 
                             compute_plan = self._resolve_compute_plan()

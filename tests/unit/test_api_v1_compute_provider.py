@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from api.v1.compute_provider import (
+    get_api_v1_compute_provider,
     ComputeProviderError,
     DistributedApiV1ComputeProvider,
     FallbackApiV1ComputeProvider,
@@ -89,3 +90,21 @@ def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatc
             model_id="llama-3-8b-instruct",
             messages=[{"role": "user", "content": "hello"}],
         )
+
+
+def test_distributed_provider_default_disables_local_fallback(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.delenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", raising=False)
+
+    provider = get_api_v1_compute_provider()
+    assert isinstance(provider, DistributedApiV1ComputeProvider)
+
+
+def test_distributed_provider_opt_in_local_fallback(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1")
+
+    provider = get_api_v1_compute_provider()
+    assert isinstance(provider, FallbackApiV1ComputeProvider)

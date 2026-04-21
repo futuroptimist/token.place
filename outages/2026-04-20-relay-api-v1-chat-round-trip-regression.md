@@ -48,4 +48,3 @@ desktop compute-node bridge process that participates in the real sink/source re
   `/api/v1/chat/completions` boundary.
 - Treat any client key-serialization or encrypted response-shape changes as outage-class changes
   requiring full-path e2e coverage updates.
-

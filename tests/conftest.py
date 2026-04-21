@@ -164,7 +164,10 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         return True
 
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
-    target_name = "landing_chat_uses_api_v1_only_non_streaming"
+    target_names = {
+        "landing_chat_uses_api_v1_only_non_streaming",
+        "landing_chat_round_trip_with_desktop_bridge_api_v1",
+    }
     target_path = "tests/e2e/test_ui.py"
 
     # Support direct nodeid invocation, e.g.
@@ -173,13 +176,13 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         return True
 
     # Focused fallback is intentionally strict: only treat the exact
-    # `tests/e2e/test_ui.py -k landing_chat_uses_api_v1_only_non_streaming`
+    # `tests/e2e/test_ui.py -k <focused landing-chat test name>`
     # shape as focused so other relay registration e2e paths stay gated.
     if target_path not in invocation_args:
         return False
 
     for i, arg in enumerate(invocation_args):
-        if arg == "-k" and i + 1 < len(invocation_args) and invocation_args[i + 1] == target_name:
+        if arg == "-k" and i + 1 < len(invocation_args) and invocation_args[i + 1] in target_names:
             return True
 
     return False

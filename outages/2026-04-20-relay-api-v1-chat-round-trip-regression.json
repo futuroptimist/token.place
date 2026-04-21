@@ -6,4 +6,3 @@
   "fix": "Pinned relay landing-page flow to API v1 non-streaming behavior and added an unmocked relay+desktop bridge+browser e2e test that verifies encrypted API v1 round-trip wiring.",
   "lessons": "Contract changes in encrypted API v1 paths require full integration tests across relay.py, static chat UI, and desktop bridge runtime; frontend-only API mocks are insufficient."
 }
-

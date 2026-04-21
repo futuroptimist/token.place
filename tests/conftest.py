@@ -164,24 +164,21 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
 
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_name = "landing_chat_uses_api_v1_only_non_streaming"
+    target_path = "tests/e2e/test_ui.py"
 
     # Support direct nodeid invocation, e.g.
     # `pytest tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming`.
     if any(arg in FOCUSED_RELAY_E2E_NODEIDS for arg in invocation_args):
         return True
 
-    has_e2e_ui_target = any("tests/e2e/test_ui.py" in arg for arg in invocation_args)
-    if not has_e2e_ui_target:
+    # Focused fallback is intentionally strict: only treat the exact
+    # `tests/e2e/test_ui.py -k landing_chat_uses_api_v1_only_non_streaming`
+    # shape as focused so other relay registration e2e paths stay gated.
+    if target_path not in invocation_args:
         return False
 
-    # Support common -k formats:
-    #   - `-k landing_chat_uses_api_v1_only_non_streaming`
-    #   - `-k "landing_chat_uses_api_v1_only_non_streaming and not slow"`
-    #   - `-klanding_chat_uses_api_v1_only_non_streaming`
     for i, arg in enumerate(invocation_args):
-        if arg == "-k" and i + 1 < len(invocation_args) and target_name in invocation_args[i + 1]:
-            return True
-        if arg.startswith("-k") and target_name in arg[2:]:
+        if arg == "-k" and i + 1 < len(invocation_args) and invocation_args[i + 1] == target_name:
             return True
 
     return False
@@ -202,6 +199,9 @@ def setup_servers(
     """
     focused_e2e_only = _is_focused_relay_landing_chat_request(request)
 
+    # Fixes the Codex-focused skip case where this guard skipped runs when
+    # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not
+    # recognize `tests/e2e/test_ui.py -k landing_chat_uses_api_v1_only_non_streaming`.
     if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:
         pytest.skip(
             "Relay/server registration smoke tests are disabled by default; "

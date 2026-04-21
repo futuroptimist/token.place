@@ -163,16 +163,28 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         return True
 
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
-    if "tests/e2e/test_ui.py" not in invocation_args:
-        return False
+    target_name = "landing_chat_uses_api_v1_only_non_streaming"
 
-    if (
-        "-k" in invocation_args
-        and "landing_chat_uses_api_v1_only_non_streaming" in invocation_args
-    ):
+    # Support direct nodeid invocation, e.g.
+    # `pytest tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming`.
+    if any(arg in FOCUSED_RELAY_E2E_NODEIDS for arg in invocation_args):
         return True
 
-    return any(arg in FOCUSED_RELAY_E2E_NODEIDS for arg in invocation_args)
+    has_e2e_ui_target = any("tests/e2e/test_ui.py" in arg for arg in invocation_args)
+    if not has_e2e_ui_target:
+        return False
+
+    # Support common -k formats:
+    #   - `-k landing_chat_uses_api_v1_only_non_streaming`
+    #   - `-k "landing_chat_uses_api_v1_only_non_streaming and not slow"`
+    #   - `-klanding_chat_uses_api_v1_only_non_streaming`
+    for i, arg in enumerate(invocation_args):
+        if arg == "-k" and i + 1 < len(invocation_args) and target_name in invocation_args[i + 1]:
+            return True
+        if arg.startswith("-k") and target_name in arg[2:]:
+            return True
+
+    return False
 
 @pytest.fixture(scope="module")
 def setup_servers(

@@ -399,8 +399,17 @@ new Vue({
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(`API error: ${errorData.error?.message || 'Unknown error'}`);
+                    let errorData = null;
+                    try {
+                        errorData = await response.json();
+                    } catch (_ignored) {
+                        errorData = null;
+                    }
+
+                    const serverMessage = errorData && errorData.error && errorData.error.message
+                        ? errorData.error.message
+                        : `HTTP ${response.status}`;
+                    throw new Error(`API v1 request failed: ${serverMessage}`);
                 }
 
                 const responseData = await response.json();
@@ -423,8 +432,11 @@ new Vue({
                 // Handle unencrypted response (should not happen with encrypted=true)
                 return responseData;
             } catch (error) {
+                const message = error && error.message
+                    ? error.message
+                    : 'Unknown API request error';
                 console.error('API request error:', error);
-                return null;
+                return { error: message };
             }
         },
 
@@ -543,6 +555,10 @@ new Vue({
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
                 let response = await this.sendMessageApi();
 
+                if (response && typeof response === 'object' && typeof response.error === 'string') {
+                    throw new Error(response.error);
+                }
+
                 // Process the response
                 if (response) {
                     // For API response, extract last message
@@ -576,7 +592,7 @@ new Vue({
                 console.error('Error sending message:', error);
                 this.chatHistory.push({
                     role: 'assistant',
-                    content: 'Sorry, an error occurred while sending your message. Please try again.'
+                    content: `Sorry, I couldn't complete your API v1 request (${error.message || 'unknown error'}). Please try again.`
                 });
             } finally {
                 this.isGeneratingResponse = false;

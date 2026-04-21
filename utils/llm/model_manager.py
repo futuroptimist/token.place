@@ -33,6 +33,16 @@ def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
 
 def _import_llama_cpp_runtime(*, require_real_runtime: bool = True):
     """Import llama_cpp while guarding against the repo-local test shim."""
+    llama_spec = importlib.util.find_spec('llama_cpp')
+    llama_module_path = getattr(llama_spec, 'origin', None)
+
+    if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
+        sys.modules.pop('llama_cpp', None)
+        raise ImportError(
+            "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
+            "install llama-cpp-python and ensure site-packages wins import priority."
+        )
+
     llama_cpp = importlib.import_module('llama_cpp')
     llama_module_path = getattr(llama_cpp, '__file__', None)
 

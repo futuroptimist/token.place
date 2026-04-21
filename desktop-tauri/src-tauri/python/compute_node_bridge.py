@@ -45,7 +45,7 @@ except ModuleNotFoundError:
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
-from utils.llm.model_manager import _is_repo_llama_cpp_shim as model_manager_is_repo_llama_cpp_shim
+from utils.llm.model_manager import _is_repo_llama_cpp_shim
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
@@ -116,11 +116,6 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
         f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
         f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
     )
-
-
-def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
-    """Return True when diagnostics indicate the repo-local llama_cpp.py shim."""
-    return model_manager_is_repo_llama_cpp_shim(module_path)
 
 
 def _start_stdin_reader() -> None:

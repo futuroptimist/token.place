@@ -101,7 +101,7 @@ def test_get_provider_disables_local_fallback_when_configured(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
 
-        assert isinstance(provider, DistributedApiV1ComputeProvider)
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 

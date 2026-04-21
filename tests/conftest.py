@@ -149,6 +149,7 @@ BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
 }
+FOCUSED_RELAY_E2E_KEYWORD = "landing_chat_uses_api_v1_only_non_streaming"
 
 @pytest.fixture(scope="module")
 def setup_servers(
@@ -168,8 +169,14 @@ def setup_servers(
     focused_e2e_only = bool(selected_nodeids) and selected_nodeids.issubset(
         FOCUSED_RELAY_E2E_NODEIDS
     )
+    keyword_expr = request.config.getoption("-k") or ""
+    focused_e2e_keyword = FOCUSED_RELAY_E2E_KEYWORD in keyword_expr
 
-    if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:
+    if (
+        os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1"
+        and not focused_e2e_only
+        and not focused_e2e_keyword
+    ):
         pytest.skip(
             "Relay/server registration smoke tests are disabled by default; "
             "set RUN_RELAY_REGISTRATION_TESTS=1 to enable.",
@@ -216,7 +223,7 @@ def setup_servers(
         print(f"Relay stderr: {stderr}")
         pytest.skip("Relay server failed to start")
 
-    if focused_e2e_only:
+    if focused_e2e_only or focused_e2e_keyword:
         print("Focused relay e2e mode enabled: skipping server registration bootstrap")
         yield relay_process, None
         relay_process.terminate()

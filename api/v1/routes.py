@@ -12,7 +12,9 @@ import uuid
 import logging
 import os
 import math
+import sys
 
+import requests
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
 from api.v1.moderation import evaluate_messages_for_policy
@@ -122,6 +124,69 @@ def _configured_relay_servers() -> list[str]:
 
 
 _image_generator = LocalImageGenerator()
+
+
+def _running_inside_relay_process() -> bool:
+    return os.path.basename(sys.argv[0]).lower() == "relay.py"
+
+
+def _try_relay_encrypted_round_trip(payload: dict) -> tuple[dict | None, str | None]:
+    """Forward encrypted API v1 payloads through relay queue endpoints when available."""
+
+    base_url = request.host_url.rstrip("/")
+    timeout_seconds = float(os.environ.get("TOKENPLACE_API_V1_RELAY_TIMEOUT_SECONDS", "30"))
+
+    try:
+        next_server_response = requests.get(f"{base_url}/next_server", timeout=5)
+        next_server_response.raise_for_status()
+        next_server_payload = next_server_response.json()
+    except Exception as exc:
+        return None, f"failed to resolve relay compute node: {exc}"
+
+    server_public_key = next_server_payload.get("server_public_key")
+    if not isinstance(server_public_key, str) or not server_public_key:
+        return None, "relay /next_server returned no server_public_key"
+
+    encrypted_messages = payload.get("messages") or {}
+    faucet_payload = {
+        "server_public_key": server_public_key,
+        "client_public_key": payload.get("client_public_key"),
+        "chat_history": encrypted_messages.get("ciphertext"),
+        "cipherkey": encrypted_messages.get("cipherkey"),
+        "iv": encrypted_messages.get("iv"),
+        "stream": False,
+    }
+
+    try:
+        faucet_response = requests.post(f"{base_url}/faucet", json=faucet_payload, timeout=5)
+        faucet_response.raise_for_status()
+    except Exception as exc:
+        return None, f"failed to enqueue relay request: {exc}"
+
+    deadline = time.time() + timeout_seconds
+    retrieve_payload = {"client_public_key": payload.get("client_public_key")}
+    while time.time() < deadline:
+        try:
+            retrieve_response = requests.post(
+                f"{base_url}/retrieve",
+                json=retrieve_payload,
+                timeout=5,
+            )
+            retrieve_response.raise_for_status()
+            retrieve_data = retrieve_response.json()
+        except Exception as exc:
+            return None, f"failed to poll relay response: {exc}"
+
+        if isinstance(retrieve_data, dict) and retrieve_data.get("chat_history"):
+            return {
+                "ciphertext": retrieve_data.get("chat_history"),
+                "cipherkey": retrieve_data.get("cipherkey"),
+                "iv": retrieve_data.get("iv"),
+            }, None
+
+        time.sleep(0.2)
+
+    return None, f"timed out waiting for relay response after {timeout_seconds:.0f}s"
 
 
 def format_error_response(message, error_type="invalid_request_error", param=None, code=None, status_code=400):
@@ -234,6 +299,24 @@ def _handle_chat_completion_request(data):
         client_public_key = None
 
         if is_encrypted_request:
+            relay_round_trip_enabled = (
+                os.environ.get("TOKENPLACE_API_V1_USE_RELAY_QUEUE", "1").strip() != "0"
+            )
+            relay_round_trip_strict = _running_inside_relay_process()
+            if relay_round_trip_enabled:
+                relay_encrypted_payload, relay_error = _try_relay_encrypted_round_trip(data)
+                if relay_encrypted_payload:
+                    log_info("API v1 encrypted completion routed via relay queue path")
+                    return jsonify({"encrypted": True, "data": relay_encrypted_payload})
+                if relay_error:
+                    log_warning(f"Relay queue path unavailable for encrypted request: {relay_error}")
+                    if relay_round_trip_strict:
+                        return format_error_response(
+                            f"Relay queue path failed: {relay_error}",
+                            error_type="server_error",
+                            status_code=502,
+                        )
+
             log_info("Processing encrypted request")
 
             try:

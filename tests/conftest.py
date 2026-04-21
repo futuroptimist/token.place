@@ -148,7 +148,8 @@ E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
-    "tests/e2e/test_ui.py::test_landing_chat_round_trip_with_desktop_bridge_api_v1",
+    "tests/e2e/test_ui.py::test_landing_chat_mock_bridge_round_trip_api_v1",
+    "tests/e2e/test_ui.py::test_landing_chat_real_inference_desktop_bridge_api_v1",
 }
 
 
@@ -166,7 +167,8 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
         "landing_chat_uses_api_v1_only_non_streaming",
-        "landing_chat_round_trip_with_desktop_bridge_api_v1",
+        "landing_chat_mock_bridge_round_trip_api_v1",
+        "landing_chat_real_inference_desktop_bridge_api_v1",
     }
     target_path = "tests/e2e/test_ui.py"
 
@@ -217,17 +219,27 @@ def setup_servers(
     # Ensure environment variables are set properly
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"  # This is the key setting for mocking the LLM
+    focused_real_inference = os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") == "1"
+    if focused_e2e_only and focused_real_inference:
+        test_env["USE_MOCK_LLM"] = "0"
+    else:
+        test_env["USE_MOCK_LLM"] = "1"  # default to mocked runtime for non-focused and mock tests
 
-    # Start the relay server with the --use_mock_llm flag
+    relay_cmd = [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT)]
+    if test_env["USE_MOCK_LLM"] == "1":
+        relay_cmd.append("--use_mock_llm")
+
+    # Start relay server
     relay_process = subprocess.Popen(
-        [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT), "--use_mock_llm"],
+        relay_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=test_env
     )
-    print(f"Started relay server on port {E2E_RELAY_PORT} with --use_mock_llm flag")
+    print(
+        f"Started relay server on port {E2E_RELAY_PORT} with USE_MOCK_LLM={test_env['USE_MOCK_LLM']}"
+    )
 
     # Wait for relay to start - increased wait time
     time.sleep(3)

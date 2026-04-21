@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import api.v1.compute_provider as compute_provider
 from api.v1.compute_provider import (
     ComputeProviderError,
     DistributedApiV1ComputeProvider,
@@ -89,3 +90,32 @@ def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatc
             model_id="llama-3-8b-instruct",
             messages=[{"role": "user", "content": "hello"}],
         )
+
+
+def test_distributed_provider_without_fallback_never_imports_local_models(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    def fake_post(_url, json=None, timeout=None):
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"role": "assistant", "content": "remote"}}]},
+        )
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", fake_post)
+    monkeypatch.setattr(
+        "api.v1.compute_provider.LocalApiV1ComputeProvider.complete_chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("local provider should never be called when fallback disabled")
+        ),
+    )
+
+    provider = compute_provider.get_api_v1_compute_provider()
+    result = provider.complete_chat(
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    assert result["content"] == "remote"
+    compute_provider._build_api_v1_compute_provider.cache_clear()

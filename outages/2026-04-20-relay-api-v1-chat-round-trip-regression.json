@@ -1,8 +1,0 @@
-{
-  "date": "2026-04-20",
-  "slug": "relay-api-v1-chat-round-trip-regression",
-  "summary": "Relay landing-page chat regressed due to API v1 contract drift across browser/relay/desktop paths, surfacing Unknown streaming error and Failed to encrypt response.",
-  "impact": "Users could not complete landing-page chat round trips through relay with desktop compute-node participation, blocking API v1 validation in-browser.",
-  "fix": "Pinned relay landing-page flow to API v1 non-streaming behavior and added an unmocked relay+desktop bridge+browser e2e test that verifies encrypted API v1 round-trip wiring.",
-  "lessons": "Contract changes in encrypted API v1 paths require full integration tests across relay.py, static chat UI, and desktop bridge runtime; frontend-only API mocks are insufficient."
-}

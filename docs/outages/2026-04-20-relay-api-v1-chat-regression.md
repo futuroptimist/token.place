@@ -1,7 +1,7 @@
-# Outage: relay landing-page API v1 chat wiring regressed across relay/browser/desktop paths
+# Outage: relay landing-page API v1 chat regression
 
 - **Date:** 2026-04-20
-- **Slug:** `relay-api-v1-chat-round-trip-regression`
+- **Slug:** `relay-api-v1-chat-regression`
 - **Affected area:** relay-served landing-page chat path (`/`) using API v1
 
 ## Summary

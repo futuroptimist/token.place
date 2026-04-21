@@ -1,8 +1,0 @@
-{
-  "date": "2026-04-20",
-  "slug": "relay-landing-chat-api-v1-key-format-regression",
-  "summary": "Relay landing-page chat at / remained broken after an incomplete fix: static/chat.js still attempted relay-path API v2 streaming first and encoded API v1 client_public_key in the wrong format, causing /api/v1/chat/completions to return Failed to encrypt response.",
-  "impact": "Users running local relay mode could not complete end-to-end landing-page chat conversations, blocking validation of the primary browser chat journey.",
-  "fix": "Made landing-page relay chat API v1-only and non-streaming, corrected client_public_key serialization to Base64-encoded full PEM bytes, and added e2e regression coverage that fails if /api/v2/chat/completions is used by the relay landing page.",
-  "lessons": "Relay-path traffic in v0.1.0 must not depend on API v2/SSE, and browser encryption contracts must test both server key decoding and client key encoding end-to-end."
-}

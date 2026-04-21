@@ -311,6 +311,20 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
     stdout_thread.start()
     stderr_thread.start()
 
+    v1_requests = []
+    v2_requests = []
+
+    def record_v1_request(route):
+        v1_requests.append(route.request)
+        route.continue_()
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.continue_()
+
+    page.route("**/api/v1/chat/completions", record_v1_request)
+    page.route("**/api/v2/chat/completions", record_v2_request)
+
     try:
         start_deadline = time.time() + 25
         registered = False
@@ -373,6 +387,16 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         assert "capital" in assistant_text.lower()
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
+
+        assert len(v1_requests) >= 1
+        assert v2_requests == []
+
+        encrypted_request = v1_requests[0].post_data_json
+        assert encrypted_request.get("encrypted") is True
+        client_public_key = encrypted_request.get("client_public_key")
+        assert isinstance(client_public_key, str) and client_public_key
+        client_public_key_pem = base64.b64decode(client_public_key, validate=True)
+        assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
     finally:
         if bridge_process.stdin:
             try:

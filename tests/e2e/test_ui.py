@@ -250,27 +250,8 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert v2_requests == []
 
 
-@pytest.mark.e2e
-def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
-    page: Page,
-    base_url: str,
-    setup_servers,
-):
-    """
-    Validate relay landing chat end-to-end through the desktop compute-node bridge.
-
-    This test intentionally avoids route mocking so CI verifies the real wiring:
-    browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
-    """
-
-    relay_process, _ = setup_servers
-    assert relay_process is not None
-
-    test_env = os.environ.copy()
-    test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"
-
-    bridge_process = subprocess.Popen(
+def _start_bridge_process(test_env: dict, base_url: str):
+    return subprocess.Popen(
         [
             sys.executable,
             "desktop-tauri/src-tauri/python/compute_node_bridge.py",
@@ -287,6 +268,25 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         text=True,
         env=test_env,
     )
+
+
+@pytest.mark.e2e
+def test_landing_chat_mock_bridge_round_trip_api_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """
+    Validate relay landing chat with the desktop bridge in explicit mock mode.
+    """
+
+    relay_process, _ = setup_servers
+    assert relay_process is not None
+
+    test_env = os.environ.copy()
+    test_env["TOKEN_PLACE_ENV"] = "testing"
+    test_env["USE_MOCK_LLM"] = "1"
+    bridge_process = _start_bridge_process(test_env, base_url)
 
     stdout_queue: "queue.Queue[str]" = queue.Queue()
     stderr_lines: list[str] = []
@@ -329,6 +329,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         start_deadline = time.time() + 25
         registered = False
         started = False
+        started_payload = None
 
         while time.time() < start_deadline:
             try:
@@ -349,6 +350,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
 
             if event_type == "started":
                 started = bool(payload.get("running"))
+                started_payload = payload
             if event_type == "status" and payload.get("registered") is True:
                 registered = True
                 break
@@ -357,6 +359,8 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
 
         assert started, "desktop bridge did not emit a started event"
         assert registered, "desktop bridge never reported relay registration"
+        assert isinstance(started_payload, dict)
+        assert str(started_payload.get("llama_module_path", "")).strip()
 
         page.goto(base_url)
         page.wait_for_load_state("networkidle")
@@ -387,6 +391,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         assert "capital" in assistant_text.lower()
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
+        assert assistant_text.strip() != "stub"
 
         assert len(v1_requests) >= 1
         assert v2_requests == []
@@ -406,6 +411,122 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
             except (BrokenPipeError, ValueError):
                 pass
 
+        try:
+            bridge_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bridge_process.kill()
+
+
+@pytest.mark.e2e
+def test_landing_chat_real_inference_desktop_bridge_api_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """
+    Validate real desktop-bridge inference wiring (no USE_MOCK_LLM).
+
+    Set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to enable this test.
+    """
+
+    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
+        pytest.skip("Real desktop inference e2e disabled; set RUN_REAL_DESKTOP_INFERENCE_E2E=1")
+
+    relay_process, _ = setup_servers
+    assert relay_process is not None
+
+    test_env = os.environ.copy()
+    test_env["TOKEN_PLACE_ENV"] = "testing"
+    test_env["USE_MOCK_LLM"] = "0"
+    bridge_process = _start_bridge_process(test_env, base_url)
+
+    stdout_queue: "queue.Queue[str]" = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def _drain_stream(stream, output_queue=None, collector=None):
+        for stream_line in iter(stream.readline, ""):
+            if output_queue is not None:
+                output_queue.put(stream_line)
+            if collector is not None:
+                collector.append(stream_line)
+
+    threading.Thread(
+        target=_drain_stream,
+        args=(bridge_process.stdout, stdout_queue, None),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_drain_stream,
+        args=(bridge_process.stderr, None, stderr_lines),
+        daemon=True,
+    ).start()
+
+    v1_requests = []
+    v2_requests = []
+
+    def _record_v1(route):
+        v1_requests.append(route.request)
+        route.continue_()
+
+    def _record_v2(route):
+        v2_requests.append(route.request.url)
+        route.continue_()
+
+    page.route("**/api/v1/chat/completions", _record_v1)
+    page.route("**/api/v2/chat/completions", _record_v2)
+
+    try:
+        start_deadline = time.time() + 25
+        started_payload = None
+        registered = False
+        while time.time() < start_deadline:
+            try:
+                payload = json.loads(stdout_queue.get(timeout=0.5))
+            except queue.Empty:
+                if bridge_process.poll() is not None:
+                    raise AssertionError(
+                        f"desktop bridge exited early rc={bridge_process.returncode}\n{''.join(stderr_lines)}"
+                    )
+                continue
+            except json.JSONDecodeError:
+                continue
+
+            if payload.get("type") == "started":
+                started_payload = payload
+            if payload.get("type") == "status" and payload.get("registered") is True:
+                registered = True
+                break
+            if payload.get("type") == "error":
+                raise AssertionError(f"desktop bridge error event: {payload}")
+
+        assert registered, "desktop bridge never reported relay registration"
+        assert started_payload, "desktop bridge did not emit started payload"
+        assert started_payload.get("llama_module_path"), "llama_module_path missing from startup payload"
+        assert "llama_cpp.py" not in str(started_payload.get("llama_module_path", "")).replace("\\", "/").rstrip("/"), (
+            "real inference must not import repo llama_cpp.py shim"
+        )
+
+        page.goto(base_url)
+        page.wait_for_load_state("networkidle")
+        page.locator("textarea").first.fill("hello relay + desktop bridge")
+        page.locator("button", has_text="Send").click()
+
+        assistant_message = page.locator(".assistant-message").last
+        assistant_message.wait_for(state="visible")
+        assistant_text = assistant_message.inner_text()
+
+        assert assistant_text.strip() != "stub"
+        assert "Mock Response" not in assistant_text
+        assert len(v1_requests) >= 1
+        assert v2_requests == []
+    finally:
+        if bridge_process.stdin:
+            try:
+                bridge_process.stdin.write(json.dumps({"type": "cancel"}) + "\n")
+                bridge_process.stdin.flush()
+                bridge_process.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
         try:
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:

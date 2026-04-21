@@ -30,6 +30,27 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             'error': str(exc),
         }
 
+    llama_module_path = str(getattr(llama_cpp, '__file__', 'unknown'))
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_shim = str((repo_root / 'llama_cpp.py').resolve())
+    shim_imported = False
+    try:
+        shim_imported = str(Path(llama_module_path).resolve()) == repo_shim
+    except Exception:
+        shim_imported = llama_module_path == repo_shim
+
+    if shim_imported:
+        return {
+            'backend': 'missing',
+            'gpu_offload_supported': False,
+            'detected_device': 'none',
+            'interpreter': sys.executable,
+            'prefix': sys.prefix,
+            'llama_module_path': llama_module_path,
+            'repo_llama_cpp_shim_imported': True,
+            'error': 'repo-local llama_cpp.py shim imported instead of installed llama_cpp package',
+        }
+
     backend = 'cpu'
     cuda_markers = (
         'GGML_USE_CUDA',
@@ -70,7 +91,8 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'detected_device': backend if gpu_offload_supported else 'cpu',
         'interpreter': sys.executable,
         'prefix': sys.prefix,
-        'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),
+        'llama_module_path': llama_module_path,
+        'repo_llama_cpp_shim_imported': False,
         'error': None,
     }
 
@@ -466,6 +488,7 @@ class ModelManager:
                                 f"kv_cache={compute_plan['kv_cache_device']} "
                                 f"interpreter={runtime_identity.get('interpreter', sys.executable)} "
                                 f"llama_module_path={runtime_identity.get('llama_module_path', 'unknown')} "
+                                f"repo_llama_cpp_shim_imported={runtime_identity.get('repo_llama_cpp_shim_imported', False)} "
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
                             self.log_info("Llama model initialized successfully.")

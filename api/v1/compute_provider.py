@@ -14,9 +14,15 @@ from typing import Any, Dict, Optional, Protocol
 
 import requests
 
-from api.v1.models import generate_response
-
 logger = logging.getLogger("api.v1.compute_provider")
+
+
+def generate_response(model_id: str, messages: list[dict[str, Any]], **options: Any):
+    """Compatibility wrapper for local generation (kept for tests monkeypatching this symbol)."""
+
+    from api.v1.models import generate_response as _generate_response
+
+    return _generate_response(model_id, messages, **options)
 
 
 class ComputeProviderError(Exception):
@@ -47,6 +53,8 @@ class LocalApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        # Import lazily so distributed-only relay runtime does not eagerly import
+        # api.v1.models (which can in turn import llama_cpp at module import time).
         updated_messages = generate_response(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
@@ -160,6 +168,9 @@ def _build_api_v1_compute_provider(mode: str, distributed_url: str) -> ApiV1Comp
         return local_provider
 
     distributed_provider = DistributedApiV1ComputeProvider(base_url=distributed_url)
+    allow_fallback = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip() != "0"
+    if not allow_fallback:
+        return distributed_provider
     return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
 
 
@@ -168,4 +179,12 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
 
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
     distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
-    return _build_api_v1_compute_provider(mode, distributed_url)
+    provider = _build_api_v1_compute_provider(mode, distributed_url)
+    logger.info(
+        "api.v1.compute_provider.selected mode=%s distributed_url_configured=%s fallback_enabled=%s provider=%s",
+        mode,
+        bool(distributed_url),
+        os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip() != "0",
+        provider.__class__.__name__,
+    )
+    return provider

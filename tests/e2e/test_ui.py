@@ -1,6 +1,12 @@
 import base64
 import json
+import os
 import pytest
+import queue
+import subprocess
+import sys
+import tempfile
+import threading
 from playwright.sync_api import Page
 import time
 
@@ -242,3 +248,165 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
     assert v2_requests == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """
+    Validate relay landing chat end-to-end through the desktop compute-node bridge.
+
+    This test intentionally avoids route mocking so CI verifies the real wiring:
+    browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
+    """
+
+    relay_process, _ = setup_servers
+    assert relay_process is not None
+
+    test_env = os.environ.copy()
+    test_env["TOKEN_PLACE_ENV"] = "testing"
+    test_env["USE_MOCK_LLM"] = "1"
+
+    bridge_process = subprocess.Popen(
+        [
+            sys.executable,
+            "desktop-tauri/src-tauri/python/compute_node_bridge.py",
+            "--model",
+            os.path.join(tempfile.gettempdir(), "mock-model.gguf"),
+            "--mode",
+            "cpu",
+            "--relay-url",
+            base_url,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=test_env,
+    )
+
+    stdout_queue: "queue.Queue[str]" = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def _drain_stream(stream, output_queue=None, collector=None):
+        for stream_line in iter(stream.readline, ""):
+            if output_queue is not None:
+                output_queue.put(stream_line)
+            if collector is not None:
+                collector.append(stream_line)
+
+    stdout_thread = threading.Thread(
+        target=_drain_stream,
+        args=(bridge_process.stdout, stdout_queue, None),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_stream,
+        args=(bridge_process.stderr, None, stderr_lines),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    v1_requests = []
+    v2_requests = []
+
+    def record_v1_request(route):
+        v1_requests.append(route.request)
+        route.continue_()
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.continue_()
+
+    page.route("**/api/v1/chat/completions", record_v1_request)
+    page.route("**/api/v2/chat/completions", record_v2_request)
+
+    try:
+        start_deadline = time.time() + 25
+        registered = False
+        started = False
+
+        while time.time() < start_deadline:
+            try:
+                line = stdout_queue.get(timeout=0.5)
+            except queue.Empty:
+                if bridge_process.poll() is not None:
+                    stderr_output = "".join(stderr_lines)
+                    raise AssertionError(
+                        f"desktop bridge exited early rc={bridge_process.returncode}\n{stderr_output}"
+                    )
+                continue
+
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_type = payload.get("type")
+
+            if event_type == "started":
+                started = bool(payload.get("running"))
+            if event_type == "status" and payload.get("registered") is True:
+                registered = True
+                break
+            if event_type == "error":
+                raise AssertionError(f"desktop bridge error event: {payload}")
+
+        assert started, "desktop bridge did not emit a started event"
+        assert registered, "desktop bridge never reported relay registration"
+
+        page.goto(base_url)
+        page.wait_for_load_state("networkidle")
+
+        textarea = page.locator("textarea").first
+        textarea.fill("hello relay + desktop bridge")
+        page.locator("button", has_text="Send").click()
+
+        assistant_message = page.locator(".assistant-message").last
+        assistant_message.wait_for(state="visible")
+
+        page.wait_for_function(
+            """
+            ({ selector, expectedText }) => {
+                const nodes = document.querySelectorAll(selector);
+                if (!nodes.length) return false;
+                const latest = nodes[nodes.length - 1];
+                return latest.textContent.includes(expectedText);
+            }
+            """,
+            arg={
+                "selector": ".assistant-message",
+                "expectedText": "capital",
+            },
+        )
+
+        assistant_text = assistant_message.inner_text()
+        assert "capital" in assistant_text.lower()
+        assert "Sorry, I encountered an issue generating a response." not in page.content()
+        assert "Unknown streaming error" not in page.content()
+
+        assert len(v1_requests) >= 1
+        assert v2_requests == []
+
+        encrypted_request = v1_requests[0].post_data_json
+        assert encrypted_request.get("encrypted") is True
+        client_public_key = encrypted_request.get("client_public_key")
+        assert isinstance(client_public_key, str) and client_public_key
+        client_public_key_pem = base64.b64decode(client_public_key, validate=True)
+        assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
+    finally:
+        if bridge_process.stdin:
+            try:
+                bridge_process.stdin.write(json.dumps({"type": "cancel"}) + "\n")
+                bridge_process.stdin.flush()
+                bridge_process.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
+
+        try:
+            bridge_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bridge_process.kill()

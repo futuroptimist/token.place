@@ -90,7 +90,11 @@ class TestCryptoManager:
 
         # Verify mock calls
         expected_json = json.dumps(message).encode('utf-8')
-        mock_encrypt.assert_called_once_with(expected_json, client_public_key)
+        mock_encrypt.assert_called_once_with(
+            expected_json,
+            client_public_key,
+            use_pkcs1v15=True,
+        )
 
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_string(self, mock_encrypt, crypto_manager):
@@ -114,7 +118,11 @@ class TestCryptoManager:
         assert 'iv' in result
 
         # Verify mock calls
-        mock_encrypt.assert_called_once_with(b'test message', client_public_key)
+        mock_encrypt.assert_called_once_with(
+            b'test message',
+            client_public_key,
+            use_pkcs1v15=True,
+        )
 
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_bytes(self, mock_encrypt, crypto_manager):
@@ -138,7 +146,11 @@ class TestCryptoManager:
         assert 'iv' in result
 
         # Verify mock calls
-        mock_encrypt.assert_called_once_with(b'test bytes', client_public_key)
+        mock_encrypt.assert_called_once_with(
+            b'test bytes',
+            client_public_key,
+            use_pkcs1v15=True,
+        )
 
     def test_encrypt_message_none_raises(self, crypto_manager):
         """encrypt_message should reject None input."""
@@ -168,7 +180,11 @@ class TestCryptoManager:
 
         crypto_manager.encrypt_message(message, b64_key)
 
-        mock_encrypt.assert_called_once_with(b'hi', b'client_public_key')
+        mock_encrypt.assert_called_once_with(
+            b'hi',
+            b'client_public_key',
+            use_pkcs1v15=True,
+        )
 
     @patch('utils.crypto.crypto_manager.encrypt')
     def test_encrypt_message_caches_decoded_base64_key(self, mock_encrypt, crypto_manager):

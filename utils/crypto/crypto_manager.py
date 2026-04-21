@@ -220,8 +220,11 @@ class CryptoManager:
             start_time = perf_counter() if record_metrics else None
 
             # Encrypt the message
+            # Keep relay/browser API v1 payloads compatible with JSEncrypt-based clients.
             encrypted_data, encrypted_key, iv = encrypt(
-                message_bytes, client_public_key_bytes
+                message_bytes,
+                client_public_key_bytes,
+                use_pkcs1v15=True,
             )
 
             # Base64 encode for JSON compatibility

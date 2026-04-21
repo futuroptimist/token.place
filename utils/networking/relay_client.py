@@ -616,7 +616,13 @@ class RelayClient:
 
             client_pub_key_b64 = request_data['client_public_key']
             stream_requested = request_data.get('stream') is True
-            stream_session_id = request_data.get('stream_session_id')
+            if stream_requested:
+                # v0.1.0 guardrail: relay-path API traffic remains non-streaming.
+                # Treat legacy streaming hints as no-ops so server.py and desktop
+                # compute-node behavior stay aligned on the same /source contract.
+                log_info(
+                    "Ignoring legacy stream flag for relay request and using non-streaming /source path"
+                )
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
@@ -632,38 +638,6 @@ class RelayClient:
             if chat_history is None:
                 return False
             client_pub_key = base64.b64decode(client_pub_key_b64)
-
-            if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
-                log_info("Processing streaming relay request for session {}", stream_session_id)
-                response_history = self.model_manager.llama_cpp_get_response(chat_history)
-                encrypted_response = self.crypto_manager.encrypt_message(response_history, client_pub_key)
-                chunk_payload = {
-                    'session_id': stream_session_id,
-                    'chunk': {
-                        'client_public_key': client_pub_key_b64,
-                        **encrypted_response,
-                    },
-                    'final': True,
-                }
-
-                request_kwargs = {
-                    'json': chunk_payload,
-                    'timeout': self._request_timeout,
-                }
-                headers = self._auth_headers()
-                if headers:
-                    request_kwargs['headers'] = headers
-
-                timeout = request_kwargs.pop('timeout', self._request_timeout)
-                stream_response = requests.post(
-                    f'{self.relay_url}/stream/source',
-                    timeout=timeout,
-                    **request_kwargs,
-                )
-                if stream_response.status_code != 200:
-                    log_error("Error status from /stream/source: {}", stream_response.status_code)
-                    return False
-                return True
 
             log_info("Getting response from LLM...")
             response_history = self.model_manager.llama_cpp_get_response(chat_history)

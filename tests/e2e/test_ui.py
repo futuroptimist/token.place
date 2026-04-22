@@ -392,16 +392,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         page.wait_for_function(
             """
-            ({ selector, expectedText }) => {
+            ({ selector }) => {
                 const nodes = document.querySelectorAll(selector);
                 if (!nodes.length) return false;
                 const latest = nodes[nodes.length - 1];
-                return latest.textContent.includes(expectedText);
+                return Boolean(latest.textContent && latest.textContent.trim().length > 0);
             }
             """,
             arg={
                 "selector": ".assistant-message",
-                "expectedText": "",
             },
         )
 

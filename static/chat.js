@@ -453,8 +453,12 @@ new Vue({
             }
 
             // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
-            // Always render the assistant response atomically instead of simulating
+            // Keep this branch explicit so future edits cannot silently reintroduce
             // incremental character streaming in the UI.
+            if (this.relayApiV1NonStreaming !== true) {
+                console.warn('relayApiV1NonStreaming is disabled; forcing atomic render fallback.');
+            }
+
             const entry = Object.assign({}, message, { isTyping: false });
             this.chatHistory.push(entry);
         },

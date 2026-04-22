@@ -204,7 +204,7 @@ def setup_servers(
     """
     focused_e2e_only = _is_focused_relay_landing_chat_request(request)
     selected_nodeids = {item.nodeid for item in request.session.items}
-    run_real_bridge_e2e = REAL_DESKTOP_BRIDGE_E2E_NODEID in selected_nodeids
+    run_real_bridge_e2e = selected_nodeids == {REAL_DESKTOP_BRIDGE_E2E_NODEID}
 
     # Fixes the Codex-focused skip case where this guard skipped runs when
     # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not

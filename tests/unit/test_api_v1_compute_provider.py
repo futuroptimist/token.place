@@ -117,3 +117,25 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
             compute_provider.get_api_v1_compute_provider()
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_describe_provider_reports_resolved_distributed_instance():
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    diagnostics = compute_provider.describe_api_v1_compute_provider(provider)
+
+    assert diagnostics["resolved_provider"] == "distributed"
+    assert diagnostics["distributed_url"] == "https://node-a.example"
+    assert diagnostics["local_fallback_enabled"] is False
+
+
+def test_get_provider_strict_distributed_mode_fails_when_local_selected(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local")
+    monkeypatch.setenv("TOKENPLACE_API_V1_REQUIRE_DISTRIBUTED", "1")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        with pytest.raises(ComputeProviderError, match="requires a distributed API v1 provider"):
+            compute_provider.get_api_v1_compute_provider()
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()

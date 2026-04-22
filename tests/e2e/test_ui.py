@@ -165,7 +165,10 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
             body=json.dumps({"server_public_key": server_public_key_b64}),
         )
 
+    v1_requests = []
+
     def handle_v1_chat(route):
+        v1_requests.append(route.request.url)
         request_json = route.request.post_data_json
         assert request_json.get("encrypted") is True
         assert isinstance(request_json.get("client_public_key"), str) and request_json[
@@ -247,6 +250,32 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
     assert v2_requests == []
+
+    assert len(v1_requests) >= 1
+
+    relay_mode = page.evaluate("() => window.__TOKENPLACE_RELAY_CHAT_MODE")
+    assert relay_mode == "api-v1-non-streaming"
+
+    chat_state = page.evaluate(
+        """
+        () => {
+            const vm = document.getElementById('app')?.__vue__;
+            if (!vm || !Array.isArray(vm.chatHistory) || vm.chatHistory.length === 0) {
+                return null;
+            }
+            const latest = vm.chatHistory[vm.chatHistory.length - 1];
+            return {
+                role: latest.role,
+                hasDisplayContent: Object.prototype.hasOwnProperty.call(latest, 'displayContent'),
+                isTyping: Boolean(latest.isTyping),
+            };
+        }
+        """
+    )
+    assert chat_state is not None
+    assert chat_state["role"] == "assistant"
+    assert chat_state["hasDisplayContent"] is False
+    assert chat_state["isTyping"] is False
 
 
 @pytest.mark.e2e

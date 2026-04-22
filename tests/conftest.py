@@ -217,17 +217,26 @@ def setup_servers(
     # Ensure environment variables are set properly
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"  # This is the key setting for mocking the LLM
+    test_env["USE_MOCK_LLM"] = "1"  # Default for non-focused e2e coverage
 
-    # Start the relay server with the --use_mock_llm flag
+    relay_cmd = [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT)]
+    if not focused_e2e_only:
+        relay_cmd.append("--use_mock_llm")
+    else:
+        test_env["USE_MOCK_LLM"] = "0"
+
+    # Start the relay server
     relay_process = subprocess.Popen(
-        [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT), "--use_mock_llm"],
+        relay_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=test_env
     )
-    print(f"Started relay server on port {E2E_RELAY_PORT} with --use_mock_llm flag")
+    print(
+        f"Started relay server on port {E2E_RELAY_PORT} "
+        f"(use_mock_llm={test_env.get('USE_MOCK_LLM', '0')})"
+    )
 
     # Wait for relay to start - increased wait time
     time.sleep(3)

@@ -1,3 +1,5 @@
+window.__TOKENPLACE_RELAY_CHAT_MODE = 'api-v1-non-streaming';
+
 new Vue({
     el: '#app',
     data: {
@@ -7,7 +9,8 @@ new Vue({
         clientPrivateKey: null,
         clientPublicKey: null,
         isGeneratingResponse: false,
-        isTouchInput: false
+        isTouchInput: false,
+        relayLandingChatMode: 'api-v1-non-streaming'
     },
     mounted() {
         this.detectTouchInput();
@@ -451,66 +454,10 @@ new Vue({
                 return;
             }
 
-            const content = message.content;
-            const typingFactory = typeof ChatTypingEffect !== 'undefined'
-                && ChatTypingEffect
-                && typeof ChatTypingEffect.createTypingAnimator === 'function';
-
-            const shouldAnimate = typingFactory && typeof content === 'string' && content.trim().length > 0;
-
-            if (!shouldAnimate) {
-                const entry = Object.assign({}, message, { isTyping: false });
-                this.chatHistory.push(entry);
-                return;
-            }
-
-            const finalText = content;
-            const entry = Object.assign({}, message, {
-                content: finalText,
-                displayContent: '',
-                isTyping: true
-            });
-            const chunkSize = this.calculateTypingChunkSize(finalText);
-
-            const animator = ChatTypingEffect.createTypingAnimator({
-                fullText: finalText,
-                chunkSize,
-                onUpdate: (partial) => {
-                    entry.displayContent = partial;
-                },
-                onComplete: () => {
-                    entry.isTyping = false;
-                    if (entry._animator && typeof entry._animator.cancel === 'function') {
-                        entry._animator.cancel();
-                    }
-                    delete entry._animator;
-                    if (typeof this.$delete === 'function') {
-                        this.$delete(entry, 'displayContent');
-                    } else {
-                        delete entry.displayContent;
-                    }
-                },
-                schedule: (fn, delay) => {
-                    if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
-                        return window.setTimeout(fn, delay);
-                    }
-                    return setTimeout(fn, delay);
-                },
-                cancelScheduled: (id) => {
-                    if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function') {
-                        window.clearTimeout(id);
-                    } else {
-                        clearTimeout(id);
-                    }
-                }
-            });
-
-            entry._animator = animator;
+            // Relay landing-page chat in v0.1.0 must remain API v1-only and non-streaming.
+            // Render the assistant response atomically to avoid letter-by-letter UI updates.
+            const entry = Object.assign({}, message, { isTyping: false });
             this.chatHistory.push(entry);
-
-            this.$nextTick(() => {
-                animator.start();
-            });
         },
 
         getDisplayContent(message) {
@@ -523,6 +470,11 @@ new Vue({
             }
 
             return message.content;
+        },
+
+
+        isRelayLandingChatNonStreaming() {
+            return this.relayLandingChatMode === 'api-v1-non-streaming';
         },
 
         // Send a message to the server

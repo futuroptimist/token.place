@@ -195,6 +195,43 @@ def _build_api_v1_compute_provider(
     return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
 
 
+
+def describe_api_v1_compute_provider(provider: ApiV1ComputeProvider) -> dict[str, Any]:
+    """Return resolved provider diagnostics based on the active provider instance."""
+
+    diagnostics: dict[str, Any] = {
+        "provider_class": provider.__class__.__name__,
+        "resolved_provider": "unknown",
+    }
+
+    if isinstance(provider, DistributedApiV1ComputeProvider):
+        diagnostics.update({
+            "resolved_provider": "distributed",
+            "distributed_url": provider.base_url.rstrip('/'),
+            "local_fallback_enabled": False,
+        })
+        return diagnostics
+
+    if isinstance(provider, FallbackApiV1ComputeProvider):
+        primary = provider.primary
+        distributed_url = getattr(primary, "base_url", "")
+        diagnostics.update({
+            "resolved_provider": "distributed_with_local_fallback",
+            "distributed_url": str(distributed_url).rstrip('/'),
+            "local_fallback_enabled": True,
+            "fallback_provider_class": provider.fallback.__class__.__name__,
+        })
+        return diagnostics
+
+    if isinstance(provider, LocalApiV1ComputeProvider):
+        diagnostics.update({
+            "resolved_provider": "local",
+            "local_fallback_enabled": False,
+        })
+        return diagnostics
+
+    return diagnostics
+
 def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     """Resolve the active provider based on environment configuration."""
 
@@ -204,4 +241,8 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
-    return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
+    strict_distributed = os.environ.get("TOKENPLACE_API_V1_REQUIRE_DISTRIBUTED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    provider = _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
+    if strict_distributed and not isinstance(provider, (DistributedApiV1ComputeProvider, FallbackApiV1ComputeProvider)):
+        raise ComputeProviderError("TOKENPLACE_API_V1_REQUIRE_DISTRIBUTED requires a distributed API v1 provider")
+    return provider

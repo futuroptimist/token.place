@@ -33,7 +33,11 @@ from api.v1.models import (
     generate_response as _generate_response,
     get_model_instance as _get_model_instance,
 )
-from api.v1.compute_provider import get_api_v1_compute_provider, ComputeProviderError
+from api.v1.compute_provider import (
+    ComputeProviderError,
+    describe_api_v1_compute_provider,
+    get_api_v1_compute_provider,
+)
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
     validate_model_name as _validate_model_name,
@@ -321,7 +325,8 @@ def _handle_chat_completion_request(data):
 
         log_info(f"Generating response using model {model_id}")
         provider = get_api_v1_compute_provider()
-        log_info(f"API v1 compute provider selected: {provider.__class__.__name__}")
+        provider_diagnostics = describe_api_v1_compute_provider(provider)
+        log_info(f"API v1 compute provider resolved diagnostics: {json.dumps(provider_diagnostics, sort_keys=True)}")
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -471,6 +476,8 @@ def _handle_text_completion_request(data):
 
         log_info(f"Generating response using model {model_id}")
         provider = get_api_v1_compute_provider()
+        provider_diagnostics = describe_api_v1_compute_provider(provider)
+        log_info(f"API v1 completions provider resolved diagnostics: {json.dumps(provider_diagnostics, sort_keys=True)}")
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,

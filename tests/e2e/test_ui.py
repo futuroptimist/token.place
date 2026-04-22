@@ -385,6 +385,26 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         textarea = page.locator("textarea").first
         textarea.fill("What is the capital of France? Respond with one word.")
+        page.evaluate(
+            """
+            () => {
+                window.__assistantTextSnapshots = [];
+                const container = document.querySelector('.chat-container');
+                if (!container) {
+                    return;
+                }
+                const observer = new MutationObserver(() => {
+                    const nodes = document.querySelectorAll('.assistant-message');
+                    if (!nodes.length) return;
+                    const latest = nodes[nodes.length - 1];
+                    const text = (latest.textContent || '').trim();
+                    window.__assistantTextSnapshots.push(text);
+                });
+                observer.observe(container, { childList: true, subtree: true, characterData: true });
+                window.__assistantObserver = observer;
+            }
+            """
+        )
         page.locator("button", has_text="Send").click()
 
         assistant_message = page.locator(".assistant-message").last
@@ -415,6 +435,51 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert v1_response_headers, "expected at least one API v1 response"
         latest_headers = v1_response_headers[-1]
         assert latest_headers.get("x-tokenplace-api-v1-stream-mode") == "non-streaming"
+        resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        assert resolved_provider_path == "distributed", (
+            "landing-page real-provider guardrail requires resolved provider path "
+            f"'distributed', got: {resolved_provider_path!r}"
+        )
+
+        page.wait_for_timeout(300)
+        non_streaming_state = page.evaluate(
+            """
+            () => {
+                if (window.__assistantObserver) {
+                    window.__assistantObserver.disconnect();
+                }
+                const snapshots = Array.isArray(window.__assistantTextSnapshots)
+                    ? window.__assistantTextSnapshots
+                    : [];
+                const nonEmpty = snapshots.filter((value) => typeof value === 'string' && value.length > 0);
+                const uniqueNonEmpty = [...new Set(nonEmpty)];
+
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                const history = vm && Array.isArray(vm.chatHistory) ? vm.chatHistory : [];
+                const assistant = [...history].reverse().find((message) => message && message.role === 'assistant') || null;
+
+                return {
+                    snapshots,
+                    uniqueNonEmpty,
+                    hasAssistant: Boolean(assistant),
+                    hasDisplayContent: Boolean(
+                        assistant && Object.prototype.hasOwnProperty.call(assistant, 'displayContent')
+                    ),
+                    hasIsTyping: Boolean(
+                        assistant && Object.prototype.hasOwnProperty.call(assistant, 'isTyping')
+                    ),
+                };
+            }
+            """
+        )
+        assert non_streaming_state["hasAssistant"] is True
+        assert non_streaming_state["hasDisplayContent"] is False
+        assert non_streaming_state["hasIsTyping"] is False
+        assert len(non_streaming_state["uniqueNonEmpty"]) == 1, (
+            "assistant message should render atomically without multi-step text growth; "
+            f"snapshots={non_streaming_state['snapshots']}"
+        )
 
         encrypted_request = v1_requests[0].post_data_json
         assert encrypted_request.get("encrypted") is True

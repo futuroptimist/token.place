@@ -188,7 +188,7 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
 
     return False
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def setup_servers(
     request: pytest.FixtureRequest,
 ) -> Generator[Tuple[subprocess.Popen, Optional[subprocess.Popen]], None, None]:
@@ -203,8 +203,7 @@ def setup_servers(
     5. Cleans up the processes after tests
     """
     focused_e2e_only = _is_focused_relay_landing_chat_request(request)
-    selected_nodeids = {item.nodeid for item in request.session.items}
-    run_real_bridge_e2e = selected_nodeids == {REAL_DESKTOP_BRIDGE_E2E_NODEID}
+    run_real_bridge_e2e = request.node.nodeid == REAL_DESKTOP_BRIDGE_E2E_NODEID
 
     # Fixes the Codex-focused skip case where this guard skipped runs when
     # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not
@@ -221,6 +220,7 @@ def setup_servers(
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
     test_env["USE_MOCK_LLM"] = "0" if run_real_bridge_e2e else "1"
+    test_env["TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED"] = "1" if run_real_bridge_e2e else "0"
 
     # Start the relay server with the --use_mock_llm flag
     relay_command = [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT)]
@@ -339,7 +339,7 @@ def setup_servers(
 
     print("Server and relay processes terminated")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], None, None]:
     """
     Create a browser context for Playwright tests.

@@ -434,11 +434,21 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert v2_requests == []
         assert v1_response_headers, "expected at least one API v1 response"
         latest_headers = v1_response_headers[-1]
-        assert latest_headers.get("x-tokenplace-api-v1-stream-mode") == "non-streaming"
+        provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
+        stream_mode = latest_headers.get("x-tokenplace-api-v1-stream-mode")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        provider_diagnostics = (
+            "landing-page real-provider guardrail diagnostics: "
+            f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
+            f"stream_mode={stream_mode!r}; expected provider_class='DistributedApiV1ComputeProvider', "
+            "resolved_provider_path='distributed' (not 'local' or "
+            "'distributed_with_local_fallback'), stream_mode='non-streaming'"
+        )
+        assert provider_class == "DistributedApiV1ComputeProvider", provider_diagnostics
+        assert stream_mode == "non-streaming", provider_diagnostics
         assert resolved_provider_path == "distributed", (
             "landing-page real-provider guardrail requires resolved provider path "
-            f"'distributed', got: {resolved_provider_path!r}"
+            f"'distributed'. {provider_diagnostics}"
         )
 
         page.wait_for_timeout(300)
@@ -469,6 +479,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                     hasIsTyping: Boolean(
                         assistant && Object.prototype.hasOwnProperty.call(assistant, 'isTyping')
                     ),
+                    assistantContent: assistant && typeof assistant.content === 'string' ? assistant.content : '',
+                    domAssistantText: (() => {
+                        const nodes = document.querySelectorAll('.assistant-message');
+                        if (!nodes.length) {
+                            return '';
+                        }
+                        const latest = nodes[nodes.length - 1];
+                        return (latest.textContent || '').trim();
+                    })(),
                 };
             }
             """
@@ -479,6 +498,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert len(non_streaming_state["uniqueNonEmpty"]) == 1, (
             "assistant message should render atomically without multi-step text growth; "
             f"snapshots={non_streaming_state['snapshots']}"
+        )
+        assert non_streaming_state["assistantContent"].strip() == non_streaming_state["domAssistantText"].strip(), (
+            "final assistant Vue state content must exactly match rendered DOM text to prove final "
+            "non-streaming rendering path"
         )
 
         encrypted_request = v1_requests[0].post_data_json

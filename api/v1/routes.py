@@ -327,7 +327,10 @@ def _handle_chat_completion_request(data):
         provider = get_api_v1_compute_provider()
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
-        log_info(f"API v1 compute provider selected: {resolved_provider_name}")
+        log_info(
+            "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
+            % (resolved_provider_name, resolved_provider_path)
+        )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -487,7 +490,10 @@ def _handle_text_completion_request(data):
         provider = get_api_v1_compute_provider()
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
-        log_info(f"API v1 compute provider selected: {resolved_provider_name}")
+        log_info(
+            "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
+            % (resolved_provider_name, resolved_provider_path)
+        )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,

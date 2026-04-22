@@ -181,3 +181,28 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 
     body = response.get_json()
     assert body['metadata'] == payload['metadata']
+
+
+def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monkeypatch):
+    class _DistributedProvider:
+        def complete_chat(self, model_id, messages, options):
+            assert model_id == "llama-3-8b-instruct"
+            assert isinstance(options, dict)
+            return {"role": "assistant", "content": "Paris"}
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [{"role": "user", "content": "Capital of France?"}],
+    }
+
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _DistributedProvider())
+    monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
+    assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"

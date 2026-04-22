@@ -261,12 +261,6 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     This test intentionally avoids route mocking so it verifies the real wiring:
     browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
     """
-    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
-        pytest.skip(
-            "Real desktop inference e2e is disabled by default; "
-            "set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to run this test."
-        )
-
     relay_process, _ = setup_servers
     assert relay_process is not None
 
@@ -274,16 +268,14 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     test_env["TOKEN_PLACE_ENV"] = "testing"
     test_env["USE_MOCK_LLM"] = "0"
     preprovisioned_model_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
-    if not preprovisioned_model_path:
-        pytest.skip(
-            "Set TOKENPLACE_REAL_E2E_MODEL_PATH to an existing GGUF path for "
-            "RUN_REAL_DESKTOP_INFERENCE_E2E=1 runs."
-        )
-    if not os.path.isfile(preprovisioned_model_path):
-        pytest.skip(
-            "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing model file "
-            f"(got: {preprovisioned_model_path})."
-        )
+    assert preprovisioned_model_path, (
+        "TOKENPLACE_REAL_E2E_MODEL_PATH must be configured for the always-on "
+        "desktop bridge landing chat e2e guardrail."
+    )
+    assert os.path.isfile(preprovisioned_model_path), (
+        "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing model file "
+        f"(got: {preprovisioned_model_path})."
+    )
 
     bridge_process = subprocess.Popen(
         [
@@ -328,6 +320,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
     v1_requests = []
     v2_requests = []
+    v1_response_headers = []
 
     def record_v1_request(route):
         v1_requests.append(route.request)
@@ -339,6 +332,12 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
     page.route("**/api/v1/chat/completions", record_v1_request)
     page.route("**/api/v2/chat/completions", record_v2_request)
+    page.on(
+        "response",
+        lambda response: v1_response_headers.append(dict(response.headers))
+        if "/api/v1/chat/completions" in response.url
+        else None,
+    )
 
     try:
         start_deadline = time.time() + 25
@@ -406,11 +405,35 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assistant_text = assistant_message.inner_text()
         assert "paris" in assistant_text.lower()
+        assert assistant_text.strip().lower() != "stub"
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
 
         assert len(v1_requests) >= 1
         assert v2_requests == []
+        assert v1_response_headers, "Expected at least one /api/v1/chat/completions response"
+        resolved_paths = {
+            headers.get("x-tokenplace-api-v1-resolved-path", "").strip().lower()
+            for headers in v1_response_headers
+        }
+        assert resolved_paths == {"distributed"}, (
+            "Landing chat should resolve API v1 requests through distributed provider only"
+        )
+        assert all(
+            headers.get("x-tokenplace-api-v1-provider-class") == "DistributedApiV1ComputeProvider"
+            for headers in v1_response_headers
+        )
+
+        # Relay landing-page path is intentionally non-streaming; assistant text
+        # should render atomically without UI typing deltas.
+        samples = []
+        for _ in range(5):
+            samples.append(assistant_message.inner_text())
+            time.sleep(0.05)
+        assert all(sample == samples[0] for sample in samples), (
+            "Assistant text changed after initial render; non-streaming flow should be atomic."
+        )
+        assert assistant_text in samples
 
         encrypted_request = v1_requests[0].post_data_json
         assert encrypted_request.get("encrypted") is True

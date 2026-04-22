@@ -150,6 +150,9 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
 }
+ALWAYS_ON_RELAY_E2E_NODEID = (
+    "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1"
+)
 
 
 def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bool:
@@ -202,11 +205,17 @@ def setup_servers(
     5. Cleans up the processes after tests
     """
     focused_e2e_only = _is_focused_relay_landing_chat_request(request)
+    selected_nodeids = {item.nodeid for item in request.session.items}
+    requires_always_on_guardrail = ALWAYS_ON_RELAY_E2E_NODEID in selected_nodeids
 
     # Fixes the Codex-focused skip case where this guard skipped runs when
     # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not
     # recognize `tests/e2e/test_ui.py -k landing_chat_uses_api_v1_only_non_streaming`.
-    if os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1" and not focused_e2e_only:
+    if (
+        os.environ.get("RUN_RELAY_REGISTRATION_TESTS", "0") != "1"
+        and not focused_e2e_only
+        and not requires_always_on_guardrail
+    ):
         pytest.skip(
             "Relay/server registration smoke tests are disabled by default; "
             "set RUN_RELAY_REGISTRATION_TESTS=1 to enable.",

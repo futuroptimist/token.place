@@ -35,6 +35,9 @@ class ApiV1ComputeProvider(Protocol):
     ) -> dict[str, Any]:
         """Return an assistant message payload compatible with OpenAI chat responses."""
 
+    def diagnostics(self) -> Dict[str, Any]:
+        """Return resolved provider diagnostics for request-path observability."""
+
 
 @dataclass(frozen=True)
 class LocalApiV1ComputeProvider:
@@ -54,6 +57,14 @@ class LocalApiV1ComputeProvider:
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
         return assistant_message
+
+    def diagnostics(self) -> Dict[str, Any]:
+        return {
+            "provider_class": self.__class__.__name__,
+            "resolved_path": "local",
+            "distributed_target": None,
+            "fallback_enabled": False,
+        }
 
 
 @dataclass(frozen=True)
@@ -113,6 +124,14 @@ class DistributedApiV1ComputeProvider:
 
         return message
 
+    def diagnostics(self) -> Dict[str, Any]:
+        return {
+            "provider_class": self.__class__.__name__,
+            "resolved_path": "distributed",
+            "distributed_target": self.base_url.rstrip("/"),
+            "fallback_enabled": False,
+        }
+
 
 @dataclass(frozen=True)
 class FallbackApiV1ComputeProvider:
@@ -141,6 +160,19 @@ class FallbackApiV1ComputeProvider:
                 messages=messages,
                 options=options,
             )
+
+    def diagnostics(self) -> Dict[str, Any]:
+        primary_diag = (
+            self.primary.diagnostics()
+            if hasattr(self.primary, "diagnostics")
+            else {"provider_class": self.primary.__class__.__name__, "distributed_target": None}
+        )
+        return {
+            "provider_class": self.__class__.__name__,
+            "resolved_path": "distributed_with_local_fallback",
+            "distributed_target": primary_diag.get("distributed_target"),
+            "fallback_enabled": True,
+        }
 
 
 @lru_cache(maxsize=8)

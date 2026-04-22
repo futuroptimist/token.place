@@ -150,6 +150,7 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
 }
+REAL_DESKTOP_BRIDGE_E2E_NODEID = "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1"
 
 
 def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bool:
@@ -202,6 +203,8 @@ def setup_servers(
     5. Cleans up the processes after tests
     """
     focused_e2e_only = _is_focused_relay_landing_chat_request(request)
+    selected_nodeids = {item.nodeid for item in request.session.items}
+    run_real_bridge_e2e = REAL_DESKTOP_BRIDGE_E2E_NODEID in selected_nodeids
 
     # Fixes the Codex-focused skip case where this guard skipped runs when
     # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not
@@ -217,17 +220,24 @@ def setup_servers(
     # Ensure environment variables are set properly
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"  # This is the key setting for mocking the LLM
+    test_env["USE_MOCK_LLM"] = "0" if run_real_bridge_e2e else "1"
 
     # Start the relay server with the --use_mock_llm flag
+    relay_command = [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT)]
+    if not run_real_bridge_e2e:
+        relay_command.append("--use_mock_llm")
+
     relay_process = subprocess.Popen(
-        [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT), "--use_mock_llm"],
+        relay_command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=test_env
     )
-    print(f"Started relay server on port {E2E_RELAY_PORT} with --use_mock_llm flag")
+    if run_real_bridge_e2e:
+        print(f"Started relay server on port {E2E_RELAY_PORT} with real-provider guardrails")
+    else:
+        print(f"Started relay server on port {E2E_RELAY_PORT} with --use_mock_llm flag")
 
     # Wait for relay to start - increased wait time
     time.sleep(3)

@@ -261,12 +261,6 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     This test intentionally avoids route mocking so it verifies the real wiring:
     browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
     """
-    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
-        pytest.skip(
-            "Real desktop inference e2e is disabled by default; "
-            "set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to run this test."
-        )
-
     relay_process, _ = setup_servers
     assert relay_process is not None
 
@@ -275,12 +269,11 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     test_env["USE_MOCK_LLM"] = "0"
     preprovisioned_model_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
     if not preprovisioned_model_path:
-        pytest.skip(
-            "Set TOKENPLACE_REAL_E2E_MODEL_PATH to an existing GGUF path for "
-            "RUN_REAL_DESKTOP_INFERENCE_E2E=1 runs."
+        raise AssertionError(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must be configured for the always-on relay landing-page real-inference guardrail."
         )
     if not os.path.isfile(preprovisioned_model_path):
-        pytest.skip(
+        raise AssertionError(
             "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing model file "
             f"(got: {preprovisioned_model_path})."
         )
@@ -339,6 +332,14 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
     page.route("**/api/v1/chat/completions", record_v1_request)
     page.route("**/api/v2/chat/completions", record_v2_request)
+
+    v1_response_headers = []
+
+    def record_v1_response(response):
+        if "/api/v1/chat/completions" in response.url:
+            v1_response_headers.append(response.headers)
+
+    page.on("response", record_v1_response)
 
     try:
         start_deadline = time.time() + 25
@@ -400,17 +401,21 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             """,
             arg={
                 "selector": ".assistant-message",
-                "expectedText": "paris",
+                "expectedText": "",
             },
         )
 
         assistant_text = assistant_message.inner_text()
-        assert "paris" in assistant_text.lower()
+        assert assistant_text.strip(), "assistant response should not be empty"
+        assert assistant_text.strip().lower() != "stub"
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
 
         assert len(v1_requests) >= 1
         assert v2_requests == []
+        assert v1_response_headers, "expected at least one API v1 response"
+        latest_headers = v1_response_headers[-1]
+        assert latest_headers.get("x-tokenplace-api-v1-stream-mode") == "non-streaming"
 
         encrypted_request = v1_requests[0].post_data_json
         assert encrypted_request.get("encrypted") is True

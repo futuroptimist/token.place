@@ -24,3 +24,9 @@ def test_landing_chat_js_avoids_relay_v2_streaming_path():
     assert "sendStreamingMessage(" not in chat_js, (
         "landing chat must not include streaming relay send helper call chain"
     )
+
+
+def test_landing_chat_js_disables_incremental_typing_for_relay_v1():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "relayApiV1NonStreaming: true" in chat_js
+    assert "incremental character streaming" in chat_js

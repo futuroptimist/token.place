@@ -7,7 +7,8 @@ new Vue({
         clientPrivateKey: null,
         clientPublicKey: null,
         isGeneratingResponse: false,
-        isTouchInput: false
+        isTouchInput: false,
+        relayApiV1NonStreaming: true
     },
     mounted() {
         this.detectTouchInput();
@@ -451,66 +452,11 @@ new Vue({
                 return;
             }
 
-            const content = message.content;
-            const typingFactory = typeof ChatTypingEffect !== 'undefined'
-                && ChatTypingEffect
-                && typeof ChatTypingEffect.createTypingAnimator === 'function';
-
-            const shouldAnimate = typingFactory && typeof content === 'string' && content.trim().length > 0;
-
-            if (!shouldAnimate) {
-                const entry = Object.assign({}, message, { isTyping: false });
-                this.chatHistory.push(entry);
-                return;
-            }
-
-            const finalText = content;
-            const entry = Object.assign({}, message, {
-                content: finalText,
-                displayContent: '',
-                isTyping: true
-            });
-            const chunkSize = this.calculateTypingChunkSize(finalText);
-
-            const animator = ChatTypingEffect.createTypingAnimator({
-                fullText: finalText,
-                chunkSize,
-                onUpdate: (partial) => {
-                    entry.displayContent = partial;
-                },
-                onComplete: () => {
-                    entry.isTyping = false;
-                    if (entry._animator && typeof entry._animator.cancel === 'function') {
-                        entry._animator.cancel();
-                    }
-                    delete entry._animator;
-                    if (typeof this.$delete === 'function') {
-                        this.$delete(entry, 'displayContent');
-                    } else {
-                        delete entry.displayContent;
-                    }
-                },
-                schedule: (fn, delay) => {
-                    if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
-                        return window.setTimeout(fn, delay);
-                    }
-                    return setTimeout(fn, delay);
-                },
-                cancelScheduled: (id) => {
-                    if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function') {
-                        window.clearTimeout(id);
-                    } else {
-                        clearTimeout(id);
-                    }
-                }
-            });
-
-            entry._animator = animator;
+            // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
+            // Always render the assistant response atomically instead of simulating
+            // incremental character streaming in the UI.
+            const entry = Object.assign({}, message, { isTyping: false });
             this.chatHistory.push(entry);
-
-            this.$nextTick(() => {
-                animator.start();
-            });
         },
 
         getDisplayContent(message) {

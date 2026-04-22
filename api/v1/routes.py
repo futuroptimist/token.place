@@ -321,7 +321,8 @@ def _handle_chat_completion_request(data):
 
         log_info(f"Generating response using model {model_id}")
         provider = get_api_v1_compute_provider()
-        log_info(f"API v1 compute provider selected: {provider.__class__.__name__}")
+        resolved_provider_name = provider.__class__.__name__
+        log_info(f"API v1 compute provider selected: {resolved_provider_name}")
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -381,9 +382,15 @@ def _handle_chat_completion_request(data):
                     status_code=500,
                 )
 
-            return jsonify({"encrypted": True, "data": encrypted_response})
+            response = jsonify({"encrypted": True, "data": encrypted_response})
+            response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
+            response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
+            return response
 
-        return jsonify(response_data)
+        response = jsonify(response_data)
+        response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
+        response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
+        return response
 
     except ValidationError as e:
         return format_error_response(
@@ -471,6 +478,8 @@ def _handle_text_completion_request(data):
 
         log_info(f"Generating response using model {model_id}")
         provider = get_api_v1_compute_provider()
+        resolved_provider_name = provider.__class__.__name__
+        log_info(f"API v1 compute provider selected: {resolved_provider_name}")
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -507,9 +516,15 @@ def _handle_text_completion_request(data):
                     error_type="server_error",
                     status_code=500,
                 )
-            return jsonify({"encrypted": True, "data": encrypted_response})
+            response = jsonify({"encrypted": True, "data": encrypted_response})
+            response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
+            response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
+            return response
 
-        return jsonify(response_data)
+        response = jsonify(response_data)
+        response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
+        response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
+        return response
 
     except ModelError as e:
         log_warning(f"Model error during response generation: {e.message}")

@@ -7,6 +7,7 @@ import logging
 import requests
 import json
 import sys
+import importlib
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -16,12 +17,49 @@ from utils.system import resource_monitor
 
 # Configure logging
 logger = logging.getLogger('model_manager')
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
+
+
+def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
+    """Return True when llama_cpp resolves to the repository-local shim."""
+    if not module_path:
+        return False
+    try:
+        return Path(str(module_path)).resolve() == REPO_LLAMA_CPP_SHIM
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _import_llama_cpp_runtime(*, require_real_runtime: bool = True):
+    """Import llama_cpp while guarding against the repo-local test shim."""
+    llama_spec = importlib.util.find_spec('llama_cpp')
+    llama_module_path = getattr(llama_spec, 'origin', None)
+
+    if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
+        sys.modules.pop('llama_cpp', None)
+        raise ImportError(
+            "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
+            "install llama-cpp-python and ensure site-packages wins import priority."
+        )
+
+    llama_cpp = importlib.import_module('llama_cpp')
+    llama_module_path = getattr(llama_cpp, '__file__', None)
+
+    if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
+        sys.modules.pop('llama_cpp', None)
+        raise ImportError(
+            "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
+            "install llama-cpp-python and ensure site-packages wins import priority."
+        )
+
+    return llama_cpp
 
 
 def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     """Return backend/offload capability details from the installed llama_cpp runtime."""
     try:
-        import llama_cpp
+        llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
     except Exception as exc:
         return {
             'backend': 'missing',
@@ -408,7 +446,8 @@ class ModelManager:
                     else:
                         try:
                             # Dynamically import Llama only when needed
-                            from llama_cpp import Llama
+                            llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
+                            Llama = llama_cpp.Llama
 
                             compute_plan = self._resolve_compute_plan()
                             n_gpu_layers = int(compute_plan['n_gpu_layers'])

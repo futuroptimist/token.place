@@ -5,7 +5,6 @@ import pytest
 import queue
 import subprocess
 import sys
-import tempfile
 import threading
 from playwright.sync_api import Page
 import time
@@ -251,7 +250,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
 
 @pytest.mark.e2e
-def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
+def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     page: Page,
     base_url: str,
     setup_servers,
@@ -259,23 +258,39 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
     """
     Validate relay landing chat end-to-end through the desktop compute-node bridge.
 
-    This test intentionally avoids route mocking so CI verifies the real wiring:
+    This test intentionally avoids route mocking so it verifies the real wiring:
     browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
     """
+    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
+        pytest.skip(
+            "Real desktop inference e2e is disabled by default; "
+            "set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to run this test."
+        )
 
     relay_process, _ = setup_servers
     assert relay_process is not None
 
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"
+    test_env["USE_MOCK_LLM"] = "0"
+    preprovisioned_model_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
+    if not preprovisioned_model_path:
+        pytest.skip(
+            "Set TOKENPLACE_REAL_E2E_MODEL_PATH to an existing GGUF path for "
+            "RUN_REAL_DESKTOP_INFERENCE_E2E=1 runs."
+        )
+    if not os.path.isfile(preprovisioned_model_path):
+        pytest.skip(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing model file "
+            f"(got: {preprovisioned_model_path})."
+        )
 
     bridge_process = subprocess.Popen(
         [
             sys.executable,
             "desktop-tauri/src-tauri/python/compute_node_bridge.py",
             "--model",
-            os.path.join(tempfile.gettempdir(), "mock-model.gguf"),
+            preprovisioned_model_path,
             "--mode",
             "cpu",
             "--relay-url",
@@ -349,6 +364,12 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
 
             if event_type == "started":
                 started = bool(payload.get("running"))
+                assert payload.get("use_mock_llm") is False
+                assert payload.get("llama_repo_stub_imported") is False
+                llama_module_path = payload.get("llama_module_path", "")
+                assert isinstance(llama_module_path, str) and llama_module_path
+                assert not llama_module_path.endswith("/llama_cpp.py")
+                assert not llama_module_path.endswith("\\llama_cpp.py")
             if event_type == "status" and payload.get("registered") is True:
                 registered = True
                 break
@@ -362,7 +383,7 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
         page.wait_for_load_state("networkidle")
 
         textarea = page.locator("textarea").first
-        textarea.fill("hello relay + desktop bridge")
+        textarea.fill("What is the capital of France? Respond with one word.")
         page.locator("button", has_text="Send").click()
 
         assistant_message = page.locator(".assistant-message").last
@@ -379,12 +400,12 @@ def test_landing_chat_round_trip_with_desktop_bridge_api_v1(
             """,
             arg={
                 "selector": ".assistant-message",
-                "expectedText": "capital",
+                "expectedText": "paris",
             },
         )
 
         assistant_text = assistant_message.inner_text()
-        assert "capital" in assistant_text.lower()
+        assert "paris" in assistant_text.lower()
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
 

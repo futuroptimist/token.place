@@ -257,10 +257,10 @@ class TestModelManager:
     @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)
     @patch('utils.llm.model_manager.os.path.exists', return_value=True)
     @patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=False)
-    @patch('llama_cpp.Llama', create=True)
+    @patch('utils.llm.model_manager._import_llama_cpp_runtime')
     def test_get_llm_instance_falls_back_to_cpu_on_low_gpu_memory(
         self,
-        mock_llama,
+        mock_import_llama_cpp_runtime,
         mock_can_allocate,
         mock_exists,
         _mock_getsize,
@@ -268,8 +268,10 @@ class TestModelManager:
     ):
         """When GPU headroom is insufficient the model should load on CPU."""
 
+        mock_llama = MagicMock()
         instance = MagicMock()
         mock_llama.return_value = instance
+        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama)
 
         with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
              patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
@@ -284,10 +286,10 @@ class TestModelManager:
     @patch('utils.llm.model_manager.os.path.getsize', return_value=4_000_000_000)
     @patch('utils.llm.model_manager.os.path.exists', return_value=True)
     @patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory', return_value=True)
-    @patch('llama_cpp.Llama', create=True)
+    @patch('utils.llm.model_manager._import_llama_cpp_runtime')
     def test_get_llm_instance_uses_gpu_when_headroom_available(
         self,
-        mock_llama,
+        mock_import_llama_cpp_runtime,
         mock_can_allocate,
         mock_exists,
         _mock_getsize,
@@ -295,8 +297,10 @@ class TestModelManager:
     ):
         """When memory is available the model continues to use the GPU."""
 
+        mock_llama = MagicMock()
         instance = MagicMock()
         mock_llama.return_value = instance
+        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama)
 
         with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
              patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
@@ -312,7 +316,8 @@ class TestModelManager:
 
         instance = MagicMock()
 
-        with patch('llama_cpp.Llama', return_value=instance, create=True) as mock_llama, \
+        mock_llama = MagicMock(return_value=instance)
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama)), \
              patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory') as mock_can_allocate, \
              patch('utils.llm.model_manager.os.path.exists', return_value=True), \
              patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')), \
@@ -352,7 +357,7 @@ class TestModelManager:
 
         # Patch everything needed
         with patch('os.path.exists', return_value=True), \
-             patch('llama_cpp.Llama', return_value=mock_llama, create=True):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=MagicMock(return_value=mock_llama))):
 
             # Call the method
             llm = model_manager.get_llm_instance()
@@ -569,10 +574,13 @@ class TestModelManager:
             assert isinstance(manager, ModelManager)
             assert mock_get_config.called
 
-    @patch('llama_cpp.Llama', side_effect=Exception('fail'), create=True)
+    @patch('utils.llm.model_manager._import_llama_cpp_runtime')
     @patch('os.path.exists', return_value=True)
-    def test_get_llm_instance_init_failure(self, mock_exists, mock_llama, model_manager):
+    def test_get_llm_instance_init_failure(self, mock_exists, mock_import_llama_cpp_runtime, model_manager):
         """Return None if Llama initialization raises an exception."""
+        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(
+            Llama=MagicMock(side_effect=Exception('fail'))
+        )
         llm = model_manager.get_llm_instance()
         assert llm is None
 
@@ -794,7 +802,7 @@ class TestModelManager:
         )
 
         with patch('utils.llm.model_manager.sys.platform', 'linux'), \
-             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             backend = ModelManager._platform_gpu_backend()
 
         assert backend == 'cuda'
@@ -809,7 +817,7 @@ class TestModelManager:
         )
 
         with patch('utils.llm.model_manager.sys.platform', 'linux'), \
-             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             backend = ModelManager._platform_gpu_backend()
 
         assert backend == 'cuda'
@@ -821,7 +829,7 @@ class TestModelManager:
             raise RuntimeError("probe failed")
 
         fake_llama = SimpleNamespace(llama_supports_gpu_offload=_raise_runtime_error)
-        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             assert ModelManager._llama_gpu_offload_available() is False
 
     def test_get_llm_instance_mock_mode_refreshes_compute_diagnostics(self, model_manager):
@@ -852,7 +860,7 @@ class TestModelManager:
         )
 
         with patch('utils.llm.model_manager.sys.platform', 'linux'), \
-             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             backend = ModelManager._platform_gpu_backend()
 
         assert backend == 'metal'
@@ -867,7 +875,7 @@ class TestModelManager:
         )
 
         with patch('utils.llm.model_manager.sys.platform', 'linux'), \
-             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             backend = ModelManager._platform_gpu_backend()
 
         assert backend == 'metal'
@@ -881,7 +889,7 @@ class TestModelManager:
         )
 
         with patch('utils.llm.model_manager.sys.platform', 'linux'), \
-             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             backend = ModelManager._platform_gpu_backend()
 
         assert backend == 'cuda'
@@ -899,7 +907,7 @@ class TestModelManager:
         )
 
         with patch('utils.llm.model_manager.sys.platform', 'linux'), \
-             patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             backend = ModelManager._platform_gpu_backend()
 
         assert backend is None
@@ -912,7 +920,7 @@ class TestModelManager:
             llama_supports_gpu_offload=None,
         )
 
-        with patch.dict(sys.modules, {'llama_cpp': fake_llama}):
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama):
             assert ModelManager._llama_gpu_offload_available() is True
 
     def test_resolve_compute_plan_gpu_and_hybrid_success_paths(self, model_manager):
@@ -952,17 +960,12 @@ class TestModelManager:
             assert ModelManager._llama_gpu_offload_available() is True
 
     def test_detect_runtime_capabilities_reports_missing_module_error(self):
-        import builtins
         from utils.llm import model_manager as mm
 
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == 'llama_cpp':
-                raise ModuleNotFoundError("No module named 'llama_cpp'")
-            return real_import(name, *args, **kwargs)
-
-        with patch('builtins.__import__', side_effect=fake_import):
+        with patch(
+            'utils.llm.model_manager._import_llama_cpp_runtime',
+            side_effect=ModuleNotFoundError("No module named 'llama_cpp'"),
+        ):
             payload = mm.detect_llama_runtime_capabilities()
 
         assert payload['backend'] == 'missing'
@@ -979,7 +982,7 @@ class TestModelManager:
         model_manager.requested_compute_mode = 'gpu'
         model_manager.log_info = lambda message: log_lines.append(message)
 
-        with patch('llama_cpp.Llama', FakeLlama), \
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
              patch.object(model_manager, '_resolve_compute_plan', return_value={
                  'requested_mode': 'gpu',
                  'effective_mode': 'cpu_fallback',

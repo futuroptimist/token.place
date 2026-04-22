@@ -321,6 +321,7 @@ def _handle_chat_completion_request(data):
 
         log_info(f"Generating response using model {model_id}")
         provider = get_api_v1_compute_provider()
+        log_info(f"API v1 compute provider selected: {provider.__class__.__name__}")
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,

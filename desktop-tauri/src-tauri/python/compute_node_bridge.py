@@ -45,6 +45,12 @@ except ModuleNotFoundError:
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
+try:
+    from utils.llm.model_manager import _is_repo_llama_cpp_shim
+except ModuleNotFoundError:
+    def _is_repo_llama_cpp_shim(_module_path: Any) -> bool:
+        return False
+
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
@@ -178,6 +184,14 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
+    repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
+        runtime_setup.get("llama_module_path", "")
+    )
+    print(
+        "desktop.runtime_setup.import_guard "
+        f"repo_llama_cpp_shim_imported={repo_llama_cpp_shim_imported}",
+        file=sys.stderr,
+    )
     gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
     if gpu_runtime_error:
         emit({"type": "error", "message": gpu_runtime_error})
@@ -255,6 +269,8 @@ def run(args: argparse.Namespace) -> int:
             "fallback_reason": diagnostics.get("fallback_reason"),
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+            "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
+            "use_mock_llm": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
             "model_path": args.model,
             "last_error": None,
         }

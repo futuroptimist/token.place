@@ -148,7 +148,7 @@ E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
-    "tests/e2e/test_ui.py::test_landing_chat_round_trip_with_desktop_bridge_api_v1",
+    "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
 }
 
 
@@ -166,7 +166,7 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
         "landing_chat_uses_api_v1_only_non_streaming",
-        "landing_chat_round_trip_with_desktop_bridge_api_v1",
+        "landing_chat_real_inference_with_desktop_bridge_api_v1",
     }
     target_path = "tests/e2e/test_ui.py"
 

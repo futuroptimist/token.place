@@ -102,6 +102,7 @@ def test_get_provider_disables_local_fallback_when_configured(monkeypatch):
         provider = compute_provider.get_api_v1_compute_provider()
 
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.diagnostics()["resolved_provider"] == "distributed"
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
@@ -117,3 +118,14 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
             compute_provider.get_api_v1_compute_provider()
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_fallback_provider_reports_resolved_diagnostics():
+    provider = FallbackApiV1ComputeProvider(
+        primary=DistributedApiV1ComputeProvider(base_url="https://node-a.example"),
+        fallback=LocalApiV1ComputeProvider(),
+    )
+    diagnostics = provider.diagnostics()
+    assert diagnostics["resolved_provider"] == "distributed_with_local_fallback"
+    assert diagnostics["resolved_target"] == "https://node-a.example"
+    assert diagnostics["fallback_provider"] == "local"

@@ -24,3 +24,6 @@ def test_landing_chat_js_avoids_relay_v2_streaming_path():
     assert "sendStreamingMessage(" not in chat_js, (
         "landing chat must not include streaming relay send helper call chain"
     )
+    assert "ChatTypingEffect.createTypingAnimator" not in chat_js, (
+        "landing chat relay API v1 path must not animate responses incrementally"
+    )

@@ -200,7 +200,10 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
         route.fulfill(
             status=200,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-TokenPlace-ApiV1-Provider": "distributed",
+            },
             body=json.dumps(
                 {
                     "encrypted": True,
@@ -245,6 +248,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         arg={"selector": ".assistant-message", "expectedText": "Relay chat path restored."},
     )
     assert "Relay chat path restored." in assistant_message.inner_text()
+    assert assistant_message.inner_text().strip() == "Relay chat path restored."
     assert "Sorry, I encountered an issue generating a response." not in page.content()
     assert v2_requests == []
 
@@ -261,12 +265,6 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     This test intentionally avoids route mocking so it verifies the real wiring:
     browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
     """
-    if os.environ.get("RUN_REAL_DESKTOP_INFERENCE_E2E", "0") != "1":
-        pytest.skip(
-            "Real desktop inference e2e is disabled by default; "
-            "set RUN_REAL_DESKTOP_INFERENCE_E2E=1 to run this test."
-        )
-
     relay_process, _ = setup_servers
     assert relay_process is not None
 
@@ -275,12 +273,12 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     test_env["USE_MOCK_LLM"] = "0"
     preprovisioned_model_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
     if not preprovisioned_model_path:
-        pytest.skip(
-            "Set TOKENPLACE_REAL_E2E_MODEL_PATH to an existing GGUF path for "
-            "RUN_REAL_DESKTOP_INFERENCE_E2E=1 runs."
+        pytest.fail(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must be set for the always-on relay "
+            "landing-page desktop-bridge e2e guardrail."
         )
     if not os.path.isfile(preprovisioned_model_path):
-        pytest.skip(
+        pytest.fail(
             "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing model file "
             f"(got: {preprovisioned_model_path})."
         )
@@ -381,6 +379,21 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         page.goto(base_url)
         page.wait_for_load_state("networkidle")
+        page.evaluate(
+            """
+            () => {
+                window.__assistantMutationLengths = [];
+                const observer = new MutationObserver(() => {
+                    const nodes = document.querySelectorAll('.assistant-message');
+                    if (!nodes.length) return;
+                    const latest = nodes[nodes.length - 1];
+                    window.__assistantMutationLengths.push((latest.textContent || '').length);
+                });
+                observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+                window.__assistantMutationObserver = observer;
+            }
+            """
+        )
 
         textarea = page.locator("textarea").first
         textarea.fill("What is the capital of France? Respond with one word.")
@@ -406,6 +419,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assistant_text = assistant_message.inner_text()
         assert "paris" in assistant_text.lower()
+        assert assistant_text.strip().lower() != "stub"
         assert "Sorry, I encountered an issue generating a response." not in page.content()
         assert "Unknown streaming error" not in page.content()
 
@@ -418,7 +432,30 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert isinstance(client_public_key, str) and client_public_key
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)
         assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
+        mutation_lengths = page.evaluate(
+            "() => Array.isArray(window.__assistantMutationLengths) ? window.__assistantMutationLengths : []"
+        )
+        assert mutation_lengths, "expected assistant DOM mutation activity"
+        assert mutation_lengths[-1] == len(assistant_text)
+        assert len(set(mutation_lengths)) <= 2, (
+            "relay landing-page API v1 flow must render non-streaming responses "
+            "without incremental letter-by-letter output"
+        )
     finally:
+        try:
+            page.evaluate(
+                """
+                () => {
+                    if (window.__assistantMutationObserver) {
+                        window.__assistantMutationObserver.disconnect();
+                        delete window.__assistantMutationObserver;
+                    }
+                }
+                """
+            )
+        except Exception:
+            pass
+
         if bridge_process.stdin:
             try:
                 bridge_process.stdin.write(json.dumps({"type": "cancel"}) + "\n")

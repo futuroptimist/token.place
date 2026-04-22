@@ -150,6 +150,9 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
 }
+REAL_DESKTOP_RELAY_E2E_NODEID = (
+    "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1"
+)
 
 
 def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bool:
@@ -187,6 +190,19 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
 
     return False
 
+
+def _is_real_desktop_bridge_landing_chat_request(request: pytest.FixtureRequest) -> bool:
+    selected_nodeids = {item.nodeid for item in request.session.items}
+    if REAL_DESKTOP_RELAY_E2E_NODEID in selected_nodeids:
+        return True
+
+    invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
+    return any(
+        arg == REAL_DESKTOP_RELAY_E2E_NODEID
+        or "landing_chat_real_inference_with_desktop_bridge_api_v1" in arg
+        for arg in invocation_args
+    )
+
 @pytest.fixture(scope="module")
 def setup_servers(
     request: pytest.FixtureRequest,
@@ -202,6 +218,7 @@ def setup_servers(
     5. Cleans up the processes after tests
     """
     focused_e2e_only = _is_focused_relay_landing_chat_request(request)
+    real_desktop_bridge_e2e = _is_real_desktop_bridge_landing_chat_request(request)
 
     # Fixes the Codex-focused skip case where this guard skipped runs when
     # RUN_RELAY_REGISTRATION_TESTS != "1" and focused detection did not
@@ -217,17 +234,23 @@ def setup_servers(
     # Ensure environment variables are set properly
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
-    test_env["USE_MOCK_LLM"] = "1"  # This is the key setting for mocking the LLM
+    test_env["USE_MOCK_LLM"] = "0" if real_desktop_bridge_e2e else "1"
 
     # Start the relay server with the --use_mock_llm flag
+    relay_cmd = [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT)]
+    if not real_desktop_bridge_e2e:
+        relay_cmd.append("--use_mock_llm")
     relay_process = subprocess.Popen(
-        [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT), "--use_mock_llm"],
+        relay_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=test_env
     )
-    print(f"Started relay server on port {E2E_RELAY_PORT} with --use_mock_llm flag")
+    print(
+        f"Started relay server on port {E2E_RELAY_PORT} "
+        f"with USE_MOCK_LLM={test_env['USE_MOCK_LLM']}"
+    )
 
     # Wait for relay to start - increased wait time
     time.sleep(3)

@@ -1038,6 +1038,24 @@ def test_module_level_fallback_when_desktop_runtime_setup_is_missing(monkeypatch
     assert module.maybe_reexec_for_runtime_refresh(setup, allow_reexec=False) is None
 
 
+def test_module_level_fallback_when_model_manager_is_missing(monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'utils.llm'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+
+    module = ModuleType('compute_node_bridge_no_model_manager')
+    module.__file__ = str(MODULE_PATH)
+    code = compile(MODULE_PATH.read_text(encoding='utf-8'), str(MODULE_PATH), 'exec')
+    exec(code, module.__dict__)
+
+    assert module._is_repo_llama_cpp_shim('/tmp/llama_cpp.py') is False
+
+
 def test_sanitize_relay_target_redacts_credentials_query_and_fragment():
     sanitized = compute_node_bridge._sanitize_relay_target(
         'https://user:pass@token.place:8443/sink?token=abc#debug'

@@ -238,6 +238,33 @@ def _load_upstream_config() -> Dict[str, Any]:
 UPSTREAM_CONFIG = _load_upstream_config()
 
 
+def _configure_api_v1_compute_provider_defaults() -> None:
+    """Default relay-hosted API v1 traffic to distributed compute-node routing."""
+
+    if os.environ.get("TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED", "0") != "1":
+        return
+
+    if not os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
+        os.environ["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "distributed"
+
+    if not os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip():
+        os.environ["TOKENPLACE_DISTRIBUTED_COMPUTE_URL"] = UPSTREAM_CONFIG["upstream_url"].rstrip("/")
+
+    if not os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "").strip():
+        os.environ["TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"] = "0"
+
+    LOGGER.info(
+        "relay.api_v1.provider_defaults "
+        "provider=%s target=%s fallback=%s",
+        os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER"),
+        os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL"),
+        os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"),
+    )
+
+
+_configure_api_v1_compute_provider_defaults()
+
+
 def _load_public_base_url() -> str | None:
     """Return the externally reachable relay URL when configured."""
 

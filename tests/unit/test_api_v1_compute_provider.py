@@ -117,3 +117,21 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
             compute_provider.get_api_v1_compute_provider()
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_distributed_provider_diagnostics_reflect_resolved_runtime(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        diagnostics = provider.diagnostics()
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    assert diagnostics["provider_class"] == "DistributedApiV1ComputeProvider"
+    assert diagnostics["resolved_path"] == "distributed"
+    assert diagnostics["distributed_target"] == "https://node-a.example"
+    assert diagnostics["fallback_enabled"] is False

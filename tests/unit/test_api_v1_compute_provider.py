@@ -132,6 +132,76 @@ def test_get_api_v1_resolved_provider_path_labels_instance_types():
     assert get_api_v1_resolved_provider_path(object()) == "unknown"
 
 
+def test_api_v1_chat_completion_maps_no_registered_nodes_to_structured_error(monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=503,
+            json=lambda: {
+                "error": {
+                    "message": "No registered compute nodes available",
+                    "code": 503,
+                }
+            },
+        ),
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    try:
+        assert response.status_code == 503
+        payload = response.get_json()
+        assert payload["error"]["type"] == "server_error"
+        assert payload["error"]["code"] == "no_registered_compute_nodes"
+        assert payload["error"]["message"] == "No LLM servers are available right now."
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_api_v1_chat_completion_maps_invalid_provider_payload_to_structured_error(monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"not_message": True}]},
+        ),
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    try:
+        assert response.status_code == 502
+        payload = response.get_json()
+        assert payload["error"]["code"] == "relay_invalid_payload"
+        assert payload["error"]["message"] == "The LLM server returned an invalid response."
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
 @pytest.mark.parametrize(
     ("post_status", "expected_backend_path"),
     [

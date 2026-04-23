@@ -400,8 +400,20 @@ new Vue({
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(`API error: ${errorData.error?.message || 'Unknown error'}`);
+                    let apiError = null;
+                    try {
+                        const errorData = await response.json();
+                        if (errorData && typeof errorData === 'object') {
+                            apiError = errorData.error || null;
+                        }
+                    } catch (_parseError) {
+                        apiError = null;
+                    }
+                    throw {
+                        type: 'api_error',
+                        error: apiError,
+                        userMessage: this.getUserFacingApiErrorMessage(apiError)
+                    };
                 }
 
                 const responseData = await response.json();
@@ -425,7 +437,13 @@ new Vue({
                 return responseData;
             } catch (error) {
                 console.error('API request error:', error);
-                return null;
+                if (error && error.type === 'api_error') {
+                    return { error: error.error, userMessage: error.userMessage };
+                }
+                return {
+                    error: null,
+                    userMessage: 'Sorry, an error occurred while sending your message. Please try again.'
+                };
             }
         },
 
@@ -475,6 +493,22 @@ new Vue({
             return message.content;
         },
 
+        getUserFacingApiErrorMessage(error) {
+            const code = error && typeof error.code === 'string' ? error.code : '';
+            const mappedMessages = {
+                no_registered_compute_nodes: 'No LLM servers are available right now.',
+                relay_provider_timeout: 'The LLM server timed out while processing your request.',
+                relay_invalid_payload: 'The LLM server returned an invalid response.',
+                relay_provider_unreachable: 'Unable to reach an LLM server right now.'
+            };
+
+            if (code && mappedMessages[code]) {
+                return mappedMessages[code];
+            }
+
+            return 'Sorry, I encountered an issue generating a response. Please try again.';
+        },
+
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
@@ -495,6 +529,13 @@ new Vue({
 
                 // Process the response
                 if (response) {
+                    if (response.userMessage) {
+                        this.chatHistory.push({
+                            role: 'assistant',
+                            content: response.userMessage
+                        });
+                        return;
+                    }
                     // For API response, extract last message
                     if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;

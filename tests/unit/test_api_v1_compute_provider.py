@@ -49,7 +49,8 @@ def test_distributed_compute_provider_posts_api_v1_contract(monkeypatch):
     assert captured["json"]["stream"] is False
     assert captured["json"]["temperature"] == 0.2
     assert "stream" not in captured["json"] or captured["json"]["stream"] is False
-    assert message["content"] == "distributed response"
+    assert message.assistant_message["content"] == "distributed response"
+    assert message.backend_path == "distributed"
 
 
 def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(monkeypatch):
@@ -75,7 +76,8 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(mon
         messages=[{"role": "user", "content": "hello"}],
     )
 
-    assert result == fallback_message
+    assert result.assistant_message == fallback_message
+    assert result.backend_path == "fallback:local"
 
 
 def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatch):
@@ -129,3 +131,36 @@ def test_get_api_v1_resolved_provider_path_labels_instance_types():
     assert get_api_v1_resolved_provider_path(distributed) == "distributed"
     assert get_api_v1_resolved_provider_path(fallback) == "distributed_with_local_fallback"
     assert get_api_v1_resolved_provider_path(object()) == "unknown"
+
+
+def test_relay_registered_compute_provider_posts_dispatch_contract(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {"message": {"role": "assistant", "content": "from relay node"}},
+        )
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", fake_post)
+
+    provider = compute_provider.RelayRegisteredApiV1ComputeProvider(
+        relay_base_url="https://relay.example",
+        timeout_seconds=9,
+    )
+    result = provider.complete_chat(
+        model_id="llama",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"temperature": 0.3, "stream": True},
+    )
+
+    assert captured["url"] == "https://relay.example/relay/api-v1/chat/dispatch"
+    assert captured["timeout"] == 9
+    assert captured["json"]["stream"] is False
+    assert captured["json"]["options"]["temperature"] == 0.3
+    assert "stream" not in captured["json"]["options"]
+    assert result.assistant_message["content"] == "from relay node"
+    assert result.backend_path == "relay_registered_node"

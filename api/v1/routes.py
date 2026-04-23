@@ -331,11 +331,12 @@ def _handle_chat_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
-        assistant_message = provider.complete_chat(
+        compute_result = provider.complete_chat(
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
         )
+        assistant_message = compute_result.assistant_message
         log_info("Response generated successfully")
 
         tool_calls = assistant_message.get("tool_calls")
@@ -391,14 +392,18 @@ def _handle_chat_completion_request(data):
                 )
 
             response = jsonify({"encrypted": True, "data": encrypted_response})
-            response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
-            response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] = resolved_provider_path
+            response.headers["X-Tokenplace-API-V1-Provider"] = compute_result.backend_provider
+            response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] = compute_result.backend_path
+            response.headers["X-Tokenplace-API-V1-Configured-Provider"] = resolved_provider_name
+            response.headers["X-Tokenplace-API-V1-Configured-Provider-Path"] = resolved_provider_path
             response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
             return response
 
         response = jsonify(response_data)
-        response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
-        response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] = resolved_provider_path
+        response.headers["X-Tokenplace-API-V1-Provider"] = compute_result.backend_provider
+        response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] = compute_result.backend_path
+        response.headers["X-Tokenplace-API-V1-Configured-Provider"] = resolved_provider_name
+        response.headers["X-Tokenplace-API-V1-Configured-Provider-Path"] = resolved_provider_path
         response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
         return response
 
@@ -494,11 +499,12 @@ def _handle_text_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
-        assistant_message = provider.complete_chat(
+        compute_result = provider.complete_chat(
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
         )
+        assistant_message = compute_result.assistant_message
         log_info("Response generated successfully")
 
         response_data = {
@@ -537,8 +543,10 @@ def _handle_text_completion_request(data):
             return response
 
         response = jsonify(response_data)
-        response.headers["X-Tokenplace-API-V1-Provider"] = resolved_provider_name
-        response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] = resolved_provider_path
+        response.headers["X-Tokenplace-API-V1-Provider"] = compute_result.backend_provider
+        response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] = compute_result.backend_path
+        response.headers["X-Tokenplace-API-V1-Configured-Provider"] = resolved_provider_name
+        response.headers["X-Tokenplace-API-V1-Configured-Provider-Path"] = resolved_provider_path
         response.headers["X-Tokenplace-API-V1-Stream-Mode"] = "non-streaming"
         return response
 

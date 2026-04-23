@@ -379,6 +379,10 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+api_v1_chat_requests = {}
+api_v1_chat_responses = {}
+api_v1_chat_response_lock = threading.Lock()
+api_v1_chat_response_condition = threading.Condition(api_v1_chat_response_lock)
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -425,6 +429,7 @@ def _live_server_diagnostics() -> list[dict[str, Any]]:
             "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
             "next_ping_in_x_seconds": payload.get("last_ping_duration"),
             "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+            "api_v1_queue_depth": len(api_v1_chat_requests.get(server_public_key, [])),
         })
     diagnostics.sort(key=lambda node: node["server_public_key"])
     return diagnostics
@@ -435,6 +440,7 @@ def _unregister_server(server_public_key: str) -> bool:
 
     removed = known_servers.pop(server_public_key, None) is not None
     client_inference_requests.pop(server_public_key, None)
+    api_v1_chat_requests.pop(server_public_key, None)
 
     with stream_lock:
         stale_session_ids = [
@@ -804,6 +810,7 @@ def sink():
 
     # Check if there are any client requests for this server
     queued_requests = client_inference_requests.get(public_key, [])
+    queued_api_v1_requests = api_v1_chat_requests.get(public_key, [])
     if queued_requests:
         batch = []
         while queued_requests and len(batch) < max_batch_size:
@@ -831,8 +838,88 @@ def sink():
 
         if max_batch_size > 1:
             response_data['batch'] = batch
+    elif queued_api_v1_requests:
+        response_data["api_v1_chat_request"] = queued_api_v1_requests.pop(0)
 
     return jsonify(response_data)
+
+
+@app.route('/relay/api-v1/chat/dispatch', methods=['POST'])
+def relay_api_v1_chat_dispatch():
+    """Dispatch a non-streaming API v1 chat request to a registered compute node."""
+    _evict_stale_servers()
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    model = data.get("model")
+    messages = data.get("messages")
+    if not isinstance(model, str) or not model.strip():
+        return jsonify({'error': 'Invalid model'}), 400
+    if not isinstance(messages, list) or not messages:
+        return jsonify({'error': 'Invalid messages'}), 400
+
+    server_public_key = data.get("server_public_key")
+    if server_public_key is None:
+        if not known_servers:
+            return jsonify({'error': 'No registered compute nodes available'}), 503
+        server_public_key = secrets.choice(list(known_servers.keys()))
+    if server_public_key not in known_servers:
+        return jsonify({'error': 'Server with the specified public key not found'}), 404
+
+    request_id = secrets.token_urlsafe(18)
+    request_payload = {
+        "request_id": request_id,
+        "model": model,
+        "messages": messages,
+        "options": data.get("options") if isinstance(data.get("options"), dict) else {},
+    }
+    api_v1_chat_requests.setdefault(server_public_key, []).append(request_payload)
+
+    timeout_seconds = float(data.get("timeout_seconds") or 65.0)
+    deadline = time.time() + max(timeout_seconds, 0.1)
+    with api_v1_chat_response_condition:
+        while time.time() < deadline:
+            response_payload = api_v1_chat_responses.pop(request_id, None)
+            if response_payload is not None:
+                if response_payload.get("error"):
+                    return jsonify({"error": response_payload["error"]}), 502
+                return jsonify(response_payload), 200
+            remaining = deadline - time.time()
+            api_v1_chat_response_condition.wait(timeout=min(max(remaining, 0), 0.5))
+
+    return jsonify({'error': 'Timed out waiting for registered compute-node response'}), 504
+
+
+@app.route('/relay/api-v1/chat/result', methods=['POST'])
+def relay_api_v1_chat_result():
+    """Accept API v1 chat completion results from registered compute nodes."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return jsonify({'error': 'Invalid request_id'}), 400
+
+    payload = {"request_id": request_id}
+    message = data.get("message")
+    error = data.get("error")
+    if isinstance(message, dict):
+        payload["message"] = message
+    elif error:
+        payload["error"] = str(error)
+    else:
+        return jsonify({'error': 'Invalid result payload'}), 400
+
+    with api_v1_chat_response_condition:
+        api_v1_chat_responses[request_id] = payload
+        api_v1_chat_response_condition.notify_all()
+
+    return jsonify({'message': 'API v1 result received'}), 200
 
 
 @app.route('/unregister', methods=['POST'])

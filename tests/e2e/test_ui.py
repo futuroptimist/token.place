@@ -459,16 +459,16 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         provider_diagnostics = (
             "landing-page real-provider guardrail diagnostics: "
             f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
-            f"stream_mode={stream_mode!r}; expected provider_class='LocalApiV1ComputeProvider', "
-            "resolved_provider_path='local', stream_mode='non-streaming'"
+            f"stream_mode={stream_mode!r}; expected provider_class='RelayRegisteredApiV1ComputeProvider', "
+            "resolved_provider_path='relay_registered_node', stream_mode='non-streaming'"
         )
-        assert provider_class == "LocalApiV1ComputeProvider", provider_diagnostics
+        assert provider_class == "RelayRegisteredApiV1ComputeProvider", provider_diagnostics
         assert stream_mode == "non-streaming", provider_diagnostics
-        assert resolved_provider_path == "local", (
+        assert resolved_provider_path == "relay_registered_node", (
             "landing-page real-provider guardrail requires resolved provider path "
-            f"'local'. {provider_diagnostics}"
+            f"'relay_registered_node'. {provider_diagnostics}"
         )
-        if runtime_supports_real_inference and resolved_provider_path != "local":
+        if runtime_supports_real_inference and resolved_provider_path != "relay_registered_node":
             assert assistant_text.strip().lower() != "stub", (
                 "assistant response must not be stub when runtime reports real inference support "
                 f"and provider path is {resolved_provider_path!r}. {provider_diagnostics}"

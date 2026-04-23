@@ -32,8 +32,17 @@ class ApiV1ComputeProvider(Protocol):
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Return an assistant message payload compatible with OpenAI chat responses."""
+    ) -> "ApiV1ComputeResult":
+        """Return assistant payload + backend diagnostics for API v1 chat responses."""
+
+
+@dataclass(frozen=True)
+class ApiV1ComputeResult:
+    """Structured result for API v1 compute execution."""
+
+    assistant_message: dict[str, Any]
+    backend_path: str
+    backend_provider: str
 
 
 @dataclass(frozen=True)
@@ -46,14 +55,18 @@ class LocalApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> ApiV1ComputeResult:
         updated_messages = generate_response(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
         assistant_message = updated_messages[-1]
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
-        return assistant_message
+        return ApiV1ComputeResult(
+            assistant_message=assistant_message,
+            backend_path="local",
+            backend_provider=self.__class__.__name__,
+        )
 
 
 @dataclass(frozen=True)
@@ -69,7 +82,7 @@ class DistributedApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> ApiV1ComputeResult:
         payload: Dict[str, Any] = {
             "model": model_id,
             "messages": messages,
@@ -111,7 +124,59 @@ class DistributedApiV1ComputeProvider:
         if not isinstance(message, dict):
             raise ComputeProviderError("distributed provider response missing message")
 
-        return message
+        return ApiV1ComputeResult(
+            assistant_message=message,
+            backend_path="distributed",
+            backend_provider=self.__class__.__name__,
+        )
+
+
+@dataclass(frozen=True)
+class RelayRegisteredApiV1ComputeProvider:
+    """Provider that routes API v1 chat to a registered relay compute node."""
+
+    relay_base_url: str
+    timeout_seconds: float = 60.0
+
+    def complete_chat(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> ApiV1ComputeResult:
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            "stream": False,
+            "options": {k: v for k, v in (options or {}).items() if k != "stream"},
+        }
+        try:
+            response = requests.post(
+                f"{self.relay_base_url.rstrip('/')}/relay/api-v1/chat/dispatch",
+                json=payload,
+                timeout=self.timeout_seconds,
+            )
+        except Exception as exc:
+            raise ComputeProviderError(f"relay registered-node request failed: {exc}") from exc
+
+        if response.status_code != 200:
+            raise ComputeProviderError(
+                f"relay registered-node provider returned status {response.status_code}"
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ComputeProviderError("relay registered-node provider returned non-JSON response") from exc
+
+        message = body.get("message")
+        if not isinstance(message, dict):
+            raise ComputeProviderError("relay registered-node response missing message")
+        return ApiV1ComputeResult(
+            assistant_message=message,
+            backend_path="relay_registered_node",
+            backend_provider=self.__class__.__name__,
+        )
 
 
 @dataclass(frozen=True)
@@ -127,7 +192,7 @@ class FallbackApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> ApiV1ComputeResult:
         try:
             return self.primary.complete_chat(
                 model_id=model_id,
@@ -136,10 +201,15 @@ class FallbackApiV1ComputeProvider:
             )
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
-            return self.fallback.complete_chat(
+            fallback_result = self.fallback.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
+            )
+            return ApiV1ComputeResult(
+                assistant_message=fallback_result.assistant_message,
+                backend_path=f"fallback:{fallback_result.backend_path}",
+                backend_provider=fallback_result.backend_provider,
             )
 
 
@@ -150,6 +220,19 @@ def _build_api_v1_compute_provider(
     """Create a compute provider for the normalized environment inputs."""
 
     local_provider = LocalApiV1ComputeProvider()
+
+    if mode == "relay_registered":
+        if not distributed_url:
+            raise ComputeProviderError(
+                "TOKENPLACE_API_V1_COMPUTE_PROVIDER=relay_registered requires "
+                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL to point at relay base URL"
+            )
+        logger.info(
+            "api_v1.compute_provider.selected provider=relay_registered mode=%s target=%s",
+            mode,
+            distributed_url.rstrip("/"),
+        )
+        return RelayRegisteredApiV1ComputeProvider(relay_base_url=distributed_url)
 
     if mode != "distributed":
         logger.info("api_v1.compute_provider.selected provider=local mode=%s", mode)
@@ -214,6 +297,8 @@ def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:
         return "distributed_with_local_fallback"
     if isinstance(provider, DistributedApiV1ComputeProvider):
         return "distributed"
+    if isinstance(provider, RelayRegisteredApiV1ComputeProvider):
+        return "relay_registered"
     if isinstance(provider, LocalApiV1ComputeProvider):
         return "local"
     return "unknown"

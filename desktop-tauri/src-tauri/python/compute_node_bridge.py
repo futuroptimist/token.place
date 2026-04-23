@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import requests
 import sys
 import threading
 import time
@@ -95,15 +96,65 @@ def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
     has_payload = all(
         key in relay_response for key in ("client_public_key", "chat_history", "cipherkey", "iv")
     )
+    has_api_v1_request = isinstance(relay_response.get("api_v1_request"), dict)
     has_heartbeat = "next_ping_in_x_seconds" in relay_response
     relay_error = _relay_error_message(relay_response)
     wait_seconds = relay_response.get("next_ping_in_x_seconds", "missing")
 
     return (
-        f"keys={keys} has_legacy_payload={has_payload} "
+        f"keys={keys} has_legacy_payload={has_payload} has_api_v1_request={has_api_v1_request} "
         f"has_heartbeat={has_heartbeat} wait={wait_seconds} "
         f"error={relay_error or 'none'}"
     )
+
+
+def _process_api_v1_request(runtime: Any, relay_response: Dict[str, Any]) -> bool:
+    """Process an API v1 request payload polled from relay /sink."""
+
+    request_payload = relay_response.get("api_v1_request")
+    if not isinstance(request_payload, dict):
+        return False
+
+    request_id = request_payload.get("request_id")
+    model_id = request_payload.get("model")
+    messages = request_payload.get("messages")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return False
+    if not isinstance(model_id, str) or not model_id.strip() or not isinstance(messages, list):
+        return False
+    try:
+        response_history = runtime.model_manager.llama_cpp_get_response(messages)
+        assistant_message = response_history[-1] if isinstance(response_history, list) else None
+        if not isinstance(assistant_message, dict):
+            assistant_message = {"role": "assistant", "content": ""}
+        publish_payload = {
+            "request_id": request_id,
+            "message": {
+                "role": assistant_message.get("role", "assistant"),
+                "content": assistant_message.get("content", ""),
+            },
+        }
+    except Exception as exc:
+        publish_payload = {
+            "request_id": request_id,
+            "error": f"desktop compute failed: {exc}",
+        }
+
+    request_kwargs = {
+        "json": publish_payload,
+        "timeout": 30,
+    }
+    auth_headers = getattr(runtime.relay_client, "_auth_headers", None)
+    if callable(auth_headers):
+        headers = auth_headers()
+        if headers:
+            request_kwargs["headers"] = headers
+
+    response = requests.post(
+        f"{runtime.relay_client.relay_url}/relay/api/v1/source",
+        **request_kwargs,
+    )
+    return response.status_code == 200
 
 
 def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
@@ -281,14 +332,16 @@ def run(args: argparse.Namespace) -> int:
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
+            api_v1_payload = isinstance(relay_response.get("api_v1_request"), dict)
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
             relay_error = _relay_error_message(relay_response)
-            registered = relay_error is None and (legacy_payload or heartbeat_ack)
+            registered = relay_error is None and (legacy_payload or api_v1_payload or heartbeat_ack)
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} heartbeat_ack={heartbeat_ack} "
+                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
+                f"heartbeat_ack={heartbeat_ack} "
                 f"summary={_relay_response_summary(relay_response)}",
                 file=sys.stderr,
             )
@@ -318,6 +371,24 @@ def run(args: argparse.Namespace) -> int:
                     last_error = None
                     print(
                         "desktop.compute_node_bridge.process_request.ok",
+                        file=sys.stderr,
+                    )
+            elif api_v1_payload:
+                print(
+                    "desktop.compute_node_bridge.process_api_v1_request.start",
+                    file=sys.stderr,
+                )
+                processed = _process_api_v1_request(runtime, relay_response)
+                if not processed:
+                    last_error = "failed to process relay api v1 request"
+                    print(
+                        "desktop.compute_node_bridge.process_api_v1_request.failed",
+                        file=sys.stderr,
+                    )
+                else:
+                    last_error = None
+                    print(
+                        "desktop.compute_node_bridge.process_api_v1_request.ok",
                         file=sys.stderr,
                     )
             else:

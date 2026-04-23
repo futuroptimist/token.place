@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from functools import lru_cache
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol
 
 import requests
@@ -36,9 +36,11 @@ class ApiV1ComputeProvider(Protocol):
         """Return an assistant message payload compatible with OpenAI chat responses."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class LocalApiV1ComputeProvider:
     """Default provider that executes inference in-process via llama.cpp."""
+
+    _last_served_by: str = field(default="local_in_process", init=False)
 
     def complete_chat(
         self,
@@ -53,15 +55,17 @@ class LocalApiV1ComputeProvider:
         assistant_message = updated_messages[-1]
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
+        self._last_served_by = "local_in_process"
         return assistant_message
 
 
-@dataclass(frozen=True)
+@dataclass
 class DistributedApiV1ComputeProvider:
     """Provider that forwards API v1 chat payloads to a remote compute endpoint."""
 
     base_url: str
     timeout_seconds: float = 30.0
+    _last_served_by: str = field(default="registered_desktop_node", init=False)
 
     def complete_chat(
         self,
@@ -82,7 +86,7 @@ class DistributedApiV1ComputeProvider:
 
         try:
             response = requests.post(
-                f"{self.base_url.rstrip('/')}/api/v1/chat/completions",
+                f"{self.base_url.rstrip('/')}/relay/api/v1/chat/completions",
                 json=payload,
                 timeout=self.timeout_seconds,
             )
@@ -111,15 +115,17 @@ class DistributedApiV1ComputeProvider:
         if not isinstance(message, dict):
             raise ComputeProviderError("distributed provider response missing message")
 
+        self._last_served_by = "registered_desktop_node"
         return message
 
 
-@dataclass(frozen=True)
+@dataclass
 class FallbackApiV1ComputeProvider:
     """Wrap distributed execution with local fallback for migration safety."""
 
     primary: ApiV1ComputeProvider
     fallback: ApiV1ComputeProvider
+    _last_served_by: str = field(default="unknown", init=False)
 
     def complete_chat(
         self,
@@ -129,18 +135,22 @@ class FallbackApiV1ComputeProvider:
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
         try:
-            return self.primary.complete_chat(
+            message = self.primary.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
+            self._last_served_by = "registered_desktop_node"
+            return message
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
-            return self.fallback.complete_chat(
+            message = self.fallback.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
+            self._last_served_by = "fallback_local_in_process"
+            return message
 
 
 @lru_cache(maxsize=8)
@@ -216,4 +226,13 @@ def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:
         return "distributed"
     if isinstance(provider, LocalApiV1ComputeProvider):
         return "local"
+    return "unknown"
+
+
+def get_api_v1_served_backend(provider: ApiV1ComputeProvider) -> str:
+    """Return a stable diagnostics label for the backend that served the last request."""
+
+    served_by = getattr(provider, "_last_served_by", None)
+    if isinstance(served_by, str) and served_by.strip():
+        return served_by
     return "unknown"

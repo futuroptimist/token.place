@@ -111,6 +111,42 @@ def test_distributed_compute_provider_handles_non_object_error_json(monkeypatch)
     assert exc_info.value.status_code == 502
 
 
+def test_distributed_compute_provider_handles_non_json_error_response(monkeypatch):
+    def invalid_json(_url, json=None, timeout=None):
+        return SimpleNamespace(status_code=502, json=lambda: (_ for _ in ()).throw(ValueError("invalid json")))
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", invalid_json)
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "compute_node_bridge_error"
+    assert str(exc_info.value) == "distributed provider returned status 502"
+
+
+def test_distributed_compute_provider_handles_non_object_error_field(monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=503, json=lambda: {"error": "bridge down"}
+        ),
+    )
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "compute_node_bridge_error"
+    assert str(exc_info.value) == "distributed provider returned status 503"
+
+
 def test_distributed_compute_provider_timeout_maps_to_timeout_metadata(monkeypatch):
     def timeout_post(_url, json=None, timeout=None):
         raise compute_provider.requests.Timeout("timed out")
@@ -128,6 +164,23 @@ def test_distributed_compute_provider_timeout_maps_to_timeout_metadata(monkeypat
     assert exc_info.value.error_type == "timeout_error"
     assert exc_info.value.status_code == 504
     assert exc_info.value.public_message == "The LLM server took too long to respond. Please try again."
+
+
+def test_distributed_compute_provider_unexpected_exception_maps_to_bridge_error(monkeypatch):
+    def boom(_url, json=None, timeout=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", boom)
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "compute_node_bridge_error"
+    assert exc_info.value.status_code == 502
 
 
 def test_distributed_compute_provider_request_exception_maps_to_unreachable(monkeypatch):

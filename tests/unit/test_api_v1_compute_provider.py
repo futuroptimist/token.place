@@ -13,6 +13,13 @@ from api.v1.compute_provider import (
 from relay import app
 
 
+@pytest.fixture
+def client():
+    app.config["TESTING"] = True
+    with app.test_client() as test_client:
+        yield test_client
+
+
 def test_distributed_compute_provider_posts_api_v1_contract(monkeypatch):
     captured = {}
 
@@ -92,6 +99,69 @@ def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatc
             model_id="llama-3-8b-instruct",
             messages=[{"role": "user", "content": "hello"}],
         )
+
+
+def test_distributed_compute_provider_maps_no_nodes_to_structured_error(monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=503,
+            json=lambda: {
+                "error": {
+                    "message": "No registered compute nodes available",
+                    "code": 503,
+                }
+            },
+        ),
+    )
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "no_compute_nodes_available"
+    assert exc_info.value.error_type == "service_unavailable_error"
+    assert exc_info.value.status_code == 503
+
+
+def test_api_v1_chat_completion_returns_structured_no_nodes_error(client, monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=503,
+            json=lambda: {
+                "error": {
+                    "message": "No registered compute nodes available",
+                    "code": 503,
+                }
+            },
+        ),
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    try:
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error"]["message"] == "No LLM servers are available right now."
+    assert payload["error"]["type"] == "service_unavailable_error"
+    assert payload["error"]["code"] == "no_compute_nodes_available"
 
 
 def test_get_provider_disables_local_fallback_when_configured(monkeypatch):

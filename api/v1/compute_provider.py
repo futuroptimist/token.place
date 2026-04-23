@@ -27,6 +27,19 @@ _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
 class ComputeProviderError(Exception):
     """Raised when a compute provider cannot satisfy a request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "compute_provider_error",
+        error_type: str = "server_error",
+        status_code: int = 502,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.error_type = error_type
+        self.status_code = status_code
+
 
 class ApiV1ComputeProvider(Protocol):
     """Contract for API v1-compatible compute providers."""
@@ -92,30 +105,105 @@ class DistributedApiV1ComputeProvider:
                 json=payload,
                 timeout=self.timeout_seconds,
             )
-        except Exception as exc:
-            raise ComputeProviderError(f"distributed provider request failed: {exc}") from exc
+        except requests.Timeout as exc:
+            raise ComputeProviderError(
+                "Timed out while contacting the LLM compute bridge.",
+                code="compute_bridge_timeout",
+                error_type="timeout_error",
+                status_code=504,
+            ) from exc
+        except requests.RequestException as exc:
+            raise ComputeProviderError(
+                "Unable to reach the LLM compute bridge.",
+                code="compute_node_unreachable",
+                error_type="server_error",
+                status_code=503,
+            ) from exc
 
         if response.status_code != 200:
+            payload = None
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+
+            relay_message = None
+            relay_code = None
+            if isinstance(payload, dict):
+                error_payload = payload.get("error")
+                if isinstance(error_payload, dict):
+                    relay_message = error_payload.get("message")
+                    relay_code = error_payload.get("code")
+
+            if response.status_code == 503 and (
+                relay_message == "No registered compute nodes available" or relay_code == 503
+            ):
+                raise ComputeProviderError(
+                    "No LLM servers are available right now.",
+                    code="no_compute_nodes_available",
+                    error_type="service_unavailable_error",
+                    status_code=503,
+                )
+
+            if response.status_code == 504:
+                raise ComputeProviderError(
+                    "Timed out waiting for an LLM server response.",
+                    code="compute_node_timeout",
+                    error_type="timeout_error",
+                    status_code=504,
+                )
+
+            if response.status_code == 502:
+                raise ComputeProviderError(
+                    "The LLM server returned an invalid response.",
+                    code="compute_node_invalid_payload",
+                    error_type="server_error",
+                    status_code=502,
+                )
+
             raise ComputeProviderError(
-                f"distributed provider returned status {response.status_code}"
+                f"distributed provider returned status {response.status_code}",
+                code="compute_node_bridge_error",
+                error_type="server_error",
+                status_code=502,
             )
 
         try:
             body = response.json()
         except ValueError as exc:
-            raise ComputeProviderError("distributed provider returned non-JSON response") from exc
+            raise ComputeProviderError(
+                "The LLM compute bridge returned a non-JSON response.",
+                code="compute_node_invalid_payload",
+                error_type="server_error",
+                status_code=502,
+            ) from exc
 
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise ComputeProviderError("distributed provider returned no choices")
+            raise ComputeProviderError(
+                "The LLM server returned an invalid response payload.",
+                code="compute_node_invalid_payload",
+                error_type="server_error",
+                status_code=502,
+            )
 
         first_choice = choices[0]
         if not isinstance(first_choice, dict):
-            raise ComputeProviderError("distributed provider choice payload is invalid")
+            raise ComputeProviderError(
+                "The LLM server returned an invalid response payload.",
+                code="compute_node_invalid_payload",
+                error_type="server_error",
+                status_code=502,
+            )
 
         message = first_choice.get("message")
         if not isinstance(message, dict):
-            raise ComputeProviderError("distributed provider response missing message")
+            raise ComputeProviderError(
+                "The LLM server returned an invalid response payload.",
+                code="compute_node_invalid_payload",
+                error_type="server_error",
+                status_code=502,
+            )
 
         _last_backend_path.set("registered_desktop_compute_node")
         return message

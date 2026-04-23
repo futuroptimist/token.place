@@ -95,12 +95,13 @@ def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
     has_payload = all(
         key in relay_response for key in ("client_public_key", "chat_history", "cipherkey", "iv")
     )
+    has_api_v1_payload = isinstance(relay_response.get("api_v1_request"), dict)
     has_heartbeat = "next_ping_in_x_seconds" in relay_response
     relay_error = _relay_error_message(relay_response)
     wait_seconds = relay_response.get("next_ping_in_x_seconds", "missing")
 
     return (
-        f"keys={keys} has_legacy_payload={has_payload} "
+        f"keys={keys} has_legacy_payload={has_payload} has_api_v1_payload={has_api_v1_payload} "
         f"has_heartbeat={has_heartbeat} wait={wait_seconds} "
         f"error={relay_error or 'none'}"
     )
@@ -281,14 +282,16 @@ def run(args: argparse.Namespace) -> int:
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
+            api_v1_payload = isinstance(relay_response.get("api_v1_request"), dict)
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
             relay_error = _relay_error_message(relay_response)
-            registered = relay_error is None and (legacy_payload or heartbeat_ack)
+            registered = relay_error is None and (legacy_payload or api_v1_payload or heartbeat_ack)
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} heartbeat_ack={heartbeat_ack} "
+                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
+                f"heartbeat_ack={heartbeat_ack} "
                 f"summary={_relay_response_summary(relay_response)}",
                 file=sys.stderr,
             )
@@ -301,10 +304,11 @@ def run(args: argparse.Namespace) -> int:
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
-            elif legacy_payload:
+            elif legacy_payload or api_v1_payload:
+                payload_kind = "api_v1" if api_v1_payload else "legacy"
                 print(
                     "desktop.compute_node_bridge.process_request.start "
-                    f"stream={relay_response.get('stream') is True}",
+                    f"kind={payload_kind} stream={relay_response.get('stream') is True}",
                     file=sys.stderr,
                 )
                 processed = runtime.process_relay_request(relay_response)

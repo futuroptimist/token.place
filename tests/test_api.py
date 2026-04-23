@@ -262,7 +262,7 @@ def test_api_v1_chat_completion_supports_distributed_provider_contract(client, m
     data = response.get_json()
     assert data['choices'][0]['message']['content'] == 'distributed-path response'
 
-    assert captured['url'] == 'https://compute.example/api/v1/chat/completions'
+    assert captured['url'] == 'https://compute.example/relay/api/v1/chat/completions'
     assert captured['json']['model'] == 'remote-only-model'
     assert captured['json']['messages'][0]['content'] == 'Ping distributed runtime'
     assert captured['json']['stream'] is False

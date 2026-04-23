@@ -53,7 +53,7 @@ class LocalApiV1ComputeProvider:
         assistant_message = updated_messages[-1]
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
-        return assistant_message
+        return {**assistant_message, "__tokenplace_backend_path": "local_in_process"}
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,7 @@ class DistributedApiV1ComputeProvider:
 
     base_url: str
     timeout_seconds: float = 30.0
+    endpoint_path: str = "/relay/api/v1/chat/completions"
 
     def complete_chat(
         self,
@@ -82,7 +83,7 @@ class DistributedApiV1ComputeProvider:
 
         try:
             response = requests.post(
-                f"{self.base_url.rstrip('/')}/api/v1/chat/completions",
+                f"{self.base_url.rstrip('/')}{self.endpoint_path}",
                 json=payload,
                 timeout=self.timeout_seconds,
             )
@@ -111,7 +112,12 @@ class DistributedApiV1ComputeProvider:
         if not isinstance(message, dict):
             raise ComputeProviderError("distributed provider response missing message")
 
-        return message
+        response_headers = getattr(response, "headers", {}) or {}
+        relay_compute_path = response_headers.get("X-Tokenplace-Relay-Compute-Path", "").strip()
+        backend_path = "registered_compute_node"
+        if relay_compute_path and relay_compute_path != "registered_compute_node":
+            backend_path = relay_compute_path
+        return {**message, "__tokenplace_backend_path": backend_path}
 
 
 @dataclass(frozen=True)
@@ -136,11 +142,17 @@ class FallbackApiV1ComputeProvider:
             )
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
-            return self.fallback.complete_chat(
+            fallback_message = self.fallback.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
+            if isinstance(fallback_message, dict):
+                fallback_message = {
+                    **fallback_message,
+                    "__tokenplace_backend_path": "fallback_to_local_in_process",
+                }
+            return fallback_message
 
 
 @lru_cache(maxsize=8)

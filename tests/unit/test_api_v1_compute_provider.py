@@ -42,7 +42,7 @@ def test_distributed_compute_provider_posts_api_v1_contract(monkeypatch):
         options={"temperature": 0.2, "stream": True},
     )
 
-    assert captured["url"] == "https://node-a.example/api/v1/chat/completions"
+    assert captured["url"] == "https://node-a.example/relay/api/v1/chat/completions"
     assert captured["timeout"] == 5
     assert captured["json"]["model"] == "llama-3-8b-instruct"
     assert captured["json"]["messages"] == [{"role": "user", "content": "hi"}]
@@ -50,6 +50,7 @@ def test_distributed_compute_provider_posts_api_v1_contract(monkeypatch):
     assert captured["json"]["temperature"] == 0.2
     assert "stream" not in captured["json"] or captured["json"]["stream"] is False
     assert message["content"] == "distributed response"
+    assert message["__tokenplace_backend_path"] == "registered_compute_node"
 
 
 def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(monkeypatch):
@@ -75,7 +76,9 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(mon
         messages=[{"role": "user", "content": "hello"}],
     )
 
-    assert result == fallback_message
+    assert result["role"] == fallback_message["role"]
+    assert result["content"] == fallback_message["content"]
+    assert result["__tokenplace_backend_path"] == "fallback_to_local_in_process"
 
 
 def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatch):

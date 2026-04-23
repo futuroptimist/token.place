@@ -400,7 +400,6 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         start_deadline = time.time() + 25
         registered = False
         started = False
-        runtime_supports_real_inference = False
 
         while time.time() < start_deadline:
             try:
@@ -427,7 +426,6 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 assert isinstance(llama_module_path, str) and llama_module_path
                 assert not llama_module_path.endswith("/llama_cpp.py")
                 assert not llama_module_path.endswith("\\llama_cpp.py")
-                runtime_supports_real_inference = llama_module_path != "missing"
             if event_type == "status" and payload.get("registered") is True:
                 registered = True
                 break
@@ -514,20 +512,26 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         provider_diagnostics = (
             "landing-page real-provider guardrail diagnostics: "
             f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
-            f"stream_mode={stream_mode!r}; expected provider_class='LocalApiV1ComputeProvider', "
-            "resolved_provider_path='local', stream_mode='non-streaming'"
+            f"stream_mode={stream_mode!r}; expected distributed non-fallback API v1 path"
         )
-        assert provider_class == "LocalApiV1ComputeProvider", provider_diagnostics
+        assert provider_class == "DistributedApiV1ComputeProvider", provider_diagnostics
         assert stream_mode == "non-streaming", provider_diagnostics
-        assert resolved_provider_path == "local", (
-            "landing-page real-provider guardrail requires resolved provider path "
-            f"'local'. {provider_diagnostics}"
+        assert resolved_provider_path == "distributed", (
+            "landing-page real-provider guardrail requires distributed provider path without local fallback. "
+            f"{provider_diagnostics}"
         )
-        if runtime_supports_real_inference and resolved_provider_path != "local":
-            assert assistant_text.strip().lower() != "stub", (
-                "assistant response must not be stub when runtime reports real inference support "
-                f"and provider path is {resolved_provider_path!r}. {provider_diagnostics}"
-            )
+
+        bridge_stderr_output = "".join(stderr_lines)
+        assert "desktop.compute_node_bridge.process_request.ok" in bridge_stderr_output, (
+            "desktop bridge must process at least one real relay request; heartbeat-only registration "
+            "is insufficient for this guardrail"
+        )
+        assert "desktop.compute_node_bridge.process_request.start stream=True" not in bridge_stderr_output, (
+            "landing-page relay API v1 guardrail forbids streaming request processing"
+        )
+        assert "legacy_payload=True api_v1_payload=False" not in bridge_stderr_output, (
+            "landing-page relay API v1 guardrail forbids legacy relay payload processing"
+        )
 
         page.wait_for_timeout(300)
         non_streaming_state = page.evaluate(

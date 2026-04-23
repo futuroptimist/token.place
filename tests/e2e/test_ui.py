@@ -511,23 +511,40 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
         stream_mode = latest_headers.get("x-tokenplace-api-v1-stream-mode")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        execution_backend_path = latest_headers.get("x-tokenplace-api-v1-execution-backend-path")
         provider_diagnostics = (
             "landing-page real-provider guardrail diagnostics: "
             f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
-            f"stream_mode={stream_mode!r}; expected provider_class='LocalApiV1ComputeProvider', "
-            "resolved_provider_path='local', stream_mode='non-streaming'"
+            f"execution_backend_path={execution_backend_path!r}, stream_mode={stream_mode!r}; "
+            "expected provider_class='DistributedApiV1ComputeProvider', "
+            "resolved_provider_path='distributed', "
+            "execution_backend_path='registered_desktop_compute_node', "
+            "stream_mode='non-streaming'"
         )
-        assert provider_class == "LocalApiV1ComputeProvider", provider_diagnostics
+        assert provider_class == "DistributedApiV1ComputeProvider", provider_diagnostics
         assert stream_mode == "non-streaming", provider_diagnostics
-        assert resolved_provider_path == "local", (
+        assert resolved_provider_path == "distributed", (
             "landing-page real-provider guardrail requires resolved provider path "
-            f"'local'. {provider_diagnostics}"
+            f"'distributed'. {provider_diagnostics}"
         )
-        if runtime_supports_real_inference and resolved_provider_path != "local":
+        assert execution_backend_path == "registered_desktop_compute_node", provider_diagnostics
+        if runtime_supports_real_inference:
             assert assistant_text.strip().lower() != "stub", (
-                "assistant response must not be stub when runtime reports real inference support "
-                f"and provider path is {resolved_provider_path!r}. {provider_diagnostics}"
+                "assistant response must not be stub when runtime reports real inference support. "
+                f"{provider_diagnostics}"
             )
+
+        processed_request_lines = [
+            line for line in stderr_lines if "desktop.compute_node_bridge.process_request.ok" in line
+        ]
+        assert processed_request_lines, (
+            "desktop bridge must process at least one relay request; heartbeat-only "
+            f"registration is insufficient. stderr_lines={stderr_lines}"
+        )
+        assert not any("legacy_payload=True" in line for line in stderr_lines), (
+            "landing-page flow must not use legacy relay payload processing. "
+            f"stderr_lines={stderr_lines}"
+        )
 
         page.wait_for_timeout(300)
         non_streaming_state = page.evaluate(

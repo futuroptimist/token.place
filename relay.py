@@ -725,9 +725,7 @@ def relay_api_v1_chat_completions():
             },
         }
     }
-    if selected_server not in client_inference_requests:
-        client_inference_requests[selected_server] = []
-    client_inference_requests[selected_server].append(queue_item)
+    client_inference_requests.setdefault(selected_server, []).append(queue_item)
 
     timeout_seconds = float(os.environ.get('TOKENPLACE_RELAY_API_V1_TIMEOUT_SECONDS', '45'))
     response_payload = _await_api_v1_response(request_id, timeout_seconds)
@@ -854,9 +852,7 @@ def faucet():
         return jsonify({'error': 'Server with the specified public key not found'}), 404
 
     # Append the client's request to the list of requests for the server
-    if server_public_key not in client_inference_requests:
-        client_inference_requests[server_public_key] = []
-    client_inference_requests[server_public_key].append({
+    client_inference_requests.setdefault(server_public_key, []).append({
         'chat_history': chat_history_ciphertext,
         'client_public_key': client_public_key,
         'cipherkey': cipherkey,

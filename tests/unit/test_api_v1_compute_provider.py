@@ -128,3 +128,4 @@ def test_get_api_v1_resolved_provider_path_labels_instance_types():
     assert get_api_v1_resolved_provider_path(local) == "local"
     assert get_api_v1_resolved_provider_path(distributed) == "distributed"
     assert get_api_v1_resolved_provider_path(fallback) == "distributed_with_local_fallback"
+    assert get_api_v1_resolved_provider_path(object()) == "unknown"

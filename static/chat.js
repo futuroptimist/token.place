@@ -368,7 +368,7 @@ new Vue({
         async sendMessageApi() {
             if (!this.serverPublicKey) {
                 console.error('Server public key not available');
-                return null;
+                return { response: null, error: this.normalizeApiError(null) };
             }
 
             try {
@@ -400,8 +400,16 @@ new Vue({
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(`API error: ${errorData.error?.message || 'Unknown error'}`);
+                    let errorData = null;
+                    try {
+                        errorData = await response.json();
+                    } catch (_parseError) {
+                        errorData = null;
+                    }
+                    return {
+                        response: null,
+                        error: this.normalizeApiError(errorData)
+                    };
                 }
 
                 const responseData = await response.json();
@@ -418,14 +426,14 @@ new Vue({
                         throw new Error('Failed to decrypt response');
                     }
 
-                    return JSON.parse(decryptedJson);
+                    return { response: JSON.parse(decryptedJson), error: null };
                 }
 
                 // Handle unencrypted response (should not happen with encrypted=true)
-                return responseData;
+                return { response: responseData, error: null };
             } catch (error) {
                 console.error('API request error:', error);
-                return null;
+                return { response: null, error: this.normalizeApiError(null) };
             }
         },
 
@@ -475,6 +483,47 @@ new Vue({
             return message.content;
         },
 
+        normalizeApiError(errorPayload) {
+            const fallback = {
+                message: 'Request failed',
+                type: 'server_error',
+                code: 'unknown_error'
+            };
+
+            if (!errorPayload || typeof errorPayload !== 'object') {
+                return fallback;
+            }
+
+            const error = errorPayload.error && typeof errorPayload.error === 'object'
+                ? errorPayload.error
+                : errorPayload;
+
+            return {
+                message: typeof error.message === 'string' ? error.message : fallback.message,
+                type: typeof error.type === 'string' ? error.type : fallback.type,
+                code: typeof error.code === 'string' ? error.code : fallback.code
+            };
+        },
+
+        userFacingErrorMessage(apiError) {
+            if (!apiError || typeof apiError !== 'object') {
+                return 'Sorry, I encountered an issue generating a response. Please try again.';
+            }
+
+            const code = apiError.code || '';
+            if (code === 'no_registered_compute_nodes') {
+                return 'No LLM servers are available right now.';
+            }
+            if (code === 'relay_compute_node_timeout' || code === 'relay_bridge_timeout') {
+                return 'LLM servers took too long to respond. Please try again.';
+            }
+            if (code === 'relay_compute_node_invalid_payload' || code === 'relay_bridge_invalid_payload') {
+                return 'LLM servers returned an invalid response. Please try again.';
+            }
+
+            return 'Sorry, I encountered an issue generating a response. Please try again.';
+        },
+
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
@@ -491,10 +540,16 @@ new Vue({
 
             try {
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
-                let response = await this.sendMessageApi();
+                const apiResult = await this.sendMessageApi();
 
                 // Process the response
-                if (response) {
+                if (apiResult && apiResult.error) {
+                    this.chatHistory.push({
+                        role: 'assistant',
+                        content: this.userFacingErrorMessage(apiResult.error)
+                    });
+                } else if (apiResult && apiResult.response) {
+                    const response = apiResult.response;
                     // For API response, extract last message
                     if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;

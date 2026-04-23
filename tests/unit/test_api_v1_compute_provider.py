@@ -94,6 +94,36 @@ def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatc
         )
 
 
+def test_distributed_compute_provider_preserves_structured_relay_error(monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=503,
+            json=lambda: {
+                "error": {
+                    "message": "No LLM servers are available right now.",
+                    "type": "server_error",
+                    "code": "no_registered_compute_nodes",
+                }
+            },
+        ),
+    )
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    err = exc_info.value
+    assert err.status_code == 503
+    assert err.error_type == "server_error"
+    assert err.code == "no_registered_compute_nodes"
+    assert err.message == "No LLM servers are available right now."
+
+
 def test_get_provider_disables_local_fallback_when_configured(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
     monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")

@@ -27,6 +27,20 @@ _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
 class ComputeProviderError(Exception):
     """Raised when a compute provider cannot satisfy a request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "server_error",
+        code: str = "compute_provider_error",
+        status_code: int = 502,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type
+        self.code = code
+        self.status_code = status_code
+
 
 class ApiV1ComputeProvider(Protocol):
     """Contract for API v1-compatible compute providers."""
@@ -92,30 +106,72 @@ class DistributedApiV1ComputeProvider:
                 json=payload,
                 timeout=self.timeout_seconds,
             )
-        except Exception as exc:
-            raise ComputeProviderError(f"distributed provider request failed: {exc}") from exc
+        except requests.Timeout as exc:
+            raise ComputeProviderError(
+                "Timed out waiting for a relay compute node response.",
+                code="relay_bridge_timeout",
+                status_code=504,
+            ) from exc
+        except requests.RequestException as exc:
+            raise ComputeProviderError(
+                "Unable to reach relay compute node bridge.",
+                code="relay_bridge_unreachable",
+                status_code=502,
+            ) from exc
 
         if response.status_code != 200:
+            default_message = f"Relay compute node request failed with status {response.status_code}."
+            error_type = "server_error"
+            error_code = "relay_bridge_error"
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    error = body.get("error")
+                    if isinstance(error, dict):
+                        default_message = str(error.get("message") or default_message)
+                        error_type = str(error.get("type") or error_type)
+                        error_code = str(error.get("code") or error_code)
+            except ValueError:
+                pass
             raise ComputeProviderError(
-                f"distributed provider returned status {response.status_code}"
+                default_message,
+                error_type=error_type,
+                code=error_code,
+                status_code=response.status_code,
             )
 
         try:
             body = response.json()
         except ValueError as exc:
-            raise ComputeProviderError("distributed provider returned non-JSON response") from exc
+            raise ComputeProviderError(
+                "Relay compute node bridge returned non-JSON response.",
+                code="relay_bridge_invalid_payload",
+                status_code=502,
+            ) from exc
 
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise ComputeProviderError("distributed provider returned no choices")
+            raise ComputeProviderError(
+                "Relay compute node bridge returned no completion choices.",
+                code="relay_bridge_invalid_payload",
+                status_code=502,
+            )
 
         first_choice = choices[0]
         if not isinstance(first_choice, dict):
-            raise ComputeProviderError("distributed provider choice payload is invalid")
+            raise ComputeProviderError(
+                "Relay compute node bridge returned an invalid choice payload.",
+                code="relay_bridge_invalid_payload",
+                status_code=502,
+            )
 
         message = first_choice.get("message")
         if not isinstance(message, dict):
-            raise ComputeProviderError("distributed provider response missing message")
+            raise ComputeProviderError(
+                "Relay compute node bridge response is missing a message payload.",
+                code="relay_bridge_invalid_payload",
+                status_code=502,
+            )
 
         _last_backend_path.set("registered_desktop_compute_node")
         return message

@@ -421,9 +421,10 @@ def _handle_chat_completion_request(data):
         )
     except ComputeProviderError as e:
         return format_error_response(
-            str(e),
-            error_type="server_error",
-            status_code=502,
+            e.message,
+            error_type=e.error_type,
+            code=e.code,
+            status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
@@ -558,9 +559,10 @@ def _handle_text_completion_request(data):
         )
     except ComputeProviderError as e:
         return format_error_response(
-            str(e),
-            error_type="server_error",
-            status_code=502,
+            e.message,
+            error_type=e.error_type,
+            code=e.code,
+            status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
         log_error("Unexpected error in create_completion endpoint")

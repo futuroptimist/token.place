@@ -400,8 +400,17 @@ new Vue({
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(`API error: ${errorData.error?.message || 'Unknown error'}`);
+                    let errorData = null;
+                    try {
+                        errorData = await response.json();
+                    } catch (_jsonError) {
+                        errorData = null;
+                    }
+                    return {
+                        error: {
+                            userMessage: this.getUserFacingApiError(errorData)
+                        }
+                    };
                 }
 
                 const responseData = await response.json();
@@ -475,6 +484,23 @@ new Vue({
             return message.content;
         },
 
+        getUserFacingApiError(errorPayload) {
+            const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
+            const errorCode = error && typeof error.code === 'string' ? error.code : '';
+            const fallbackMessage = 'Sorry, I encountered an issue generating a response. Please try again.';
+
+            const codeToMessage = {
+                no_registered_compute_nodes: 'No LLM servers are available right now.',
+                compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
+                compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
+                compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
+                compute_node_bridge_error: 'Unable to contact the LLM server right now. Please try again.',
+                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
+            };
+
+            return codeToMessage[errorCode] || fallbackMessage;
+        },
+
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
@@ -495,8 +521,14 @@ new Vue({
 
                 // Process the response
                 if (response) {
+                    if (response.error && typeof response.error.userMessage === 'string') {
+                        this.chatHistory.push({
+                            role: 'assistant',
+                            content: response.error.userMessage
+                        });
+                    }
                     // For API response, extract last message
-                    if (response.choices && response.choices.length > 0) {
+                    else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
                         this.appendAssistantMessage(assistantMessage);
                     }

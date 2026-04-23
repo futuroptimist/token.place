@@ -30,3 +30,19 @@ def test_landing_chat_js_disables_incremental_typing_for_relay_v1():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "relayApiV1NonStreaming: true" in chat_js
     assert "incremental character streaming" in chat_js
+
+
+def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "getUserFacingApiError" in chat_js
+    assert "no_registered_compute_nodes" in chat_js
+    assert "compute_node_timeout" in chat_js
+    assert "compute_node_bridge_timeout" in chat_js
+    assert "compute_node_unreachable" in chat_js
+    assert "compute_node_invalid_payload" in chat_js
+    assert "No LLM servers are available right now." in chat_js
+    assert "The LLM server took too long to respond. Please try again." in chat_js
+    assert "The LLM server is unavailable right now. Please try again." in chat_js
+    assert "The LLM server returned an invalid response. Please try again." in chat_js
+    assert "distributed provider timed out contacting relay bridge" not in chat_js
+    assert "distributed provider request failed" not in chat_js

@@ -27,6 +27,66 @@ _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
 class ComputeProviderError(Exception):
     """Raised when a compute provider cannot satisfy a request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "compute_provider_error",
+        error_type: str = "server_error",
+        public_message: str | None = None,
+        status_code: int = 502,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.error_type = error_type
+        self.public_message = public_message or "Unable to generate a response right now."
+        self.status_code = status_code
+
+
+_RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
+    "no_registered_compute_nodes": {
+        "error_type": "service_unavailable_error",
+        "public_message": "No LLM servers are available right now.",
+        "status_code": 503,
+    },
+    "compute_node_timeout": {
+        "error_type": "timeout_error",
+        "public_message": "The LLM server took too long to respond. Please try again.",
+        "status_code": 504,
+    },
+    "compute_node_bridge_timeout": {
+        "error_type": "timeout_error",
+        "public_message": "The LLM server took too long to respond. Please try again.",
+        "status_code": 504,
+    },
+    "compute_node_unreachable": {
+        "error_type": "service_unavailable_error",
+        "public_message": "The LLM server is unavailable right now. Please try again.",
+        "status_code": 503,
+    },
+    "compute_node_bridge_error": {
+        "error_type": "server_error",
+        "public_message": "Unable to contact the LLM server right now. Please try again.",
+        "status_code": 502,
+    },
+    "compute_node_invalid_payload": {
+        "error_type": "server_error",
+        "public_message": "The LLM server returned an invalid response. Please try again.",
+        "status_code": 502,
+    },
+}
+
+
+def _error_from_code(code: str, *, message: str) -> ComputeProviderError:
+    mapped = _RELAY_ERROR_MAP.get(code, {})
+    return ComputeProviderError(
+        message,
+        code=code,
+        error_type=mapped.get("error_type", "server_error"),
+        public_message=mapped.get("public_message", "Unable to generate a response right now."),
+        status_code=int(mapped.get("status_code", 502)),
+    )
+
 
 class ApiV1ComputeProvider(Protocol):
     """Contract for API v1-compatible compute providers."""
@@ -92,30 +152,68 @@ class DistributedApiV1ComputeProvider:
                 json=payload,
                 timeout=self.timeout_seconds,
             )
+        except requests.Timeout as exc:
+            raise _error_from_code(
+                "compute_node_bridge_timeout",
+                message=f"distributed provider timed out contacting relay bridge: {exc}",
+            ) from exc
+        except requests.RequestException as exc:
+            raise _error_from_code(
+                "compute_node_unreachable",
+                message=f"distributed provider request failed: {exc}",
+            ) from exc
         except Exception as exc:
-            raise ComputeProviderError(f"distributed provider request failed: {exc}") from exc
+            raise _error_from_code(
+                "compute_node_bridge_error",
+                message=f"distributed provider request failed: {exc}",
+            ) from exc
 
         if response.status_code != 200:
-            raise ComputeProviderError(
-                f"distributed provider returned status {response.status_code}"
-            )
+            error_code = "compute_node_bridge_error"
+            error_message = f"distributed provider returned status {response.status_code}"
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    error_payload = parsed.get("error", {})
+                    if isinstance(error_payload, dict):
+                        candidate_code = error_payload.get("code")
+                        candidate_message = error_payload.get("message")
+                        if isinstance(candidate_code, str) and candidate_code.strip():
+                            error_code = candidate_code.strip()
+                        if isinstance(candidate_message, str) and candidate_message.strip():
+                            error_message = candidate_message.strip()
+            except ValueError:
+                pass
+            raise _error_from_code(error_code, message=error_message)
 
         try:
             body = response.json()
         except ValueError as exc:
-            raise ComputeProviderError("distributed provider returned non-JSON response") from exc
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="distributed provider returned non-JSON response",
+            ) from exc
 
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise ComputeProviderError("distributed provider returned no choices")
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="distributed provider returned no choices",
+            )
 
         first_choice = choices[0]
         if not isinstance(first_choice, dict):
-            raise ComputeProviderError("distributed provider choice payload is invalid")
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="distributed provider choice payload is invalid",
+            )
 
         message = first_choice.get("message")
         if not isinstance(message, dict):
-            raise ComputeProviderError("distributed provider response missing message")
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="distributed provider response missing message",
+            )
 
         _last_backend_path.set("registered_desktop_compute_node")
         return message

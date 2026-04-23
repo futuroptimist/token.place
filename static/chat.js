@@ -493,6 +493,8 @@ new Vue({
                 no_registered_compute_nodes: 'No LLM servers are available right now.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
+                compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
+                compute_node_bridge_error: 'Unable to contact the LLM server right now. Please try again.',
                 compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
             };
 

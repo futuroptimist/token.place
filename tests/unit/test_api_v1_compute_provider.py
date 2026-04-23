@@ -130,6 +130,25 @@ def test_distributed_compute_provider_timeout_maps_to_timeout_metadata(monkeypat
     assert exc_info.value.public_message == "The LLM server took too long to respond. Please try again."
 
 
+def test_distributed_compute_provider_request_exception_maps_to_unreachable(monkeypatch):
+    def failing_post(_url, json=None, timeout=None):
+        raise compute_provider.requests.RequestException("connection reset by peer")
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", failing_post)
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "compute_node_unreachable"
+    assert exc_info.value.error_type == "service_unavailable_error"
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.public_message == "The LLM server is unavailable right now. Please try again."
+
+
 @pytest.mark.parametrize(
     ("status_code", "payload", "expected_error_code"),
     [

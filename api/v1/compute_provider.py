@@ -65,8 +65,8 @@ _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
         "status_code": 503,
     },
     "compute_node_bridge_error": {
-        "error_type": "upstream_error",
-        "public_message": "The LLM server returned an error. Please try again.",
+        "error_type": "server_error",
+        "public_message": "Unable to contact the LLM server right now. Please try again.",
         "status_code": 502,
     },
     "compute_node_invalid_payload": {

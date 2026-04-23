@@ -24,6 +24,12 @@ def test_landing_chat_js_avoids_relay_v2_streaming_path():
     assert "sendStreamingMessage(" not in chat_js, (
         "landing chat must not include streaming relay send helper call chain"
     )
+    assert "/api/v1/completions" not in chat_js, (
+        "landing chat must not use legacy API v1 completions endpoint"
+    )
+    assert "/relay/api/v1/chat/completions" not in chat_js, (
+        "landing chat browser flow must call relay /api/v1/chat/completions only"
+    )
 
 
 def test_landing_chat_js_disables_incremental_typing_for_relay_v1():

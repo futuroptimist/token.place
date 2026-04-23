@@ -343,6 +343,53 @@ def test_api_v1_chat_completion_emits_execution_backend_path_header(
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
 
+def test_api_v1_chat_completion_emits_provider_diagnostics_headers_for_distributed_path(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "distributed response",
+                        }
+                    }
+                ]
+            },
+        ),
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    try:
+        assert response.status_code == 200
+        assert response.headers["X-Tokenplace-API-V1-Provider"] == "DistributedApiV1ComputeProvider"
+        assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
+        assert (
+            response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"]
+            == "registered_desktop_compute_node"
+        )
+        assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
 def test_api_v1_chat_completion_returns_structured_error_for_no_registered_nodes(
     monkeypatch,
 ):

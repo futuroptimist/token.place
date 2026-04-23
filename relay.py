@@ -379,6 +379,7 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+api_v1_request_results = {}
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -435,6 +436,9 @@ def _unregister_server(server_public_key: str) -> bool:
 
     removed = known_servers.pop(server_public_key, None) is not None
     client_inference_requests.pop(server_public_key, None)
+    for request_id, result_payload in list(api_v1_request_results.items()):
+        if result_payload.get("server_public_key") == server_public_key:
+            api_v1_request_results.pop(request_id, None)
 
     with stream_lock:
         stale_session_ids = [
@@ -453,6 +457,51 @@ def _unregister_server(server_public_key: str) -> bool:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
     return removed
+
+
+def _queue_api_v1_compute_request(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    options: dict[str, Any],
+    timeout_seconds: float,
+) -> tuple[int, dict[str, Any]]:
+    """Queue an API v1 compute request for a registered node and await completion."""
+
+    _evict_stale_servers()
+    if not known_servers:
+        return 503, {"error": "No registered compute nodes available"}
+
+    server_public_key = secrets.choice(list(known_servers.keys()))
+    request_id = secrets.token_urlsafe(18)
+    queued_payload = {
+        "api_v1_request": {
+            "request_id": request_id,
+            "model": model,
+            "messages": messages,
+            "options": options,
+            "stream": False,
+        }
+    }
+    if server_public_key not in client_inference_requests:
+        client_inference_requests[server_public_key] = []
+    client_inference_requests[server_public_key].append(queued_payload)
+
+    deadline = time.time() + max(float(timeout_seconds), 0.1)
+    while time.time() < deadline:
+        result_payload = api_v1_request_results.pop(request_id, None)
+        if isinstance(result_payload, dict):
+            status_code = int(result_payload.get("status_code", 502))
+            body = result_payload.get("body")
+            if not isinstance(body, dict):
+                body = {"error": "Invalid compute-node response payload"}
+                status_code = 502
+            body["relay_backend"] = "registered_compute_node"
+            body["server_public_key"] = result_payload.get("server_public_key")
+            return status_code, body
+        time.sleep(0.05)
+
+    return 504, {"error": "Timed out waiting for registered compute node"}
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -818,21 +867,95 @@ def sink():
             batch.append(request_payload)
 
         first_request = batch[0]
-        response_data.update({
-            'client_public_key': first_request['client_public_key'],
-            'chat_history': first_request['chat_history'],
-            'cipherkey': first_request['cipherkey'],
-            'iv': first_request.get('iv', ''),
-        })
+        if isinstance(first_request, dict) and isinstance(first_request.get("api_v1_request"), dict):
+            response_data["api_v1_request"] = first_request["api_v1_request"]
+        else:
+            response_data.update({
+                'client_public_key': first_request['client_public_key'],
+                'chat_history': first_request['chat_history'],
+                'cipherkey': first_request['cipherkey'],
+                'iv': first_request.get('iv', ''),
+            })
 
-        if first_request.get('stream') and first_request.get('stream_session_id'):
-            response_data['stream'] = True
-            response_data['stream_session_id'] = first_request['stream_session_id']
+            if first_request.get('stream') and first_request.get('stream_session_id'):
+                response_data['stream'] = True
+                response_data['stream_session_id'] = first_request['stream_session_id']
 
         if max_batch_size > 1:
             response_data['batch'] = batch
 
     return jsonify(response_data)
+
+
+@app.route('/relay/api/v1/chat/completions', methods=['POST'])
+def relay_api_v1_chat_completions():
+    """Dispatch API v1 chat-completion compute to registered compute nodes."""
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    model = data.get("model")
+    messages = data.get("messages")
+    if not isinstance(model, str) or not model.strip():
+        return jsonify({'error': 'Invalid model'}), 400
+    if not isinstance(messages, list):
+        return jsonify({'error': 'Invalid messages'}), 400
+    if data.get("stream") is True:
+        return jsonify({'error': 'Streaming is not supported for API v1 relay compute'}), 400
+
+    options = {
+        key: value
+        for key, value in data.items()
+        if key not in {"model", "messages", "stream"} and value is not None
+    }
+    timeout_seconds = float(data.get("relay_timeout_seconds", 30))
+    status_code, result = _queue_api_v1_compute_request(
+        model=model,
+        messages=messages,
+        options=options,
+        timeout_seconds=timeout_seconds,
+    )
+    response = jsonify(result)
+    response.status_code = status_code
+    response.headers["X-Tokenplace-Relay-Compute-Path"] = (
+        "registered_compute_node" if status_code == 200 else "registered_compute_node_error"
+    )
+    return response
+
+
+@app.route('/relay/api/v1/chat/completions/result', methods=['POST'])
+def relay_api_v1_chat_completions_result():
+    """Accept API v1 compute results emitted by registered compute nodes."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return jsonify({'error': 'Invalid request_id'}), 400
+
+    status_code = data.get("status_code", 200)
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid status_code'}), 400
+
+    body = data.get("body")
+    if not isinstance(body, dict):
+        return jsonify({'error': 'Invalid body'}), 400
+
+    api_v1_request_results[request_id] = {
+        "status_code": status_code,
+        "body": body,
+        "server_public_key": data.get("server_public_key"),
+    }
+    return jsonify({'message': 'result accepted'}), 200
 
 
 @app.route('/unregister', methods=['POST'])

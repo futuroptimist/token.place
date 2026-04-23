@@ -733,6 +733,78 @@ class RelayClient:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
             return False
 
+    def process_api_v1_chat_request(self, request_data: Dict[str, Any]) -> bool:
+        """Process a relay-dispatched API v1 chat request and return result to relay."""
+
+        api_v1_request = request_data.get("api_v1_request")
+        if not isinstance(api_v1_request, dict):
+            return False
+
+        request_id = api_v1_request.get("request_id")
+        messages = api_v1_request.get("messages")
+        if not isinstance(request_id, str) or not request_id.strip():
+            log_error("Invalid API v1 relay request: missing request_id")
+            return False
+        if not isinstance(messages, list):
+            log_error("Invalid API v1 relay request: messages must be a list")
+            return False
+
+        status_code = 200
+        result_body: Dict[str, Any]
+        try:
+            response_history = self.model_manager.llama_cpp_get_response(messages)
+            if not response_history or not isinstance(response_history[-1], dict):
+                raise ValueError("model returned invalid response history")
+            assistant_message = response_history[-1]
+            result_body = {
+                "id": f"relaychat-{int(time.time() * 1000)}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": api_v1_request.get("model", "unknown"),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": assistant_message.get("role", "assistant"),
+                            "content": assistant_message.get("content", ""),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        except Exception as exc:
+            status_code = 502
+            result_body = {"error": str(exc)}
+
+        result_payload = {
+            "request_id": request_id,
+            "status_code": status_code,
+            "body": result_body,
+            "server_public_key": self.crypto_manager.public_key_b64,
+        }
+
+        request_kwargs = {
+            "json": result_payload,
+            "timeout": self._request_timeout,
+        }
+        headers = self._auth_headers()
+        if headers:
+            request_kwargs["headers"] = headers
+
+        timeout = request_kwargs.pop("timeout", self._request_timeout)
+        result_response = requests.post(
+            f"{self.relay_url}/relay/api/v1/chat/completions/result",
+            timeout=timeout,
+            **request_kwargs,
+        )
+        if result_response.status_code != 200:
+            log_error(
+                "Error status from /relay/api/v1/chat/completions/result: {}",
+                result_response.status_code,
+            )
+            return False
+        return True
+
     def poll_relay_continuously(self):  # pragma: no cover
         """
         Continuously poll the relay for new chat messages and process them.

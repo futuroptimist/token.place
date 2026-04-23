@@ -220,12 +220,10 @@ def setup_servers(
     test_env = os.environ.copy()
     test_env["TOKEN_PLACE_ENV"] = "testing"
     test_env["USE_MOCK_LLM"] = "0" if run_real_bridge_e2e else "1"
-    if run_real_bridge_e2e:
-        test_env["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "distributed"
-        test_env["TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"] = "0"
-        test_env["TOKENPLACE_DISTRIBUTED_COMPUTE_URL"] = E2E_BASE_URL
-    else:
-        test_env["TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED"] = "0"
+    # NOTE: keep API v1 provider selection local for the desktop-bridge landing-page
+    # guardrail. Pointing TOKENPLACE_DISTRIBUTED_COMPUTE_URL at the relay causes
+    # recursive /api/v1/chat/completions self-calls and deterministic failures.
+    test_env["TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED"] = "0"
 
     # Start the relay server with the --use_mock_llm flag
     relay_command = [sys.executable, "relay.py", "--port", str(E2E_RELAY_PORT)]

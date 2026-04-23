@@ -10,6 +10,7 @@ from api.v1.compute_provider import (
     LocalApiV1ComputeProvider,
     get_api_v1_resolved_provider_path,
 )
+from relay import app
 
 
 def test_distributed_compute_provider_posts_api_v1_contract(monkeypatch):
@@ -129,3 +130,61 @@ def test_get_api_v1_resolved_provider_path_labels_instance_types():
     assert get_api_v1_resolved_provider_path(distributed) == "distributed"
     assert get_api_v1_resolved_provider_path(fallback) == "distributed_with_local_fallback"
     assert get_api_v1_resolved_provider_path(object()) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("post_status", "expected_backend_path"),
+    [
+        (200, "registered_desktop_compute_node"),
+        (503, "fallback_local_in_process"),
+    ],
+)
+def test_api_v1_chat_completion_emits_execution_backend_path_header(
+    monkeypatch, post_status, expected_backend_path
+):
+    def fake_post(_url, json=None, timeout=None):
+        if post_status == 200:
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "distributed response",
+                            }
+                        }
+                    ]
+                },
+            )
+        return SimpleNamespace(status_code=503, json=lambda: {"error": "down"})
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", fake_post)
+    monkeypatch.setattr(
+        "api.v1.compute_provider.generate_response",
+        lambda _model, messages, **_options: messages
+        + [{"role": "assistant", "content": "fallback response"}],
+    )
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    try:
+        assert response.status_code == 200
+        assert (
+            response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"]
+            == expected_backend_path
+        )
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()

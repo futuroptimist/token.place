@@ -50,29 +50,51 @@ ensure_playwright_browsers() {
 
     local cache_dir
     local chromium_binary
+    local chromium_patterns
 
     cache_dir="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+    chromium_patterns=(
+        "*/chrome-linux/headless_shell"
+        "*/chrome-headless-shell-linux64/chrome-headless-shell"
+        "*/chrome-linux/chrome"
+        "*/chrome-linux64/chrome"
+    )
 
-    if [ -d "$cache_dir" ]; then
-        chromium_binary=$(find "$cache_dir" -maxdepth 2 -path "*/chrome-linux/headless_shell" -type f 2>/dev/null | head -n 1 || true)
-    else
-        chromium_binary=""
-    fi
+    detect_chromium_binary() {
+        local pattern
+        local found_binary
+
+        if [ ! -d "$cache_dir" ]; then
+            return
+        fi
+
+        for pattern in "${chromium_patterns[@]}"; do
+            found_binary=$(find "$cache_dir" -maxdepth 3 -path "$pattern" -type f 2>/dev/null | head -n 1 || true)
+            if [ -n "$found_binary" ]; then
+                echo "$found_binary"
+                return
+            fi
+        done
+    }
+
+    chromium_binary="$(detect_chromium_binary || true)"
 
     if [ -z "$chromium_binary" ]; then
         echo "Installing Playwright Chromium browser binaries..."
-        if ! playwright install --with-deps chromium; then
+
+        # CI workflow already installs Playwright/browser deps in a dedicated step.
+        if [ "${CI:-}" = "true" ]; then
+            if ! playwright install chromium; then
+                echo "Warning: playwright browser installation failed"
+            fi
+        elif ! playwright install --with-deps chromium; then
             echo "Warning: playwright install --with-deps failed; retrying without system deps"
             if ! playwright install chromium; then
                 echo "Warning: playwright browser installation failed"
             fi
         fi
 
-        if [ -d "$cache_dir" ]; then
-            chromium_binary=$(find "$cache_dir" -maxdepth 2 -path "*/chrome-linux/headless_shell" -type f 2>/dev/null | head -n 1 || true)
-        else
-            chromium_binary=""
-        fi
+        chromium_binary="$(detect_chromium_binary || true)"
 
         if [ -z "$chromium_binary" ]; then
             echo "Warning: Playwright Chromium browser binaries are still missing after installation attempts"

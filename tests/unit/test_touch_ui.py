@@ -46,3 +46,14 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     assert "The LLM server returned an invalid response. Please try again." in chat_js
     assert "distributed provider timed out contacting relay bridge" not in chat_js
     assert "distributed provider request failed" not in chat_js
+
+
+def test_landing_chat_js_targets_relay_api_v1_chat_endpoint_only():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "fetch('/api/v1/chat/completions'" in chat_js
+    assert "/api/v1/completions" not in chat_js, (
+        "landing chat must not call the legacy API v1 completions endpoint"
+    )
+    assert "/relay/api/v1/chat/completions" not in chat_js, (
+        "landing chat must not bypass relay API routing via relay-internal endpoints"
+    )

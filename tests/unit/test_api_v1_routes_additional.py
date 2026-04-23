@@ -316,3 +316,57 @@ def test_legacy_completion_encrypted_response_sets_provider_headers(client, monk
     assert response.headers["X-Tokenplace-API-V1-Provider"] == "_LocalProvider"
     assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "local"
     assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
+
+
+def test_chat_completions_rejects_streaming_contract_and_skips_provider(client, monkeypatch):
+    provider_called = False
+
+    def _provider():
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("provider should not be called for stream=true")
+
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", _provider)
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert provider_called is False
+    error = response.get_json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] == "stream"
+    assert "Streaming is not supported for API v1 chat completions" in error["message"]
+
+
+def test_legacy_completions_rejects_streaming_contract_and_skips_provider(client, monkeypatch):
+    provider_called = False
+
+    def _provider():
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("provider should not be called for stream=true")
+
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", _provider)
+
+    response = client.post(
+        "/api/v1/completions",
+        json={
+            "model": "llama-3-8b-instruct",
+            "prompt": "hi",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert provider_called is False
+    error = response.get_json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] == "stream"
+    assert "Streaming is not supported for API v1 completions" in error["message"]

@@ -420,6 +420,12 @@ def _handle_chat_completion_request(data):
             status_code=400,
         )
     except ComputeProviderError as e:
+        execution_backend_path = get_api_v1_last_backend_path()
+        log_warning(
+            "API v1 compute provider error "
+            f"code={e.code} status={e.status_code} "
+            f"path={execution_backend_path} detail={str(e)}"
+        )
         return format_error_response(
             e.public_message,
             error_type=e.error_type,

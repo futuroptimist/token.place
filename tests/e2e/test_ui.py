@@ -249,6 +249,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert v2_requests == []
 
 
+@pytest.mark.e2e
 def test_landing_chat_shows_no_servers_available_message(
     page: Page,
     base_url: str,

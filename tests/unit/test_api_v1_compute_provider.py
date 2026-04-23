@@ -94,6 +94,42 @@ def test_distributed_compute_provider_raises_when_contract_is_invalid(monkeypatc
         )
 
 
+def test_distributed_compute_provider_handles_non_object_error_json(monkeypatch):
+    monkeypatch.setattr(
+        "api.v1.compute_provider.requests.post",
+        lambda _url, json=None, timeout=None: SimpleNamespace(status_code=503, json=lambda: []),
+    )
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "compute_node_bridge_error"
+    assert exc_info.value.status_code == 502
+
+
+def test_distributed_compute_provider_timeout_maps_to_timeout_metadata(monkeypatch):
+    def timeout_post(_url, json=None, timeout=None):
+        raise compute_provider.requests.Timeout("timed out")
+
+    monkeypatch.setattr("api.v1.compute_provider.requests.post", timeout_post)
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    with pytest.raises(ComputeProviderError) as exc_info:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert exc_info.value.code == "compute_node_bridge_timeout"
+    assert exc_info.value.error_type == "timeout_error"
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.public_message == "The LLM server took too long to respond. Please try again."
+
+
 @pytest.mark.parametrize(
     ("status_code", "payload", "expected_error_code"),
     [

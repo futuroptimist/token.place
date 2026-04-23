@@ -5,6 +5,7 @@ from flask import Flask
 import sys
 import os
 from datetime import datetime, timedelta
+import relay as relay_module
 
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -209,6 +210,47 @@ def test_two_servers_receive_only_addressed_work(client):
     server_one_work = client.post("/sink", json={"server_public_key": server_one})
     assert server_one_work.status_code == 200
     assert server_one_work.get_json()["chat_history"] == "work-for-server-one"
+
+
+def test_relay_api_v1_returns_structured_error_for_invalid_json(client):
+    response = client.post(
+        "/relay/api/v1/chat/completions",
+        data="[",
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data["error"]["type"] == "invalid_request_error"
+    assert data["error"]["code"] == "invalid_request_payload"
+    assert data["error"]["message"] == "Invalid request data"
+
+
+def test_relay_api_v1_masks_upstream_bridge_error_message(client, monkeypatch):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    monkeypatch.setattr(
+        relay_module,
+        "_await_api_v1_response",
+        lambda request_id, timeout_seconds: {"error": "stacktrace/token"},
+    )
+
+    response = client.post(
+        "/relay/api/v1/chat/completions",
+        json={
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 502
+    data = response.get_json()
+    assert data["error"]["type"] == "upstream_error"
+    assert data["error"]["code"] == "compute_node_bridge_error"
+    assert data["error"]["message"] == "Compute node returned an error"
 
 # --- Test /faucet ---
 

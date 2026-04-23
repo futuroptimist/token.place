@@ -54,6 +54,21 @@ _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
         "public_message": "The LLM server took too long to respond. Please try again.",
         "status_code": 504,
     },
+    "compute_node_bridge_timeout": {
+        "error_type": "timeout_error",
+        "public_message": "The LLM server took too long to respond. Please try again.",
+        "status_code": 504,
+    },
+    "compute_node_unreachable": {
+        "error_type": "service_unavailable_error",
+        "public_message": "The LLM server is unavailable right now. Please try again.",
+        "status_code": 503,
+    },
+    "compute_node_bridge_error": {
+        "error_type": "upstream_error",
+        "public_message": "The LLM server returned an error. Please try again.",
+        "status_code": 502,
+    },
     "compute_node_invalid_payload": {
         "error_type": "server_error",
         "public_message": "The LLM server returned an invalid response. Please try again.",
@@ -157,14 +172,16 @@ class DistributedApiV1ComputeProvider:
             error_code = "compute_node_bridge_error"
             error_message = f"distributed provider returned status {response.status_code}"
             try:
-                error_payload = response.json().get("error", {})
-                if isinstance(error_payload, dict):
-                    candidate_code = error_payload.get("code")
-                    candidate_message = error_payload.get("message")
-                    if isinstance(candidate_code, str) and candidate_code.strip():
-                        error_code = candidate_code.strip()
-                    if isinstance(candidate_message, str) and candidate_message.strip():
-                        error_message = candidate_message.strip()
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    error_payload = parsed.get("error", {})
+                    if isinstance(error_payload, dict):
+                        candidate_code = error_payload.get("code")
+                        candidate_message = error_payload.get("message")
+                        if isinstance(candidate_code, str) and candidate_code.strip():
+                            error_code = candidate_code.strip()
+                        if isinstance(candidate_message, str) and candidate_message.strip():
+                            error_message = candidate_message.strip()
             except ValueError:
                 pass
             raise _error_from_code(error_code, message=error_message)

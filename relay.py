@@ -696,7 +696,17 @@ def relay_api_v1_chat_completions():
     """Queue API v1 chat requests for registered compute nodes and wait for completion."""
 
     _evict_stale_servers()
-    payload = request.get_json() or {}
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify(
+            {
+                'error': {
+                    'type': 'invalid_request_error',
+                    'code': 'invalid_request_payload',
+                    'message': 'Invalid request data',
+                }
+            }
+        ), 400
     if not isinstance(payload, dict):
         return jsonify(
             {
@@ -765,12 +775,17 @@ def relay_api_v1_chat_completions():
         ), 504
 
     if response_payload.get('error'):
+        logging.warning(
+            "Compute node bridge error for request_id=%s: %r",
+            request_id,
+            response_payload.get('error'),
+        )
         return jsonify(
             {
                 'error': {
                     'type': 'upstream_error',
                     'code': 'compute_node_bridge_error',
-                    'message': str(response_payload['error']),
+                    'message': 'Compute node returned an error',
                 }
             }
         ), 502

@@ -381,6 +381,7 @@ client_inference_requests = {}
 client_responses = {}
 api_v1_response_queue = {}
 api_v1_response_lock = threading.Condition()
+api_v1_pending_request_ids = set()
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -459,6 +460,8 @@ def _unregister_server(server_public_key: str) -> bool:
 
 def _enqueue_api_v1_response(request_id: str, payload: Dict[str, Any]) -> None:
     with api_v1_response_lock:
+        if request_id not in api_v1_pending_request_ids:
+            return
         api_v1_response_queue[request_id] = payload
         api_v1_response_lock.notify_all()
 
@@ -468,9 +471,11 @@ def _await_api_v1_response(request_id: str, timeout_seconds: float) -> Optional[
     with api_v1_response_lock:
         while True:
             if request_id in api_v1_response_queue:
+                api_v1_pending_request_ids.discard(request_id)
                 return api_v1_response_queue.pop(request_id)
             remaining = deadline - time.time()
             if remaining <= 0:
+                api_v1_pending_request_ids.discard(request_id)
                 return None
             api_v1_response_lock.wait(timeout=remaining)
 
@@ -706,6 +711,8 @@ def relay_api_v1_chat_completions():
 
     selected_server = secrets.choice(available_servers)
     request_id = secrets.token_urlsafe(16)
+    with api_v1_response_lock:
+        api_v1_pending_request_ids.add(request_id)
     queue_item = {
         'api_v1_request': {
             'request_id': request_id,

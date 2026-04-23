@@ -16,6 +16,10 @@ from relay import (
     known_servers,
     client_inference_requests,
     client_responses,
+    api_v1_pending_request_ids,
+    api_v1_response_queue,
+    _await_api_v1_response,
+    _enqueue_api_v1_response,
     streaming_sessions,
     streaming_sessions_by_client,
 )
@@ -34,6 +38,8 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_responses.clear()
+    api_v1_pending_request_ids.clear()
+    api_v1_response_queue.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
 
@@ -44,8 +50,43 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_responses.clear()
+    api_v1_pending_request_ids.clear()
+    api_v1_response_queue.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
+
+
+def test_api_v1_enqueue_ignores_late_response_without_pending_waiter():
+    """Late responses should be ignored when there is no pending waiter."""
+
+    api_v1_pending_request_ids.clear()
+    api_v1_response_queue.clear()
+
+    _enqueue_api_v1_response("req-late", {"message": {"role": "assistant", "content": "late"}})
+
+    assert "req-late" not in api_v1_response_queue
+
+
+def test_api_v1_await_timeout_discards_pending_id(monkeypatch):
+    """Timed out waiters should not keep request IDs pending indefinitely."""
+
+    api_v1_pending_request_ids.clear()
+    api_v1_response_queue.clear()
+    api_v1_pending_request_ids.add("req-timeout")
+
+    class _TimeStub:
+        def __init__(self):
+            self._values = iter([100.0, 100.3, 100.3])
+
+        def time(self):
+            return next(self._values)
+
+    monkeypatch.setattr("relay.time", _TimeStub())
+
+    response = _await_api_v1_response("req-timeout", timeout_seconds=0.1)
+
+    assert response is None
+    assert "req-timeout" not in api_v1_pending_request_ids
 
 
 def test_inference_endpoint_removed(client):

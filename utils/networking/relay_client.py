@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import ipaddress
 import json
 import jsonschema
@@ -743,6 +744,7 @@ class RelayClient:
 
         request_id = api_v1_request.get('request_id')
         messages = api_v1_request.get('messages')
+        options = api_v1_request.get('options')
         if not isinstance(request_id, str) or not request_id.strip() or not isinstance(messages, list):
             log_error("Invalid api_v1_request payload for compute node bridge")
             return False
@@ -750,7 +752,26 @@ class RelayClient:
         source_payload: Dict[str, Any] = {'request_id': request_id}
 
         try:
-            response_history = self.model_manager.llama_cpp_get_response(messages)
+            llama_kwargs: Dict[str, Any] = {}
+            if isinstance(options, dict):
+                try:
+                    signature = inspect.signature(self.model_manager.llama_cpp_get_response)
+                    accepts_kwargs = any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                    if accepts_kwargs:
+                        llama_kwargs = options
+                    else:
+                        llama_kwargs = {
+                            key: value
+                            for key, value in options.items()
+                            if key in signature.parameters and key != 'chat_history'
+                        }
+                except (TypeError, ValueError):
+                    llama_kwargs = {}
+
+            response_history = self.model_manager.llama_cpp_get_response(messages, **llama_kwargs)
             assistant_message = response_history[-1] if isinstance(response_history, list) else None
             if not isinstance(assistant_message, dict):
                 source_payload['error'] = 'invalid assistant message payload'
@@ -766,19 +787,33 @@ class RelayClient:
 
         request_kwargs = {
             'json': source_payload,
-            'timeout': self._request_timeout,
         }
         headers = self._auth_headers()
         if headers:
             request_kwargs['headers'] = headers
 
-        timeout = request_kwargs.pop('timeout', self._request_timeout)
-        response = requests.post(
-            f'{self.relay_url}/relay/api/v1/source',
-            timeout=timeout,
-            **request_kwargs,
-        )
-        return response.status_code == 200
+        try:
+            response = requests.post(
+                f'{self.relay_url}/relay/api/v1/source',
+                timeout=self._request_timeout,
+                **request_kwargs,
+            )
+            if response.status_code != 200:
+                log_error("Error status from /relay/api/v1/source: {}", response.status_code)
+                return False
+            return True
+        except requests.ConnectionError as exc:
+            log_error("Connection error posting to /relay/api/v1/source: {}", str(exc), exc_info=True)
+            return False
+        except requests.Timeout as exc:
+            log_error("Timeout posting to /relay/api/v1/source: {}", str(exc), exc_info=True)
+            return False
+        except requests.RequestException as exc:
+            log_error("Request error posting to /relay/api/v1/source: {}", str(exc), exc_info=True)
+            return False
+        except Exception as exc:
+            log_error("Unexpected error posting to /relay/api/v1/source: {}", str(exc), exc_info=True)
+            return False
 
     def poll_relay_continuously(self):  # pragma: no cover
         """
@@ -837,7 +872,10 @@ class RelayClient:
 
                     # Check if there's a client request to process
                     required_fields = ['client_public_key', 'chat_history', 'cipherkey', 'iv']
-                    if all(field in relay_response for field in required_fields):
+                    if isinstance(relay_response.get('api_v1_request'), dict):
+                        log_info("Processing API v1 relay request...")
+                        self.process_api_v1_chat_request(relay_response)
+                    elif all(field in relay_response for field in required_fields):
                         log_info("Processing client request...")
                         self.process_client_request(relay_response)
                     else:

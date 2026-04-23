@@ -1157,6 +1157,41 @@ class TestRelayClient:
         assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.process_api_v1_chat_request')
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_relay_continuously_processes_api_v1_requests(
+        self,
+        mock_sleep,
+        mock_process_client,
+        mock_process_api_v1,
+        mock_ping,
+        relay_client,
+    ):
+        """Polling should dispatch API v1 payloads to the dedicated handler."""
+        api_v1_payload = {
+            'next_ping_in_x_seconds': 5,
+            'api_v1_request': {
+                'request_id': 'req-123',
+                'messages': [{'role': 'user', 'content': 'hello'}],
+            },
+        }
+        mock_ping.side_effect = [api_v1_payload]
+
+        relay_client.start()
+
+        def stop_after_sleep(_seconds):
+            relay_client.stop()
+            return None
+
+        mock_sleep.side_effect = stop_after_sleep
+        relay_client.poll_relay_continuously()
+
+        mock_process_api_v1.assert_called_once_with(api_v1_payload)
+        mock_process_client.assert_not_called()
+        mock_sleep.assert_called_once_with(5)
+
+    @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.time.sleep')
     def test_poll_relay_continuously_with_error(self, mock_sleep, mock_ping, relay_client):
         """Test the continuous polling with an error in the response."""
@@ -1209,3 +1244,58 @@ class TestRelayClient:
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_api_v1_chat_request_connection_error(self, mock_post, relay_client):
+        """API v1 source posting should gracefully handle connection failures."""
+        mock_post.side_effect = requests.ConnectionError("relay unavailable")
+        request_data = {
+            'api_v1_request': {
+                'request_id': 'req-abc',
+                'messages': [{'role': 'user', 'content': 'Hi'}],
+            }
+        }
+
+        assert relay_client.process_api_v1_chat_request(request_data) is False
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_api_v1_chat_request_non_200(self, mock_post, relay_client):
+        """Non-200 responses from /relay/api/v1/source should return False."""
+        mock_response = MagicMock()
+        mock_response.status_code = 502
+        mock_post.return_value = mock_response
+        request_data = {
+            'api_v1_request': {
+                'request_id': 'req-non-200',
+                'messages': [{'role': 'user', 'content': 'Hi'}],
+            }
+        }
+
+        assert relay_client.process_api_v1_chat_request(request_data) is False
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_api_v1_chat_request_forwards_supported_llama_options(self, mock_post, relay_client):
+        """Forward supported API v1 options into llama inference when accepted."""
+
+        def _llama_stub(chat_history, temperature=None):
+            assert temperature == 0.33
+            return [
+                *chat_history,
+                {"role": "assistant", "content": "option-aware"},
+            ]
+
+        relay_client.model_manager.llama_cpp_get_response = _llama_stub
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+        request_data = {
+            'api_v1_request': {
+                'request_id': 'req-opt',
+                'messages': [{'role': 'user', 'content': 'Hello'}],
+                'options': {'temperature': 0.33, 'response_format': {'type': 'json_object'}},
+            }
+        }
+
+        result = relay_client.process_api_v1_chat_request(request_data)
+
+        assert result is True

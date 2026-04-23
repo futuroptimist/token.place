@@ -152,6 +152,28 @@ def _configure_mock_mode(enable_mock: bool) -> None:
         LOGGER.info("mock.llm.enabled", extra={"use_mock_llm": True})
 
 
+def _enforce_api_v1_distributed_guardrail() -> None:
+    """Optionally force API v1 distributed routing for guardrail runs."""
+
+    enforce = os.environ.get("TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED", "0").strip().lower()
+    if enforce not in {"1", "true", "yes", "on"}:
+        return
+
+    if not os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
+        os.environ["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "distributed"
+    if not os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "").strip():
+        os.environ["TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"] = "0"
+
+    LOGGER.info(
+        "relay.api_v1_distributed_guardrail.enabled",
+        extra={
+            "provider_mode": os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER"),
+            "fallback": os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"),
+            "has_distributed_url": bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()),
+        },
+    )
+
+
 def _build_cli_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="token.place relay server", add_help=add_help)
     parser.add_argument(
@@ -190,6 +212,7 @@ def _detect_mock_flag(argv: list[str]) -> bool:
 
 
 _configure_mock_mode(_detect_mock_flag(sys.argv[1:]))
+_enforce_api_v1_distributed_guardrail()
 
 
 GPU_HOST_ENV = "TOKENPLACE_GPU_HOST"

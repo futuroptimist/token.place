@@ -50,29 +50,51 @@ ensure_playwright_browsers() {
 
     local cache_dir
     local chromium_binary
+    local chromium_patterns
 
     cache_dir="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+    chromium_patterns=(
+        "*/chrome-linux/headless_shell"
+        "*/chrome-headless-shell-linux64/chrome-headless-shell"
+        "*/chrome-linux/chrome"
+        "*/chrome-linux64/chrome"
+    )
 
-    if [ -d "$cache_dir" ]; then
-        chromium_binary=$(find "$cache_dir" -maxdepth 2 -path "*/chrome-linux/headless_shell" -type f 2>/dev/null | head -n 1 || true)
-    else
-        chromium_binary=""
-    fi
+    detect_chromium_binary() {
+        local pattern
+        local found_binary
+
+        if [ ! -d "$cache_dir" ]; then
+            return
+        fi
+
+        for pattern in "${chromium_patterns[@]}"; do
+            found_binary=$(find "$cache_dir" -maxdepth 3 -path "$pattern" -type f 2>/dev/null | head -n 1 || true)
+            if [ -n "$found_binary" ]; then
+                echo "$found_binary"
+                return
+            fi
+        done
+    }
+
+    chromium_binary="$(detect_chromium_binary || true)"
 
     if [ -z "$chromium_binary" ]; then
         echo "Installing Playwright Chromium browser binaries..."
-        if ! playwright install --with-deps chromium; then
+
+        # CI workflow already installs Playwright/browser deps in a dedicated step.
+        if [ "${CI:-}" = "true" ]; then
+            if ! playwright install chromium; then
+                echo "Warning: playwright browser installation failed"
+            fi
+        elif ! playwright install --with-deps chromium; then
             echo "Warning: playwright install --with-deps failed; retrying without system deps"
             if ! playwright install chromium; then
                 echo "Warning: playwright browser installation failed"
             fi
         fi
 
-        if [ -d "$cache_dir" ]; then
-            chromium_binary=$(find "$cache_dir" -maxdepth 2 -path "*/chrome-linux/headless_shell" -type f 2>/dev/null | head -n 1 || true)
-        else
-            chromium_binary=""
-        fi
+        chromium_binary="$(detect_chromium_binary || true)"
 
         if [ -z "$chromium_binary" ]; then
             echo "Warning: Playwright Chromium browser binaries are still missing after installation attempts"
@@ -140,6 +162,13 @@ if [ "${RUN_E2E:-0}" = "1" ]; then
     run_test "End-to-End Tests" "$PYTHON_CMD -m pytest tests/test_e2e_*.py -v $COVERAGE_ARGS" "Testing complete workflows"
 else
     echo "Skipping End-to-End Tests (set RUN_E2E=1 to enable)"
+fi
+
+# 8b. Relay landing-page real desktop bridge guardrail (requires local GGUF model path)
+if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ]; then
+    run_test "Relay Landing Page Real Desktop Bridge Guardrail"   "RUN_RELAY_REGISTRATION_TESTS=1 $PYTHON_CMD -m pytest tests/e2e/test_ui.py -v -k 'landing_chat_real_inference_with_desktop_bridge_api_v1' $COVERAGE_ARGS"   "Verifying browser -> relay/API v1 -> desktop bridge runtime with non-streaming guardrails"
+else
+    echo "Skipping Relay Landing Page Real Desktop Bridge Guardrail (set TOKENPLACE_REAL_E2E_MODEL_PATH to a local GGUF file to enable)"
 fi
 
 # 9. Run failure recovery tests

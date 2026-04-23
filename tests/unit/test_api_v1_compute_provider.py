@@ -8,6 +8,7 @@ from api.v1.compute_provider import (
     DistributedApiV1ComputeProvider,
     FallbackApiV1ComputeProvider,
     LocalApiV1ComputeProvider,
+    get_api_v1_resolved_provider_path,
 )
 
 
@@ -117,3 +118,14 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
             compute_provider.get_api_v1_compute_provider()
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_get_api_v1_resolved_provider_path_labels_instance_types():
+    local = LocalApiV1ComputeProvider()
+    distributed = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+    fallback = FallbackApiV1ComputeProvider(primary=distributed, fallback=local)
+
+    assert get_api_v1_resolved_provider_path(local) == "local"
+    assert get_api_v1_resolved_provider_path(distributed) == "distributed"
+    assert get_api_v1_resolved_provider_path(fallback) == "distributed_with_local_fallback"
+    assert get_api_v1_resolved_provider_path(object()) == "unknown"

@@ -205,3 +205,15 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
         not in {"0", "false", "no", "off"}
     )
     return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
+
+
+def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:
+    """Return a stable diagnostics label for the resolved provider instance."""
+
+    if isinstance(provider, FallbackApiV1ComputeProvider):
+        return "distributed_with_local_fallback"
+    if isinstance(provider, DistributedApiV1ComputeProvider):
+        return "distributed"
+    if isinstance(provider, LocalApiV1ComputeProvider):
+        return "local"
+    return "unknown"

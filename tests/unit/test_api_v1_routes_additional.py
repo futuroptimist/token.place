@@ -7,6 +7,7 @@ import pytest
 import relay
 from relay import app
 from api.v1 import compute_provider, routes
+from api.v1.compute_provider import ApiV1ComputeResult
 from api.v1.models import ModelError
 from api.v1.validation import ValidationError
 
@@ -190,7 +191,11 @@ def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monk
         def complete_chat(self, model_id, messages, options):
             assert model_id == "llama-3-8b-instruct"
             assert isinstance(options, dict)
-            return {"role": "assistant", "content": "Paris"}
+            return ApiV1ComputeResult(
+                assistant_message={"role": "assistant", "content": "Paris"},
+                backend_path="distributed",
+                backend_provider="_DistributedProvider",
+            )
 
     payload = {
         "model": "llama-3-8b-instruct",
@@ -215,7 +220,11 @@ def test_chat_completion_encrypted_response_sets_provider_headers(client, monkey
         def complete_chat(self, model_id, messages, options):
             assert model_id == "llama-3-8b-instruct"
             assert isinstance(options, dict)
-            return {"role": "assistant", "content": "Paris"}
+            return ApiV1ComputeResult(
+                assistant_message={"role": "assistant", "content": "Paris"},
+                backend_path="distributed",
+                backend_provider="_DistributedProvider",
+            )
 
     encrypted_payload = {
         "ciphertext": base64.b64encode(
@@ -265,7 +274,11 @@ def test_legacy_completion_sets_provider_headers(client, monkeypatch):
             assert model_id == "llama-3-8b-instruct"
             assert messages == [{"role": "user", "content": "hi"}]
             assert isinstance(options, dict)
-            return {"role": "assistant", "content": "hello"}
+            return ApiV1ComputeResult(
+                assistant_message={"role": "assistant", "content": "hello"},
+                backend_path="local",
+                backend_provider="_LocalProvider",
+            )
 
     payload = {
         "model": "llama-3-8b-instruct",
@@ -290,7 +303,11 @@ def test_legacy_completion_encrypted_response_sets_provider_headers(client, monk
             assert model_id == "llama-3-8b-instruct"
             assert messages == [{"role": "user", "content": "hi"}]
             assert isinstance(options, dict)
-            return {"role": "assistant", "content": "hello"}
+            return ApiV1ComputeResult(
+                assistant_message={"role": "assistant", "content": "hello"},
+                backend_path="local",
+                backend_provider="_LocalProvider",
+            )
 
     payload = {
         "model": "llama-3-8b-instruct",

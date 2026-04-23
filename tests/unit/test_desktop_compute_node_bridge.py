@@ -103,6 +103,30 @@ class StreamingRuntime(FakeRuntime):
         return self.relay_client.process_client_request(payload)
 
 
+class ApiV1Runtime(FakeRuntime):
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = SimpleNamespace(
+            relay_url='https://token.place',
+            _request_timeout=2,
+            server_registration_token='',
+        )
+        self._responses = [
+            {
+                'next_ping_in_x_seconds': 0,
+                'api_v1_chat_request': {
+                    'request_id': 'req-1',
+                    'model': 'llama',
+                    'messages': [{'role': 'user', 'content': 'hi'}],
+                    'options': {'temperature': 0.2},
+                },
+            },
+        ]
+        self.model_manager.llama_cpp_get_response = (
+            lambda messages, **_kwargs: messages + [{'role': 'assistant', 'content': 'hello'}]
+        )
+
+
 class ProcessingFailureRuntime(FakeRuntime):
     def __init__(self, _config):
         self.model_manager = FakeModelManager()
@@ -599,6 +623,45 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     assert endpoint == '/stream/source'
     assert payload['stream'] is True
     assert payload['stream_session_id'] == 'session-123'
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert any(event.get('registered') is True for event in status_events)
+
+
+def test_run_api_v1_payload_posts_result_to_relay(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiV1Runtime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+    sleep_counter = {'count': 0}
+
+    def fake_sleep_with_cancel(_seconds):
+        sleep_counter['count'] += 1
+        return sleep_counter['count'] > 1
+
+    posted = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted['url'] = url
+        posted['json'] = json
+        posted['headers'] = headers
+        posted['timeout'] = timeout
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', fake_sleep_with_cancel)
+    monkeypatch.setattr(compute_node_bridge.requests, 'post', fake_post)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+    assert posted['url'] == 'https://token.place/relay/api-v1/chat/result'
+    assert posted['json']['request_id'] == 'req-1'
+    assert posted['json']['message']['content'] == 'hello'
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']

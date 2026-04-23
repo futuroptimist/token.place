@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+import requests
+
 if __package__ in (None, ""):
     script_dir = str(Path(__file__).resolve().parent)
     if script_dir not in sys.path:
@@ -281,9 +283,10 @@ def run(args: argparse.Namespace) -> int:
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
+            api_v1_chat_request = relay_response.get("api_v1_chat_request")
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
             relay_error = _relay_error_message(relay_response)
-            registered = relay_error is None and (legacy_payload or heartbeat_ack)
+            registered = relay_error is None and (legacy_payload or heartbeat_ack or isinstance(api_v1_chat_request, dict))
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
@@ -320,6 +323,56 @@ def run(args: argparse.Namespace) -> int:
                         "desktop.compute_node_bridge.process_request.ok",
                         file=sys.stderr,
                     )
+            elif isinstance(api_v1_chat_request, dict):
+                request_id = api_v1_chat_request.get("request_id")
+                request_messages = api_v1_chat_request.get("messages")
+                request_model = api_v1_chat_request.get("model")
+                request_options = api_v1_chat_request.get("options")
+                print(
+                    "desktop.compute_node_bridge.process_api_v1_request.start "
+                    f"request_id={request_id}",
+                    file=sys.stderr,
+                )
+                result_payload: Dict[str, Any] = {"request_id": request_id}
+                try:
+                    if not isinstance(request_messages, list):
+                        raise ValueError("api_v1 request missing messages list")
+                    if not isinstance(request_model, str) or not request_model.strip():
+                        raise ValueError("api_v1 request missing model")
+
+                    if isinstance(request_options, dict):
+                        llama_history = runtime.model_manager.llama_cpp_get_response(
+                            request_messages, **request_options
+                        )
+                    else:
+                        llama_history = runtime.model_manager.llama_cpp_get_response(request_messages)
+                    if not llama_history or not isinstance(llama_history[-1], dict):
+                        raise ValueError("api_v1 request produced invalid assistant message")
+                    result_payload["message"] = llama_history[-1]
+                    last_error = None
+                    print(
+                        "desktop.compute_node_bridge.process_api_v1_request.ok "
+                        f"request_id={request_id}",
+                        file=sys.stderr,
+                    )
+                except Exception as exc:
+                    result_payload["error"] = str(exc)
+                    last_error = str(exc)
+                    print(
+                        "desktop.compute_node_bridge.process_api_v1_request.failed "
+                        f"request_id={request_id} error={exc}",
+                        file=sys.stderr,
+                    )
+                headers = {}
+                relay_token = runtime.relay_client.server_registration_token
+                if relay_token:
+                    headers["X-Relay-Server-Token"] = relay_token
+                requests.post(
+                    f"{active_relay_url.rstrip('/')}/relay/api-v1/chat/result",
+                    json=result_payload,
+                    headers=headers or None,
+                    timeout=runtime.relay_client._request_timeout,
+                )
             else:
                 last_error = None
 

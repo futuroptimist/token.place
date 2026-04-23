@@ -43,6 +43,7 @@ RELAY_RESPONSE_SCHEMA = {
         "chat_history": {"type": "string"},
         "cipherkey": {"type": "string"},
         "iv": {"type": "string"},
+        "api_v1_request": {"type": "object"},
         "error": {"type": "string"}
     }
 }
@@ -732,6 +733,52 @@ class RelayClient:
         except Exception as e:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
             return False
+
+    def process_api_v1_chat_request(self, request_data: Dict[str, Any]) -> bool:
+        """Process relay API v1 chat request payload and post result back to relay."""
+
+        api_v1_request = request_data.get('api_v1_request') if isinstance(request_data, dict) else None
+        if not isinstance(api_v1_request, dict):
+            return False
+
+        request_id = api_v1_request.get('request_id')
+        messages = api_v1_request.get('messages')
+        if not isinstance(request_id, str) or not request_id.strip() or not isinstance(messages, list):
+            log_error("Invalid api_v1_request payload for compute node bridge")
+            return False
+
+        source_payload: Dict[str, Any] = {'request_id': request_id}
+
+        try:
+            response_history = self.model_manager.llama_cpp_get_response(messages)
+            assistant_message = response_history[-1] if isinstance(response_history, list) else None
+            if not isinstance(assistant_message, dict):
+                source_payload['error'] = 'invalid assistant message payload'
+            else:
+                source_payload['message'] = {
+                    'role': assistant_message.get('role', 'assistant'),
+                    'content': assistant_message.get('content', ''),
+                }
+                if isinstance(assistant_message.get('tool_calls'), list):
+                    source_payload['message']['tool_calls'] = assistant_message['tool_calls']
+        except Exception as exc:  # pragma: no cover - model runtime edge case
+            source_payload['error'] = str(exc)
+
+        request_kwargs = {
+            'json': source_payload,
+            'timeout': self._request_timeout,
+        }
+        headers = self._auth_headers()
+        if headers:
+            request_kwargs['headers'] = headers
+
+        timeout = request_kwargs.pop('timeout', self._request_timeout)
+        response = requests.post(
+            f'{self.relay_url}/relay/api/v1/source',
+            timeout=timeout,
+            **request_kwargs,
+        )
+        return response.status_code == 200
 
     def poll_relay_continuously(self):  # pragma: no cover
         """

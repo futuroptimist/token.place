@@ -42,7 +42,7 @@ def test_distributed_compute_provider_posts_api_v1_contract(monkeypatch):
         options={"temperature": 0.2, "stream": True},
     )
 
-    assert captured["url"] == "https://node-a.example/api/v1/chat/completions"
+    assert captured["url"] == "https://node-a.example/relay/api/v1/chat/completions"
     assert captured["timeout"] == 5
     assert captured["json"]["model"] == "llama-3-8b-instruct"
     assert captured["json"]["messages"] == [{"role": "user", "content": "hi"}]

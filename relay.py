@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
@@ -379,6 +379,8 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+api_v1_response_queue = {}
+api_v1_response_lock = threading.Condition()
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -453,6 +455,24 @@ def _unregister_server(server_public_key: str) -> bool:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
     return removed
+
+
+def _enqueue_api_v1_response(request_id: str, payload: Dict[str, Any]) -> None:
+    with api_v1_response_lock:
+        api_v1_response_queue[request_id] = payload
+        api_v1_response_lock.notify_all()
+
+
+def _await_api_v1_response(request_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+    deadline = time.time() + max(timeout_seconds, 0.1)
+    with api_v1_response_lock:
+        while True:
+            if request_id in api_v1_response_queue:
+                return api_v1_response_queue.pop(request_id)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            api_v1_response_lock.wait(timeout=remaining)
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -665,6 +685,93 @@ def relay_diagnostics():
         "total_registered_compute_nodes": len(live_nodes),
     })
 
+
+@app.route('/relay/api/v1/chat/completions', methods=['POST'])
+def relay_api_v1_chat_completions():
+    """Queue API v1 chat requests for registered compute nodes and wait for completion."""
+
+    _evict_stale_servers()
+    payload = request.get_json() or {}
+    if not isinstance(payload, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    model = payload.get('model')
+    messages = payload.get('messages')
+    if not isinstance(model, str) or not model.strip() or not isinstance(messages, list):
+        return jsonify({'error': {'message': 'Invalid API v1 payload', 'code': 400}}), 400
+
+    available_servers = list(known_servers.keys())
+    if not available_servers:
+        return jsonify({'error': {'message': 'No registered compute nodes available', 'code': 503}}), 503
+
+    selected_server = secrets.choice(available_servers)
+    request_id = secrets.token_urlsafe(16)
+    queue_item = {
+        'api_v1_request': {
+            'request_id': request_id,
+            'model': model,
+            'messages': messages,
+            'options': {
+                key: value
+                for key, value in payload.items()
+                if key not in {'model', 'messages', 'stream'}
+            },
+        }
+    }
+    if selected_server not in client_inference_requests:
+        client_inference_requests[selected_server] = []
+    client_inference_requests[selected_server].append(queue_item)
+
+    timeout_seconds = float(os.environ.get('TOKENPLACE_RELAY_API_V1_TIMEOUT_SECONDS', '45'))
+    response_payload = _await_api_v1_response(request_id, timeout_seconds)
+    if response_payload is None:
+        return jsonify({'error': {'message': 'Timed out waiting for registered compute node', 'code': 504}}), 504
+
+    if response_payload.get('error'):
+        return jsonify({'error': {'message': response_payload['error'], 'code': 502}}), 502
+
+    message = response_payload.get('message')
+    if not isinstance(message, dict):
+        return jsonify({'error': {'message': 'Compute node returned invalid response', 'code': 502}}), 502
+
+    return jsonify(
+        {
+            'id': f"chatcmpl-{request_id}",
+            'object': 'chat.completion',
+            'created': int(time.time()),
+            'model': model,
+            'choices': [{'index': 0, 'message': message, 'finish_reason': 'stop'}],
+        }
+    )
+
+
+@app.route('/relay/api/v1/source', methods=['POST'])
+def relay_api_v1_source():
+    """Accept API v1 completion results from registered compute nodes."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    payload = request.get_json() or {}
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    request_id = payload.get('request_id')
+    if not isinstance(request_id, str) or not request_id.strip():
+        return jsonify({'error': 'Missing request_id'}), 400
+
+    response_payload: Dict[str, Any] = {}
+    message = payload.get('message')
+    if isinstance(message, dict):
+        response_payload['message'] = message
+    error = payload.get('error')
+    if isinstance(error, str) and error.strip():
+        response_payload['error'] = error.strip()
+
+    _enqueue_api_v1_response(request_id, response_payload)
+    return jsonify({'message': 'API v1 response queued'}), 200
+
 @app.route('/faucet', methods=['POST'])
 def faucet():
     """
@@ -818,12 +925,15 @@ def sink():
             batch.append(request_payload)
 
         first_request = batch[0]
-        response_data.update({
-            'client_public_key': first_request['client_public_key'],
-            'chat_history': first_request['chat_history'],
-            'cipherkey': first_request['cipherkey'],
-            'iv': first_request.get('iv', ''),
-        })
+        if 'api_v1_request' in first_request:
+            response_data['api_v1_request'] = first_request['api_v1_request']
+        else:
+            response_data.update({
+                'client_public_key': first_request['client_public_key'],
+                'chat_history': first_request['chat_history'],
+                'cipherkey': first_request['cipherkey'],
+                'iv': first_request.get('iv', ''),
+            })
 
         if first_request.get('stream') and first_request.get('stream_session_id'):
             response_data['stream'] = True

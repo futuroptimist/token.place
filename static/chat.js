@@ -365,6 +365,43 @@ new Vue({
         },
 
         // Send a message to the server using the new API
+        mapApiErrorToUserMessage(error) {
+            const code = error && typeof error.code === 'string' ? error.code : '';
+            if (code === 'no_compute_nodes_available') {
+                return 'No LLM servers are available right now.';
+            }
+            if (code === 'compute_node_timeout' || code === 'compute_bridge_timeout') {
+                return 'LLM servers are taking too long to respond. Please try again.';
+            }
+            if (code === 'compute_node_unreachable' || code === 'compute_node_bridge_error') {
+                return 'Unable to reach an LLM server right now. Please try again.';
+            }
+            if (code === 'compute_node_invalid_payload') {
+                return 'An LLM server returned an invalid response. Please try again.';
+            }
+            return 'Sorry, I encountered an issue generating a response. Please try again.';
+        },
+
+        async parseApiError(response) {
+            let errorData = null;
+            try {
+                errorData = await response.json();
+            } catch (_ignored) {
+                errorData = null;
+            }
+
+            const errorPayload = errorData && errorData.error && typeof errorData.error === 'object'
+                ? errorData.error
+                : {};
+
+            return {
+                status: response.status,
+                message: typeof errorPayload.message === 'string' ? errorPayload.message : 'Unknown error',
+                type: typeof errorPayload.type === 'string' ? errorPayload.type : 'server_error',
+                code: typeof errorPayload.code === 'string' ? errorPayload.code : 'unknown_error',
+            };
+        },
+
         async sendMessageApi() {
             if (!this.serverPublicKey) {
                 console.error('Server public key not available');
@@ -400,8 +437,9 @@ new Vue({
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(`API error: ${errorData.error?.message || 'Unknown error'}`);
+                    const apiError = await this.parseApiError(response);
+                    apiError.userMessage = this.mapApiErrorToUserMessage(apiError);
+                    throw apiError;
                 }
 
                 const responseData = await response.json();
@@ -425,7 +463,7 @@ new Vue({
                 return responseData;
             } catch (error) {
                 console.error('API request error:', error);
-                return null;
+                throw error;
             }
         },
 
@@ -526,7 +564,9 @@ new Vue({
                 console.error('Error sending message:', error);
                 this.chatHistory.push({
                     role: 'assistant',
-                    content: 'Sorry, an error occurred while sending your message. Please try again.'
+                    content: error && typeof error.userMessage === 'string'
+                        ? error.userMessage
+                        : 'Sorry, an error occurred while sending your message. Please try again.'
                 });
             } finally {
                 this.isGeneratingResponse = false;

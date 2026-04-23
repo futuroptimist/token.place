@@ -456,23 +456,29 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
         stream_mode = latest_headers.get("x-tokenplace-api-v1-stream-mode")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        execution_path = latest_headers.get("x-tokenplace-api-v1-execution-path")
         provider_diagnostics = (
             "landing-page real-provider guardrail diagnostics: "
             f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
-            f"stream_mode={stream_mode!r}; expected provider_class='LocalApiV1ComputeProvider', "
-            "resolved_provider_path='local', stream_mode='non-streaming'"
+            f"execution_path={execution_path!r}, stream_mode={stream_mode!r}; "
+            "expected provider_class='RelayRegisteredApiV1ComputeProvider', "
+            "resolved_provider_path='relay_registered', execution_path='relay_registered_compute_node', "
+            "stream_mode='non-streaming'"
         )
-        assert provider_class == "LocalApiV1ComputeProvider", provider_diagnostics
+        assert provider_class == "RelayRegisteredApiV1ComputeProvider", provider_diagnostics
         assert stream_mode == "non-streaming", provider_diagnostics
-        assert resolved_provider_path == "local", (
+        assert resolved_provider_path == "relay_registered", (
             "landing-page real-provider guardrail requires resolved provider path "
-            f"'local'. {provider_diagnostics}"
+            f"'relay_registered'. {provider_diagnostics}"
         )
-        if runtime_supports_real_inference and resolved_provider_path != "local":
+        assert execution_path == "relay_registered_compute_node", provider_diagnostics
+        if runtime_supports_real_inference:
             assert assistant_text.strip().lower() != "stub", (
                 "assistant response must not be stub when runtime reports real inference support "
                 f"and provider path is {resolved_provider_path!r}. {provider_diagnostics}"
             )
+        bridge_stderr = "".join(stderr_lines)
+        assert "desktop.compute_node_bridge.process_request.start" in bridge_stderr
 
         page.wait_for_timeout(300)
         non_streaming_state = page.evaluate(

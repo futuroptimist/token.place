@@ -174,6 +174,25 @@ def _enforce_api_v1_distributed_guardrail() -> None:
     )
 
 
+def _configure_api_v1_relay_registered_provider(host: str, port: int) -> None:
+    """Default relay API v1 chat handling to registered compute nodes."""
+
+    if not os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
+        os.environ["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "relay_registered"
+
+    if not os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip():
+        host_for_url = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+        os.environ["TOKENPLACE_DISTRIBUTED_COMPUTE_URL"] = f"http://{host_for_url}:{port}"
+
+    LOGGER.info(
+        "relay.api_v1_provider.defaulted",
+        extra={
+            "provider_mode": os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER"),
+            "distributed_url": os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL"),
+        },
+    )
+
+
 def _build_cli_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="token.place relay server", add_help=add_help)
     parser.add_argument(
@@ -1016,6 +1035,7 @@ def main(argv: list[str] | None = None) -> None:
         port = args.port
 
     _configure_mock_mode(args.use_mock_llm)
+    _configure_api_v1_relay_registered_provider(host, port)
     serve(host, port)
 
 

@@ -511,23 +511,27 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
         stream_mode = latest_headers.get("x-tokenplace-api-v1-stream-mode")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        execution_backend_path = latest_headers.get("x-tokenplace-api-v1-execution-backend-path")
         provider_diagnostics = (
-            "landing-page real-provider guardrail diagnostics: "
+            "landing-page real desktop-bridge guardrail diagnostics: "
             f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
-            f"stream_mode={stream_mode!r}; expected provider_class='LocalApiV1ComputeProvider', "
-            "resolved_provider_path='local', stream_mode='non-streaming'"
+            f"execution_backend_path={execution_backend_path!r}, stream_mode={stream_mode!r}; "
+            "expected distributed provider path with desktop-bridge execution and non-streaming mode"
         )
-        assert provider_class == "LocalApiV1ComputeProvider", provider_diagnostics
         assert stream_mode == "non-streaming", provider_diagnostics
-        assert resolved_provider_path == "local", (
-            "landing-page real-provider guardrail requires resolved provider path "
-            f"'local'. {provider_diagnostics}"
+        assert provider_class in {"DistributedApiV1ComputeProvider", "FallbackApiV1ComputeProvider"}, (
+            "landing-page real desktop-bridge guardrail requires distributed provider selection. "
+            f"{provider_diagnostics}"
         )
-        if runtime_supports_real_inference and resolved_provider_path != "local":
-            assert assistant_text.strip().lower() != "stub", (
-                "assistant response must not be stub when runtime reports real inference support "
-                f"and provider path is {resolved_provider_path!r}. {provider_diagnostics}"
-            )
+        assert resolved_provider_path == "distributed", (
+            "landing-page real desktop-bridge guardrail must fail on local/fallback provider resolution. "
+            f"{provider_diagnostics}"
+        )
+        assert execution_backend_path == "registered_desktop_compute_node", (
+            "landing-page real desktop-bridge guardrail requires desktop bridge processing path. "
+            f"{provider_diagnostics}"
+        )
+        assert assistant_text.strip().lower() != "stub"
 
         page.wait_for_timeout(300)
         non_streaming_state = page.evaluate(
@@ -589,6 +593,16 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert isinstance(client_public_key, str) and client_public_key
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)
         assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
+
+        stderr_output = "".join(stderr_lines)
+        assert "desktop.compute_node_bridge.process_request.ok" in stderr_output, (
+            "desktop bridge must process at least one real relay request; heartbeat-only registration "
+            "must fail this guardrail"
+        )
+        assert "desktop.compute_node_bridge.process_request.start stream=True" not in stderr_output
+        assert "api_v1_payload=False" not in stderr_output, (
+            "desktop bridge request processing must stay on API v1 payload path and exclude legacy payload handling"
+        )
     finally:
         if bridge_process.stdin:
             try:

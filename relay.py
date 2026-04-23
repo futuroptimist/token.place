@@ -379,6 +379,8 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+api_v1_pending_requests = {}
+api_v1_pending_responses = {}
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -435,6 +437,7 @@ def _unregister_server(server_public_key: str) -> bool:
 
     removed = known_servers.pop(server_public_key, None) is not None
     client_inference_requests.pop(server_public_key, None)
+    api_v1_pending_requests.pop(server_public_key, None)
 
     with stream_lock:
         stale_session_ids = [
@@ -453,6 +456,10 @@ def _unregister_server(server_public_key: str) -> bool:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
     return removed
+
+
+def _is_api_v1_compute_request(payload: Dict[str, Any]) -> bool:
+    return isinstance(payload, dict) and payload.get("kind") == "api_v1_chat_completion"
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -803,11 +810,17 @@ def sink():
     }
 
     # Check if there are any client requests for this server
-    queued_requests = client_inference_requests.get(public_key, [])
+    legacy_queue = client_inference_requests.get(public_key, [])
+    api_v1_queue = api_v1_pending_requests.get(public_key, [])
+    queued_requests = legacy_queue if legacy_queue else api_v1_queue
     if queued_requests:
         batch = []
         while queued_requests and len(batch) < max_batch_size:
             request_payload = queued_requests.pop(0)
+            if _is_api_v1_compute_request(request_payload):
+                batch.append(request_payload)
+                continue
+
             if request_payload.get('stream'):
                 session = _register_stream_session(
                     public_key,
@@ -818,21 +831,107 @@ def sink():
             batch.append(request_payload)
 
         first_request = batch[0]
-        response_data.update({
-            'client_public_key': first_request['client_public_key'],
-            'chat_history': first_request['chat_history'],
-            'cipherkey': first_request['cipherkey'],
-            'iv': first_request.get('iv', ''),
-        })
+        if _is_api_v1_compute_request(first_request):
+            response_data['api_v1_request'] = {
+                'request_id': first_request['request_id'],
+                'model': first_request['model'],
+                'messages': first_request['messages'],
+                'options': first_request.get('options', {}),
+                'stream': False,
+            }
+        else:
+            response_data.update({
+                'client_public_key': first_request['client_public_key'],
+                'chat_history': first_request['chat_history'],
+                'cipherkey': first_request['cipherkey'],
+                'iv': first_request.get('iv', ''),
+            })
 
-        if first_request.get('stream') and first_request.get('stream_session_id'):
-            response_data['stream'] = True
-            response_data['stream_session_id'] = first_request['stream_session_id']
+            if first_request.get('stream') and first_request.get('stream_session_id'):
+                response_data['stream'] = True
+                response_data['stream_session_id'] = first_request['stream_session_id']
 
         if max_batch_size > 1:
             response_data['batch'] = batch
 
     return jsonify(response_data)
+
+
+@app.route('/relay/api/v1/chat/completions', methods=['POST'])
+def relay_api_v1_chat_completions():
+    """Queue API v1 chat completions for registered compute nodes and await a response."""
+
+    _evict_stale_servers()
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    messages = data.get('messages')
+    model = data.get('model')
+    if not isinstance(model, str) or not model.strip():
+        return jsonify({'error': 'Missing required parameter: model'}), 400
+    if not isinstance(messages, list) or not messages:
+        return jsonify({'error': 'Missing required parameter: messages'}), 400
+    if bool(data.get('stream')):
+        return jsonify({'error': 'Streaming is not supported for relay API v1 chat'}), 400
+
+    if not known_servers:
+        return jsonify({'error': 'No registered compute nodes available'}), 503
+
+    server_public_key = secrets.choice(list(known_servers.keys()))
+    request_id = secrets.token_urlsafe(12)
+    request_payload = {
+        'kind': 'api_v1_chat_completion',
+        'request_id': request_id,
+        'model': model,
+        'messages': messages,
+        'options': data.get('options', {}),
+    }
+    if server_public_key not in api_v1_pending_requests:
+        api_v1_pending_requests[server_public_key] = []
+    api_v1_pending_requests[server_public_key].append(request_payload)
+
+    timeout_seconds = 30.0
+    started = time.time()
+    while (time.time() - started) < timeout_seconds:
+        response_payload = api_v1_pending_responses.pop(request_id, None)
+        if response_payload is not None:
+            if response_payload.get('error'):
+                return jsonify({'error': response_payload['error']}), 502
+            message = response_payload.get('message')
+            if not isinstance(message, dict):
+                return jsonify({'error': 'Invalid relay compute response'}), 502
+            return jsonify({
+                'id': f'chatcmpl-relay-{request_id}',
+                'object': 'chat.completion',
+                'choices': [{'index': 0, 'message': message, 'finish_reason': 'stop'}],
+            }), 200
+        time.sleep(0.05)
+
+    return jsonify({'error': 'Timed out waiting for registered compute node'}), 504
+
+
+@app.route('/relay/api/v1/source', methods=['POST'])
+def relay_api_v1_source():
+    """Accept API v1 compute results emitted by registered compute nodes."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    request_id = data.get('request_id')
+    if not isinstance(request_id, str) or not request_id.strip():
+        return jsonify({'error': 'Missing request_id'}), 400
+
+    api_v1_pending_responses[request_id] = {
+        'message': data.get('message'),
+        'error': data.get('error'),
+    }
+    return jsonify({'message': 'API v1 response received'}), 200
 
 
 @app.route('/unregister', methods=['POST'])

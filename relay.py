@@ -695,19 +695,45 @@ def relay_diagnostics():
 def relay_api_v1_chat_completions():
     """Queue API v1 chat requests for registered compute nodes and wait for completion."""
 
+    def _api_v1_error(message: str, *, code: str, status_code: int) -> tuple[Response, int]:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": message,
+                        "type": "server_error" if status_code >= 500 else "invalid_request_error",
+                        "code": code,
+                    }
+                }
+            ),
+            status_code,
+        )
+
     _evict_stale_servers()
     payload = request.get_json() or {}
     if not isinstance(payload, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+        return _api_v1_error(
+            "Invalid request data.",
+            code="invalid_request_data",
+            status_code=400,
+        )
 
     model = payload.get('model')
     messages = payload.get('messages')
     if not isinstance(model, str) or not model.strip() or not isinstance(messages, list):
-        return jsonify({'error': {'message': 'Invalid API v1 payload', 'code': 400}}), 400
+        return _api_v1_error(
+            "Invalid API v1 payload.",
+            code="invalid_request_payload",
+            status_code=400,
+        )
 
     available_servers = list(known_servers.keys())
     if not available_servers:
-        return jsonify({'error': {'message': 'No registered compute nodes available', 'code': 503}}), 503
+        return _api_v1_error(
+            "No LLM servers are available right now.",
+            code="no_registered_compute_nodes",
+            status_code=503,
+        )
 
     selected_server = secrets.choice(available_servers)
     request_id = secrets.token_urlsafe(16)
@@ -730,14 +756,26 @@ def relay_api_v1_chat_completions():
     timeout_seconds = float(os.environ.get('TOKENPLACE_RELAY_API_V1_TIMEOUT_SECONDS', '45'))
     response_payload = _await_api_v1_response(request_id, timeout_seconds)
     if response_payload is None:
-        return jsonify({'error': {'message': 'Timed out waiting for registered compute node', 'code': 504}}), 504
+        return _api_v1_error(
+            "Timed out waiting for an LLM server response.",
+            code="relay_compute_node_timeout",
+            status_code=504,
+        )
 
     if response_payload.get('error'):
-        return jsonify({'error': {'message': response_payload['error'], 'code': 502}}), 502
+        return _api_v1_error(
+            "LLM server failed to process the request.",
+            code="relay_compute_node_error",
+            status_code=502,
+        )
 
     message = response_payload.get('message')
     if not isinstance(message, dict):
-        return jsonify({'error': {'message': 'Compute node returned invalid response', 'code': 502}}), 502
+        return _api_v1_error(
+            "LLM server returned an invalid response payload.",
+            code="relay_compute_node_invalid_payload",
+            status_code=502,
+        )
 
     return jsonify(
         {

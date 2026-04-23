@@ -210,6 +210,38 @@ def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monk
     assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
 
 
+def test_chat_completion_returns_structured_compute_provider_error(client, monkeypatch):
+    class _FailingProvider:
+        def complete_chat(self, model_id, messages, options):
+            raise compute_provider.ComputeProviderError(
+                "No LLM servers are available right now.",
+                error_type="server_error",
+                code="no_registered_compute_nodes",
+                status_code=503,
+            )
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _FailingProvider())
+    monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "error": {
+            "message": "No LLM servers are available right now.",
+            "type": "server_error",
+            "code": "no_registered_compute_nodes",
+        }
+    }
+
+
 def test_chat_completion_encrypted_response_sets_provider_headers(client, monkeypatch):
     class _DistributedProvider:
         def complete_chat(self, model_id, messages, options):

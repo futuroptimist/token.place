@@ -300,7 +300,7 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
     assert response.get_json()['choices'][0]['message']['content'] == 'local fallback response'
 
 
-def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monkeypatch):
+def test_api_v1_chat_completion_distributed_no_fallback_returns_upstream_status(client, monkeypatch):
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
@@ -314,7 +314,16 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monk
 
     monkeypatch.setattr(
         'api.v1.compute_provider.requests.post',
-        lambda _url, json=None, timeout=None: MagicMock(status_code=503, json=lambda: {'error': 'down'}),
+        lambda _url, json=None, timeout=None: MagicMock(
+            status_code=503,
+            json=lambda: {
+                'error': {
+                    'message': 'No LLM servers are available right now.',
+                    'type': 'server_error',
+                    'code': 'no_registered_compute_nodes',
+                }
+            },
+        ),
     )
 
     local_generate = MagicMock(side_effect=AssertionError('local generation should not run'))
@@ -328,7 +337,8 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monk
         },
     )
 
-    assert response.status_code == 502
+    assert response.status_code == 503
+    assert response.get_json()['error']['code'] == 'no_registered_compute_nodes'
     local_generate.assert_not_called()
 
 

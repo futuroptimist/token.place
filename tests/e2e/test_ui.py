@@ -249,6 +249,60 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert v2_requests == []
 
 
+def test_landing_chat_shows_no_servers_available_message(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Structured API v1 no-server errors should render a clear landing-chat message."""
+
+    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+
+    page.route(
+        "**/api/v1/public-key",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": server_public_key_b64}),
+        ),
+    )
+    page.route(
+        "**/api/v1/chat/completions",
+        lambda route: route.fulfill(
+            status=503,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "error": {
+                        "type": "service_unavailable_error",
+                        "code": "no_registered_compute_nodes",
+                        "message": "No registered compute nodes available",
+                    }
+                }
+            ),
+        ),
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    page.locator("textarea").first.fill("hello")
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "No LLM servers are available right now." in assistant_message.inner_text()
+
+
 @pytest.mark.e2e
 def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     page: Page,

@@ -53,6 +53,38 @@ def test_create_completion_model_error(client, monkeypatch):
     assert resp.status_code == 400
 
 
+def test_chat_completion_rejects_streaming_requests(client):
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    error = response.get_json()["error"]
+    assert error["param"] == "stream"
+    assert "Streaming is not supported for API v1 chat completions" in error["message"]
+    assert "/api/v2/chat/completions" in error["message"]
+
+
+def test_legacy_completion_rejects_streaming_requests(client):
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "prompt": "hi",
+        "stream": True,
+    }
+
+    response = client.post("/api/v1/completions", json=payload)
+
+    assert response.status_code == 400
+    error = response.get_json()["error"]
+    assert error["param"] == "stream"
+    assert "Streaming is not supported for API v1 completions" in error["message"]
+    assert "/api/v2/chat/completions" in error["message"]
+
+
 def test_health_check_exception(client, monkeypatch):
     orig_jsonify = routes.jsonify
     def fake_jsonify(*args, **kwargs):

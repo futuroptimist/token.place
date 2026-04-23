@@ -45,6 +45,10 @@ class FakeRelayClientRouting(FakeRelayClient):
         self.endpoint_calls.append((endpoint, payload))
         return True
 
+    def process_api_v1_chat_request(self, payload):
+        self.endpoint_calls.append(('/relay/api/v1/source', payload))
+        return True
+
 
 class FakeRuntime:
     def __init__(self, _config):
@@ -102,6 +106,31 @@ class StreamingRuntime(FakeRuntime):
         self._processed.append(payload)
         return self.relay_client.process_client_request(payload)
 
+
+
+
+class ApiV1Runtime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        ApiV1Runtime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClientRouting()
+        self._responses = [
+            {
+                'next_ping_in_x_seconds': 0,
+                'api_v1_request': {
+                    'request_id': 'req-1',
+                    'model': 'llama-3-8b-instruct',
+                    'messages': [{'role': 'user', 'content': 'hello'}],
+                },
+            },
+        ]
+        self._processed = []
+
+    def process_relay_request(self, payload):
+        self._processed.append(payload)
+        return self.relay_client.process_api_v1_chat_request(payload)
 
 class ProcessingFailureRuntime(FakeRuntime):
     def __init__(self, _config):
@@ -228,6 +257,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module.is_legacy_relay_payload = (
         lambda payload: {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(payload)
     )
+    module.is_api_v1_relay_payload = lambda payload: isinstance(payload, dict) and 'api_v1_request' in payload
     module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     module.SUPPORTED_COMPUTE_MODES = supported_modes
@@ -605,6 +635,43 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
     assert any(event.get('registered') is True for event in status_events)
 
 
+
+
+def test_run_api_v1_payload_uses_relay_api_v1_source_endpoint(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiV1Runtime)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    runtime = ApiV1Runtime.last_instance
+    assert runtime is not None
+    assert len(runtime._processed) == 1
+    assert runtime._processed[0]['api_v1_request']['request_id'] == 'req-1'
+
+    assert len(runtime.relay_client.endpoint_calls) == 1
+    endpoint, payload = runtime.relay_client.endpoint_calls[0]
+    assert endpoint == '/relay/api/v1/source'
+    assert payload['api_v1_request']['request_id'] == 'req-1'
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert any(event.get('registered') is True for event in status_events)
+
 def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=NullErrorHeartbeatRuntime)
@@ -797,6 +864,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
     )
     module.ComputeNodeRuntime = CapturingRuntime
     module.is_legacy_relay_payload = lambda _payload: False
+    module.is_api_v1_relay_payload = lambda _payload: False
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     module.normalize_compute_mode = lambda mode: mode
     module.apply_compute_mode = lambda _model_manager, mode: mode
@@ -942,6 +1010,10 @@ def resolve_relay_port(relay_port, _relay_url):
 
 
 def is_legacy_relay_payload(_payload):
+    return False
+
+
+def is_api_v1_relay_payload(_payload):
     return False
 
 

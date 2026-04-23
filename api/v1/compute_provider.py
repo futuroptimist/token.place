@@ -6,6 +6,7 @@ remote distributed compute-node endpoint while preserving a local fallback.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from functools import lru_cache
@@ -17,6 +18,10 @@ import requests
 from api.v1.models import generate_response
 
 logger = logging.getLogger("api.v1.compute_provider")
+_last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "api_v1_last_backend_path",
+    default="unknown",
+)
 
 
 class ComputeProviderError(Exception):
@@ -53,6 +58,7 @@ class LocalApiV1ComputeProvider:
         assistant_message = updated_messages[-1]
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
+        _last_backend_path.set("local_in_process")
         return assistant_message
 
 
@@ -82,7 +88,7 @@ class DistributedApiV1ComputeProvider:
 
         try:
             response = requests.post(
-                f"{self.base_url.rstrip('/')}/api/v1/chat/completions",
+                f"{self.base_url.rstrip('/')}/relay/api/v1/chat/completions",
                 json=payload,
                 timeout=self.timeout_seconds,
             )
@@ -111,6 +117,7 @@ class DistributedApiV1ComputeProvider:
         if not isinstance(message, dict):
             raise ComputeProviderError("distributed provider response missing message")
 
+        _last_backend_path.set("registered_desktop_compute_node")
         return message
 
 
@@ -129,18 +136,21 @@ class FallbackApiV1ComputeProvider:
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
         try:
-            return self.primary.complete_chat(
+            message = self.primary.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
+            return message
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
-            return self.fallback.complete_chat(
+            message = self.fallback.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
+            _last_backend_path.set("fallback_local_in_process")
+            return message
 
 
 @lru_cache(maxsize=8)
@@ -217,3 +227,9 @@ def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:
     if isinstance(provider, LocalApiV1ComputeProvider):
         return "local"
     return "unknown"
+
+
+def get_api_v1_last_backend_path() -> str:
+    """Return per-request backend execution diagnostics label."""
+
+    return _last_backend_path.get()

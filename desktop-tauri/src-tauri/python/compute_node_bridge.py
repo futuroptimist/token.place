@@ -203,6 +203,7 @@ def run(args: argparse.Namespace) -> int:
             compute_mode_diagnostics,
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
+            is_api_v1_relay_payload,
             is_legacy_relay_payload,
             resolve_relay_port,
             resolve_relay_url,
@@ -281,14 +282,16 @@ def run(args: argparse.Namespace) -> int:
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             legacy_payload = is_legacy_relay_payload(relay_response)
+            api_v1_payload = is_api_v1_relay_payload(relay_response)
             heartbeat_ack = "next_ping_in_x_seconds" in relay_response
             relay_error = _relay_error_message(relay_response)
-            registered = relay_error is None and (legacy_payload or heartbeat_ack)
+            registered = relay_error is None and (legacy_payload or api_v1_payload or heartbeat_ack)
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} heartbeat_ack={heartbeat_ack} "
+                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
+                f"heartbeat_ack={heartbeat_ack} "
                 f"summary={_relay_response_summary(relay_response)}",
                 file=sys.stderr,
             )
@@ -301,10 +304,10 @@ def run(args: argparse.Namespace) -> int:
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
-            elif legacy_payload:
+            elif legacy_payload or api_v1_payload:
                 print(
                     "desktop.compute_node_bridge.process_request.start "
-                    f"stream={relay_response.get('stream') is True}",
+                    f"stream={relay_response.get('stream') is True} api_v1_payload={api_v1_payload}",
                     file=sys.stderr,
                 )
                 processed = runtime.process_relay_request(relay_response)

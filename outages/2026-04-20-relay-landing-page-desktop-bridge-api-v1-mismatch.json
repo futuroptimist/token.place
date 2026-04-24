@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-20",
+  "slug": "relay-landing-page-desktop-bridge-api-v1-mismatch",
+  "summary": "Relay landing-page chat used /api/v1/chat/completions while CI guardrails still allowed a local-provider bypass path, so desktop registration looked healthy without proving real desktop-bridge servicing of landing-page requests.",
+  "impact": "Users could receive fake/stub landing-page replies instead of real desktop inference, and node-unavailable conditions surfaced with weak user-facing messaging despite apparent desktop health signals.",
+  "fix": "Landed API v1 non-streaming landing-page guardrails plus real desktop-bridge e2e verification and CI workflow enforcement (tests/e2e/test_ui.py, tests/unit/test_api_v1_routes_additional.py, tests/unit/test_touch_ui.py, .github/workflows/ci.yml, run_all_tests.sh), alongside improved structured API v1 error mapping in the landing UI.",
+  "lessons": "Registration/heartbeat checks are insufficient as release gates without an unmocked browser-to-relay-to-desktop-bridge round-trip test, and CI guardrails must be narrowly scoped to the real execution path they claim to protect."
+}

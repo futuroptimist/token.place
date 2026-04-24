@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-20",
+  "slug": "relay-landing-page-desktop-bridge-api-v1-mismatch",
+  "summary": "Relay landing-page chat used API v1 while validation around desktop bridge behavior remained aligned to legacy relay behavior, allowing a healthy/registered desktop state without proving API v1 desktop-bridge request servicing.",
+  "impact": "Users could receive fake/stub responses or weak no-node failure messaging even when desktop appeared healthy, creating misleading confidence in landing-page chat readiness.",
+  "fix": "Added an unmocked relay landing-page desktop-bridge API v1 e2e guardrail test, enforced distributed API v1 routing with fallback disabled in real bridge fixture mode, and wired CI to run the guardrail with a tiny real GGUF model prior to the full suite.",
+  "lessons": "Registration and heartbeat health are insufficient proxy signals for landing-page readiness; CI guardrails must assert real API v1 desktop-bridge request processing and reject local-provider bypass paths."
+}

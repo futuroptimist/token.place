@@ -499,7 +499,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assistant_text = assistant_message.inner_text()
         assert assistant_text.strip(), "assistant response should not be empty"
-        assert "Sorry, I encountered an issue generating a response." in assistant_text
+        assert "Sorry, I encountered an issue generating a response." not in assistant_text
         assert "Unknown streaming error" not in assistant_text
 
         assert len(v1_requests) >= 1
@@ -583,13 +583,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
 
         process_request_lines = [
-            line
-            for line in stderr_lines
-            if "desktop.compute_node_bridge.process_request" in line
+            line for line in stderr_lines if "desktop.compute_node_bridge.process_request" in line
         ]
-        assert not process_request_lines, (
-            "desktop bridge should not process relay requests while distributed API v1 is fail-closed"
-        )
+        assert process_request_lines, "desktop bridge should process relay E2EE request payloads"
     finally:
         if bridge_process.stdin:
             try:

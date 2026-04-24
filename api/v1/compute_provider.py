@@ -7,13 +7,19 @@ remote distributed compute-node endpoint while preserving a local fallback.
 from __future__ import annotations
 
 import contextvars
+import base64
+import json
 import logging
 import os
+import time
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
+import requests
+
 from api.v1.models import generate_response
+from encrypt import decrypt, encrypt, generate_keys
 
 logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -122,10 +128,77 @@ class LocalApiV1ComputeProvider:
 
 @dataclass(frozen=True)
 class DistributedApiV1ComputeProvider:
-    """Provider that fail-closes distributed API v1 relay dispatch."""
+    """Provider that relays API v1 requests through relay-blind E2EE envelopes."""
 
     base_url: str
     timeout_seconds: float = 30.0
+    poll_interval_seconds: float = 0.25
+    response_timeout_seconds: float = 30.0
+
+    _PROTOCOL = "api_v1_relay_e2ee"
+    _VERSION = 1
+
+    def _request_url(self, path: str) -> str:
+        return f"{self.base_url.rstrip('/')}{path}"
+
+    def _post_json(self, path: str, payload: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+        try:
+            response = requests.post(
+                self._request_url(path),
+                json=payload,
+                timeout=timeout or self.timeout_seconds,
+            )
+        except requests.Timeout as exc:
+            raise _error_from_code("compute_node_timeout", message=str(exc)) from exc
+        except requests.RequestException as exc:
+            raise _error_from_code("compute_node_unreachable", message=str(exc)) from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise _error_from_code("compute_node_invalid_payload", message="relay returned non-JSON payload") from exc
+
+        if response.status_code >= 400:
+            relay_error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(relay_error, dict):
+                relay_code = relay_error.get("code")
+                relay_message = relay_error.get("message") or "relay error"
+                if isinstance(relay_code, str):
+                    raise _error_from_code(relay_code, message=str(relay_message))
+                raise ComputeProviderError(str(relay_message))
+            raise ComputeProviderError(f"relay returned HTTP {response.status_code}")
+
+        if not isinstance(body, dict):
+            raise _error_from_code("compute_node_invalid_payload", message="relay returned invalid JSON payload")
+        return body
+
+    def _get_json(self, path: str, *, timeout: float | None = None) -> dict[str, Any]:
+        try:
+            response = requests.get(
+                self._request_url(path),
+                timeout=timeout or self.timeout_seconds,
+            )
+        except requests.Timeout as exc:
+            raise _error_from_code("compute_node_timeout", message=str(exc)) from exc
+        except requests.RequestException as exc:
+            raise _error_from_code("compute_node_unreachable", message=str(exc)) from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="relay returned non-JSON payload",
+            ) from exc
+
+        if response.status_code >= 400:
+            raise ComputeProviderError(f"relay returned HTTP {response.status_code}")
+        if not isinstance(body, dict):
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="relay returned invalid JSON payload",
+            )
+        return body
 
     def complete_chat(
         self,
@@ -134,12 +207,89 @@ class DistributedApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        raise ComputeProviderError(
-            "distributed API v1 relay execution is disabled pending reviewed E2EE envelope design",
-            code="distributed_api_v1_relay_disabled",
-            error_type="service_unavailable_error",
-            public_message="Distributed API v1 is temporarily unavailable.",
-            status_code=503,
+        next_server = self._get_json("/next_server", timeout=self.timeout_seconds)
+        server_public_key_b64 = next_server.get("server_public_key")
+        if not isinstance(server_public_key_b64, str) or not server_public_key_b64.strip():
+            raise _error_from_code(
+                "no_registered_compute_nodes",
+                message="No registered compute nodes available",
+            )
+
+        try:
+            client_private_key, client_public_key = generate_keys()
+            envelope_payload = {
+                "protocol": self._PROTOCOL,
+                "version": self._VERSION,
+                "request": {
+                    "model": model_id,
+                    "messages": messages,
+                    "options": options or {},
+                },
+            }
+            ciphertext_dict, cipherkey, iv = encrypt(
+                json.dumps(envelope_payload).encode("utf-8"),
+                base64.b64decode(server_public_key_b64),
+                use_pkcs1v15=True,
+            )
+            faucet_payload = {
+                "client_public_key": base64.b64encode(client_public_key).decode("utf-8"),
+                "server_public_key": server_public_key_b64,
+                "chat_history": base64.b64encode(ciphertext_dict["ciphertext"]).decode("utf-8"),
+                "cipherkey": base64.b64encode(cipherkey).decode("utf-8"),
+                "iv": base64.b64encode(iv).decode("utf-8"),
+            }
+        except Exception as exc:
+            raise _error_from_code("compute_node_invalid_payload", message=f"unable to build encrypted relay payload: {exc}") from exc
+
+        self._post_json("/faucet", faucet_payload, timeout=self.timeout_seconds)
+
+        deadline = time.monotonic() + max(self.response_timeout_seconds, 0.1)
+        while time.monotonic() < deadline:
+            retrieve_response = self._post_json(
+                "/retrieve",
+                {"client_public_key": faucet_payload["client_public_key"]},
+                timeout=self.timeout_seconds,
+            )
+            if retrieve_response.get("error") == "No response available for the given public key":
+                time.sleep(self.poll_interval_seconds)
+                continue
+
+            try:
+                decrypted = decrypt(
+                    {
+                        "ciphertext": base64.b64decode(retrieve_response["chat_history"]),
+                        "iv": base64.b64decode(retrieve_response["iv"]),
+                    },
+                    base64.b64decode(retrieve_response["cipherkey"]),
+                    client_private_key,
+                )
+                decoded = json.loads(decrypted.decode("utf-8"))
+            except Exception as exc:
+                raise _error_from_code("compute_node_invalid_payload", message=str(exc)) from exc
+
+            if not isinstance(decoded, dict):
+                raise _error_from_code(
+                    "compute_node_invalid_payload",
+                    message="compute node returned non-object response envelope",
+                )
+            if decoded.get("ok") is not True:
+                relay_error = decoded.get("error") or {}
+                if isinstance(relay_error, dict) and isinstance(relay_error.get("code"), str):
+                    raise _error_from_code(relay_error["code"], message=str(relay_error.get("message", "distributed inference failed")))
+                raise ComputeProviderError("distributed inference failed")
+
+            assistant_message = decoded.get("assistant_message")
+            if not isinstance(assistant_message, dict):
+                raise _error_from_code(
+                    "compute_node_invalid_payload",
+                    message="compute node response missing assistant_message",
+                )
+            _last_backend_path.set("distributed_relay_e2ee")
+            return assistant_message
+
+        raise _error_from_code(
+            "compute_node_timeout",
+            message="timed out waiting for distributed relay API v1 response",
         )
 
 

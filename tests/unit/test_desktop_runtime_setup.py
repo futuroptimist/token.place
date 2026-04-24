@@ -252,7 +252,6 @@ def test_runtime_bootstrap_falls_back_to_cpu_when_repair_fails(monkeypatch):
             cmake_args=None,
             force_cmake=False,
             index_url='https://pypi.org/simple',
-            extra_index_url=None,
             only_binary=True,
             no_binary=False,
         )
@@ -386,7 +385,7 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     linux_plans = desktop_runtime_setup._fallback_unpinned_plans('linux')
 
     assert [plan.backend for plan in win_plans] == ['cuda', 'cpu']
-    assert [plan.backend for plan in darwin_plans] == ['metal', 'metal']
+    assert [plan.backend for plan in darwin_plans] == ['metal', 'cpu']
     assert [plan.backend for plan in linux_plans] == ['cpu']
 
 
@@ -808,12 +807,11 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
             platform='win32',
             backend='cuda',
             package_spec='llama-cpp-python==0.3.16',
-            cmake_args=None,
-            force_cmake=False,
-            index_url='https://abetlen.github.io/llama-cpp-python/whl/cu124',
-            extra_index_url='https://pypi.org/simple',
-            only_binary=True,
-            no_binary=False,
+            cmake_args='-DGGML_CUDA=on',
+            force_cmake=True,
+            index_url='https://pypi.org/simple',
+            only_binary=False,
+            no_binary=True,
         )
     ]
     monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)

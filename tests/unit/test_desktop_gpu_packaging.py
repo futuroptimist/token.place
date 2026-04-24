@@ -170,7 +170,7 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
     assert plan.no_binary is True
 
 
-def test_llama_cpp_install_plan_darwin_selects_metal_wheel_index():
+def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
     plan = llama_cpp_install_plan(platform="darwin", requirements_path=ROOT / "requirements.txt")
 
     assert plan.backend == "metal"

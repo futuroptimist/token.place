@@ -7,8 +7,10 @@ on:
 
 jobs:
   test:
-    name: Run tests and collect coverage
+    name: Test suite + relay landing-page real desktop-bridge API v1 guardrail
     runs-on: ubuntu-latest
+    env:
+      CI_REAL_DESKTOP_BRIDGE_MODEL_PATH: .ci-models/tinygemma3-Q8_0.gguf
     permissions:
       actions: read
       contents: read
@@ -50,32 +52,35 @@ jobs:
       - name: Install Node.js dependencies
         if: steps.prep.outputs.rc != '2'
         run: npm ci
-      - name: Restore cached real desktop-bridge model artifact
+      - name: Restore relay landing-page desktop-bridge API v1 guardrail model cache
         if: steps.prep.outputs.rc != '2'
         uses: actions/cache@v4
         with:
-          path: .ci-models/tinygemma3-Q8_0.gguf
-          key: ci-real-desktop-bridge-model-tinygemma3-q8-20260422
-      - name: Provision real desktop-bridge model artifact
+          path: ${{ env.CI_REAL_DESKTOP_BRIDGE_MODEL_PATH }}
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-model-tinygemma3-q8_0-v1
+      - name: Provision relay landing-page desktop-bridge API v1 guardrail model artifact
         if: steps.prep.outputs.rc != '2'
         run: |
           set -euo pipefail
-          mkdir -p .ci-models
-          MODEL_PATH=".ci-models/tinygemma3-Q8_0.gguf"
+          mkdir -p "$(dirname "${CI_REAL_DESKTOP_BRIDGE_MODEL_PATH}")"
+          MODEL_PATH="${CI_REAL_DESKTOP_BRIDGE_MODEL_PATH}"
           if [ ! -s "$MODEL_PATH" ]; then
+            # Keep this as a tiny real GGUF (about 45 MB) so CI still exercises
+            # actual llama.cpp inference and desktop bridge wiring (not a fake).
             curl -fL \
               "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/c287502cd9e278dac8eed805c112cce5d0081e0b/tinygemma3-Q8_0.gguf" \
               -o "$MODEL_PATH.tmp"
             mv "$MODEL_PATH.tmp" "$MODEL_PATH"
           fi
           test -s "$MODEL_PATH"
-      - name: Run tests
+          test "$(wc -c < "$MODEL_PATH")" -ge 40000000
+      - name: Run tests (includes relay landing-page real desktop-bridge API v1 guardrail)
         if: steps.prep.outputs.rc != '2'
         run: ./run_all_tests.sh
         env:
           TEST_COVERAGE: '1'
-          # Keep the real landing-page desktop-bridge guardrail always-on in CI.
-          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/tinygemma3-Q8_0.gguf
+          # Keep this guardrail always-on when the real tiny GGUF is provisioned.
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/${{ env.CI_REAL_DESKTOP_BRIDGE_MODEL_PATH }}
       - name: Upload coverage reports to Codecov
         if: steps.prep.outputs.rc != '2'
         uses: codecov/codecov-action@v5

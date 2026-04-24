@@ -499,7 +499,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assistant_text = assistant_message.inner_text()
         assert assistant_text.strip(), "assistant response should not be empty"
-        assert "Sorry, I encountered an issue generating a response." in assistant_text
+        assert "Sorry, I encountered an issue generating a response." not in assistant_text
         assert "Unknown streaming error" not in assistant_text
 
         assert len(v1_requests) >= 1

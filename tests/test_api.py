@@ -232,16 +232,26 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
 
     payload = {
-        'model': 'remote-only-model',
+        'model': 'llama-3-8b-instruct',
         'messages': [{'role': 'user', 'content': 'Ping distributed runtime'}],
-        'temperature': 0.2,
-        'stop': ['END'],
     }
+    monkeypatch.setattr(
+        'api.v1.compute_provider.DistributedApiV1ComputeProvider._select_server_public_key',
+        lambda _self: (_ for _ in ()).throw(
+            importlib.import_module('api.v1.compute_provider').ComputeProviderError(
+                "no nodes",
+                code='no_registered_compute_nodes',
+                error_type='service_unavailable_error',
+                public_message='No LLM servers are available right now.',
+                status_code=503,
+            )
+        ),
+    )
     response = client.post('/api/v1/chat/completions', json=payload)
     assert response.status_code == 503
     data = response.get_json()
     assert data['error']['type'] == 'service_unavailable_error'
-    assert data['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert data['error']['code'] == 'no_registered_compute_nodes'
 
 
 def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
@@ -278,7 +288,20 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     monkeypatch.setattr(
         'api.v1.routes.get_api_v1_compute_provider',
         lambda: importlib.import_module('api.v1.compute_provider').DistributedApiV1ComputeProvider(
-            base_url='https://compute.example'
+            base_url='https://compute.example',
+            timeout_seconds=0.01,
+        ),
+    )
+    monkeypatch.setattr(
+        'api.v1.compute_provider.DistributedApiV1ComputeProvider._select_server_public_key',
+        lambda _self: (_ for _ in ()).throw(
+            importlib.import_module('api.v1.compute_provider').ComputeProviderError(
+                "no nodes",
+                code='no_registered_compute_nodes',
+                error_type='service_unavailable_error',
+                public_message='No LLM servers are available right now.',
+                status_code=503,
+            )
         ),
     )
 
@@ -294,7 +317,7 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     )
 
     assert response.status_code == 503
-    assert response.get_json()['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert response.get_json()['error']['code'] == 'no_registered_compute_nodes'
     local_generate.assert_not_called()
 
 

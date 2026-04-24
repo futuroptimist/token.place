@@ -226,30 +226,10 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     assert 'Mock response' in data['choices'][0]['message']['content']
 
 
-def test_api_v1_chat_completion_supports_distributed_provider_contract(client, monkeypatch):
-    captured = {}
-
-    def fake_post(url, json=None, timeout=None):
-        captured['url'] = url
-        captured['json'] = json
-        captured['timeout'] = timeout
-        return MagicMock(
-            status_code=200,
-            json=lambda: {
-                'choices': [
-                    {
-                        'message': {
-                            'role': 'assistant',
-                            'content': 'distributed-path response',
-                        }
-                    }
-                ]
-            },
-        )
-
-    monkeypatch.setattr('api.v1.compute_provider.requests.post', fake_post)
+def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_nodes(client, monkeypatch):
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+    monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
 
     payload = {
         'model': 'remote-only-model',
@@ -258,23 +238,13 @@ def test_api_v1_chat_completion_supports_distributed_provider_contract(client, m
         'stop': ['END'],
     }
     response = client.post('/api/v1/chat/completions', json=payload)
-    assert response.status_code == 200
+    assert response.status_code == 503
     data = response.get_json()
-    assert data['choices'][0]['message']['content'] == 'distributed-path response'
-
-    assert captured['url'] == 'https://compute.example/relay/api/v1/chat/completions'
-    assert captured['json']['model'] == 'remote-only-model'
-    assert captured['json']['messages'][0]['content'] == 'Ping distributed runtime'
-    assert captured['json']['stream'] is False
-    assert captured['json']['stop'] == ['END']
+    assert data['error']['type'] == 'service_unavailable_error'
+    assert data['error']['code'] == 'distributed_api_v1_relay_disabled'
 
 
 def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
-    monkeypatch.setattr(
-        'api.v1.compute_provider.requests.post',
-        lambda _url, json=None, timeout=None: MagicMock(status_code=503, json=lambda: {'error': 'down'}),
-    )
-
     fallback_message = {
         'role': 'assistant',
         'content': 'local fallback response',
@@ -300,7 +270,7 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
     assert response.get_json()['choices'][0]['message']['content'] == 'local fallback response'
 
 
-def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monkeypatch):
+def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monkeypatch):
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
@@ -310,11 +280,6 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monk
         lambda: importlib.import_module('api.v1.compute_provider').DistributedApiV1ComputeProvider(
             base_url='https://compute.example'
         ),
-    )
-
-    monkeypatch.setattr(
-        'api.v1.compute_provider.requests.post',
-        lambda _url, json=None, timeout=None: MagicMock(status_code=503, json=lambda: {'error': 'down'}),
     )
 
     local_generate = MagicMock(side_effect=AssertionError('local generation should not run'))
@@ -328,7 +293,8 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monk
         },
     )
 
-    assert response.status_code == 502
+    assert response.status_code == 503
+    assert response.get_json()['error']['code'] == 'distributed_api_v1_relay_disabled'
     local_generate.assert_not_called()
 
 

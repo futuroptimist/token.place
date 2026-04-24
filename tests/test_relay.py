@@ -140,6 +140,60 @@ def test_sink_invalid_payload(client):
     assert data['error'] == 'Invalid public key'
 
 
+def test_sink_drops_api_v1_only_queue(client):
+    """Sink should drain stale API v1 plaintext entries without dispatching work."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {"api_v1_request": {"messages": [{"role": "user", "content": "stale"}]}},
+        {"api_v1_request": {"messages": [{"role": "user", "content": "stale-2"}]}},
+    ]
+
+    response = client.post("/sink", json={"server_public_key": DUMMY_SERVER_PUB_KEY})
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert "next_ping_in_x_seconds" in payload
+    assert "chat_history" not in payload
+    assert client_inference_requests[DUMMY_SERVER_PUB_KEY] == []
+
+
+def test_sink_skips_api_v1_and_returns_legacy_batch(client):
+    """Sink should skip stale API v1 entries and still dispatch legacy E2EE work."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    legacy_payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "legacy-ciphertext",
+        "cipherkey": "legacy-cipherkey",
+        "iv": "legacy-iv",
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {"api_v1_request": {"messages": [{"role": "user", "content": "stale"}]}},
+        legacy_payload,
+    ]
+
+    response = client.post(
+        "/sink",
+        json={"server_public_key": DUMMY_SERVER_PUB_KEY, "max_batch_size": 2},
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert payload["client_public_key"] == legacy_payload["client_public_key"]
+    assert payload["chat_history"] == legacy_payload["chat_history"]
+    assert payload["cipherkey"] == legacy_payload["cipherkey"]
+    assert payload["iv"] == legacy_payload["iv"]
+    assert payload["batch"] == [legacy_payload]
+    assert client_inference_requests[DUMMY_SERVER_PUB_KEY] == []
+
+
 def test_sink_returns_batch_when_requested(client):
     """Servers can opt into batched work retrieval via max_batch_size."""
     sink_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
@@ -212,45 +266,38 @@ def test_two_servers_receive_only_addressed_work(client):
     assert server_one_work.get_json()["chat_history"] == "work-for-server-one"
 
 
-def test_relay_api_v1_returns_structured_error_for_invalid_json(client):
+def test_relay_api_v1_fails_closed(client):
     response = client.post(
         "/relay/api/v1/chat/completions",
         data="[",
         content_type="application/json",
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 503
     data = response.get_json()
-    assert data["error"]["type"] == "invalid_request_error"
-    assert data["error"]["code"] == "invalid_request_payload"
-    assert data["error"]["message"] == "Invalid request data"
+    assert data["error"]["type"] == "service_unavailable_error"
+    assert data["error"]["code"] == "distributed_api_v1_relay_disabled"
 
 
-def test_relay_api_v1_masks_upstream_bridge_error_message(client, monkeypatch):
+def test_relay_api_v1_source_fails_closed(client):
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         "public_key": DUMMY_SERVER_PUB_KEY,
         "last_ping": datetime.now(),
         "last_ping_duration": 10,
     }
-    monkeypatch.setattr(
-        relay_module,
-        "_await_api_v1_response",
-        lambda request_id, timeout_seconds: {"error": "stacktrace/token"},
-    )
 
     response = client.post(
-        "/relay/api/v1/chat/completions",
+        "/relay/api/v1/source",
         json={
-            "model": "llama-3-8b-instruct",
-            "messages": [{"role": "user", "content": "hello"}],
+            "request_id": "req-1",
+            "message": {"role": "assistant", "content": "hello"},
         },
     )
 
-    assert response.status_code == 502
+    assert response.status_code == 503
     data = response.get_json()
-    assert data["error"]["type"] == "upstream_error"
-    assert data["error"]["code"] == "compute_node_bridge_error"
-    assert data["error"]["message"] == "Compute node returned an error"
+    assert data["error"]["type"] == "service_unavailable_error"
+    assert data["error"]["code"] == "distributed_api_v1_relay_disabled"
 
 # --- Test /faucet ---
 
@@ -373,13 +420,11 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
 
 def test_healthz_returns_draining_when_shutdown_flag_set(client):
     """healthz should switch to draining status and 503 during shutdown."""
-    from relay import DRAINING
-
-    DRAINING.set()
+    relay_module.DRAINING.set()
     try:
         response = client.get("/healthz")
     finally:
-        DRAINING.clear()
+        relay_module.DRAINING.clear()
 
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "0"

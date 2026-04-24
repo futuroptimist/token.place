@@ -21,6 +21,12 @@ def test_landing_chat_js_avoids_relay_v2_streaming_path():
     assert "/api/v1/chat/completions" in chat_js, (
         "landing chat must call relay API v1 chat completions endpoint"
     )
+    assert "/api/v1/completions" not in chat_js, (
+        "landing chat must not call legacy API v1 text completions endpoint"
+    )
+    assert "/relay/api/v1/chat/completions" not in chat_js, (
+        "landing chat must not use relay-prefixed API v1 bypass path"
+    )
     assert "/api/v2/chat/completions" not in chat_js, (
         "landing chat must not call relay v2 chat completions endpoint"
     )

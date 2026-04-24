@@ -320,6 +320,32 @@ def test_legacy_completion_sets_provider_headers(client, monkeypatch):
     assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
 
 
+def test_legacy_completion_rejects_streaming_for_api_v1(client, monkeypatch):
+    provider_called = {"value": False}
+
+    class _GuardrailProvider:
+        def complete_chat(self, model_id, messages, options):
+            provider_called["value"] = True
+            return {"role": "assistant", "content": "hello"}
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "prompt": "hi",
+        "stream": True,
+    }
+
+    monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _GuardrailProvider())
+
+    response = client.post("/api/v1/completions", json=payload)
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"]["param"] == "stream"
+    assert "Streaming is not supported for API v1 completions" in body["error"]["message"]
+    assert provider_called["value"] is False
+
+
 def test_legacy_completion_encrypted_response_sets_provider_headers(client, monkeypatch):
     class _LocalProvider:
         def complete_chat(self, model_id, messages, options):

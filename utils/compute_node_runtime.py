@@ -100,10 +100,12 @@ class ApiV1RelayRequestAdapter:
         self._relay_client = relay_client
 
     def can_process(self, request_data: Dict[str, Any]) -> bool:
-        return is_api_v1_relay_payload(request_data)
+        del request_data
+        return False
 
     def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_api_v1_chat_request(request_data)
+        del request_data
+        return False
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -266,7 +268,6 @@ class ComputeNodeRuntime:
         )
         if request_adapters is None:
             self.request_adapters = [
-                ApiV1RelayRequestAdapter(self.relay_client),
                 LegacyRelayRequestAdapter(self.relay_client),
             ]
         else:

@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: Run tests and collect coverage
+    name: Run tests + relay landing-page real desktop-bridge API v1 guardrail
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -54,14 +54,20 @@ jobs:
         if: steps.prep.outputs.rc != '2'
         uses: actions/cache@v4
         with:
-          path: .ci-models/tinygemma3-Q8_0.gguf
-          key: ci-real-desktop-bridge-model-tinygemma3-q8-20260422
-      - name: Provision real desktop-bridge model artifact
+          path: .ci-models/relay-landing-desktop-bridge-api-v1/tinygemma3-Q8_0.gguf
+          key: ci-relay-landing-desktop-bridge-api-v1-real-model-tinygemma3-q8-c287502
+      - name: Provision relay landing-page real desktop-bridge API v1 model artifact
         if: steps.prep.outputs.rc != '2'
         run: |
           set -euo pipefail
-          mkdir -p .ci-models
-          MODEL_PATH=".ci-models/tinygemma3-Q8_0.gguf"
+          MODEL_DIR=".ci-models/relay-landing-desktop-bridge-api-v1"
+          MODEL_PATH="$MODEL_DIR/tinygemma3-Q8_0.gguf"
+          mkdir -p "$MODEL_DIR"
+
+          # Keep this a tiny *real* GGUF (not a fake artifact): this guardrail
+          # must exercise real llama.cpp inference for browser -> relay/API v1
+          # -> desktop bridge wiring. tinygemma3-Q8_0 is currently ~47 MB and
+          # the smallest practical option we can pin from the existing source.
           if [ ! -s "$MODEL_PATH" ]; then
             curl -fL \
               "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/c287502cd9e278dac8eed805c112cce5d0081e0b/tinygemma3-Q8_0.gguf" \
@@ -74,8 +80,9 @@ jobs:
         run: ./run_all_tests.sh
         env:
           TEST_COVERAGE: '1'
-          # Keep the real landing-page desktop-bridge guardrail always-on in CI.
-          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/tinygemma3-Q8_0.gguf
+          # Keep the relay landing-page desktop-bridge API v1 real-inference
+          # guardrail always-on in CI when the tiny GGUF artifact is present.
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/relay-landing-desktop-bridge-api-v1/tinygemma3-Q8_0.gguf
       - name: Upload coverage reports to Codecov
         if: steps.prep.outputs.rc != '2'
         uses: codecov/codecov-action@v5

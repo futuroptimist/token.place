@@ -106,7 +106,11 @@ jobs:
               if expected_backend not in {"cuda", "metal"}:
                   return True
               probe = _probe_llama_runtime(runtime_root=repo_root)
-              return probe.gpu_offload_supported and probe.backend == expected_backend
+              # Probe `backend` is derived from compile-time GGML backend markers.
+              # `gpu_offload_supported` can be False on CI runners that lack a usable
+              # GPU device even when the installed wheel/source build correctly
+              # exposes the requested backend (notably Metal on hosted macOS).
+              return probe.backend == expected_backend
 
           def _can_attempt_cuda_build() -> bool:
               if sys.platform.lower().startswith("win"):

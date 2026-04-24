@@ -1,3 +1,5 @@
+import copy
+
 from api.v1 import compute_provider
 from api.v1.compute_provider import (
     ComputeProviderError,
@@ -9,23 +11,77 @@ from api.v1.compute_provider import (
 from relay import app
 
 
-def test_distributed_compute_provider_fails_closed_without_relay_calls():
+class _FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return copy.deepcopy(self._payload)
+
+
+class _FakeCryptoManager:
+    public_key_b64 = "client-public-key"
+
+    def __init__(self):
+        self._encrypted = {}
+
+    def encrypt_message(self, message, _client_public_key):
+        token = f"cipher-{len(self._encrypted) + 1}"
+        self._encrypted[token] = copy.deepcopy(message)
+        return {"chat_history": token, "cipherkey": "encrypted-key", "iv": "encrypted-iv"}
+
+    def decrypt_message(self, encrypted_payload):
+        return copy.deepcopy(self._encrypted.get(encrypted_payload.get("chat_history")))
+
+
+def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+    posted_payloads = []
+    retrieve_calls = []
+
+    def fake_get(url, timeout):
+        assert url == "https://node-a.example/next_server"
+        assert timeout == 5
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        posted_payloads.append((url, copy.deepcopy(json), timeout))
+        if url.endswith("/faucet"):
+            assert "messages" not in json
+            assert "chat_history" in json and json["chat_history"]
+            return _FakeResponse(200, {"message": "Request received"})
+        if url.endswith("/retrieve"):
+            retrieve_calls.append(copy.deepcopy(json))
+            response_envelope = {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": fake_crypto._encrypted["cipher-1"]["request_id"],
+                "api_v1_response": {
+                    "message": {"role": "assistant", "content": "Distributed secure response"},
+                },
+            }
+            encrypted_response = fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64)
+            return _FakeResponse(200, encrypted_response)
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(compute_provider, "get_crypto_manager", lambda: fake_crypto)
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
-
-    try:
-        provider.complete_chat(
-            model_id="llama-3-8b-instruct",
-            messages=[{"role": "user", "content": "hi"}],
-            options={"temperature": 0.2},
-        )
-        raise AssertionError("expected ComputeProviderError")
-    except ComputeProviderError as exc:
-        assert exc.code == "distributed_api_v1_relay_disabled"
-        assert exc.error_type == "service_unavailable_error"
-        assert exc.status_code == 503
+    response = provider.complete_chat(
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"temperature": 0.2},
+    )
+    assert response["content"] == "Distributed secure response"
+    assert retrieve_calls == [{"client_public_key": fake_crypto.public_key_b64}]
+    assert posted_payloads[0][0] == "https://node-a.example/faucet"
+    assert posted_payloads[1][0] == "https://node-a.example/retrieve"
 
 
-def test_fallback_compute_provider_uses_local_adapter_when_distributed_disabled(monkeypatch):
+def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(monkeypatch):
     fallback_message = {"role": "assistant", "content": "local fallback"}
 
     monkeypatch.setattr(
@@ -37,6 +93,11 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_disabled(
     provider = FallbackApiV1ComputeProvider(
         primary=DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=0.01),
         fallback=LocalApiV1ComputeProvider(),
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: _FakeResponse(200, {"error": {"code": 503}}),
     )
 
     result = provider.complete_chat(
@@ -123,6 +184,11 @@ def test_api_v1_chat_completion_returns_structured_error_when_distributed_only(m
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
     monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
     monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: _FakeResponse(200, {"error": {"code": 503}}),
+    )
     compute_provider._build_api_v1_compute_provider.cache_clear()
 
     app.config["TESTING"] = True
@@ -139,6 +205,6 @@ def test_api_v1_chat_completion_returns_structured_error_when_distributed_only(m
         assert response.status_code == 503
         error = response.get_json()["error"]
         assert error["type"] == "service_unavailable_error"
-        assert error["code"] == "distributed_api_v1_relay_disabled"
+        assert error["code"] == "no_registered_compute_nodes"
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()

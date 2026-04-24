@@ -167,6 +167,53 @@ def _extract_chat_history_and_validate_key_binding(
     return None
 
 
+def _extract_api_v1_request_payload(
+    decrypted_payload: Any,
+    expected_client_public_key_b64: str,
+) -> Optional[Dict[str, Any]]:
+    """Validate API v1 relay E2EE envelope and return request payload."""
+
+    if not isinstance(decrypted_payload, dict):
+        return None
+
+    if decrypted_payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+        return None
+
+    bound_client_key = decrypted_payload.get("client_public_key")
+    if bound_client_key != expected_client_public_key_b64:
+        log_error("Rejected API v1 relay payload: encrypted client key binding mismatch")
+        return None
+
+    request_id = decrypted_payload.get("request_id")
+    api_v1_request = decrypted_payload.get("api_v1_request")
+    if not isinstance(request_id, str) or not request_id.strip():
+        log_error("Rejected API v1 relay payload: missing request_id")
+        return None
+    if not isinstance(api_v1_request, dict):
+        log_error("Rejected API v1 relay payload: missing api_v1_request object")
+        return None
+
+    model = api_v1_request.get("model")
+    messages = api_v1_request.get("messages")
+    options = api_v1_request.get("options", {})
+    if not isinstance(model, str) or not model.strip():
+        log_error("Rejected API v1 relay payload: model must be a non-empty string")
+        return None
+    if not isinstance(messages, list):
+        log_error("Rejected API v1 relay payload: messages must be a list")
+        return None
+    if not isinstance(options, dict):
+        log_error("Rejected API v1 relay payload: options must be an object")
+        return None
+
+    return {
+        "request_id": request_id,
+        "model": model,
+        "messages": messages,
+        "options": options,
+    }
+
+
 class RelayClient:
     """
     Client for communicating with relay servers.
@@ -618,6 +665,7 @@ class RelayClient:
             client_pub_key_b64 = request_data['client_public_key']
             stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
+            client_pub_key = base64.b64decode(client_pub_key_b64)
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
@@ -626,13 +674,60 @@ class RelayClient:
                 return False
 
             log_info("Decrypted client request")
+            api_v1_request_payload = _extract_api_v1_request_payload(
+                decrypted_chat_history,
+                client_pub_key_b64,
+            )
+            if api_v1_request_payload is not None:
+                response_history = self.model_manager.llama_cpp_get_response(
+                    api_v1_request_payload["messages"],
+                    **api_v1_request_payload["options"],
+                )
+                if not isinstance(response_history, list) or not response_history:
+                    log_error("LLM returned invalid API v1 response history")
+                    return False
+                assistant_message = response_history[-1]
+                if not isinstance(assistant_message, dict):
+                    log_error("LLM returned invalid API v1 assistant message")
+                    return False
+
+                encrypted_response = self.crypto_manager.encrypt_message(
+                    {
+                        "protocol": "tokenplace_api_v1_relay_e2ee",
+                        "version": 1,
+                        "request_id": api_v1_request_payload["request_id"],
+                        "api_v1_response": {
+                            "message": assistant_message,
+                        },
+                    },
+                    client_pub_key,
+                )
+                source_payload = {
+                    "client_public_key": client_pub_key_b64,
+                    **encrypted_response,
+                }
+                request_kwargs = {
+                    "json": source_payload,
+                    "timeout": self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs["headers"] = headers
+
+                timeout = request_kwargs.pop("timeout", self._request_timeout)
+                source_response = requests.post(
+                    f"{self.relay_url}/source",
+                    timeout=timeout,
+                    **request_kwargs
+                )
+                return source_response.status_code == 200
+
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,
                 client_pub_key_b64,
             )
             if chat_history is None:
                 return False
-            client_pub_key = base64.b64decode(client_pub_key_b64)
 
             if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
                 log_info("Processing streaming relay request for session {}", stream_session_id)

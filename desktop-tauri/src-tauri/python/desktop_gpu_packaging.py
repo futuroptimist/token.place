@@ -118,7 +118,9 @@ def llama_cpp_install_plan_fallbacks(
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
-                only_binary=True,
+                # Allow both wheels and source so Windows CI can recover when
+                # PyPI does not provide a compatible binary for the runner ABI.
+                only_binary=False,
                 no_binary=False,
             )
         )

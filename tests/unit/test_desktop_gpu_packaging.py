@@ -32,7 +32,7 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.package_spec == "llama-cpp-python"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
-    assert cpu_fallback.only_binary is True
+    assert cpu_fallback.only_binary is False
     assert cpu_fallback.no_binary is False
 
 
@@ -130,7 +130,7 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
     assert plan.backend == "cpu"
 
 
-def test_windows_cpu_fallback_install_args_are_binary_only():
+def test_windows_cpu_fallback_install_args_allow_wheel_or_source():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
     cpu_fallback = plans[1]
 
@@ -139,8 +139,6 @@ def test_windows_cpu_fallback_install_args_are_binary_only():
         "--no-cache-dir",
         "--index-url",
         "https://pypi.org/simple",
-        "--only-binary",
-        "llama-cpp-python",
         "--prefer-binary",
     ]
 

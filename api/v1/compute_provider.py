@@ -13,8 +13,6 @@ from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
-import requests
-
 from api.v1.models import generate_response
 
 logger = logging.getLogger("api.v1.compute_provider")
@@ -44,6 +42,14 @@ class ComputeProviderError(Exception):
 
 
 _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
+    "relay_api_v1_plaintext_disabled": {
+        "error_type": "service_unavailable_error",
+        "public_message": (
+            "Distributed API v1 relay is temporarily disabled while encrypted transport "
+            "is restored."
+        ),
+        "status_code": 503,
+    },
     "no_registered_compute_nodes": {
         "error_type": "service_unavailable_error",
         "public_message": "No LLM servers are available right now.",
@@ -124,7 +130,7 @@ class LocalApiV1ComputeProvider:
 
 @dataclass(frozen=True)
 class DistributedApiV1ComputeProvider:
-    """Provider that forwards API v1 chat payloads to a remote compute endpoint."""
+    """Provider that fails closed while distributed API v1 relay is plaintext."""
 
     base_url: str
     timeout_seconds: float = 30.0
@@ -136,87 +142,14 @@ class DistributedApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "model": model_id,
-            "messages": messages,
-            "stream": False,
-        }
-        for key, value in (options or {}).items():
-            if key == "stream":
-                continue
-            payload[key] = value
-
-        try:
-            response = requests.post(
-                f"{self.base_url.rstrip('/')}/relay/api/v1/chat/completions",
-                json=payload,
-                timeout=self.timeout_seconds,
-            )
-        except requests.Timeout as exc:
-            raise _error_from_code(
-                "compute_node_bridge_timeout",
-                message=f"distributed provider timed out contacting relay bridge: {exc}",
-            ) from exc
-        except requests.RequestException as exc:
-            raise _error_from_code(
-                "compute_node_unreachable",
-                message=f"distributed provider request failed: {exc}",
-            ) from exc
-        except Exception as exc:
-            raise _error_from_code(
-                "compute_node_bridge_error",
-                message=f"distributed provider request failed: {exc}",
-            ) from exc
-
-        if response.status_code != 200:
-            error_code = "compute_node_bridge_error"
-            error_message = f"distributed provider returned status {response.status_code}"
-            try:
-                parsed = response.json()
-                if isinstance(parsed, dict):
-                    error_payload = parsed.get("error", {})
-                    if isinstance(error_payload, dict):
-                        candidate_code = error_payload.get("code")
-                        candidate_message = error_payload.get("message")
-                        if isinstance(candidate_code, str) and candidate_code.strip():
-                            error_code = candidate_code.strip()
-                        if isinstance(candidate_message, str) and candidate_message.strip():
-                            error_message = candidate_message.strip()
-            except ValueError:
-                pass
-            raise _error_from_code(error_code, message=error_message)
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message="distributed provider returned non-JSON response",
-            ) from exc
-
-        choices = body.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message="distributed provider returned no choices",
-            )
-
-        first_choice = choices[0]
-        if not isinstance(first_choice, dict):
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message="distributed provider choice payload is invalid",
-            )
-
-        message = first_choice.get("message")
-        if not isinstance(message, dict):
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message="distributed provider response missing message",
-            )
-
-        _last_backend_path.set("registered_desktop_compute_node")
-        return message
+        del model_id, messages, options
+        raise _error_from_code(
+            "relay_api_v1_plaintext_disabled",
+            message=(
+                "distributed API v1 relay has been disabled because it forwards plaintext "
+                "messages through relay dispatch"
+            ),
+        )
 
 
 @dataclass(frozen=True)

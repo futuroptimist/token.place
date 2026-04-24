@@ -51,7 +51,6 @@ class ComputeNodeRuntimeConfig:
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
-API_V1_RELAY_REQUIRED_FIELDS = frozenset({"api_v1_request"})
 
 
 def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
@@ -63,11 +62,8 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
 
 def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Return whether ``payload`` carries relay API v1 request work."""
-
-    if not isinstance(payload, dict):
-        return False
-    return API_V1_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
+    """API v1 relay payloads are intentionally disabled until E2EE support exists."""
+    return False
 
 
 class RelayRequestAdapter(Protocol):
@@ -94,16 +90,17 @@ class LegacyRelayRequestAdapter:
 
 
 class ApiV1RelayRequestAdapter:
-    """Adapter for relay-dispatched API v1 chat-completions payloads."""
+    """Disabled adapter retained for compatibility in tests/integration wiring."""
 
     def __init__(self, relay_client: "RelayClient"):
         self._relay_client = relay_client
 
     def can_process(self, request_data: Dict[str, Any]) -> bool:
-        return is_api_v1_relay_payload(request_data)
+        return False
 
     def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_api_v1_chat_request(request_data)
+        _ = request_data
+        return False
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -266,7 +263,6 @@ class ComputeNodeRuntime:
         )
         if request_adapters is None:
             self.request_adapters = [
-                ApiV1RelayRequestAdapter(self.relay_client),
                 LegacyRelayRequestAdapter(self.relay_client),
             ]
         else:

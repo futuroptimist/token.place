@@ -586,9 +586,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "assistant message should render atomically without multi-step text growth; "
             f"snapshots={non_streaming_state['snapshots']}"
         )
-        assert non_streaming_state["assistantContent"].strip() == non_streaming_state["domAssistantText"].strip(), (
-            "final assistant Vue state content must exactly match rendered DOM text to prove final "
-            "non-streaming rendering path"
+        assistant_content = non_streaming_state["assistantContent"].strip()
+        dom_assistant_text = non_streaming_state["domAssistantText"].strip()
+
+        # DOM rendering may include line-wrap/newline formatting while preserving the same text payload.
+        assistant_content_compact = " ".join(assistant_content.split())
+        dom_assistant_text_compact = " ".join(dom_assistant_text.split())
+        assert assistant_content_compact == dom_assistant_text_compact, (
+            "final assistant Vue state content must match rendered DOM text (allowing equivalent "
+            "whitespace formatting) to prove final non-streaming rendering path"
         )
 
         encrypted_request = v1_requests[0].post_data_json

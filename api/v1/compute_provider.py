@@ -7,19 +7,13 @@ remote distributed compute-node endpoint while preserving a local fallback.
 from __future__ import annotations
 
 import contextvars
-import json
 import logging
 import os
-import base64
-import time
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
-import requests
-
 from api.v1.models import generate_response
-from encrypt import decrypt, encrypt, generate_keys
 
 logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -128,7 +122,7 @@ class LocalApiV1ComputeProvider:
 
 @dataclass(frozen=True)
 class DistributedApiV1ComputeProvider:
-    """Provider that forwards API v1 chat payloads via the E2EE relay flow."""
+    """Provider that fail-closes distributed API v1 relay dispatch."""
 
     base_url: str
     timeout_seconds: float = 30.0
@@ -140,155 +134,12 @@ class DistributedApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        next_server_url = f"{self.base_url.rstrip('/')}/next_server"
-        try:
-            next_server_response = requests.get(next_server_url, timeout=self.timeout_seconds)
-            next_server_data = next_server_response.json()
-        except Exception as exc:
-            raise _error_from_code(
-                "compute_node_unreachable",
-                message=f"failed to fetch next relay server: {exc}",
-            ) from exc
-
-        server_public_key_b64 = ""
-        if isinstance(next_server_data, dict):
-            server_public_key_b64 = str(next_server_data.get("server_public_key", "")).strip()
-        if not server_public_key_b64:
-            raise _error_from_code(
-                "no_registered_compute_nodes",
-                message="relay reported no registered compute nodes",
-            )
-
-        try:
-            server_public_key = base64.b64decode(server_public_key_b64)
-            client_private_key, client_public_key = generate_keys()
-            client_public_key_b64 = base64.b64encode(client_public_key).decode("utf-8")
-        except Exception as exc:
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message=f"failed to initialise encrypted relay payload: {exc}",
-            ) from exc
-
-        relay_payload = {
-            "chat_history": messages,
-            "client_public_key": client_public_key_b64,
-        }
-        try:
-            ciphertext_dict, encrypted_key, iv = encrypt(
-                json.dumps(relay_payload).encode("utf-8"),
-                server_public_key,
-                use_pkcs1v15=True,
-            )
-        except Exception as exc:
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message=f"failed to encrypt relay request payload: {exc}",
-            ) from exc
-
-        faucet_payload = {
-            "client_public_key": client_public_key_b64,
-            "server_public_key": server_public_key_b64,
-            "chat_history": base64.b64encode(ciphertext_dict["ciphertext"]).decode("utf-8"),
-            "cipherkey": base64.b64encode(encrypted_key).decode("utf-8"),
-            "iv": base64.b64encode(iv).decode("utf-8"),
-            # Marker consumed by compute-node bridge diagnostics so encrypted
-            # API v1 relay requests are distinguishable from legacy payloads.
-            "api_v1_payload": True,
-        }
-
-        try:
-            faucet_response = requests.post(
-                f"{self.base_url.rstrip('/')}/faucet",
-                json=faucet_payload,
-                timeout=self.timeout_seconds,
-            )
-            if faucet_response.status_code != 200:
-                raise _error_from_code(
-                    "compute_node_unreachable",
-                    message=f"relay faucet returned status {faucet_response.status_code}",
-                )
-        except ComputeProviderError:
-            raise
-        except Exception as exc:
-            raise _error_from_code(
-                "compute_node_unreachable",
-                message=f"failed to post encrypted payload to relay faucet: {exc}",
-            ) from exc
-
-        deadline = time.time() + self.timeout_seconds
-        while time.time() < deadline:
-            try:
-                retrieve_response = requests.post(
-                    f"{self.base_url.rstrip('/')}/retrieve",
-                    json={"client_public_key": client_public_key_b64},
-                    timeout=min(5.0, self.timeout_seconds),
-                )
-                retrieve_data = retrieve_response.json()
-            except Exception as exc:
-                raise _error_from_code(
-                    "compute_node_unreachable",
-                    message=f"failed to retrieve encrypted relay response: {exc}",
-                ) from exc
-
-            if not isinstance(retrieve_data, dict):
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="relay retrieve endpoint returned an invalid payload type",
-                )
-
-            no_response_yet = "No response available" in str(retrieve_data.get("error", ""))
-            if no_response_yet:
-                time.sleep(0.2)
-                continue
-
-            if not all(field in retrieve_data for field in ("chat_history", "cipherkey", "iv")):
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="relay retrieve endpoint returned payload without encryption fields",
-                )
-
-            try:
-                decrypted_bytes = decrypt(
-                    {
-                        "ciphertext": base64.b64decode(retrieve_data["chat_history"]),
-                        "iv": base64.b64decode(retrieve_data["iv"]),
-                    },
-                    base64.b64decode(retrieve_data["cipherkey"]),
-                    client_private_key,
-                )
-            except Exception as exc:
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message=f"failed to decrypt relay response: {exc}",
-                ) from exc
-
-            try:
-                decrypted_payload = json.loads(decrypted_bytes.decode("utf-8"))
-            except Exception as exc:
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message=f"failed to parse decrypted relay response: {exc}",
-                ) from exc
-
-            if not isinstance(decrypted_payload, list) or not decrypted_payload:
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="decrypted relay response must be a non-empty message list",
-                )
-
-            assistant_message = decrypted_payload[-1]
-            if not isinstance(assistant_message, dict):
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="decrypted relay response is missing a valid assistant message object",
-                )
-
-            _last_backend_path.set("registered_desktop_compute_node")
-            return assistant_message
-
-        raise _error_from_code(
-            "compute_node_timeout",
-            message="timed out waiting for encrypted relay response",
+        raise ComputeProviderError(
+            "distributed API v1 relay execution is disabled pending reviewed E2EE envelope design",
+            code="distributed_api_v1_relay_disabled",
+            error_type="service_unavailable_error",
+            public_message="Distributed API v1 is temporarily unavailable.",
+            status_code=503,
         )
 
 

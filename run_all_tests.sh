@@ -104,6 +104,16 @@ ensure_playwright_browsers() {
 
 ensure_playwright_browsers
 
+# Default to the CI guardrail model path when present so the explicit
+# landing-page desktop-bridge API v1 check can run in verification contexts
+# without requiring an extra export command.
+if [ -z "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f ".ci-models/stories15M-q4_0.gguf" ]; then
+    TOKENPLACE_REAL_E2E_MODEL_PATH=".ci-models/stories15M-q4_0.gguf"
+fi
+if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ]; then
+    export TOKENPLACE_REAL_E2E_MODEL_PATH
+fi
+
 # Array to track test failures
 FAILED_TESTS=()
 

@@ -74,6 +74,12 @@ jobs:
             mv "$MODEL_PATH.tmp" "$MODEL_PATH"
           fi
           test -s "$MODEL_PATH"
+      - name: Verify tiny real GGUF loads via relay landing-page desktop-bridge API v1 guardrail
+        if: steps.prep.outputs.rc != '2'
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+          RUN_RELAY_REGISTRATION_TESTS: '1'
+        run: python -m pytest -q tests/e2e/test_ui.py -k 'landing_chat_real_inference_with_desktop_bridge_api_v1'
       - name: Run tests
         if: steps.prep.outputs.rc != '2'
         run: ./run_all_tests.sh

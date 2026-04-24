@@ -55,19 +55,22 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ci-models/stories15M-q4_0.gguf
-          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-20260424
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
       - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
         if: steps.prep.outputs.rc != '2'
         run: |
           set -euo pipefail
           mkdir -p .ci-models
           MODEL_PATH=".ci-models/stories15M-q4_0.gguf"
+          MODEL_REV="99dd1a73db5a37100bd4ae633f4cfce6560e1567"
+          MODEL_SHA256="6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04"
           if [ ! -s "$MODEL_PATH" ]; then
             # Keep this guardrail real (not mocked) while staying lightweight:
             # a tiny GGUF still exercises end-to-end llama.cpp inference behavior.
             curl -fL \
-              "https://huggingface.co/ggml-org/tiny-llamas/resolve/99dd1a73db5a37100bd4ae633f4cfce6560e1567/stories15M-q4_0.gguf" \
+              "https://huggingface.co/ggml-org/tiny-llamas/resolve/${MODEL_REV}/stories15M-q4_0.gguf" \
               -o "$MODEL_PATH.tmp"
+            printf '%s  %s\n' "$MODEL_SHA256" "$MODEL_PATH.tmp" | sha256sum --check
             mv "$MODEL_PATH.tmp" "$MODEL_PATH"
           fi
           test -s "$MODEL_PATH"

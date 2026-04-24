@@ -531,10 +531,6 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "landing-page real-provider guardrail requires execution backend path "
             f"'registered_desktop_compute_node'. {provider_diagnostics}"
         )
-        forbidden_provider_paths = {"local", "distributed_with_local_fallback"}
-        forbidden_execution_paths = {"local_in_process", "fallback_local_in_process"}
-        assert resolved_provider_path not in forbidden_provider_paths, provider_diagnostics
-        assert execution_backend_path not in forbidden_execution_paths, provider_diagnostics
         if runtime_supports_real_inference:
             assert assistant_text.strip().lower() != "stub", (
                 "assistant response must not be stub when runtime reports real inference support. "

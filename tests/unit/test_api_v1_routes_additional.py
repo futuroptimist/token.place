@@ -203,7 +203,11 @@ def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monk
     monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _DistributedProvider())
     monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
 
-    response = client.post("/api/v1/chat/completions", json=payload)
+    backend_path_token = compute_provider._last_backend_path.set("unknown")
+    try:
+        response = client.post("/api/v1/chat/completions", json=payload)
+    finally:
+        compute_provider._last_backend_path.reset(backend_path_token)
 
     assert response.status_code == 200
     assert response.headers["X-Tokenplace-API-V1-Provider"] == "_DistributedProvider"
@@ -232,7 +236,6 @@ def test_chat_completion_rejects_streaming_for_api_v1(client, monkeypatch):
     monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _GuardrailProvider())
 
     response = client.post("/api/v1/chat/completions", json=payload)
 

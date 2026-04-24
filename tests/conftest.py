@@ -273,8 +273,11 @@ def setup_servers(
         print(f"Relay stderr: {stderr}")
         pytest.skip("Relay server failed to start")
 
-    if focused_e2e_only:
-        print("Focused relay e2e mode enabled: skipping server registration bootstrap")
+    if focused_e2e_only or run_real_bridge_e2e:
+        if run_real_bridge_e2e:
+            print("Real desktop-bridge guardrail mode: skipping server.py registration bootstrap to avoid non-bridge node selection")
+        else:
+            print("Focused relay e2e mode enabled: skipping server registration bootstrap")
         yield relay_process, None
         relay_process.terminate()
         relay_process.wait(timeout=5)

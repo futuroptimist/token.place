@@ -270,7 +270,7 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
     assert response.get_json()['choices'][0]['message']['content'] == 'local fallback response'
 
 
-def test_api_v1_chat_completion_distributed_no_fallback_returns_502(client, monkeypatch):
+def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monkeypatch):
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')

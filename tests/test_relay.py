@@ -225,7 +225,7 @@ def test_relay_api_v1_fails_closed(client):
     assert data["error"]["code"] == "distributed_api_v1_relay_disabled"
 
 
-def test_relay_api_v1_source_fails_closed(client, monkeypatch):
+def test_relay_api_v1_source_fails_closed(client):
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         "public_key": DUMMY_SERVER_PUB_KEY,
         "last_ping": datetime.now(),

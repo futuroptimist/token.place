@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
@@ -379,9 +379,6 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
-api_v1_response_queue = {}
-api_v1_response_lock = threading.Condition()
-api_v1_pending_request_ids = set()
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -456,28 +453,6 @@ def _unregister_server(server_public_key: str) -> bool:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
     return removed
-
-
-def _enqueue_api_v1_response(request_id: str, payload: Dict[str, Any]) -> None:
-    with api_v1_response_lock:
-        if request_id not in api_v1_pending_request_ids:
-            return
-        api_v1_response_queue[request_id] = payload
-        api_v1_response_lock.notify_all()
-
-
-def _await_api_v1_response(request_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
-    deadline = time.time() + max(timeout_seconds, 0.1)
-    with api_v1_response_lock:
-        while True:
-            if request_id in api_v1_response_queue:
-                api_v1_pending_request_ids.discard(request_id)
-                return api_v1_response_queue.pop(request_id)
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                api_v1_pending_request_ids.discard(request_id)
-                return None
-            api_v1_response_lock.wait(timeout=remaining)
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:

@@ -140,6 +140,60 @@ def test_sink_invalid_payload(client):
     assert data['error'] == 'Invalid public key'
 
 
+def test_sink_drops_api_v1_only_queue(client):
+    """Sink should drain stale API v1 plaintext entries without dispatching work."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {"api_v1_request": {"messages": [{"role": "user", "content": "stale"}]}},
+        {"api_v1_request": {"messages": [{"role": "user", "content": "stale-2"}]}},
+    ]
+
+    response = client.post("/sink", json={"server_public_key": DUMMY_SERVER_PUB_KEY})
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert "next_ping_in_x_seconds" in payload
+    assert "chat_history" not in payload
+    assert client_inference_requests[DUMMY_SERVER_PUB_KEY] == []
+
+
+def test_sink_skips_api_v1_and_returns_legacy_batch(client):
+    """Sink should skip stale API v1 entries and still dispatch legacy E2EE work."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    legacy_payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "legacy-ciphertext",
+        "cipherkey": "legacy-cipherkey",
+        "iv": "legacy-iv",
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {"api_v1_request": {"messages": [{"role": "user", "content": "stale"}]}},
+        legacy_payload,
+    ]
+
+    response = client.post(
+        "/sink",
+        json={"server_public_key": DUMMY_SERVER_PUB_KEY, "max_batch_size": 2},
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+
+    assert payload["client_public_key"] == legacy_payload["client_public_key"]
+    assert payload["chat_history"] == legacy_payload["chat_history"]
+    assert payload["cipherkey"] == legacy_payload["cipherkey"]
+    assert payload["iv"] == legacy_payload["iv"]
+    assert payload["batch"] == [legacy_payload]
+    assert client_inference_requests[DUMMY_SERVER_PUB_KEY] == []
+
+
 def test_sink_returns_batch_when_requested(client):
     """Servers can opt into batched work retrieval via max_batch_size."""
     sink_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}

@@ -164,11 +164,16 @@ else
     echo "Skipping End-to-End Tests (set RUN_E2E=1 to enable)"
 fi
 
-# 8b. Relay landing-page real desktop bridge guardrail (requires local GGUF model path)
+# 8b. Relay landing-page real desktop-bridge API v1 guardrail (requires local GGUF model path)
 if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ]; then
-    run_test "Relay Landing Page Real Desktop Bridge Guardrail"   "RUN_RELAY_REGISTRATION_TESTS=1 $PYTHON_CMD -m pytest tests/e2e/test_ui.py -v -k 'landing_chat_real_inference_with_desktop_bridge_api_v1' $COVERAGE_ARGS"   "Verifying browser -> relay/API v1 -> desktop bridge runtime with non-streaming guardrails"
+    # Use a tiny real GGUF model here so CI still validates true inference plumbing
+    # end-to-end instead of passing with a mock/stub-only desktop bridge path.
+    run_test \
+        "Relay Landing Page Real Desktop-Bridge API v1 Guardrail" \
+        "RUN_RELAY_REGISTRATION_TESTS=1 $PYTHON_CMD -m pytest tests/e2e/test_ui.py -v -k 'landing_chat_real_inference_with_desktop_bridge_api_v1' $COVERAGE_ARGS" \
+        "Verifying browser -> relay/API v1 -> desktop bridge runtime with non-streaming guardrails"
 else
-    echo "Skipping Relay Landing Page Real Desktop Bridge Guardrail (set TOKENPLACE_REAL_E2E_MODEL_PATH to a local GGUF file to enable)"
+    echo "Skipping Relay Landing Page Real Desktop-Bridge API v1 Guardrail (set TOKENPLACE_REAL_E2E_MODEL_PATH to a local GGUF file to enable)"
 fi
 
 # 9. Run failure recovery tests

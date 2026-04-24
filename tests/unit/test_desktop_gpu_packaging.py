@@ -1,6 +1,7 @@
 """Unit tests for desktop llama-cpp-python packaging contract helpers."""
 
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -10,6 +11,7 @@ if str(DESKTOP_PYTHON) not in sys.path:
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
+    backend_probe_satisfies_install_plan,
     llama_cpp_install_plan,
     llama_cpp_install_plan_fallbacks,
     llama_cpp_requirement_spec,
@@ -18,30 +20,21 @@ from desktop_gpu_packaging import (
 
 def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    assert len(plans) == 3
+    assert len(plans) == 2
 
     gpu_plan = plans[0]
     assert gpu_plan.backend == "cuda"
     assert gpu_plan.package_spec.startswith("llama-cpp-python==")
-    assert gpu_plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
-    assert gpu_plan.extra_index_url == "https://pypi.org/simple"
-    assert gpu_plan.only_binary is True
-    assert gpu_plan.pip_env() == {}
+    assert gpu_plan.index_url == "https://pypi.org/simple"
+    assert gpu_plan.only_binary is False
+    assert gpu_plan.no_binary is True
+    assert gpu_plan.pip_env() == {"CMAKE_ARGS": "-DGGML_CUDA=on", "FORCE_CMAKE": "1"}
 
-    unpinned_cuda_fallback = plans[1]
-    assert unpinned_cuda_fallback.backend == "cuda"
-    assert unpinned_cuda_fallback.package_spec == "llama-cpp-python"
-    assert unpinned_cuda_fallback.index_url == "https://abetlen.github.io/llama-cpp-python/whl/cu124"
-    assert unpinned_cuda_fallback.extra_index_url == "https://pypi.org/simple"
-    assert unpinned_cuda_fallback.only_binary is True
-    assert unpinned_cuda_fallback.no_binary is False
-
-    cpu_fallback = plans[2]
+    cpu_fallback = plans[1]
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.package_spec == "llama-cpp-python"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
-    assert cpu_fallback.extra_index_url is None
-    assert cpu_fallback.only_binary is True
+    assert cpu_fallback.only_binary is False
     assert cpu_fallback.no_binary is False
 
 
@@ -51,8 +44,7 @@ def test_macos_install_plan_requests_metal_then_source_fallback():
 
     wheel_plan = plans[0]
     assert wheel_plan.backend == "metal"
-    assert wheel_plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/metal"
-    assert wheel_plan.extra_index_url == "https://pypi.org/simple"
+    assert wheel_plan.index_url == "https://pypi.org/simple"
     assert wheel_plan.only_binary is True
 
     source_fallback = plans[1]
@@ -115,7 +107,6 @@ def test_pip_install_args_include_index_and_binary_flags():
         cmake_args=None,
         force_cmake=False,
         index_url="https://example.invalid/simple",
-        extra_index_url="https://pypi.org/simple",
         only_binary=True,
         no_binary=True,
     )
@@ -125,8 +116,6 @@ def test_pip_install_args_include_index_and_binary_flags():
         "--no-cache-dir",
         "--index-url",
         "https://example.invalid/simple",
-        "--extra-index-url",
-        "https://pypi.org/simple",
         "--only-binary",
         "llama-cpp-python",
         "--no-binary",
@@ -143,17 +132,15 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
     assert plan.backend == "cpu"
 
 
-def test_windows_cpu_fallback_install_args_are_binary_only():
+def test_windows_cpu_fallback_install_args_allow_wheel_or_source():
     plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
-    cpu_fallback = plans[2]
+    cpu_fallback = plans[1]
 
     assert cpu_fallback.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",
         "--index-url",
         "https://pypi.org/simple",
-        "--only-binary",
-        "llama-cpp-python",
         "--prefer-binary",
     ]
 
@@ -179,16 +166,16 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
 
     assert plan.platform == "win32"
     assert plan.backend == "cuda"
-    assert plan.only_binary is True
+    assert plan.only_binary is False
+    assert plan.no_binary is True
 
 
-def test_llama_cpp_install_plan_darwin_selects_metal_wheel_index():
+def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
     plan = llama_cpp_install_plan(platform="darwin", requirements_path=ROOT / "requirements.txt")
 
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
-    assert plan.index_url == "https://abetlen.github.io/llama-cpp-python/whl/metal"
-    assert plan.extra_index_url == "https://pypi.org/simple"
+    assert plan.index_url == "https://pypi.org/simple"
     assert plan.only_binary is True
     assert plan.no_binary is False
 
@@ -218,3 +205,55 @@ def test_requirement_spec_strips_spaces_around_version_pin(tmp_path):
     requirements.write_text("llama-cpp-python== 0.3.16 \n", encoding="utf-8")
 
     assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"
+
+
+def test_backend_probe_satisfies_plan_for_matching_backend():
+    plan = LlamaCppInstallPlan(
+        platform="win32",
+        backend="cuda",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_CUDA=on",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="cuda", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is True
+
+
+def test_backend_probe_rejects_mismatched_cuda_backend():
+    plan = LlamaCppInstallPlan(
+        platform="win32",
+        backend="cuda",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_CUDA=on",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="cpu", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is False
+
+
+def test_backend_probe_accepts_macos_metal_source_build_with_clean_import_probe():
+    plan = LlamaCppInstallPlan(
+        platform="darwin",
+        backend="metal",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="cpu", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is True
+
+
+def test_backend_probe_rejects_macos_metal_source_build_when_probe_errors():
+    plan = LlamaCppInstallPlan(
+        platform="darwin",
+        backend="metal",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="missing", llama_module_path="missing", error="import failed")
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is False

@@ -93,7 +93,11 @@ jobs:
           desktop_python_root = repo_root / "desktop-tauri" / "src-tauri" / "python"
           sys.path.insert(0, str(desktop_python_root))
 
-          from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks
+          from desktop_gpu_packaging import (
+              backend_probe_satisfies_install_plan,
+              llama_cpp_install_plan_fallbacks,
+          )
+          from desktop_runtime_setup import _probe_llama_runtime
 
           plans = llama_cpp_install_plan_fallbacks(platform=sys.platform, requirements_path=repo_root / "requirements.txt")
 
@@ -101,7 +105,33 @@ jobs:
               lower = output.lower()
               return "bad crc-32" in lower or "badzipfile" in lower
 
+          def _supports_expected_backend(plan) -> bool:
+              if plan.backend not in {"cuda", "metal"}:
+                  return True
+              probe = _probe_llama_runtime(runtime_root=repo_root)
+              if backend_probe_satisfies_install_plan(plan, probe):
+                  return True
+              print("Backend validation probe details:")
+              print(f"  probe.backend={probe.backend}")
+              print(f"  probe.gpu_offload_supported={probe.gpu_offload_supported}")
+              print(f"  probe.detected_device={probe.detected_device}")
+              print(f"  probe.llama_module_path={probe.llama_module_path}")
+              print(f"  probe.error={probe.error}")
+              print(f"  sys.executable={sys.executable}")
+              return False
+
+          def _can_attempt_cuda_build() -> bool:
+              if sys.platform.lower().startswith("win"):
+                  return bool(os.environ.get("CUDA_PATH")) or pathlib.Path(
+                      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA"
+                  ).exists()
+              return True
+
           for plan_index, plan in enumerate(plans, start=1):
+              if plan.backend == "cuda" and not _can_attempt_cuda_build():
+                  print("Skipping CUDA source-build plan: CUDA toolkit not detected on this runner.")
+                  continue
+
               install_args = plan.pip_install_args()
               command = [sys.executable, "-m", "pip", "install", *install_args, plan.package_spec]
               env = os.environ.copy()
@@ -110,9 +140,7 @@ jobs:
               print(f"Installing {plan.package_spec} for backend={plan.backend} on platform={sys.platform}")
               print(f"Install plan {plan_index}/{len(plans)}")
               if plan.index_url:
-                  print(f"Using primary wheel index: {plan.index_url}")
-              if plan.extra_index_url:
-                  print(f"Using extra package index: {plan.extra_index_url}")
+                  print(f"Using pip index-url: {plan.index_url}")
               if plan.pip_env():
                   print(f"Using build env: {plan.pip_env()}")
 
@@ -126,7 +154,13 @@ jobs:
                       text=True,
                   )
                   if result.returncode == 0:
-                      raise SystemExit(0)
+                      if _supports_expected_backend(plan):
+                          raise SystemExit(0)
+                      print(
+                          f"Install succeeded but backend probe did not confirm expected "
+                          f"GPU backend={plan.backend}; trying next fallback plan."
+                      )
+                      break
 
                   combined_output = f"{result.stdout}\n{result.stderr}"
                   print(combined_output)

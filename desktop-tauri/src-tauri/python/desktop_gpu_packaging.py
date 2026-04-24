@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,6 @@ class LlamaCppInstallPlan:
     cmake_args: str | None
     force_cmake: bool
     index_url: str | None = None
-    extra_index_url: str | None = None
     only_binary: bool = False
     no_binary: bool = False
 
@@ -25,13 +25,11 @@ class LlamaCppInstallPlan:
         args = ["--upgrade", "--no-cache-dir"]
         if self.index_url:
             args.extend(["--index-url", self.index_url])
-        if self.extra_index_url:
-            args.extend(["--extra-index-url", self.extra_index_url])
         if self.only_binary:
             args.extend(["--only-binary", "llama-cpp-python"])
         if self.no_binary:
             args.extend(["--no-binary", "llama-cpp-python"])
-        if self.index_url or self.extra_index_url:
+        if self.index_url:
             args.append("--prefer-binary")
         return args
 
@@ -73,11 +71,11 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="cuda",
             package_spec=package_spec,
-            cmake_args=None,
-            force_cmake=False,
-            index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
-            extra_index_url="https://pypi.org/simple",
-            only_binary=True,
+            cmake_args="-DGGML_CUDA=on",
+            force_cmake=True,
+            index_url="https://pypi.org/simple",
+            only_binary=False,
+            no_binary=True,
         )
 
     if detected_platform == "darwin":
@@ -87,8 +85,7 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args=None,
             force_cmake=False,
-            index_url="https://abetlen.github.io/llama-cpp-python/whl/metal",
-            extra_index_url="https://pypi.org/simple",
+            index_url="https://pypi.org/simple",
             only_binary=True,
         )
 
@@ -111,25 +108,7 @@ def llama_cpp_install_plan_fallbacks(
     plans = [primary]
 
     if primary.platform.startswith("win"):
-        # CUDA wheels may be unavailable for a given Python ABI on Windows.
-        # First, fall back to an unpinned CUDA wheel so CI can use the newest
-        # available CUDA binary (e.g. when requirements pin is newer than
-        # published CUDA wheels on the mirror index).
-        plans.append(
-            LlamaCppInstallPlan(
-                platform=primary.platform,
-                backend="cuda",
-                package_spec="llama-cpp-python",
-                cmake_args=None,
-                force_cmake=False,
-                index_url=primary.index_url,
-                extra_index_url=primary.extra_index_url,
-                only_binary=True,
-                no_binary=False,
-            )
-        )
-
-        # If CUDA wheels are unavailable entirely for this ABI, fall back to
+        # If CUDA builds are unavailable for this ABI, fall back to
         # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
         # without requiring local native compilation toolchains.
         plans.append(
@@ -140,8 +119,9 @@ def llama_cpp_install_plan_fallbacks(
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
-                extra_index_url=None,
-                only_binary=True,
+                # Allow both wheels and source so Windows CI can recover when
+                # PyPI does not provide a compatible binary for the runner ABI.
+                only_binary=False,
                 no_binary=False,
             )
         )
@@ -158,10 +138,38 @@ def llama_cpp_install_plan_fallbacks(
                 cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
                 force_cmake=True,
                 index_url="https://pypi.org/simple",
-                extra_index_url=None,
                 only_binary=False,
                 no_binary=True,
             )
         )
 
     return plans
+
+
+def backend_probe_satisfies_install_plan(plan: LlamaCppInstallPlan, probe: Any) -> bool:
+    """Return whether a runtime probe is sufficient for an install plan.
+
+    Hosted macOS CI runners can fail to positively report live Metal offload even
+    when a Metal source build completed successfully from PyPI. For that narrow
+    case we accept a clean import probe as sufficient evidence while keeping
+    CUDA validation strict.
+    """
+
+    if plan.backend not in {"cuda", "metal"}:
+        return True
+
+    probe_backend = str(getattr(probe, "backend", "missing") or "missing")
+    if probe_backend == plan.backend:
+        return True
+
+    if not (
+        plan.backend == "metal"
+        and plan.platform == "darwin"
+        and plan.force_cmake
+        and "GGML_METAL=on" in (plan.cmake_args or "")
+    ):
+        return False
+
+    probe_error = str(getattr(probe, "error", "") or "").strip()
+    module_path = str(getattr(probe, "llama_module_path", "") or "").strip().lower()
+    return not probe_error and module_path not in {"", "missing", "unknown"}

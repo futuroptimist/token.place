@@ -42,6 +42,8 @@ ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = """
+import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -59,11 +61,6 @@ if bootstrap_script:
 
 repo_root = Path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd())).resolve()
 
-from utils.llm.model_manager import detect_llama_runtime_capabilities
-# NOTE: detect_llama_runtime_capabilities must keep `import llama_cpp` lazy
-# (inside the function body). We sanitize sys.path below before that import
-# runs so site-packages can win over a repo-local llama_cpp.py shim.
-
 repo_root_resolved = str(repo_root.resolve())
 sanitized = []
 for entry in sys.path:
@@ -73,7 +70,65 @@ for entry in sys.path:
     sanitized.append(entry)
 sys.path[:] = sanitized
 
-payload = detect_llama_runtime_capabilities()
+try:
+    llama_spec = importlib.util.find_spec("llama_cpp")
+    llama_module_path = getattr(llama_spec, "origin", None)
+    repo_shim = str((repo_root / "llama_cpp.py").resolve())
+    if llama_module_path and str(Path(llama_module_path).resolve()) == repo_shim:
+        raise ImportError(
+            "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
+            "install llama-cpp-python and ensure site-packages wins import priority."
+        )
+
+    llama_cpp = importlib.import_module("llama_cpp")
+    llama_module_path = getattr(llama_cpp, "__file__", llama_module_path or "unknown")
+    if llama_module_path and str(Path(llama_module_path).resolve()) == repo_shim:
+        raise ImportError(
+            "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
+            "install llama-cpp-python and ensure site-packages wins import priority."
+        )
+
+    backend = "cpu"
+    cuda_markers = ("GGML_USE_CUDA", "GGML_CUDA", "LLAMA_CUDA", "GGML_USE_CUBLAS", "LLAMA_CUBLAS")
+    metal_markers = ("GGML_USE_METAL", "GGML_METAL", "LLAMA_METAL")
+    if any(bool(getattr(llama_cpp, marker, False)) for marker in cuda_markers):
+        backend = "cuda"
+    elif any(bool(getattr(llama_cpp, marker, False)) for marker in metal_markers):
+        backend = "metal"
+
+    supports_gpu = getattr(llama_cpp, "llama_supports_gpu_offload", None)
+    gpu_offload_supported = False
+    if callable(supports_gpu):
+        try:
+            gpu_offload_supported = bool(supports_gpu())
+        except Exception:
+            gpu_offload_supported = False
+    else:
+        gpu_offload_supported = backend in {"cuda", "metal"}
+
+    if gpu_offload_supported and backend == "cpu":
+        backend = "metal" if sys.platform == "darwin" else "cuda"
+
+    payload = {
+        "backend": backend,
+        "gpu_offload_supported": gpu_offload_supported,
+        "detected_device": backend if gpu_offload_supported else "cpu",
+        "interpreter": sys.executable,
+        "prefix": sys.prefix,
+        "llama_module_path": llama_module_path or "unknown",
+        "error": None,
+    }
+except Exception as exc:
+    payload = {
+        "backend": "missing",
+        "gpu_offload_supported": False,
+        "detected_device": "none",
+        "interpreter": sys.executable,
+        "prefix": sys.prefix,
+        "llama_module_path": "missing",
+        "error": str(exc),
+    }
+
 print(json.dumps(payload))
 """.strip()
 
@@ -540,12 +595,11 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
                 platform=detected_platform,
                 backend="cuda",
                 package_spec="llama-cpp-python",
-                cmake_args=None,
-                force_cmake=False,
-                index_url="https://abetlen.github.io/llama-cpp-python/whl/cu124",
-                extra_index_url="https://pypi.org/simple",
-                only_binary=True,
-                no_binary=False,
+                cmake_args="-DGGML_CUDA=on",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                only_binary=False,
+                no_binary=True,
             ),
             LlamaCppInstallPlan(
                 platform=detected_platform,
@@ -554,7 +608,6 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
-                extra_index_url=None,
                 only_binary=True,
                 no_binary=False,
             ),
@@ -566,23 +619,21 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
                 platform=detected_platform,
                 backend="metal",
                 package_spec="llama-cpp-python",
-                cmake_args=None,
-                force_cmake=False,
-                index_url="https://abetlen.github.io/llama-cpp-python/whl/metal",
-                extra_index_url="https://pypi.org/simple",
-                only_binary=True,
-                no_binary=False,
-            ),
-            LlamaCppInstallPlan(
-                platform=detected_platform,
-                backend="metal",
-                package_spec="llama-cpp-python",
                 cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
                 force_cmake=True,
                 index_url="https://pypi.org/simple",
-                extra_index_url=None,
                 only_binary=False,
                 no_binary=True,
+            ),
+            LlamaCppInstallPlan(
+                platform=detected_platform,
+                backend="cpu",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://pypi.org/simple",
+                only_binary=True,
+                no_binary=False,
             ),
         ]
 
@@ -594,7 +645,6 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
             cmake_args=None,
             force_cmake=False,
             index_url=None,
-            extra_index_url=None,
             only_binary=False,
             no_binary=False,
         )

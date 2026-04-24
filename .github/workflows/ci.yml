@@ -1,4 +1,4 @@
-name: CI
+name: CI (relay landing-page real desktop-bridge API v1 guardrail)
 
 on:
   pull_request:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: Run tests and collect coverage
+    name: Run tests + relay landing-page real desktop-bridge API v1 guardrail
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -50,18 +50,20 @@ jobs:
       - name: Install Node.js dependencies
         if: steps.prep.outputs.rc != '2'
         run: npm ci
-      - name: Restore cached real desktop-bridge model artifact
+      - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
         if: steps.prep.outputs.rc != '2'
         uses: actions/cache@v4
         with:
-          path: .ci-models/tinygemma3-Q8_0.gguf
-          key: ci-real-desktop-bridge-model-tinygemma3-q8-20260422
-      - name: Provision real desktop-bridge model artifact
+          path: .ci-models/relay-landing-api-v1-tinygemma3-Q8_0.gguf
+          key: ci-relay-landing-api-v1-real-model-tinygemma3-q8-20260424
+      - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
         if: steps.prep.outputs.rc != '2'
         run: |
           set -euo pipefail
           mkdir -p .ci-models
-          MODEL_PATH=".ci-models/tinygemma3-Q8_0.gguf"
+          # Keep this guardrail on a tiny *real* GGUF to verify real llama.cpp inference
+          # end-to-end without paying the CI cost/fragility of large checkpoint downloads.
+          MODEL_PATH=".ci-models/relay-landing-api-v1-tinygemma3-Q8_0.gguf"
           if [ ! -s "$MODEL_PATH" ]; then
             curl -fL \
               "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/c287502cd9e278dac8eed805c112cce5d0081e0b/tinygemma3-Q8_0.gguf" \
@@ -74,8 +76,9 @@ jobs:
         run: ./run_all_tests.sh
         env:
           TEST_COVERAGE: '1'
-          # Keep the real landing-page desktop-bridge guardrail always-on in CI.
-          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/tinygemma3-Q8_0.gguf
+          # Keep the relay landing-page desktop-bridge API v1 guardrail always-on with
+          # a tiny real model (not a fake) so CI still proves real runtime behavior.
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/relay-landing-api-v1-tinygemma3-Q8_0.gguf
       - name: Upload coverage reports to Codecov
         if: steps.prep.outputs.rc != '2'
         uses: codecov/codecov-action@v5

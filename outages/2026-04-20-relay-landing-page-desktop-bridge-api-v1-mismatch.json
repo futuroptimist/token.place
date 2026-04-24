@@ -1,7 +1,7 @@
 {
   "date": "2026-04-20",
   "slug": "relay-landing-page-desktop-bridge-api-v1-mismatch",
-  "summary": "The relay landing-page used API v1 chat completions while desktop-bridge servicing validation remained effectively aligned to legacy relay behavior, allowing desktop registration/health to appear green without proving real API v1 request handling.",
+  "summary": "The relay landing-page used API v1 chat completions while desktop-bridge servicing checks remained aligned to legacy relay behavior, allowing desktop registration/health to appear green without proving real API v1 request handling.",
   "impact": "Users could see a healthy desktop operator but still receive fake/stub-style or poor failure experiences on landing-page requests, especially when no nodes were available.",
   "fix": "Added an unmocked landing-page browser->relay->desktop-bridge API v1 e2e guardrail, wired CI to run it always-on with a tiny real GGUF model, and tightened user-facing failure messaging for no-node/bridge-error conditions.",
   "lessons": "Registration heartbeat signals are not sufficient readiness checks; CI must validate full request-processing semantics and provider-path diagnostics for relay landing-page API v1 traffic."

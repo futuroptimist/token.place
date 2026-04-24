@@ -6,7 +6,7 @@
 
 ## Summary
 The landing-page chat path used `POST /api/v1/chat/completions`, but the desktop bridge was only
-participating in legacy relay polling/response semantics for request handling. That mismatch let the
+participating in legacy relay polling semantics for request handling. That mismatch let the
 desktop app appear healthy (`Running`/`Registered`) while not actually servicing landing-page API v1
 requests end-to-end.
 
@@ -35,7 +35,7 @@ requests end-to-end.
 
 ## Why CI/tests missed it
 CI initially validated a local-provider/mocked-path bypass instead of enforcing the full browser →
-relay API v1 → relay sink/source → desktop bridge runtime contract. As a result, checks could pass
+relay API v1 → relay sink/source → desktop bridge contract. As a result, checks could pass
 while the desktop bridge never handled the landing-page request payload that users depend on.
 
 ## Remediation

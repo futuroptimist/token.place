@@ -695,6 +695,19 @@ def relay_diagnostics():
 def relay_api_v1_chat_completions():
     """Queue API v1 chat requests for registered compute nodes and wait for completion."""
 
+    if not SERVER_REGISTRATION_TOKENS:
+        return jsonify(
+            {
+                'error': {
+                    'type': 'service_unavailable_error',
+                    'code': 'relay_registration_tokens_required',
+                    'message': (
+                        'API v1 relay dispatch requires relay server registration tokens'
+                    ),
+                }
+            }
+        ), 503
+
     _evict_stale_servers()
     payload = request.get_json(silent=True)
     if payload is None:

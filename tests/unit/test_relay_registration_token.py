@@ -231,3 +231,37 @@ def test_evict_stale_servers_cleans_up_queue_and_stream_state(relay_module) -> N
     assert "stale-server" not in relay_module.client_inference_requests
     assert "session-stale" not in relay_module.streaming_sessions
     assert "client-stale" not in relay_module.streaming_sessions_by_client
+
+
+def test_api_v1_relay_dispatch_requires_registration_tokens_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API v1 relay dispatch should fail closed when registration tokens are unset."""
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", raising=False)
+
+    for name in MODULES_TO_CLEAR:
+        sys.modules.pop(name, None)
+
+    try:
+        relay = importlib.import_module("relay")
+        relay.app.config["TESTING"] = True
+        client = relay.app.test_client()
+
+        response = client.post(
+            "/relay/api/v1/chat/completions",
+            json={"model": "llama", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "relay_registration_tokens_required",
+                "message": "API v1 relay dispatch requires relay server registration tokens",
+            }
+        }
+    finally:
+        for name in MODULES_TO_CLEAR:
+            sys.modules.pop(name, None)

@@ -8,15 +8,17 @@
 The landing-page chat path used `POST /api/v1/chat/completions`, but the desktop bridge was only
 participating in legacy relay polling/response semantics for request handling. That mismatch let the
 desktop app appear healthy (`Running`/`Registered`) while not actually servicing landing-page API v1
-requests end to end.
+requests end-to-end.
 
-## Impact / user-visible symptoms
+## Symptoms
 - Users could see desktop operator status as healthy while landing-page requests were not processed
   by the registered desktop bridge.
-- Landing-page responses could fall back to a fake/stub-style result instead of real desktop
-  inference in scenarios where real-provider path assumptions were bypassed.
 - Failure messaging was weak for degraded relay availability, including poor UX when no compute
   nodes were available.
+
+## Impact
+- Landing-page responses could fall back to a fake/stub-style result instead of real desktop
+  inference in scenarios where real-provider path assumptions were bypassed.
 
 ## Root cause
 1. Contract drift across boundaries: landing-page traffic was pinned to API v1, while bridge-side
@@ -36,7 +38,7 @@ CI initially validated a local-provider/mocked-path bypass instead of enforcing 
 relay API v1 → relay sink/source → desktop bridge runtime contract. As a result, checks could pass
 while the desktop bridge never handled the landing-page request payload that users depend on.
 
-## Resolution (final fixed state)
+## Remediation
 - Added an unmocked e2e guardrail in `tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1`
   that requires:
   - API v1 route usage and non-streaming behavior,
@@ -48,7 +50,7 @@ while the desktop bridge never handled the landing-page request payload that use
 - Tightened landing-page failure handling so no-node and bridge-error states surface actionable user
   messages instead of generic failures.
 
-## Preventive follow-ups / guardrails added
+## Follow-up / prevention
 - Keep relay landing-page desktop-bridge API v1 guardrail mandatory in CI.
 - Keep assertions that reject v2/streaming drift on relay landing-page traffic.
 - Preserve user-facing error-code mapping coverage for no-node and bridge-failure conditions.

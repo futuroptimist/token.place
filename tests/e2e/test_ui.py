@@ -3,6 +3,7 @@ import json
 import os
 import pytest
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -586,9 +587,18 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "assistant message should render atomically without multi-step text growth; "
             f"snapshots={non_streaming_state['snapshots']}"
         )
-        assert non_streaming_state["assistantContent"].strip() == non_streaming_state["domAssistantText"].strip(), (
-            "final assistant Vue state content must exactly match rendered DOM text to prove final "
-            "non-streaming rendering path"
+        assistant_content = non_streaming_state["assistantContent"].strip()
+        dom_assistant_text = non_streaming_state["domAssistantText"].strip()
+
+        # DOM rendering can add/remove whitespace around punctuation and wrapped lines.
+        # Compare lexical token sequences so punctuation-preserving whitespace differences pass,
+        # while real word-boundary/content regressions still fail.
+        token_pattern = r"\w+|[^\w\s]"
+        assistant_content_tokens = re.findall(token_pattern, assistant_content, flags=re.UNICODE)
+        dom_assistant_text_tokens = re.findall(token_pattern, dom_assistant_text, flags=re.UNICODE)
+        assert assistant_content_tokens == dom_assistant_text_tokens, (
+            "final assistant Vue state content must match rendered DOM text token-for-token "
+            "(allowing formatting-only whitespace differences) to prove final non-streaming rendering path"
         )
 
         encrypted_request = v1_requests[0].post_data_json

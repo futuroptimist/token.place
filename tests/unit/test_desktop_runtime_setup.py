@@ -612,6 +612,8 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     assert probe.backend == 'cuda'
     assert 'ensure_runtime_import_paths' in desktop_runtime_setup._PROBE_SNIPPET
     assert "Path(entry or \".\").resolve()" in desktop_runtime_setup._PROBE_SNIPPET
+    assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
+    assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
     assert captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)[:2] == [
         str(PYTHON_MODULE_DIR),

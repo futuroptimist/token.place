@@ -111,8 +111,6 @@ jobs:
               print(f"Install plan {plan_index}/{len(plans)}")
               if plan.index_url:
                   print(f"Using primary wheel index: {plan.index_url}")
-              if plan.extra_index_url:
-                  print(f"Using extra package index: {plan.extra_index_url}")
               if plan.pip_env():
                   print(f"Using build env: {plan.pip_env()}")
 

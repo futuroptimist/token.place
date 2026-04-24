@@ -591,8 +591,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         # DOM rendering may inject or remove whitespace around wrapped/newline boundaries
         # while preserving the same non-streaming payload text.
-        assistant_content_compact = "".join(assistant_content.split())
-        dom_assistant_text_compact = "".join(dom_assistant_text.split())
+        assistant_content_compact = " ".join(assistant_content.split())
+        dom_assistant_text_compact = " ".join(dom_assistant_text.split())
         assert assistant_content_compact == dom_assistant_text_compact, (
             "final assistant Vue state content must match rendered DOM text (allowing equivalent "
             "whitespace formatting) to prove final non-streaming rendering path"

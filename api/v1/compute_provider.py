@@ -7,12 +7,19 @@ remote distributed compute-node endpoint while preserving a local fallback.
 from __future__ import annotations
 
 import contextvars
+import base64
+import json
 import logging
 import os
+import time
+import uuid
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
+import requests
+
+from api.v1.encryption import encryption_manager
 from api.v1.models import generate_response
 
 logger = logging.getLogger("api.v1.compute_provider")
@@ -122,7 +129,7 @@ class LocalApiV1ComputeProvider:
 
 @dataclass(frozen=True)
 class DistributedApiV1ComputeProvider:
-    """Provider that fail-closes distributed API v1 relay dispatch."""
+    """Provider that dispatches API v1 requests through the relay E2EE envelope."""
 
     base_url: str
     timeout_seconds: float = 30.0
@@ -134,12 +141,125 @@ class DistributedApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        raise ComputeProviderError(
-            "distributed API v1 relay execution is disabled pending reviewed E2EE envelope design",
-            code="distributed_api_v1_relay_disabled",
-            error_type="service_unavailable_error",
-            public_message="Distributed API v1 is temporarily unavailable.",
-            status_code=503,
+        request_id = f"api-v1-{uuid.uuid4().hex}"
+        request_payload = {
+            "protocol": "api_v1_e2ee",
+            "version": 1,
+            "request_id": request_id,
+            "api_v1_request": {
+                "request_id": request_id,
+                "model": model_id,
+                "messages": messages,
+                "options": options or {},
+            },
+        }
+
+        relay_url = self.base_url.rstrip("/")
+        timeout = self.timeout_seconds
+        try:
+            next_server_response = requests.get(
+                f"{relay_url}/next_server",
+                timeout=timeout,
+            )
+            next_server_response.raise_for_status()
+            next_server_data = next_server_response.json()
+        except requests.Timeout as exc:
+            raise _error_from_code("compute_node_timeout", message=str(exc)) from exc
+        except requests.RequestException as exc:
+            raise _error_from_code("compute_node_unreachable", message=str(exc)) from exc
+        except json.JSONDecodeError as exc:
+            raise _error_from_code("compute_node_invalid_payload", message=str(exc)) from exc
+
+        server_public_key = next_server_data.get("server_public_key")
+        if not isinstance(server_public_key, str) or not server_public_key:
+            raise _error_from_code(
+                "no_registered_compute_nodes",
+                message="relay returned no compute node public key",
+            )
+
+        encrypted_request = encryption_manager.encrypt_message(request_payload, server_public_key)
+        if not encrypted_request:
+            raise _error_from_code(
+                "compute_node_bridge_error",
+                message="failed to encrypt distributed API v1 relay envelope",
+            )
+
+        faucet_payload = {
+            "client_public_key": encryption_manager.public_key_b64,
+            "server_public_key": server_public_key,
+            "chat_history": encrypted_request["ciphertext"],
+            "cipherkey": encrypted_request["cipherkey"],
+            "iv": encrypted_request["iv"],
+        }
+
+        try:
+            faucet_response = requests.post(
+                f"{relay_url}/faucet",
+                json=faucet_payload,
+                timeout=timeout,
+            )
+            faucet_response.raise_for_status()
+        except requests.Timeout as exc:
+            raise _error_from_code("compute_node_timeout", message=str(exc)) from exc
+        except requests.RequestException as exc:
+            raise _error_from_code("compute_node_unreachable", message=str(exc)) from exc
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                retrieve_response = requests.post(
+                    f"{relay_url}/retrieve",
+                    json={"client_public_key": encryption_manager.public_key_b64},
+                    timeout=min(2.0, timeout),
+                )
+                retrieve_response.raise_for_status()
+                retrieve_data = retrieve_response.json()
+            except requests.Timeout:
+                continue
+            except requests.RequestException as exc:
+                raise _error_from_code("compute_node_unreachable", message=str(exc)) from exc
+            except json.JSONDecodeError as exc:
+                raise _error_from_code("compute_node_invalid_payload", message=str(exc)) from exc
+
+            if retrieve_data.get("error"):
+                time.sleep(0.2)
+                continue
+
+            try:
+                decrypted = encryption_manager.decrypt_message(
+                    {
+                        "ciphertext": base64.b64decode(retrieve_data["chat_history"]),
+                        "iv": base64.b64decode(retrieve_data["iv"]),
+                    },
+                    base64.b64decode(retrieve_data["cipherkey"]),
+                )
+                if decrypted is None:
+                    raise ValueError("empty decrypted payload")
+                response_payload = json.loads(decrypted.decode("utf-8"))
+            except Exception as exc:
+                raise _error_from_code("compute_node_invalid_payload", message=str(exc)) from exc
+
+            if isinstance(response_payload, dict):
+                api_v1_error = response_payload.get("api_v1_error")
+                if isinstance(api_v1_error, dict):
+                    error_code = api_v1_error.get("code", "compute_node_bridge_error")
+                    raise _error_from_code(
+                        str(error_code),
+                        message=str(api_v1_error.get("message", "distributed API v1 relay error")),
+                    )
+                api_v1_response = response_payload.get("api_v1_response")
+                if isinstance(api_v1_response, dict) and isinstance(api_v1_response.get("message"), dict):
+                    _last_backend_path.set("distributed_relay_e2ee")
+                    return api_v1_response["message"]
+
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="distributed API v1 relay response had unexpected shape",
+            )
+
+        raise _error_from_code(
+            "compute_node_timeout",
+            message="timed out while waiting for distributed API v1 relay response",
         )
 
 

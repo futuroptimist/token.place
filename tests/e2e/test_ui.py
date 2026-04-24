@@ -499,7 +499,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assistant_text = assistant_message.inner_text()
         assert assistant_text.strip(), "assistant response should not be empty"
-        assert "Sorry, I encountered an issue generating a response." in assistant_text
+        assert "Sorry, I encountered an issue generating a response." not in assistant_text
+        assert "No LLM servers are available right now." not in assistant_text
         assert "Unknown streaming error" not in assistant_text
 
         assert len(v1_requests) >= 1
@@ -508,8 +509,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         latest_headers = v1_response_headers[-1]
         provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        execution_backend_path = latest_headers.get("x-tokenplace-api-v1-execution-backend-path")
         assert provider_class in (None, "DistributedApiV1ComputeProvider")
         assert resolved_provider_path in (None, "distributed")
+        assert execution_backend_path in (None, "distributed_relay_e2ee")
 
         page.wait_for_timeout(300)
         non_streaming_state = page.evaluate(
@@ -587,9 +590,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             for line in stderr_lines
             if "desktop.compute_node_bridge.process_request" in line
         ]
-        assert not process_request_lines, (
-            "desktop bridge should not process relay requests while distributed API v1 is fail-closed"
-        )
+        assert process_request_lines, "desktop bridge should process relay requests for API v1 E2EE mode"
     finally:
         if bridge_process.stdin:
             try:

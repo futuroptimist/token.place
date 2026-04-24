@@ -1,3 +1,5 @@
+import base64
+
 from api.v1 import compute_provider
 from api.v1.compute_provider import (
     ComputeProviderError,
@@ -9,20 +11,63 @@ from api.v1.compute_provider import (
 from relay import app
 
 
-def test_distributed_compute_provider_fails_closed():
+class _FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_distributed_compute_provider_uses_encrypted_relay_flow(monkeypatch):
     provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
 
-    try:
-        provider.complete_chat(
-            model_id="llama-3-8b-instruct",
-            messages=[{"role": "user", "content": "hi"}],
-            options={"temperature": 0.2},
-        )
-        raise AssertionError("expected ComputeProviderError")
-    except ComputeProviderError as exc:
-        assert exc.code == "distributed_api_v1_relay_disabled"
-        assert exc.error_type == "service_unavailable_error"
-        assert exc.status_code == 503
+    monkeypatch.setattr(
+        compute_provider,
+        "generate_keys",
+        lambda: (b"fake-private-key", b"fake-public-key"),
+    )
+    monkeypatch.setattr(
+        compute_provider,
+        "encrypt",
+        lambda *_args, **_kwargs: ({"ciphertext": b"enc-history"}, b"enc-key", b"enc-iv"),
+    )
+    monkeypatch.setattr(
+        compute_provider,
+        "decrypt",
+        lambda *_args, **_kwargs: b'[{"role":"assistant","content":"bonjour"}]',
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse(
+            200, {"server_public_key": base64.b64encode(b"server-pub").decode("utf-8")}
+        ),
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "post",
+        lambda url, *args, **kwargs: (
+            _FakeResponse(200, {"message": "queued"})
+            if url.endswith("/faucet")
+            else _FakeResponse(
+                200,
+                {
+                    "chat_history": base64.b64encode(b"encrypted-response").decode("utf-8"),
+                    "cipherkey": base64.b64encode(b"encrypted-key").decode("utf-8"),
+                    "iv": base64.b64encode(b"response-iv").decode("utf-8"),
+                },
+            )
+        ),
+    )
+
+    result = provider.complete_chat(
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"temperature": 0.2},
+    )
+    assert result["content"] == "bonjour"
 
 
 def test_fallback_compute_provider_uses_local_adapter_when_distributed_disabled(monkeypatch):
@@ -35,7 +80,7 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_disabled(
     )
 
     provider = FallbackApiV1ComputeProvider(
-        primary=DistributedApiV1ComputeProvider(base_url="https://node-a.example"),
+        primary=DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=0.01),
         fallback=LocalApiV1ComputeProvider(),
     )
 
@@ -139,6 +184,6 @@ def test_api_v1_chat_completion_returns_structured_error_when_distributed_only(m
         assert response.status_code == 503
         error = response.get_json()["error"]
         assert error["type"] == "service_unavailable_error"
-        assert error["code"] == "distributed_api_v1_relay_disabled"
+        assert error["code"] == "compute_node_unreachable"
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()

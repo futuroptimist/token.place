@@ -226,7 +226,7 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     assert 'Mock response' in data['choices'][0]['message']['content']
 
 
-def test_api_v1_chat_completion_fails_closed_for_distributed_provider(client, monkeypatch):
+def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_nodes(client, monkeypatch):
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
@@ -241,7 +241,7 @@ def test_api_v1_chat_completion_fails_closed_for_distributed_provider(client, mo
     assert response.status_code == 503
     data = response.get_json()
     assert data['error']['type'] == 'service_unavailable_error'
-    assert data['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert data['error']['code'] == 'compute_node_unreachable'
 
 
 def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
@@ -294,7 +294,7 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     )
 
     assert response.status_code == 503
-    assert response.get_json()['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert response.get_json()['error']['code'] == 'compute_node_unreachable'
     local_generate.assert_not_called()
 
 

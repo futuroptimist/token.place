@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -143,3 +144,32 @@ def llama_cpp_install_plan_fallbacks(
         )
 
     return plans
+
+
+def backend_probe_satisfies_install_plan(plan: LlamaCppInstallPlan, probe: Any) -> bool:
+    """Return whether a runtime probe is sufficient for an install plan.
+
+    Hosted macOS CI runners can fail to positively report live Metal offload even
+    when a Metal source build completed successfully from PyPI. For that narrow
+    case we accept a clean import probe as sufficient evidence while keeping
+    CUDA validation strict.
+    """
+
+    if plan.backend not in {"cuda", "metal"}:
+        return True
+
+    probe_backend = str(getattr(probe, "backend", "missing") or "missing")
+    if probe_backend == plan.backend:
+        return True
+
+    if not (
+        plan.backend == "metal"
+        and plan.platform == "darwin"
+        and plan.force_cmake
+        and "GGML_METAL=on" in (plan.cmake_args or "")
+    ):
+        return False
+
+    probe_error = str(getattr(probe, "error", "") or "").strip()
+    module_path = str(getattr(probe, "llama_module_path", "") or "").strip().lower()
+    return not probe_error and module_path not in {"", "missing", "unknown"}

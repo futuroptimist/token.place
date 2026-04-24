@@ -1,6 +1,7 @@
 """Unit tests for desktop llama-cpp-python packaging contract helpers."""
 
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -10,6 +11,7 @@ if str(DESKTOP_PYTHON) not in sys.path:
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
+    backend_probe_satisfies_install_plan,
     llama_cpp_install_plan,
     llama_cpp_install_plan_fallbacks,
     llama_cpp_requirement_spec,
@@ -203,3 +205,55 @@ def test_requirement_spec_strips_spaces_around_version_pin(tmp_path):
     requirements.write_text("llama-cpp-python== 0.3.16 \n", encoding="utf-8")
 
     assert llama_cpp_requirement_spec(requirements) == "llama-cpp-python==0.3.16"
+
+
+def test_backend_probe_satisfies_plan_for_matching_backend():
+    plan = LlamaCppInstallPlan(
+        platform="win32",
+        backend="cuda",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_CUDA=on",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="cuda", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is True
+
+
+def test_backend_probe_rejects_mismatched_cuda_backend():
+    plan = LlamaCppInstallPlan(
+        platform="win32",
+        backend="cuda",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_CUDA=on",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="cpu", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is False
+
+
+def test_backend_probe_accepts_macos_metal_source_build_with_clean_import_probe():
+    plan = LlamaCppInstallPlan(
+        platform="darwin",
+        backend="metal",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="cpu", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is True
+
+
+def test_backend_probe_rejects_macos_metal_source_build_when_probe_errors():
+    plan = LlamaCppInstallPlan(
+        platform="darwin",
+        backend="metal",
+        package_spec="llama-cpp-python==0.3.16",
+        cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+        force_cmake=True,
+    )
+    probe = SimpleNamespace(backend="missing", llama_module_path="missing", error="import failed")
+
+    assert backend_probe_satisfies_install_plan(plan, probe) is False

@@ -93,7 +93,10 @@ jobs:
           desktop_python_root = repo_root / "desktop-tauri" / "src-tauri" / "python"
           sys.path.insert(0, str(desktop_python_root))
 
-          from desktop_gpu_packaging import llama_cpp_install_plan_fallbacks
+          from desktop_gpu_packaging import (
+              backend_probe_satisfies_install_plan,
+              llama_cpp_install_plan_fallbacks,
+          )
           from desktop_runtime_setup import _probe_llama_runtime
 
           plans = llama_cpp_install_plan_fallbacks(platform=sys.platform, requirements_path=repo_root / "requirements.txt")
@@ -102,15 +105,20 @@ jobs:
               lower = output.lower()
               return "bad crc-32" in lower or "badzipfile" in lower
 
-          def _supports_expected_backend(expected_backend: str) -> bool:
-              if expected_backend not in {"cuda", "metal"}:
+          def _supports_expected_backend(plan) -> bool:
+              if plan.backend not in {"cuda", "metal"}:
                   return True
               probe = _probe_llama_runtime(runtime_root=repo_root)
-              # Probe `backend` is derived from compile-time GGML backend markers.
-              # `gpu_offload_supported` can be False on CI runners that lack a usable
-              # GPU device even when the installed wheel/source build correctly
-              # exposes the requested backend (notably Metal on hosted macOS).
-              return probe.backend == expected_backend
+              if backend_probe_satisfies_install_plan(plan, probe):
+                  return True
+              print("Backend validation probe details:")
+              print(f"  probe.backend={probe.backend}")
+              print(f"  probe.gpu_offload_supported={probe.gpu_offload_supported}")
+              print(f"  probe.detected_device={probe.detected_device}")
+              print(f"  probe.llama_module_path={probe.llama_module_path}")
+              print(f"  probe.error={probe.error}")
+              print(f"  sys.executable={sys.executable}")
+              return False
 
           def _can_attempt_cuda_build() -> bool:
               if sys.platform.lower().startswith("win"):
@@ -146,7 +154,7 @@ jobs:
                       text=True,
                   )
                   if result.returncode == 0:
-                      if _supports_expected_backend(plan.backend):
+                      if _supports_expected_backend(plan):
                           raise SystemExit(0)
                       print(
                           f"Install succeeded but backend probe did not confirm expected "

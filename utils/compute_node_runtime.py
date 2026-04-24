@@ -62,9 +62,13 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
 
 def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Distributed API v1 relay payloads are disabled until E2EE-compatible."""
+    """Return whether ``payload`` is an encrypted API v1 relay request."""
 
-    return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("api_v1_payload") is not True:
+        return False
+    return LEGACY_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
 
 
 class RelayRequestAdapter(Protocol):

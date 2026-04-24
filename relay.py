@@ -782,6 +782,7 @@ def faucet():
         'cipherkey': cipherkey,
         'iv': iv,  # Include the IV in the saved client's request
         'stream': stream_requested,
+        'api_v1_payload': data.get('api_v1_payload') is True,
     })
     return jsonify({'message': 'Request received'}), 200
 
@@ -865,6 +866,8 @@ def sink():
                 'cipherkey': first_request['cipherkey'],
                 'iv': first_request.get('iv', ''),
             })
+            if first_request.get('api_v1_payload') is True:
+                response_data['api_v1_payload'] = True
 
             if first_request.get('stream') and first_request.get('stream_session_id'):
                 response_data['stream'] = True

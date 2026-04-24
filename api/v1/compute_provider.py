@@ -191,6 +191,9 @@ class DistributedApiV1ComputeProvider:
             "chat_history": base64.b64encode(ciphertext_dict["ciphertext"]).decode("utf-8"),
             "cipherkey": base64.b64encode(encrypted_key).decode("utf-8"),
             "iv": base64.b64encode(iv).decode("utf-8"),
+            # Marker consumed by compute-node bridge diagnostics so encrypted
+            # API v1 relay requests are distinguishable from legacy payloads.
+            "api_v1_payload": True,
         }
 
         try:

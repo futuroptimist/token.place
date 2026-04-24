@@ -167,6 +167,17 @@ def _extract_chat_history_and_validate_key_binding(
     return None
 
 
+def _is_api_v1_e2ee_envelope(payload: Any) -> bool:
+    """Return True when the decrypted payload matches the API v1 E2EE envelope shape."""
+
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("protocol") == "api_v1_e2ee"
+        and isinstance(payload.get("api_v1_request"), dict)
+    )
+
+
 class RelayClient:
     """
     Client for communicating with relay servers.
@@ -626,13 +637,20 @@ class RelayClient:
                 return False
 
             log_info("Decrypted client request")
+            client_pub_key = base64.b64decode(client_pub_key_b64)
+            if _is_api_v1_e2ee_envelope(decrypted_chat_history):
+                return self.process_api_v1_chat_request(
+                    decrypted_chat_history,
+                    client_pub_key_b64=client_pub_key_b64,
+                    client_pub_key=client_pub_key,
+                )
+
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,
                 client_pub_key_b64,
             )
             if chat_history is None:
                 return False
-            client_pub_key = base64.b64decode(client_pub_key_b64)
 
             if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
                 log_info("Processing streaming relay request for session {}", stream_session_id)
@@ -734,11 +752,96 @@ class RelayClient:
             log_error("Exception during request processing: {}", str(e), exc_info=True)
             return False
 
-    def process_api_v1_chat_request(self, request_data: Dict[str, Any]) -> bool:
-        """Relay API v1 plaintext dispatch is disabled pending an E2EE-compatible design."""
+    def process_api_v1_chat_request(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        client_pub_key_b64: str,
+        client_pub_key: bytes,
+    ) -> bool:
+        """Process an API v1 E2EE relay request and return an encrypted API v1 response envelope."""
 
-        log_error("Rejected disabled relay API v1 payload dispatch")
-        return False
+        api_v1_request = request_data.get("api_v1_request")
+        if not isinstance(api_v1_request, dict):
+            log_error("Invalid API v1 relay payload: missing api_v1_request object")
+            return False
+
+        model_id = api_v1_request.get("model")
+        messages = api_v1_request.get("messages")
+        options = api_v1_request.get("options", {})
+        request_id = api_v1_request.get("request_id")
+        if not isinstance(model_id, str) or not isinstance(messages, list):
+            log_error("Invalid API v1 relay payload: model/messages types are invalid")
+            return False
+        if options is None:
+            options = {}
+        if not isinstance(options, dict):
+            log_error("Invalid API v1 relay payload: options must be an object")
+            return False
+
+        response_payload: Dict[str, Any]
+        try:
+            from api.v1.models import generate_response
+
+            response_messages = generate_response(model_id, messages, **options)
+            if not response_messages or not isinstance(response_messages[-1], dict):
+                raise ValueError("API v1 compute node returned invalid response history")
+            response_payload = {
+                "protocol": "api_v1_e2ee",
+                "version": 1,
+                "request_id": request_id,
+                "api_v1_response": {
+                    "message": response_messages[-1],
+                },
+            }
+        except Exception as exc:
+            log_error("API v1 relay compute failed: {}", str(exc), exc_info=True)
+            response_payload = {
+                "protocol": "api_v1_e2ee",
+                "version": 1,
+                "request_id": request_id,
+                "api_v1_error": {
+                    "code": "compute_node_bridge_error",
+                    "message": "Unable to generate a distributed API v1 response.",
+                },
+            }
+
+        encrypted_response = self.crypto_manager.encrypt_message(response_payload, client_pub_key)
+        if not isinstance(encrypted_response, dict):
+            log_error("Failed to encrypt API v1 relay response payload")
+            return False
+        source_payload = {
+            'client_public_key': client_pub_key_b64,
+            **encrypted_response
+        }
+        try:
+            jsonschema.validate(instance=source_payload, schema=MESSAGE_SCHEMA)
+        except jsonschema.exceptions.ValidationError as e:
+            log_error("Invalid response payload format: {}", str(e))
+            return False
+
+        request_kwargs = {
+            'json': source_payload,
+            'timeout': self._request_timeout,
+        }
+        headers = self._auth_headers()
+        if headers:
+            request_kwargs['headers'] = headers
+
+        timeout = request_kwargs.pop('timeout', self._request_timeout)
+        try:
+            source_response = requests.post(
+                f'{self.relay_url}/source',
+                timeout=timeout,
+                **request_kwargs
+            )
+        except requests.RequestException as exc:
+            log_error("API v1 relay failed posting response: {}", str(exc), exc_info=True)
+            return False
+        if source_response.status_code != 200:
+            log_error("Error status from /source: {}", source_response.status_code)
+            return False
+        return True
 
     def poll_relay_continuously(self):  # pragma: no cover
         """

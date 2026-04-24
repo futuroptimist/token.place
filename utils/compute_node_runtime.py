@@ -51,7 +51,6 @@ class ComputeNodeRuntimeConfig:
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
-API_V1_RELAY_REQUIRED_FIELDS = frozenset({"api_v1_request"})
 
 
 def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
@@ -65,9 +64,8 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
     """Return whether ``payload`` carries relay API v1 request work."""
 
-    if not isinstance(payload, dict):
-        return False
-    return API_V1_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
+    del payload
+    return False
 
 
 class RelayRequestAdapter(Protocol):
@@ -100,10 +98,12 @@ class ApiV1RelayRequestAdapter:
         self._relay_client = relay_client
 
     def can_process(self, request_data: Dict[str, Any]) -> bool:
-        return is_api_v1_relay_payload(request_data)
+        del request_data
+        return False
 
     def process(self, request_data: Dict[str, Any]) -> bool:
-        return self._relay_client.process_api_v1_chat_request(request_data)
+        del request_data
+        return False
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -266,7 +266,6 @@ class ComputeNodeRuntime:
         )
         if request_adapters is None:
             self.request_adapters = [
-                ApiV1RelayRequestAdapter(self.relay_client),
                 LegacyRelayRequestAdapter(self.relay_client),
             ]
         else:

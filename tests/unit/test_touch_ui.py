@@ -18,11 +18,23 @@ def test_chat_js_defines_touch_detection_hook():
 
 def test_landing_chat_js_avoids_relay_v2_streaming_path():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "/api/v1/chat/completions" in chat_js, (
+        "landing chat must call relay API v1 chat completions endpoint"
+    )
+    assert "/api/v1/completions" not in chat_js, (
+        "landing chat must not call legacy API v1 text completions endpoint"
+    )
+    assert "/relay/api/v1/chat/completions" not in chat_js, (
+        "landing chat must not use relay-prefixed API v1 bypass path"
+    )
     assert "/api/v2/chat/completions" not in chat_js, (
         "landing chat must not call relay v2 chat completions endpoint"
     )
     assert "sendStreamingMessage(" not in chat_js, (
         "landing chat must not include streaming relay send helper call chain"
+    )
+    assert not re.search(r"""(['\"]?)stream\1\s*:\s*true\b""", chat_js), (
+        "landing chat request payload must not opt into streaming for relay API v1"
     )
 
 

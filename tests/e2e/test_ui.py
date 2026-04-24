@@ -511,22 +511,30 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
         stream_mode = latest_headers.get("x-tokenplace-api-v1-stream-mode")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
+        execution_backend_path = latest_headers.get("x-tokenplace-api-v1-execution-backend-path")
         provider_diagnostics = (
             "landing-page real-provider guardrail diagnostics: "
             f"provider_class={provider_class!r}, resolved_provider_path={resolved_provider_path!r}, "
-            f"stream_mode={stream_mode!r}; expected provider_class='LocalApiV1ComputeProvider', "
-            "resolved_provider_path='local', stream_mode='non-streaming'"
+            f"execution_backend_path={execution_backend_path!r}, stream_mode={stream_mode!r}; "
+            "expected provider_class='DistributedApiV1ComputeProvider', "
+            "resolved_provider_path='distributed', "
+            "execution_backend_path='registered_desktop_compute_node', "
+            "stream_mode='non-streaming'"
         )
-        assert provider_class == "LocalApiV1ComputeProvider", provider_diagnostics
+        assert provider_class == "DistributedApiV1ComputeProvider", provider_diagnostics
         assert stream_mode == "non-streaming", provider_diagnostics
-        assert resolved_provider_path == "local", (
+        assert resolved_provider_path == "distributed", (
             "landing-page real-provider guardrail requires resolved provider path "
-            f"'local'. {provider_diagnostics}"
+            f"'distributed'. {provider_diagnostics}"
         )
-        if runtime_supports_real_inference and resolved_provider_path != "local":
+        assert execution_backend_path == "registered_desktop_compute_node", (
+            "landing-page real-provider guardrail requires execution backend path "
+            f"'registered_desktop_compute_node'. {provider_diagnostics}"
+        )
+        if runtime_supports_real_inference:
             assert assistant_text.strip().lower() != "stub", (
-                "assistant response must not be stub when runtime reports real inference support "
-                f"and provider path is {resolved_provider_path!r}. {provider_diagnostics}"
+                "assistant response must not be stub when runtime reports real inference support. "
+                f"{provider_diagnostics}"
             )
 
         page.wait_for_timeout(300)
@@ -585,10 +593,35 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         encrypted_request = v1_requests[0].post_data_json
         assert encrypted_request.get("encrypted") is True
+        assert encrypted_request.get("stream") in (None, False)
         client_public_key = encrypted_request.get("client_public_key")
         assert isinstance(client_public_key, str) and client_public_key
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)
         assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
+
+        process_request_ok_lines = [
+            line
+            for line in stderr_lines
+            if "desktop.compute_node_bridge.process_request.ok" in line
+        ]
+        process_request_start_lines = [
+            line
+            for line in stderr_lines
+            if "desktop.compute_node_bridge.process_request.start" in line
+        ]
+        assert process_request_ok_lines, (
+            "desktop bridge did not process any relay request; only heartbeat registration "
+            "would indicate a bypassed landing-page path"
+        )
+        assert any("api_v1_payload=True" in line for line in process_request_start_lines), (
+            "desktop bridge never processed an API v1 relay payload"
+        )
+        assert not any("api_v1_payload=False" in line for line in process_request_start_lines), (
+            "desktop bridge processed a non-API-v1 relay payload (legacy bypass detected)"
+        )
+        assert not any("stream=True" in line for line in process_request_start_lines), (
+            "desktop bridge processed a streaming relay request; landing-page flow must stay non-streaming"
+        )
     finally:
         if bridge_process.stdin:
             try:

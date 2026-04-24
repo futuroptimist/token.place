@@ -693,152 +693,32 @@ def relay_diagnostics():
 
 @app.route('/relay/api/v1/chat/completions', methods=['POST'])
 def relay_api_v1_chat_completions():
-    """Queue API v1 chat requests for registered compute nodes and wait for completion."""
-
-    _evict_stale_servers()
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify(
-            {
-                'error': {
-                    'type': 'invalid_request_error',
-                    'code': 'invalid_request_payload',
-                    'message': 'Invalid request data',
-                }
-            }
-        ), 400
-    if not isinstance(payload, dict):
-        return jsonify(
-            {
-                'error': {
-                    'type': 'invalid_request_error',
-                    'code': 'invalid_request_payload',
-                    'message': 'Invalid request data',
-                }
-            }
-        ), 400
-
-    model = payload.get('model')
-    messages = payload.get('messages')
-    if not isinstance(model, str) or not model.strip() or not isinstance(messages, list):
-        return jsonify(
-            {
-                'error': {
-                    'type': 'invalid_request_error',
-                    'code': 'invalid_api_v1_payload',
-                    'message': 'Invalid API v1 payload',
-                }
-            }
-        ), 400
-
-    available_servers = list(known_servers.keys())
-    if not available_servers:
-        return jsonify(
-            {
-                'error': {
-                    'type': 'service_unavailable_error',
-                    'code': 'no_registered_compute_nodes',
-                    'message': 'No registered compute nodes available',
-                }
-            }
-        ), 503
-
-    selected_server = secrets.choice(available_servers)
-    request_id = secrets.token_urlsafe(16)
-    with api_v1_response_lock:
-        api_v1_pending_request_ids.add(request_id)
-    queue_item = {
-        'api_v1_request': {
-            'request_id': request_id,
-            'model': model,
-            'messages': messages,
-            'options': {
-                key: value
-                for key, value in payload.items()
-                if key not in {'model', 'messages', 'stream'}
-            },
-        }
-    }
-    client_inference_requests.setdefault(selected_server, []).append(queue_item)
-
-    timeout_seconds = float(os.environ.get('TOKENPLACE_RELAY_API_V1_TIMEOUT_SECONDS', '45'))
-    response_payload = _await_api_v1_response(request_id, timeout_seconds)
-    if response_payload is None:
-        return jsonify(
-            {
-                'error': {
-                    'type': 'timeout_error',
-                    'code': 'compute_node_timeout',
-                    'message': 'Timed out waiting for registered compute node',
-                }
-            }
-        ), 504
-
-    if response_payload.get('error'):
-        logging.warning(
-            "Compute node bridge error for request_id=%s: %r",
-            request_id,
-            response_payload.get('error'),
-        )
-        return jsonify(
-            {
-                'error': {
-                    'type': 'upstream_error',
-                    'code': 'compute_node_bridge_error',
-                    'message': 'Compute node returned an error',
-                }
-            }
-        ), 502
-
-    message = response_payload.get('message')
-    if not isinstance(message, dict):
-        return jsonify(
-            {
-                'error': {
-                    'type': 'server_error',
-                    'code': 'compute_node_invalid_payload',
-                    'message': 'Compute node returned invalid response',
-                }
-            }
-        ), 502
+    """Fail closed for plaintext API v1 relay chat-completion dispatch."""
 
     return jsonify(
         {
-            'id': f"chatcmpl-{request_id}",
-            'object': 'chat.completion',
-            'created': int(time.time()),
-            'model': model,
-            'choices': [{'index': 0, 'message': message, 'finish_reason': 'stop'}],
+            'error': {
+                'type': 'service_unavailable_error',
+                'code': 'api_v1_relay_disabled',
+                'message': 'Distributed relay API v1 is disabled until end-to-end encryption is restored.',
+            }
         }
-    )
+    ), 503
 
 
 @app.route('/relay/api/v1/source', methods=['POST'])
 def relay_api_v1_source():
-    """Accept API v1 completion results from registered compute nodes."""
+    """Fail closed for plaintext API v1 relay source submission."""
 
-    auth_error = _validate_server_registration()
-    if auth_error:
-        return auth_error
-
-    payload = request.get_json() or {}
-    if not isinstance(payload, dict):
-        return jsonify({'error': 'Invalid request data'}), 400
-
-    request_id = payload.get('request_id')
-    if not isinstance(request_id, str) or not request_id.strip():
-        return jsonify({'error': 'Missing request_id'}), 400
-
-    response_payload: Dict[str, Any] = {}
-    message = payload.get('message')
-    if isinstance(message, dict):
-        response_payload['message'] = message
-    error = payload.get('error')
-    if isinstance(error, str) and error.strip():
-        response_payload['error'] = error.strip()
-
-    _enqueue_api_v1_response(request_id, response_payload)
-    return jsonify({'message': 'API v1 response queued'}), 200
+    return jsonify(
+        {
+            'error': {
+                'type': 'service_unavailable_error',
+                'code': 'api_v1_relay_disabled',
+                'message': 'Distributed relay API v1 is disabled until end-to-end encryption is restored.',
+            }
+        }
+    ), 503
 
 @app.route('/faucet', methods=['POST'])
 def faucet():
@@ -981,6 +861,12 @@ def sink():
         batch = []
         while queued_requests and len(batch) < max_batch_size:
             request_payload = queued_requests.pop(0)
+            if 'api_v1_request' in request_payload:
+                logging.warning(
+                    "Dropping plaintext api_v1_request relay queue item for server=%s",
+                    public_key,
+                )
+                continue
             if request_payload.get('stream'):
                 session = _register_stream_session(
                     public_key,
@@ -991,15 +877,12 @@ def sink():
             batch.append(request_payload)
 
         first_request = batch[0]
-        if 'api_v1_request' in first_request:
-            response_data['api_v1_request'] = first_request['api_v1_request']
-        else:
-            response_data.update({
-                'client_public_key': first_request['client_public_key'],
-                'chat_history': first_request['chat_history'],
-                'cipherkey': first_request['cipherkey'],
-                'iv': first_request.get('iv', ''),
-            })
+        response_data.update({
+            'client_public_key': first_request['client_public_key'],
+            'chat_history': first_request['chat_history'],
+            'cipherkey': first_request['cipherkey'],
+            'iv': first_request.get('iv', ''),
+        })
 
         if first_request.get('stream') and first_request.get('stream_session_id'):
             response_data['stream'] = True

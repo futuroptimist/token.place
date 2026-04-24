@@ -1,12 +1,14 @@
 from unittest.mock import call, MagicMock
 
 from utils.compute_node_runtime import (
+    ApiV1RelayRequestAdapter,
     apply_compute_mode,
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
     LegacyRelayRequestAdapter,
     first_env,
     format_relay_target,
+    is_api_v1_relay_payload,
     is_legacy_relay_payload,
     normalize_compute_mode,
     resolve_relay_port,
@@ -167,6 +169,18 @@ def test_compute_node_runtime_respects_explicit_empty_adapter_list():
     assert runtime.process_relay_request(legacy_payload) is False
     relay_client.process_client_request.assert_not_called()
 
+
+def test_api_v1_relay_payload_detection_is_hard_disabled():
+    assert is_api_v1_relay_payload({"api_v1_payload": True}) is False
+
+
+def test_api_v1_relay_request_adapter_is_noop_when_disabled():
+    relay_client = MagicMock()
+    adapter = ApiV1RelayRequestAdapter(relay_client)
+
+    assert adapter.can_process({"api_v1_payload": True}) is False
+    assert adapter.process({"api_v1_payload": True}) is False
+    relay_client.process_api_v1_chat_request.assert_not_called()
 
 def test_legacy_relay_request_adapter_only_matches_legacy_contract():
     relay_client = MagicMock()

@@ -40,8 +40,6 @@ class FakeRelayClientRouting(FakeRelayClient):
 
     def process_client_request(self, payload):
         endpoint = '/source'
-        if payload.get('stream') is True and payload.get('stream_session_id'):
-            endpoint = '/stream/source'
         self.endpoint_calls.append((endpoint, payload))
         return True
 
@@ -597,7 +595,7 @@ def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(capsy
     assert events[-1]['type'] == 'stopped'
 
 
-def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
+def test_run_stream_hint_uses_shared_runtime_non_streaming_relay_path(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)
 
@@ -626,7 +624,7 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
 
     assert len(runtime.relay_client.endpoint_calls) == 1
     endpoint, payload = runtime.relay_client.endpoint_calls[0]
-    assert endpoint == '/stream/source'
+    assert endpoint == '/source'
     assert payload['stream'] is True
     assert payload['stream_session_id'] == 'session-123'
 

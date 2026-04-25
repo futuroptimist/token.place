@@ -915,7 +915,7 @@ class TestRelayClient:
 
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_streaming_posts_to_stream_source(
+    def test_process_client_request_streaming_flag_falls_back_to_source(
         self,
         mock_post,
         relay_client,
@@ -923,7 +923,7 @@ class TestRelayClient:
         mock_model_manager,
         mock_http_response,
     ):
-        """Streaming relay requests should publish chunks to /stream/source."""
+        """Legacy stream hints must still use the non-streaming /source contract."""
         request_data = TEST_VALID_RESPONSE.copy()
         request_data['stream'] = True
         request_data['stream_session_id'] = 'session-123'
@@ -937,18 +937,18 @@ class TestRelayClient:
         assert result is True
         mock_post.assert_called_once()
         call = mock_post.call_args
-        assert call.args[0] == 'http://localhost:5000/stream/source'
-        assert call.kwargs['json']['session_id'] == 'session-123'
-        assert call.kwargs['json']['final'] is True
+        assert call.args[0] == 'http://localhost:5000/source'
+        assert call.kwargs['json']['client_public_key'] == request_data['client_public_key']
+        assert 'stream_session_id' not in call.kwargs['json']
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_streaming_uses_registration_token_header(
+    def test_process_client_request_streaming_hint_uses_registration_token_header(
         self,
         mock_post,
         mock_crypto_manager,
         mock_model_manager,
     ):
-        """Streaming posts should include the relay registration token when configured."""
+        """Stream-hinted requests should keep auth headers on the /source post."""
 
         config_values = {
             'relay.request_timeout': 15,

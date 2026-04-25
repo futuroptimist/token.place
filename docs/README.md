@@ -35,6 +35,9 @@ testing, and deploying token.place. For an expanded overview of every directory,
   - Start here: [CONTRIBUTING.md](../CONTRIBUTING.md)
   - Also see: [TESTING.md](TESTING.md), [TESTING_IMPROVEMENTS.md](TESTING_IMPROVEMENTS.md),
     [STYLE_GUIDE.md](STYLE_GUIDE.md)
+- **Review outage writeups**
+  - Start here: [outages/](../outages)
+  - Also see: [2026-04-20 relay API v1 chat regression](../outages/2026-04-20-relay-api-v1-chat-regression.md)
 
 ## Key checklists
 

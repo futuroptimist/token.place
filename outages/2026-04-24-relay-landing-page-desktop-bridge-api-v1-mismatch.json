@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-24",
+  "slug": "relay-landing-page-desktop-bridge-api-v1-mismatch",
+  "summary": "Relay landing-page chat used API v1 while desktop bridge servicing remained aligned to legacy relay request handling, allowing operators to appear registered while real landing-page requests were not processed through the intended desktop-bridge path.",
+  "impact": "Users could see healthy desktop operator status but still receive stub/fake responses or weak failure messaging when no relay compute nodes were available.",
+  "fix": "Aligned guardrails to enforce distributed API v1 landing-page routing through registered desktop bridge execution, added unmocked e2e assertions for API v1 non-streaming bridge request processing, and made this real-model guardrail always-on in CI.",
+  "lessons": "Registration heartbeat checks are not sufficient service health signals; CI guardrails must assert real end-to-end request processing on the exact API/protocol path users rely on and must fail on local-provider bypasses."
+}

@@ -455,6 +455,21 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         page.goto(base_url)
         page.wait_for_load_state("networkidle")
+        page.wait_for_function(
+            """
+            () => {
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                return Boolean(
+                    vm &&
+                    typeof vm.serverPublicKey === 'string' &&
+                    vm.serverPublicKey.trim().length > 0 &&
+                    typeof vm.clientPublicKey === 'string' &&
+                    vm.clientPublicKey.trim().length > 0
+                );
+            }
+            """
+        )
 
         textarea = page.locator("textarea").first
         textarea.fill("What is the capital of France? Respond with one word.")

@@ -56,6 +56,15 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
             retrieve_calls.append(copy.deepcopy(json))
             retrieve_attempt["count"] += 1
             if retrieve_attempt["count"] == 1:
+                return _FakeResponse(
+                    200,
+                    {
+                        "chat_history": "missing-cipher",
+                        "cipherkey": "encrypted-key",
+                        "iv": "encrypted-iv",
+                    },
+                )
+            if retrieve_attempt["count"] == 2:
                 stale_response_envelope = {
                     "protocol": "legacy_protocol",
                     "version": 1,
@@ -97,6 +106,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
     )
     assert response["content"] == "Distributed secure response"
     assert retrieve_calls == [
+        {"client_public_key": fake_crypto.public_key_b64},
         {"client_public_key": fake_crypto.public_key_b64},
         {"client_public_key": fake_crypto.public_key_b64},
     ]

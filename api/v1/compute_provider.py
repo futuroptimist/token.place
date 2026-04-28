@@ -276,6 +276,10 @@ class DistributedApiV1ComputeProvider:
                 continue
 
             decrypted_response = crypto_manager.decrypt_message(retrieve_payload)
+            if decrypted_response is None:
+                time.sleep(poll_interval)
+                continue
+
             if not isinstance(decrypted_response, dict):
                 raise _error_from_code(
                     "compute_node_invalid_payload",

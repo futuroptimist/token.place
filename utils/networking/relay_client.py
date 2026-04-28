@@ -679,50 +679,75 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if api_v1_request_payload is not None:
-                from api.v1.models import generate_response
+                from api.v1.models import ModelError, generate_response
+
+                def _post_api_v1_source(response_envelope: Dict[str, Any]) -> bool:
+                    encrypted_response = self.crypto_manager.encrypt_message(
+                        response_envelope,
+                        client_pub_key,
+                    )
+                    source_payload = {
+                        "client_public_key": client_pub_key_b64,
+                        **encrypted_response,
+                    }
+                    request_kwargs = {
+                        "json": source_payload,
+                    }
+                    headers = self._auth_headers()
+                    if headers:
+                        request_kwargs["headers"] = headers
+
+                    source_response = requests.post(
+                        f"{self.relay_url}/source",
+                        timeout=self._request_timeout,
+                        **request_kwargs,
+                    )
+                    return source_response.status_code == 200
 
                 api_v1_options = dict(api_v1_request_payload["options"])
-                response_history = generate_response(
-                    api_v1_request_payload["model"],
-                    api_v1_request_payload["messages"],
-                    **api_v1_options,
-                )
-                if not isinstance(response_history, list) or not response_history:
-                    log_error("LLM returned invalid API v1 response history")
-                    return False
-                assistant_message = response_history[-1]
-                if not isinstance(assistant_message, dict):
-                    log_error("LLM returned invalid API v1 assistant message")
-                    return False
+                try:
+                    response_history = generate_response(
+                        api_v1_request_payload["model"],
+                        api_v1_request_payload["messages"],
+                        **api_v1_options,
+                    )
+                    if not isinstance(response_history, list) or not response_history:
+                        log_error("LLM returned invalid API v1 response history")
+                        return False
+                    assistant_message = response_history[-1]
+                    if not isinstance(assistant_message, dict):
+                        log_error("LLM returned invalid API v1 assistant message")
+                        return False
 
-                encrypted_response = self.crypto_manager.encrypt_message(
-                    {
-                        "protocol": "tokenplace_api_v1_relay_e2ee",
-                        "version": 1,
-                        "request_id": api_v1_request_payload["request_id"],
-                        "api_v1_response": {
-                            "message": assistant_message,
-                        },
-                    },
-                    client_pub_key,
-                )
-                source_payload = {
-                    "client_public_key": client_pub_key_b64,
-                    **encrypted_response,
-                }
-                request_kwargs = {
-                    "json": source_payload,
-                }
-                headers = self._auth_headers()
-                if headers:
-                    request_kwargs["headers"] = headers
-
-                source_response = requests.post(
-                    f"{self.relay_url}/source",
-                    timeout=self._request_timeout,
-                    **request_kwargs
-                )
-                return source_response.status_code == 200
+                    return _post_api_v1_source(
+                        {
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
+                            "request_id": api_v1_request_payload["request_id"],
+                            "api_v1_response": {
+                                "message": assistant_message,
+                            },
+                        }
+                    )
+                except ModelError as exc:
+                    model_error_code = (
+                        "compute_node_model_unsupported"
+                        if getattr(exc, "error_type", "") == "model_not_found"
+                        else "compute_node_model_error"
+                    )
+                    return _post_api_v1_source(
+                        {
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
+                            "request_id": api_v1_request_payload["request_id"],
+                            "api_v1_response": {
+                                "error": {
+                                    "code": model_error_code,
+                                    "message": str(exc),
+                                }
+                            },
+                        }
+                    )
 
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,

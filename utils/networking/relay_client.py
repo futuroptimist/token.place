@@ -117,6 +117,16 @@ def log_error(message, *args, exc_info: bool = False) -> None:
     _log("error", message, *args, exc_info=exc_info)
 
 
+def _normalize_client_public_key_b64(client_public_key_b64: Any) -> Optional[str]:
+    """Normalize relay metadata key format for consistent decode/binding checks."""
+    if not isinstance(client_public_key_b64, str):
+        return None
+    normalized = client_public_key_b64.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
 def _extract_chat_history_and_validate_key_binding(
     decrypted_payload: Any,
     expected_client_public_key_b64: str,
@@ -663,11 +673,14 @@ class RelayClient:
                 log_error("Invalid request data format: {}", str(e))
                 return False
 
-            client_pub_key_b64 = request_data['client_public_key']
+            client_pub_key_b64 = _normalize_client_public_key_b64(request_data['client_public_key'])
+            if client_pub_key_b64 is None:
+                log_error("Invalid client_public_key format in relay request metadata")
+                return False
             stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
             try:
-                client_pub_key = base64.b64decode(client_pub_key_b64.strip(), validate=True)
+                client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
             except (AttributeError, binascii.Error, ValueError):
                 log_error("Invalid client_public_key encoding in relay request metadata")
                 return False
@@ -687,27 +700,34 @@ class RelayClient:
                 from api.v1.models import ModelError, generate_response
 
                 def _post_api_v1_source(response_envelope: Dict[str, Any]) -> bool:
-                    encrypted_response = self.crypto_manager.encrypt_message(
-                        response_envelope,
-                        client_pub_key,
-                    )
-                    source_payload = {
-                        "client_public_key": client_pub_key_b64,
-                        **encrypted_response,
-                    }
-                    request_kwargs = {
-                        "json": source_payload,
-                    }
-                    headers = self._auth_headers()
-                    if headers:
-                        request_kwargs["headers"] = headers
+                    try:
+                        encrypted_response = self.crypto_manager.encrypt_message(
+                            response_envelope,
+                            client_pub_key,
+                        )
+                        source_payload = {
+                            "client_public_key": client_pub_key_b64,
+                            **encrypted_response,
+                        }
+                        request_kwargs = {
+                            "json": source_payload,
+                        }
+                        headers = self._auth_headers()
+                        if headers:
+                            request_kwargs["headers"] = headers
 
-                    source_response = requests.post(
-                        f"{self.relay_url}/source",
-                        timeout=self._request_timeout,
-                        **request_kwargs,
-                    )
-                    return source_response.status_code == 200
+                        source_response = requests.post(
+                            f"{self.relay_url}/source",
+                            timeout=self._request_timeout,
+                            **request_kwargs,
+                        )
+                        return source_response.status_code == 200
+                    except Exception:
+                        log_error(
+                            "Failed to encrypt or post API v1 response to relay /source",
+                            exc_info=True,
+                        )
+                        return False
 
                 api_v1_options = dict(api_v1_request_payload["options"])
                 try:

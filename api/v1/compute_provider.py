@@ -151,12 +151,22 @@ class DistributedApiV1ComputeProvider:
     ) -> dict[str, Any]:
         crypto_manager = self._build_request_crypto_manager()
         relay_timeout = max(min(self.timeout_seconds, 30.0), 1.0)
+        deadline = time.time() + relay_timeout
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
+
+        def _remaining_timeout() -> float:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise _error_from_code(
+                    "compute_node_timeout",
+                    message="timed out waiting for distributed relay API v1 encrypted response",
+                )
+            return remaining
 
         try:
             next_server_response = requests.get(
                 self._relay_url("/next_server"),
-                timeout=relay_timeout,
+                timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
             raise _error_from_code(
@@ -217,7 +227,7 @@ class DistributedApiV1ComputeProvider:
             faucet_response = requests.post(
                 self._relay_url("/faucet"),
                 json=faucet_payload,
-                timeout=relay_timeout,
+                timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
             raise _error_from_code(
@@ -240,44 +250,44 @@ class DistributedApiV1ComputeProvider:
                 ),
             )
 
-        deadline = time.time() + relay_timeout
         poll_interval = self._poll_interval_seconds()
         while time.time() < deadline:
             try:
+                retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
                     self._relay_url("/retrieve"),
                     json={"client_public_key": crypto_manager.public_key_b64},
-                    timeout=poll_interval + 0.5,
+                    timeout=retrieve_timeout,
                 )
             except requests.RequestException:
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             if retrieve_response.status_code != 200:
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             try:
                 retrieve_payload = retrieve_response.json()
             except ValueError:
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             if not isinstance(retrieve_payload, dict):
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             if retrieve_payload.get("error"):
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             if not {"chat_history", "cipherkey", "iv"}.issubset(retrieve_payload.keys()):
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             decrypted_response = crypto_manager.decrypt_message(retrieve_payload)
             if decrypted_response is None:
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             if not isinstance(decrypted_response, dict):
@@ -287,11 +297,11 @@ class DistributedApiV1ComputeProvider:
                 )
 
             if decrypted_response.get("protocol") != "tokenplace_api_v1_relay_e2ee":
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             if decrypted_response.get("request_id") != relay_request_id:
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             api_v1_response = decrypted_response.get("api_v1_response")

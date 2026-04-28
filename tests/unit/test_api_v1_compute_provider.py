@@ -43,7 +43,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
 
     def fake_get(url, timeout):
         assert url == "https://node-a.example/next_server"
-        assert timeout == 5
+        assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
@@ -146,7 +146,7 @@ def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(mon
 
     def fake_get(url, timeout):
         assert url == "https://node-a.example/next_server"
-        assert timeout == 5
+        assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
@@ -171,6 +171,47 @@ def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(mon
     except ComputeProviderError as exc:
         assert exc.code == "no_registered_compute_nodes"
         assert exc.status_code == 503
+
+
+def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+    observed_timeouts = {"get": None, "post": None}
+    timestamps = iter([100.0, 102.0, 104.0])
+
+    def fake_time():
+        return next(timestamps)
+
+    def fake_get(url, timeout):
+        observed_timeouts["get"] = timeout
+        assert url == "https://node-a.example/next_server"
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        observed_timeouts["post"] = timeout
+        assert url == "https://node-a.example/faucet"
+        return _FakeResponse(404, {"error": "server unavailable"})
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.time, "time", fake_time)
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "no_registered_compute_nodes"
+
+    assert observed_timeouts["get"] == 3.0
+    assert observed_timeouts["post"] == 1.0
 
 
 def test_get_provider_disables_local_fallback_when_configured(monkeypatch):

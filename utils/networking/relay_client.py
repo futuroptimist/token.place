@@ -754,9 +754,45 @@ class RelayClient:
                         }
                     )
                 except ModelError as exc:
+                    error_type = getattr(exc, "error_type", "")
+                    if error_type in {"model_not_found", "model_load_error"} and hasattr(
+                        self.model_manager, "llama_cpp_get_response"
+                    ):
+                        log_info(
+                            "API v1 relay request model '%s' unavailable (%s); "
+                            "falling back to active compute-node runtime model",
+                            api_v1_request_payload["model"],
+                            error_type,
+                        )
+                        try:
+                            fallback_response_history = self.model_manager.llama_cpp_get_response(
+                                api_v1_request_payload["messages"]
+                            )
+                        except Exception as fallback_exc:
+                            log_error(
+                                "Fallback runtime-model execution failed for API v1 relay request: {}",
+                                str(fallback_exc),
+                                exc_info=True,
+                            )
+                        else:
+                            if isinstance(fallback_response_history, list) and fallback_response_history:
+                                fallback_assistant_message = fallback_response_history[-1]
+                                if isinstance(fallback_assistant_message, dict):
+                                    return _post_api_v1_source(
+                                        {
+                                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                                            "version": 1,
+                                            "request_id": api_v1_request_payload["request_id"],
+                                            "api_v1_response": {
+                                                "message": fallback_assistant_message,
+                                            },
+                                        }
+                                    )
+                            log_error("Fallback runtime-model execution returned invalid API v1 output")
+
                     model_error_code = (
                         "compute_node_model_unsupported"
-                        if getattr(exc, "error_type", "") == "model_not_found"
+                        if error_type == "model_not_found"
                         else "compute_node_model_error"
                     )
                     return _post_api_v1_source(

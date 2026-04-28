@@ -471,8 +471,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             """
         )
 
+        prompt_text = "What is the capital of France? Respond with one word."
         textarea = page.locator("textarea").first
-        textarea.fill("What is the capital of France? Respond with one word.")
         page.evaluate(
             """
             () => {
@@ -493,38 +493,43 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             }
             """
         )
-        page.locator("button", has_text="Send").click()
-        page.wait_for_function(
-            """
-            () => {
-                const appEl = document.querySelector('#app');
-                const vm = appEl && appEl.__vue__;
-                if (!vm || !Array.isArray(vm.chatHistory)) {
-                    return false;
+        assistant_text = ""
+        user_message_count = page.locator(".user-message").count()
+        assistant_message_count = page.locator(".assistant-message").count()
+        transient_bridge_errors = {
+            "Unable to contact the LLM server right now. Please try again.",
+            "The LLM server is unavailable right now. Please try again.",
+            "The LLM server took too long to respond. Please try again.",
+        }
+        for _ in range(2):
+            textarea.fill(prompt_text)
+            page.locator("button", has_text="Send").click()
+            user_message_count += 1
+            page.locator(".user-message").nth(user_message_count - 1).wait_for(state="visible")
+
+            assistant_message_count += 1
+            assistant_message = page.locator(".assistant-message").nth(assistant_message_count - 1)
+            assistant_message.wait_for(state="visible")
+            page.wait_for_function(
+                """
+                ({ selector, index }) => {
+                    const nodes = document.querySelectorAll(selector);
+                    const node = nodes[index];
+                    if (!node) return false;
+                    const text = (node.textContent || '').trim();
+                    return text.length > 0;
                 }
-                return vm.chatHistory.some((entry) => entry && entry.role === 'user');
-            }
-            """
-        )
+                """,
+                arg={
+                    "selector": ".assistant-message",
+                    "index": assistant_message_count - 1,
+                },
+            )
+            assistant_text = assistant_message.inner_text().strip()
+            if assistant_text and assistant_text not in transient_bridge_errors:
+                break
 
-        assistant_message = page.locator(".assistant-message").last
-        assistant_message.wait_for(state="visible")
-
-        page.wait_for_function(
-            """
-            ({ selector }) => {
-                const nodes = document.querySelectorAll(selector);
-                if (!nodes.length) return false;
-                const latest = nodes[nodes.length - 1];
-                return Boolean(latest.textContent && latest.textContent.trim().length > 0);
-            }
-            """,
-            arg={
-                "selector": ".assistant-message",
-            },
-        )
-
-        assistant_text = assistant_message.inner_text()
+        assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"
         assert "Sorry, I encountered an issue generating a response." not in assistant_text
         assert "Paris" in assistant_text

@@ -835,6 +835,91 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    @patch('api.v1.models.generate_response')
+    def test_process_client_request_api_v1_e2ee_success(
+        self,
+        mock_generate_response,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """API v1 relay envelopes should call generate_response and post encrypted response."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        decrypted_payload = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-123",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {"temperature": 0.2, "max_tokens": 50},
+            },
+        }
+        mock_crypto_manager.decrypt_message.return_value = decrypted_payload
+        mock_generate_response.return_value = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv'
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is True
+        mock_generate_response.assert_called_once_with(
+            "llama-3-8b-instruct",
+            [{"role": "user", "content": "Hello"}],
+            temperature=0.2,
+            max_tokens=50,
+        )
+        mock_post.assert_called_once_with(
+            'http://localhost:5000/source',
+            json={
+                'client_public_key': request_data["client_public_key"],
+                'chat_history': 'encrypted_chat_history',
+                'cipherkey': 'encrypted_key',
+                'iv': 'encrypted_iv',
+            },
+            timeout=relay_client._request_timeout,
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    @patch('api.v1.models.generate_response')
+    def test_process_client_request_api_v1_e2ee_rejects_mismatched_bound_key(
+        self,
+        mock_generate_response,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """API v1 relay envelopes with mismatched encrypted key bindings are rejected."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-123",
+            "client_public_key": "different-client-key",
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {"temperature": 0.2},
+            },
+        }
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is False
+        mock_generate_response.assert_not_called()
+        mock_post.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_rejects_mismatched_bound_client_key(
         self,
         mock_post,

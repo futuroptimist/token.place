@@ -39,6 +39,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
     fake_crypto = _FakeCryptoManager()
     posted_payloads = []
     retrieve_calls = []
+    retrieve_attempt = {"count": 0}
 
     def fake_get(url, timeout):
         assert url == "https://node-a.example/next_server"
@@ -53,6 +54,21 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
             return _FakeResponse(200, {"message": "Request received"})
         if url.endswith("/retrieve"):
             retrieve_calls.append(copy.deepcopy(json))
+            retrieve_attempt["count"] += 1
+            if retrieve_attempt["count"] == 1:
+                stale_response_envelope = {
+                    "protocol": "legacy_protocol",
+                    "version": 1,
+                    "request_id": "stale",
+                    "api_v1_response": {
+                        "message": {"role": "assistant", "content": "ignore stale"},
+                    },
+                }
+                stale_encrypted_response = fake_crypto.encrypt_message(
+                    stale_response_envelope,
+                    fake_crypto.public_key_b64,
+                )
+                return _FakeResponse(200, stale_encrypted_response)
             response_envelope = {
                 "protocol": "tokenplace_api_v1_relay_e2ee",
                 "version": 1,
@@ -65,7 +81,11 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
             return _FakeResponse(200, encrypted_response)
         raise AssertionError(f"unexpected URL {url}")
 
-    monkeypatch.setattr(compute_provider, "get_crypto_manager", lambda: fake_crypto)
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
     monkeypatch.setattr(compute_provider.requests, "get", fake_get)
     monkeypatch.setattr(compute_provider.requests, "post", fake_post)
 
@@ -76,7 +96,10 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
-    assert retrieve_calls == [{"client_public_key": fake_crypto.public_key_b64}]
+    assert retrieve_calls == [
+        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64},
+    ]
     assert posted_payloads[0][0] == "https://node-a.example/faucet"
     assert posted_payloads[1][0] == "https://node-a.example/retrieve"
 
@@ -106,6 +129,38 @@ def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(mon
     )
 
     assert result == fallback_message
+
+
+def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+
+    def fake_get(url, timeout):
+        assert url == "https://node-a.example/next_server"
+        assert timeout == 5
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        assert url == "https://node-a.example/faucet"
+        return _FakeResponse(404, {"error": "server unavailable"})
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "no_registered_compute_nodes"
+        assert exc.status_code == 503
 
 
 def test_get_provider_disables_local_fallback_when_configured(monkeypatch):

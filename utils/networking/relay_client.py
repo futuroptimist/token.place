@@ -679,9 +679,13 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if api_v1_request_payload is not None:
-                response_history = self.model_manager.llama_cpp_get_response(
+                from api.v1.models import generate_response
+
+                api_v1_options = dict(api_v1_request_payload["options"])
+                response_history = generate_response(
+                    api_v1_request_payload["model"],
                     api_v1_request_payload["messages"],
-                    **api_v1_request_payload["options"],
+                    **api_v1_options,
                 )
                 if not isinstance(response_history, list) or not response_history:
                     log_error("LLM returned invalid API v1 response history")
@@ -708,16 +712,14 @@ class RelayClient:
                 }
                 request_kwargs = {
                     "json": source_payload,
-                    "timeout": self._request_timeout,
                 }
                 headers = self._auth_headers()
                 if headers:
                     request_kwargs["headers"] = headers
 
-                timeout = request_kwargs.pop("timeout", self._request_timeout)
                 source_response = requests.post(
                     f"{self.relay_url}/source",
-                    timeout=timeout,
+                    timeout=self._request_timeout,
                     **request_kwargs
                 )
                 return source_response.status_code == 200

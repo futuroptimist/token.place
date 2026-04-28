@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional, Protocol
 import requests
 
 from api.v1.models import generate_response
-from utils.crypto.crypto_manager import get_crypto_manager
+from utils.crypto.crypto_manager import CryptoManager
 
 logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -138,6 +138,10 @@ class DistributedApiV1ComputeProvider:
     def _poll_interval_seconds(self) -> float:
         return min(max(self.timeout_seconds / 20.0, 0.1), 0.5)
 
+    def _build_request_crypto_manager(self) -> CryptoManager:
+        """Create an isolated crypto manager for each relay request."""
+        return CryptoManager()
+
     def complete_chat(
         self,
         *,
@@ -145,7 +149,7 @@ class DistributedApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        crypto_manager = get_crypto_manager()
+        crypto_manager = self._build_request_crypto_manager()
         relay_timeout = max(min(self.timeout_seconds, 30.0), 1.0)
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
 
@@ -221,6 +225,12 @@ class DistributedApiV1ComputeProvider:
                 message=f"unable to post encrypted request to relay faucet endpoint: {exc}",
             ) from exc
 
+        if faucet_response.status_code == 404:
+            raise _error_from_code(
+                "no_registered_compute_nodes",
+                message="relay reported selected compute node is no longer available",
+            )
+
         if faucet_response.status_code != 200:
             raise _error_from_code(
                 "compute_node_bridge_error",
@@ -273,10 +283,8 @@ class DistributedApiV1ComputeProvider:
                 )
 
             if decrypted_response.get("protocol") != "tokenplace_api_v1_relay_e2ee":
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="decrypted relay response protocol mismatch",
-                )
+                time.sleep(poll_interval)
+                continue
 
             if decrypted_response.get("request_id") != relay_request_id:
                 time.sleep(poll_interval)

@@ -17,6 +17,8 @@ class _FakeResponse:
         self._payload = payload
 
     def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
         return copy.deepcopy(self._payload)
 
 
@@ -56,6 +58,22 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
             retrieve_calls.append(copy.deepcopy(json))
             retrieve_attempt["count"] += 1
             if retrieve_attempt["count"] == 1:
+                return _FakeResponse(503, {"error": "busy"})
+            if retrieve_attempt["count"] == 2:
+                return _FakeResponse(200, ValueError("not json"))
+            if retrieve_attempt["count"] == 3:
+                return _FakeResponse(200, ["not", "a", "dict"])
+            if retrieve_attempt["count"] == 4:
+                return _FakeResponse(200, {"error": {"code": "still processing"}})
+            if retrieve_attempt["count"] == 5:
+                return _FakeResponse(
+                    200,
+                    {
+                        "chat_history": "cipher-with-missing-fields",
+                        "cipherkey": "encrypted-key",
+                    },
+                )
+            if retrieve_attempt["count"] == 6:
                 return _FakeResponse(
                     200,
                     {
@@ -64,7 +82,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
                         "iv": "encrypted-iv",
                     },
                 )
-            if retrieve_attempt["count"] == 2:
+            if retrieve_attempt["count"] == 7:
                 stale_response_envelope = {
                     "protocol": "legacy_protocol",
                     "version": 1,
@@ -106,6 +124,11 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
     )
     assert response["content"] == "Distributed secure response"
     assert retrieve_calls == [
+        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64},
         {"client_public_key": fake_crypto.public_key_b64},
         {"client_public_key": fake_crypto.public_key_b64},
         {"client_public_key": fake_crypto.public_key_b64},

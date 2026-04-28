@@ -748,6 +748,25 @@ class RelayClient:
                             },
                         }
                     )
+                except Exception as exc:
+                    log_error(
+                        "Unexpected error processing API v1 relay request: {}",
+                        str(exc),
+                        exc_info=True,
+                    )
+                    return _post_api_v1_source(
+                        {
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
+                            "request_id": api_v1_request_payload["request_id"],
+                            "api_v1_response": {
+                                "error": {
+                                    "code": "compute_node_internal_error",
+                                    "message": "Unexpected internal error during inference",
+                                }
+                            },
+                        }
+                    )
 
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,

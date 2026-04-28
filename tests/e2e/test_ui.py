@@ -494,6 +494,18 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             """
         )
         page.locator("button", has_text="Send").click()
+        page.wait_for_function(
+            """
+            () => {
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                if (!vm || !Array.isArray(vm.chatHistory)) {
+                    return false;
+                }
+                return vm.chatHistory.some((entry) => entry && entry.role === 'user');
+            }
+            """
+        )
 
         assistant_message = page.locator(".assistant-message").last
         assistant_message.wait_for(state="visible")

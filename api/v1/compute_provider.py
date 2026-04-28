@@ -216,7 +216,13 @@ class DistributedApiV1ComputeProvider:
             },
         }
 
-        encrypted_envelope = crypto_manager.encrypt_message(plaintext_envelope, server_public_key)
+        try:
+            encrypted_envelope = crypto_manager.encrypt_message(plaintext_envelope, server_public_key)
+        except Exception as exc:
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message=f"failed to encrypt relay request envelope: {exc}",
+            ) from exc
         faucet_payload = {
             "client_public_key": crypto_manager.public_key_b64,
             "server_public_key": server_public_key,

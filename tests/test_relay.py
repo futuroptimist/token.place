@@ -380,6 +380,41 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
     assert crypto_stub.last_encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
 
 
+def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-invalid-client-key",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    post_calls = {"count": 0}
+
+    def fake_post(*_args, **_kwargs):
+        post_calls["count"] += 1
+        class _Response:
+            status_code = 200
+        return _Response()
+
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": "%%%not-base64%%%",
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is False
+    assert post_calls["count"] == 0
+
+
 def test_relay_client_api_v1_posts_encrypted_model_unsupported_error(monkeypatch):
     from api.v1.models import ModelError
 

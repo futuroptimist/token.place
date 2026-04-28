@@ -37,6 +37,11 @@ class _FakeCryptoManager:
         return copy.deepcopy(self._encrypted.get(encrypted_payload.get("chat_history")))
 
 
+class _FailingEncryptCryptoManager(_FakeCryptoManager):
+    def encrypt_message(self, _message, _client_public_key):
+        raise ValueError("invalid server key")
+
+
 def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch):
     fake_crypto = _FakeCryptoManager()
     posted_payloads = []
@@ -194,6 +199,34 @@ def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(mon
     except ComputeProviderError as exc:
         assert exc.code == "no_registered_compute_nodes"
         assert exc.status_code == 503
+
+
+def test_distributed_compute_provider_maps_encryption_failure_to_provider_error(monkeypatch):
+    fake_crypto = _FailingEncryptCryptoManager()
+
+    def fake_get(url, timeout):
+        assert url == "https://node-a.example/next_server"
+        assert 0 < timeout <= 5
+        return _FakeResponse(200, {"server_public_key": "bad-server-key"})
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_invalid_payload"
+        assert exc.status_code == 502
+        assert "failed to encrypt relay request envelope" in str(exc)
 
 
 def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypatch):

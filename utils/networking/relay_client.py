@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ipaddress
 import json
 import jsonschema
@@ -665,7 +666,11 @@ class RelayClient:
             client_pub_key_b64 = request_data['client_public_key']
             stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
-            client_pub_key = base64.b64decode(client_pub_key_b64)
+            try:
+                client_pub_key = base64.b64decode(client_pub_key_b64.strip(), validate=True)
+            except (AttributeError, binascii.Error, ValueError):
+                log_error("Invalid client_public_key encoding in relay request metadata")
+                return False
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)

@@ -713,11 +713,35 @@ class RelayClient:
                     )
                     if not isinstance(response_history, list) or not response_history:
                         log_error("LLM returned invalid API v1 response history")
-                        return False
+                        return _post_api_v1_source(
+                            {
+                                "protocol": "tokenplace_api_v1_relay_e2ee",
+                                "version": 1,
+                                "request_id": api_v1_request_payload["request_id"],
+                                "api_v1_response": {
+                                    "error": {
+                                        "code": "compute_node_internal_error",
+                                        "message": "LLM returned invalid response history",
+                                    }
+                                },
+                            }
+                        )
                     assistant_message = response_history[-1]
                     if not isinstance(assistant_message, dict):
                         log_error("LLM returned invalid API v1 assistant message")
-                        return False
+                        return _post_api_v1_source(
+                            {
+                                "protocol": "tokenplace_api_v1_relay_e2ee",
+                                "version": 1,
+                                "request_id": api_v1_request_payload["request_id"],
+                                "api_v1_response": {
+                                    "error": {
+                                        "code": "compute_node_internal_error",
+                                        "message": "LLM returned invalid assistant message",
+                                    }
+                                },
+                            }
+                        )
 
                     return _post_api_v1_source(
                         {

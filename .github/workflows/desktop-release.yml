@@ -302,7 +302,7 @@ jobs:
           path: release-assets/windows
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@153bb8e36b35d4f28c473603ceb4af68578f6b88 # v2.6.1
+        uses: softprops/action-gh-release@153bb8e36b35d4f28c473603ceb4af68578f6b88
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:

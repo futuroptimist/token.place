@@ -1,5 +1,7 @@
 import copy
 import json
+import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -45,17 +47,13 @@ def test_static_forbidden_plaintext_patterns_regression_guard():
         root / "server.py",
     ]
     forbidden_patterns = [
-        "client_inference_requests.setdefault(server_public_key, []).append({\"api_v1_request\"",
-        "client_inference_requests.setdefault(server_public_key, []).append({'api_v1_request'",
-        "\"api_v1_request\": {\"messages\"",
-        "'api_v1_request': {'messages'",
-        "requests.post(self._relay_url('/relay/api/v1/chat/completions')",
-        "requests.post(self._relay_url(\"/relay/api/v1/chat/completions\")",
+        r"client_inference_requests\.setdefault\(server_public_key,\s*\[\]\)\.append\(\s*\{[^}]*api_v1_request[^}]*messages",
+        r"requests\.post\(self\._relay_url\((?:'|\")/relay/api/v1/chat/completions(?:'|\")\)",
     ]
 
     scanned = "\n\n".join(f.read_text(encoding="utf-8") for f in targets if f.exists())
 
-    matched = [pattern for pattern in forbidden_patterns if pattern in scanned]
+    matched = [pattern for pattern in forbidden_patterns if re.search(pattern, scanned, flags=re.DOTALL)]
     assert matched == [], (
         "Found forbidden plaintext relay-dispatch pattern(s): "
         f"{matched}. These patterns indicate PR #813-style regression risk."
@@ -83,6 +81,7 @@ def test_runtime_relay_state_never_stores_plaintext_sentinel_when_distributed_di
 
 def test_network_egress_never_leaks_plaintext_sentinel_to_relay(monkeypatch):
     outbound = []
+    crypto_manager = compute_provider.CryptoManager()
 
     class _Resp:
         def __init__(self, status_code, payload):
@@ -96,7 +95,9 @@ def test_network_egress_never_leaks_plaintext_sentinel_to_relay(monkeypatch):
         def _inner(url, **kwargs):
             outbound.append({"method": method, "url": url, "kwargs": copy.deepcopy(kwargs)})
             if str(url).endswith("/next_server"):
-                return _Resp(200, {"error": {"code": 503, "message": "No servers available"}})
+                return _Resp(200, {"server_public_key": crypto_manager.public_key_b64})
+            if str(url).endswith("/faucet"):
+                return _Resp(500, {"error": "forced faucet failure for test coverage"})
             return _Resp(500, {"error": "unexpected"})
 
         return _inner
@@ -117,9 +118,9 @@ def test_network_egress_never_leaks_plaintext_sentinel_to_relay(monkeypatch):
             options={"temperature": 0.1},
         )
 
-    relay_calls = [call for call in outbound if "relay" in call["url"]]
-    assert relay_calls, "Expected at least one relay-targeted outbound call"
-    serialized = _to_text(relay_calls)
+    faucet_calls = [call for call in outbound if str(call["url"]).endswith("/faucet")]
+    assert faucet_calls, "Expected an outbound /faucet relay request"
+    serialized = _to_text(faucet_calls)
     assert E2EE_SENTINEL_NETWORK not in serialized
 
 
@@ -133,10 +134,17 @@ def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(caplog, relay_clien
         {"api_v1_request": {"messages": [{"role": "user", "content": E2EE_SENTINEL_LOGS}]}}
     ]
 
-    sink_response = relay_client.post("/sink", json={"server_public_key": "server-key"})
-    assert sink_response.status_code == 200
+    relay_logger = logging.getLogger("tokenplace.relay")
+    relay_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="tokenplace.relay"):
+            sink_response = relay_client.post("/sink", json={"server_public_key": "server-key"})
+        assert sink_response.status_code == 200
+    finally:
+        relay_logger.removeHandler(caplog.handler)
 
     logs_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert logs_text, "Expected relay logs to be captured during /sink request"
     assert E2EE_SENTINEL_LOGS not in logs_text
 
     diagnostics_text = _to_text(relay_client.get("/relay/diagnostics").get_json())

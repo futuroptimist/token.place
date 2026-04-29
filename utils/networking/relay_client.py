@@ -578,7 +578,7 @@ class RelayClient:
 
             try:
                 log_info(
-                    "Pinging relay {}/sink with key {}...",
+                    "desktop.compute_node_bridge.api_v1_e2ee.poll relay={} with key {}...",
                     candidate_url,
                     self.crypto_manager.public_key_b64[:10],
                 )
@@ -592,15 +592,34 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 timeout = request_kwargs.pop('timeout', self._request_timeout)
+                register_response = requests.post(
+                    f'{candidate_url}/api/v1/relay/servers/register',
+                    timeout=timeout,
+                    **request_kwargs,
+                )
+                if register_response.status_code != 200:
+                    log_error(
+                        "Error from relay /api/v1/relay/servers/register: status {} ({} bytes)",
+                        register_response.status_code,
+                        len(register_response.text),
+                    )
+                    last_error = {
+                        'error': f"HTTP {register_response.status_code}",
+                        'next_ping_in_x_seconds': self._request_timeout,
+                    }
+                    encountered_error = True
+                    continue
+
+                log_info("desktop.compute_node_bridge.api_v1_e2ee.register relay={}", candidate_url)
                 response = requests.post(
-                    f'{candidate_url}/sink',
+                    f'{candidate_url}/api/v1/relay/servers/poll',
                     timeout=timeout,
                     **request_kwargs,
                 )
 
                 if response.status_code != 200:
                     log_error(
-                        "Error from relay /sink: status {} ({} bytes)",
+                        "Error from relay /api/v1/relay/servers/poll: status {} ({} bytes)",
                         response.status_code,
                         len(response.text),
                     )
@@ -717,14 +736,14 @@ class RelayClient:
                             request_kwargs["headers"] = headers
 
                         source_response = requests.post(
-                            f"{self.relay_url}/source",
+                            f"{self.relay_url}/api/v1/relay/responses",
                             timeout=self._request_timeout,
                             **request_kwargs,
                         )
                         return source_response.status_code == 200
                     except Exception:
                         log_error(
-                            "Failed to encrypt or post API v1 response to relay /source",
+                            "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
                             exc_info=True,
                         )
                         return False
@@ -913,7 +932,7 @@ class RelayClient:
                 log_error("Invalid response payload format: {}", str(e))
                 return False
 
-            log_info("Posting response to {}/source. Payload keys: {}", self.relay_url, list(source_payload.keys()))
+            log_info("desktop.compute_node_bridge.api_v1_e2ee.response_submitted relay={} payload_keys={}", self.relay_url, list(source_payload.keys()))
 
             request_kwargs = {
                 'json': source_payload,
@@ -925,24 +944,24 @@ class RelayClient:
 
             timeout = request_kwargs.pop('timeout', self._request_timeout)
             source_response = requests.post(
-                f'{self.relay_url}/source',
+                f'{self.relay_url}/api/v1/relay/responses',
                 timeout=timeout,
                 **request_kwargs
             )
 
             log_info(
-                "Response sent to /source. Status: {}, body length: {}",
+                "Response sent to /api/v1/relay/responses. Status: {}, body length: {}",
                 source_response.status_code,
                 len(source_response.text)
             )
 
             if source_response.status_code != 200:
-                log_error("Error status from /source: {}", source_response.status_code)
+                log_error("Error status from /api/v1/relay/responses: {}", source_response.status_code)
                 return False
 
             response_content = source_response.text.strip()
             if not response_content:
-                log_error("Empty response from /source")
+                log_error("Empty response from /api/v1/relay/responses")
                 return False
 
             return True

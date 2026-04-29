@@ -256,7 +256,7 @@ jobs:
           PY
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact_name }}
           path: desktop-tauri/release-artifacts/*
@@ -302,7 +302,7 @@ jobs:
           path: release-assets/windows
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@c062e08bd532815e2082a7e09a9927dc4bc7a32c # v2.3.2
+        uses: softprops/action-gh-release@153bb8e36b35d4f28c473603ceb4af68578f6b88 # v2.6.1
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:

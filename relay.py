@@ -801,6 +801,10 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
 
+    if not envelope.get('client_public_key'):
+        return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
+
+    envelope['e2ee_v1'] = True
     client_inference_requests.setdefault(server_public_key, []).append(envelope)
     return jsonify({'message': 'Request received'}), 200
 
@@ -980,7 +984,7 @@ def sink():
         batch = []
         while queued_requests and len(batch) < max_batch_size:
             request_payload = queued_requests.pop(0)
-            if 'api_v1_request' in request_payload:
+            if 'api_v1_request' in request_payload or request_payload.get('e2ee_v1'):
                 LOGGER.warning(
                     "relay.api_v1_plaintext_payload_dropped",
                     extra={"server_public_key": public_key},

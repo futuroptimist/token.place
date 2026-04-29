@@ -1097,6 +1097,19 @@ def test_api_v1_relay_plaintext_messages_not_stored(client):
     assert plaintext not in json.dumps(queued_payload)
 
 
+def test_api_v1_relay_requests_requires_client_public_key(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    response = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-missing-client-key',
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'ciphertext': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+
+    assert response.status_code == 400
+    assert response.get_json() == {'error': {'message': 'Missing client public key', 'code': 400}}
 
 
 def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeypatch):

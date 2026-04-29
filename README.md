@@ -165,20 +165,23 @@ See also:
 
 ## API v1 E2EE architecture baseline (v0.1.0)
 
-- **API v1 is the active API for v0.1.0** and the only active runtime integration target.
+- **This baseline applies to the active v0.1.0 relay/client-server runtime path** (including distributed relay and desktop integration paths being finalized for v0.1.0).
+- **API v1 is the active API for v0.1.0** and the only approved runtime integration target.
 - **API v1 is non-streaming** for relay/client-server inference paths; return responses only after
   full model generation is complete.
 - **Do not add streaming to API v1** for active relay/client-server paths.
 - **API v2 exists but is incomplete**; do not route runtime traffic through API v2 until API v1 is
   launched and v0.1.0 is finalized.
+- **If later sections of this README show API v2 streaming or `/api/v2/chat/completions` examples,
+  treat them as experimental/reference-only** and not as approved runtime integration guidance for v0.1.0.
 - **Deprecated legacy relay endpoints**: `/sink`, `/faucet`, `/source`, `/retrieve`,
   `/next_server`. Do not use, extend, or reintroduce these as active production fallbacks.
 - Relay-blind E2EE remains mandatory: relay surfaces may see ciphertext + safe routing metadata
   only, and must never store or expose plaintext model payload content.
 
 Known migration gap: `relay.py`, desktop-tauri paths, and relay landing-page HTML chat flow are
-not fully aligned yet; some E2E pieces still hit legacy routes. Prompts 1-4 handle that migration
-work. Prompt 0 is docs-only.
+not fully aligned yet; some E2E pieces still hit legacy routes. This migration is tracked as
+follow-up implementation work.
 
 See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md).
 

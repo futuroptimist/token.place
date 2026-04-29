@@ -39,4 +39,4 @@ Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python
 - Active inference paths for `server.py`, `relay.py`, `client.py`, desktop Tauri flows, and relay
   HTML chat UI should use API v1 E2EE routes.
 - Relay must remain ciphertext-only (+ routing metadata). If E2EE is not possible, fail closed.
-- See docs/architecture/api_v1_e2ee_relay.md for migration context and Prompt 1-4 alignment work.
+- See docs/architecture/api_v1_e2ee_relay.md for migration context and follow-up alignment work.

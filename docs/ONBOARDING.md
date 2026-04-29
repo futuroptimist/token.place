@@ -38,7 +38,7 @@ This ensures that plaintext prompts and responses never reach the relay or any i
   it must fail closed.
 
 Known migration context: `relay.py`, desktop Tauri, and relay HTML chat UI are not fully aligned
-yet and some E2E pieces still touch legacy routes. Prompts 1-4 own that migration work.
+yet and some E2E pieces still touch legacy routes. The migration is tracked as follow-up work.
 See [docs/architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
 
 ## Cross-Platform Notes

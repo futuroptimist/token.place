@@ -626,6 +626,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             if "desktop.compute_node_bridge.process_request" in line
         ]
         assert process_request_lines, "desktop bridge should process encrypted relay requests"
+        bridge_stderr_text = "".join(stderr_lines)
+        assert "E2EE_SENTINEL_SHOULD_NEVER_REACH_RELAY_PLAINTEXT" not in bridge_stderr_text
+        assert "E2EE_SENTINEL_SHOULD_NEVER_LEAVE_PROCESS_AS_PLAINTEXT" not in bridge_stderr_text
+        assert "E2EE_SENTINEL_SHOULD_NEVER_APPEAR_IN_LOGS_OR_DIAGNOSTICS" not in bridge_stderr_text
     finally:
         if bridge_process.stdin:
             try:

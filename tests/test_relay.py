@@ -6,6 +6,7 @@ import sys
 import os
 from datetime import datetime, timedelta
 import relay as relay_module
+from utils.networking.relay_client import RelayClient
 
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -298,6 +299,386 @@ def test_relay_api_v1_source_fails_closed(client):
     data = response.get_json()
     assert data["error"]["type"] == "service_unavailable_error"
     assert data["error"]["code"] == "distributed_api_v1_relay_disabled"
+
+
+class _RelayClientApiV1CryptoStub:
+    def __init__(self, decrypted_payload):
+        self.decrypted_payload = decrypted_payload
+        self.last_encrypted_payload = None
+
+    def decrypt_message(self, _request_data):
+        return self.decrypted_payload
+
+    def encrypt_message(self, payload, _client_pub_key):
+        self.last_encrypted_payload = payload
+        return {
+            "chat_history": "ciphertext-only",
+            "cipherkey": "cipher-key",
+            "iv": "cipher-iv",
+        }
+
+
+def _build_relay_client_for_api_v1_tests(crypto_stub, model_manager=None):
+    return RelayClient(
+        base_url="https://relay.example",
+        port=None,
+        crypto_manager=crypto_stub,
+        model_manager=model_manager or object(),
+        include_configured_servers=False,
+    )
+
+
+def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monkeypatch):
+    captured = {}
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-1",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {"temperature": 0.2, "max_tokens": 42},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    def fake_generate_response(model, messages, **options):
+        captured["model"] = model
+        captured["messages"] = messages
+        captured["options"] = options
+        return messages + [{"role": "assistant", "content": "bonjour"}]
+
+    def fake_post(url, json, timeout, **_kwargs):
+        assert url == "https://relay.example/source"
+        assert timeout == relay_client._request_timeout
+        assert "chat_history" in json and "cipherkey" in json and "iv" in json
+        assert "messages" not in json
+        assert "prompt" not in json
+        assert "model" not in json
+        assert "api_v1_response" not in json
+
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is True
+    assert captured["model"] == "llama-3-8b-instruct:alignment"
+    assert captured["messages"] == [{"role": "user", "content": "hello"}]
+    assert captured["options"] == {"temperature": 0.2, "max_tokens": 42}
+    assert crypto_stub.last_encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
+
+
+def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-invalid-client-key",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    post_calls = {"count": 0}
+
+    def fake_post(*_args, **_kwargs):
+        post_calls["count"] += 1
+        class _Response:
+            status_code = 200
+        return _Response()
+
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": "%%%not-base64%%%",
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is False
+    assert post_calls["count"] == 0
+
+
+def test_relay_client_api_v1_normalizes_client_public_key_binding(monkeypatch):
+    normalized_client_key = DUMMY_CLIENT_PUB_KEY
+    request_client_key = f"  {normalized_client_key}\n"
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": normalized_client_key,
+        "request_id": "req-normalized-client-key",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    def fake_generate_response(_model, messages, **_options):
+        return messages + [{"role": "assistant", "content": "bonjour"}]
+
+    def fake_post(_url, json, timeout, **_kwargs):
+        assert timeout == relay_client._request_timeout
+        assert json["client_public_key"] == normalized_client_key
+
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": request_client_key,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is True
+
+
+def test_relay_client_api_v1_posts_encrypted_model_unsupported_error(monkeypatch):
+    from api.v1.models import ModelError
+
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-unsupported",
+        "api_v1_request": {
+            "model": "unknown-model-id",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    def fake_generate_response(*_args, **_kwargs):
+        raise ModelError("Model 'unknown-model-id' not found", status_code=404, error_type="model_not_found")
+
+    def fake_post(_url, json=None, timeout=None, **_kwargs):
+        assert json is not None
+        assert timeout is not None
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is True
+    encrypted_payload = crypto_stub.last_encrypted_payload
+    assert encrypted_payload["request_id"] == "req-unsupported"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
+
+
+def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unavailable(monkeypatch):
+    from api.v1.models import ModelError
+
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-runtime-fallback",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {"temperature": 0.2},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+
+    class _RuntimeModelManager:
+        @staticmethod
+        def llama_cpp_get_response(messages):
+            return messages + [{"role": "assistant", "content": "Paris"}]
+
+    relay_client = _build_relay_client_for_api_v1_tests(
+        crypto_stub,
+        model_manager=_RuntimeModelManager(),
+    )
+
+    def fake_generate_response(*_args, **_kwargs):
+        raise ModelError("Model file missing", status_code=500, error_type="model_load_error")
+
+    def fake_post(_url, json=None, timeout=None, **_kwargs):
+        assert json is not None
+        assert timeout is not None
+
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is True
+    encrypted_payload = crypto_stub.last_encrypted_payload
+    assert encrypted_payload["request_id"] == "req-runtime-fallback"
+    assert encrypted_payload["api_v1_response"]["message"]["content"] == "Paris"
+
+
+def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_exception(monkeypatch):
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-internal",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {"temperature": 0.2},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    def fake_generate_response(*_args, **_kwargs):
+        raise RuntimeError("backend crashed")
+
+    def fake_post(_url, json=None, timeout=None, **_kwargs):
+        assert json is not None
+        assert timeout is not None
+
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is True
+    encrypted_payload = crypto_stub.last_encrypted_payload
+    assert encrypted_payload["request_id"] == "req-internal"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
+
+
+def test_relay_client_api_v1_source_post_failure_returns_false(monkeypatch):
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-source-post-failure",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    def fake_generate_response(_model, messages, **_options):
+        return messages + [{"role": "assistant", "content": "bonjour"}]
+
+    def raising_post(*_args, **_kwargs):
+        raise RuntimeError("relay /source unavailable")
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", raising_post)
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is False
+
+
+@pytest.mark.parametrize(
+    ("generated_response", "expected_error_message"),
+    [
+        ([], "LLM returned invalid response history"),
+        ([{"role": "assistant", "content": "ok"}, "bad-last-message"], "LLM returned invalid assistant message"),
+    ],
+)
+def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inference_output(
+    monkeypatch,
+    generated_response,
+    expected_error_message,
+):
+    decrypted_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "request_id": "req-invalid-inference-output",
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct:alignment",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
+    crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+
+    def fake_generate_response(*_args, **_kwargs):
+        return generated_response
+
+    def fake_post(_url, json=None, timeout=None, **_kwargs):
+        assert json is not None
+        assert timeout is not None
+
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+    assert relay_client.process_client_request(request_data) is True
+    encrypted_payload = crypto_stub.last_encrypted_payload
+    assert encrypted_payload["request_id"] == "req-invalid-inference-output"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
+    assert encrypted_payload["api_v1_response"]["error"]["message"] == expected_error_message
 
 # --- Test /faucet ---
 

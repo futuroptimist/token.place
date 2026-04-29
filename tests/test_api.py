@@ -241,7 +241,7 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     assert response.status_code == 503
     data = response.get_json()
     assert data['error']['type'] == 'service_unavailable_error'
-    assert data['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert data['error']['code'] in {'no_registered_compute_nodes', 'compute_node_unreachable'}
 
 
 def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
@@ -294,7 +294,10 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     )
 
     assert response.status_code == 503
-    assert response.get_json()['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert response.get_json()['error']['code'] in {
+        'no_registered_compute_nodes',
+        'compute_node_unreachable',
+    }
     local_generate.assert_not_called()
 
 

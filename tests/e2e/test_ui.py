@@ -455,9 +455,27 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         page.goto(base_url)
         page.wait_for_load_state("networkidle")
+        page.wait_for_function(
+            """
+            () => {
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                return Boolean(
+                    vm &&
+                    typeof vm.serverPublicKey === 'string' &&
+                    vm.serverPublicKey.trim().length > 0 &&
+                    typeof vm.clientPublicKey === 'string' &&
+                    vm.clientPublicKey.trim().length > 0
+                );
+            }
+            """
+        )
 
+        prompt_text = (
+            "Reply with a short sentence confirming you received this message. "
+            "Keep it under ten words."
+        )
         textarea = page.locator("textarea").first
-        textarea.fill("What is the capital of France? Respond with one word.")
         page.evaluate(
             """
             () => {
@@ -478,28 +496,46 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             }
             """
         )
-        page.locator("button", has_text="Send").click()
+        assistant_text = ""
+        user_message_count = page.locator(".user-message").count()
+        assistant_message_count = page.locator(".assistant-message").count()
+        transient_bridge_errors = {
+            "Unable to contact the LLM server right now. Please try again.",
+            "The LLM server is unavailable right now. Please try again.",
+            "The LLM server took too long to respond. Please try again.",
+        }
+        for _ in range(2):
+            textarea.fill(prompt_text)
+            page.locator("button", has_text="Send").click()
+            user_message_count += 1
+            page.locator(".user-message").nth(user_message_count - 1).wait_for(state="visible")
 
-        assistant_message = page.locator(".assistant-message").last
-        assistant_message.wait_for(state="visible")
+            assistant_message_count += 1
+            assistant_message = page.locator(".assistant-message").nth(assistant_message_count - 1)
+            assistant_message.wait_for(state="visible")
+            page.wait_for_function(
+                """
+                ({ selector, index }) => {
+                    const nodes = document.querySelectorAll(selector);
+                    const node = nodes[index];
+                    if (!node) return false;
+                    const text = (node.textContent || '').trim();
+                    return text.length > 0;
+                }
+                """,
+                arg={
+                    "selector": ".assistant-message",
+                    "index": assistant_message_count - 1,
+                },
+            )
+            assistant_text = assistant_message.inner_text().strip()
+            if assistant_text and assistant_text not in transient_bridge_errors:
+                break
 
-        page.wait_for_function(
-            """
-            ({ selector }) => {
-                const nodes = document.querySelectorAll(selector);
-                if (!nodes.length) return false;
-                const latest = nodes[nodes.length - 1];
-                return Boolean(latest.textContent && latest.textContent.trim().length > 0);
-            }
-            """,
-            arg={
-                "selector": ".assistant-message",
-            },
-        )
-
-        assistant_text = assistant_message.inner_text()
+        assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"
-        assert "Sorry, I encountered an issue generating a response." in assistant_text
+        assert "Sorry, I encountered an issue generating a response." not in assistant_text
+        assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
 
         assert len(v1_requests) >= 1
@@ -508,8 +544,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         latest_headers = v1_response_headers[-1]
         provider_class = latest_headers.get("x-tokenplace-api-v1-provider")
         resolved_provider_path = latest_headers.get("x-tokenplace-api-v1-resolved-provider-path")
-        assert provider_class in (None, "DistributedApiV1ComputeProvider")
-        assert resolved_provider_path in (None, "distributed")
+        execution_backend_path = latest_headers.get("x-tokenplace-api-v1-execution-backend-path")
+        assert provider_class == "DistributedApiV1ComputeProvider"
+        assert resolved_provider_path == "distributed"
+        assert execution_backend_path == "distributed_relay_e2ee"
 
         page.wait_for_timeout(300)
         non_streaming_state = page.evaluate(
@@ -587,9 +625,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             for line in stderr_lines
             if "desktop.compute_node_bridge.process_request" in line
         ]
-        assert not process_request_lines, (
-            "desktop bridge should not process relay requests while distributed API v1 is fail-closed"
-        )
+        assert process_request_lines, "desktop bridge should process encrypted relay requests"
     finally:
         if bridge_process.stdin:
             try:

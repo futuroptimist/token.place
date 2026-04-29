@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ipaddress
 import json
 import jsonschema
@@ -116,6 +117,16 @@ def log_error(message, *args, exc_info: bool = False) -> None:
     _log("error", message, *args, exc_info=exc_info)
 
 
+def _normalize_client_public_key_b64(client_public_key_b64: Any) -> Optional[str]:
+    """Normalize relay metadata key format for consistent decode/binding checks."""
+    if not isinstance(client_public_key_b64, str):
+        return None
+    normalized = client_public_key_b64.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
 def _extract_chat_history_and_validate_key_binding(
     decrypted_payload: Any,
     expected_client_public_key_b64: str,
@@ -165,6 +176,53 @@ def _extract_chat_history_and_validate_key_binding(
 
     log_error("Invalid encrypted payload: expected chat_history list or payload containing chat_history")
     return None
+
+
+def _extract_api_v1_request_payload(
+    decrypted_payload: Any,
+    expected_client_public_key_b64: str,
+) -> Optional[Dict[str, Any]]:
+    """Validate API v1 relay E2EE envelope and return request payload."""
+
+    if not isinstance(decrypted_payload, dict):
+        return None
+
+    if decrypted_payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+        return None
+
+    bound_client_key = decrypted_payload.get("client_public_key")
+    if bound_client_key != expected_client_public_key_b64:
+        log_error("Rejected API v1 relay payload: encrypted client key binding mismatch")
+        return None
+
+    request_id = decrypted_payload.get("request_id")
+    api_v1_request = decrypted_payload.get("api_v1_request")
+    if not isinstance(request_id, str) or not request_id.strip():
+        log_error("Rejected API v1 relay payload: missing request_id")
+        return None
+    if not isinstance(api_v1_request, dict):
+        log_error("Rejected API v1 relay payload: missing api_v1_request object")
+        return None
+
+    model = api_v1_request.get("model")
+    messages = api_v1_request.get("messages")
+    options = api_v1_request.get("options", {})
+    if not isinstance(model, str) or not model.strip():
+        log_error("Rejected API v1 relay payload: model must be a non-empty string")
+        return None
+    if not isinstance(messages, list):
+        log_error("Rejected API v1 relay payload: messages must be a list")
+        return None
+    if not isinstance(options, dict):
+        log_error("Rejected API v1 relay payload: options must be an object")
+        return None
+
+    return {
+        "request_id": request_id,
+        "model": model,
+        "messages": messages,
+        "options": options,
+    }
 
 
 class RelayClient:
@@ -615,9 +673,17 @@ class RelayClient:
                 log_error("Invalid request data format: {}", str(e))
                 return False
 
-            client_pub_key_b64 = request_data['client_public_key']
+            client_pub_key_b64 = _normalize_client_public_key_b64(request_data['client_public_key'])
+            if client_pub_key_b64 is None:
+                log_error("Invalid client_public_key format in relay request metadata")
+                return False
             stream_requested = request_data.get('stream') is True
             stream_session_id = request_data.get('stream_session_id')
+            try:
+                client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
+            except (AttributeError, binascii.Error, ValueError):
+                log_error("Invalid client_public_key encoding in relay request metadata")
+                return False
 
             log_info("Decrypting client request...")
             decrypted_chat_history = self.crypto_manager.decrypt_message(request_data)
@@ -626,13 +692,173 @@ class RelayClient:
                 return False
 
             log_info("Decrypted client request")
+            api_v1_request_payload = _extract_api_v1_request_payload(
+                decrypted_chat_history,
+                client_pub_key_b64,
+            )
+            if api_v1_request_payload is not None:
+                from api.v1.models import ModelError, generate_response
+
+                def _post_api_v1_source(response_envelope: Dict[str, Any]) -> bool:
+                    try:
+                        encrypted_response = self.crypto_manager.encrypt_message(
+                            response_envelope,
+                            client_pub_key,
+                        )
+                        source_payload = {
+                            "client_public_key": client_pub_key_b64,
+                            **encrypted_response,
+                        }
+                        request_kwargs = {
+                            "json": source_payload,
+                        }
+                        headers = self._auth_headers()
+                        if headers:
+                            request_kwargs["headers"] = headers
+
+                        source_response = requests.post(
+                            f"{self.relay_url}/source",
+                            timeout=self._request_timeout,
+                            **request_kwargs,
+                        )
+                        return source_response.status_code == 200
+                    except Exception:
+                        log_error(
+                            "Failed to encrypt or post API v1 response to relay /source",
+                            exc_info=True,
+                        )
+                        return False
+
+                api_v1_options = dict(api_v1_request_payload["options"])
+                try:
+                    response_history = generate_response(
+                        api_v1_request_payload["model"],
+                        api_v1_request_payload["messages"],
+                        **api_v1_options,
+                    )
+                    if not isinstance(response_history, list) or not response_history:
+                        log_error("LLM returned invalid API v1 response history")
+                        return _post_api_v1_source(
+                            {
+                                "protocol": "tokenplace_api_v1_relay_e2ee",
+                                "version": 1,
+                                "request_id": api_v1_request_payload["request_id"],
+                                "api_v1_response": {
+                                    "error": {
+                                        "code": "compute_node_internal_error",
+                                        "message": "LLM returned invalid response history",
+                                    }
+                                },
+                            }
+                        )
+                    assistant_message = response_history[-1]
+                    if not isinstance(assistant_message, dict):
+                        log_error("LLM returned invalid API v1 assistant message")
+                        return _post_api_v1_source(
+                            {
+                                "protocol": "tokenplace_api_v1_relay_e2ee",
+                                "version": 1,
+                                "request_id": api_v1_request_payload["request_id"],
+                                "api_v1_response": {
+                                    "error": {
+                                        "code": "compute_node_internal_error",
+                                        "message": "LLM returned invalid assistant message",
+                                    }
+                                },
+                            }
+                        )
+
+                    return _post_api_v1_source(
+                        {
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
+                            "request_id": api_v1_request_payload["request_id"],
+                            "api_v1_response": {
+                                "message": assistant_message,
+                            },
+                        }
+                    )
+                except ModelError as exc:
+                    error_type = getattr(exc, "error_type", "")
+                    if error_type in {"model_not_found", "model_load_error"} and hasattr(
+                        self.model_manager, "llama_cpp_get_response"
+                    ):
+                        log_info(
+                            "API v1 relay request model '%s' unavailable (%s); "
+                            "falling back to active compute-node runtime model",
+                            api_v1_request_payload["model"],
+                            error_type,
+                        )
+                        try:
+                            fallback_response_history = self.model_manager.llama_cpp_get_response(
+                                api_v1_request_payload["messages"]
+                            )
+                        except Exception as fallback_exc:
+                            log_error(
+                                "Fallback runtime-model execution failed for API v1 relay request: {}",
+                                str(fallback_exc),
+                                exc_info=True,
+                            )
+                        else:
+                            if isinstance(fallback_response_history, list) and fallback_response_history:
+                                fallback_assistant_message = fallback_response_history[-1]
+                                if isinstance(fallback_assistant_message, dict):
+                                    return _post_api_v1_source(
+                                        {
+                                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                                            "version": 1,
+                                            "request_id": api_v1_request_payload["request_id"],
+                                            "api_v1_response": {
+                                                "message": fallback_assistant_message,
+                                            },
+                                        }
+                                    )
+                            log_error("Fallback runtime-model execution returned invalid API v1 output")
+
+                    model_error_code = (
+                        "compute_node_model_unsupported"
+                        if error_type == "model_not_found"
+                        else "compute_node_model_error"
+                    )
+                    return _post_api_v1_source(
+                        {
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
+                            "request_id": api_v1_request_payload["request_id"],
+                            "api_v1_response": {
+                                "error": {
+                                    "code": model_error_code,
+                                    "message": str(exc),
+                                }
+                            },
+                        }
+                    )
+                except Exception as exc:
+                    log_error(
+                        "Unexpected error processing API v1 relay request: {}",
+                        str(exc),
+                        exc_info=True,
+                    )
+                    return _post_api_v1_source(
+                        {
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
+                            "request_id": api_v1_request_payload["request_id"],
+                            "api_v1_response": {
+                                "error": {
+                                    "code": "compute_node_internal_error",
+                                    "message": "Unexpected internal error during inference",
+                                }
+                            },
+                        }
+                    )
+
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,
                 client_pub_key_b64,
             )
             if chat_history is None:
                 return False
-            client_pub_key = base64.b64decode(client_pub_key_b64)
 
             if stream_requested and isinstance(stream_session_id, str) and stream_session_id.strip():
                 log_info("Processing streaming relay request for session {}", stream_session_id)

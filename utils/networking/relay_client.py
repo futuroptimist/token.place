@@ -664,13 +664,22 @@ class RelayClient:
         if headers:
             request_kwargs['headers'] = headers
         response = requests.post(
-            f'{target_url}/api/v1/relay/servers/register',
+            self._build_api_v1_url(target_url, "/relay/servers/register"),
             timeout=request_kwargs.pop('timeout'),
             **request_kwargs,
         )
         if response.status_code != 200:
-            return {'error': f'HTTP {response.status_code}'}
+            return {'error': f'HTTP {response.status_code}', 'next_ping_in_x_seconds': self._request_timeout}
         return response.json()
+
+    @staticmethod
+    def _build_api_v1_url(relay_url: str, route: str) -> str:
+        """Build API v1 URLs without duplicating a pre-existing /api/v1 suffix."""
+        base = relay_url.rstrip("/")
+        normalized_route = route if route.startswith("/") else f"/{route}"
+        if base.endswith("/api/v1"):
+            return f"{base}{normalized_route}"
+        return f"{base}/api/v1{normalized_route}"
 
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Register then poll API v1 relay routes for encrypted work."""
@@ -701,7 +710,7 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 response = requests.post(
-                    f'{candidate_url}/api/v1/relay/servers/poll',
+                    self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
                     timeout=request_kwargs.pop('timeout'),
                     **request_kwargs,
                 )
@@ -786,7 +795,7 @@ class RelayClient:
                             request_kwargs["headers"] = headers
 
                         source_response = requests.post(
-                            f"{self.relay_url}/api/v1/relay/responses",
+                            self._build_api_v1_url(self.relay_url, "/relay/responses"),
                             timeout=self._request_timeout,
                             **request_kwargs,
                         )

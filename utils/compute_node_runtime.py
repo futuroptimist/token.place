@@ -66,12 +66,16 @@ def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
 
     if not isinstance(payload, dict):
         return False
-    return (
-        payload.get("protocol") == "tokenplace_api_v1_relay_e2ee"
-        and payload.get("version") == 1
-        and isinstance(payload.get("request_id"), str)
-        and LEGACY_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
-    )
+    required_string_fields = ("request_id", "client_public_key", "chat_history", "cipherkey", "iv")
+    if payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+        return False
+    if payload.get("version") != 1:
+        return False
+    for field in required_string_fields:
+        value = payload.get(field)
+        if not isinstance(value, str):
+            return False
+    return True
 
 
 class RelayRequestAdapter(Protocol):

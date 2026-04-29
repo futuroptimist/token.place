@@ -771,7 +771,15 @@ class TestRelayClient:
 
         result = relay_client.register_api_v1_compute_node('http://relay-a.example')
 
-        assert result == {'error': 'HTTP 503'}
+        assert result == {'error': 'HTTP 503', 'next_ping_in_x_seconds': relay_client._request_timeout}
+
+    def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
+        assert RelayClient._build_api_v1_url(
+            "http://localhost:5000", "/relay/servers/register"
+        ) == "http://localhost:5000/api/v1/relay/servers/register"
+        assert RelayClient._build_api_v1_url(
+            "https://relay.cloudflare.workers.dev/api/v1", "/relay/servers/register"
+        ) == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_fails_over_and_uses_register_interval(self, mock_post, relay_client):

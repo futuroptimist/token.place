@@ -183,6 +183,54 @@ def test_api_v1_relay_payload_detection_identifies_valid_api_v1_envelope():
     }) is True
 
 
+def test_api_v1_relay_payload_detection_rejects_legacy_messages_shape():
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "api_v1_request": {"messages": []},
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is True
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "wrong",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 2,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": {},
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+
+
 def test_api_v1_relay_request_adapter_processes_api_v1_payload():
     relay_client = MagicMock()
     adapter = ApiV1RelayRequestAdapter(relay_client)

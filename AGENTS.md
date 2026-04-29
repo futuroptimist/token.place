@@ -76,3 +76,10 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 ### Prompt Agent
 - **When:** you run `flywheel prompt`
 - **Does:** generate context-aware prompts for Codex or other LLM assistants
+
+## Security invariant: relay-blind E2EE (must-follow)
+- Distributed relay inference must be ciphertext-only for relay-visible payloads.
+- Never queue or forward plaintext `messages`/`prompt`/tool args/model output through relay state.
+- Never POST raw model payloads to relay endpoints; use approved encrypted envelopes only.
+- Never log or expose distributed plaintext in diagnostics/errors.
+- If plaintext is needed, keep it local/non-distributed or fail closed.

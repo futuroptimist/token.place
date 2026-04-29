@@ -306,6 +306,10 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
 
 @pytest.mark.e2e
+RELAY_SENTINEL = "E2EE_SENTINEL_SHOULD_NEVER_REACH_RELAY_PLAINTEXT"
+
+
+@pytest.mark.e2e
 def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     page: Page,
     base_url: str,
@@ -471,10 +475,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             """
         )
 
-        prompt_text = (
-            "Reply with a short sentence confirming you received this message. "
-            "Keep it under ten words."
-        )
+        prompt_text = RELAY_SENTINEL
         textarea = page.locator("textarea").first
         page.evaluate(
             """
@@ -619,6 +620,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert isinstance(client_public_key, str) and client_public_key
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)
         assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
+
+        combined_bridge_output = "".join(stderr_lines)
+        assert RELAY_SENTINEL not in combined_bridge_output
 
         process_request_lines = [
             line

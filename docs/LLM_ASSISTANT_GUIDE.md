@@ -15,6 +15,28 @@ This document provides guidance specifically for LLM assistants (like Claude) to
 - `/tests/`: Test suites for unit and integration testing
 - `/docs/`: Documentation for contributors
 
+
+## API v1 relay rules for assistants (must-follow)
+
+- API v1 is the active API for `v0.1.0` and the only active runtime target.
+- API v1 is non-streaming for relay/client-server inference; return full responses only.
+- Do not add streaming to API v1.
+- API v2 is incomplete; do not route runtime traffic through API v2 until API v1 launch and
+  `v0.1.0` finalization.
+- Deprecated legacy relay endpoints (`/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server`)
+  are historical compatibility only. Do not use or extend them for active production paths, and do
+  not reintroduce them as fallbacks.
+- Keep active inference paths aligned on API v1 E2EE routes for `server.py`, `relay.py`,
+  `client.py`, desktop Tauri flows, and relay HTML chat UI.
+- Relay-visible surfaces must stay ciphertext-only (+ safe routing metadata). Plaintext prompts,
+  messages, responses, tool arguments, or model output text must never appear in relay-owned
+  state/logs/diagnostics/payloads.
+- If a path cannot preserve E2EE, fail closed.
+
+Migration context: there is a known gap between `relay.py`, desktop Tauri, and relay HTML chat UI
+where some E2E segments still use legacy routes. Prompts 1-4 own the migration repairs.
+Reference: [docs/architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
+
 ## Environment-Specific Considerations
 
 ### Windows/PowerShell Environment

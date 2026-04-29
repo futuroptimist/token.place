@@ -22,6 +22,25 @@ Welcome to `token.place`! This document provides a high-level overview of the pr
 
 This ensures that plaintext prompts and responses never reach the relay or any intermediate service. See [docs/ARCHITECTURE.md](ARCHITECTURE.md) for more details.
 
+
+## API v1-only architecture baseline (v0.1.0)
+
+- API v1 is the active API for `v0.1.0` and the only active runtime integration target.
+- API v1 is non-streaming for relay/client-server inference: return responses only after full
+  generation is complete.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route runtime traffic through API v2 yet.
+- Deprecated legacy relay endpoints (`/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server`)
+  must not be used in active production paths, extended for new features, or revived as fallbacks.
+- Active inference paths for `server.py`, `relay.py`, `client.py`, desktop Tauri, and relay HTML
+  chat UI should align on API v1 E2EE routes.
+- Relay must remain ciphertext-only plus safe routing metadata. If a path cannot preserve E2EE,
+  it must fail closed.
+
+Known migration context: `relay.py`, desktop Tauri, and relay HTML chat UI are not fully aligned
+yet and some E2E pieces still touch legacy routes. The migration is tracked as follow-up work.
+See [docs/architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
+
 ## Cross-Platform Notes
 
 The project runs on Windows, macOS and Linux. Path handling, configuration locations and launcher scripts adapt automatically. For platform specifics and Docker instructions, see [CROSS_PLATFORM.md](CROSS_PLATFORM.md).

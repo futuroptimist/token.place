@@ -1,29 +1,15 @@
 # token.place llms.txt
 
-Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python servers host local LLMs; a relay obfuscates IPs. JavaScript clients handle browser-side crypto.
+Secure proxy with relay-blind E2EE for AI inference.
 
-## Setup
-- Run `./scripts/setup.sh YOURNAME YOURREPO` after cloning.
+## Runtime architecture baseline (v0.1.0)
+- API v1 is the active runtime API for v0.1.0.
+- API v1 is non-streaming; responses return after full generation.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route active runtime traffic through API v2 yet.
+- Deprecated legacy relay endpoints: `/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server`.
+- Do not use, extend, or reintroduce those legacy endpoints in active production paths.
+- Active inference paths for `server.py`, `relay.py`, `client.py`, desktop Tauri, and relay HTML chat UI must align on API v1 E2EE relay routes.
+- E2EE invariant: relay sees ciphertext plus safe routing metadata only; plaintext payload content must fail closed.
 
-## Checks
-- `pre-commit run --all-files` before pushing (runs `./run_all_tests.sh`).
-
-## Coding
-- New JS should use TypeScript, React hooks, and Tailwind CSS.
-
-## Agents
-- Code Linter Agent: PR linting via ESLint/Flake8
-- Docs Agent: spell- and link-check docs updates
-- Quest Generator Agent: scaffold quests on demand
-- Synergy Bot: spot shared utilities across repos
-- Release Drafter Bot: draft notes on pushes to main
-- CI Bot: run tests on GitHub Actions
-- Claude PR Assistant: tag @claude in PRs or issues for automated help
-- Security Bot: patch dependency alerts
-- Prompt Agent: generate flywheel prompts
-
-## Development
-- Python 3.12 with pre-commit formatting
-- Tests live in `tests/` and cover Python, JS, and Playwright
-- Docs in `docs/` with onboarding and style guides
-- See AGENTS.md for the Markdown version of this file
+See `docs/architecture/api_v1_e2ee_relay.md` and `AGENTS.md`.

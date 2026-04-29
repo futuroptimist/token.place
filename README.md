@@ -162,6 +162,18 @@ See also:
 - [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
+## API v1-only architecture baseline (v0.1.0)
+
+- **API v1 is the active API for v0.1.0.**
+- **API v1 is non-streaming** for relay-path inference; responses are returned only after full generation.
+- **Do not add streaming to API v1.**
+- **API v2 exists but is incomplete** and must not carry active runtime traffic yet.
+- Do not migrate server, relay, client, desktop Tauri, or relay HTML chat runtime flows to API v2 until API v1 is launched and v0.1.0 is finalized.
+- Legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, and `/next_server` are deprecated and must not be used, extended, or reintroduced in active production paths.
+- Relay-path inference must stay E2EE: relay sees ciphertext plus safe routing metadata only; plaintext model payloads must fail closed.
+
+See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md) for required component alignment and migration context.
+
 ## Canonical entrypoints
 
 - `server.py` is the canonical compute-node server entrypoint.
@@ -170,12 +182,9 @@ See also:
 
 ## Deployment topology
 
-- **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
-  legacy sink/source contract.
-- **Near-term multi-node legacy flow:** multiple compute nodes (including desktop-tauri after
-  parity) register through `relay.py` using the same legacy contract.
-- **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
-  contracts after parity and operational readiness gates are complete.
+- **Current state note (migration gap):** some local/self-hosted flows still touch deprecated legacy relay routes during migration; this is not the target architecture.
+- **Near-term repair objective:** align relay, server, client, desktop-tauri, and relay HTML chat UI on API v1 E2EE routes and stop active runtime legacy-route usage.
+- **Target launch architecture for v0.1.0:** API v1-only active runtime traffic (non-streaming, E2EE relay-blind).
 - **Operator platform targets:** Windows 11 + NVIDIA/CUDA and macOS Apple Silicon + Metal first,
   CPU fallback always supported, Raspberry Pi as a later low-power compute-node target.
 

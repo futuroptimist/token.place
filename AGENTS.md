@@ -81,3 +81,15 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 ### Prompt Agent
 - **When:** you run `flywheel prompt`
 - **Does:** generate context-aware prompts for Codex or other LLM assistants
+
+
+## API v1-only runtime policy (v0.1.0, must-follow)
+- API v1 is the only active runtime integration target for v0.1.0.
+- API v1 is non-streaming; return responses only after full generation. Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route runtime traffic through API v2 yet.
+- Do not migrate `server.py`, `relay.py`, `client.py`, desktop Tauri flows, or relay HTML chat UI flows to API v2 until API v1 is launched and v0.1.0 is finalized.
+- `/sink`, `/faucet`, `/source`, `/retrieve`, and `/next_server` are deprecated legacy relay endpoints.
+- Do not use, extend, or reintroduce deprecated legacy endpoints in active production paths.
+- Active client/server relay inference must use API v1 E2EE routes and fail closed if E2EE cannot be preserved.
+- Migration context: there is a known alignment gap between `relay.py`, desktop Tauri, and relay HTML chat UI; Prompts 1-4 own the code migration, not docs-only prompts.
+- Architecture reference: `docs/architecture/api_v1_e2ee_relay.md`.

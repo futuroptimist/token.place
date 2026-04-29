@@ -218,7 +218,9 @@ jobs:
 
             app_path="${app_files[0]}"
             app_name="$(basename "${app_path}" .app)"
-            dmg_path="release-artifacts/${app_name}_${{ github.ref_name || inputs.tag_name || 'manual' }}_${{ matrix.tauri_target }}.dmg"
+            ref_slug="${{ github.ref_name || inputs.tag_name || 'manual' }}"
+            ref_slug="${ref_slug//\//-}"
+            dmg_path="release-artifacts/${app_name}_${ref_slug}_${{ matrix.tauri_target }}.dmg"
 
             rm -f "${dmg_path}"
             hdiutil create -volname "${app_name}" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"

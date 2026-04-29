@@ -705,7 +705,11 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
     if not isinstance(payload, dict):
         return None, ('Invalid request data', 400)
 
-    required = ['chat_history', 'cipherkey', 'iv']
+    required = ['cipherkey', 'iv']
+    has_ciphertext = 'ciphertext' in payload
+    has_chat_history = 'chat_history' in payload
+    if not has_ciphertext and not has_chat_history:
+        return None, ('Invalid request data', 400)
     if require_server_key:
         required.insert(0, 'server_public_key')
     missing = [field for field in required if field not in payload]
@@ -714,7 +718,8 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
 
     envelope = {
         'client_public_key': payload.get('client_public_key'),
-        'chat_history': payload['chat_history'],
+        'chat_history': payload.get('ciphertext', payload.get('chat_history')),
+        'ciphertext': payload.get('ciphertext', payload.get('chat_history')),
         'cipherkey': payload['cipherkey'],
         'iv': payload['iv'],
     }
@@ -736,8 +741,13 @@ def api_v1_relay_servers_register():
     if auth_error:
         return auth_error
 
-    data = request.get_json()
-    public_key = data['server_public_key']
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not public_key:
+        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
 
     if public_key in known_servers:
         known_servers[public_key]['last_ping'] = datetime.now()
@@ -754,7 +764,26 @@ def api_v1_relay_servers_register():
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
 def api_v1_relay_servers_poll():
     """Claim the next queued encrypted workload for a registered compute node."""
-    return sink()
+    _evict_stale_servers()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not public_key:
+        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+    if public_key not in known_servers:
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+
+    queued_requests = client_inference_requests.get(public_key, [])
+    if not queued_requests:
+        return jsonify({'message': 'No requests available'}), 200
+
+    first_request = queued_requests.pop(0)
+    if not queued_requests:
+        client_inference_requests.pop(public_key, None)
+
+    return jsonify(first_request), 200
 
 
 @app.route('/api/v1/relay/requests', methods=['POST'])
@@ -783,7 +812,8 @@ def api_v1_relay_responses():
     if auth_error:
         return auth_error
 
-    envelope, error = _extract_ciphertext_envelope(request.get_json(), require_server_key=False)
+    data = request.get_json()
+    envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
     if error:
         msg, code = error
         return jsonify({'error': {'message': msg, 'code': code}}), code

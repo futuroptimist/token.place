@@ -1097,6 +1097,38 @@ def test_api_v1_relay_plaintext_messages_not_stored(client):
     assert plaintext not in json.dumps(queued_payload)
 
 
+def test_api_v1_relay_response_plaintext_not_stored(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    plaintext = 'PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE'
+    response_payload = {
+        'request_id': 'req-response-no-plaintext',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response-only',
+        'cipherkey': 'cipherkey-response-only',
+        'iv': 'iv-response-only',
+        'messages': [{'role': 'assistant', 'content': plaintext}],
+        'prompt': plaintext,
+        'assistant_output': plaintext,
+        'tool_arguments': plaintext,
+        'model_output_text': plaintext,
+    }
+    source = client.post('/api/v1/relay/responses', json=response_payload)
+    assert source.status_code == 200
+
+    queued_payload = client_responses[DUMMY_CLIENT_PUB_KEY]
+    assert 'messages' not in queued_payload
+    assert 'prompt' not in queued_payload
+    assert 'assistant_output' not in queued_payload
+    assert 'tool_arguments' not in queued_payload
+    assert 'model_output_text' not in queued_payload
+    assert plaintext not in json.dumps(queued_payload)
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    assert retrieved.status_code == 200
+    assert plaintext not in json.dumps(retrieved.get_json())
+
+
 def test_api_v1_relay_chat_completions_fail_closed_and_queue_unchanged(client):
     client_inference_requests.clear()
     response = client.post('/relay/api/v1/chat/completions', json={

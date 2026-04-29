@@ -191,7 +191,12 @@ jobs:
       - name: Build Tauri bundles
         shell: bash
         run: |
-          if [ -n "${{ matrix.tauri_target }}" ]; then
+          if [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ matrix.tauri_target }}" ]; then
+            # Tauri's built-in DMG bundler is flaky for cross-target macOS builds in CI
+            # (bundle_dmg.sh intermittently exits non-zero). Build the .app reliably, then
+            # generate the DMG in the staging step via hdiutil.
+            npm run tauri build -- --target ${{ matrix.tauri_target }} --bundles app
+          elif [ -n "${{ matrix.tauri_target }}" ]; then
             npm run tauri build -- --target ${{ matrix.tauri_target }}
           else
             npm run tauri build
@@ -203,13 +208,20 @@ jobs:
           set -euo pipefail
           mkdir -p release-artifacts
           if [ "${{ runner.os }}" = "macOS" ]; then
-            dmg_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/dmg"
-            dmg_files=("${dmg_dir}"/*.dmg)
-            if [ ! -e "${dmg_files[0]}" ]; then
-              echo "No DMG found in ${dmg_dir}" >&2
+            bundle_root="src-tauri/target/${{ matrix.tauri_target }}/release/bundle"
+            app_dir="${bundle_root}/macos"
+            app_files=("${app_dir}"/*.app)
+            if [ ! -e "${app_files[0]}" ]; then
+              echo "No .app bundle found in ${app_dir}" >&2
               exit 1
             fi
-            cp "${dmg_files[@]}" release-artifacts/
+
+            app_path="${app_files[0]}"
+            app_name="$(basename "${app_path}" .app)"
+            dmg_path="release-artifacts/${app_name}_${{ github.ref_name || inputs.tag_name || 'manual' }}_${{ matrix.tauri_target }}.dmg"
+
+            rm -f "${dmg_path}"
+            hdiutil create -volname "${app_name}" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"

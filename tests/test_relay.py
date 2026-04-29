@@ -1137,6 +1137,39 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
     polled = poll.get_json()
     assert polled['request_id'] == 'req-no-sink-delegation'
 
+
+def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'legacy-plaintext',
+            'cipherkey': 'legacy-key',
+            'iv': 'legacy-iv',
+        },
+        {
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'request_id': 'req-e2ee-only',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'e2ee_v1': True,
+        },
+    ]
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    payload = poll.get_json()
+    assert payload['request_id'] == 'req-e2ee-only'
+    assert payload['chat_history'] == 'ciphertext-request'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+
+
 def test_api_v1_relay_response_plaintext_not_stored(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
@@ -1221,6 +1254,7 @@ def test_api_v1_poll_requires_registration_token_when_configured(client, monkeyp
         'chat_history': 'ciphertext-request',
         'cipherkey': 'cipherkey-request',
         'iv': 'iv-request',
+        'e2ee_v1': True,
     }]
 
     monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['expected-token'])

@@ -783,7 +783,23 @@ def api_v1_relay_servers_poll():
     if not queued_requests:
         return jsonify({'message': 'No requests available'}), 200
 
-    first_request = queued_requests.pop(0)
+    first_request = None
+    while queued_requests:
+        candidate = queued_requests[0]
+        if candidate.get('e2ee_v1'):
+            first_request = queued_requests.pop(0)
+            break
+        LOGGER.warning(
+            "relay.api_v1_legacy_payload_skipped",
+            extra={"server_public_key": public_key},
+        )
+        queued_requests.pop(0)
+
+    if first_request is None:
+        if not queued_requests:
+            client_inference_requests.pop(public_key, None)
+        return jsonify({'message': 'No requests available'}), 200
+
     if not queued_requests:
         client_inference_requests.pop(public_key, None)
 

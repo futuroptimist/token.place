@@ -151,6 +151,29 @@ There are tons of personal computers and homelabs out there with lots of compute
 For a quick orientation to the repository layout and key docs, see [docs/ONBOARDING.md](docs/ONBOARDING.md).
 For a directory-by-directory atlas, visit [docs/REPO_MAP.md](docs/REPO_MAP.md).
 
+
+## API v1-only architecture baseline (v0.1.0)
+
+For `v0.1.0`, **API v1 is the only active runtime integration target**.
+
+- **API v1 is the active API for v0.1.0.**
+- **API v1 is non-streaming.** Return responses only after the full model response is generated.
+- **Do not add streaming to API v1.**
+- **API v2 exists but is incomplete.** Do not route runtime traffic through API v2 yet.
+- Do not migrate UI/desktop/server flows to API v2 until API v1 launches and `v0.1.0` is finalized.
+- Legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, and `/next_server` are
+  deprecated and must not be used for active production inference paths.
+- Do not extend deprecated legacy routes for new features or reintroduce them as compatibility
+  fallbacks.
+- Active inference alignment target: `server.py`, `relay.py`, `client.py`, desktop Tauri app, and
+  relay HTML chat UI all use API v1 E2EE routes.
+- Relay-path E2EE is fail-closed: relay sees ciphertext + safe routing metadata only; plaintext
+  prompts/messages/responses/tool arguments must never appear in relay-owned state, logs, diagnostics,
+  or relay-visible HTTP payloads.
+
+See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md) for the
+detailed baseline that Prompts 1-4 implement.
+
 ## Desktop direction
 
 The `desktop-tauri/` app is the forward-looking desktop path, but it is currently an MVP and does
@@ -168,7 +191,7 @@ See also:
 - `relay.py` is the canonical relay entrypoint.
 - `server/server_app.py` is retained only as a legacy compatibility shim that delegates to `server.py`.
 
-## Deployment topology
+## Deployment topology (legacy notes below are historical/deprecated during migration)
 
 - **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
   legacy sink/source contract.

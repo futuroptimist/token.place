@@ -1,3 +1,10 @@
+
+> **API baseline (v0.1.0):** API v1 is the only active runtime target, non-streaming, and E2EE
+> relay-blind (ciphertext + routing metadata only). API v2 is incomplete and must not carry active
+> runtime traffic yet. Deprecated legacy relay routes (`/sink`, `/faucet`, `/source`, `/retrieve`,
+> `/next_server`) must not be used or extended for active production flows.
+> See `docs/architecture/api_v1_e2ee_relay.md`.
+
 # Guide for LLM Assistants Working with token.place
 
 This document provides guidance specifically for LLM assistants (like Claude) to help navigate and work with the token.place codebase more effectively.

@@ -1,3 +1,10 @@
+
+> **API baseline (v0.1.0):** API v1 is the only active runtime target, non-streaming, and E2EE
+> relay-blind (ciphertext + routing metadata only). API v2 is incomplete and must not carry active
+> runtime traffic yet. Deprecated legacy relay routes (`/sink`, `/faucet`, `/source`, `/retrieve`,
+> `/next_server`) must not be used or extended for active production flows.
+> See `docs/architecture/api_v1_e2ee_relay.md`.
+
 # Claude Integration
 
 This file summarizes best practices from [Anthropic's "Claude Code Best Practices"](https://www.anthropic.com/engineering/claude-code-best-practices).

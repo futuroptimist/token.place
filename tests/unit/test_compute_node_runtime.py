@@ -170,17 +170,35 @@ def test_compute_node_runtime_respects_explicit_empty_adapter_list():
     relay_client.process_client_request.assert_not_called()
 
 
-def test_api_v1_relay_payload_detection_is_hard_disabled():
-    assert is_api_v1_relay_payload({"api_v1_payload": True}) is False
+def test_api_v1_relay_payload_detection_matches_contract():
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req_123",
+        "client_public_key": "client-key",
+        "chat_history": "ciphertext",
+        "cipherkey": "key",
+        "iv": "iv",
+    }) is True
 
 
-def test_api_v1_relay_request_adapter_is_noop_when_disabled():
+def test_api_v1_relay_request_adapter_delegates_to_relay_client():
     relay_client = MagicMock()
+    relay_client.process_client_request.return_value = True
     adapter = ApiV1RelayRequestAdapter(relay_client)
+    payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req_123",
+        "client_public_key": "client-key",
+        "chat_history": "ciphertext",
+        "cipherkey": "key",
+        "iv": "iv",
+    }
 
-    assert adapter.can_process({"api_v1_payload": True}) is False
-    assert adapter.process({"api_v1_payload": True}) is False
-    relay_client.process_api_v1_chat_request.assert_not_called()
+    assert adapter.can_process(payload) is True
+    assert adapter.process(payload) is True
+    relay_client.process_client_request.assert_called_once_with(payload)
 
 def test_legacy_relay_request_adapter_only_matches_legacy_contract():
     relay_client = MagicMock()

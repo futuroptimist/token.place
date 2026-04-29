@@ -578,7 +578,7 @@ class RelayClient:
 
             try:
                 log_info(
-                    "Pinging relay {}/sink with key {}...",
+                    "desktop.compute_node_bridge.api_v1_e2ee.register relay={} key_prefix={}",
                     candidate_url,
                     self.crypto_manager.public_key_b64[:10],
                 )
@@ -593,14 +593,14 @@ class RelayClient:
 
                 timeout = request_kwargs.pop('timeout', self._request_timeout)
                 response = requests.post(
-                    f'{candidate_url}/sink',
+                    f'{candidate_url}/api/v1/relay/servers/poll',
                     timeout=timeout,
                     **request_kwargs,
                 )
 
                 if response.status_code != 200:
                     log_error(
-                        "Error from relay /sink: status {} ({} bytes)",
+                        "Error from relay /api/v1/relay/servers/poll: status {} ({} bytes)",
                         response.status_code,
                         len(response.text),
                     )
@@ -612,6 +612,11 @@ class RelayClient:
                     continue
 
                 relay_response = response.json()
+                log_info(
+                    "desktop.compute_node_bridge.api_v1_e2ee.poll relay={} response_keys={}",
+                    candidate_url,
+                    sorted(relay_response.keys()),
+                )
                 try:
                     jsonschema.validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
                 except jsonschema.exceptions.ValidationError as exc:
@@ -631,15 +636,15 @@ class RelayClient:
                 return relay_response
 
             except requests.ConnectionError as exc:
-                log_error("Connection error when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Connection error when polling relay API v1: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except requests.Timeout as exc:
-                log_error("Request timeout when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Request timeout when polling relay API v1: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except requests.RequestException as exc:
-                log_error("Request exception when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Request exception when polling relay API v1: {}", str(exc), exc_info=True)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except json.JSONDecodeError as exc:
@@ -717,14 +722,19 @@ class RelayClient:
                             request_kwargs["headers"] = headers
 
                         source_response = requests.post(
-                            f"{self.relay_url}/source",
+                            f"{self.relay_url}/api/v1/relay/responses",
                             timeout=self._request_timeout,
                             **request_kwargs,
                         )
+                        if source_response.status_code == 200:
+                            log_info(
+                                "desktop.compute_node_bridge.api_v1_e2ee.response_submitted request_id={}",
+                                response_envelope.get("request_id"),
+                            )
                         return source_response.status_code == 200
                     except Exception:
                         log_error(
-                            "Failed to encrypt or post API v1 response to relay /source",
+                            "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
                             exc_info=True,
                         )
                         return False

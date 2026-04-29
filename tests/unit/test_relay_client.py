@@ -348,7 +348,7 @@ class TestRelayClient:
 
         # Verify mock calls
         mock_post.assert_called_once_with(
-            'http://localhost:5000/sink',
+            'http://localhost:5000/api/v1/relay/servers/poll',
             json={'server_public_key': 'mock_public_key_b64'},
             timeout=relay_client._request_timeout
         )
@@ -452,8 +452,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
@@ -501,8 +501,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'https://relay.cloudflare.workers.dev/api/v1/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'https://relay.cloudflare.workers.dev/api/v1/api/v1/relay/servers/poll',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -558,9 +558,9 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
-            'http://backup-relay:6000/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
@@ -609,8 +609,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
@@ -880,7 +880,7 @@ class TestRelayClient:
             max_tokens=50,
         )
         mock_post.assert_called_once_with(
-            'http://localhost:5000/source',
+            'http://localhost:5000/api/v1/relay/responses',
             json={
                 'client_public_key': request_data["client_public_key"],
                 'chat_history': 'encrypted_chat_history',

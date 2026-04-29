@@ -578,7 +578,7 @@ class RelayClient:
 
             try:
                 log_info(
-                    "Pinging relay {}/sink with key {}...",
+                    "desktop.compute_node_bridge.api_v1_e2ee.register relay={} key_prefix={}",
                     candidate_url,
                     self.crypto_manager.public_key_b64[:10],
                 )
@@ -593,14 +593,14 @@ class RelayClient:
 
                 timeout = request_kwargs.pop('timeout', self._request_timeout)
                 response = requests.post(
-                    f'{candidate_url}/sink',
+                    f'{candidate_url}/api/v1/relay/servers/register',
                     timeout=timeout,
                     **request_kwargs,
                 )
 
                 if response.status_code != 200:
                     log_error(
-                        "Error from relay /sink: status {} ({} bytes)",
+                        "desktop.compute_node_bridge.api_v1_e2ee.register.error status={} body_bytes={}",
                         response.status_code,
                         len(response.text),
                     )
@@ -611,17 +611,33 @@ class RelayClient:
                     encountered_error = True
                     continue
 
-                relay_response = response.json()
-                try:
-                    jsonschema.validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
-                except jsonschema.exceptions.ValidationError as exc:
-                    log_error("Invalid relay response format: {}", str(exc))
+                register_response = response.json()
+                next_ping = register_response.get('next_ping_in_x_seconds', self._request_timeout)
+
+                poll_kwargs = {
+                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'timeout': self._request_timeout,
+                }
+                if headers:
+                    poll_kwargs['headers'] = headers
+                log_info("desktop.compute_node_bridge.api_v1_e2ee.poll relay={}", candidate_url)
+                poll_response = requests.post(
+                    f'{candidate_url}/api/v1/relay/servers/poll',
+                    **poll_kwargs,
+                )
+                if poll_response.status_code != 200:
                     last_error = {
-                        'error': f"Invalid response format: {str(exc)}",
-                        'next_ping_in_x_seconds': self._request_timeout,
+                        'error': f"HTTP {poll_response.status_code}",
+                        'next_ping_in_x_seconds': next_ping,
                     }
                     encountered_error = True
                     continue
+
+                relay_response = poll_response.json()
+                if isinstance(relay_response, dict) and relay_response.get('e2ee_v1'):
+                    log_info("desktop.compute_node_bridge.api_v1_e2ee.work_received relay={}", candidate_url)
+                elif isinstance(relay_response, dict):
+                    relay_response.setdefault('next_ping_in_x_seconds', next_ping)
 
                 self._active_relay_index = index
                 if encountered_error:
@@ -717,14 +733,17 @@ class RelayClient:
                             request_kwargs["headers"] = headers
 
                         source_response = requests.post(
-                            f"{self.relay_url}/source",
+                            f"{self.relay_url}/api/v1/relay/responses",
                             timeout=self._request_timeout,
                             **request_kwargs,
                         )
-                        return source_response.status_code == 200
+                        if source_response.status_code == 200:
+                            log_info("desktop.compute_node_bridge.api_v1_e2ee.response_submitted relay={}", self.relay_url)
+                            return True
+                        return False
                     except Exception:
                         log_error(
-                            "Failed to encrypt or post API v1 response to relay /source",
+                            "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
                             exc_info=True,
                         )
                         return False

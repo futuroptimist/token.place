@@ -1097,6 +1097,33 @@ def test_api_v1_relay_plaintext_messages_not_stored(client):
     assert plaintext not in json.dumps(queued_payload)
 
 
+
+
+def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeypatch):
+    def _sink_should_not_be_called():
+        raise AssertionError('legacy sink() should not be called by API v1 register/poll')
+
+    monkeypatch.setattr('relay.sink', _sink_should_not_be_called)
+
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-no-sink-delegation',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'ciphertext': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    polled = poll.get_json()
+    assert polled['request_id'] == 'req-no-sink-delegation'
+
 def test_api_v1_relay_response_plaintext_not_stored(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 

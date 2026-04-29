@@ -701,6 +701,101 @@ def relay_api_v1_source():
         }
     ), 503
 
+def _extract_ciphertext_envelope(payload, *, require_server_key=False):
+    if not isinstance(payload, dict):
+        return None, ('Invalid request data', 400)
+
+    required = ['chat_history', 'cipherkey', 'iv']
+    if require_server_key:
+        required.insert(0, 'server_public_key')
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return None, ('Invalid request data', 400)
+
+    envelope = {
+        'client_public_key': payload.get('client_public_key'),
+        'chat_history': payload['chat_history'],
+        'cipherkey': payload['cipherkey'],
+        'iv': payload['iv'],
+    }
+    if require_server_key:
+        envelope['server_public_key'] = payload['server_public_key']
+    if 'request_id' in payload:
+        envelope['request_id'] = payload['request_id']
+    if 'protocol' in payload:
+        envelope['protocol'] = payload['protocol']
+    if 'version' in payload:
+        envelope['version'] = payload['version']
+    return envelope, None
+
+
+@app.route('/api/v1/relay/servers/register', methods=['POST'])
+def api_v1_relay_servers_register():
+    """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
+    return sink()
+
+
+@app.route('/api/v1/relay/servers/poll', methods=['POST'])
+def api_v1_relay_servers_poll():
+    """Claim the next queued encrypted workload for a registered compute node."""
+    return sink()
+
+
+@app.route('/api/v1/relay/requests', methods=['POST'])
+def api_v1_relay_requests():
+    """Queue an encrypted API v1 relay request envelope for a target compute node."""
+    _evict_stale_servers()
+    envelope, error = _extract_ciphertext_envelope(request.get_json(), require_server_key=True)
+    if error:
+        msg, code = error
+        return jsonify({'error': {'message': msg, 'code': code}}), code
+
+    server_public_key = envelope.pop('server_public_key')
+    if server_public_key not in known_servers:
+        return jsonify({'error': 'Server with the specified public key not found'}), 404
+
+    stream_requested = bool(request.get_json().get('stream', False))
+    if stream_requested and not envelope.get('client_public_key'):
+        return jsonify({'error': {'message': 'Streaming requests require a client public key', 'code': 400}}), 400
+    envelope['stream'] = stream_requested
+
+    client_inference_requests.setdefault(server_public_key, []).append(envelope)
+    return jsonify({'message': 'Request received'}), 200
+
+
+@app.route('/api/v1/relay/responses', methods=['POST'])
+def api_v1_relay_responses():
+    """Store an encrypted API v1 response envelope for client retrieval."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    envelope, error = _extract_ciphertext_envelope(request.get_json(), require_server_key=False)
+    if error:
+        msg, code = error
+        return jsonify({'error': {'message': msg, 'code': code}}), code
+
+    client_public_key = envelope.get('client_public_key')
+    if not client_public_key:
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    client_responses[client_public_key] = envelope
+    return jsonify({'message': 'Response received and queued for client'}), 200
+
+
+@app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
+def api_v1_relay_responses_retrieve():
+    """Retrieve an encrypted API v1 response envelope by client public key."""
+    data = request.get_json()
+    if not data or 'client_public_key' not in data:
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    client_public_key = data['client_public_key']
+    if client_public_key not in client_responses:
+        return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
+
+    return jsonify(client_responses.pop(client_public_key)), 200
+
 @app.route('/faucet', methods=['POST'])
 def faucet():
     """

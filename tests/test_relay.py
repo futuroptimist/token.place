@@ -1,6 +1,7 @@
 import pytest
 import time
 import base64
+import json
 from flask import Flask
 import sys
 import os
@@ -1020,3 +1021,84 @@ def test_streaming_state_lifecycle(client):
     assert DUMMY_CLIENT_PUB_KEY not in streaming_sessions_by_client
     # Response should be removed from queue
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_relay_route_contract_e2ee_flow(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    request_payload = {
+        'request_id': 'req-123',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }
+    queued = client.post('/api/v1/relay/requests', json=request_payload)
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    polled_payload = poll.get_json()
+    assert polled_payload['chat_history'] == 'ciphertext-request'
+    assert polled_payload['cipherkey'] == 'cipherkey-request'
+    assert polled_payload['iv'] == 'iv-request'
+    assert polled_payload['client_public_key'] == DUMMY_CLIENT_PUB_KEY
+
+    response_payload = {
+        'request_id': 'req-123',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    }
+    source = client.post('/api/v1/relay/responses', json=response_payload)
+    assert source.status_code == 200
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    assert retrieved.status_code == 200
+    retrieved_payload = retrieved.get_json()
+    assert retrieved_payload['chat_history'] == 'ciphertext-response'
+    assert retrieved_payload['cipherkey'] == 'cipherkey-response'
+    assert retrieved_payload['iv'] == 'iv-response'
+    assert retrieved_payload['request_id'] == 'req-123'
+    assert retrieved_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+
+
+def test_api_v1_relay_plaintext_messages_not_stored(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    plaintext = 'PLAINTEXT_SENTINEL_DO_NOT_STORE'
+    payload = {
+        'request_id': 'req-no-messages',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-only',
+        'cipherkey': 'cipherkey-only',
+        'iv': 'iv-only',
+        'messages': [{'role': 'user', 'content': plaintext}],
+        'prompt': plaintext,
+    }
+    response = client.post('/api/v1/relay/requests', json=payload)
+    assert response.status_code == 200
+
+    queued_payload = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
+    assert 'messages' not in queued_payload
+    assert 'prompt' not in queued_payload
+    assert plaintext not in json.dumps(queued_payload)
+
+
+def test_api_v1_relay_chat_completions_fail_closed_and_queue_unchanged(client):
+    client_inference_requests.clear()
+    response = client.post('/relay/api/v1/chat/completions', json={
+        'model': 'x',
+        'messages': [{'role': 'user', 'content': 'should-not-queue'}],
+    })
+    assert response.status_code == 503
+    assert client_inference_requests == {}

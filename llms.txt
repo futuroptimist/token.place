@@ -27,3 +27,16 @@ Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python
 - Tests live in `tests/` and cover Python, JS, and Playwright
 - Docs in `docs/` with onboarding and style guides
 - See AGENTS.md for the Markdown version of this file
+
+
+## API architecture baseline (v0.1.0)
+- API v1 is the active API for v0.1.0 and the only active runtime integration target.
+- API v1 is non-streaming for relay/client-server inference; return only full responses.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route runtime traffic through API v2 yet.
+- Deprecated legacy relay routes: `/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server`.
+  Do not use or extend them for active production paths.
+- Active inference paths for `server.py`, `relay.py`, `client.py`, desktop Tauri flows, and relay
+  HTML chat UI should use API v1 E2EE routes.
+- Relay must remain ciphertext-only (+ routing metadata). If E2EE is not possible, fail closed.
+- See docs/architecture/api_v1_e2ee_relay.md for migration context and Prompt 1-4 alignment work.

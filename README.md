@@ -162,6 +162,26 @@ See also:
 - [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
+
+## API v1 E2EE architecture baseline (v0.1.0)
+
+- **API v1 is the active API for v0.1.0** and the only active runtime integration target.
+- **API v1 is non-streaming** for relay/client-server inference paths; return responses only after
+  full model generation is complete.
+- **Do not add streaming to API v1** for active relay/client-server paths.
+- **API v2 exists but is incomplete**; do not route runtime traffic through API v2 until API v1 is
+  launched and v0.1.0 is finalized.
+- **Deprecated legacy relay endpoints**: `/sink`, `/faucet`, `/source`, `/retrieve`,
+  `/next_server`. Do not use, extend, or reintroduce these as active production fallbacks.
+- Relay-blind E2EE remains mandatory: relay surfaces may see ciphertext + safe routing metadata
+  only, and must never store or expose plaintext model payload content.
+
+Known migration gap: `relay.py`, desktop-tauri paths, and relay landing-page HTML chat flow are
+not fully aligned yet; some E2E pieces still hit legacy routes. Prompts 1-4 handle that migration
+work. Prompt 0 is docs-only.
+
+See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md).
+
 ## Canonical entrypoints
 
 - `server.py` is the canonical compute-node server entrypoint.
@@ -171,7 +191,7 @@ See also:
 ## Deployment topology
 
 - **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
-  legacy sink/source contract.
+  deprecated legacy sink/source contract (historical compatibility only; not for active production paths).
 - **Near-term multi-node legacy flow:** multiple compute nodes (including desktop-tauri after
   parity) register through `relay.py` using the same legacy contract.
 - **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
@@ -256,7 +276,7 @@ In the short-to-medium term architecture, sugarkube scope remains relay-only.
   - [x] server.py stays on personal gaming PC
   - [x] potential cloud fallback node via Cloudflare
 - [x] allow participation from other server.pys
-  - [x] Relay enforces invitation tokens so community-run `server.py` nodes can authenticate `/sink` and `/source`
+  - [x] (Historical legacy) Relay invitation tokens for deprecated `/sink` and `/source` compatibility flows
   - [x] split relay/server python dependencies to reduce installation toil for relay-only nodes
 - [x] API v2 with at least 10 models supported and available
   - [x] Catalogue exposes Llama 3, Mixtral, Phi-3, Mistral Nemo, and Qwen2.5 variants
@@ -588,7 +608,7 @@ list.
 
 `token.place` now ships with an opt-in challenge/response layer for compute
 nodes. Set `TOKEN_PLACE_RELAY_SERVER_TOKEN` before launching the relay and
-every `/sink` or `/source` call must include an `X-Relay-Server-Token`
+for deprecated legacy `/sink` or `/source` compatibility flows only, include an `X-Relay-Server-Token`
 header that matches the configured value. Requests missing the header are
 rejected with an HTTP 401 so unknown machines can no longer impersonate
 trusted servers. Sensitive tokens are stripped when saving config files, so
@@ -629,7 +649,7 @@ python client.py
 
 #### Relay batching
 
-Operators running `server.py` can include a `max_batch_size` integer in their `/sink` polls to
+For deprecated legacy compatibility only, operators running `server.py` can include a `max_batch_size` integer in `/sink` polls to
 retrieve multiple pending jobs at once. The relay removes up to that many queued faucet requests,
 returns the first item via the legacy `client_public_key`/`chat_history` fields, and exposes the full
 batch under a `batch` array for upgraded workers. Leaving `max_batch_size` unset preserves the
@@ -986,7 +1006,7 @@ For deployments that need to relocate the queue file, set `TOKEN_PLACE_CONTRIBUT
 Once an operator is ready to host `server.py`, generate an invitation token and expose it to the relay by
 setting `TOKEN_PLACE_RELAY_SERVER_TOKENS` (comma or newline delimited) before launching `relay.py`.
 Each joined node must supply the matching token via the `TOKEN_PLACE_RELAY_SERVER_TOKEN` environment
-variable, which the relay client automatically forwards to the `/sink` and `/source` endpoints as the
+variable, which the legacy relay client forwards to deprecated `/sink` and `/source` endpoints as the
 `X-Relay-Server-Token` header. Requests without a valid token are rejected, preventing uninvited nodes
 from queueing or retrieving encrypted workloads while still keeping the workflow simple for approved
 operators.

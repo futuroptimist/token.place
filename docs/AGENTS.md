@@ -36,7 +36,14 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
 
 ### API boundary for `v0.1.0` (must-follow)
 
-- API v2 is deferred until **after** API v1 is fully launched on sugarkube.
+- API v1 is the active API for `v0.1.0` and the only active runtime integration target.
+- API v1 relay/client-server inference is **non-streaming by design**: return responses only
+  after full model generation is complete. Do not add streaming to API v1.
+- API v2 exists but is incomplete and is deferred until **after** API v1 is fully launched on
+  sugarkube and `v0.1.0` is finalized.
+- Deprecated legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, and
+  `/next_server` are historical compatibility only. Do not use them in active production paths, do
+  not extend them for new features, and do not reintroduce them as fallbacks.
 - Until that launch happens, the following traffic must be **API v1-only**:
   - desktop-tauri network/API calls,
   - `relay.py`,
@@ -46,6 +53,7 @@ Important: Always stylize the project name as lowercase `token.place` (not Title
   the landing-page relay chat flow.
 - Desktop prompt smoke tests may still use local `llama_cpp_python` streaming because that path is
   local-only and not relay/API traffic.
+- Architecture reference: [architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
 
 ## Documentation
 

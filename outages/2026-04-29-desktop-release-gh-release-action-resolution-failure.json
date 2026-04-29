@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-29",
+  "slug": "desktop-release-gh-release-action-resolution-failure",
+  "summary": "Desktop Tauri Release publish stage failed because the workflow pinned softprops/action-gh-release to an unavailable commit SHA.",
+  "impact": "Release artifacts were produced but GitHub Release publication failed to start for the affected run.",
+  "fix": "Replaced the unavailable SHA pin with softprops/action-gh-release@v2 in desktop release workflows.",
+  "lessons": "Pinned third-party action revisions can become unresolvable; dependency audits and coordinated workflow updates reduce release pipeline outages."
+}

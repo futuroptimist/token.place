@@ -229,6 +229,58 @@ def test_distributed_compute_provider_maps_encryption_failure_to_provider_error(
         assert "failed to encrypt relay request envelope" in str(exc)
 
 
+def test_distributed_compute_provider_maps_next_server_json_error(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: _FakeResponse(200, ValueError("bad json")),
+    )
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_invalid_payload"
+        assert "next_server response was not valid JSON" in str(exc)
+
+
+def test_distributed_compute_provider_maps_next_server_5xx(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda *_args, **_kwargs: _FakeResponse(503, {"error": "unavailable"}),
+    )
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_unreachable"
+        assert "unexpected status 503" in str(exc)
+
+
 def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypatch):
     fake_crypto = _FakeCryptoManager()
     observed_timeouts = {"get": None, "post": None}

@@ -1020,3 +1020,78 @@ def test_streaming_state_lifecycle(client):
     assert DUMMY_CLIENT_PUB_KEY not in streaming_sessions_by_client
     # Response should be removed from queue
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_relay_route_contract_round_trip_ciphertext_only(client):
+    """API v1 relay routes should queue/poll/respond/retrieve ciphertext envelopes."""
+    register_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register_response = client.post('/api/v1/relay/servers/register', json=register_payload)
+    assert register_response.status_code == 200
+
+    sentinel = 'SENTINEL_CIPHERTEXT_PAYLOAD_DO_NOT_PARSE'
+    request_payload = {
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': sentinel,
+        'cipherkey': 'cipherkey-sentinel',
+        'iv': 'iv-sentinel',
+    }
+    queued_response = client.post('/api/v1/relay/requests', json=request_payload)
+    assert queued_response.status_code == 200
+
+    poll_response = client.post('/api/v1/relay/servers/poll', json=register_payload)
+    assert poll_response.status_code == 200
+    poll_data = poll_response.get_json()
+    assert poll_data['client_public_key'] == DUMMY_CLIENT_PUB_KEY
+    assert poll_data['chat_history'] == sentinel
+    assert poll_data['cipherkey'] == 'cipherkey-sentinel'
+    assert poll_data['iv'] == 'iv-sentinel'
+    assert 'messages' not in poll_data
+
+    response_payload = {
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'RESPONSE_CIPHERTEXT_SENTINEL',
+        'cipherkey': 'response-cipherkey',
+        'iv': 'response-iv',
+    }
+    source_response = client.post('/api/v1/relay/responses', json=response_payload)
+    assert source_response.status_code == 200
+
+    retrieve_response = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY},
+    )
+    assert retrieve_response.status_code == 200
+    retrieve_data = retrieve_response.get_json()
+    assert retrieve_data == {
+        'chat_history': 'RESPONSE_CIPHERTEXT_SENTINEL',
+        'cipherkey': 'response-cipherkey',
+        'iv': 'response-iv',
+    }
+
+
+def test_api_v1_relay_chat_completions_plaintext_path_fail_closed(client):
+    """Relay API v1 plaintext chat path must remain disabled."""
+    response = client.post(
+        '/relay/api/v1/chat/completions',
+        json={
+            'model': 'gpt-4o-mini',
+            'messages': [{'role': 'user', 'content': 'plaintext must not queue'}],
+        },
+    )
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert client_inference_requests == {}
+
+
+def test_api_v1_relay_source_plaintext_path_fail_closed(client):
+    """Relay API v1 plaintext source path must remain disabled."""
+    response = client.post(
+        '/relay/api/v1/source',
+        json={'id': 'raw-source-payload', 'content': 'plaintext must not queue'},
+    )
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload['error']['code'] == 'distributed_api_v1_relay_disabled'
+    assert client_responses == {}

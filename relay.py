@@ -963,6 +963,36 @@ def retrieve():
         return jsonify({'error': 'No response available for the given public key'}), 200
 
 
+
+
+@app.route('/api/v1/relay/servers/register', methods=['POST'])
+def api_v1_relay_servers_register():
+    """Register or heartbeat a compute node using the API v1 relay contract."""
+    return sink()
+
+
+@app.route('/api/v1/relay/servers/poll', methods=['POST'])
+def api_v1_relay_servers_poll():
+    """Poll encrypted inference work using the API v1 relay contract."""
+    return sink()
+
+
+@app.route('/api/v1/relay/requests', methods=['POST'])
+def api_v1_relay_requests():
+    """Submit ciphertext-only inference work using the API v1 relay contract."""
+    return faucet()
+
+
+@app.route('/api/v1/relay/responses', methods=['POST'])
+def api_v1_relay_responses():
+    """Submit ciphertext-only compute responses using the API v1 relay contract."""
+    return source()
+
+
+@app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
+def api_v1_relay_responses_retrieve():
+    """Retrieve ciphertext-only compute responses using the API v1 relay contract."""
+    return retrieve()
 @app.route('/stream/retrieve', methods=['POST'])
 def stream_retrieve():
     """Return queued streaming chunks for the requesting client."""

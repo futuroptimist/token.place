@@ -33,6 +33,12 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
   sidecar launch, include regression coverage that asserts GPU mode does not
   silently fall back to CPU when GPU runtime support is expected.
 
+
+## Relay-blind E2EE invariant (must-follow)
+- Distributed inference relay traffic is ciphertext-only; relay-visible plaintext model payload content is forbidden.
+- Never queue, log, diagnose, forward, or echo OpenAI `messages`/`prompt` plaintext through relay-owned state or relay-targeted network calls.
+- If distributed relay cannot satisfy relay-blind E2EE, fail closed.
+
 ## Coding Conventions
 - New JavaScript should be written in **TypeScript** using functional React
   components and hooks.

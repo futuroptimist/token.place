@@ -352,7 +352,7 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
         return messages + [{"role": "assistant", "content": "bonjour"}]
 
     def fake_post(url, json, timeout, **_kwargs):
-        assert url == "https://relay.example/source"
+        assert url == "https://relay.example/api/v1/relay/responses"
         assert timeout == relay_client._request_timeout
         assert "chat_history" in json and "cipherkey" in json and "iv" in json
         assert "messages" not in json

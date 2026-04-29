@@ -704,7 +704,7 @@ def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     assert 'desktop.compute_node_bridge.model_init.start' in stderr
     assert 'desktop.compute_node_bridge.model_init.ready' in stderr
     assert 'desktop.compute_node_bridge.runtime_state' in stderr
-    assert 'desktop.compute_node_bridge.relay_poll' in stderr
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.poll' in stderr
     assert 'desktop.compute_node_bridge.stop' in stderr
 
 

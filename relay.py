@@ -987,13 +987,21 @@ def sink():
     if queued_requests:
         batch = []
         while queued_requests and len(batch) < max_batch_size:
-            request_payload = queued_requests.pop(0)
-            if 'api_v1_request' in request_payload or request_payload.get('e2ee_v1'):
+            request_payload = queued_requests[0]
+            if 'api_v1_request' in request_payload:
+                queued_requests.pop(0)
                 LOGGER.warning(
                     "relay.api_v1_plaintext_payload_dropped",
                     extra={"server_public_key": public_key},
                 )
                 continue
+            if request_payload.get('e2ee_v1'):
+                LOGGER.warning(
+                    "relay.api_v1_ciphertext_payload_skipped",
+                    extra={"server_public_key": public_key},
+                )
+                break
+            request_payload = queued_requests.pop(0)
             if request_payload.get('stream'):
                 session = _register_stream_session(
                     public_key,
@@ -1005,7 +1013,10 @@ def sink():
 
         if batch:
             first_request = batch[0]
-            response_data.update(first_request)
+            response_data['client_public_key'] = first_request.get('client_public_key')
+            response_data['chat_history'] = first_request.get('chat_history')
+            response_data['cipherkey'] = first_request.get('cipherkey')
+            response_data['iv'] = first_request.get('iv')
 
             if first_request.get('stream') and first_request.get('stream_session_id'):
                 response_data['stream'] = True

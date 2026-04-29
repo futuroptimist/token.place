@@ -195,8 +195,9 @@ See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay
 
 - **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
   deprecated legacy sink/source contract (historical compatibility only; not for active production paths).
-- **Near-term multi-node legacy flow:** multiple compute nodes (including desktop-tauri after
-  parity) register through `relay.py` using the same legacy contract.
+- **Near-term multi-node legacy flow (deprecated/historical migration context only):** multiple
+  compute nodes (including desktop-tauri after parity) register through `relay.py` using the same
+  legacy contract until API v1 distributed migration is complete.
 - **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
   contracts after parity and operational readiness gates are complete.
 - **Operator platform targets:** Windows 11 + NVIDIA/CUDA and macOS Apple Silicon + Metal first,

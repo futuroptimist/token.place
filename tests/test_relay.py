@@ -1206,3 +1206,33 @@ def test_api_v1_register_does_not_dequeue_requests(client):
     claimed = poll.get_json()
     assert claimed['request_id'] == 'req-register-heartbeat'
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests or len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 0
+
+
+def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 10,
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [{
+        'request_id': 'req-auth',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }]
+
+    monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['expected-token'])
+
+    unauthorized = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert unauthorized.status_code == 401
+    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+
+    authorized = client.post(
+        '/api/v1/relay/servers/poll',
+        json=server_payload,
+        headers={'X-Relay-Server-Token': 'expected-token'},
+    )
+    assert authorized.status_code == 200
+    assert authorized.get_json()['request_id'] == 'req-auth'

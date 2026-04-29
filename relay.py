@@ -764,6 +764,10 @@ def api_v1_relay_servers_register():
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
 def api_v1_relay_servers_poll():
     """Claim the next queued encrypted workload for a registered compute node."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
     _evict_stale_servers()
     data = request.get_json(silent=True)
     if not isinstance(data, dict):

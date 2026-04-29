@@ -348,7 +348,7 @@ class TestRelayClient:
 
         # Verify mock calls
         mock_post.assert_called_once_with(
-            'http://localhost:5000/sink',
+            'http://localhost:5000/api/v1/relay/servers/poll',
             json={'server_public_key': 'mock_public_key_b64'},
             timeout=relay_client._request_timeout
         )
@@ -452,8 +452,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
@@ -501,8 +501,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'https://relay.cloudflare.workers.dev/api/v1/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'https://relay.cloudflare.workers.dev/api/v1/relay/servers/poll',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -558,9 +558,9 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
-            'http://backup-relay:6000/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
@@ -609,8 +609,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/sink',
-            'http://backup-relay:6000/sink',
+            'http://primary-relay:5000/api/v1/relay/servers/poll',
+            'http://backup-relay:6000/api/v1/relay/servers/poll',
         ]
         assert client.relay_url == 'http://backup-relay:6000'
 
@@ -816,7 +816,7 @@ class TestRelayClient:
             mock_crypto_manager.decrypt_message.return_value
         )
 
-        # Check the encryption and post to /source
+        # Check the encryption and post to /api/v1/relay/responses
         mock_crypto_manager.encrypt_message.assert_called_once_with(
             mock_model_manager.llama_cpp_get_response.return_value,
             base64.b64decode('Y2xpZW50X2tleV9iNjQ=')
@@ -829,7 +829,7 @@ class TestRelayClient:
             'iv': 'encrypted_iv'
         }
         mock_post.assert_called_once_with(
-            'http://localhost:5000/source',
+            'http://localhost:5000/api/v1/relay/responses',
             json=expected_payload,
             timeout=relay_client._request_timeout
         )
@@ -880,7 +880,7 @@ class TestRelayClient:
             max_tokens=50,
         )
         mock_post.assert_called_once_with(
-            'http://localhost:5000/source',
+            'http://localhost:5000/api/v1/relay/responses',
             json={
                 'client_public_key': request_data["client_public_key"],
                 'chat_history': 'encrypted_chat_history',
@@ -1118,11 +1118,11 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_source_error(self, mock_post, relay_client, mock_crypto_manager, mock_model_manager, mock_http_response):
-        """Test processing a client request with error from /source endpoint."""
+        """Test processing a client request with error from /api/v1/relay/responses endpoint."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
 
-        # Mock error response from /source
+        # Mock error response from /api/v1/relay/responses
         mock_http_response.status_code = 500
         mock_http_response.text = "Internal server error"
         mock_post.return_value = mock_http_response
@@ -1135,11 +1135,11 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_empty_response(self, mock_post, relay_client, mock_crypto_manager, mock_model_manager, mock_http_response):
-        """Test processing a client request with empty response from /source."""
+        """Test processing a client request with empty response from /api/v1/relay/responses."""
         # Setup
         request_data = TEST_VALID_RESPONSE.copy()
 
-        # Mock empty response from /source
+        # Mock empty response from /api/v1/relay/responses
         mock_http_response.status_code = 200
         mock_http_response.text = ""
         mock_post.return_value = mock_http_response

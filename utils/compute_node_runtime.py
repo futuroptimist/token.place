@@ -62,9 +62,16 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
 
 def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Return whether ``payload`` is a relay API v1 request (disabled)."""
+    """Return whether ``payload`` is a relay API v1 request envelope."""
 
-    return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("protocol") == "tokenplace_api_v1_relay_e2ee"
+        and payload.get("version") == 1
+        and LEGACY_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
+        and "request_id" in payload
+    )
 
 
 class RelayRequestAdapter(Protocol):
@@ -91,17 +98,16 @@ class LegacyRelayRequestAdapter:
 
 
 class ApiV1RelayRequestAdapter:
-    """No-op adapter retained for backwards-compatible imports only."""
+    """Adapter for API v1 E2EE request envelopes."""
 
     def __init__(self, relay_client: "RelayClient"):
         self._relay_client = relay_client
 
     def can_process(self, request_data: Dict[str, Any]) -> bool:
-        return False
+        return is_api_v1_relay_payload(request_data)
 
     def process(self, request_data: Dict[str, Any]) -> bool:
-        _log_warning("Ignoring disabled relay API v1 payload handling in compute node runtime")
-        return False
+        return self._relay_client.process_client_request(request_data)
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -264,6 +270,7 @@ class ComputeNodeRuntime:
         )
         if request_adapters is None:
             self.request_adapters = [
+                ApiV1RelayRequestAdapter(self.relay_client),
                 LegacyRelayRequestAdapter(self.relay_client),
             ]
         else:
@@ -309,7 +316,7 @@ class ComputeNodeRuntime:
         return False
 
     def register_and_poll_once(self) -> Dict[str, Any]:
-        """Ping relay /sink and return response data."""
+        """Register/poll relay API v1 routes and return response data."""
 
         return self.relay_client.ping_relay()
 

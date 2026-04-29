@@ -33,6 +33,11 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
   sidecar launch, include regression coverage that asserts GPU mode does not
   silently fall back to CPU when GPU runtime support is expected.
 
+## Relay-blind E2EE invariant (must-follow)
+- Distributed relay inference must be relay-blind E2EE (ciphertext only + routing metadata).
+- Never queue, forward, log, diagnose, or expose plaintext model payload content in relay-owned state.
+- Any distributed plaintext path must fail closed unless replaced by an approved E2EE envelope path.
+
 ## Coding Conventions
 - New JavaScript should be written in **TypeScript** using functional React
   components and hooks.

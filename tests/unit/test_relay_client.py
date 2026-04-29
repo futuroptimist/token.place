@@ -880,7 +880,7 @@ class TestRelayClient:
             max_tokens=50,
         )
         mock_post.assert_called_once_with(
-            'http://localhost:5000/source',
+            'http://localhost:5000/api/v1/relay/responses',
             json={
                 'client_public_key': request_data["client_public_key"],
                 'chat_history': 'encrypted_chat_history',

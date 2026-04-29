@@ -5,7 +5,7 @@
 - **Affected area:** GitHub Actions desktop release pipeline (`.github/workflows/desktop-release.yml`)
 
 ## Summary
-The **Publish Github Release** stage in the desktop Tauri release workflow failed
+The **Publish GitHub Release** stage in the desktop Tauri release workflow failed
 before execution because it referenced a non-existent commit SHA for
 `softprops/action-gh-release`.
 

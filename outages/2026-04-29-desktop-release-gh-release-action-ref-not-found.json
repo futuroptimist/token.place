@@ -1,0 +1,18 @@
+{
+  "date": "2026-04-29",
+  "slug": "desktop-release-gh-release-action-ref-not-found",
+  "summary": "The Desktop Tauri Release workflow failed before publish execution because GitHub Actions could not resolve the exact commit SHA pinned for softprops/action-gh-release.",
+  "impact": "Desktop artifacts were built, but the workflow could not create/update the GitHub Release, blocking installer publication from CI.",
+  "fix": "Updated .github/workflows/desktop-release.yml and .github/workflows/desktop-build.yml to use softprops/action-gh-release@v2 instead of the non-resolvable commit SHA 153bb8e36b35d4f28c473603ceb4af68578f6b88.",
+  "lessons": "Monitor third-party action references, validate pinned SHAs on a schedule, and centralize critical release dependency versions.",
+  "workflowRun": "actions/runs/25091837962",
+  "affectedJobs": [
+    "Publish GitHub Release (ubuntu-24.04)"
+  ],
+  "detection": {
+    "errors": [
+      "Unable to resolve action softprops/action-gh-release@153bb8e36b35d4f28c473603ceb4af68578f6b88, unable to find version 153bb8e36b35d4f28c473603ceb4af68578f6b88"
+    ]
+  },
+  "rootCause": "Release workflows pinned softprops/action-gh-release to commit 153bb8e36b35d4f28c473603ceb4af68578f6b88. GitHub Actions could not resolve that action ref, so workflow initialization failed before publish steps executed."
+}

@@ -1,12 +1,16 @@
 # Claude Integration
 
-This file summarizes best practices from [Anthropic's "Claude Code Best Practices"](https://www.anthropic.com/engineering/claude-code-best-practices).
-It complements [AGENTS.md](AGENTS.md) and [llms.txt](llms.txt) by focusing on guidance specific to the Claude model family.
+This guide complements `AGENTS.md`, `llms.txt`, and project docs for Claude-family assistants.
 
-## Key Points
-- Keep prompts concise and provide explicit context.
-- Prefer deterministic functions with clear input and output formats.
-- Use code comments to explain non-obvious logic.
-- Validate model output before acting on it.
+## Mandatory architecture context before code edits
+- API v1 is the active API for v0.1.0.
+- API v1 is non-streaming; responses are returned after complete generation.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not move active runtime traffic to API v2 yet.
+- `/sink`, `/faucet`, `/source`, `/retrieve`, and `/next_server` are deprecated legacy relay endpoints.
+- Do not use, extend, or reintroduce legacy endpoints in active production paths.
+- Maintain relay-blind E2EE: relay sees ciphertext and safe routing metadata only; plaintext paths must fail closed.
 
-For broader assistant behavior, see [docs/AGENTS.md](docs/AGENTS.md).
+Known migration context: there is still a gap between `relay.py`, desktop Tauri, and relay HTML chat UI alignment. Code migration is owned by the Prompt 1-4 sequence; docs-only prompts should not implement runtime migrations early.
+
+See `docs/architecture/api_v1_e2ee_relay.md` for full baseline.

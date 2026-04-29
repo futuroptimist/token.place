@@ -62,3 +62,19 @@ Development dependencies live in [requirements.txt](../requirements.txt).
 static analysis failures surface before the broader CI workflow runs.
 
 Happy hacking!
+
+
+## API v1-only runtime baseline (v0.1.0)
+
+- API v1 is the active runtime API for v0.1.0.
+- API v1 is non-streaming; relay-path responses are returned only after full generation.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route active runtime traffic through API v2 yet.
+- Deprecated legacy relay endpoints: `/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server`.
+- Do not use, extend, or reintroduce legacy endpoints in active production paths.
+- Required alignment for active paths: `server.py`, `relay.py`, `client.py`, desktop Tauri, and relay HTML chat UI must use API v1 E2EE relay routes.
+- E2EE invariant: relay sees ciphertext plus safe routing metadata only; if E2EE cannot be preserved, fail closed.
+
+Migration note: there is a known gap between `relay.py`, desktop Tauri, and relay HTML chat UI where some paths still touch legacy routes. Prompt sequence 1-4 owns that runtime migration work.
+
+See [architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).

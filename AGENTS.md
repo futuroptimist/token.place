@@ -38,6 +38,17 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Never queue, forward, log, diagnose, or expose plaintext model payload content in relay-owned state.
 - Any distributed plaintext path must fail closed unless replaced by an approved E2EE envelope path.
 
+
+## API v1-only runtime guardrails for v0.1.0 (must-follow)
+- API v1 is the active API for v0.1.0 and is non-streaming; return responses only after full generation.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route runtime traffic to API v2 until API v1 launch and v0.1.0 finalization.
+- Deprecated legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, and `/next_server` must not be used in active production paths.
+- Do not extend legacy relay routes for new features and do not reintroduce them as compatibility fallbacks.
+- Required active-path alignment on API v1 E2EE: `server.py`, `relay.py`, `client.py`, desktop Tauri, and relay landing-page HTML chat UI.
+- If a path cannot preserve relay-blind E2EE (ciphertext only + safe routing metadata), fail closed rather than sending plaintext through relay.
+- Architecture baseline doc: [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md).
+
 ## Coding Conventions
 - New JavaScript should be written in **TypeScript** using functional React
   components and hooks.

@@ -162,6 +162,25 @@ See also:
 - [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
+## API v1 launch architecture guardrails (v0.1.0)
+
+- **API v1 is the active API for `v0.1.0` and the only active runtime integration target.**
+- **API v1 is non-streaming.** Return responses only after full model generation is complete.
+- **Do not add streaming to API v1.**
+- **API v2 exists but is incomplete and must not carry runtime traffic yet.**
+- **Do not migrate active UI/desktop/server/relay flows to API v2** until API v1 is launched and
+  `v0.1.0` is finalized.
+- **Deprecated legacy relay endpoints** `/sink`, `/faucet`, `/source`, `/retrieve`, and
+  `/next_server` must not be used in active production paths, extended for new features, or
+  reintroduced as fallbacks.
+- Active inference alignment target: `server.py`, `relay.py`, `client.py`, desktop Tauri, and
+  relay landing-page chat UI all use API v1 E2EE relay routes.
+- E2EE invariant: relay sees ciphertext + safe routing metadata only; if E2EE cannot be preserved,
+  fail closed.
+
+See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md) for the
+canonical migration baseline and Prompt 0-4 context.
+
 ## Canonical entrypoints
 
 - `server.py` is the canonical compute-node server entrypoint.

@@ -68,6 +68,19 @@ When helping users in a Linux/Unix environment:
    kill -9 <pid>
    ```
 
+
+## API v1-only relay guidance (must-follow for active runtime work)
+
+- API v1 is the active API for v0.1.0 and the only active runtime integration target.
+- API v1 is non-streaming. Return responses only after full generation; do not add streaming.
+- API v2 exists but is incomplete. Do not route runtime traffic to API v2 yet.
+- Deprecated legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, and `/next_server` are historical only. Do not use, extend, or revive them for active production paths.
+- Required component alignment on API v1 E2EE: `server.py`, `relay.py`, `client.py`, desktop Tauri, and relay landing-page HTML chat UI.
+- E2EE invariant: relay sees ciphertext + safe routing metadata only. Never permit plaintext prompts/messages/responses/tool arguments/model output in relay-owned state/logs/diagnostics/payloads.
+- If E2EE cannot be preserved on a path, fail closed.
+- Migration context: a known gap still exists between relay.py, desktop Tauri, and relay HTML chat UI; Prompts 1-4 are intended to close that gap.
+- Reference: [architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
+
 ## Common Tasks and Solutions
 
 ### Running Tests

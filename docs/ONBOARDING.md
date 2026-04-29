@@ -12,6 +12,21 @@ Welcome to `token.place`! This document provides a high-level overview of the pr
 - **`static/`** – frontend assets including `chat.js`, a browser-based chat client that performs client-side encryption.
 - **`tests/`** – unit, integration and end-to-end tests. See [tests/README.md](../tests/README.md).
 
+
+## API v1-only launch baseline (v0.1.0)
+
+- API v1 is the active API for v0.1.0 and the only active runtime target.
+- API v1 is non-streaming: return responses only after full model generation.
+- Do not add streaming to API v1.
+- API v2 exists but is incomplete; do not route runtime traffic through API v2 yet.
+- Deprecated legacy relay endpoints `/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server` must not be used in active production paths, extended for new features, or revived as fallbacks.
+- Required active-path alignment on API v1 E2EE: `server.py`, `relay.py`, `client.py`, desktop Tauri, and relay landing-page HTML chat UI.
+- Relay sees ciphertext only (plus safe routing metadata). If E2EE cannot be preserved, fail closed.
+
+Known migration gap: some end-to-end path segments still use legacy routes. Prompts 1-4 address
+that gap after this Prompt 0 docs baseline. See
+[architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
+
 ## Encryption Workflow
 
 1. Clients generate an RSA key pair and fetch the server's public key.

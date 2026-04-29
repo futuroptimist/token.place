@@ -10,7 +10,8 @@ testing, and deploying token.place. For an expanded overview of every directory,
   - Start here: [README.md](../README.md#quickstart)
   - Also see: [ONBOARDING.md](ONBOARDING.md), [DEVELOPMENT.md](DEVELOPMENT.md)
 - **Understand architecture choices**
-  - Start here: [ARCHITECTURE.md](ARCHITECTURE.md)
+  - Start here: [ARCHITECTURE.md](ARCHITECTURE.md),
+    [architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md)
   - Also see: [STREAMING_IMPLEMENTATION_GUIDE.md](STREAMING_IMPLEMENTATION_GUIDE.md),
     [CROSS_PLATFORM.md](CROSS_PLATFORM.md),
     [roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md),

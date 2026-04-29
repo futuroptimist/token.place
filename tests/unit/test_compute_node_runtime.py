@@ -170,7 +170,8 @@ def test_compute_node_runtime_respects_explicit_empty_adapter_list():
     relay_client.process_client_request.assert_not_called()
 
 
-def test_api_v1_relay_payload_detection_is_hard_disabled():
+def test_api_v1_relay_payload_detection_matches_e2ee_envelopes():
+    assert is_api_v1_relay_payload({"e2ee_v1": True}) is True
     assert is_api_v1_relay_payload({"api_v1_payload": True}) is False
 
 

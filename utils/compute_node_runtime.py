@@ -62,9 +62,9 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
 
 def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Return whether ``payload`` is a relay API v1 request (disabled)."""
+    """Return whether ``payload`` is an API v1 encrypted relay request envelope."""
 
-    return False
+    return isinstance(payload, dict) and payload.get("e2ee_v1") is True
 
 
 class RelayRequestAdapter(Protocol):
@@ -309,7 +309,7 @@ class ComputeNodeRuntime:
         return False
 
     def register_and_poll_once(self) -> Dict[str, Any]:
-        """Ping relay /sink and return response data."""
+        """Register and poll relay API v1 encrypted workload routes once."""
 
         return self.relay_client.ping_relay()
 

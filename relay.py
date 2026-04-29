@@ -732,7 +732,23 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
 def api_v1_relay_servers_register():
     """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
-    return sink()
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    public_key = data['server_public_key']
+
+    if public_key in known_servers:
+        known_servers[public_key]['last_ping'] = datetime.now()
+    else:
+        known_servers[public_key] = {
+            'public_key': public_key,
+            'last_ping': datetime.now(),
+            'last_ping_duration': 10,
+        }
+
+    return jsonify({'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration']}), 200
 
 
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
@@ -745,19 +761,16 @@ def api_v1_relay_servers_poll():
 def api_v1_relay_requests():
     """Queue an encrypted API v1 relay request envelope for a target compute node."""
     _evict_stale_servers()
-    envelope, error = _extract_ciphertext_envelope(request.get_json(), require_server_key=True)
+    data = request.get_json()
+    envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
     if error:
         msg, code = error
         return jsonify({'error': {'message': msg, 'code': code}}), code
 
     server_public_key = envelope.pop('server_public_key')
     if server_public_key not in known_servers:
-        return jsonify({'error': 'Server with the specified public key not found'}), 404
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
-    stream_requested = bool(request.get_json().get('stream', False))
-    if stream_requested and not envelope.get('client_public_key'):
-        return jsonify({'error': {'message': 'Streaming requests require a client public key', 'code': 400}}), 400
-    envelope['stream'] = stream_requested
 
     client_inference_requests.setdefault(server_public_key, []).append(envelope)
     return jsonify({'message': 'Request received'}), 200
@@ -868,7 +881,7 @@ def faucet():
 
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
-        return jsonify({'error': 'Server with the specified public key not found'}), 404
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     # Append the client's request to the list of requests for the server
     client_inference_requests.setdefault(server_public_key, []).append({
@@ -954,12 +967,7 @@ def sink():
 
         if batch:
             first_request = batch[0]
-            response_data.update({
-                'client_public_key': first_request['client_public_key'],
-                'chat_history': first_request['chat_history'],
-                'cipherkey': first_request['cipherkey'],
-                'iv': first_request.get('iv', ''),
-            })
+            response_data.update(first_request)
 
             if first_request.get('stream') and first_request.get('stream_session_id'):
                 response_data['stream'] = True

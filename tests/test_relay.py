@@ -736,7 +736,7 @@ def test_faucet_unknown_server(client):
     assert response.status_code == 404
     data = response.get_json()
     assert 'error' in data
-    assert data['error'] == 'Server with the specified public key not found'
+    assert data['error'] == {'message': 'Server with the specified public key not found', 'code': 404}
 
 
 def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
@@ -1048,6 +1048,9 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     assert polled_payload['cipherkey'] == 'cipherkey-request'
     assert polled_payload['iv'] == 'iv-request'
     assert polled_payload['client_public_key'] == DUMMY_CLIENT_PUB_KEY
+    assert polled_payload['request_id'] == 'req-123'
+    assert polled_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+    assert polled_payload['version'] == 1
 
     response_payload = {
         'request_id': 'req-123',
@@ -1102,3 +1105,32 @@ def test_api_v1_relay_chat_completions_fail_closed_and_queue_unchanged(client):
     })
     assert response.status_code == 503
     assert client_inference_requests == {}
+
+
+def test_api_v1_register_does_not_dequeue_requests(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    request_payload = {
+        'request_id': 'req-register-heartbeat',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }
+    queued = client.post('/api/v1/relay/requests', json=request_payload)
+    assert queued.status_code == 200
+
+    heartbeat = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert heartbeat.status_code == 200
+
+    # Register/heartbeat should not claim work.
+    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    claimed = poll.get_json()
+    assert claimed['request_id'] == 'req-register-heartbeat'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests or len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 0

@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-29",
+  "slug": "desktop-release-publish-action-pin-invalid",
+  "summary": "Desktop Tauri release publishing failed because the workflow referenced a non-existent pinned SHA for softprops/action-gh-release.",
+  "impact": "GitHub Release publication was blocked at action-resolution time, preventing release asset publishing despite successful upstream build steps.",
+  "fix": "Replaced the invalid action pin with the valid softprops/action-gh-release v2.6.1 commit SHA (153bb8e04406b158c6c84fc1615b65b24149a1fe) in desktop release workflows.",
+  "lessons": "Pinned GitHub Actions SHAs must be verified against upstream refs before merge; use deterministic SHA validation in CI maintenance changes."
+}

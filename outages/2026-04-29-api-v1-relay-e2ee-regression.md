@@ -42,18 +42,18 @@ That bridge unintentionally routed plaintext `messages` through relay-owned stat
 relay-blind E2EE contract.
 
 ## Timeline
-- **2026-04-?? (introduction):** PR #813 merged as
+- **2026-04-23 (introduction):** PR #813 merged as
   `0f01d38b01e7e6bab44bc42eeaab9eccd3a5e0ed`, introducing API v1 distributed relay plaintext
   handling regression.
 - **Attempted partial mitigation:** PR #831 proposed registration-token hardening to reduce
   unauthenticated plaintext dispatch exposure, but did not restore relay-blind E2EE. It was
   closed/not merged in favor of full containment + restoration + safeguards.
-- **Prompt 1 containment:** PR #834 merged as `86c27f9` (with follow-up containment commits),
+- **Prompt 1 containment:** PR #834 merged as `86c27f99abba73d78b29337c5b3f001a6065e844` (with follow-up containment commits),
   fail-closing unsafe distributed API v1 relay dispatch and surfacing safe error behavior
   (`distributed_api_v1_relay_disabled`) instead of forwarding plaintext.
-- **Prompt 2 restoration:** PR #836 merged as `a0f9a6c`, restoring distributed API v1 relay
+- **Prompt 2 restoration:** PR #836 merged as `a0f9a6cefbbb88e745c6eee299d2667b783ddc1b`, restoring distributed API v1 relay
   functionality through relay-blind E2EE envelope handling.
-- **Prompt 3 prevention:** PR #842 merged as `5151be7`, adding permanent multi-layer safeguards to
+- **Prompt 3 prevention:** PR #842 merged as `5151be745126d870d1b30c0ed0bf2d4e5e55f44a`, adding permanent multi-layer safeguards to
   prevent plaintext relay regressions.
 
 ## Root cause
@@ -88,12 +88,12 @@ API v1 relay plaintext handling as a contract violation. Subsequent containment/
 Prompt 3 safeguards codified the violation conditions and prevention checks.
 
 ## Immediate containment
-Prompt 1 containment (PR #834, merge commit `86c27f9`) disabled unsafe distributed API v1 relay
+Prompt 1 containment (PR #834, merge commit `86c27f99abba73d78b29337c5b3f001a6065e844`) disabled unsafe distributed API v1 relay
 plaintext dispatch and forced fail-closed behavior. User-visible behavior temporarily moved to the
 safe error path rather than attempting insecure distributed execution.
 
 ## Restoration or deferment
-Prompt 2 restoration (PR #836, merge commit `a0f9a6c`) restored distributed API v1 relay behavior
+Prompt 2 restoration (PR #836, merge commit `a0f9a6cefbbb88e745c6eee299d2667b783ddc1b`) restored distributed API v1 relay behavior
 through relay-blind E2EE envelope routing. The final user-visible state after Prompt 2 is that
 successful distributed API relay is available again via E2EE-preserving flow.
 
@@ -101,7 +101,7 @@ successful distributed API relay is available again via E2EE-preserving flow.
 this section with explicit fail-closed deferment details for that branch/release.)
 
 ## Permanent remediation / regression prevention
-Prompt 3 safeguards (PR #842, merge commit `5151be7`) added multi-layer anti-regression coverage:
+Prompt 3 safeguards (PR #842, merge commit `5151be745126d870d1b30c0ed0bf2d4e5e55f44a`) added multi-layer anti-regression coverage:
 - static forbidden-pattern checks,
 - runtime relay-state sentinels,
 - network egress sentinels,

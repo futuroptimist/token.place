@@ -1,6 +1,7 @@
 import pytest
 import time
 import base64
+import json
 from flask import Flask
 import sys
 import os
@@ -735,7 +736,7 @@ def test_faucet_unknown_server(client):
     assert response.status_code == 404
     data = response.get_json()
     assert 'error' in data
-    assert data['error'] == 'Server with the specified public key not found'
+    assert data['error'] == {'message': 'Server with the specified public key not found', 'code': 404}
 
 
 def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
@@ -1020,3 +1021,252 @@ def test_streaming_state_lifecycle(client):
     assert DUMMY_CLIENT_PUB_KEY not in streaming_sessions_by_client
     # Response should be removed from queue
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_relay_route_contract_e2ee_flow(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    request_payload = {
+        'request_id': 'req-123',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }
+    queued = client.post('/api/v1/relay/requests', json=request_payload)
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    polled_payload = poll.get_json()
+    assert polled_payload['chat_history'] == 'ciphertext-request'
+    assert polled_payload['cipherkey'] == 'cipherkey-request'
+    assert polled_payload['iv'] == 'iv-request'
+    assert polled_payload['client_public_key'] == DUMMY_CLIENT_PUB_KEY
+    assert polled_payload['request_id'] == 'req-123'
+    assert polled_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+    assert polled_payload['version'] == 1
+
+    response_payload = {
+        'request_id': 'req-123',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    }
+    source = client.post('/api/v1/relay/responses', json=response_payload)
+    assert source.status_code == 200
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    assert retrieved.status_code == 200
+    retrieved_payload = retrieved.get_json()
+    assert retrieved_payload['chat_history'] == 'ciphertext-response'
+    assert retrieved_payload['cipherkey'] == 'cipherkey-response'
+    assert retrieved_payload['iv'] == 'iv-response'
+    assert retrieved_payload['request_id'] == 'req-123'
+    assert retrieved_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+
+
+def test_api_v1_relay_plaintext_messages_not_stored(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    plaintext = 'PLAINTEXT_SENTINEL_DO_NOT_STORE'
+    payload = {
+        'request_id': 'req-no-messages',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-only',
+        'cipherkey': 'cipherkey-only',
+        'iv': 'iv-only',
+        'messages': [{'role': 'user', 'content': plaintext}],
+        'prompt': plaintext,
+    }
+    response = client.post('/api/v1/relay/requests', json=payload)
+    assert response.status_code == 200
+
+    queued_payload = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
+    assert 'messages' not in queued_payload
+    assert 'prompt' not in queued_payload
+    assert plaintext not in json.dumps(queued_payload)
+
+
+def test_api_v1_relay_requests_requires_client_public_key(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    response = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-missing-client-key',
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'ciphertext': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+
+    assert response.status_code == 400
+    assert response.get_json() == {'error': {'message': 'Missing client public key', 'code': 400}}
+
+
+def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeypatch):
+    def _sink_should_not_be_called():
+        raise AssertionError('legacy sink() should not be called by API v1 register/poll')
+
+    monkeypatch.setattr('relay.sink', _sink_should_not_be_called)
+
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-no-sink-delegation',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'ciphertext': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    polled = poll.get_json()
+    assert polled['request_id'] == 'req-no-sink-delegation'
+
+
+def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
+        {
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'legacy-plaintext',
+            'cipherkey': 'legacy-key',
+            'iv': 'legacy-iv',
+        },
+        {
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'request_id': 'req-e2ee-only',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'e2ee_v1': True,
+        },
+    ]
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    payload = poll.get_json()
+    assert payload['request_id'] == 'req-e2ee-only'
+    assert payload['chat_history'] == 'ciphertext-request'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+
+
+def test_api_v1_relay_response_plaintext_not_stored(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    plaintext = 'PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE'
+    response_payload = {
+        'request_id': 'req-response-no-plaintext',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response-only',
+        'cipherkey': 'cipherkey-response-only',
+        'iv': 'iv-response-only',
+        'messages': [{'role': 'assistant', 'content': plaintext}],
+        'prompt': plaintext,
+        'assistant_output': plaintext,
+        'tool_arguments': plaintext,
+        'model_output_text': plaintext,
+    }
+    source = client.post('/api/v1/relay/responses', json=response_payload)
+    assert source.status_code == 200
+
+    queued_payload = client_responses[DUMMY_CLIENT_PUB_KEY]
+    assert 'messages' not in queued_payload
+    assert 'prompt' not in queued_payload
+    assert 'assistant_output' not in queued_payload
+    assert 'tool_arguments' not in queued_payload
+    assert 'model_output_text' not in queued_payload
+    assert plaintext not in json.dumps(queued_payload)
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    assert retrieved.status_code == 200
+    assert plaintext not in json.dumps(retrieved.get_json())
+
+
+def test_api_v1_relay_chat_completions_fail_closed_and_queue_unchanged(client):
+    client_inference_requests.clear()
+    response = client.post('/relay/api/v1/chat/completions', json={
+        'model': 'x',
+        'messages': [{'role': 'user', 'content': 'should-not-queue'}],
+    })
+    assert response.status_code == 503
+    assert client_inference_requests == {}
+
+
+def test_api_v1_register_does_not_dequeue_requests(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    request_payload = {
+        'request_id': 'req-register-heartbeat',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }
+    queued = client.post('/api/v1/relay/requests', json=request_payload)
+    assert queued.status_code == 200
+
+    heartbeat = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert heartbeat.status_code == 200
+
+    # Register/heartbeat should not claim work.
+    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    claimed = poll.get_json()
+    assert claimed['request_id'] == 'req-register-heartbeat'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests or len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 0
+
+
+def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 10,
+    }
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [{
+        'request_id': 'req-auth',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+        'e2ee_v1': True,
+    }]
+
+    monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['expected-token'])
+
+    unauthorized = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert unauthorized.status_code == 401
+    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+
+    authorized = client.post(
+        '/api/v1/relay/servers/poll',
+        json=server_payload,
+        headers={'X-Relay-Server-Token': 'expected-token'},
+    )
+    assert authorized.status_code == 200
+    assert authorized.get_json()['request_id'] == 'req-auth'

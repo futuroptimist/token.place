@@ -701,6 +701,168 @@ def relay_api_v1_source():
         }
     ), 503
 
+def _extract_ciphertext_envelope(payload, *, require_server_key=False):
+    if not isinstance(payload, dict):
+        return None, ('Invalid request data', 400)
+
+    required = ['cipherkey', 'iv']
+    has_ciphertext = 'ciphertext' in payload
+    has_chat_history = 'chat_history' in payload
+    if not has_ciphertext and not has_chat_history:
+        return None, ('Invalid request data', 400)
+    if require_server_key:
+        required.insert(0, 'server_public_key')
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return None, ('Invalid request data', 400)
+
+    envelope = {
+        'client_public_key': payload.get('client_public_key'),
+        'chat_history': payload.get('ciphertext', payload.get('chat_history')),
+        'ciphertext': payload.get('ciphertext', payload.get('chat_history')),
+        'cipherkey': payload['cipherkey'],
+        'iv': payload['iv'],
+    }
+    if require_server_key:
+        envelope['server_public_key'] = payload['server_public_key']
+    if 'request_id' in payload:
+        envelope['request_id'] = payload['request_id']
+    if 'protocol' in payload:
+        envelope['protocol'] = payload['protocol']
+    if 'version' in payload:
+        envelope['version'] = payload['version']
+    return envelope, None
+
+
+@app.route('/api/v1/relay/servers/register', methods=['POST'])
+def api_v1_relay_servers_register():
+    """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not public_key:
+        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+
+    if public_key in known_servers:
+        known_servers[public_key]['last_ping'] = datetime.now()
+    else:
+        known_servers[public_key] = {
+            'public_key': public_key,
+            'last_ping': datetime.now(),
+            'last_ping_duration': 10,
+        }
+
+    return jsonify({'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration']}), 200
+
+
+@app.route('/api/v1/relay/servers/poll', methods=['POST'])
+def api_v1_relay_servers_poll():
+    """Claim the next queued encrypted workload for a registered compute node."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    _evict_stale_servers()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not public_key:
+        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+    if public_key not in known_servers:
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+
+    queued_requests = client_inference_requests.get(public_key, [])
+    if not queued_requests:
+        return jsonify({'message': 'No requests available'}), 200
+
+    first_request = None
+    while queued_requests:
+        candidate = queued_requests[0]
+        if candidate.get('e2ee_v1'):
+            first_request = queued_requests.pop(0)
+            break
+        LOGGER.warning(
+            "relay.api_v1_legacy_payload_skipped",
+            extra={"server_public_key": public_key},
+        )
+        queued_requests.pop(0)
+
+    if first_request is None:
+        if not queued_requests:
+            client_inference_requests.pop(public_key, None)
+        return jsonify({'message': 'No requests available'}), 200
+
+    if not queued_requests:
+        client_inference_requests.pop(public_key, None)
+
+    return jsonify(first_request), 200
+
+
+@app.route('/api/v1/relay/requests', methods=['POST'])
+def api_v1_relay_requests():
+    """Queue an encrypted API v1 relay request envelope for a target compute node."""
+    _evict_stale_servers()
+    data = request.get_json()
+    envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
+    if error:
+        msg, code = error
+        return jsonify({'error': {'message': msg, 'code': code}}), code
+
+    server_public_key = envelope.pop('server_public_key')
+    if server_public_key not in known_servers:
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+
+
+    if not envelope.get('client_public_key'):
+        return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
+
+    envelope['e2ee_v1'] = True
+    client_inference_requests.setdefault(server_public_key, []).append(envelope)
+    return jsonify({'message': 'Request received'}), 200
+
+
+@app.route('/api/v1/relay/responses', methods=['POST'])
+def api_v1_relay_responses():
+    """Store an encrypted API v1 response envelope for client retrieval."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json()
+    envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
+    if error:
+        msg, code = error
+        return jsonify({'error': {'message': msg, 'code': code}}), code
+
+    client_public_key = envelope.get('client_public_key')
+    if not client_public_key:
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    client_responses[client_public_key] = envelope
+    return jsonify({'message': 'Response received and queued for client'}), 200
+
+
+@app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
+def api_v1_relay_responses_retrieve():
+    """Retrieve an encrypted API v1 response envelope by client public key."""
+    data = request.get_json()
+    if not data or 'client_public_key' not in data:
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    client_public_key = data['client_public_key']
+    if client_public_key not in client_responses:
+        return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
+
+    return jsonify(client_responses.pop(client_public_key)), 200
+
 @app.route('/faucet', methods=['POST'])
 def faucet():
     """
@@ -773,7 +935,7 @@ def faucet():
 
     # Check if the server with the specified public key is known
     if server_public_key not in known_servers:
-        return jsonify({'error': 'Server with the specified public key not found'}), 404
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     # Append the client's request to the list of requests for the server
     client_inference_requests.setdefault(server_public_key, []).append({
@@ -841,13 +1003,21 @@ def sink():
     if queued_requests:
         batch = []
         while queued_requests and len(batch) < max_batch_size:
-            request_payload = queued_requests.pop(0)
+            request_payload = queued_requests[0]
             if 'api_v1_request' in request_payload:
+                queued_requests.pop(0)
                 LOGGER.warning(
                     "relay.api_v1_plaintext_payload_dropped",
                     extra={"server_public_key": public_key},
                 )
                 continue
+            if request_payload.get('e2ee_v1'):
+                LOGGER.warning(
+                    "relay.api_v1_ciphertext_payload_skipped",
+                    extra={"server_public_key": public_key},
+                )
+                break
+            request_payload = queued_requests.pop(0)
             if request_payload.get('stream'):
                 session = _register_stream_session(
                     public_key,
@@ -859,12 +1029,10 @@ def sink():
 
         if batch:
             first_request = batch[0]
-            response_data.update({
-                'client_public_key': first_request['client_public_key'],
-                'chat_history': first_request['chat_history'],
-                'cipherkey': first_request['cipherkey'],
-                'iv': first_request.get('iv', ''),
-            })
+            response_data['client_public_key'] = first_request.get('client_public_key')
+            response_data['chat_history'] = first_request.get('chat_history')
+            response_data['cipherkey'] = first_request.get('cipherkey')
+            response_data['iv'] = first_request.get('iv')
 
             if first_request.get('stream') and first_request.get('stream_session_id'):
                 response_data['stream'] = True

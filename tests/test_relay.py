@@ -1020,3 +1020,65 @@ def test_streaming_state_lifecycle(client):
     assert DUMMY_CLIENT_PUB_KEY not in streaming_sessions_by_client
     # Response should be removed from queue
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_relay_ciphertext_contract_flow(client):
+    server_key = DUMMY_SERVER_PUB_KEY
+    client_key = DUMMY_CLIENT_PUB_KEY
+
+    register_response = client.post(
+        "/api/v1/relay/servers/register", json={"server_public_key": server_key}
+    )
+    assert register_response.status_code == 200
+
+    request_envelope = {
+        "server_public_key": server_key,
+        "client_public_key": client_key,
+        "chat_history": "encrypted-request",
+        "cipherkey": "encrypted-key",
+        "iv": "encrypted-iv",
+        "protocol": "e2ee-v1",
+    }
+    queue_response = client.post("/api/v1/relay/requests", json=request_envelope)
+    assert queue_response.status_code == 200
+
+    poll_response = client.post(
+        "/api/v1/relay/servers/poll", json={"server_public_key": server_key}
+    )
+    assert poll_response.status_code == 200
+    poll_payload = poll_response.get_json()
+    assert poll_payload["client_public_key"] == client_key
+    assert poll_payload["chat_history"] == request_envelope["chat_history"]
+    assert poll_payload["cipherkey"] == request_envelope["cipherkey"]
+    assert poll_payload["iv"] == request_envelope["iv"]
+    assert "messages" not in str(poll_payload)
+
+    response_envelope = {
+        "client_public_key": client_key,
+        "chat_history": "encrypted-response",
+        "cipherkey": "encrypted-response-key",
+        "iv": "encrypted-response-iv",
+    }
+    response_post = client.post("/api/v1/relay/responses", json=response_envelope)
+    assert response_post.status_code == 200
+
+    retrieve_response = client.post(
+        "/api/v1/relay/responses/retrieve", json={"client_public_key": client_key}
+    )
+    assert retrieve_response.status_code == 200
+    retrieved = retrieve_response.get_json()
+    assert retrieved["chat_history"] == "encrypted-response"
+    assert retrieved["cipherkey"] == "encrypted-response-key"
+    assert retrieved["iv"] == "encrypted-response-iv"
+    assert "messages" not in str(retrieved)
+
+
+def test_api_v1_relay_chat_completions_fail_closed_plaintext(client):
+    payload = {
+        "model": "llama-3",
+        "messages": [{"role": "user", "content": "plaintext-should-not-queue"}],
+    }
+    response = client.post("/relay/api/v1/chat/completions", json=payload)
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == "distributed_api_v1_relay_disabled"
+    assert client_inference_requests == {}

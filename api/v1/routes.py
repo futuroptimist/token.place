@@ -78,6 +78,18 @@ DEFAULT_SERVICE_NAME = 'token.place'
 SERVICE_NAME = os.getenv('SERVICE_NAME', DEFAULT_SERVICE_NAME)
 
 
+def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_request: bool) -> bool:
+    """Allow desktop-bridge distributed override only for explicit API v1 E2EE intent."""
+
+    if not isinstance(request_metadata, dict) or not is_encrypted_request:
+        return False
+    if request_metadata.get("inference_target") != "desktop_bridge_api_v1_e2ee":
+        return False
+    if request_metadata.get("relay_path") != "api_v1_e2ee":
+        return False
+    return bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip())
+
+
 def _get_service_name() -> str:
     """Return the configured service identifier for health responses."""
 
@@ -326,9 +338,9 @@ def _handle_chat_completion_request(data):
             ]
 
         request_metadata = data.get("metadata")
-        force_desktop_bridge_distributed = bool(
-            isinstance(request_metadata, dict)
-            and request_metadata.get("inference_target") == "desktop_bridge_api_v1_e2ee"
+        force_desktop_bridge_distributed = _should_force_desktop_bridge_distributed(
+            request_metadata,
+            is_encrypted_request,
         )
 
         log_info(f"Generating response using model {model_id}")

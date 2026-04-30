@@ -6,6 +6,7 @@ from api.v1.compute_provider import (
     DistributedApiV1ComputeProvider,
     FallbackApiV1ComputeProvider,
     LocalApiV1ComputeProvider,
+    get_api_v1_compute_provider_for_mode,
     get_api_v1_resolved_provider_path,
 )
 from relay import app
@@ -628,3 +629,22 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_invalid_payload"
         assert "compute node response missing assistant message" in str(exc)
+
+
+def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    try:
+        get_api_v1_compute_provider_for_mode(mode="distributed", distributed_fallback_enabled=False)
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert "requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL" in str(exc)
+
+
+def test_get_api_v1_compute_provider_for_mode_reads_fallback_from_env(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1")
+
+    provider = get_api_v1_compute_provider_for_mode(mode="distributed", distributed_fallback_enabled=None)
+    assert isinstance(provider, LocalApiV1ComputeProvider)

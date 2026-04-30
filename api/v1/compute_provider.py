@@ -426,13 +426,20 @@ def _build_api_v1_compute_provider(
 def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     """Resolve the active provider based on environment configuration."""
 
+    mode, distributed_url, distributed_fallback_enabled = _read_api_v1_provider_env()
+    return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
+
+
+def _read_api_v1_provider_env() -> tuple[str, str, bool]:
+    """Read and normalize API v1 provider environment configuration."""
+
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
     distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
     distributed_fallback_enabled = (
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
-    return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
+    return mode, distributed_url, distributed_fallback_enabled
 
 
 def get_api_v1_compute_provider_for_mode(
@@ -443,12 +450,9 @@ def get_api_v1_compute_provider_for_mode(
     """Resolve provider with an explicit mode override for request-scoped routing."""
 
     normalized_mode = (mode or "local").strip().lower()
-    distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    _, distributed_url, fallback_enabled_from_env = _read_api_v1_provider_env()
     if distributed_fallback_enabled is None:
-        distributed_fallback_enabled = (
-            os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        distributed_fallback_enabled = fallback_enabled_from_env
     return _build_api_v1_compute_provider(
         normalized_mode,
         distributed_url,

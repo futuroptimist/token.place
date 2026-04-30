@@ -1,3 +1,6 @@
+const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
+const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+
 new Vue({
     el: '#app',
     data: {
@@ -491,7 +494,7 @@ new Vue({
         getUserFacingApiError(errorPayload) {
             const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
             const errorCode = error && typeof error.code === 'string' ? error.code : '';
-            const fallbackMessage = 'Sorry, I encountered an issue generating a response. Please try again.';
+            const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
 
             const codeToMessage = {
                 no_registered_compute_nodes: 'No LLM servers are available right now.',
@@ -516,7 +519,7 @@ new Vue({
             if (normalized.toLowerCase() === 'stub') {
                 return true;
             }
-            return normalized === 'Sorry, I encountered an issue generating a response. Please try again.';
+            return normalized === ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
         // Send a message to the server
@@ -549,7 +552,7 @@ new Vue({
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
-                            throw new Error('Invalid assistant response content from API v1 relay path');
+                            throw new Error('invalid_assistant_response_content');
                         }
                         this.appendAssistantMessage(assistantMessage);
                     }
@@ -572,14 +575,17 @@ new Vue({
                     // Add a failure message if we couldn't get a response
                     this.chatHistory.push({
                         role: 'assistant',
-                        content: 'Sorry, I encountered an issue generating a response. Please try again.'
+                        content: ASSISTANT_GENERIC_FALLBACK_MESSAGE
                     });
                 }
             } catch (error) {
                 console.error('Error sending message:', error);
+                const isInvalidRelayResponse = error && error.message === 'invalid_assistant_response_content';
                 this.chatHistory.push({
                     role: 'assistant',
-                    content: 'Sorry, an error occurred while sending your message. Please try again.'
+                    content: isInvalidRelayResponse
+                        ? ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE
+                        : 'Sorry, an error occurred while sending your message. Please try again.'
                 });
             } finally {
                 this.isGeneratingResponse = false;

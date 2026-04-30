@@ -164,40 +164,40 @@ class DistributedApiV1ComputeProvider:
             return remaining
 
         try:
-            next_server_response = requests.get(
-                self._relay_url("/next_server"),
+            api_v1_relay_servers_next_response = requests.get(
+                self._relay_url("/api/v1/relay/servers/next"),
                 timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
             raise _error_from_code(
                 "compute_node_unreachable",
-                message=f"unable to reach relay next_server endpoint: {exc}",
+                message=f"unable to reach relay api_v1_relay_servers_next endpoint: {exc}",
             ) from exc
 
-        if next_server_response.status_code >= 500:
+        if api_v1_relay_servers_next_response.status_code >= 500:
             raise _error_from_code(
                 "compute_node_unreachable",
                 message=(
-                    "relay next_server endpoint returned "
-                    f"unexpected status {next_server_response.status_code}"
+                    "relay api_v1_relay_servers_next endpoint returned "
+                    f"unexpected status {api_v1_relay_servers_next_response.status_code}"
                 ),
             )
 
         try:
-            next_server_payload = next_server_response.json()
+            api_v1_relay_servers_next_payload = api_v1_relay_servers_next_response.json()
         except ValueError as exc:
             raise _error_from_code(
                 "compute_node_invalid_payload",
-                message="relay next_server response was not valid JSON",
+                message="relay api_v1_relay_servers_next response was not valid JSON",
             ) from exc
 
-        if not isinstance(next_server_payload, dict):
+        if not isinstance(api_v1_relay_servers_next_payload, dict):
             raise _error_from_code(
                 "compute_node_invalid_payload",
-                message="relay next_server response must be an object",
+                message="relay api_v1_relay_servers_next response must be an object",
             )
 
-        server_public_key = next_server_payload.get("server_public_key")
+        server_public_key = api_v1_relay_servers_next_payload.get("server_public_key")
         if not isinstance(server_public_key, str) or not server_public_key.strip():
             raise _error_from_code(
                 "no_registered_compute_nodes",
@@ -223,75 +223,75 @@ class DistributedApiV1ComputeProvider:
                 "compute_node_invalid_payload",
                 message=f"failed to encrypt relay request envelope: {exc}",
             ) from exc
-        faucet_payload = {
+        api_v1_relay_requests_payload = {
             "client_public_key": crypto_manager.public_key_b64,
             "server_public_key": server_public_key,
             **encrypted_envelope,
         }
 
         try:
-            faucet_response = requests.post(
-                self._relay_url("/faucet"),
-                json=faucet_payload,
+            api_v1_relay_requests_response = requests.post(
+                self._relay_url("/api/v1/relay/requests"),
+                json=api_v1_relay_requests_payload,
                 timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
             raise _error_from_code(
                 "compute_node_unreachable",
-                message=f"unable to post encrypted request to relay faucet endpoint: {exc}",
+                message=f"unable to post encrypted request to relay api_v1_relay_requests endpoint: {exc}",
             ) from exc
 
-        if faucet_response.status_code == 404:
+        if api_v1_relay_requests_response.status_code == 404:
             raise _error_from_code(
                 "no_registered_compute_nodes",
                 message="relay reported selected compute node is no longer available",
             )
 
-        if faucet_response.status_code != 200:
+        if api_v1_relay_requests_response.status_code != 200:
             raise _error_from_code(
                 "compute_node_bridge_error",
                 message=(
-                    "relay faucet endpoint returned unexpected status "
-                    f"{faucet_response.status_code}"
+                    "relay api_v1_relay_requests endpoint returned unexpected status "
+                    f"{api_v1_relay_requests_response.status_code}"
                 ),
             )
 
         poll_interval = self._poll_interval_seconds()
         while time.time() < deadline:
             try:
-                retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
-                retrieve_response = requests.post(
-                    self._relay_url("/retrieve"),
+                api_v1_relay_responses_retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
+                api_v1_relay_responses_retrieve_response = requests.post(
+                    self._relay_url("/api/v1/relay/responses/retrieve"),
                     json={"client_public_key": crypto_manager.public_key_b64},
-                    timeout=retrieve_timeout,
+                    timeout=api_v1_relay_responses_retrieve_timeout,
                 )
             except requests.RequestException:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if retrieve_response.status_code != 200:
+            if api_v1_relay_responses_retrieve_response.status_code != 200:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
             try:
-                retrieve_payload = retrieve_response.json()
+                api_v1_relay_responses_retrieve_payload = api_v1_relay_responses_retrieve_response.json()
             except ValueError:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if not isinstance(retrieve_payload, dict):
+            if not isinstance(api_v1_relay_responses_retrieve_payload, dict):
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if retrieve_payload.get("error"):
+            if api_v1_relay_responses_retrieve_payload.get("error"):
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if not {"chat_history", "cipherkey", "iv"}.issubset(retrieve_payload.keys()):
+            if not {"chat_history", "cipherkey", "iv"}.issubset(api_v1_relay_responses_retrieve_payload.keys()):
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            decrypted_response = crypto_manager.decrypt_message(retrieve_payload)
+            decrypted_response = crypto_manager.decrypt_message(api_v1_relay_responses_retrieve_payload)
             if decrypted_response is None:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue

@@ -784,16 +784,29 @@ def api_v1_relay_servers_poll():
         return jsonify({'message': 'No requests available'}), 200
 
     first_request = None
-    while queued_requests:
-        candidate = queued_requests[0]
-        is_api_v1_envelope = bool(candidate.get('e2ee_v1'))
-        is_legacy_ciphertext_payload = all(
-            key in candidate for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv')
-        )
-        if is_api_v1_envelope or is_legacy_ciphertext_payload:
-            first_request = queued_requests.pop(0)
+
+    def _is_legacy_ciphertext_payload(payload):
+        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
+
+    # Prefer explicit API v1 envelopes when both API v1 and legacy ciphertext payloads are queued.
+    for idx, candidate in enumerate(queued_requests):
+        if bool(candidate.get('e2ee_v1')):
+            first_request = queued_requests.pop(idx)
             break
-        queued_requests.pop(0)
+
+    if first_request is None:
+        while queued_requests:
+            candidate = queued_requests[0]
+            if _is_legacy_ciphertext_payload(candidate):
+                first_request = queued_requests.pop(0)
+                break
+            queued_requests.pop(0)
+
+
+    if first_request is not None and bool(first_request.get('e2ee_v1')):
+        # When an API v1 envelope is available, keep API v1-only semantics by dropping
+        # legacy ciphertext payloads left in the same queue.
+        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
 
     if first_request is None:
         if not queued_requests:

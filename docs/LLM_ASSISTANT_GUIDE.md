@@ -34,7 +34,7 @@ This document provides guidance specifically for LLM assistants (like Claude) to
 - If a path cannot preserve E2EE, fail closed.
 
 Migration context: there is a known gap between `relay.py`, desktop Tauri, and relay HTML chat UI
-where some E2E segments still use legacy routes. Prompts 1-4 own the migration repairs.
+where some E2E segments still use legacy routes. migration workstream own the migration repairs.
 Reference: [docs/architecture/api_v1_e2ee_relay.md](architecture/api_v1_e2ee_relay.md).
 
 ## Environment-Specific Considerations

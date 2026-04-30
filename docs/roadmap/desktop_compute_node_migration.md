@@ -29,7 +29,7 @@ This avoids changing compute runtime, deployment topology, and network contract 
 
 ## 7-step implementation sequence (prompts 1–7)
 
-### Prompt 1 — Shared compute-node runtime extraction
+### Phase 1 — Shared compute-node runtime extraction
 
 Extract compute-node concerns from `server.py` into a shared runtime usable by both
 `server.py` and desktop-tauri.
@@ -40,7 +40,7 @@ Extract compute-node concerns from `server.py` into a shared runtime usable by b
 - `server.py` continues to pass existing tests using shared runtime.
 - Desktop-tauri can invoke the same runtime abstraction (even if incomplete).
 
-### Prompt 2 — Desktop parity on legacy contract
+### Phase 2 — Desktop parity on legacy contract
 
 Promote desktop-tauri from MVP/local prompt tester to a real compute node that can
 participate on the legacy relay contract.
@@ -51,7 +51,7 @@ participate on the legacy relay contract.
 - Desktop participates in relay flow with legacy sink/source semantics.
 - Desktop parity checklist (below) is satisfied.
 
-### Prompt 3 — Legacy multi-node relay hardening
+### Phase 3 — Legacy multi-node relay hardening
 
 Use existing relay multi-node registration and forwarding to support mixed compute-node
 fleets (`server.py` and desktop nodes) on the legacy contract.
@@ -62,7 +62,7 @@ fleets (`server.py` and desktop nodes) on the legacy contract.
 - Failover/load-balancing behavior validated on legacy contract.
 - Operational runbooks updated for mixed-node operation.
 
-### Prompt 4 — Relay-on-sugarkube rollout (legacy contract)
+### Phase 4 — Relay-on-sugarkube rollout (legacy contract)
 
 Deploy `relay.py` to sugarkube as lightweight control-plane infrastructure while compute
 nodes remain external.

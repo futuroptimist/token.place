@@ -628,6 +628,17 @@ def index():
 def serve_static(path):
     return send_from_directory('static', path)
 
+@app.route('/api/v1/relay/servers/next', methods=['GET'])
+def api_v1_relay_servers_next():
+    """Return the next registered compute node public key for API v1 E2EE relay traffic."""
+    _evict_stale_servers()
+    if not known_servers:
+        return jsonify({'error': {'message': 'No servers available', 'code': 503}})
+
+    server_public_key = secrets.choice(list(known_servers.keys()))
+    return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+
+
 @app.route('/next_server', methods=['GET'])
 def next_server():
     """
@@ -638,20 +649,7 @@ def next_server():
         - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
-    _evict_stale_servers()
-    if not known_servers:
-        return jsonify({
-            'error': {
-                'message': 'No servers available',
-                'code': 503
-            }
-        })
-
-    # Select a server randomly using cryptographically secure randomness
-    server_public_key = secrets.choice(list(known_servers.keys()))
-    return jsonify({
-        'server_public_key': known_servers[server_public_key]['public_key']
-    })
+    return jsonify({'error': {'message': 'Legacy route deprecated. Use /api/v1/relay/servers/next', 'code': 410}}), 410
 
 
 @app.route('/relay/diagnostics', methods=['GET'])

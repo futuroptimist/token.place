@@ -39,7 +39,7 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Any distributed plaintext path must fail closed unless replaced by an approved E2EE envelope path.
 
 
-## API v1-only relay architecture guardrails (Prompt 0 baseline)
+## API v1-only relay architecture guardrails (baseline)
 - API v1 is the active API for `v0.1.0` and the only active runtime target.
 - API v1 is non-streaming; responses are returned only after full model output generation.
 - Do not add streaming to API v1 relay/client-server inference paths.
@@ -53,7 +53,7 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
 - Relay-owned state/logs/diagnostics/payloads must stay ciphertext-only (+ safe routing metadata).
   Never expose plaintext prompts/messages/responses/tool arguments/model output text.
 - If E2EE cannot be preserved for a path, fail closed.
-- Context for Prompts 1-4: there is a known alignment gap where some E2E pieces still touch legacy
+- Context for migration workstream: there is a known alignment gap where some E2E pieces still touch legacy
   routes; migrations are intentional follow-up work, not behavior to preserve.
 - Architecture note: [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay.md).
 

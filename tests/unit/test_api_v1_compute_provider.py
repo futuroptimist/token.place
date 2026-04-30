@@ -50,17 +50,17 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
     retrieve_attempt = {"count": 0}
 
     def fake_get(url, timeout):
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
         posted_payloads.append((url, copy.deepcopy(json), timeout))
-        if url.endswith("/faucet"):
+        if url.endswith("/api/v1/relay/requests"):
             assert "messages" not in json
             assert "chat_history" in json and json["chat_history"]
             return _FakeResponse(200, {"message": "Request received"})
-        if url.endswith("/retrieve"):
+        if url.endswith("/api/v1/relay/responses/retrieve"):
             retrieve_calls.append(copy.deepcopy(json))
             retrieve_attempt["count"] += 1
             if retrieve_attempt["count"] == 1:
@@ -139,8 +139,8 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         {"client_public_key": fake_crypto.public_key_b64},
         {"client_public_key": fake_crypto.public_key_b64},
     ]
-    assert posted_payloads[0][0] == "https://node-a.example/faucet"
-    assert posted_payloads[1][0] == "https://node-a.example/retrieve"
+    assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
+    assert posted_payloads[1][0] == "https://node-a.example/api/v1/relay/responses/retrieve"
 
 
 def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(monkeypatch):
@@ -174,12 +174,12 @@ def test_distributed_compute_provider_maps_faucet_404_to_no_registered_nodes(mon
     fake_crypto = _FakeCryptoManager()
 
     def fake_get(url, timeout):
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
-        assert url == "https://node-a.example/faucet"
+        assert url == "https://node-a.example/api/v1/relay/requests"
         return _FakeResponse(404, {"error": "server unavailable"})
 
     monkeypatch.setattr(
@@ -206,7 +206,7 @@ def test_distributed_compute_provider_maps_encryption_failure_to_provider_error(
     fake_crypto = _FailingEncryptCryptoManager()
 
     def fake_get(url, timeout):
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "bad-server-key"})
 
@@ -292,12 +292,12 @@ def test_distributed_compute_provider_applies_end_to_end_timeout_budget(monkeypa
 
     def fake_get(url, timeout):
         observed_timeouts["get"] = timeout
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
         observed_timeouts["post"] = timeout
-        assert url == "https://node-a.example/faucet"
+        assert url == "https://node-a.example/api/v1/relay/requests"
         return _FakeResponse(404, {"error": "server unavailable"})
 
     monkeypatch.setattr(
@@ -327,14 +327,14 @@ def test_distributed_compute_provider_maps_decrypted_payload_shape_errors(monkey
     fake_crypto = _FakeCryptoManager()
 
     def fake_get(url, timeout):
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
-        if url.endswith("/faucet"):
+        if url.endswith("/api/v1/relay/requests"):
             return _FakeResponse(200, {"message": "Request received"})
-        if url.endswith("/retrieve"):
+        if url.endswith("/api/v1/relay/responses/retrieve"):
             return _FakeResponse(
                 200,
                 {"chat_history": "cipher-not-dict", "cipherkey": "encrypted-key", "iv": "encrypted-iv"},
@@ -367,14 +367,14 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
     retrieve_attempt = {"count": 0}
 
     def fake_get(url, timeout):
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
-        if url.endswith("/faucet"):
+        if url.endswith("/api/v1/relay/requests"):
             return _FakeResponse(200, {"message": "Request received"})
-        if url.endswith("/retrieve"):
+        if url.endswith("/api/v1/relay/responses/retrieve"):
             retrieve_attempt["count"] += 1
             latest_request_id = fake_crypto._encrypted[list(fake_crypto._encrypted.keys())[-1]][
                 "request_id"
@@ -571,7 +571,7 @@ def test_distributed_compute_provider_maps_faucet_request_exception(monkeypatch)
     )
 
     def _raise_request_exception(url, json, timeout):
-        assert url.endswith('/faucet')
+        assert url.endswith('/api/v1/relay/requests')
         raise compute_provider.requests.RequestException("post failed")
 
     monkeypatch.setattr(compute_provider.requests, "post", _raise_request_exception)
@@ -592,14 +592,14 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
     fake_crypto = _FakeCryptoManager()
 
     def fake_get(url, timeout):
-        assert url == "https://node-a.example/next_server"
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
         assert 0 < timeout <= 5
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
-        if url.endswith('/faucet'):
+        if url.endswith('/api/v1/relay/requests'):
             return _FakeResponse(200, {"message": "Request received"})
-        if url.endswith('/retrieve'):
+        if url.endswith('/api/v1/relay/responses/retrieve'):
             latest_request_id = fake_crypto._encrypted[list(fake_crypto._encrypted.keys())[-1]]["request_id"]
             response_envelope = {
                 "protocol": "tokenplace_api_v1_relay_e2ee",

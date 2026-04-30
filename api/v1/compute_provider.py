@@ -25,6 +25,10 @@ _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
     "api_v1_last_backend_path",
     default="unknown",
 )
+_force_distributed: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "api_v1_force_distributed",
+    default=False,
+)
 
 
 class ComputeProviderError(Exception):
@@ -427,11 +431,15 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     """Resolve the active provider based on environment configuration."""
 
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
+    if _force_distributed.get():
+        mode = "distributed"
     distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
     distributed_fallback_enabled = (
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
+    if _force_distributed.get():
+        distributed_fallback_enabled = False
     return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
 
 
@@ -451,3 +459,15 @@ def get_api_v1_last_backend_path() -> str:
     """Return per-request backend execution diagnostics label."""
 
     return _last_backend_path.get()
+
+
+def set_api_v1_force_distributed(enabled: bool) -> contextvars.Token[bool]:
+    """Set request-scoped distributed-only provider resolution."""
+
+    return _force_distributed.set(bool(enabled))
+
+
+def reset_api_v1_force_distributed(token: contextvars.Token[bool]) -> None:
+    """Restore request-scoped distributed-only provider resolution."""
+
+    _force_distributed.reset(token)

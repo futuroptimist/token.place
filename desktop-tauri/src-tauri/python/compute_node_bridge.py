@@ -314,6 +314,10 @@ def run(args: argparse.Namespace) -> int:
                     )
             elif api_v1_payload or legacy_payload:
                 print(
+                    "desktop.compute_node_bridge.process_request",
+                    file=sys.stderr,
+                )
+                print(
                     "desktop.compute_node_bridge.api_v1_e2ee.work_received",
                     file=sys.stderr,
                 )

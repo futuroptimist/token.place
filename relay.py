@@ -628,6 +628,29 @@ def index():
 def serve_static(path):
     return send_from_directory('static', path)
 
+
+
+def _legacy_routes_enabled() -> bool:
+    return str(os.getenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _legacy_route_deprecated_response(route_name: str):
+    return jsonify({
+        "error": {
+            "message": f"Legacy relay endpoint '{route_name}' is deprecated. Use API v1 relay E2EE routes.",
+            "code": "legacy_relay_endpoint_deprecated",
+            "deprecated": True,
+        }
+    }), 410
+
+
+def _select_next_server_payload():
+    _evict_stale_servers()
+    if not known_servers:
+        return jsonify({'error': {'message': 'No servers available','code': 503}})
+    server_public_key = secrets.choice(list(known_servers.keys()))
+    return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+
 @app.route('/next_server', methods=['GET'])
 def next_server():
     """
@@ -638,20 +661,15 @@ def next_server():
         - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
-    _evict_stale_servers()
-    if not known_servers:
-        return jsonify({
-            'error': {
-                'message': 'No servers available',
-                'code': 503
-            }
-        })
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/next_server')
+    return _select_next_server_payload()
 
-    # Select a server randomly using cryptographically secure randomness
-    server_public_key = secrets.choice(list(known_servers.keys()))
-    return jsonify({
-        'server_public_key': known_servers[server_public_key]['public_key']
-    })
+
+@app.route('/api/v1/relay/servers/next', methods=['GET'])
+def api_v1_relay_servers_next():
+    """Get a registered compute node public key for API v1 encrypted relay requests."""
+    return _select_next_server_payload()
 
 
 @app.route('/relay/diagnostics', methods=['GET'])
@@ -878,6 +896,8 @@ def api_v1_relay_responses_retrieve():
 
 @app.route('/faucet', methods=['POST'])
 def faucet():
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/faucet')
     """
     Endpoint for clients to request inference given a public key.
     The public key uniquely identifies the server to send the request to,
@@ -962,6 +982,8 @@ def faucet():
 
 @app.route('/sink', methods=['POST'])
 def sink():
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/sink')
     """
     Endpoint for server instances to announce their availability (offering a compute sink).
     The request body should be application/json and contain the following keys:
@@ -1078,6 +1100,8 @@ def unregister():
 
 @app.route('/source', methods=['POST'])
 def source():
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/source')
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
@@ -1127,6 +1151,8 @@ def stream_source():
 
 @app.route('/retrieve', methods=['POST'])
 def retrieve():
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/retrieve')
     """
     Endpoint for clients to retrieve responses queued by the /source endpoint.
     """

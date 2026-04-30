@@ -630,6 +630,18 @@ def serve_static(path):
 
 @app.route('/next_server', methods=['GET'])
 def next_server():
+    """Deprecated legacy endpoint retained for explicit compatibility failures."""
+    return jsonify({
+        'error': {
+            'message': 'Legacy relay endpoint deprecated. Use /api/v1/relay/servers/next.',
+            'code': 410,
+            'type': 'deprecated_endpoint',
+        }
+    }), 410
+
+
+@app.route('/api/v1/relay/servers/next', methods=['GET'])
+def api_v1_relay_servers_next():
     """
     Endpoint for clients to get the next server to send a request to.
     This allows the relay to load-balance requests across heterogeneous servers and clients in a random manner.
@@ -878,6 +890,50 @@ def api_v1_relay_responses_retrieve():
 
 @app.route('/faucet', methods=['POST'])
 def faucet():
+    """Deprecated legacy endpoint retained for explicit compatibility failures."""
+    return jsonify({
+        'error': {
+            'message': 'Legacy relay endpoint deprecated. Use /api/v1/relay/requests.',
+            'code': 410,
+            'type': 'deprecated_endpoint',
+        }
+    }), 410
+
+@app.route('/retrieve', methods=['POST'])
+def retrieve():
+    """Deprecated legacy endpoint retained for explicit compatibility failures."""
+    return jsonify({
+        'error': {
+            'message': 'Legacy relay endpoint deprecated. Use /api/v1/relay/responses/retrieve.',
+            'code': 410,
+            'type': 'deprecated_endpoint',
+        }
+    }), 410
+
+@app.route('/sink', methods=['POST'])
+def sink():
+    """Deprecated legacy endpoint retained for explicit compatibility failures."""
+    return jsonify({
+        'error': {
+            'message': 'Legacy relay endpoint deprecated. Use /api/v1/relay/servers/register and /api/v1/relay/servers/poll.',
+            'code': 410,
+            'type': 'deprecated_endpoint',
+        }
+    }), 410
+
+@app.route('/source', methods=['POST'])
+def source():
+    """Deprecated legacy endpoint retained for explicit compatibility failures."""
+    return jsonify({
+        'error': {
+            'message': 'Legacy relay endpoint deprecated. Use /api/v1/relay/responses.',
+            'code': 410,
+            'type': 'deprecated_endpoint',
+        }
+    }), 410
+
+@app.route('/stream/source', methods=['POST'])
+def stream_source():
     """
     Endpoint for clients to request inference given a public key.
     The public key uniquely identifies the server to send the request to,

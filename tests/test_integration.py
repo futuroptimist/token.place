@@ -41,7 +41,7 @@ def setup_servers():
     server_registered = False
     while time.time() - start_wait_time < max_wait_time:
         try:
-            response = requests.get(f'{base_relay_url}/next_server')
+            response = requests.get(f'{base_relay_url}/api/v1/relay/servers/next')
             if response.status_code == 200 and 'server_public_key' in response.json():
                 print("Server registered successfully.")
                 server_registered = True
@@ -114,10 +114,10 @@ def test_faucet_endpoint(setup_servers):
     private_key, public_key = generate_keys()
     public_key_b64 = base64.b64encode(public_key).decode('utf-8')
 
-    # Fetch the server's public key from the /next_server endpoint
+    # Fetch the server's public key from the /api/v1/relay/servers/next endpoint
     base_url = f'http://localhost:{relay_port}'
-    response = requests.get(f'{base_url}/next_server')
-    assert response.status_code == 200, "Expected a 200 OK response from /next_server endpoint."
+    response = requests.get(f'{base_url}/api/v1/relay/servers/next')
+    assert response.status_code == 200, "Expected a 200 OK response from /api/v1/relay/servers/next endpoint."
     server_public_key_b64 = response.json()['server_public_key']
     server_public_key = base64.b64decode(server_public_key_b64)
 
@@ -139,20 +139,20 @@ def test_faucet_endpoint(setup_servers):
         "iv": iv_b64,
     }
 
-    # Send the request to the /faucet endpoint
-    response = requests.post(f'{base_url}/faucet', json=payload)
+    # Send the request to the /api/v1/relay/requests endpoint
+    response = requests.post(f'{base_url}/api/v1/relay/requests', json=payload)
 
     # Check if the response status code is 200
-    assert response.status_code == 200, "Expected a 200 OK response from /faucet endpoint."
+    assert response.status_code == 200, "Expected a 200 OK response from /api/v1/relay/requests endpoint."
 
     # Check if the response contains the expected message
     assert response.json() == {'message': 'Request received'}, "Expected 'Request received' message."
 
-    # Poll the /retrieve endpoint for a response
+    # Poll the /api/v1/relay/responses/retrieve endpoint for a response
     start_time = time.time()
     timeout = 60  # Timeout in seconds
     while True:
-        response = requests.post(f'{base_url}/retrieve', json={"client_public_key": public_key_b64})
+        response = requests.post(f'{base_url}/api/v1/relay/responses/retrieve', json={"client_public_key": public_key_b64})
         if response.status_code == 200:
             data = response.json()
             if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:

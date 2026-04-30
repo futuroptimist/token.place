@@ -1270,3 +1270,39 @@ def test_api_v1_poll_requires_registration_token_when_configured(client, monkeyp
     )
     assert authorized.status_code == 200
     assert authorized.get_json()['request_id'] == 'req-auth'
+
+
+def test_legacy_relay_routes_return_410_by_default(client, monkeypatch):
+    """Legacy relay routes fail closed with 410 unless compatibility is enabled."""
+    monkeypatch.delenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", raising=False)
+
+    checks = [
+        ("get", "/next_server", None),
+        ("post", "/sink", {"server_public_key": DUMMY_SERVER_PUB_KEY}),
+        ("post", "/faucet", {"client_public_key": DUMMY_CLIENT_PUB_KEY, "server_public_key": DUMMY_SERVER_PUB_KEY, "chat_history": "x", "cipherkey": "y", "iv": "z"}),
+        ("post", "/source", {"client_public_key": DUMMY_CLIENT_PUB_KEY, "server_public_key": DUMMY_SERVER_PUB_KEY, "chat_history": "x", "cipherkey": "y", "iv": "z"}),
+        ("post", "/retrieve", {"client_public_key": DUMMY_CLIENT_PUB_KEY}),
+    ]
+
+    for method, route, payload in checks:
+        if method == "get":
+            response = client.get(route)
+        else:
+            response = client.post(route, json=payload)
+        assert response.status_code == 410
+        body = response.get_json()
+        assert body["error"]["code"] == "legacy_relay_endpoint_deprecated"
+
+
+def test_legacy_next_server_can_be_enabled_with_compatibility_flag(client, monkeypatch):
+    """Compatibility flag restores legacy next_server behavior where still supported."""
+    monkeypatch.setenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "1")
+
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    response = client.get("/next_server")
+    assert response.status_code == 200
+    assert response.get_json()["server_public_key"] == DUMMY_SERVER_PUB_KEY

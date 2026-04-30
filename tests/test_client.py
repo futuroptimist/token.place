@@ -34,7 +34,7 @@ class TestChatClient(unittest.TestCase):
         self.assertIsNone(server_public_key)
 
     @patch('client.requests.post')
-    def test_send_request_to_faucet(self, mock_post):
+    def test_send_request_to_relay_requests(self, mock_post):
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -43,7 +43,7 @@ class TestChatClient(unittest.TestCase):
         server_public_key_b64 = base64.b64encode(b'MockServerPublicKey').decode('utf-8')
         encrypted_cipherkey_b64 = base64.b64encode(b'encrypted_cipherkey').decode('utf-8')
         iv_b64 = base64.b64encode(b'MockIV').decode('utf-8')  # Mock IV for the test.
-        response = self.chat_client.send_request_to_faucet(encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64)
+        response = self.chat_client.send_request_to_relay_requests(encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64)
         self.assertEqual(response.status_code, 200)
 
     def test_encrypt_with_server_public_key_bytes(self):

@@ -435,6 +435,13 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
 
 
+def get_api_v1_compute_provider_for_desktop_bridge() -> ApiV1ComputeProvider:
+    """Resolve distributed-only provider for explicit desktop-bridge relay mode."""
+
+    distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    return _build_api_v1_compute_provider("distributed", distributed_url, False)
+
+
 def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:
     """Return a stable diagnostics label for the resolved provider instance."""
 

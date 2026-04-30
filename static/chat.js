@@ -387,7 +387,10 @@ new Vue({
                     model: "llama-3-8b-instruct",
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
-                    messages: encryptedData
+                    messages: encryptedData,
+                    metadata: {
+                        tokenplace_execution_target: 'desktop_bridge_api_v1_e2ee'
+                    }
                 };
 
                 // Send the request to the API
@@ -495,10 +498,25 @@ new Vue({
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
                 compute_node_bridge_error: 'Unable to contact the LLM server right now. Please try again.',
-                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
+                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.',
+                distributed_mode_required: 'Desktop bridge mode requires a reachable relay compute node.'
             };
 
             return codeToMessage[errorCode] || fallbackMessage;
+        },
+
+        isInvalidAssistantContent(content) {
+            if (typeof content !== 'string') {
+                return true;
+            }
+            const normalized = content.trim();
+            if (!normalized) {
+                return true;
+            }
+            if (normalized.toLowerCase() === 'stub') {
+                return true;
+            }
+            return normalized === 'Sorry, I encountered an issue generating a response. Please try again.';
         },
 
         // Send a message to the server
@@ -530,6 +548,9 @@ new Vue({
                     // For API response, extract last message
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
+                        if (!assistantMessage || this.isInvalidAssistantContent(assistantMessage.content)) {
+                            throw new Error('Invalid assistant response content for desktop bridge mode');
+                        }
                         this.appendAssistantMessage(assistantMessage);
                     }
                     // For legacy response format (full chat history)

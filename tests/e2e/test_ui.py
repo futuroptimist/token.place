@@ -534,6 +534,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"
+        assert assistant_text.strip().lower() != "stub"
         assert "Sorry, I encountered an issue generating a response." not in assistant_text
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
@@ -615,6 +616,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         encrypted_request = v1_requests[0].post_data_json
         assert encrypted_request.get("encrypted") is True
         assert encrypted_request.get("stream") in (None, False)
+        metadata = encrypted_request.get("metadata")
+        assert isinstance(metadata, dict)
+        assert metadata.get("tokenplace_execution_target") == "desktop_bridge_api_v1_e2ee"
         client_public_key = encrypted_request.get("client_public_key")
         assert isinstance(client_public_key, str) and client_public_key
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)

@@ -35,6 +35,7 @@ from api.v1.models import (
 )
 from api.v1.compute_provider import (
     get_api_v1_compute_provider,
+    get_api_v1_compute_provider_for_desktop_bridge,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
     ComputeProviderError,
@@ -324,8 +325,19 @@ def _handle_chat_completion_request(data):
                 if isinstance(message, dict)
             ]
 
+        request_metadata = data.get("metadata")
+        desktop_bridge_mode_requested = (
+            isinstance(request_metadata, dict)
+            and request_metadata.get("tokenplace_execution_target")
+            == "desktop_bridge_api_v1_e2ee"
+        )
+
         log_info(f"Generating response using model {model_id}")
-        provider = get_api_v1_compute_provider()
+        provider = (
+            get_api_v1_compute_provider_for_desktop_bridge()
+            if desktop_bridge_mode_requested
+            else get_api_v1_compute_provider()
+        )
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
         log_info(
@@ -378,7 +390,6 @@ def _handle_chat_completion_request(data):
             },
         }
 
-        request_metadata = data.get("metadata")
         if isinstance(request_metadata, dict) and request_metadata:
             response_data["metadata"] = request_metadata
 

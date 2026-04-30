@@ -484,6 +484,23 @@ new Vue({
             return message.content;
         },
 
+        isInvalidAssistantResponseContent(content) {
+            if (typeof content !== 'string') {
+                return true;
+            }
+
+            const normalized = content.trim().toLowerCase();
+            if (!normalized) {
+                return true;
+            }
+
+            if (normalized === 'stub') {
+                return true;
+            }
+
+            return normalized === 'sorry, i encountered an issue generating a response. please try again.';
+        },
+
         getUserFacingApiError(errorPayload) {
             const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
             const errorCode = error && typeof error.code === 'string' ? error.code : '';
@@ -495,7 +512,8 @@ new Vue({
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
                 compute_node_bridge_error: 'Unable to contact the LLM server right now. Please try again.',
-                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
+                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.',
+                distributed_api_v1_relay_disabled: 'Desktop bridge mode is currently unavailable. Please try again shortly.'
             };
 
             return codeToMessage[errorCode] || fallbackMessage;
@@ -530,13 +548,17 @@ new Vue({
                     // For API response, extract last message
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
+                        const assistantContent = assistantMessage && assistantMessage.content;
+                        if (this.isInvalidAssistantResponseContent(assistantContent)) {
+                            throw new Error('Invalid assistant response content from API v1 relay path');
+                        }
                         this.appendAssistantMessage(assistantMessage);
                     }
                     // For legacy response format (full chat history)
                     else if (Array.isArray(response)) {
                         const history = response.slice();
                         const candidate = history.length > 0 ? history[history.length - 1] : null;
-                        if (candidate && candidate.role === 'assistant' && typeof candidate.content === 'string') {
+                        if (candidate && candidate.role === 'assistant' && typeof candidate.content === 'string' && !this.isInvalidAssistantResponseContent(candidate.content)) {
                             history.pop();
                             this.chatHistory = history;
                             this.appendAssistantMessage(candidate);

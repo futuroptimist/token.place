@@ -786,13 +786,13 @@ def api_v1_relay_servers_poll():
     first_request = None
     while queued_requests:
         candidate = queued_requests[0]
-        if candidate.get('e2ee_v1'):
+        is_api_v1_envelope = bool(candidate.get('e2ee_v1'))
+        is_legacy_ciphertext_payload = all(
+            key in candidate for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv')
+        )
+        if is_api_v1_envelope or is_legacy_ciphertext_payload:
             first_request = queued_requests.pop(0)
             break
-        LOGGER.warning(
-            "relay.api_v1_legacy_payload_skipped",
-            extra={"server_public_key": public_key},
-        )
         queued_requests.pop(0)
 
     if first_request is None:

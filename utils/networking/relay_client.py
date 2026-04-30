@@ -721,8 +721,13 @@ class RelayClient:
                     }
                     continue
                 payload = response.json()
-                if isinstance(payload, dict):
-                    payload.setdefault('next_ping_in_x_seconds', register_wait)
+                if not isinstance(payload, dict):
+                    last_error = {
+                        'error': 'Invalid response format: expected object payload',
+                        'next_ping_in_x_seconds': register_wait,
+                    }
+                    continue
+                payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 return payload
             except Exception as exc:

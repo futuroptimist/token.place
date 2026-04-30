@@ -805,6 +805,20 @@ class TestRelayClient:
         ]
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_non_dict_payload_returns_bounded_error(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 7}
+        poll_ok_non_dict = MagicMock(status_code=200)
+        poll_ok_non_dict.json.return_value = ['unexpected']
+        mock_post.side_effect = [register_ok, poll_ok_non_dict]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result == {
+            'error': 'Invalid response format: expected object payload',
+            'next_ping_in_x_seconds': 7,
+        }
+
     def test_poll_api_v1_encrypted_work_propagates_register_interval_on_poll_error(self, mock_post, relay_client):
         register_ok = MagicMock(status_code=200)
         register_ok.json.return_value = {'next_ping_in_x_seconds': 11}

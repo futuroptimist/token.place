@@ -35,6 +35,7 @@ from api.v1.models import (
 )
 from api.v1.compute_provider import (
     get_api_v1_compute_provider,
+    get_api_v1_compute_provider_for_mode,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
     ComputeProviderError,
@@ -75,6 +76,18 @@ validate_model_name = _validate_model_name
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
 DEFAULT_SERVICE_NAME = 'token.place'
 SERVICE_NAME = os.getenv('SERVICE_NAME', DEFAULT_SERVICE_NAME)
+
+
+def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_request: bool) -> bool:
+    """Allow desktop-bridge distributed override only for explicit API v1 E2EE intent."""
+
+    if not isinstance(request_metadata, dict) or not is_encrypted_request:
+        return False
+    if request_metadata.get("inference_target") != "desktop_bridge_api_v1_e2ee":
+        return False
+    if request_metadata.get("relay_path") != "api_v1_e2ee":
+        return False
+    return bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip())
 
 
 def _get_service_name() -> str:
@@ -324,8 +337,21 @@ def _handle_chat_completion_request(data):
                 if isinstance(message, dict)
             ]
 
+        request_metadata = data.get("metadata")
+        force_desktop_bridge_distributed = _should_force_desktop_bridge_distributed(
+            request_metadata,
+            is_encrypted_request,
+        )
+
         log_info(f"Generating response using model {model_id}")
-        provider = get_api_v1_compute_provider()
+        provider = (
+            get_api_v1_compute_provider_for_mode(
+                mode="distributed",
+                distributed_fallback_enabled=False,
+            )
+            if force_desktop_bridge_distributed
+            else get_api_v1_compute_provider()
+        )
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
         log_info(
@@ -378,7 +404,6 @@ def _handle_chat_completion_request(data):
             },
         }
 
-        request_metadata = data.get("metadata")
         if isinstance(request_metadata, dict) and request_metadata:
             response_data["metadata"] = request_metadata
 

@@ -1,3 +1,6 @@
+const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
+const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+
 new Vue({
     el: '#app',
     data: {
@@ -387,7 +390,11 @@ new Vue({
                     model: "llama-3-8b-instruct",
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
-                    messages: encryptedData
+                    messages: encryptedData,
+                    metadata: {
+                        inference_target: "desktop_bridge_api_v1_e2ee",
+                        relay_path: "api_v1_e2ee"
+                    }
                 };
 
                 // Send the request to the API
@@ -487,7 +494,7 @@ new Vue({
         getUserFacingApiError(errorPayload) {
             const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
             const errorCode = error && typeof error.code === 'string' ? error.code : '';
-            const fallbackMessage = 'Sorry, I encountered an issue generating a response. Please try again.';
+            const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
 
             const codeToMessage = {
                 no_registered_compute_nodes: 'No LLM servers are available right now.',
@@ -499,6 +506,20 @@ new Vue({
             };
 
             return codeToMessage[errorCode] || fallbackMessage;
+        },
+
+        isInvalidAssistantResponseContent(content) {
+            if (typeof content !== 'string') {
+                return true;
+            }
+            const normalized = content.trim();
+            if (!normalized) {
+                return true;
+            }
+            if (normalized.toLowerCase() === 'stub') {
+                return true;
+            }
+            return normalized === ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
         // Send a message to the server
@@ -530,6 +551,9 @@ new Vue({
                     // For API response, extract last message
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
+                        if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
+                            throw new Error('invalid_assistant_response_content');
+                        }
                         this.appendAssistantMessage(assistantMessage);
                     }
                     // For legacy response format (full chat history)
@@ -551,14 +575,17 @@ new Vue({
                     // Add a failure message if we couldn't get a response
                     this.chatHistory.push({
                         role: 'assistant',
-                        content: 'Sorry, I encountered an issue generating a response. Please try again.'
+                        content: ASSISTANT_GENERIC_FALLBACK_MESSAGE
                     });
                 }
             } catch (error) {
                 console.error('Error sending message:', error);
+                const isInvalidRelayResponse = error && error.message === 'invalid_assistant_response_content';
                 this.chatHistory.push({
                     role: 'assistant',
-                    content: 'Sorry, an error occurred while sending your message. Please try again.'
+                    content: isInvalidRelayResponse
+                        ? ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE
+                        : 'Sorry, an error occurred while sending your message. Please try again.'
                 });
             } finally {
                 this.isGeneratingResponse = false;

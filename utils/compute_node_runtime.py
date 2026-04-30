@@ -62,9 +62,20 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
 
 def is_api_v1_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Return whether ``payload`` is a relay API v1 request (disabled)."""
+    """Return whether ``payload`` matches the API v1 E2EE relay envelope."""
 
-    return False
+    if not isinstance(payload, dict):
+        return False
+    required_string_fields = ("request_id", "client_public_key", "chat_history", "cipherkey", "iv")
+    if payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+        return False
+    if payload.get("version") != 1:
+        return False
+    for field in required_string_fields:
+        value = payload.get(field)
+        if not isinstance(value, str):
+            return False
+    return True
 
 
 class RelayRequestAdapter(Protocol):
@@ -91,17 +102,16 @@ class LegacyRelayRequestAdapter:
 
 
 class ApiV1RelayRequestAdapter:
-    """No-op adapter retained for backwards-compatible imports only."""
+    """Adapter for API v1 E2EE relay request envelopes."""
 
     def __init__(self, relay_client: "RelayClient"):
         self._relay_client = relay_client
 
     def can_process(self, request_data: Dict[str, Any]) -> bool:
-        return False
+        return is_api_v1_relay_payload(request_data)
 
     def process(self, request_data: Dict[str, Any]) -> bool:
-        _log_warning("Ignoring disabled relay API v1 payload handling in compute node runtime")
-        return False
+        return self._relay_client.process_client_request(request_data)
 
 
 def first_env(keys: List[str]) -> Optional[str]:
@@ -264,6 +274,7 @@ class ComputeNodeRuntime:
         )
         if request_adapters is None:
             self.request_adapters = [
+                ApiV1RelayRequestAdapter(self.relay_client),
                 LegacyRelayRequestAdapter(self.relay_client),
             ]
         else:
@@ -309,9 +320,9 @@ class ComputeNodeRuntime:
         return False
 
     def register_and_poll_once(self) -> Dict[str, Any]:
-        """Ping relay /sink and return response data."""
+        """Poll relay for one encrypted API v1 work item."""
 
-        return self.relay_client.ping_relay()
+        return self.relay_client.poll_api_v1_encrypted_work()
 
     def stop(self) -> None:
         """Stop relay polling and network activity."""

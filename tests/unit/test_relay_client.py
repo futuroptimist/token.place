@@ -764,6 +764,72 @@ class TestRelayClient:
         assert result['error'] == "Unexpected error"
         assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_non_200_returns_error(self, mock_post, relay_client):
+        mock_post.return_value = MagicMock(status_code=503)
+
+        result = relay_client.register_api_v1_compute_node('http://relay-a.example')
+
+        assert result == {'error': 'HTTP 503', 'next_ping_in_x_seconds': relay_client._request_timeout}
+
+    def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
+        assert RelayClient._build_api_v1_url(
+            "http://localhost:5000", "/relay/servers/register"
+        ) == "http://localhost:5000/api/v1/relay/servers/register"
+        assert RelayClient._build_api_v1_url(
+            "https://relay.cloudflare.workers.dev/api/v1", "/relay/servers/register"
+        ) == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_fails_over_and_uses_register_interval(self, mock_post, relay_client):
+        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+        relay_client._active_relay_index = 0
+
+        register_fail = MagicMock(status_code=500)
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 9}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_fail, register_ok, poll_ok]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['next_ping_in_x_seconds'] == 9
+        assert relay_client._active_relay_index == 1
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://relay-a.example/api/v1/relay/servers/register',
+            'http://relay-b.example/api/v1/relay/servers/register',
+            'http://relay-b.example/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_non_dict_payload_returns_bounded_error(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 7}
+        poll_ok_non_dict = MagicMock(status_code=200)
+        poll_ok_non_dict.json.return_value = ['unexpected']
+        mock_post.side_effect = [register_ok, poll_ok_non_dict]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result == {
+            'error': 'Invalid response format: expected object payload',
+            'next_ping_in_x_seconds': 7,
+        }
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_propagates_register_interval_on_poll_error(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 11}
+        poll_fail = MagicMock(status_code=429)
+        mock_post.side_effect = [register_ok, poll_fail]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result == {'error': 'HTTP 429', 'next_ping_in_x_seconds': 11}
+
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""
         # Setup request data with missing fields
@@ -880,7 +946,7 @@ class TestRelayClient:
             max_tokens=50,
         )
         mock_post.assert_called_once_with(
-            'http://localhost:5000/source',
+            'http://localhost:5000/api/v1/relay/responses',
             json={
                 'client_public_key': request_data["client_public_key"],
                 'chat_history': 'encrypted_chat_history',

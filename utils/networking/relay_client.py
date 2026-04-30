@@ -656,6 +656,89 @@ class RelayClient:
             'next_ping_in_x_seconds': self._request_timeout,
         }
 
+    def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
+        target_url = relay_url or self.relay_url
+        payload = {'server_public_key': self.crypto_manager.public_key_b64}
+        request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
+        headers = self._auth_headers()
+        if headers:
+            request_kwargs['headers'] = headers
+        response = requests.post(
+            self._build_api_v1_url(target_url, "/relay/servers/register"),
+            timeout=request_kwargs.pop('timeout'),
+            **request_kwargs,
+        )
+        if response.status_code != 200:
+            return {'error': f'HTTP {response.status_code}', 'next_ping_in_x_seconds': self._request_timeout}
+        return response.json()
+
+    @staticmethod
+    def _build_api_v1_url(relay_url: str, route: str) -> str:
+        """Build API v1 URLs without duplicating a pre-existing /api/v1 suffix."""
+        base = relay_url.rstrip("/")
+        normalized_route = route if route.startswith("/") else f"/{route}"
+        if base.endswith("/api/v1"):
+            return f"{base}{normalized_route}"
+        return f"{base}/api/v1{normalized_route}"
+
+    def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
+        """Register then poll API v1 relay routes for encrypted work."""
+
+        last_error: Optional[Dict[str, Any]] = None
+        for offset in range(len(self._relay_urls)):
+            index = (self._active_relay_index + offset) % len(self._relay_urls)
+            candidate_url = self._relay_urls[index]
+
+            try:
+                register_response = self.register_api_v1_compute_node(candidate_url)
+                register_wait = self._request_timeout
+                if isinstance(register_response, dict):
+                    register_wait = register_response.get('next_ping_in_x_seconds', self._request_timeout)
+                    if register_response.get('error'):
+                        last_error = {
+                            'error': register_response.get('error'),
+                            'next_ping_in_x_seconds': register_wait,
+                        }
+                        continue
+
+                request_kwargs: Dict[str, Any] = {
+                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'timeout': self._request_timeout,
+                }
+                headers = self._auth_headers()
+                if headers:
+                    request_kwargs['headers'] = headers
+
+                response = requests.post(
+                    self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
+                    timeout=request_kwargs.pop('timeout'),
+                    **request_kwargs,
+                )
+                if response.status_code != 200:
+                    last_error = {
+                        'error': f'HTTP {response.status_code}',
+                        'next_ping_in_x_seconds': register_wait,
+                    }
+                    continue
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    last_error = {
+                        'error': 'Invalid response format: expected object payload',
+                        'next_ping_in_x_seconds': register_wait,
+                    }
+                    continue
+                payload.setdefault('next_ping_in_x_seconds', register_wait)
+                self._active_relay_index = index
+                return payload
+            except Exception as exc:
+                log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
+                last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+
+        return last_error or {
+            'error': 'No relay targets responded',
+            'next_ping_in_x_seconds': self._request_timeout,
+        }
+
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
         """
         Process a client request from the relay.
@@ -717,14 +800,14 @@ class RelayClient:
                             request_kwargs["headers"] = headers
 
                         source_response = requests.post(
-                            f"{self.relay_url}/source",
+                            self._build_api_v1_url(self.relay_url, "/relay/responses"),
                             timeout=self._request_timeout,
                             **request_kwargs,
                         )
                         return source_response.status_code == 200
                     except Exception:
                         log_error(
-                            "Failed to encrypt or post API v1 response to relay /source",
+                            "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
                             exc_info=True,
                         )
                         return False

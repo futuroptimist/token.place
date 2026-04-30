@@ -170,17 +170,93 @@ def test_compute_node_runtime_respects_explicit_empty_adapter_list():
     relay_client.process_client_request.assert_not_called()
 
 
-def test_api_v1_relay_payload_detection_is_hard_disabled():
+def test_api_v1_relay_payload_detection_identifies_valid_api_v1_envelope():
     assert is_api_v1_relay_payload({"api_v1_payload": True}) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is True
 
 
-def test_api_v1_relay_request_adapter_is_noop_when_disabled():
+def test_api_v1_relay_payload_detection_rejects_legacy_messages_shape():
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "api_v1_request": {"messages": []},
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is True
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "wrong",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 2,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": 123,
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": {},
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+
+
+def test_api_v1_relay_request_adapter_processes_api_v1_payload():
     relay_client = MagicMock()
     adapter = ApiV1RelayRequestAdapter(relay_client)
 
-    assert adapter.can_process({"api_v1_payload": True}) is False
-    assert adapter.process({"api_v1_payload": True}) is False
-    relay_client.process_api_v1_chat_request.assert_not_called()
+    payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }
+    relay_client.process_client_request.return_value = True
+    assert adapter.can_process(payload) is True
+    assert adapter.process(payload) is True
+    relay_client.process_client_request.assert_called_once_with(payload)
 
 def test_legacy_relay_request_adapter_only_matches_legacy_contract():
     relay_client = MagicMock()
@@ -266,7 +342,7 @@ def test_apply_compute_mode_sets_expected_gpu_layer_defaults():
 
 def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client():
     relay_client = MagicMock()
-    relay_client.ping_relay.return_value = {"relayStatus": "ok"}
+    relay_client.poll_api_v1_encrypted_work.return_value = {"relayStatus": "ok"}
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
     crypto_manager = MagicMock()
@@ -279,7 +355,7 @@ def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client()
     )
 
     assert runtime.register_and_poll_once() == {"relayStatus": "ok"}
-    relay_client.ping_relay.assert_called_once_with()
+    relay_client.poll_api_v1_encrypted_work.assert_called_once_with()
 
 
 def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
@@ -305,13 +381,13 @@ def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
     }
 
     relay_client.process_client_request.return_value = True
-    relay_client.ping_relay.side_effect = lambda: {
+    relay_client.poll_api_v1_encrypted_work.side_effect = lambda: {
         "relayStatus": "ok",
         "processed": runtime.process_relay_request(legacy_payload),
     }
 
     assert runtime.register_and_poll_once() == {"relayStatus": "ok", "processed": True}
-    relay_client.ping_relay.assert_called_once_with()
+    relay_client.poll_api_v1_encrypted_work.assert_called_once_with()
     relay_client.process_client_request.assert_called_once_with(legacy_payload)
 
 

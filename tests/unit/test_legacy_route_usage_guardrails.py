@@ -8,6 +8,7 @@ def test_active_production_paths_do_not_reference_legacy_relay_routes():
     root = Path(__file__).resolve().parents[2]
     targets = [
         root / "api" / "v1" / "compute_provider.py",
+        root / "client.py",
         root / "static" / "chat.js",
         root / "desktop" / "src" / "services" / "desktopBridgeClient.ts",
         root / "desktop" / "src" / "services" / "desktopApiClient.ts",

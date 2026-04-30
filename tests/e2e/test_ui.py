@@ -435,11 +435,13 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert started, "desktop bridge did not emit a started event"
         assert registered, "desktop bridge never reported relay registration"
         relay_ready = False
-        relay_next_server_body = ""
+        relay_server_selection_body = ""
         for _ in range(20):
-            next_server_response = page.request.get(f"{base_url}/next_server")
+            next_server_response = page.request.get(
+                f"{base_url}/api/v1/relay/servers/next"
+            )
             if next_server_response.ok:
-                relay_next_server_body = next_server_response.text()
+                relay_server_selection_body = next_server_response.text()
                 try:
                     payload = next_server_response.json()
                 except Exception:  # pragma: no cover - defensive for non-json relay errors
@@ -449,8 +451,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                     break
             time.sleep(0.25)
         assert relay_ready, (
-            "desktop bridge reported registered but relay /next_server did not expose "
-            f"an active server_public_key in time. Last response body: {relay_next_server_body!r}"
+            "desktop bridge reported registered but relay /api/v1/relay/servers/next "
+            "did not expose an active server_public_key in time. Last response body: "
+            f"{relay_server_selection_body!r}"
         )
 
         page.goto(base_url)

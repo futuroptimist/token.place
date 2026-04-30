@@ -165,20 +165,20 @@ class DistributedApiV1ComputeProvider:
 
         try:
             next_server_response = requests.get(
-                self._relay_url("/next_server"),
+                self._relay_url("/api/v1/relay/servers/next"),
                 timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
             raise _error_from_code(
                 "compute_node_unreachable",
-                message=f"unable to reach relay next_server endpoint: {exc}",
+                message=f"unable to reach relay server selection endpoint: {exc}",
             ) from exc
 
         if next_server_response.status_code >= 500:
             raise _error_from_code(
                 "compute_node_unreachable",
                 message=(
-                    "relay next_server endpoint returned "
+                    "relay server selection endpoint returned "
                     f"unexpected status {next_server_response.status_code}"
                 ),
             )
@@ -188,13 +188,13 @@ class DistributedApiV1ComputeProvider:
         except ValueError as exc:
             raise _error_from_code(
                 "compute_node_invalid_payload",
-                message="relay next_server response was not valid JSON",
+                message="relay server selection response was not valid JSON",
             ) from exc
 
         if not isinstance(next_server_payload, dict):
             raise _error_from_code(
                 "compute_node_invalid_payload",
-                message="relay next_server response must be an object",
+                message="relay server selection response must be an object",
             )
 
         server_public_key = next_server_payload.get("server_public_key")
@@ -231,14 +231,14 @@ class DistributedApiV1ComputeProvider:
 
         try:
             faucet_response = requests.post(
-                self._relay_url("/faucet"),
+                self._relay_url("/api/v1/relay/requests"),
                 json=faucet_payload,
                 timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
             raise _error_from_code(
                 "compute_node_unreachable",
-                message=f"unable to post encrypted request to relay faucet endpoint: {exc}",
+                message=f"unable to post encrypted request to relay request endpoint: {exc}",
             ) from exc
 
         if faucet_response.status_code == 404:
@@ -251,7 +251,7 @@ class DistributedApiV1ComputeProvider:
             raise _error_from_code(
                 "compute_node_bridge_error",
                 message=(
-                    "relay faucet endpoint returned unexpected status "
+                    "relay request endpoint returned unexpected status "
                     f"{faucet_response.status_code}"
                 ),
             )
@@ -261,7 +261,7 @@ class DistributedApiV1ComputeProvider:
             try:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
-                    self._relay_url("/retrieve"),
+                    self._relay_url("/api/v1/relay/responses/retrieve"),
                     json={"client_public_key": crypto_manager.public_key_b64},
                     timeout=retrieve_timeout,
                 )

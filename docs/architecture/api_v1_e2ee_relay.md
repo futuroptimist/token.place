@@ -1,7 +1,6 @@
 # API v1-only E2EE relay architecture (v0.1.0)
 
-This note is the canonical architecture baseline for the API v1 relay repair sequence
-(Prompts 0-4).
+This note is the canonical architecture baseline for API v1 relay-blind E2EE.
 
 ## Release target and scope
 
@@ -66,16 +65,24 @@ plaintext model payload content, including:
 
 Any path that would expose plaintext to relay-owned surfaces must fail closed.
 
-## Migration context (why this exists)
+## Local developer workflow
 
-There is a known alignment gap between `relay.py`, desktop-tauri flows, and the relay landing-page
-HTML chat UI. Some end-to-end flow segments still hit deprecated legacy routes.
+1. Start relay (`python relay.py`) and confirm relay diagnostics endpoint is reachable:
+   `/relay/diagnostics`.
+2. Start desktop bridge/compute node and ensure it registers on API v1 relay routes:
+   `/api/v1/relay/servers/register` and `/api/v1/relay/servers/poll`.
+3. Open landing-page chat and verify requests flow through API v1 E2EE routes:
+   `/api/v1/relay/servers/next` -> `/api/v1/relay/requests` ->
+   `/api/v1/relay/responses` -> `/api/v1/relay/responses/retrieve`.
 
-Prompts 1-4 in this sequence own the implementation repair:
+## Success signals and failure signatures
 
-1. restore/audit API v1 relay/server route contract,
-2. migrate desktop bridge paths,
-3. migrate relay landing-page chat path and remove plaintext bypass behavior,
-4. add final guardrails proving active production paths no longer use legacy routes.
-
-This Prompt 0 documentation baseline intentionally does **not** implement those code migrations.
+- Success:
+  - relay diagnostics shows registered compute nodes with routing metadata only.
+  - browser chat returns non-stub assistant content through API v1 path.
+- Failure signatures:
+  - local provider selected when desktop bridge intended.
+  - heartbeat-only compute node (registers but never polls).
+  - any request to legacy endpoints (`/sink`, `/faucet`, `/source`, `/retrieve`, `/next_server`).
+  - `stub` content in chat response.
+  - any `E2EE_SENTINEL_*` plaintext marker in relay logs/diagnostics/state.

@@ -819,6 +819,7 @@ class TestRelayClient:
             'next_ping_in_x_seconds': 7,
         }
 
+    @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_propagates_register_interval_on_poll_error(self, mock_post, relay_client):
         register_ok = MagicMock(status_code=200)
         register_ok.json.return_value = {'next_ping_in_x_seconds': 11}

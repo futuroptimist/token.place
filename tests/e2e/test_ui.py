@@ -543,7 +543,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"
-        assert "Sorry, I encountered an issue generating a response." not in assistant_text
+        assert assistant_text.lower() != "stub"
+        assert assistant_text != "Sorry, I encountered an issue generating a response. Please try again."
+        assert assistant_text != "Sorry, an error occurred while sending your message. Please try again."
+        assert assistant_text != "Sorry, the relay returned an invalid response. Please try again."
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
 

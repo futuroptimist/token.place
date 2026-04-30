@@ -79,7 +79,9 @@ def test_runtime_relay_state_never_stores_plaintext_sentinel_when_distributed_di
     assert E2EE_SENTINEL_RELAY_STATE not in diag_text
 
 
-def test_legacy_sink_and_faucet_contract_remains_ciphertext_only(relay_client):
+def test_legacy_sink_and_faucet_contract_remains_ciphertext_only(monkeypatch, relay_client):
+    monkeypatch.setenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "1")
+
     relay.known_servers["server-key"] = {
         "public_key": "server-key",
         "last_ping": relay.datetime.now(),
@@ -155,9 +157,9 @@ def test_network_egress_never_leaks_plaintext_sentinel_to_relay(monkeypatch):
     def _capture(method):
         def _inner(url, **kwargs):
             outbound.append({"method": method, "url": url, "kwargs": copy.deepcopy(kwargs)})
-            if str(url).endswith("/next_server"):
+            if str(url).endswith("/api/v1/relay/servers/next"):
                 return _Resp(200, {"server_public_key": crypto_manager.public_key_b64})
-            if str(url).endswith("/faucet"):
+            if str(url).endswith("/api/v1/relay/requests"):
                 return _Resp(500, {"error": "forced faucet failure for test coverage"})
             return _Resp(500, {"error": "unexpected"})
 
@@ -179,13 +181,15 @@ def test_network_egress_never_leaks_plaintext_sentinel_to_relay(monkeypatch):
             options={"temperature": 0.1},
         )
 
-    faucet_calls = [call for call in outbound if str(call["url"]).endswith("/faucet")]
-    assert faucet_calls, "Expected an outbound /faucet relay request"
-    serialized = _to_text(faucet_calls)
+    request_calls = [call for call in outbound if str(call["url"]).endswith("/api/v1/relay/requests")]
+    assert request_calls, "Expected an outbound /api/v1/relay/requests relay request"
+    serialized = _to_text(request_calls)
     assert E2EE_SENTINEL_NETWORK not in serialized
 
 
-def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(caplog, relay_client):
+def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(monkeypatch, caplog, relay_client):
+    monkeypatch.setenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "1")
+
     relay.known_servers["server-key"] = {
         "public_key": "server-key",
         "last_ping": relay.datetime.now(),

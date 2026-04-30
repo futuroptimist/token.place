@@ -14,7 +14,7 @@ def test_get_server_public_key():
         key = client.get_server_public_key()
         assert key == b'k'
         mock_get.assert_called_with(
-            'http://testserver:5000/next_server', timeout=REQUEST_TIMEOUT
+            'http://testserver:5000/api/v1/relay/servers/next', timeout=REQUEST_TIMEOUT
         )
 
 
@@ -23,7 +23,7 @@ def test_send_message_flow():
     with patch.object(client, 'get_server_public_key', return_value=b'server_key') as m_get, \
          patch('client.encrypt') as m_enc, \
          patch('client.decrypt') as m_dec, \
-         patch.object(client, 'send_request_to_faucet') as m_faucet, \
+         patch.object(client, 'send_request_to_relay_requests') as m_faucet, \
          patch.object(client, 'retrieve_response') as m_retrieve:
         m_enc.return_value = ({'ciphertext': b'data', 'iv': b'iv'}, b'cipher', b'iv')
         m_dec.return_value = b'[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]'

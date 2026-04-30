@@ -218,7 +218,7 @@ class ChatClient:
         """Fetch the server's public key from the relay."""
         try:
             response = requests.get(
-                f'{self.base_url}:{self.relay_port}/next_server', timeout=REQUEST_TIMEOUT
+                f'{self.base_url}:{self.relay_port}/api/v1/relay/servers/next', timeout=REQUEST_TIMEOUT
             )
             if response.status_code == 200:
                 data = response.json()
@@ -237,8 +237,8 @@ class ChatClient:
             )
             return None
 
-    def send_request_to_faucet(self, encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64):
-        """Send the encrypted chat history and IV to the faucet endpoint."""
+    def send_request_to_relay_requests(self, encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64):
+        """Send the encrypted chat history and IV to the relay requests endpoint."""
         try:
             data = {
                 "client_public_key": self.public_key_b64,
@@ -248,12 +248,12 @@ class ChatClient:
                 "iv": iv_b64,
             }
             response = requests.post(
-                f'{self.base_url}:{self.relay_port}/faucet', json=data, timeout=REQUEST_TIMEOUT
+                f'{self.base_url}:{self.relay_port}/api/v1/relay/requests', json=data, timeout=REQUEST_TIMEOUT
             )
             return response
         except requests.exceptions.RequestException as e:
             logger.warning(
-                "Error while sending request to faucet: %s",
+                "Error while sending request to relay requests: %s",
                 e.__class__.__name__,
             )
             return None
@@ -263,7 +263,7 @@ class ChatClient:
         while True:
             try:
                 response = requests.post(
-                    f'{self.base_url}:{self.relay_port}/retrieve',
+                    f'{self.base_url}:{self.relay_port}/api/v1/relay/responses/retrieve',
                     json={"client_public_key": self.public_key_b64},
                     timeout=REQUEST_TIMEOUT,
                 )
@@ -290,7 +290,7 @@ class ChatClient:
                         )
                 else:
                     logger.warning(
-                        "Unexpected status code from /retrieve endpoint: %s",
+                        "Unexpected status code from /api/v1/relay/responses/retrieve endpoint: %s",
                         response.status_code,
                     )
             except requests.exceptions.RequestException as e:
@@ -326,13 +326,13 @@ class ChatClient:
             iv_b64 = base64.b64encode(iv).decode('utf-8')
             encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
 
-            response_faucet = self.send_request_to_faucet(
+            response_request = self.send_request_to_relay_requests(
                 encrypted_chat_history_b64,
                 iv_b64,
                 base64.b64encode(server_public_key).decode('utf-8'),
                 encrypted_cipherkey_b64
             )
-            if response_faucet and response_faucet.status_code == 200:
+            if response_request and response_request.status_code == 200:
                 start_time = time.time()
                 timeout = 60  # Adjust the timeout as needed
                 while True:

@@ -647,7 +647,7 @@ def _legacy_route_deprecated_response(route_name: str):
 def _select_next_server_payload():
     _evict_stale_servers()
     if not known_servers:
-        return jsonify({'error': {'message': 'No servers available','code': 503}})
+        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
     server_public_key = secrets.choice(list(known_servers.keys()))
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
 
@@ -896,8 +896,6 @@ def api_v1_relay_responses_retrieve():
 
 @app.route('/faucet', methods=['POST'])
 def faucet():
-    if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/faucet')
     """
     Endpoint for clients to request inference given a public key.
     The public key uniquely identifies the server to send the request to,
@@ -939,6 +937,9 @@ def faucet():
         "iv": "yUR11oNkM/ZQeGuRF6JHAw=="
     }
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/faucet')
+
     _evict_stale_servers()
     # Parse the request data
     data = request.get_json()
@@ -982,8 +983,6 @@ def faucet():
 
 @app.route('/sink', methods=['POST'])
 def sink():
-    if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/sink')
     """
     Endpoint for server instances to announce their availability (offering a compute sink).
     The request body should be application/json and contain the following keys:
@@ -996,6 +995,9 @@ def sink():
             Conforms to the same JSON format as the request body.
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/sink')
+
     _evict_stale_servers()
     auth_error = _validate_server_registration()
     if auth_error:
@@ -1100,11 +1102,12 @@ def unregister():
 
 @app.route('/source', methods=['POST'])
 def source():
-    if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/source')
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/source')
+
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
@@ -1151,11 +1154,12 @@ def stream_source():
 
 @app.route('/retrieve', methods=['POST'])
 def retrieve():
-    if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/retrieve')
     """
     Endpoint for clients to retrieve responses queued by the /source endpoint.
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/retrieve')
+
     data = request.get_json()
     if not data or 'client_public_key' not in data:
         return jsonify({'error': 'Invalid request data'}), 400

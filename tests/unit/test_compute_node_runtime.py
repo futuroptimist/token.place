@@ -223,6 +223,15 @@ def test_api_v1_relay_payload_detection_rejects_legacy_messages_shape():
     assert is_api_v1_relay_payload({
         "protocol": "tokenplace_api_v1_relay_e2ee",
         "version": 1,
+        "request_id": 123,
+        "client_public_key": "k",
+        "chat_history": "c",
+        "cipherkey": "k",
+        "iv": "i",
+    }) is False
+    assert is_api_v1_relay_payload({
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
         "request_id": "req-1",
         "client_public_key": "k",
         "chat_history": {},

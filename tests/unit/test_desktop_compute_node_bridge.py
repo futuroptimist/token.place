@@ -1138,3 +1138,12 @@ def test_sanitize_relay_target_redacts_credentials_query_and_fragment():
 def test_sanitize_relay_target_returns_unknown_for_invalid_values():
     assert compute_node_bridge._sanitize_relay_target(None) == 'unknown'
     assert compute_node_bridge._sanitize_relay_target('not-a-valid-url') == 'unknown'
+
+
+def test_relay_response_summary_handles_non_dict_payloads():
+    summary = compute_node_bridge._relay_response_summary(["unexpected"])
+    assert summary == "non-dict response type=list"
+
+
+def test_relay_error_message_normalizes_non_string_truthy_values():
+    assert compute_node_bridge._relay_error_message({"error": 503}) == "503"

@@ -387,7 +387,11 @@ new Vue({
                     model: "llama-3-8b-instruct",
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
-                    messages: encryptedData
+                    messages: encryptedData,
+                    metadata: {
+                        inference_target: "desktop_bridge_api_v1_e2ee",
+                        relay_path: "api_v1_e2ee"
+                    }
                 };
 
                 // Send the request to the API
@@ -501,6 +505,20 @@ new Vue({
             return codeToMessage[errorCode] || fallbackMessage;
         },
 
+        isInvalidAssistantResponseContent(content) {
+            if (typeof content !== 'string') {
+                return true;
+            }
+            const normalized = content.trim();
+            if (!normalized) {
+                return true;
+            }
+            if (normalized.toLowerCase() === 'stub') {
+                return true;
+            }
+            return normalized === 'Sorry, I encountered an issue generating a response. Please try again.';
+        },
+
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
@@ -530,6 +548,9 @@ new Vue({
                     // For API response, extract last message
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
+                        if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
+                            throw new Error('Invalid assistant response content from API v1 relay path');
+                        }
                         this.appendAssistantMessage(assistantMessage);
                     }
                     // For legacy response format (full chat history)

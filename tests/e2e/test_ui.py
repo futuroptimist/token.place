@@ -504,6 +504,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "The LLM server is unavailable right now. Please try again.",
             "The LLM server took too long to respond. Please try again.",
         }
+        disallowed_assistant_outputs = {
+            "stub",
+            "Sorry, I encountered an issue generating a response. Please try again.",
+        }
         for _ in range(2):
             textarea.fill(prompt_text)
             page.locator("button", has_text="Send").click()
@@ -529,12 +533,17 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 },
             )
             assistant_text = assistant_message.inner_text().strip()
-            if assistant_text and assistant_text not in transient_bridge_errors:
+            if (
+                assistant_text
+                and assistant_text not in transient_bridge_errors
+                and assistant_text not in disallowed_assistant_outputs
+            ):
                 break
 
         assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"
         assert "Sorry, I encountered an issue generating a response." not in assistant_text
+        assert assistant_text.lower() != "stub"
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
 
@@ -615,6 +624,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         encrypted_request = v1_requests[0].post_data_json
         assert encrypted_request.get("encrypted") is True
         assert encrypted_request.get("stream") in (None, False)
+        metadata = encrypted_request.get("metadata")
+        assert isinstance(metadata, dict)
+        assert metadata.get("inference_target") == "desktop_bridge_api_v1_e2ee"
+        assert metadata.get("relay_path") == "api_v1_e2ee"
         client_public_key = encrypted_request.get("client_public_key")
         assert isinstance(client_public_key, str) and client_public_key
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)

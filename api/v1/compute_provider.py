@@ -435,6 +435,27 @@ def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
 
 
+def get_api_v1_compute_provider_for_mode(
+    *,
+    mode: str,
+    distributed_fallback_enabled: bool | None = None,
+) -> ApiV1ComputeProvider:
+    """Resolve provider with an explicit mode override for request-scoped routing."""
+
+    normalized_mode = (mode or "local").strip().lower()
+    distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    if distributed_fallback_enabled is None:
+        distributed_fallback_enabled = (
+            os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+    return _build_api_v1_compute_provider(
+        normalized_mode,
+        distributed_url,
+        bool(distributed_fallback_enabled),
+    )
+
+
 def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:
     """Return a stable diagnostics label for the resolved provider instance."""
 

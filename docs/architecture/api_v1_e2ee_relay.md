@@ -1,38 +1,26 @@
 # API v1-only E2EE relay architecture (v0.1.0)
 
-This note is the canonical architecture baseline for the API v1 relay repair sequence
-(Prompts 0-4).
+## Architecture summary
 
-## Release target and scope
+token.place v0.1.0 uses API v1 as the only active runtime API for relay-based inference.
+Distributed inference must remain relay-blind end-to-end encryption (E2EE): the relay can only
+handle ciphertext plus safe routing metadata.
 
-- **API v1 is the active API for token.place v0.1.0.**
-- **API v1 is non-streaming.** Responses are returned only after full model generation is
-  complete.
-- **Do not add streaming to API v1** for relay/client-server inference paths.
+## Active API v1 relay flow
 
-## Runtime routing rules (must-follow)
+1. Compute node registers and heartbeats with `POST /api/v1/relay/servers/register`.
+2. Client/server API v1 provider fetches a target node with `GET /api/v1/relay/servers/next`.
+3. Client/server API v1 provider submits encrypted request envelope to
+   `POST /api/v1/relay/requests`.
+4. Compute node polls for encrypted work with `POST /api/v1/relay/servers/poll`.
+5. Compute node returns encrypted response envelope with `POST /api/v1/relay/responses`.
+6. Client/server API v1 provider retrieves encrypted response from
+   `POST /api/v1/relay/responses/retrieve`.
 
-All active production inference paths must use API v1 E2EE routes:
+## Deprecated legacy endpoints
 
-- `server.py` API/runtime inference paths
-- `relay.py` relay paths
-- `client.py` client paths
-- `desktop-tauri` compute-node / bridge paths
-- relay landing-page HTML chat UI served by `relay.py`
-
-If a path cannot preserve API v1 E2EE invariants, it must **fail closed** instead of routing
-plaintext or using deprecated fallbacks.
-
-## API v2 status
-
-- API v2 exists in the repository, but it is currently incomplete.
-- Do **not** route active runtime traffic through API v2 yet.
-- Do **not** migrate server, relay, client, desktop, or relay HTML chat UI runtime paths to API v2
-  until API v1 is launched and v0.1.0 is finalized.
-
-## Deprecated legacy relay endpoints
-
-The following endpoints are deprecated legacy relay routes:
+The following legacy endpoints are deprecated and must not be used by active production inference
+paths:
 
 - `/sink`
 - `/faucet`
@@ -40,42 +28,37 @@ The following endpoints are deprecated legacy relay routes:
 - `/retrieve`
 - `/next_server`
 
-Rules:
+Current behavior: these routes remain in `relay.py` only to return explicit deprecation errors
+(HTTP 410) that point callers to API v1 endpoints.
 
-- Do not use them in active production inference paths.
-- Do not extend them for new features.
-- Do not reintroduce them as compatibility fallbacks in active runtime traffic.
-- Use API v1 E2EE relay routes instead.
+## E2EE invariant
 
-Legacy routes may remain temporarily for historical compatibility and migration staging, but they
-must be clearly labeled deprecated legacy behavior in docs and code comments.
+The relay must never store, log, or return plaintext model payload content. This includes prompts,
+`messages`, assistant text, tool arguments, and model output text. If a path cannot preserve this,
+it must fail closed.
 
-## E2EE invariant (relay-blind requirement)
+## Local developer workflow
 
-Relay-visible surfaces must remain ciphertext-only plus safe routing metadata.
+1. Start relay: `python relay.py`.
+2. Start compute node bridge runtime (desktop-tauri flow) configured for API v1 relay endpoints.
+3. Open relay landing-page chat UI in browser and run chat inference.
+4. Validate relay diagnostics and logs for ciphertext-only behavior.
 
-Relay-owned state, relay logs, relay diagnostics, and relay HTTP payloads must never include
-plaintext model payload content, including:
+## Expected success signals
 
-- plaintext prompts
-- OpenAI `messages`
-- legacy `prompt` fields
-- assistant response text
-- tool arguments
-- model output text or equivalent content payloads
+- Relay returns 200 from API v1 relay routes listed above.
+- Compute node poll returns queued encrypted envelopes.
+- Relay diagnostics show registered compute nodes without plaintext payload fields.
+- No relay logs include message plaintext.
 
-Any path that would expose plaintext to relay-owned surfaces must fail closed.
+## Common failure signatures
 
-## Migration context (why this exists)
-
-There is a known alignment gap between `relay.py`, desktop-tauri flows, and the relay landing-page
-HTML chat UI. Some end-to-end flow segments still hit deprecated legacy routes.
-
-Prompts 1-4 in this sequence own the implementation repair:
-
-1. restore/audit API v1 relay/server route contract,
-2. migrate desktop bridge paths,
-3. migrate relay landing-page chat path and remove plaintext bypass behavior,
-4. add final guardrails proving active production paths no longer use legacy routes.
-
-This Prompt 0 documentation baseline intentionally does **not** implement those code migrations.
+- **Local provider selected unexpectedly**: API v1 route returns local backend marker instead of
+  distributed relay marker.
+- **Heartbeat-only compute node**: node appears registered but polling endpoint returns no queued
+  work while requests are expected.
+- **Legacy endpoint usage**: route returns 410 deprecation error for `/sink`, `/faucet`,
+  `/source`, `/retrieve`, or `/next_server`.
+- **Stub response regression**: UI reports success without compute-node response payload.
+- **Plaintext sentinel regression**: sentinel strings appear in relay state, diagnostics, logs,
+  outbound relay calls, or API error payloads.

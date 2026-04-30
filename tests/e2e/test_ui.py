@@ -504,6 +504,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "The LLM server is unavailable right now. Please try again.",
             "The LLM server took too long to respond. Please try again.",
         }
+        invalid_success_outputs = transient_bridge_errors | {
+            "stub",
+            "Sorry, I encountered an issue generating a response. Please try again.",
+        }
         for _ in range(2):
             textarea.fill(prompt_text)
             page.locator("button", has_text="Send").click()
@@ -529,13 +533,14 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 },
             )
             assistant_text = assistant_message.inner_text().strip()
-            if assistant_text and assistant_text not in transient_bridge_errors:
+            if assistant_text and assistant_text not in invalid_success_outputs:
                 break
 
         assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"
+        assert assistant_text.lower() != "stub"
         assert "Sorry, I encountered an issue generating a response." not in assistant_text
-        assert assistant_text not in transient_bridge_errors
+        assert assistant_text not in invalid_success_outputs
         assert "Unknown streaming error" not in assistant_text
 
         assert len(v1_requests) >= 1

@@ -394,7 +394,8 @@ new Vue({
                 const response = await fetch('/api/v1/chat/completions', {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'X-Tokenplace-Execution-Mode': 'desktop-bridge'
                     },
                     body: JSON.stringify(payload)
                 });
@@ -498,7 +499,24 @@ new Vue({
                 compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
             };
 
-            return codeToMessage[errorCode] || fallbackMessage;
+                return codeToMessage[errorCode] || fallbackMessage;
+        },
+
+        isInvalidAssistantOutput(content) {
+            if (typeof content !== 'string') {
+                return true;
+            }
+            const normalized = content.trim();
+            if (!normalized) {
+                return true;
+            }
+            if (normalized.toLowerCase() === 'stub') {
+                return true;
+            }
+            if (normalized === 'Sorry, I encountered an issue generating a response. Please try again.') {
+                return true;
+            }
+            return false;
         },
 
         // Send a message to the server
@@ -530,6 +548,9 @@ new Vue({
                     // For API response, extract last message
                     else if (response.choices && response.choices.length > 0) {
                         const assistantMessage = response.choices[0].message;
+                        if (this.isInvalidAssistantOutput(assistantMessage && assistantMessage.content)) {
+                            throw new Error('Invalid assistant output returned from API v1 desktop bridge path');
+                        }
                         this.appendAssistantMessage(assistantMessage);
                     }
                     // For legacy response format (full chat history)

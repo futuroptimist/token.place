@@ -37,6 +37,8 @@ from api.v1.compute_provider import (
     get_api_v1_compute_provider,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
+    reset_api_v1_force_distributed,
+    set_api_v1_force_distributed,
     ComputeProviderError,
 )
 from api.v1.validation import (
@@ -116,6 +118,12 @@ def log_error(message, exc_info=False):
 
 # Create a Blueprint for v1 API
 v1_bp = Blueprint('v1', __name__, url_prefix='/api/v1')
+
+
+def _request_wants_desktop_bridge_distributed() -> bool:
+    mode_header = request.headers.get("X-Tokenplace-Execution-Mode", "")
+    normalized_mode = mode_header.strip().lower()
+    return normalized_mode in {"desktop-bridge", "desktop_bridge", "distributed"}
 
 
 def _configured_relay_servers() -> list[str]:
@@ -325,6 +333,9 @@ def _handle_chat_completion_request(data):
             ]
 
         log_info(f"Generating response using model {model_id}")
+        force_distributed_token = set_api_v1_force_distributed(
+            _request_wants_desktop_bridge_distributed()
+        )
         provider = get_api_v1_compute_provider()
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
@@ -332,11 +343,14 @@ def _handle_chat_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
-        assistant_message = provider.complete_chat(
-            model_id=model_id,
-            messages=messages,
-            options=_extract_chat_completion_options(data),
-        )
+        try:
+            assistant_message = provider.complete_chat(
+                model_id=model_id,
+                messages=messages,
+                options=_extract_chat_completion_options(data),
+            )
+        finally:
+            reset_api_v1_force_distributed(force_distributed_token)
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 

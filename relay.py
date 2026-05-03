@@ -1057,6 +1057,89 @@ def sink():
     return jsonify(response_data)
 
 
+
+
+# API v1 E2EE relay route aliases
+@app.route('/api/v1/relay/servers/register', methods=['POST'])
+def api_v1_relay_servers_register():
+    """Register compute nodes and optionally claim queued ciphertext work."""
+    return sink()
+
+
+@app.route('/api/v1/relay/servers/poll', methods=['POST'])
+def api_v1_relay_servers_poll():
+    """Poll for queued ciphertext work for a compute node."""
+    return sink()
+
+
+@app.route('/api/v1/relay/requests', methods=['POST'])
+def api_v1_relay_requests():
+    """Queue an encrypted client work envelope for a specific compute node."""
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    relay_request = {
+        'client_public_key': data.get('client_public_key'),
+        'server_public_key': data.get('server_public_key'),
+        'chat_history': data.get('ciphertext'),
+        'cipherkey': data.get('cipherkey'),
+        'iv': data.get('iv'),
+        'request_id': data.get('request_id'),
+        'protocol': data.get('protocol'),
+        'version': data.get('version'),
+    }
+
+    if not all([relay_request['server_public_key'], relay_request['chat_history'], relay_request['cipherkey'], relay_request['iv']]):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    with app.test_request_context('/faucet', method='POST', json=relay_request):
+        return faucet()
+
+
+@app.route('/api/v1/relay/responses', methods=['POST'])
+def api_v1_relay_responses():
+    """Queue an encrypted compute response envelope for client retrieval."""
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    relay_response = {
+        'client_public_key': data.get('client_public_key'),
+        'chat_history': data.get('ciphertext'),
+        'cipherkey': data.get('cipherkey'),
+        'iv': data.get('iv'),
+        'request_id': data.get('request_id'),
+        'protocol': data.get('protocol'),
+        'version': data.get('version'),
+    }
+    if not all([relay_response['client_public_key'], relay_response['chat_history'], relay_response['cipherkey'], relay_response['iv']]):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    with app.test_request_context('/source', method='POST', json=relay_response):
+        return source()
+
+
+@app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
+def api_v1_relay_responses_retrieve():
+    """Retrieve an encrypted response envelope for a client public key."""
+    data = request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    with app.test_request_context('/retrieve', method='POST', json={'client_public_key': data.get('client_public_key')}):
+        response = retrieve()
+
+    payload, status = response if isinstance(response, tuple) else (response, 200)
+    body = payload.get_json()
+    if status == 200 and 'chat_history' in body:
+        body = {
+            'client_public_key': data.get('client_public_key'),
+            'ciphertext': body.get('chat_history'),
+            'cipherkey': body.get('cipherkey'),
+            'iv': body.get('iv'),
+        }
+    return jsonify(body), status
 @app.route('/unregister', methods=['POST'])
 def unregister():
     """Explicitly unregister a compute node and clear relay queue/session state."""

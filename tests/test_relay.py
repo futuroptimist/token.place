@@ -302,6 +302,72 @@ def test_relay_api_v1_source_fails_closed(client):
     assert data["error"]["code"] == "distributed_api_v1_relay_disabled"
 
 
+
+
+def test_api_v1_relay_e2ee_contract_round_trip(client):
+    register_payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
+    register_resp = client.post('/api/v1/relay/servers/register', json=register_payload)
+    assert register_resp.status_code == 200
+
+    request_payload = {
+        'request_id': 'req-e2ee-1',
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'ciphertext': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+    }
+    enqueue_resp = client.post('/api/v1/relay/requests', json=request_payload)
+    assert enqueue_resp.status_code == 200
+
+    poll_resp = client.post('/api/v1/relay/servers/poll', json=register_payload)
+    assert poll_resp.status_code == 200
+    polled = poll_resp.get_json()
+    assert polled['chat_history'] == request_payload['ciphertext']
+    assert polled['cipherkey'] == request_payload['cipherkey']
+    assert polled['iv'] == request_payload['iv']
+
+    response_payload = {
+        'request_id': 'req-e2ee-1',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'ciphertext': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+    }
+    source_resp = client.post('/api/v1/relay/responses', json=response_payload)
+    assert source_resp.status_code == 200
+
+    retrieve_resp = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    assert retrieve_resp.status_code == 200
+    retrieved = retrieve_resp.get_json()
+    assert retrieved['ciphertext'] == response_payload['ciphertext']
+    assert retrieved['cipherkey'] == response_payload['cipherkey']
+    assert retrieved['iv'] == response_payload['iv']
+
+
+def test_api_v1_relay_routes_do_not_store_plaintext_messages(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    payload = {
+        'request_id': 'req-e2ee-2',
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'ciphertext': 'sentinel-ciphertext-only',
+        'cipherkey': 'sentinel-key',
+        'iv': 'sentinel-iv',
+        'messages': [{'role': 'user', 'content': 'LEAK-ME-PLAINTEXT'}],
+        'prompt': 'LEAK-ME-PLAINTEXT',
+    }
+    resp = client.post('/api/v1/relay/requests', json=payload)
+    assert resp.status_code == 200
+
+    queued = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
+    assert 'messages' not in queued
+    assert 'prompt' not in queued
+    assert queued['chat_history'] == 'sentinel-ciphertext-only'
 class _RelayClientApiV1CryptoStub:
     def __init__(self, decrypted_payload):
         self.decrypted_payload = decrypted_payload

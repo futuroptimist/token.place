@@ -1,0 +1,8 @@
+{
+  "date": "2026-04-29",
+  "slug": "api-v1-distributed-relay-e2ee-regression",
+  "summary": "PR #813 introduced an API v1 distributed relay bridge that posted plaintext OpenAI-style messages through relay-owned state, violating the relay-blind E2EE invariant for distributed inference.",
+  "impact": "Code-level exposure risk existed for distributed API v1 traffic because relay state could carry plaintext prompts/messages. This was treated as a security incident; there is no confirmed exploitation in repository evidence.",
+  "fix": "Prompt 1 fail-closed unsafe distributed API v1 relay dispatch (PR #834), Prompt 2 restored distributed API v1 relay through an E2EE envelope path (PR #836), and Prompt 3 added permanent anti-regression safeguards (PR #842).",
+  "lessons": "Distributed relay paths must preserve ciphertext-only relay ownership at every boundary. Registration/auth hardening alone (for example PR #831) is insufficient without end-to-end relay-blind E2EE contract enforcement and invariant tests."
+}

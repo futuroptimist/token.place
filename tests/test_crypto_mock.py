@@ -19,14 +19,14 @@ TEST_RESPONSE = [
 def mock_server_responses():
     """Mock server responses for testing the CryptoClient"""
     with patch('utils.crypto_helpers.requests') as mock_requests:
-        # Mock next_server endpoint
+        # Mock API v1 relay server-selection endpoint
         next_server_response = MagicMock()
         next_server_response.status_code = 200
         next_server_response.json.return_value = {
             'server_public_key': base64.b64encode(b'mock_server_public_key').decode('utf-8')
         }
 
-        # Mock faucet endpoint
+        # Mock API v1 relay request endpoint
         faucet_response = MagicMock()
         faucet_response.status_code = 200
         faucet_response.json.return_value = {
@@ -34,7 +34,7 @@ def mock_server_responses():
             'message': 'Request received'
         }
 
-        # Mock retrieve endpoint
+        # Mock API v1 relay response retrieval endpoint
         retrieve_response = MagicMock()
         retrieve_response.status_code = 200
         retrieve_response.json.return_value = {
@@ -71,7 +71,7 @@ def mock_server_responses():
 
         # Configure the mock requests
         def get_side_effect(url, *args, **kwargs):
-            if '/next_server' in url:
+            if '/api/v1/relay/servers/next' in url:
                 return next_server_response
             elif '/api/v1/public-key' in url:
                 return api_key_response
@@ -81,9 +81,9 @@ def mock_server_responses():
                 return response
 
         def post_side_effect(url, *args, **kwargs):
-            if '/faucet' in url:
+            if '/api/v1/relay/requests' in url:
                 return faucet_response
-            elif '/retrieve' in url:
+            elif '/api/v1/relay/responses/retrieve' in url:
                 return retrieve_response
             elif '/api/v1/chat/completions' in url:
                 return api_completions_response

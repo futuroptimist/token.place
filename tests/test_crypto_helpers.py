@@ -55,7 +55,7 @@ def test_fetch_server_public_key(mock_crypto_client):
     # Test the default endpoint
     result = client.fetch_server_public_key()
     assert result is True
-    mock_requests.get.assert_called_with('https://mock-server.com/next_server', timeout=10)
+    mock_requests.get.assert_called_with('https://mock-server.com/api/v1/relay/servers/next', timeout=10)
 
     # Test a custom endpoint
     result = client.fetch_server_public_key('/api/v1/public-key')

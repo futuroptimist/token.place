@@ -31,8 +31,10 @@ DUMMY_CLIENT_PUB_KEY = base64.b64encode(b"client_public_key_456").decode('utf-8'
 
 @pytest.fixture
 def client():
-    """Create a Flask test client fixture"""
+    """Create a Flask test client fixture."""
     app.config['TESTING'] = True
+    previous_legacy_flag = os.environ.get("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES")
+    os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
     client_inference_requests.clear()
@@ -42,6 +44,11 @@ def client():
 
     with app.test_client() as client:
         yield client
+
+    if previous_legacy_flag is None:
+        os.environ.pop("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", None)
+    else:
+        os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
 
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
@@ -61,7 +68,7 @@ def test_inference_endpoint_removed(client):
 def test_next_server_no_servers(client):
     """Test /next_server when no servers are registered."""
     response = client.get("/next_server")
-    assert response.status_code == 200 # Endpoint itself works
+    assert response.status_code == 503
     data = response.get_json()
     assert 'error' in data
     assert data['error']['message'] == 'No servers available'
@@ -96,7 +103,7 @@ def test_next_server_evicts_stale_nodes(client):
     response = client.get("/next_server")
     payload = response.get_json()
 
-    assert response.status_code == 200
+    assert response.status_code == 503
     assert payload["error"]["message"] == "No servers available"
     assert DUMMY_SERVER_PUB_KEY not in known_servers
 

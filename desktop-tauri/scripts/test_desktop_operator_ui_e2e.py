@@ -350,7 +350,12 @@ def assert_relay_roundtrip(
         )
 
     relay_text = relay_log.read_text(encoding="utf-8", errors="replace")
-    for marker in ('"http_path": "/faucet"', '"http_path": "/source"', '"http_path": "/retrieve"'):
+    for marker in (
+        '"http_path": "/api/v1/relay/servers/next"',
+        '"http_path": "/api/v1/relay/requests"',
+        '"http_path": "/api/v1/relay/responses"',
+        '"http_path": "/api/v1/relay/responses/retrieve"',
+    ):
         if marker not in relay_text:
             raise AssertionError(
                 diagnostics_message(

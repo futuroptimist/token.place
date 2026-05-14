@@ -752,6 +752,47 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
     return envelope, None
 
 
+def _queue_client_response(client_public_key, envelope):
+    """Queue an encrypted response while preserving per-request retrieval."""
+    existing = client_responses.get(client_public_key)
+    if existing is None:
+        client_responses[client_public_key] = envelope
+        return
+    if isinstance(existing, list):
+        existing.append(envelope)
+        return
+    client_responses[client_public_key] = [existing, envelope]
+
+
+def _pop_client_response(client_public_key, request_id=None):
+    """Pop a queued encrypted response, optionally matching API v1 request id."""
+    if client_public_key not in client_responses:
+        return None
+
+    queued = client_responses[client_public_key]
+    if isinstance(queued, list):
+        if request_id:
+            for idx, candidate in enumerate(queued):
+                if candidate.get('request_id') == request_id:
+                    response = queued.pop(idx)
+                    if not queued:
+                        client_responses.pop(client_public_key, None)
+                    elif len(queued) == 1:
+                        client_responses[client_public_key] = queued[0]
+                    return response
+            return None
+        response = queued.pop(0)
+        if not queued:
+            client_responses.pop(client_public_key, None)
+        elif len(queued) == 1:
+            client_responses[client_public_key] = queued[0]
+        return response
+
+    if request_id and queued.get('request_id') != request_id:
+        return None
+    return client_responses.pop(client_public_key)
+
+
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
 def api_v1_relay_servers_register():
     """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
@@ -877,7 +918,7 @@ def api_v1_relay_responses():
     if not client_public_key:
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
 
-    client_responses[client_public_key] = envelope
+    _queue_client_response(client_public_key, envelope)
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 
@@ -889,10 +930,11 @@ def api_v1_relay_responses_retrieve():
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
 
     client_public_key = data['client_public_key']
-    if client_public_key not in client_responses:
+    response = _pop_client_response(client_public_key, data.get('request_id'))
+    if response is None:
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
-    return jsonify(client_responses.pop(client_public_key)), 200
+    return jsonify(response), 200
 
 @app.route('/faucet', methods=['POST'])
 def faucet():

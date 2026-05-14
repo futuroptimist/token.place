@@ -750,3 +750,83 @@ def test_stream_chat_completion_emits_partial_events_on_fallback(mock_post):
             'data': {"choices": [{"message": {"content": "full"}}]},
         },
     ]
+
+
+def test_send_chat_message_uses_per_request_id_without_shared_state(monkeypatch):
+    """Concurrent sends must not depend on mutable last-request instance state."""
+    client = CryptoClient('https://test-server.com')
+    client.server_public_key = b'mock_public_key'
+    client.server_public_key_b64 = 'mock-server-key'
+
+    class FixedUuid:
+        hex = 'abc123'
+
+    sent_payloads = []
+    retrieve_calls = []
+
+    monkeypatch.setattr('utils.crypto_helpers.uuid.uuid4', lambda: FixedUuid())
+    monkeypatch.setattr(
+        client,
+        'encrypt_message',
+        lambda envelope: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+    )
+
+    def fake_send(endpoint, payload):
+        sent_payloads.append((endpoint, payload))
+        return {'message': 'Request received'}
+
+    def fake_retrieve(max_retries, retry_delay=2, expected_request_id=None, chat_history=None):
+        retrieve_calls.append((max_retries, retry_delay, expected_request_id, chat_history))
+        return [{'role': 'assistant', 'content': 'ok'}]
+
+    monkeypatch.setattr(client, 'send_encrypted_message', fake_send)
+    monkeypatch.setattr(client, 'retrieve_chat_response', fake_retrieve)
+    monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda _seconds: None)
+
+    assert client.send_chat_message('hello', max_retries=7) == [{'role': 'assistant', 'content': 'ok'}]
+
+    assert sent_payloads[0][0] == '/api/v1/relay/requests'
+    assert sent_payloads[0][1]['request_id'] == 'crypto-client-abc123'
+    assert sent_payloads[0][1]['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+    assert retrieve_calls == [
+        (7, 2, 'crypto-client-abc123', [{'role': 'user', 'content': 'hello'}])
+    ]
+    assert not hasattr(client, '_last_chat_relay_request_id')
+
+
+def test_retrieve_chat_response_filters_with_explicit_request_id(monkeypatch):
+    client = CryptoClient('https://test-server.com')
+    client.client_public_key_b64 = 'client-key'
+    sent_payloads = []
+
+    def fake_send(endpoint, payload):
+        sent_payloads.append((endpoint, dict(payload)))
+        return {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+
+    monkeypatch.setattr(client, 'send_encrypted_message', fake_send)
+    monkeypatch.setattr(
+        client,
+        'decrypt_message',
+        lambda _encrypted: {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'request_id': 'req-1',
+            'api_v1_response': {
+                'message': {'role': 'assistant', 'content': 'done'},
+            },
+        },
+    )
+
+    response = client.retrieve_chat_response(
+        max_retries=1,
+        retry_delay=0,
+        expected_request_id='req-1',
+        chat_history=[{'role': 'user', 'content': 'hi'}],
+    )
+
+    assert sent_payloads == [
+        ('/api/v1/relay/responses/retrieve', {'client_public_key': 'client-key', 'request_id': 'req-1'})
+    ]
+    assert response == [
+        {'role': 'user', 'content': 'hi'},
+        {'role': 'assistant', 'content': 'done'},
+    ]

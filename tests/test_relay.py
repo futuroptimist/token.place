@@ -1081,6 +1081,81 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     assert retrieved_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
 
 
+def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_responses(client):
+    response_one = {
+        'request_id': 'req-1',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response-1',
+        'cipherkey': 'cipherkey-response-1',
+        'iv': 'iv-response-1',
+    }
+    response_two = {
+        'request_id': 'req-2',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response-2',
+        'cipherkey': 'cipherkey-response-2',
+        'iv': 'iv-response-2',
+    }
+
+    assert client.post('/api/v1/relay/responses', json=response_one).status_code == 200
+    assert client.post('/api/v1/relay/responses', json=response_two).status_code == 200
+
+    missing = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-missing'},
+    )
+    assert missing.status_code == 404
+    assert len(client_responses[DUMMY_CLIENT_PUB_KEY]) == 2
+
+    retrieved_two = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-2'},
+    )
+    assert retrieved_two.status_code == 200
+    assert retrieved_two.get_json()['request_id'] == 'req-2'
+    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-1'
+
+    retrieved_one = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-1'},
+    )
+    assert retrieved_one.status_code == 200
+    assert retrieved_one.get_json()['request_id'] == 'req-1'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
+    response_payload = {
+        'request_id': 'req-1',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    }
+    assert client.post('/api/v1/relay/responses', json=response_payload).status_code == 200
+
+    mismatch = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-other'},
+    )
+    assert mismatch.status_code == 404
+    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-1'
+
+    retrieved = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-1'},
+    )
+    assert retrieved.status_code == 200
+    assert retrieved.get_json()['request_id'] == 'req-1'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
 def test_api_v1_relay_plaintext_messages_not_stored(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 

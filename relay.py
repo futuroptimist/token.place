@@ -742,14 +742,19 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
         'cipherkey': payload['cipherkey'],
         'iv': payload['iv'],
     }
+    request_id = payload.get('request_id')
+    protocol = payload.get('protocol')
+    version = payload.get('version')
+    if protocol != 'tokenplace_api_v1_relay_e2ee' or version != 1:
+        return None, ('Invalid API v1 relay envelope protocol', 400)
+    if not isinstance(request_id, str) or not request_id.strip():
+        return None, ('Invalid API v1 relay request id', 400)
+
     if require_server_key:
         envelope['server_public_key'] = payload['server_public_key']
-    if 'request_id' in payload:
-        envelope['request_id'] = payload['request_id']
-    if 'protocol' in payload:
-        envelope['protocol'] = payload['protocol']
-    if 'version' in payload:
-        envelope['version'] = payload['version']
+    envelope['request_id'] = request_id
+    envelope['protocol'] = protocol
+    envelope['version'] = version
     return envelope, None
 
 
@@ -847,28 +852,14 @@ def api_v1_relay_servers_poll():
 
     first_request = None
 
-    def _is_legacy_ciphertext_payload(payload):
-        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
-
-    # Prefer explicit API v1 envelopes when both API v1 and legacy ciphertext payloads are queued.
+    # API v1 poll is API v1-only: claim explicit API v1 E2EE envelopes and never
+    # dispatch legacy ciphertext work through the desktop bridge polling path.
     for idx, candidate in enumerate(queued_requests):
         if bool(candidate.get('e2ee_v1')):
             first_request = queued_requests.pop(idx)
             break
 
-    if first_request is None:
-        while queued_requests:
-            candidate = queued_requests[0]
-            if _is_legacy_ciphertext_payload(candidate):
-                first_request = queued_requests.pop(0)
-                break
-            queued_requests.pop(0)
-
-
-    if first_request is not None and bool(first_request.get('e2ee_v1')):
-        # When an API v1 envelope is available, keep API v1-only semantics by dropping
-        # legacy ciphertext payloads left in the same queue.
-        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
+    queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
 
     if first_request is None:
         if not queued_requests:

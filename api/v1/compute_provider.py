@@ -91,6 +91,28 @@ def _error_from_code(code: str, *, message: str) -> ComputeProviderError:
     )
 
 
+_INVALID_ASSISTANT_CONTENT = {
+    "",
+    "stub",
+    "sorry, the relay returned an invalid response. please try again.",
+    "unable to generate a response right now.",
+}
+
+
+def _is_meaningful_assistant_message(message: Any) -> bool:
+    """Return True only for non-empty, non-placeholder assistant content."""
+
+    if not isinstance(message, dict):
+        return False
+    if message.get("role", "assistant") != "assistant":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    normalized = content.strip()
+    return normalized.lower() not in _INVALID_ASSISTANT_CONTENT
+
+
 class ApiV1ComputeProvider(Protocol):
     """Contract for API v1-compatible compute providers."""
 
@@ -224,6 +246,9 @@ class DistributedApiV1ComputeProvider:
                 message=f"failed to encrypt relay request envelope: {exc}",
             ) from exc
         faucet_payload = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": relay_request_id,
             "client_public_key": crypto_manager.public_key_b64,
             "server_public_key": server_public_key,
             **encrypted_envelope,
@@ -262,7 +287,10 @@ class DistributedApiV1ComputeProvider:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
                     self._relay_url("/api/v1/relay/responses/retrieve"),
-                    json={"client_public_key": crypto_manager.public_key_b64},
+                    json={
+                        "client_public_key": crypto_manager.public_key_b64,
+                        "request_id": relay_request_id,
+                    },
                     timeout=retrieve_timeout,
                 )
             except requests.RequestException:
@@ -324,10 +352,10 @@ class DistributedApiV1ComputeProvider:
                 )
 
             assistant_message = api_v1_response.get("message")
-            if not isinstance(assistant_message, dict):
+            if not _is_meaningful_assistant_message(assistant_message):
                 raise _error_from_code(
                     "compute_node_invalid_payload",
-                    message="compute node response missing assistant message",
+                    message="compute node response missing meaningful assistant content",
                 )
 
             _last_backend_path.set("distributed_relay_e2ee")

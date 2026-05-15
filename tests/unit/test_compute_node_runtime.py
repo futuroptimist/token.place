@@ -104,7 +104,7 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
     thread.start.assert_called_once_with()
 
 
-def test_compute_node_runtime_request_flow_delegates_to_relay_client():
+def test_compute_node_runtime_api_v1_request_flow_delegates_to_relay_client():
     relay_client = MagicMock()
     relay_client.process_client_request.return_value = True
     model_manager = MagicMock()
@@ -119,6 +119,9 @@ def test_compute_node_runtime_request_flow_delegates_to_relay_client():
     )
 
     payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-1",
         "client_public_key": "key",
         "chat_history": "payload",
         "cipherkey": "cipher",
@@ -358,7 +361,7 @@ def test_compute_node_runtime_register_and_poll_once_delegates_to_relay_client()
     relay_client.poll_api_v1_encrypted_work.assert_called_once_with()
 
 
-def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
+def test_compute_node_runtime_default_legacy_adapter_path_is_not_active():
     relay_client = MagicMock()
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
@@ -371,7 +374,7 @@ def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
         crypto_manager=crypto_manager,
     )
 
-    assert any(isinstance(adapter, LegacyRelayRequestAdapter) for adapter in runtime.request_adapters)
+    assert not any(isinstance(adapter, LegacyRelayRequestAdapter) for adapter in runtime.request_adapters)
 
     legacy_payload = {
         "client_public_key": "key",
@@ -386,9 +389,9 @@ def test_compute_node_runtime_default_legacy_adapter_path_remains_active():
         "processed": runtime.process_relay_request(legacy_payload),
     }
 
-    assert runtime.register_and_poll_once() == {"relayStatus": "ok", "processed": True}
+    assert runtime.register_and_poll_once() == {"relayStatus": "ok", "processed": False}
     relay_client.poll_api_v1_encrypted_work.assert_called_once_with()
-    relay_client.process_client_request.assert_called_once_with(legacy_payload)
+    relay_client.process_client_request.assert_not_called()
 
 
 def test_compute_node_runtime_stop_delegates_to_relay_client():

@@ -273,10 +273,7 @@ class ComputeNodeRuntime:
             include_configured_servers=runtime_config.use_configured_relay_fallbacks,
         )
         if request_adapters is None:
-            self.request_adapters = [
-                ApiV1RelayRequestAdapter(self.relay_client),
-                LegacyRelayRequestAdapter(self.relay_client),
-            ]
+            self.request_adapters = [ApiV1RelayRequestAdapter(self.relay_client)]
         else:
             self.request_adapters = list(request_adapters)
 

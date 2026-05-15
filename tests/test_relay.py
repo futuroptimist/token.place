@@ -1223,6 +1223,8 @@ def test_api_v1_relay_plaintext_messages_not_stored(client):
     plaintext = 'PLAINTEXT_SENTINEL_DO_NOT_STORE'
     payload = {
         'request_id': 'req-no-messages',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'server_public_key': DUMMY_SERVER_PUB_KEY,
         'chat_history': 'ciphertext-only',
@@ -1245,6 +1247,8 @@ def test_api_v1_relay_requests_requires_client_public_key(client):
 
     response = client.post('/api/v1/relay/requests', json={
         'request_id': 'req-missing-client-key',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
         'server_public_key': DUMMY_SERVER_PUB_KEY,
         'ciphertext': 'ciphertext-request',
         'cipherkey': 'cipherkey-request',
@@ -1267,6 +1271,8 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
 
     queued = client.post('/api/v1/relay/requests', json={
         'request_id': 'req-no-sink-delegation',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'server_public_key': DUMMY_SERVER_PUB_KEY,
         'ciphertext': 'ciphertext-request',
@@ -1319,6 +1325,8 @@ def test_api_v1_relay_response_plaintext_not_stored(client):
     plaintext = 'PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE'
     response_payload = {
         'request_id': 'req-response-no-plaintext',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'chat_history': 'ciphertext-response-only',
         'cipherkey': 'cipherkey-response-only',
@@ -1362,6 +1370,8 @@ def test_api_v1_register_does_not_dequeue_requests(client):
 
     request_payload = {
         'request_id': 'req-register-heartbeat',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'server_public_key': DUMMY_SERVER_PUB_KEY,
         'chat_history': 'ciphertext-request',

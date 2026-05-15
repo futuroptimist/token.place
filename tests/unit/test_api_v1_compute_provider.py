@@ -58,6 +58,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         posted_payloads.append((url, copy.deepcopy(json), timeout))
         if url.endswith("/api/v1/relay/requests"):
             assert "messages" not in json
+            assert json["protocol"] == "tokenplace_api_v1_relay_e2ee"
+            assert json["version"] == 1
+            assert isinstance(json["request_id"], str) and json["request_id"]
             assert "chat_history" in json and json["chat_history"]
             return _FakeResponse(200, {"message": "Request received"})
         if url.endswith("/api/v1/relay/responses/retrieve"):
@@ -129,15 +132,16 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
+    request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
     assert retrieve_calls == [
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
     ]
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
     assert posted_payloads[1][0] == "https://node-a.example/api/v1/relay/responses/retrieve"
@@ -628,7 +632,7 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_invalid_payload"
-        assert "compute node response missing assistant message" in str(exc)
+        assert "compute node response missing meaningful assistant content" in str(exc)
 
 
 def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(monkeypatch):

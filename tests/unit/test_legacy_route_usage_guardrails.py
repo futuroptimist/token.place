@@ -13,6 +13,8 @@ def test_active_production_paths_do_not_reference_legacy_relay_routes():
         root / "static" / "chat.js",
         root / "desktop" / "src" / "services" / "desktopBridgeClient.ts",
         root / "desktop" / "src" / "services" / "desktopApiClient.ts",
+        root / "desktop-tauri" / "src" / "App.tsx",
+        root / "desktop-tauri" / "src-tauri" / "src" / "forward.rs",
     ]
 
     violations: list[str] = []

@@ -1152,3 +1152,72 @@ def test_alias_get_model(client, monkeypatch):
     resp_api = client.get(f'/api/v1/models/{model_id}')
     assert resp_alias.status_code == resp_api.status_code
     assert resp_alias.get_json() == resp_api.get_json()
+
+
+def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_unset(
+    monkeypatch, client, client_keys
+):
+    """Explicit desktop API v1 E2EE metadata must enqueue via same-origin relay."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    captured = {}
+
+    class FakeDistributedProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured["model_id"] = model_id
+            captured["messages"] = messages
+            captured["options"] = options
+            return {"role": "assistant", "content": "desktop bridge response"}
+
+    def fake_get_provider_for_mode(**kwargs):
+        captured["provider_kwargs"] = kwargs
+        return FakeDistributedProvider()
+
+    monkeypatch.setattr(
+        routes_module,
+        "get_api_v1_compute_provider_for_mode",
+        fake_get_provider_for_mode,
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "get_api_v1_resolved_provider_path",
+        lambda _provider: "distributed",
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "get_api_v1_last_backend_path",
+        lambda: "distributed_relay_e2ee",
+    )
+
+    public_key = client.get("/api/v1/public-key").get_json()["public_key"]
+    encrypted_messages = _encrypt_messages_for_server(
+        [{"role": "user", "content": "hello desktop"}],
+        public_key,
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3-8b-instruct",
+            "encrypted": True,
+            "client_public_key": client_keys["public_key_b64"],
+            "messages": encrypted_messages,
+            "metadata": {
+                "inference_target": "desktop_bridge_api_v1_e2ee",
+                "relay_path": "api_v1_e2ee",
+            },
+        },
+        base_url="http://127.0.0.1:5010",
+    )
+
+    assert response.status_code == 200
+    assert captured["provider_kwargs"] == {
+        "mode": "distributed",
+        "distributed_url": "http://127.0.0.1:5010",
+        "distributed_fallback_enabled": False,
+    }
+    assert captured["messages"] == [{"role": "user", "content": "hello desktop"}]
+    assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
+    assert response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"] == "distributed_relay_e2ee"

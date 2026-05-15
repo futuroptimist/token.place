@@ -457,7 +457,7 @@ export function App() {
           <button disabled={!canStart} onClick={startInference}>Start local inference</button>
           <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
           <button disabled={!output || isForwarding} onClick={forwardEncrypted}>
-            Debug relay forward (legacy /next_server + /faucet)
+            Debug relay forward (disabled; API v1 E2EE only)
           </button>
         </div>
 

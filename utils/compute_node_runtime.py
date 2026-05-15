@@ -58,6 +58,8 @@ def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
 
     if not isinstance(payload, dict):
         return False
+    if payload.get("protocol") == "tokenplace_api_v1_relay_e2ee" or payload.get("e2ee_v1") is True:
+        return False
     return LEGACY_RELAY_REQUIRED_FIELDS.issubset(payload.keys())
 
 
@@ -275,7 +277,6 @@ class ComputeNodeRuntime:
         if request_adapters is None:
             self.request_adapters = [
                 ApiV1RelayRequestAdapter(self.relay_client),
-                LegacyRelayRequestAdapter(self.relay_client),
             ]
         else:
             self.request_adapters = list(request_adapters)

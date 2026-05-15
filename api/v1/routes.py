@@ -85,9 +85,16 @@ def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_requ
         return False
     if request_metadata.get("inference_target") != "desktop_bridge_api_v1_e2ee":
         return False
-    if request_metadata.get("relay_path") != "api_v1_e2ee":
-        return False
-    return bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip())
+    return request_metadata.get("relay_path") == "api_v1_e2ee"
+
+
+def _request_relay_base_url() -> str:
+    """Return the API v1 relay base URL for same-origin desktop bridge work."""
+
+    configured = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    if configured:
+        return configured
+    return request.host_url.rstrip("/")
 
 
 def _get_service_name() -> str:
@@ -347,6 +354,7 @@ def _handle_chat_completion_request(data):
         provider = (
             get_api_v1_compute_provider_for_mode(
                 mode="distributed",
+                distributed_url=_request_relay_base_url(),
                 distributed_fallback_enabled=False,
             )
             if force_desktop_bridge_distributed

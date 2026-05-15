@@ -226,6 +226,9 @@ class DistributedApiV1ComputeProvider:
         faucet_payload = {
             "client_public_key": crypto_manager.public_key_b64,
             "server_public_key": server_public_key,
+            "request_id": relay_request_id,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
             **encrypted_envelope,
         }
 
@@ -445,17 +448,19 @@ def _read_api_v1_provider_env() -> tuple[str, str, bool]:
 def get_api_v1_compute_provider_for_mode(
     *,
     mode: str,
+    distributed_url: str | None = None,
     distributed_fallback_enabled: bool | None = None,
 ) -> ApiV1ComputeProvider:
     """Resolve provider with an explicit mode override for request-scoped routing."""
 
     normalized_mode = (mode or "local").strip().lower()
-    _, distributed_url, fallback_enabled_from_env = _read_api_v1_provider_env()
+    _, env_distributed_url, fallback_enabled_from_env = _read_api_v1_provider_env()
     if distributed_fallback_enabled is None:
         distributed_fallback_enabled = fallback_enabled_from_env
+    selected_distributed_url = distributed_url if distributed_url is not None else env_distributed_url
     return _build_api_v1_compute_provider(
         normalized_mode,
-        distributed_url,
+        selected_distributed_url.strip(),
         bool(distributed_fallback_enabled),
     )
 

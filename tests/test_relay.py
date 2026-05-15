@@ -363,6 +363,9 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
         assert url == "https://relay.example/api/v1/relay/responses"
         assert timeout == relay_client._request_timeout
         assert "chat_history" in json and "cipherkey" in json and "iv" in json
+        assert json["request_id"] == "req-1"
+        assert json["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert json["version"] == 1
         assert "messages" not in json
         assert "prompt" not in json
         assert "model" not in json

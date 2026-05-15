@@ -790,6 +790,9 @@ class RelayClient:
                         )
                         source_payload = {
                             "client_public_key": client_pub_key_b64,
+                            "request_id": response_envelope["request_id"],
+                            "protocol": "tokenplace_api_v1_relay_e2ee",
+                            "version": 1,
                             **encrypted_response,
                         }
                         request_kwargs = {

@@ -17,39 +17,10 @@ pub struct RelayEnvelope {
     pub iv: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct NextServerResponse {
-    server_public_key: String,
-}
-
-pub async fn encrypt_and_forward(relay_base_url: &str, final_output: &str) -> anyhow::Result<()> {
-    let relay = relay_base_url.trim_end_matches('/');
-    let server = reqwest::get(format!("{relay}/next_server"))
-        .await?
-        .json::<NextServerResponse>()
-        .await?;
-
-    let (pub_key_b64, _private_key_b64) = crate::keygen::generate_rsa_keypair_b64()?;
-    let payload = serde_json::to_string(&vec![serde_json::json!({
-        "role": "assistant",
-        "content": final_output,
-    })])?;
-
-    let envelope =
-        assemble_relay_envelope(&server.server_public_key, &pub_key_b64, payload.as_bytes())?;
-
-    let response = reqwest::Client::new()
-        .post(format!("{relay}/faucet"))
-        .json(&envelope)
-        .send()
-        .await?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "relay forward failed: {}",
-        response.status()
-    );
-
-    Ok(())
+pub async fn encrypt_and_forward(_relay_base_url: &str, _final_output: &str) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "debug relay forwarding is disabled; use the API v1 relay E2EE desktop bridge path"
+    )
 }
 
 pub fn assemble_relay_envelope(

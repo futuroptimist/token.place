@@ -12,6 +12,8 @@ import uuid
 import logging
 import os
 import math
+import ipaddress
+from urllib.parse import urlparse
 
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
@@ -85,9 +87,125 @@ def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_requ
         return False
     if request_metadata.get("inference_target") != "desktop_bridge_api_v1_e2ee":
         return False
-    if request_metadata.get("relay_path") != "api_v1_e2ee":
+    return request_metadata.get("relay_path") == "api_v1_e2ee"
+
+
+def _normalise_relay_origin(value: str) -> str:
+    """Return a normalized HTTP(S) origin, or an empty string for invalid input."""
+
+    candidate = (value or "").strip().rstrip("/")
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate)
+    path = parsed.path.rstrip("/")
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or path not in {"", "/api/v1"}
+    ):
+        return ""
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return ""
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+
+    netloc = hostname
+    try:
+        if ipaddress.ip_address(hostname).version == 6:
+            netloc = f"[{hostname}]"
+    except ValueError:
+        pass
+
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return f"{parsed.scheme.lower()}://{netloc}{path}"
+
+
+def _origin_host_is_loopback(origin: str) -> bool:
+    """Return True when an origin targets a loopback host."""
+
+    hostname = (urlparse(origin).hostname or "").lower()
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
         return False
-    return bool(os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip())
+
+
+def _request_remote_addr_is_loopback() -> bool:
+    """Return True when the inbound Flask request came from loopback."""
+
+    remote_addr = request.remote_addr or ""
+    try:
+        return ipaddress.ip_address(remote_addr).is_loopback
+    except ValueError:
+        return False
+
+
+def _trusted_configured_relay_origins() -> list[str]:
+    """Return relay origins trusted for request-scoped same-origin routing."""
+
+    config = get_config()
+    candidates = [
+        config.get("relay.server_url", ""),
+        config.get("api.relay_url", ""),
+    ]
+    candidates.extend(config.get("relay.server_pool", []) or [])
+
+    trusted: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        origin = _normalise_relay_origin(candidate)
+        if origin and origin not in trusted:
+            trusted.append(origin)
+    return trusted
+
+
+def _request_loopback_relay_origin() -> str:
+    """Return the request origin only when it is verified loopback-local."""
+
+    request_origin = _normalise_relay_origin(request.host_url)
+    if (
+        request_origin
+        and _origin_host_is_loopback(request_origin)
+        and _request_remote_addr_is_loopback()
+    ):
+        return request_origin
+    return ""
+
+
+def _request_relay_base_url() -> str:
+    """Return a trusted API v1 relay base URL for desktop bridge work."""
+
+    configured = _normalise_relay_origin(
+        os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "")
+    )
+    if configured:
+        return configured
+
+    loopback_origin = _request_loopback_relay_origin()
+    if loopback_origin:
+        return loopback_origin
+
+    trusted_origins = _trusted_configured_relay_origins()
+    if trusted_origins:
+        return trusted_origins[0]
+
+    raise ComputeProviderError(
+        "desktop bridge distributed routing requires a trusted relay origin",
+        code="untrusted_relay_origin",
+        error_type="invalid_request_error",
+        public_message="No trusted relay origin is configured for this request.",
+        status_code=400,
+    )
 
 
 def _get_service_name() -> str:
@@ -347,6 +465,7 @@ def _handle_chat_completion_request(data):
         provider = (
             get_api_v1_compute_provider_for_mode(
                 mode="distributed",
+                distributed_url=_request_relay_base_url(),
                 distributed_fallback_enabled=False,
             )
             if force_desktop_bridge_distributed

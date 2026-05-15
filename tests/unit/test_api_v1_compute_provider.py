@@ -1,4 +1,5 @@
 import copy
+from urllib.parse import urlparse
 
 from api.v1 import compute_provider
 from api.v1.compute_provider import (
@@ -43,6 +44,21 @@ class _FailingEncryptCryptoManager(_FakeCryptoManager):
         raise ValueError("invalid server key")
 
 
+def test_distributed_compute_provider_relay_url_preserves_api_v1_base():
+    """Path-scoped API v1 relay bases should not duplicate the API prefix."""
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://relay.example/api/v1")
+
+    assert (
+        provider._relay_url("/api/v1/relay/servers/next")
+        == "https://relay.example/api/v1/relay/servers/next"
+    )
+    assert (
+        provider._relay_url("/api/v1/relay/responses/retrieve")
+        == "https://relay.example/api/v1/relay/responses/retrieve"
+    )
+
+
 def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch):
     fake_crypto = _FakeCryptoManager()
     posted_payloads = []
@@ -58,6 +74,10 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         posted_payloads.append((url, copy.deepcopy(json), timeout))
         if url.endswith("/api/v1/relay/requests"):
             assert "messages" not in json
+            assert json["protocol"] == "tokenplace_api_v1_relay_e2ee"
+            assert json["version"] == 1
+            assert isinstance(json["request_id"], str)
+            assert json["request_id"].startswith("api-v1-")
             assert "chat_history" in json and json["chat_history"]
             return _FakeResponse(200, {"message": "Request received"})
         if url.endswith("/api/v1/relay/responses/retrieve"):
@@ -129,18 +149,24 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
-    assert retrieve_calls == [
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-    ]
+    relay_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
+    expected_retrieve_payload = {
+        "client_public_key": fake_crypto.public_key_b64,
+        "request_id": relay_request_id,
+    }
+    assert retrieve_calls == [expected_retrieve_payload] * 8
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
     assert posted_payloads[1][0] == "https://node-a.example/api/v1/relay/responses/retrieve"
+    touched_urls = [
+        posted_payloads[0][0],
+        posted_payloads[1][0],
+        "https://node-a.example/api/v1/relay/servers/next",
+    ]
+    assert not any(
+        urlparse(url).path == legacy
+        for url in touched_urls
+        for legacy in ("/sink", "/faucet", "/source", "/retrieve", "/next_server")
+    )
 
 
 def test_fallback_compute_provider_uses_local_adapter_when_distributed_fails(monkeypatch):

@@ -1152,3 +1152,281 @@ def test_alias_get_model(client, monkeypatch):
     resp_api = client.get(f'/api/v1/models/{model_id}')
     assert resp_alias.status_code == resp_api.status_code
     assert resp_alias.get_json() == resp_api.get_json()
+
+
+def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_unset(
+    monkeypatch, client, client_keys
+):
+    """Explicit desktop API v1 E2EE metadata may use loopback same-origin locally."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class EmptyConfig:
+        def get(self, _key, default=None):
+            return default
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
+
+    captured = {}
+
+    class FakeDistributedProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured["model_id"] = model_id
+            captured["messages"] = messages
+            captured["options"] = options
+            return {"role": "assistant", "content": "desktop bridge response"}
+
+    def fake_get_provider_for_mode(**kwargs):
+        captured["provider_kwargs"] = kwargs
+        return FakeDistributedProvider()
+
+    monkeypatch.setattr(
+        routes_module,
+        "get_api_v1_compute_provider_for_mode",
+        fake_get_provider_for_mode,
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "get_api_v1_resolved_provider_path",
+        lambda _provider: "distributed",
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "get_api_v1_last_backend_path",
+        lambda: "distributed_relay_e2ee",
+    )
+
+    public_key = client.get("/api/v1/public-key").get_json()["public_key"]
+    encrypted_messages = _encrypt_messages_for_server(
+        [{"role": "user", "content": "hello desktop"}],
+        public_key,
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "llama-3-8b-instruct",
+            "encrypted": True,
+            "client_public_key": client_keys["public_key_b64"],
+            "messages": encrypted_messages,
+            "metadata": {
+                "inference_target": "desktop_bridge_api_v1_e2ee",
+                "relay_path": "api_v1_e2ee",
+            },
+        },
+        base_url="http://127.0.0.1:5010",
+    )
+
+    assert response.status_code == 200
+    assert captured["provider_kwargs"] == {
+        "mode": "distributed",
+        "distributed_url": "http://127.0.0.1:5010",
+        "distributed_fallback_enabled": False,
+    }
+    assert captured["messages"] == [{"role": "user", "content": "hello desktop"}]
+    assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
+    assert response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"] == "distributed_relay_e2ee"
+
+
+def test_normalise_relay_origin_preserves_ipv6_loopback_brackets():
+    """IPv6 literal origins must keep brackets when reconstructed with ports."""
+
+    import api.v1.routes as routes_module
+
+    assert (
+        routes_module._normalise_relay_origin("http://[::1]:5010")
+        == "http://[::1]:5010"
+    )
+
+
+def test_normalise_relay_origin_preserves_api_v1_base_paths():
+    """Explicit API v1 relay bases remain trusted instead of being ignored."""
+
+    import api.v1.routes as routes_module
+
+    assert (
+        routes_module._normalise_relay_origin("https://relay.example/api/v1/")
+        == "https://relay.example/api/v1"
+    )
+    assert (
+        routes_module._normalise_relay_origin("http://[::1]:5010/api/v1")
+        == "http://[::1]:5010/api/v1"
+    )
+    assert routes_module._normalise_relay_origin("https://relay.example/api/v2") == ""
+
+
+def test_desktop_bridge_relay_base_url_preserves_env_api_v1_base_over_loopback(
+    monkeypatch,
+):
+    """Path-scoped explicit relay URLs must not fall back to same-origin routing."""
+
+    monkeypatch.setenv(
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "https://relay.example/api/v1/",
+    )
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://relay.example/api/v1"
+
+
+def test_desktop_bridge_relay_base_url_preserves_config_api_v1_base_for_untrusted_host(
+    monkeypatch,
+):
+    """Path-scoped trusted config relay URLs must not be ignored for forged hosts."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "relay.server_url": "https://relay.example/api/v1/",
+                "api.relay_url": "",
+                "relay.server_pool": [],
+            }
+            return values.get(key, default)
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://attacker.example",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://relay.example/api/v1"
+
+
+def test_desktop_bridge_relay_base_url_allows_ipv6_loopback_same_origin_only_from_loopback(
+    monkeypatch,
+):
+    """Bracketed IPv6 localhost fallback is limited to loopback clients."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+    from api.v1.compute_provider import ComputeProviderError
+
+    class EmptyConfig:
+        def get(self, _key, default=None):
+            return default
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://[::1]:5010",
+        environ_base={"REMOTE_ADDR": "::1"},
+    ):
+        assert routes_module._request_relay_base_url() == "http://[::1]:5010"
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://[::1]:5010",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        with pytest.raises(ComputeProviderError) as exc_info:
+            routes_module._request_relay_base_url()
+
+    assert exc_info.value.code == "untrusted_relay_origin"
+
+
+def test_desktop_bridge_relay_base_url_uses_configured_origin_for_untrusted_host(
+    monkeypatch,
+):
+    """Forged Host headers must not control outbound desktop relay routing."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "relay.server_url": "https://token.place/",
+                "api.relay_url": "",
+                "relay.server_pool": ["https://token.place/"],
+            }
+            return values.get(key, default)
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://attacker.example",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://token.place"
+
+
+def test_desktop_bridge_relay_base_url_prefers_loopback_host_over_default_config(
+    monkeypatch,
+):
+    """Verified loopback desktop requests stay on their same-origin local relay."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "relay.server_url": "https://token.place/",
+                "api.relay_url": "",
+                "relay.server_pool": [],
+            }
+            return values.get(key, default)
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert routes_module._request_relay_base_url() == "http://127.0.0.1:5010"
+
+
+def test_desktop_bridge_relay_base_url_prefers_env_over_loopback_host(
+    monkeypatch,
+):
+    """The explicit distributed relay URL remains highest precedence."""
+
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://relay.example/")
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://relay.example"
+
+
+def test_desktop_bridge_relay_base_url_fails_closed_without_trusted_origin(
+    monkeypatch,
+):
+    """Desktop distributed override must fail closed when no trusted relay exists."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+    from api.v1.compute_provider import ComputeProviderError
+
+    class EmptyConfig:
+        def get(self, _key, default=None):
+            return default
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://attacker.example",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        with pytest.raises(ComputeProviderError) as exc_info:
+            routes_module._request_relay_base_url()
+
+    assert exc_info.value.code == "untrusted_relay_origin"
+    assert exc_info.value.status_code == 400

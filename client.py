@@ -5,6 +5,7 @@ import time
 import os
 import argparse
 import logging
+import uuid
 from encrypt import generate_keys, encrypt, decrypt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
@@ -213,6 +214,7 @@ class ChatClient:
         self.private_key, self.public_key = generate_keys()
         self.public_key_b64 = base64.b64encode(self.public_key).decode('utf-8')
         self.chat_history = []
+        self.model = "llama-3-8b-instruct"
 
     def get_server_public_key(self):
         """Fetch the server's public key from the relay."""
@@ -237,8 +239,15 @@ class ChatClient:
             )
             return None
 
-    def send_request_to_relay_requests(self, encrypted_chat_history_b64, iv_b64, server_public_key_b64, encrypted_cipherkey_b64):
-        """Send the encrypted chat history and IV to the relay requests endpoint."""
+    def send_request_to_relay_requests(
+        self,
+        encrypted_chat_history_b64,
+        iv_b64,
+        server_public_key_b64,
+        encrypted_cipherkey_b64,
+        request_id=None,
+    ):
+        """Send an encrypted API v1 E2EE relay envelope to the relay requests endpoint."""
         try:
             data = {
                 "client_public_key": self.public_key_b64,
@@ -246,7 +255,11 @@ class ChatClient:
                 "chat_history": encrypted_chat_history_b64,
                 "cipherkey": encrypted_cipherkey_b64,
                 "iv": iv_b64,
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
             }
+            if request_id:
+                data["request_id"] = request_id
             response = requests.post(
                 f'{self.base_url}:{self.relay_port}/api/v1/relay/requests', json=data, timeout=REQUEST_TIMEOUT
             )
@@ -258,13 +271,20 @@ class ChatClient:
             )
             return None
 
-    def retrieve_response(self, timeout=60):
+    def retrieve_response(self, timeout=60, request_id=None, chat_history=None):
         start_time = time.time()
         while True:
             try:
                 response = requests.post(
                     f'{self.base_url}:{self.relay_port}/api/v1/relay/responses/retrieve',
-                    json={"client_public_key": self.public_key_b64},
+                    json={
+                        key: value
+                        for key, value in {
+                            "client_public_key": self.public_key_b64,
+                            "request_id": request_id,
+                        }.items()
+                        if value is not None
+                    },
                     timeout=REQUEST_TIMEOUT,
                 )
                 if response.status_code == 200:
@@ -281,7 +301,32 @@ class ChatClient:
                                 "Received decrypted AI response (%d bytes)",
                                 len(decrypted_chat_history),
                             )
-                            return json.loads(decrypted_chat_history.decode('utf-8'))
+                            decrypted_payload = json.loads(decrypted_chat_history.decode('utf-8'))
+                            if isinstance(decrypted_payload, dict):
+                                if decrypted_payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+                                    logger.warning("Unexpected API v1 relay protocol in response.")
+                                    return None
+                                if request_id and decrypted_payload.get("request_id") != request_id:
+                                    logger.debug("Skipping response for a different request_id.")
+                                    continue
+                                api_v1_response = decrypted_payload.get("api_v1_response")
+                                if not isinstance(api_v1_response, dict):
+                                    logger.warning("API v1 response envelope missing api_v1_response.")
+                                    return None
+                                if api_v1_response.get("error"):
+                                    logger.warning("API v1 relay response returned an error.")
+                                    return None
+                                assistant_message = api_v1_response.get("message")
+                                if not isinstance(assistant_message, dict):
+                                    logger.warning("API v1 response envelope missing assistant message.")
+                                    return None
+                                if not isinstance(assistant_message.get("role"), str) or not isinstance(
+                                    assistant_message.get("content"), str
+                                ):
+                                    logger.warning("Invalid assistant message format in API v1 response.")
+                                    return None
+                                return list(chat_history or self.chat_history) + [assistant_message]
+                            return decrypted_payload
                         else:
                             logger.debug("Decryption failed. Skipping this response.")
                     else:
@@ -311,12 +356,19 @@ class ChatClient:
 
         server_public_key = self.get_server_public_key()
 
-        logger.debug("Retrieved server public key (%d bytes)", len(server_public_key))
-
         if server_public_key:
+            logger.debug("Retrieved server public key (%d bytes)", len(server_public_key))
+            request_id = f"chat-client-{uuid.uuid4().hex}"
             bound_payload = {
-                "chat_history": self.chat_history,
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": request_id,
                 "client_public_key": self.public_key_b64,
+                "api_v1_request": {
+                    "model": self.model,
+                    "messages": self.chat_history,
+                    "options": {},
+                },
             }
             ciphertext_dict, cipherkey, iv = encrypt(
                 json.dumps(bound_payload).encode('utf-8'),
@@ -330,13 +382,14 @@ class ChatClient:
                 encrypted_chat_history_b64,
                 iv_b64,
                 base64.b64encode(server_public_key).decode('utf-8'),
-                encrypted_cipherkey_b64
+                encrypted_cipherkey_b64,
+                request_id=request_id,
             )
             if response_request and response_request.status_code == 200:
                 start_time = time.time()
                 timeout = 60  # Adjust the timeout as needed
                 while True:
-                    response = self.retrieve_response()
+                    response = self.retrieve_response(request_id=request_id, chat_history=self.chat_history)
                     if response:
                         self.chat_history = response
                         return response

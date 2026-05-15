@@ -949,6 +949,9 @@ class TestRelayClient:
             'http://localhost:5000/api/v1/relay/responses',
             json={
                 'client_public_key': request_data["client_public_key"],
+                'request_id': 'req-123',
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
                 'chat_history': 'encrypted_chat_history',
                 'cipherkey': 'encrypted_key',
                 'iv': 'encrypted_iv',

@@ -33,6 +33,7 @@ import logging
 from copy import deepcopy
 from typing import Dict, Tuple, Any, List, Optional, Union, Iterator
 import time
+import uuid
 
 # Import encryption functions
 from encrypt import (
@@ -91,11 +92,15 @@ class CryptoClient:
         """Return True if a server public key has been loaded."""
         return self.server_public_key is not None
 
-    def fetch_server_public_key(self, endpoint: str = "/next_server", timeout: float = 10) -> bool:
+    def fetch_server_public_key(
+        self,
+        endpoint: str = "/api/v1/relay/servers/next",
+        timeout: float = 10,
+    ) -> bool:
         """Fetch the server's public key.
 
-        By default this queries the relay's ``/next_server`` endpoint to
-        discover a server and retrieve its public key. When connecting
+        By default this queries the relay's API v1 server-selection endpoint
+        to discover a server and retrieve its public key. When connecting
         directly to a token.place server, pass ``"/api/v1/public-key"`` as the
         ``endpoint`` parameter instead.
 
@@ -304,24 +309,34 @@ class CryptoClient:
 
         logger.debug("Sending chat message with %d entries", len(chat_history))
 
-        wrapped_payload = {
-            "chat_history": chat_history,
+        request_id = f"crypto-client-{uuid.uuid4().hex}"
+
+        plaintext_envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": request_id,
             "client_public_key": self.client_public_key_b64,
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": chat_history,
+                "options": {},
+            },
         }
 
-        # Encrypt the chat history
         try:
-            encrypted_data = self.encrypt_message(wrapped_payload)
+            encrypted_data = self.encrypt_message(plaintext_envelope)
         except Exception as e:
             logger.error(
-                "Failed to encrypt message: %s",
+                "Failed to encrypt API v1 relay envelope: %s",
                 e.__class__.__name__,
                 exc_info=self.debug,
             )
             return None
 
-        # Prepare the payload
         payload = {
+            'request_id': request_id,
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
             'client_public_key': self.client_public_key_b64,
             'server_public_key': self.server_public_key_b64,
             'chat_history': encrypted_data['ciphertext'],
@@ -329,14 +344,13 @@ class CryptoClient:
             'iv': encrypted_data['iv']
         }
 
-        # Send to the faucet endpoint
-        response = self.send_encrypted_message('/faucet', payload)
+        response = self.send_encrypted_message('/api/v1/relay/requests', payload)
         if not response:
-            logger.error("Failed to send message to faucet")
+            logger.error("Failed to send message to API v1 relay requests")
             return None
 
-        if not response.get('success', False) and 'message' not in response:
-            logger.error("Unexpected response from faucet")
+        if 'message' not in response and not response.get('success', False):
+            logger.error("Unexpected response from API v1 relay requests")
             return None
 
         logger.debug("Message sent successfully, waiting for processing")
@@ -344,16 +358,29 @@ class CryptoClient:
         # Wait for processing
         time.sleep(3)
 
-        # Retrieve the response
-        return self.retrieve_chat_response(max_retries)
+        # Retrieve the response for this request id without sharing mutable
+        # in-flight state across concurrent sends on the same client instance.
+        return self.retrieve_chat_response(
+            max_retries,
+            expected_request_id=request_id,
+            chat_history=chat_history,
+        )
 
-    def retrieve_chat_response(self, max_retries: int = 5, retry_delay: int = 2) -> Optional[List[Dict]]:
+    def retrieve_chat_response(
+        self,
+        max_retries: int = 5,
+        retry_delay: int = 2,
+        expected_request_id: Optional[str] = None,
+        chat_history: Optional[List[Dict]] = None,
+    ) -> Optional[List[Dict]]:
         """
         Retrieve and decrypt a chat response from the server
 
         Args:
             max_retries: Maximum number of retry attempts
             retry_delay: Delay between retries in seconds
+            expected_request_id: Optional API v1 relay request id to retrieve.
+            chat_history: Original chat history for the matching request.
 
         Returns:
             Decrypted chat history or None if failed
@@ -361,12 +388,14 @@ class CryptoClient:
         payload = {
             'client_public_key': self.client_public_key_b64
         }
+        if expected_request_id:
+            payload['request_id'] = expected_request_id
 
         logger.debug(f"Attempting to retrieve response, max retries: {max_retries}")
 
         for i in range(max_retries):
             logger.debug(f"Retrieve attempt {i+1}/{max_retries}")
-            response = self.send_encrypted_message('/retrieve', payload)
+            response = self.send_encrypted_message('/api/v1/relay/responses/retrieve', payload)
 
             if not response:
                 logger.error("Failed to retrieve response")
@@ -407,7 +436,35 @@ class CryptoClient:
                         'iv': response['iv']
                     })
 
-                    # Validate the response structure
+                    if isinstance(decrypted_data, dict):
+                        if decrypted_data.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+                            logger.warning("Unexpected API v1 relay protocol in response")
+                            return None
+                        if expected_request_id and decrypted_data.get("request_id") != expected_request_id:
+                            logger.debug("Ignoring response for a different relay request id")
+                            time.sleep(retry_delay)
+                            continue
+                        api_v1_response = decrypted_data.get("api_v1_response")
+                        if not isinstance(api_v1_response, dict):
+                            logger.warning("API v1 relay response missing api_v1_response object")
+                            return None
+                        if api_v1_response.get("error"):
+                            logger.error("API v1 relay response error: %s", api_v1_response.get("error"))
+                            return None
+                        assistant_message = api_v1_response.get("message")
+                        if not isinstance(assistant_message, dict):
+                            logger.warning("API v1 relay response missing assistant message")
+                            return None
+                        if not isinstance(assistant_message.get("role"), str) or not isinstance(
+                            assistant_message.get("content"), str
+                        ):
+                            logger.warning("Invalid assistant message format in API v1 relay response")
+                            return None
+                        if chat_history is None:
+                            return [assistant_message]
+                        return list(chat_history) + [assistant_message]
+
+                    # Validate the response structure for legacy-compatible test fixtures.
                     if isinstance(decrypted_data, list) and len(decrypted_data) > 0:
                         for msg in decrypted_data:
                             if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:

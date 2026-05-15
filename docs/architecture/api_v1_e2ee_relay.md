@@ -1,7 +1,6 @@
 # API v1-only E2EE relay architecture (v0.1.0)
 
-This note is the canonical architecture baseline for the API v1 relay repair sequence
-(Prompts 0-4).
+This note is the canonical architecture baseline for the API v1 E2EE migration roadmap.
 
 ## Release target and scope
 
@@ -71,11 +70,11 @@ Any path that would expose plaintext to relay-owned surfaces must fail closed.
 There is a known alignment gap between `relay.py`, desktop-tauri flows, and the relay landing-page
 HTML chat UI. Some end-to-end flow segments still hit deprecated legacy routes.
 
-Prompts 1-4 in this sequence own the implementation repair:
+The migration roadmap follow-up phases own the implementation repair:
 
 1. restore/audit API v1 relay/server route contract,
 2. migrate desktop bridge paths,
 3. migrate relay landing-page chat path and remove plaintext bypass behavior,
 4. add final guardrails proving active production paths no longer use legacy routes.
 
-This Prompt 0 documentation baseline intentionally does **not** implement those code migrations.
+This documentation baseline intentionally does **not** implement those code migrations.

@@ -1,5 +1,6 @@
 import pytest
 import time
+import threading
 import base64
 import json
 from flask import Flask
@@ -31,8 +32,10 @@ DUMMY_CLIENT_PUB_KEY = base64.b64encode(b"client_public_key_456").decode('utf-8'
 
 @pytest.fixture
 def client():
-    """Create a Flask test client fixture"""
+    """Create a Flask test client fixture."""
     app.config['TESTING'] = True
+    previous_legacy_flag = os.environ.get("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES")
+    os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
     client_inference_requests.clear()
@@ -42,6 +45,11 @@ def client():
 
     with app.test_client() as client:
         yield client
+
+    if previous_legacy_flag is None:
+        os.environ.pop("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", None)
+    else:
+        os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
 
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
@@ -61,7 +69,7 @@ def test_inference_endpoint_removed(client):
 def test_next_server_no_servers(client):
     """Test /next_server when no servers are registered."""
     response = client.get("/next_server")
-    assert response.status_code == 200 # Endpoint itself works
+    assert response.status_code == 503
     data = response.get_json()
     assert 'error' in data
     assert data['error']['message'] == 'No servers available'
@@ -96,7 +104,7 @@ def test_next_server_evicts_stale_nodes(client):
     response = client.get("/next_server")
     payload = response.get_json()
 
-    assert response.status_code == 200
+    assert response.status_code == 503
     assert payload["error"]["message"] == "No servers available"
     assert DUMMY_SERVER_PUB_KEY not in known_servers
 
@@ -355,6 +363,9 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
         assert url == "https://relay.example/api/v1/relay/responses"
         assert timeout == relay_client._request_timeout
         assert "chat_history" in json and "cipherkey" in json and "iv" in json
+        assert json["request_id"] == "req-1"
+        assert json["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert json["version"] == 1
         assert "messages" not in json
         assert "prompt" not in json
         assert "model" not in json
@@ -1074,6 +1085,138 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     assert retrieved_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
 
 
+def test_queue_client_response_serializes_concurrent_updates(monkeypatch):
+    class SlowSnapshotDict(dict):
+        def __init__(self):
+            super().__init__()
+            self._active_lock = threading.Lock()
+            self._active_gets = 0
+            self.concurrent_get_seen = False
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            with self._active_lock:
+                self._active_gets += 1
+                if self._active_gets > 1:
+                    self.concurrent_get_seen = True
+            time.sleep(0.05)
+            with self._active_lock:
+                self._active_gets -= 1
+            return value
+
+    response_queue = SlowSnapshotDict()
+    monkeypatch.setattr(relay_module, "client_responses", response_queue)
+    envelopes = [
+        {
+            'request_id': 'req-1',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'ciphertext-response-1',
+            'cipherkey': 'cipherkey-response-1',
+            'iv': 'iv-response-1',
+        },
+        {
+            'request_id': 'req-2',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'ciphertext-response-2',
+            'cipherkey': 'cipherkey-response-2',
+            'iv': 'iv-response-2',
+        },
+    ]
+    threads = [
+        threading.Thread(
+            target=relay_module._queue_client_response,
+            args=(DUMMY_CLIENT_PUB_KEY, envelope),
+        )
+        for envelope in envelopes
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert response_queue.concurrent_get_seen is False
+    queued = response_queue[DUMMY_CLIENT_PUB_KEY]
+    assert isinstance(queued, list)
+    assert sorted(item['request_id'] for item in queued) == ['req-1', 'req-2']
+
+
+def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_responses(client):
+    response_one = {
+        'request_id': 'req-1',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response-1',
+        'cipherkey': 'cipherkey-response-1',
+        'iv': 'iv-response-1',
+    }
+    response_two = {
+        'request_id': 'req-2',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response-2',
+        'cipherkey': 'cipherkey-response-2',
+        'iv': 'iv-response-2',
+    }
+
+    assert client.post('/api/v1/relay/responses', json=response_one).status_code == 200
+    assert client.post('/api/v1/relay/responses', json=response_two).status_code == 200
+
+    missing = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-missing'},
+    )
+    assert missing.status_code == 404
+    assert len(client_responses[DUMMY_CLIENT_PUB_KEY]) == 2
+
+    retrieved_two = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-2'},
+    )
+    assert retrieved_two.status_code == 200
+    assert retrieved_two.get_json()['request_id'] == 'req-2'
+    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-1'
+
+    retrieved_one = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-1'},
+    )
+    assert retrieved_one.status_code == 200
+    assert retrieved_one.get_json()['request_id'] == 'req-1'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
+    response_payload = {
+        'request_id': 'req-1',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    }
+    assert client.post('/api/v1/relay/responses', json=response_payload).status_code == 200
+
+    mismatch = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-other'},
+    )
+    assert mismatch.status_code == 404
+    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-1'
+
+    retrieved = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-1'},
+    )
+    assert retrieved.status_code == 200
+    assert retrieved.get_json()['request_id'] == 'req-1'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
 def test_api_v1_relay_plaintext_messages_not_stored(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
@@ -1270,3 +1413,39 @@ def test_api_v1_poll_requires_registration_token_when_configured(client, monkeyp
     )
     assert authorized.status_code == 200
     assert authorized.get_json()['request_id'] == 'req-auth'
+
+
+def test_legacy_relay_routes_return_410_by_default(client, monkeypatch):
+    """Legacy relay routes fail closed with 410 unless compatibility is enabled."""
+    monkeypatch.delenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", raising=False)
+
+    checks = [
+        ("get", "/next_server", None),
+        ("post", "/sink", {"server_public_key": DUMMY_SERVER_PUB_KEY}),
+        ("post", "/faucet", {"client_public_key": DUMMY_CLIENT_PUB_KEY, "server_public_key": DUMMY_SERVER_PUB_KEY, "chat_history": "x", "cipherkey": "y", "iv": "z"}),
+        ("post", "/source", {"client_public_key": DUMMY_CLIENT_PUB_KEY, "server_public_key": DUMMY_SERVER_PUB_KEY, "chat_history": "x", "cipherkey": "y", "iv": "z"}),
+        ("post", "/retrieve", {"client_public_key": DUMMY_CLIENT_PUB_KEY}),
+    ]
+
+    for method, route, payload in checks:
+        if method == "get":
+            response = client.get(route)
+        else:
+            response = client.post(route, json=payload)
+        assert response.status_code == 410
+        body = response.get_json()
+        assert body["error"]["code"] == "legacy_relay_endpoint_deprecated"
+
+
+def test_legacy_next_server_can_be_enabled_with_compatibility_flag(client, monkeypatch):
+    """Compatibility flag restores legacy next_server behavior where still supported."""
+    monkeypatch.setenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "1")
+
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    response = client.get("/next_server")
+    assert response.status_code == 200
+    assert response.get_json()["server_public_key"] == DUMMY_SERVER_PUB_KEY

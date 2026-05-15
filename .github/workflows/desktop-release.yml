@@ -71,6 +71,28 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: desktop-tauri/src-tauri -> target
+          # Do not restore ~/.cargo/bin from cache. Restoring toolchain shims can
+          # shadow the Cargo installed by dtolnay/rust-toolchain and make Tauri's
+          # `cargo metadata` probe execute the rustup installer instead of Cargo.
+          cache-bin: 'false'
+
+      - name: Validate Cargo toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_path="$(command -v cargo)"
+          rustup_path="$(command -v rustup)"
+          echo "cargo=${cargo_path}"
+          echo "rustup=${rustup_path}"
+          cargo_version="$(cargo --version 2>&1)"
+          echo "${cargo_version}"
+          if [[ "${cargo_version}" != cargo\ * ]]; then
+            echo "::error::cargo resolved to ${cargo_path}, but it did not report a Cargo version."
+            exit 1
+          fi
+          rustc --version
+          rustup show active-toolchain
+          cargo metadata --manifest-path src-tauri/Cargo.toml --format-version=1 --no-deps >/dev/null
 
       - name: Add macOS arm64 Rust target
         if: matrix.tauri_target != ''

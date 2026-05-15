@@ -379,6 +379,7 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+client_responses_lock = threading.Lock()
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -628,6 +629,29 @@ def index():
 def serve_static(path):
     return send_from_directory('static', path)
 
+
+
+def _legacy_routes_enabled() -> bool:
+    return str(os.getenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _legacy_route_deprecated_response(route_name: str):
+    return jsonify({
+        "error": {
+            "message": f"Legacy relay endpoint '{route_name}' is deprecated. Use API v1 relay E2EE routes.",
+            "code": "legacy_relay_endpoint_deprecated",
+            "deprecated": True,
+        }
+    }), 410
+
+
+def _select_next_server_payload():
+    _evict_stale_servers()
+    if not known_servers:
+        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
+    server_public_key = secrets.choice(list(known_servers.keys()))
+    return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+
 @app.route('/next_server', methods=['GET'])
 def next_server():
     """
@@ -638,20 +662,15 @@ def next_server():
         - server_public_key: the RSA-2048 public key of the selected server to send a request to
         - error: an error message with a message and a code
     """
-    _evict_stale_servers()
-    if not known_servers:
-        return jsonify({
-            'error': {
-                'message': 'No servers available',
-                'code': 503
-            }
-        })
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/next_server')
+    return _select_next_server_payload()
 
-    # Select a server randomly using cryptographically secure randomness
-    server_public_key = secrets.choice(list(known_servers.keys()))
-    return jsonify({
-        'server_public_key': known_servers[server_public_key]['public_key']
-    })
+
+@app.route('/api/v1/relay/servers/next', methods=['GET'])
+def api_v1_relay_servers_next():
+    """Get a registered compute node public key for API v1 encrypted relay requests."""
+    return _select_next_server_payload()
 
 
 @app.route('/relay/diagnostics', methods=['GET'])
@@ -732,6 +751,49 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
     if 'version' in payload:
         envelope['version'] = payload['version']
     return envelope, None
+
+
+def _queue_client_response(client_public_key, envelope):
+    """Queue an encrypted response while preserving per-request retrieval."""
+    with client_responses_lock:
+        existing = client_responses.get(client_public_key)
+        if existing is None:
+            client_responses[client_public_key] = envelope
+            return
+        if isinstance(existing, list):
+            existing.append(envelope)
+            return
+        client_responses[client_public_key] = [existing, envelope]
+
+
+def _pop_client_response(client_public_key, request_id=None):
+    """Pop a queued encrypted response, optionally matching API v1 request id."""
+    with client_responses_lock:
+        if client_public_key not in client_responses:
+            return None
+
+        queued = client_responses[client_public_key]
+        if isinstance(queued, list):
+            if request_id:
+                for idx, candidate in enumerate(queued):
+                    if candidate.get('request_id') == request_id:
+                        response = queued.pop(idx)
+                        if not queued:
+                            client_responses.pop(client_public_key, None)
+                        elif len(queued) == 1:
+                            client_responses[client_public_key] = queued[0]
+                        return response
+                return None
+            response = queued.pop(0)
+            if not queued:
+                client_responses.pop(client_public_key, None)
+            elif len(queued) == 1:
+                client_responses[client_public_key] = queued[0]
+            return response
+
+        if request_id and queued.get('request_id') != request_id:
+            return None
+        return client_responses.pop(client_public_key)
 
 
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
@@ -859,7 +921,7 @@ def api_v1_relay_responses():
     if not client_public_key:
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
 
-    client_responses[client_public_key] = envelope
+    _queue_client_response(client_public_key, envelope)
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 
@@ -871,10 +933,11 @@ def api_v1_relay_responses_retrieve():
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
 
     client_public_key = data['client_public_key']
-    if client_public_key not in client_responses:
+    response = _pop_client_response(client_public_key, data.get('request_id'))
+    if response is None:
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
-    return jsonify(client_responses.pop(client_public_key)), 200
+    return jsonify(response), 200
 
 @app.route('/faucet', methods=['POST'])
 def faucet():
@@ -919,6 +982,9 @@ def faucet():
         "iv": "yUR11oNkM/ZQeGuRF6JHAw=="
     }
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/faucet')
+
     _evict_stale_servers()
     # Parse the request data
     data = request.get_json()
@@ -974,6 +1040,9 @@ def sink():
             Conforms to the same JSON format as the request body.
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/sink')
+
     _evict_stale_servers()
     auth_error = _validate_server_registration()
     if auth_error:
@@ -1081,6 +1150,9 @@ def source():
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/source')
+
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
@@ -1095,11 +1167,12 @@ def source():
     iv = data['iv']
 
     # Store the response in the client_responses dictionary
-    client_responses[client_public_key] = {
-        'chat_history': encrypted_chat_history,
-        'cipherkey': encrypted_cipherkey,
-        'iv': iv
-    }
+    with client_responses_lock:
+        client_responses[client_public_key] = {
+            'chat_history': encrypted_chat_history,
+            'cipherkey': encrypted_cipherkey,
+            'iv': iv
+        }
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 
@@ -1130,6 +1203,9 @@ def retrieve():
     """
     Endpoint for clients to retrieve responses queued by the /source endpoint.
     """
+    if not _legacy_routes_enabled():
+        return _legacy_route_deprecated_response('/retrieve')
+
     data = request.get_json()
     if not data or 'client_public_key' not in data:
         return jsonify({'error': 'Invalid request data'}), 400
@@ -1137,11 +1213,11 @@ def retrieve():
     client_public_key = data['client_public_key']
 
     # Check if there's a response for the given client public key
-    if client_public_key in client_responses:
-        response_data = client_responses.pop(client_public_key)
+    with client_responses_lock:
+        response_data = client_responses.pop(client_public_key, None)
+    if response_data is not None:
         return jsonify(response_data), 200
-    else:
-        return jsonify({'error': 'No response available for the given public key'}), 200
+    return jsonify({'error': 'No response available for the given public key'}), 200
 
 
 @app.route('/stream/retrieve', methods=['POST'])

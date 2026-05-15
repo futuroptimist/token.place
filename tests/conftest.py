@@ -301,7 +301,7 @@ def setup_servers(
     server_registered = False
     for _ in range(30):  # 30 seconds timeout
         try:
-            response = requests.get(f"{E2E_BASE_URL}/next_server", timeout=10)
+            response = requests.get(f"{E2E_BASE_URL}/api/v1/relay/servers/next", timeout=10)
             if response.status_code == 200 and response.json().get('server_public_key'):
                 server_registered = True
                 print("✓ Server registered with relay")

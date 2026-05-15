@@ -165,7 +165,7 @@ class DistributedApiV1ComputeProvider:
 
         try:
             next_server_response = requests.get(
-                self._relay_url("/next_server"),
+                self._relay_url("/api/v1/relay/servers/next"),
                 timeout=_remaining_timeout(),
             )
         except requests.RequestException as exc:
@@ -231,7 +231,7 @@ class DistributedApiV1ComputeProvider:
 
         try:
             faucet_response = requests.post(
-                self._relay_url("/faucet"),
+                self._relay_url("/api/v1/relay/requests"),
                 json=faucet_payload,
                 timeout=_remaining_timeout(),
             )
@@ -261,7 +261,7 @@ class DistributedApiV1ComputeProvider:
             try:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
-                    self._relay_url("/retrieve"),
+                    self._relay_url("/api/v1/relay/responses/retrieve"),
                     json={"client_public_key": crypto_manager.public_key_b64},
                     timeout=retrieve_timeout,
                 )

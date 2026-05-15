@@ -15,6 +15,7 @@ def relay_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
 
     monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
     monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", "unit-token")
+    monkeypatch.setenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "1")
 
     for name in MODULES_TO_CLEAR:
         sys.modules.pop(name, None)
@@ -29,6 +30,7 @@ def relay_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
 
     monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
     monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", raising=False)
+    monkeypatch.delenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", raising=False)
 
 
 def test_sink_rejects_missing_registration_token(relay_module) -> None:
@@ -172,6 +174,7 @@ def test_sink_accepts_plural_registration_tokens(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
     monkeypatch.delenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", raising=False)
     monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKENS", "alpha-token, beta-token")
+    monkeypatch.setenv("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", "1")
 
     for name in MODULES_TO_CLEAR:
         sys.modules.pop(name, None)

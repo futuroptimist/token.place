@@ -816,6 +816,8 @@ class RelayClient:
                         return False
 
                 api_v1_options = dict(api_v1_request_payload["options"])
+                log_info("API v1 E2EE work received")
+                log_info("API v1 E2EE inference started")
                 try:
                     response_history = generate_response(
                         api_v1_request_payload["model"],
@@ -854,7 +856,25 @@ class RelayClient:
                             }
                         )
 
-                    return _post_api_v1_source(
+                    assistant_content = assistant_message.get("content")
+                    if not isinstance(assistant_content, str) or not assistant_content.strip():
+                        log_error("LLM returned empty API v1 assistant content")
+                        return _post_api_v1_source(
+                            {
+                                "protocol": "tokenplace_api_v1_relay_e2ee",
+                                "version": 1,
+                                "request_id": api_v1_request_payload["request_id"],
+                                "api_v1_response": {
+                                    "error": {
+                                        "code": "compute_node_invalid_output",
+                                        "message": "LLM returned empty assistant content",
+                                    }
+                                },
+                            }
+                        )
+
+                    log_info("API v1 E2EE inference completed")
+                    posted = _post_api_v1_source(
                         {
                             "protocol": "tokenplace_api_v1_relay_e2ee",
                             "version": 1,
@@ -864,6 +884,9 @@ class RelayClient:
                             },
                         }
                     )
+                    if posted:
+                        log_info("API v1 E2EE encrypted response submitted")
+                    return posted
                 except ModelError as exc:
                     error_type = getattr(exc, "error_type", "")
                     if error_type in {"model_not_found", "model_load_error"} and hasattr(
@@ -888,8 +911,16 @@ class RelayClient:
                         else:
                             if isinstance(fallback_response_history, list) and fallback_response_history:
                                 fallback_assistant_message = fallback_response_history[-1]
-                                if isinstance(fallback_assistant_message, dict):
-                                    return _post_api_v1_source(
+                                fallback_content = (
+                                    fallback_assistant_message.get("content")
+                                    if isinstance(fallback_assistant_message, dict)
+                                    else None
+                                )
+                                if isinstance(fallback_assistant_message, dict) and (
+                                    isinstance(fallback_content, str) and fallback_content.strip()
+                                ):
+                                    log_info("API v1 E2EE inference completed")
+                                    posted = _post_api_v1_source(
                                         {
                                             "protocol": "tokenplace_api_v1_relay_e2ee",
                                             "version": 1,
@@ -899,6 +930,9 @@ class RelayClient:
                                             },
                                         }
                                     )
+                                    if posted:
+                                        log_info("API v1 E2EE encrypted response submitted")
+                                    return posted
                             log_error("Fallback runtime-model execution returned invalid API v1 output")
 
                     model_error_code = (

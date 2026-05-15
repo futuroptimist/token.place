@@ -46,7 +46,7 @@ class FakeRelayClientRouting(FakeRelayClient):
         return True
 
     def process_api_v1_chat_request(self, payload):
-        self.endpoint_calls.append(('/relay/api/v1/source', payload))
+        self.endpoint_calls.append(('/api/v1/relay/responses', payload))
         return True
 
 
@@ -58,6 +58,9 @@ class FakeRuntime:
             {'next_ping_in_x_seconds': 0, 'error': 'temporary outage'},
             {
                 'next_ping_in_x_seconds': 0,
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-1',
                 'client_public_key': 'abc',
                 'chat_history': 'ciphertext',
                 'cipherkey': 'key',
@@ -107,8 +110,6 @@ class StreamingRuntime(FakeRuntime):
         return self.relay_client.process_client_request(payload)
 
 
-
-
 class ApiV1Runtime(FakeRuntime):
     last_instance = None
 
@@ -119,11 +120,13 @@ class ApiV1Runtime(FakeRuntime):
         self._responses = [
             {
                 'next_ping_in_x_seconds': 0,
-                'api_v1_request': {
-                    'request_id': 'req-1',
-                    'model': 'llama-3-8b-instruct',
-                    'messages': [{'role': 'user', 'content': 'hello'}],
-                },
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-1',
+                'client_public_key': 'abc',
+                'chat_history': 'ciphertext',
+                'cipherkey': 'key',
+                'iv': 'iv',
             },
         ]
         self._processed = []
@@ -132,6 +135,7 @@ class ApiV1Runtime(FakeRuntime):
         self._processed.append(payload)
         return self.relay_client.process_api_v1_chat_request(payload)
 
+
 class ProcessingFailureRuntime(FakeRuntime):
     def __init__(self, _config):
         self.model_manager = FakeModelManager()
@@ -139,6 +143,9 @@ class ProcessingFailureRuntime(FakeRuntime):
         self._responses = [
             {
                 'next_ping_in_x_seconds': 0,
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-1',
                 'client_public_key': 'abc',
                 'chat_history': 'ciphertext',
                 'cipherkey': 'key',
@@ -257,7 +264,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module.is_legacy_relay_payload = (
         lambda payload: {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(payload)
     )
-    module.is_api_v1_relay_payload = lambda payload: isinstance(payload, dict) and 'api_v1_request' in payload
+    module.is_api_v1_relay_payload = lambda payload: isinstance(payload, dict) and payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee' and payload.get('version') == 1 and isinstance(payload.get('request_id'), str)
     module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     module.SUPPORTED_COMPUTE_MODES = supported_modes
@@ -620,15 +627,8 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
 
     runtime = StreamingRuntime.last_instance
     assert runtime is not None
-    assert len(runtime._processed) == 1
-    assert runtime._processed[0]['stream'] is True
-    assert runtime._processed[0]['stream_session_id'] == 'session-123'
-
-    assert len(runtime.relay_client.endpoint_calls) == 1
-    endpoint, payload = runtime.relay_client.endpoint_calls[0]
-    assert endpoint == '/stream/source'
-    assert payload['stream'] is True
-    assert payload['stream_session_id'] == 'session-123'
+    assert runtime._processed == []
+    assert runtime.relay_client.endpoint_calls == []
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
@@ -661,12 +661,12 @@ def test_run_api_v1_payload_uses_relay_api_v1_source_endpoint(capsys, monkeypatc
     runtime = ApiV1Runtime.last_instance
     assert runtime is not None
     assert len(runtime._processed) == 1
-    assert runtime._processed[0]['api_v1_request']['request_id'] == 'req-1'
+    assert runtime._processed[0]['request_id'] == 'req-1'
 
     assert len(runtime.relay_client.endpoint_calls) == 1
     endpoint, payload = runtime.relay_client.endpoint_calls[0]
-    assert endpoint == '/relay/api/v1/source'
-    assert payload['api_v1_request']['request_id'] == 'req-1'
+    assert endpoint == '/api/v1/relay/responses'
+    assert payload['request_id'] == 'req-1'
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
@@ -769,7 +769,7 @@ def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch
     assert 'update relay.py to repo HEAD' in actionable_errors[0]['last_error']
 
 
-def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, monkeypatch):
+def test_run_reports_error_when_api_v1_relay_request_processing_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=ProcessingFailureRuntime)
     call_count = {'n': 0}

@@ -46,6 +46,22 @@ class ComputeProviderError(Exception):
         self.status_code = status_code
 
 
+def _is_invalid_assistant_content(content: Any) -> bool:
+    """Return True for successful assistant payloads the UI must reject."""
+
+    if not isinstance(content, str):
+        return True
+    normalized = content.strip()
+    if not normalized:
+        return True
+    if normalized.lower() == "stub":
+        return True
+    return normalized in {
+        "Sorry, I couldn't get a response. Please try again.",
+        "Sorry, an error occurred while sending your message. Please try again.",
+        "I'm sorry, I encountered an error while processing your request.",
+    }
+
 _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
     "no_registered_compute_nodes": {
         "error_type": "service_unavailable_error",
@@ -226,6 +242,9 @@ class DistributedApiV1ComputeProvider:
         faucet_payload = {
             "client_public_key": crypto_manager.public_key_b64,
             "server_public_key": server_public_key,
+            "request_id": relay_request_id,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
             **encrypted_envelope,
         }
 
@@ -262,7 +281,10 @@ class DistributedApiV1ComputeProvider:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
                     self._relay_url("/api/v1/relay/responses/retrieve"),
-                    json={"client_public_key": crypto_manager.public_key_b64},
+                    json={
+                        "client_public_key": crypto_manager.public_key_b64,
+                        "request_id": relay_request_id,
+                    },
                     timeout=retrieve_timeout,
                 )
             except requests.RequestException:
@@ -328,6 +350,13 @@ class DistributedApiV1ComputeProvider:
                 raise _error_from_code(
                     "compute_node_invalid_payload",
                     message="compute node response missing assistant message",
+                )
+
+            assistant_content = assistant_message.get("content")
+            if _is_invalid_assistant_content(assistant_content):
+                raise _error_from_code(
+                    "compute_node_invalid_payload",
+                    message="compute node response contained invalid assistant content",
                 )
 
             _last_backend_path.set("distributed_relay_e2ee")

@@ -847,36 +847,19 @@ def api_v1_relay_servers_poll():
 
     first_request = None
 
-    def _is_legacy_ciphertext_payload(payload):
-        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
-
-    # Prefer explicit API v1 envelopes when both API v1 and legacy ciphertext payloads are queued.
-    for idx, candidate in enumerate(queued_requests):
-        if bool(candidate.get('e2ee_v1')):
-            first_request = queued_requests.pop(idx)
-            break
-
-    if first_request is None:
-        while queued_requests:
-            candidate = queued_requests[0]
-            if _is_legacy_ciphertext_payload(candidate):
-                first_request = queued_requests.pop(0)
-                break
-            queued_requests.pop(0)
-
-
-    if first_request is not None and bool(first_request.get('e2ee_v1')):
-        # When an API v1 envelope is available, keep API v1-only semantics by dropping
-        # legacy ciphertext payloads left in the same queue.
-        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
-
-    if first_request is None:
-        if not queued_requests:
+    # API v1 polling is API v1-only: never surface legacy sink/faucet payloads here.
+    api_v1_requests = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
+    if api_v1_requests:
+        first_request = api_v1_requests.pop(0)
+        if api_v1_requests:
+            client_inference_requests[public_key] = api_v1_requests
+        else:
             client_inference_requests.pop(public_key, None)
-        return jsonify({'message': 'No requests available'}), 200
-
-    if not queued_requests:
+    else:
+        # Drop stale/non-API-v1 payloads from this API v1 queue so desktop bridges
+        # do not misdiagnose legacy work as active API v1 E2EE traffic.
         client_inference_requests.pop(public_key, None)
+        return jsonify({'message': 'No requests available'}), 200
 
     return jsonify(first_request), 200
 
@@ -895,9 +878,12 @@ def api_v1_relay_requests():
     if server_public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
-
     if not envelope.get('client_public_key'):
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
+    if envelope.get('protocol') != 'tokenplace_api_v1_relay_e2ee' or envelope.get('version') != 1:
+        return jsonify({'error': {'message': 'Invalid API v1 relay protocol metadata', 'code': 400}}), 400
+    if not isinstance(envelope.get('request_id'), str) or not envelope.get('request_id').strip():
+        return jsonify({'error': {'message': 'Missing API v1 relay request id', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
     client_inference_requests.setdefault(server_public_key, []).append(envelope)
@@ -920,6 +906,10 @@ def api_v1_relay_responses():
     client_public_key = envelope.get('client_public_key')
     if not client_public_key:
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+    if envelope.get('protocol') != 'tokenplace_api_v1_relay_e2ee' or envelope.get('version') != 1:
+        return jsonify({'error': {'message': 'Invalid API v1 relay protocol metadata', 'code': 400}}), 400
+    if not isinstance(envelope.get('request_id'), str) or not envelope.get('request_id').strip():
+        return jsonify({'error': {'message': 'Missing API v1 relay request id', 'code': 400}}), 400
 
     _queue_client_response(client_public_key, envelope)
     return jsonify({'message': 'Response received and queued for client'}), 200

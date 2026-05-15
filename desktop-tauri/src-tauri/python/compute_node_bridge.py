@@ -286,7 +286,7 @@ def run(args: argparse.Namespace) -> int:
             api_v1_payload = is_api_v1_relay_payload(relay_response)
             relay_error = _relay_error_message(relay_response)
             has_heartbeat = "next_ping_in_x_seconds" in relay_response
-            registered = relay_error is None and (has_heartbeat or api_v1_payload or legacy_payload)
+            registered = relay_error is None and (has_heartbeat or api_v1_payload)
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
@@ -312,7 +312,7 @@ def run(args: argparse.Namespace) -> int:
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
-            elif api_v1_payload or legacy_payload:
+            elif api_v1_payload:
                 print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,

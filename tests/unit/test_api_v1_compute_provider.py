@@ -129,17 +129,21 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
+    expected_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
     assert retrieve_calls == [
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": expected_request_id},
     ]
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
+    assert posted_payloads[0][1]["request_id"] == expected_request_id
+    assert posted_payloads[0][1]["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert posted_payloads[0][1]["version"] == 1
     assert posted_payloads[1][0] == "https://node-a.example/api/v1/relay/responses/retrieve"
 
 
@@ -629,6 +633,51 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_invalid_payload"
         assert "compute node response missing assistant message" in str(exc)
+
+
+def test_distributed_compute_provider_rejects_stub_assistant_content(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+
+    def fake_get(url, timeout):
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/api/v1/relay/requests"):
+            return _FakeResponse(200, {"message": "Request received"})
+        if url.endswith("/api/v1/relay/responses/retrieve"):
+            request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
+            response_envelope = {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": request_id,
+                "api_v1_response": {
+                    "message": {"role": "assistant", "content": "stub"},
+                },
+            }
+            return _FakeResponse(
+                200,
+                fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64),
+            )
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=5)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_invalid_payload"
+        assert "invalid assistant content" in str(exc)
 
 
 def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(monkeypatch):

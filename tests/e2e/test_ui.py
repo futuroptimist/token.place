@@ -315,7 +315,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     Validate relay landing chat end-to-end through the desktop compute-node bridge.
 
     This test intentionally avoids route mocking so it verifies the real wiring:
-    browser UI -> relay.py API v1 -> relay sink/source -> desktop bridge runtime.
+    browser UI -> relay.py API v1 -> API v1 E2EE relay queue -> desktop bridge runtime.
     """
     relay_process, _ = setup_servers
     assert relay_process is not None
@@ -646,6 +646,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         ]
         assert process_request_lines, "desktop bridge should process encrypted relay requests"
         bridge_stderr_text = "".join(stderr_lines)
+        assert "api_v1_payload=True" in bridge_stderr_text
+        assert "desktop.compute_node_bridge.api_v1_e2ee.work_received" in bridge_stderr_text
+        assert "desktop.compute_node_bridge.api_v1_e2ee.response_submitted" in bridge_stderr_text
         assert "E2EE_SENTINEL_SHOULD_NEVER_REACH_RELAY_PLAINTEXT" not in bridge_stderr_text
         assert "E2EE_SENTINEL_SHOULD_NEVER_LEAVE_PROCESS_AS_PLAINTEXT" not in bridge_stderr_text
         assert "E2EE_SENTINEL_SHOULD_NEVER_APPEAR_IN_LOGS_OR_DIAGNOSTICS" not in bridge_stderr_text

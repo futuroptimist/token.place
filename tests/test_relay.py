@@ -692,6 +692,46 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
     assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
     assert encrypted_payload["api_v1_response"]["error"]["message"] == expected_error_message
 
+
+def test_api_v1_relay_requests_queue_detectable_e2ee_work_for_poll(client):
+    """API v1 queue/poll keeps relay state ciphertext-only and marks E2EE work."""
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    payload = {
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "server_public_key": DUMMY_SERVER_PUB_KEY,
+        "request_id": "req-api-v1",
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "chat_history": "opaque-ciphertext",
+        "cipherkey": "opaque-key",
+        "iv": "opaque-iv",
+    }
+
+    queued = client.post("/api/v1/relay/requests", json=payload)
+    assert queued.status_code == 200
+    relay_state = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
+    assert relay_state["e2ee_v1"] is True
+    assert relay_state["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert relay_state["version"] == 1
+    assert "messages" not in json.dumps(relay_state)
+
+    polled = client.post(
+        "/api/v1/relay/servers/poll",
+        json={"server_public_key": DUMMY_SERVER_PUB_KEY},
+    )
+    assert polled.status_code == 200
+    work = polled.get_json()
+    assert work["request_id"] == "req-api-v1"
+    assert work["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert work["version"] == 1
+    assert work["chat_history"] == "opaque-ciphertext"
+    assert "api_v1_request" not in work
+    assert "messages" not in json.dumps(work)
+
 # --- Test /faucet ---
 
 def test_faucet_submit_request(client):

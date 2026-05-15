@@ -900,6 +900,8 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
+    envelope.setdefault('protocol', 'tokenplace_api_v1_relay_e2ee')
+    envelope.setdefault('version', 1)
     client_inference_requests.setdefault(server_public_key, []).append(envelope)
     return jsonify({'message': 'Request received'}), 200
 

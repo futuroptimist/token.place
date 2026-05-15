@@ -171,14 +171,14 @@ class DistributedApiV1ComputeProvider:
         except requests.RequestException as exc:
             raise _error_from_code(
                 "compute_node_unreachable",
-                message=f"unable to reach relay next_server endpoint: {exc}",
+                message=f"unable to reach API v1 relay server selection endpoint: {exc}",
             ) from exc
 
         if next_server_response.status_code >= 500:
             raise _error_from_code(
                 "compute_node_unreachable",
                 message=(
-                    "relay next_server endpoint returned "
+                    "API v1 relay server selection endpoint returned "
                     f"unexpected status {next_server_response.status_code}"
                 ),
             )
@@ -188,13 +188,13 @@ class DistributedApiV1ComputeProvider:
         except ValueError as exc:
             raise _error_from_code(
                 "compute_node_invalid_payload",
-                message="relay next_server response was not valid JSON",
+                message="API v1 relay server selection response was not valid JSON",
             ) from exc
 
         if not isinstance(next_server_payload, dict):
             raise _error_from_code(
                 "compute_node_invalid_payload",
-                message="relay next_server response must be an object",
+                message="API v1 relay server selection response must be an object",
             )
 
         server_public_key = next_server_payload.get("server_public_key")
@@ -226,6 +226,9 @@ class DistributedApiV1ComputeProvider:
         faucet_payload = {
             "client_public_key": crypto_manager.public_key_b64,
             "server_public_key": server_public_key,
+            "request_id": relay_request_id,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
             **encrypted_envelope,
         }
 
@@ -238,7 +241,7 @@ class DistributedApiV1ComputeProvider:
         except requests.RequestException as exc:
             raise _error_from_code(
                 "compute_node_unreachable",
-                message=f"unable to post encrypted request to relay faucet endpoint: {exc}",
+                message=f"unable to post encrypted request to API v1 relay queue endpoint: {exc}",
             ) from exc
 
         if faucet_response.status_code == 404:
@@ -251,7 +254,7 @@ class DistributedApiV1ComputeProvider:
             raise _error_from_code(
                 "compute_node_bridge_error",
                 message=(
-                    "relay faucet endpoint returned unexpected status "
+                    "API v1 relay queue endpoint returned unexpected status "
                     f"{faucet_response.status_code}"
                 ),
             )
@@ -262,7 +265,10 @@ class DistributedApiV1ComputeProvider:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
                     self._relay_url("/api/v1/relay/responses/retrieve"),
-                    json={"client_public_key": crypto_manager.public_key_b64},
+                    json={
+                        "client_public_key": crypto_manager.public_key_b64,
+                        "request_id": relay_request_id,
+                    },
                     timeout=retrieve_timeout,
                 )
             except requests.RequestException:
@@ -328,6 +334,17 @@ class DistributedApiV1ComputeProvider:
                 raise _error_from_code(
                     "compute_node_invalid_payload",
                     message="compute node response missing assistant message",
+                )
+
+            content = assistant_message.get("content")
+            if (
+                not isinstance(content, str)
+                or not content.strip()
+                or content.strip().lower() == "stub"
+            ):
+                raise _error_from_code(
+                    "compute_node_invalid_payload",
+                    message="compute node response contained invalid assistant content",
                 )
 
             _last_backend_path.set("distributed_relay_e2ee")
@@ -446,11 +463,14 @@ def get_api_v1_compute_provider_for_mode(
     *,
     mode: str,
     distributed_fallback_enabled: bool | None = None,
+    distributed_url_override: str | None = None,
 ) -> ApiV1ComputeProvider:
     """Resolve provider with an explicit mode override for request-scoped routing."""
 
     normalized_mode = (mode or "local").strip().lower()
     _, distributed_url, fallback_enabled_from_env = _read_api_v1_provider_env()
+    if distributed_url_override is not None:
+        distributed_url = distributed_url_override.strip()
     if distributed_fallback_enabled is None:
         distributed_fallback_enabled = fallback_enabled_from_env
     return _build_api_v1_compute_provider(

@@ -265,7 +265,10 @@ class DistributedApiV1ComputeProvider:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
                 retrieve_response = requests.post(
                     self._relay_url("/api/v1/relay/responses/retrieve"),
-                    json={"client_public_key": crypto_manager.public_key_b64},
+                    json={
+                        "client_public_key": crypto_manager.public_key_b64,
+                        "request_id": relay_request_id,
+                    },
                     timeout=retrieve_timeout,
                 )
             except requests.RequestException:

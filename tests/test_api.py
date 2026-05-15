@@ -1221,3 +1221,57 @@ def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_uns
     assert captured["messages"] == [{"role": "user", "content": "hello desktop"}]
     assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
     assert response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"] == "distributed_relay_e2ee"
+
+
+def test_desktop_bridge_relay_base_url_uses_configured_origin_for_untrusted_host(
+    monkeypatch,
+):
+    """Forged Host headers must not control outbound desktop relay routing."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "relay.server_url": "https://token.place/",
+                "api.relay_url": "",
+                "relay.server_pool": ["https://token.place/"],
+            }
+            return values.get(key, default)
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://attacker.example",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://token.place"
+
+
+def test_desktop_bridge_relay_base_url_fails_closed_without_trusted_origin(
+    monkeypatch,
+):
+    """Desktop distributed override must fail closed when no trusted relay exists."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+    from api.v1.compute_provider import ComputeProviderError
+
+    class EmptyConfig:
+        def get(self, _key, default=None):
+            return default
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://attacker.example",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        with pytest.raises(ComputeProviderError) as exc_info:
+            routes_module._request_relay_base_url()
+
+    assert exc_info.value.code == "untrusted_relay_origin"
+    assert exc_info.value.status_code == 400

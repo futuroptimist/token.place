@@ -134,16 +134,12 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
-    assert retrieve_calls == [
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-    ]
+    relay_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
+    expected_retrieve_payload = {
+        "client_public_key": fake_crypto.public_key_b64,
+        "request_id": relay_request_id,
+    }
+    assert retrieve_calls == [expected_retrieve_payload] * 8
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
     assert posted_payloads[1][0] == "https://node-a.example/api/v1/relay/responses/retrieve"
     touched_urls = [

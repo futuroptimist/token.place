@@ -12,6 +12,8 @@ import uuid
 import logging
 import os
 import math
+import ipaddress
+from urllib.parse import urlparse
 
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
@@ -88,13 +90,104 @@ def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_requ
     return request_metadata.get("relay_path") == "api_v1_e2ee"
 
 
-def _request_relay_base_url() -> str:
-    """Return the API v1 relay base URL for same-origin desktop bridge work."""
+def _normalise_relay_origin(value: str) -> str:
+    """Return a normalized HTTP(S) origin, or an empty string for invalid input."""
 
-    configured = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    candidate = (value or "").strip().rstrip("/")
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path not in {"", "/"}
+    ):
+        return ""
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return ""
+
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{hostname}:{parsed.port}"
+    return f"{parsed.scheme.lower()}://{netloc}"
+
+
+def _origin_host_is_loopback(origin: str) -> bool:
+    """Return True when an origin targets a loopback host."""
+
+    hostname = (urlparse(origin).hostname or "").lower()
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_remote_addr_is_loopback() -> bool:
+    """Return True when the inbound Flask request came from loopback."""
+
+    remote_addr = request.remote_addr or ""
+    try:
+        return ipaddress.ip_address(remote_addr).is_loopback
+    except ValueError:
+        return False
+
+
+def _trusted_configured_relay_origins() -> list[str]:
+    """Return relay origins trusted for request-scoped same-origin routing."""
+
+    config = get_config()
+    candidates = [
+        config.get("relay.server_url", ""),
+        config.get("api.relay_url", ""),
+    ]
+    candidates.extend(config.get("relay.server_pool", []) or [])
+
+    trusted: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        origin = _normalise_relay_origin(candidate)
+        if origin and origin not in trusted:
+            trusted.append(origin)
+    return trusted
+
+
+def _request_relay_base_url() -> str:
+    """Return a trusted API v1 relay base URL for desktop bridge work."""
+
+    configured = _normalise_relay_origin(
+        os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "")
+    )
     if configured:
         return configured
-    return request.host_url.rstrip("/")
+
+    request_origin = _normalise_relay_origin(request.host_url)
+    trusted_origins = _trusted_configured_relay_origins()
+    if request_origin in trusted_origins:
+        return request_origin
+
+    if (
+        request_origin
+        and _origin_host_is_loopback(request_origin)
+        and _request_remote_addr_is_loopback()
+    ):
+        return request_origin
+
+    if trusted_origins:
+        return trusted_origins[0]
+
+    raise ComputeProviderError(
+        "desktop bridge distributed routing requires a trusted relay origin",
+        code="untrusted_relay_origin",
+        error_type="invalid_request_error",
+        public_message="No trusted relay origin is configured for this request.",
+        status_code=400,
+    )
 
 
 def _get_service_name() -> str:

@@ -98,10 +98,11 @@ def _normalise_relay_origin(value: str) -> str:
         return ""
 
     parsed = urlparse(candidate)
+    path = parsed.path.rstrip("/")
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.netloc
-        or parsed.path not in {"", "/"}
+        or path not in {"", "/api/v1"}
     ):
         return ""
 
@@ -123,7 +124,7 @@ def _normalise_relay_origin(value: str) -> str:
 
     if port is not None:
         netloc = f"{netloc}:{port}"
-    return f"{parsed.scheme.lower()}://{netloc}"
+    return f"{parsed.scheme.lower()}://{netloc}{path}"
 
 
 def _origin_host_is_loopback(origin: str) -> bool:

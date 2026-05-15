@@ -44,6 +44,21 @@ class _FailingEncryptCryptoManager(_FakeCryptoManager):
         raise ValueError("invalid server key")
 
 
+def test_distributed_compute_provider_relay_url_preserves_api_v1_base():
+    """Path-scoped API v1 relay bases should not duplicate the API prefix."""
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://relay.example/api/v1")
+
+    assert (
+        provider._relay_url("/api/v1/relay/servers/next")
+        == "https://relay.example/api/v1/relay/servers/next"
+    )
+    assert (
+        provider._relay_url("/api/v1/relay/responses/retrieve")
+        == "https://relay.example/api/v1/relay/responses/retrieve"
+    )
+
+
 def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch):
     fake_crypto = _FakeCryptoManager()
     posted_payloads = []

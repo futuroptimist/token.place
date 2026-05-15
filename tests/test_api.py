@@ -1240,6 +1240,68 @@ def test_normalise_relay_origin_preserves_ipv6_loopback_brackets():
     )
 
 
+def test_normalise_relay_origin_preserves_api_v1_base_paths():
+    """Explicit API v1 relay bases remain trusted instead of being ignored."""
+
+    import api.v1.routes as routes_module
+
+    assert (
+        routes_module._normalise_relay_origin("https://relay.example/api/v1/")
+        == "https://relay.example/api/v1"
+    )
+    assert (
+        routes_module._normalise_relay_origin("http://[::1]:5010/api/v1")
+        == "http://[::1]:5010/api/v1"
+    )
+    assert routes_module._normalise_relay_origin("https://relay.example/api/v2") == ""
+
+
+def test_desktop_bridge_relay_base_url_preserves_env_api_v1_base_over_loopback(
+    monkeypatch,
+):
+    """Path-scoped explicit relay URLs must not fall back to same-origin routing."""
+
+    monkeypatch.setenv(
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "https://relay.example/api/v1/",
+    )
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://relay.example/api/v1"
+
+
+def test_desktop_bridge_relay_base_url_preserves_config_api_v1_base_for_untrusted_host(
+    monkeypatch,
+):
+    """Path-scoped trusted config relay URLs must not be ignored for forged hosts."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "relay.server_url": "https://relay.example/api/v1/",
+                "api.relay_url": "",
+                "relay.server_pool": [],
+            }
+            return values.get(key, default)
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://attacker.example",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://relay.example/api/v1"
+
+
 def test_desktop_bridge_relay_base_url_allows_ipv6_loopback_same_origin_only_from_loopback(
     monkeypatch,
 ):

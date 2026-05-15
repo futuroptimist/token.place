@@ -133,7 +133,10 @@ class DistributedApiV1ComputeProvider:
     timeout_seconds: float = 30.0
 
     def _relay_url(self, path: str) -> str:
-        return f"{self.base_url.rstrip('/')}{path}"
+        base_url = self.base_url.rstrip("/")
+        if base_url.endswith("/api/v1") and path.startswith("/api/v1/"):
+            path = path[len("/api/v1"):]
+        return f"{base_url}{path}"
 
     def _poll_interval_seconds(self) -> float:
         return min(max(self.timeout_seconds / 20.0, 0.1), 0.5)

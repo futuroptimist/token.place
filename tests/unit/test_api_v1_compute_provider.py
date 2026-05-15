@@ -129,15 +129,16 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
+    request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
     assert retrieve_calls == [
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
-        {"client_public_key": fake_crypto.public_key_b64},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
+        {"client_public_key": fake_crypto.public_key_b64, "request_id": request_id},
     ]
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
     assert posted_payloads[1][0] == "https://node-a.example/api/v1/relay/responses/retrieve"
@@ -253,7 +254,7 @@ def test_distributed_compute_provider_maps_next_server_json_error(monkeypatch):
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_invalid_payload"
-        assert "next_server response was not valid JSON" in str(exc)
+        assert "API v1 relay server selection response was not valid JSON" in str(exc)
 
 
 def test_distributed_compute_provider_maps_next_server_5xx(monkeypatch):
@@ -457,6 +458,24 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
 
+def test_get_api_v1_compute_provider_for_mode_accepts_request_scoped_relay_url(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    provider = get_api_v1_compute_provider_for_mode(
+        mode="distributed",
+        distributed_fallback_enabled=False,
+        distributed_url_override="http://127.0.0.1:5010",
+    )
+
+    try:
+        assert isinstance(provider, DistributedApiV1ComputeProvider)
+        assert provider.base_url == "http://127.0.0.1:5010"
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
 def test_get_api_v1_resolved_provider_path_labels_instance_types():
     local = LocalApiV1ComputeProvider()
     distributed = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
@@ -553,7 +572,7 @@ def test_distributed_compute_provider_maps_next_server_request_exception(monkeyp
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_unreachable"
-        assert "unable to reach relay next_server endpoint" in str(exc)
+        assert "unable to reach API v1 relay server selection endpoint" in str(exc)
 
 
 def test_distributed_compute_provider_maps_faucet_request_exception(monkeypatch):
@@ -585,7 +604,7 @@ def test_distributed_compute_provider_maps_faucet_request_exception(monkeypatch)
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_unreachable"
-        assert "unable to post encrypted request to relay faucet endpoint" in str(exc)
+        assert "unable to post encrypted request to API v1 relay queue endpoint" in str(exc)
 
 
 def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch):
@@ -630,7 +649,6 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
         assert exc.code == "compute_node_invalid_payload"
         assert "compute node response missing assistant message" in str(exc)
 
-
 def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
     monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
@@ -640,7 +658,6 @@ def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(mon
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert "requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL" in str(exc)
-
 
 def test_get_api_v1_compute_provider_for_mode_reads_fallback_from_env(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)

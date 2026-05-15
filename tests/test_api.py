@@ -1300,10 +1300,10 @@ def test_desktop_bridge_relay_base_url_uses_configured_origin_for_untrusted_host
         assert routes_module._request_relay_base_url() == "https://token.place"
 
 
-def test_desktop_bridge_relay_base_url_prefers_configured_origin_over_loopback_host(
+def test_desktop_bridge_relay_base_url_prefers_loopback_host_over_default_config(
     monkeypatch,
 ):
-    """Configured relay origins take precedence over localhost Host fallback."""
+    """Verified loopback desktop requests stay on their same-origin local relay."""
 
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
     import api.v1.routes as routes_module
@@ -1324,7 +1324,23 @@ def test_desktop_bridge_relay_base_url_prefers_configured_origin_over_loopback_h
         base_url="http://127.0.0.1:5010",
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     ):
-        assert routes_module._request_relay_base_url() == "https://token.place"
+        assert routes_module._request_relay_base_url() == "http://127.0.0.1:5010"
+
+
+def test_desktop_bridge_relay_base_url_prefers_env_over_loopback_host(
+    monkeypatch,
+):
+    """The explicit distributed relay URL remains highest precedence."""
+
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://relay.example/")
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://relay.example"
 
 
 def test_desktop_bridge_relay_base_url_fails_closed_without_trusted_origin(

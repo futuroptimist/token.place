@@ -1229,6 +1229,50 @@ def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_uns
     assert response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"] == "distributed_relay_e2ee"
 
 
+def test_normalise_relay_origin_preserves_ipv6_loopback_brackets():
+    """IPv6 literal origins must keep brackets when reconstructed with ports."""
+
+    import api.v1.routes as routes_module
+
+    assert (
+        routes_module._normalise_relay_origin("http://[::1]:5010")
+        == "http://[::1]:5010"
+    )
+
+
+def test_desktop_bridge_relay_base_url_allows_ipv6_loopback_same_origin_only_from_loopback(
+    monkeypatch,
+):
+    """Bracketed IPv6 localhost fallback is limited to loopback clients."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+    from api.v1.compute_provider import ComputeProviderError
+
+    class EmptyConfig:
+        def get(self, _key, default=None):
+            return default
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://[::1]:5010",
+        environ_base={"REMOTE_ADDR": "::1"},
+    ):
+        assert routes_module._request_relay_base_url() == "http://[::1]:5010"
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://[::1]:5010",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        with pytest.raises(ComputeProviderError) as exc_info:
+            routes_module._request_relay_base_url()
+
+    assert exc_info.value.code == "untrusted_relay_origin"
+
+
 def test_desktop_bridge_relay_base_url_uses_configured_origin_for_untrusted_host(
     monkeypatch,
 ):

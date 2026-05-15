@@ -109,9 +109,20 @@ def _normalise_relay_origin(value: str) -> str:
     if not hostname:
         return ""
 
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+
     netloc = hostname
-    if parsed.port is not None:
-        netloc = f"{hostname}:{parsed.port}"
+    try:
+        if ipaddress.ip_address(hostname).version == 6:
+            netloc = f"[{hostname}]"
+    except ValueError:
+        pass
+
+    if port is not None:
+        netloc = f"{netloc}:{port}"
     return f"{parsed.scheme.lower()}://{netloc}"
 
 

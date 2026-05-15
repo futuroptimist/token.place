@@ -166,20 +166,17 @@ def _request_relay_base_url() -> str:
     if configured:
         return configured
 
-    request_origin = _normalise_relay_origin(request.host_url)
     trusted_origins = _trusted_configured_relay_origins()
-    if request_origin in trusted_origins:
-        return request_origin
+    if trusted_origins:
+        return trusted_origins[0]
 
+    request_origin = _normalise_relay_origin(request.host_url)
     if (
         request_origin
         and _origin_host_is_loopback(request_origin)
         and _request_remote_addr_is_loopback()
     ):
         return request_origin
-
-    if trusted_origins:
-        return trusted_origins[0]
 
     raise ComputeProviderError(
         "desktop bridge distributed routing requires a trusted relay origin",

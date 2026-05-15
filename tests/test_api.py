@@ -1157,10 +1157,16 @@ def test_alias_get_model(client, monkeypatch):
 def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_unset(
     monkeypatch, client, client_keys
 ):
-    """Explicit desktop API v1 E2EE metadata must enqueue via same-origin relay."""
+    """Explicit desktop API v1 E2EE metadata may use loopback same-origin locally."""
 
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
     import api.v1.routes as routes_module
+
+    class EmptyConfig:
+        def get(self, _key, default=None):
+            return default
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
 
     captured = {}
 
@@ -1246,6 +1252,33 @@ def test_desktop_bridge_relay_base_url_uses_configured_origin_for_untrusted_host
         "/api/v1/chat/completions",
         base_url="https://attacker.example",
         environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        assert routes_module._request_relay_base_url() == "https://token.place"
+
+
+def test_desktop_bridge_relay_base_url_prefers_configured_origin_over_loopback_host(
+    monkeypatch,
+):
+    """Configured relay origins take precedence over localhost Host fallback."""
+
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    import api.v1.routes as routes_module
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "relay.server_url": "https://token.place/",
+                "api.relay_url": "",
+                "relay.server_pool": [],
+            }
+            return values.get(key, default)
+
+    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
     ):
         assert routes_module._request_relay_base_url() == "https://token.place"
 

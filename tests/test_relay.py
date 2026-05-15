@@ -1,5 +1,6 @@
 import pytest
 import time
+import threading
 import base64
 import json
 from flask import Flask
@@ -1079,6 +1080,63 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     assert retrieved_payload['iv'] == 'iv-response'
     assert retrieved_payload['request_id'] == 'req-123'
     assert retrieved_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+
+
+def test_queue_client_response_serializes_concurrent_updates(monkeypatch):
+    class SlowSnapshotDict(dict):
+        def __init__(self):
+            super().__init__()
+            self._active_lock = threading.Lock()
+            self._active_gets = 0
+            self.concurrent_get_seen = False
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            with self._active_lock:
+                self._active_gets += 1
+                if self._active_gets > 1:
+                    self.concurrent_get_seen = True
+            time.sleep(0.05)
+            with self._active_lock:
+                self._active_gets -= 1
+            return value
+
+    response_queue = SlowSnapshotDict()
+    monkeypatch.setattr(relay_module, "client_responses", response_queue)
+    envelopes = [
+        {
+            'request_id': 'req-1',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'ciphertext-response-1',
+            'cipherkey': 'cipherkey-response-1',
+            'iv': 'iv-response-1',
+        },
+        {
+            'request_id': 'req-2',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': 'ciphertext-response-2',
+            'cipherkey': 'cipherkey-response-2',
+            'iv': 'iv-response-2',
+        },
+    ]
+    threads = [
+        threading.Thread(
+            target=relay_module._queue_client_response,
+            args=(DUMMY_CLIENT_PUB_KEY, envelope),
+        )
+        for envelope in envelopes
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert response_queue.concurrent_get_seen is False
+    queued = response_queue[DUMMY_CLIENT_PUB_KEY]
+    assert isinstance(queued, list)
+    assert sorted(item['request_id'] for item in queued) == ['req-1', 'req-2']
 
 
 def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_responses(client):

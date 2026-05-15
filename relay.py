@@ -379,6 +379,7 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+client_responses_lock = threading.Lock()
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -754,43 +755,45 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
 
 def _queue_client_response(client_public_key, envelope):
     """Queue an encrypted response while preserving per-request retrieval."""
-    existing = client_responses.get(client_public_key)
-    if existing is None:
-        client_responses[client_public_key] = envelope
-        return
-    if isinstance(existing, list):
-        existing.append(envelope)
-        return
-    client_responses[client_public_key] = [existing, envelope]
+    with client_responses_lock:
+        existing = client_responses.get(client_public_key)
+        if existing is None:
+            client_responses[client_public_key] = envelope
+            return
+        if isinstance(existing, list):
+            existing.append(envelope)
+            return
+        client_responses[client_public_key] = [existing, envelope]
 
 
 def _pop_client_response(client_public_key, request_id=None):
     """Pop a queued encrypted response, optionally matching API v1 request id."""
-    if client_public_key not in client_responses:
-        return None
-
-    queued = client_responses[client_public_key]
-    if isinstance(queued, list):
-        if request_id:
-            for idx, candidate in enumerate(queued):
-                if candidate.get('request_id') == request_id:
-                    response = queued.pop(idx)
-                    if not queued:
-                        client_responses.pop(client_public_key, None)
-                    elif len(queued) == 1:
-                        client_responses[client_public_key] = queued[0]
-                    return response
+    with client_responses_lock:
+        if client_public_key not in client_responses:
             return None
-        response = queued.pop(0)
-        if not queued:
-            client_responses.pop(client_public_key, None)
-        elif len(queued) == 1:
-            client_responses[client_public_key] = queued[0]
-        return response
 
-    if request_id and queued.get('request_id') != request_id:
-        return None
-    return client_responses.pop(client_public_key)
+        queued = client_responses[client_public_key]
+        if isinstance(queued, list):
+            if request_id:
+                for idx, candidate in enumerate(queued):
+                    if candidate.get('request_id') == request_id:
+                        response = queued.pop(idx)
+                        if not queued:
+                            client_responses.pop(client_public_key, None)
+                        elif len(queued) == 1:
+                            client_responses[client_public_key] = queued[0]
+                        return response
+                return None
+            response = queued.pop(0)
+            if not queued:
+                client_responses.pop(client_public_key, None)
+            elif len(queued) == 1:
+                client_responses[client_public_key] = queued[0]
+            return response
+
+        if request_id and queued.get('request_id') != request_id:
+            return None
+        return client_responses.pop(client_public_key)
 
 
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
@@ -1164,11 +1167,12 @@ def source():
     iv = data['iv']
 
     # Store the response in the client_responses dictionary
-    client_responses[client_public_key] = {
-        'chat_history': encrypted_chat_history,
-        'cipherkey': encrypted_cipherkey,
-        'iv': iv
-    }
+    with client_responses_lock:
+        client_responses[client_public_key] = {
+            'chat_history': encrypted_chat_history,
+            'cipherkey': encrypted_cipherkey,
+            'iv': iv
+        }
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 
@@ -1209,11 +1213,11 @@ def retrieve():
     client_public_key = data['client_public_key']
 
     # Check if there's a response for the given client public key
-    if client_public_key in client_responses:
-        response_data = client_responses.pop(client_public_key)
+    with client_responses_lock:
+        response_data = client_responses.pop(client_public_key, None)
+    if response_data is not None:
         return jsonify(response_data), 200
-    else:
-        return jsonify({'error': 'No response available for the given public key'}), 200
+    return jsonify({'error': 'No response available for the given public key'}), 200
 
 
 @app.route('/stream/retrieve', methods=['POST'])

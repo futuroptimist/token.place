@@ -830,3 +830,71 @@ def test_retrieve_chat_response_filters_with_explicit_request_id(monkeypatch):
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'done'},
     ]
+
+def test_retrieve_chat_response_api_v1_invalid_envelopes(monkeypatch):
+    client = CryptoClient('https://test-server.com')
+    client.client_public_key_b64 = 'client-key'
+    encrypted_response = {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+    monkeypatch.setattr(client, 'send_encrypted_message', lambda _endpoint, _payload: encrypted_response)
+
+    invalid_envelopes = [
+        {'protocol': 'unexpected', 'api_v1_response': {'message': {'role': 'assistant', 'content': 'done'}}},
+        {'protocol': 'tokenplace_api_v1_relay_e2ee'},
+        {'protocol': 'tokenplace_api_v1_relay_e2ee', 'api_v1_response': {'error': {'message': 'boom'}}},
+        {'protocol': 'tokenplace_api_v1_relay_e2ee', 'api_v1_response': {}},
+        {'protocol': 'tokenplace_api_v1_relay_e2ee', 'api_v1_response': {'message': {'role': 'assistant'}}},
+    ]
+
+    for envelope in invalid_envelopes:
+        monkeypatch.setattr(client, 'decrypt_message', lambda _encrypted, envelope=envelope: envelope)
+        assert client.retrieve_chat_response(max_retries=1, retry_delay=0) is None
+
+
+def test_retrieve_chat_response_retries_mismatched_api_v1_request_id(monkeypatch):
+    client = CryptoClient('https://test-server.com')
+    client.client_public_key_b64 = 'client-key'
+    encrypted_response = {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+    monkeypatch.setattr(client, 'send_encrypted_message', lambda _endpoint, _payload: encrypted_response)
+    monkeypatch.setattr(
+        client,
+        'decrypt_message',
+        lambda _encrypted: {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'request_id': 'other-request',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'wrong'}},
+        },
+    )
+    sleep_calls = []
+    monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda seconds: sleep_calls.append(seconds))
+
+    assert client.retrieve_chat_response(
+        max_retries=1,
+        retry_delay=0,
+        expected_request_id='expected-request',
+    ) is None
+    assert sleep_calls == [0]
+
+
+def test_retrieve_chat_response_api_v1_message_without_original_history(monkeypatch):
+    client = CryptoClient('https://test-server.com')
+    client.client_public_key_b64 = 'client-key'
+    monkeypatch.setattr(
+        client,
+        'send_encrypted_message',
+        lambda _endpoint, _payload: {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+    )
+    monkeypatch.setattr(
+        client,
+        'decrypt_message',
+        lambda _encrypted: {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'request_id': 'req-1',
+            'api_v1_response': {'message': {'role': 'assistant', 'content': 'done'}},
+        },
+    )
+
+    assert client.retrieve_chat_response(
+        max_retries=1,
+        retry_delay=0,
+        expected_request_id='req-1',
+    ) == [{'role': 'assistant', 'content': 'done'}]

@@ -2,6 +2,7 @@
 Unit tests for the relay client module.
 """
 import base64
+import builtins
 import json
 import math
 import pytest
@@ -902,15 +903,24 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
-    @patch('api.v1.models.generate_response')
     def test_process_client_request_api_v1_e2ee_success(
         self,
-        mock_generate_response,
         mock_post,
         relay_client,
         mock_crypto_manager,
+        mock_model_manager,
+        monkeypatch,
     ):
-        """API v1 relay envelopes should call generate_response and post encrypted response."""
+        """API v1 relay envelopes use desktop runtime model without importing api.v1."""
+
+        original_import = builtins.__import__
+
+        def fail_api_v1_models_import(name, *args, **kwargs):
+            if name == 'api.v1.models':
+                raise ModuleNotFoundError("No module named 'api'")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, '__import__', fail_api_v1_models_import)
         request_data = TEST_VALID_RESPONSE.copy()
         decrypted_payload = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -920,14 +930,10 @@ class TestRelayClient:
             "api_v1_request": {
                 "model": "llama-3-8b-instruct",
                 "messages": [{"role": "user", "content": "Hello"}],
-                "options": {"temperature": 0.2, "max_tokens": 50},
+                "options": {},
             },
         }
         mock_crypto_manager.decrypt_message.return_value = decrypted_payload
-        mock_generate_response.return_value = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there"},
-        ]
         mock_crypto_manager.encrypt_message.return_value = {
             'chat_history': 'encrypted_chat_history',
             'cipherkey': 'encrypted_key',
@@ -940,11 +946,8 @@ class TestRelayClient:
         result = relay_client.process_client_request(request_data)
 
         assert result is True
-        mock_generate_response.assert_called_once_with(
-            "llama-3-8b-instruct",
-            [{"role": "user", "content": "Hello"}],
-            temperature=0.2,
-            max_tokens=50,
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}]
         )
         mock_crypto_manager.encrypt_message.assert_called_with(
             {
@@ -953,7 +956,10 @@ class TestRelayClient:
                 "request_id": "req-123",
                 "client_public_key": request_data["client_public_key"],
                 "api_v1_response": {
-                    "message": {"role": "assistant", "content": "Hi there"},
+                    "message": {
+                        "role": "assistant",
+                        "content": "The capital of France is Paris.",
+                    },
                 },
             },
             base64.b64decode(request_data["client_public_key"], validate=True),
@@ -973,10 +979,8 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
-    @patch('api.v1.models.generate_response')
     def test_process_client_request_api_v1_e2ee_posts_response_to_polling_relay(
         self,
-        mock_generate_response,
         mock_post,
         relay_client,
         mock_crypto_manager,
@@ -996,10 +1000,6 @@ class TestRelayClient:
                 "options": {},
             },
         }
-        mock_generate_response.return_value = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there"},
-        ]
         source_response = MagicMock()
         source_response.status_code = 200
         mock_post.return_value = source_response
@@ -1011,13 +1011,12 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
-    @patch('api.v1.models.generate_response')
     def test_process_client_request_api_v1_e2ee_rejects_mismatched_bound_key(
         self,
-        mock_generate_response,
         mock_post,
         relay_client,
         mock_crypto_manager,
+        mock_model_manager,
     ):
         """API v1 relay envelopes with mismatched encrypted key bindings are rejected."""
         request_data = TEST_VALID_RESPONSE.copy()
@@ -1036,8 +1035,128 @@ class TestRelayClient:
         result = relay_client.process_client_request(request_data)
 
         assert result is False
-        mock_generate_response.assert_not_called()
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
         mock_post.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_invalid_runtime_output_posts_encrypted_error(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Invalid desktop runtime output becomes an encrypted API v1 error response."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-invalid-output",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "SENTINEL-PLAINTEXT"}],
+                "options": {},
+            },
+        }
+        mock_model_manager.llama_cpp_get_response.return_value = [
+            {"role": "assistant", "content": ""},
+        ]
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv',
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_invalid_model_output"
+        )
+        relay_visible_payload = mock_post.call_args.kwargs["json"]
+        assert "SENTINEL-PLAINTEXT" not in json.dumps(relay_visible_payload)
+        assert relay_visible_payload["request_id"] == "req-invalid-output"
+        assert relay_visible_payload["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert relay_visible_payload["version"] == 1
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_unsupported_model_posts_encrypted_error(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Unsupported requested models produce encrypted API v1 errors, not timeouts."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-unsupported-model",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_model_unsupported"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        assert mock_post.call_args.kwargs["json"]["request_id"] == (
+            "req-unsupported-model"
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_unsupported_options_posts_encrypted_error(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Unsupported API v1 options produce encrypted errors instead of plaintext failures."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-unsupported-options",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {"tools": []},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_options_unsupported"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        assert mock_post.call_args.kwargs["json"]["request_id"] == "req-unsupported-options"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_rejects_mismatched_bound_client_key(

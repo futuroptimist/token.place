@@ -319,6 +319,12 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
+            if decrypted_response.get("client_public_key") != crypto_manager.public_key_b64:
+                raise _error_from_code(
+                    "compute_node_invalid_payload",
+                    message="decrypted relay response client_public_key binding mismatch",
+                )
+
             api_v1_response = decrypted_response.get("api_v1_response")
             if not isinstance(api_v1_response, dict):
                 raise _error_from_code(

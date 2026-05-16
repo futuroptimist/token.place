@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import queue
 import sys
 import threading
@@ -85,24 +86,51 @@ def _sanitize_relay_target(relay_url: Any) -> str:
     return urlunsplit((parsed.scheme, f"{parsed.hostname}{port}", "", "", ""))
 
 
-def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
-    """Return a compact summary string for relay registration diagnostics."""
+def _safe_poll_wait_seconds(relay_response: Dict[str, Any], default: float = 1) -> float:
+    """Return a finite non-negative relay poll wait interval."""
+
+    fallback = (
+        default
+        if isinstance(default, (int, float)) and not isinstance(default, bool)
+        else 1
+    )
+    fallback = (
+        float(fallback)
+        if math.isfinite(float(fallback)) and float(fallback) >= 0
+        else 1.0
+    )
+
+    if not isinstance(relay_response, dict):
+        return fallback
+
+    wait_seconds = relay_response.get("next_ping_in_x_seconds")
+    if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
+        return fallback
+
+    wait_seconds = float(wait_seconds)
+    if not math.isfinite(wait_seconds) or wait_seconds < 0:
+        return fallback
+    return wait_seconds
+
+
+def _relay_response_summary(
+    relay_response: Dict[str, Any], *, api_v1_payload: bool = False, wait_seconds: float = 1
+) -> str:
+    """Return a compact metadata-only summary for relay registration diagnostics."""
 
     if not isinstance(relay_response, dict):
         return f"non-dict response type={type(relay_response).__name__}"
 
     keys = sorted(relay_response.keys())
-    has_payload = all(
-        key in relay_response for key in ("client_public_key", "chat_history", "cipherkey", "iv")
-    )
     has_heartbeat = "next_ping_in_x_seconds" in relay_response
     relay_error = _relay_error_message(relay_response)
-    wait_seconds = relay_response.get("next_ping_in_x_seconds", "missing")
+    request_id = relay_response.get("request_id")
+    safe_request_id = request_id if isinstance(request_id, str) and request_id else "none"
 
     return (
-        f"keys={keys} has_legacy_payload={has_payload} "
-        f"has_heartbeat={has_heartbeat} wait={wait_seconds} "
-        f"error={relay_error or 'none'}"
+        f"keys={keys} api_v1_payload={api_v1_payload} "
+        f"heartbeat={has_heartbeat} request_id={safe_request_id} "
+        f"wait={wait_seconds} error={relay_error or 'none'}"
     )
 
 
@@ -204,7 +232,6 @@ def run(args: argparse.Namespace) -> int:
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_api_v1_relay_payload,
-            is_legacy_relay_payload,
             resolve_relay_port,
             resolve_relay_url,
         )
@@ -282,25 +309,38 @@ def run(args: argparse.Namespace) -> int:
             print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
-            legacy_payload = is_legacy_relay_payload(relay_response)
             api_v1_payload = is_api_v1_relay_payload(relay_response)
             relay_error = _relay_error_message(relay_response)
-            has_heartbeat = "next_ping_in_x_seconds" in relay_response
-            registered = relay_error is None and (has_heartbeat or api_v1_payload or legacy_payload)
+            has_heartbeat = (
+                isinstance(relay_response, dict) and "next_ping_in_x_seconds" in relay_response
+            )
+            registered = relay_error is None and (has_heartbeat or api_v1_payload)
+            wait_seconds = _safe_poll_wait_seconds(
+                relay_response, getattr(runtime.relay_client, "_request_timeout", 1)
+            )
+            request_id = (
+                relay_response.get("request_id")
+                if isinstance(relay_response, dict)
+                and isinstance(relay_response.get("request_id"), str)
+                else "none"
+            )
+            summary = _relay_response_summary(
+                relay_response, api_v1_payload=api_v1_payload, wait_seconds=wait_seconds
+            )
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
-                f"summary={_relay_response_summary(relay_response)}",
+                f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
+                f"request_id={request_id} wait={wait_seconds} summary={summary}",
                 file=sys.stderr,
             )
 
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
-                f"summary={_relay_response_summary(relay_response)}",
+                f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
+                f"request_id={request_id} wait={wait_seconds} summary={summary}",
                 file=sys.stderr,
             )
 
@@ -312,7 +352,7 @@ def run(args: argparse.Namespace) -> int:
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
-            elif api_v1_payload or legacy_payload:
+            elif api_v1_payload:
                 print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,
@@ -335,7 +375,7 @@ def run(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
             else:
-                if "next_ping_in_x_seconds" in relay_response:
+                if has_heartbeat:
                     last_error = None
                 else:
                     last_error = (
@@ -367,7 +407,6 @@ def run(args: argparse.Namespace) -> int:
                 }
             )
 
-            wait_seconds = float(relay_response.get("next_ping_in_x_seconds", 1))
             if _sleep_with_cancel(wait_seconds):
                 break
     finally:

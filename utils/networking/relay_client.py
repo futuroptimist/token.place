@@ -1144,7 +1144,7 @@ class RelayClient:
         unsupported = sorted(key for key in options if key not in passthrough_options)
         if unsupported:
             return False, ", ".join(unsupported)
-        if options.get("stream") is True:
+        if bool(options.get("stream", False)):
             return False, "stream"
         return True, None
 
@@ -1266,7 +1266,7 @@ class RelayClient:
             "temperature": configured("model.temperature", 0.7),
             "top_p": configured("model.top_p", 0.9),
             "stop": configured("model.stop_tokens", []),
-            "stream": True,
+            "stream": False,
         }
         completion_kwargs.update(safe_options)
         return completion_kwargs
@@ -1357,7 +1357,10 @@ class RelayClient:
             )
 
         safe_options = {key: value for key, value in options.items() if key != "stream"}
-        if safe_options and not has_direct_runtime_completion:
+        options_require_direct_completion = bool(safe_options)
+        if "stream" in options:
+            safe_options["stream"] = False
+        if options_require_direct_completion and not has_direct_runtime_completion:
             return self._api_v1_response_envelope(
                 request_id,
                 error={
@@ -1393,16 +1396,6 @@ class RelayClient:
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
                 )
-                if assistant_message is None and completion_kwargs.get("stream") is True:
-                    fallback_kwargs = dict(completion_kwargs)
-                    fallback_kwargs["stream"] = False
-                    completion = create_chat_completion(
-                        messages=runtime_messages,
-                        **fallback_kwargs,
-                    )
-                    assistant_message = self._assistant_message_from_runtime_completion(
-                        completion
-                    )
             else:
                 if not has_runtime_chat:
                     return self._api_v1_response_envelope(

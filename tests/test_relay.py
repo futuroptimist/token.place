@@ -108,6 +108,100 @@ def test_next_server_evicts_stale_nodes(client):
     assert payload["error"]["message"] == "No servers available"
     assert DUMMY_SERVER_PUB_KEY not in known_servers
 
+
+
+def test_api_v1_next_server_prefers_freshly_polling_desktop_bridge(client):
+    """API v1 selection must not queue work for a recently abandoned bridge key."""
+
+    old_key = base64.b64encode(b"old_desktop_bridge_key").decode("utf-8")
+    active_key = base64.b64encode(b"active_desktop_bridge_key").decode("utf-8")
+    known_servers[old_key] = {
+        "public_key": old_key,
+        "last_ping": datetime.now() - timedelta(seconds=20),
+        "last_ping_duration": 10,
+    }
+    known_servers[active_key] = {
+        "public_key": active_key,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client_inference_requests[active_key] = [{"e2ee_v1": True}]
+
+    selections = [client.get("/api/v1/relay/servers/next").get_json()["server_public_key"] for _ in range(10)]
+
+    assert selections == [active_key] * 10
+
+
+def test_api_v1_relay_queue_poll_response_retrieve_is_ciphertext_only(client):
+    request_sentinel = "PLAINTEXT_REQUEST_SENTINEL"
+    response_sentinel = "PLAINTEXT_RESPONSE_SENTINEL"
+    server_key = base64.b64encode(b"server_key_api_v1").decode("utf-8")
+    client_key = base64.b64encode(b"client_key_api_v1").decode("utf-8")
+
+    assert client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": server_key},
+    ).status_code == 200
+
+    request_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-ciphertext-only",
+        "client_public_key": client_key,
+        "server_public_key": server_key,
+        "chat_history": "opaque-request-ciphertext",
+        "cipherkey": "opaque-request-key",
+        "iv": "opaque-request-iv",
+    }
+    assert request_sentinel not in json.dumps(request_payload)
+    enqueue = client.post("/api/v1/relay/requests", json=request_payload)
+    assert enqueue.status_code == 200
+
+    assert request_sentinel not in json.dumps(client_inference_requests)
+    polled = client.post(
+        "/api/v1/relay/servers/poll",
+        json={"server_public_key": server_key},
+    )
+    assert polled.status_code == 200
+    polled_payload = polled.get_json()
+    assert polled_payload["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert polled_payload["version"] == 1
+    assert polled_payload["request_id"] == "req-ciphertext-only"
+    assert polled_payload["client_public_key"] == client_key
+    assert polled_payload["chat_history"] == "opaque-request-ciphertext"
+    assert "messages" not in json.dumps(polled_payload)
+    assert request_sentinel not in json.dumps(polled_payload)
+
+    response_payload = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-ciphertext-only",
+        "client_public_key": client_key,
+        "chat_history": "opaque-response-ciphertext",
+        "cipherkey": "opaque-response-key",
+        "iv": "opaque-response-iv",
+    }
+    assert response_sentinel not in json.dumps(response_payload)
+    submitted = client.post("/api/v1/relay/responses", json=response_payload)
+    assert submitted.status_code == 200
+    assert response_sentinel not in json.dumps(client_responses)
+
+    stale = client.post(
+        "/api/v1/relay/responses/retrieve",
+        json={"client_public_key": client_key, "request_id": "wrong-request"},
+    )
+    assert stale.status_code == 404
+
+    retrieved = client.post(
+        "/api/v1/relay/responses/retrieve",
+        json={"client_public_key": client_key, "request_id": "req-ciphertext-only"},
+    )
+    assert retrieved.status_code == 200
+    retrieved_payload = retrieved.get_json()
+    assert retrieved_payload["request_id"] == "req-ciphertext-only"
+    assert retrieved_payload["chat_history"] == "opaque-response-ciphertext"
+    assert response_sentinel not in json.dumps(retrieved_payload)
+
 # --- Test /sink ---
 
 def test_sink_register_new_server(client):

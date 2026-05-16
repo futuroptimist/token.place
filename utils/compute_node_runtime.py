@@ -54,7 +54,7 @@ LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "
 
 
 def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Return whether ``payload`` matches the legacy relay sink/source contract."""
+    """Return whether ``payload`` matches the deprecated relay ciphertext contract."""
 
     if not isinstance(payload, dict):
         return False
@@ -91,7 +91,7 @@ class RelayRequestAdapter(Protocol):
 
 
 class LegacyRelayRequestAdapter:
-    """Compatibility adapter for the existing relay sink/source request shape."""
+    """Compatibility adapter for the deprecated relay ciphertext request shape."""
 
     def __init__(self, relay_client: "RelayClient"):
         self._relay_client = relay_client

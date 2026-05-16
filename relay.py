@@ -649,7 +649,21 @@ def _select_next_server_payload():
     _evict_stale_servers()
     if not known_servers:
         return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-    server_public_key = secrets.choice(list(known_servers.keys()))
+
+    # API v1 relay requests are encrypted to the selected compute-node key. A
+    # random choice can queue work for a recently abandoned desktop key while the
+    # current bridge keeps polling a newer key, causing heartbeat-only polls and
+    # response retrieval timeouts. Prefer the most recently heartbeated node and
+    # use queue depth only as a deterministic tie-breaker; the relay still sees
+    # only safe routing metadata.
+    server_public_key, _server_state = min(
+        known_servers.items(),
+        key=lambda item: (
+            float(_server_ping_age_seconds(item[1].get('last_ping'))),
+            len(client_inference_requests.get(item[0], [])),
+            item[0],
+        ),
+    )
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
 
 @app.route('/next_server', methods=['GET'])
@@ -841,6 +855,7 @@ def api_v1_relay_servers_poll():
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
+    known_servers[public_key]['last_ping'] = datetime.now()
     queued_requests = client_inference_requests.get(public_key, [])
     if not queued_requests:
         return jsonify({'message': 'No requests available'}), 200

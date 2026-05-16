@@ -1,5 +1,7 @@
 from unittest.mock import call, MagicMock
 
+import pytest
+
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
     apply_compute_mode,
@@ -79,6 +81,7 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()
+    relay_client.poll_api_v1_encrypted_work_continuously = MagicMock()
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
     crypto_manager = MagicMock()
@@ -86,7 +89,7 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
     thread = MagicMock()
 
     def fake_thread_factory(*, target, daemon):
-        assert target == relay_client.poll_relay_continuously
+        assert target == relay_client.poll_api_v1_encrypted_work_continuously
         assert daemon is True
         return thread
 
@@ -102,6 +105,90 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
 
     assert created_thread is thread
     thread.start.assert_called_once_with()
+
+
+def test_compute_node_runtime_polling_thread_supports_api_v1_only_relay_client():
+    class ApiV1OnlyRelayClient:
+        def __init__(self):
+            self.poll_api_v1_encrypted_work_continuously = MagicMock()
+
+    relay_client = ApiV1OnlyRelayClient()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+    thread = MagicMock()
+
+    def fake_thread_factory(*, target, daemon):
+        assert target == relay_client.poll_api_v1_encrypted_work_continuously
+        assert daemon is True
+        return thread
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+        thread_factory=fake_thread_factory,
+    )
+
+    created_thread = runtime.start_relay_polling()
+
+    assert created_thread is thread
+    thread.start.assert_called_once_with()
+
+
+def test_compute_node_runtime_polling_thread_fails_closed_when_api_v1_poller_missing():
+    class LegacyOnlyRelayClient:
+        @property
+        def poll_relay_continuously(self):
+            raise AssertionError("legacy poller must not be accessed")
+
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+    thread_factory = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=LegacyOnlyRelayClient(),
+        crypto_manager=crypto_manager,
+        thread_factory=thread_factory,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="API v1 E2EE relay polling is required; legacy relay polling is deprecated",
+    ):
+        runtime.start_relay_polling()
+
+    thread_factory.assert_not_called()
+
+
+def test_compute_node_runtime_polling_thread_fails_closed_when_api_v1_poller_not_callable():
+    relay_client = MagicMock()
+    relay_client.poll_api_v1_encrypted_work_continuously = None
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+    thread_factory = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+        thread_factory=thread_factory,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="API v1 E2EE relay polling is required; legacy relay polling is deprecated",
+    ):
+        runtime.start_relay_polling()
+
+    relay_client.poll_relay_continuously.assert_not_called()
+    thread_factory.assert_not_called()
 
 
 def test_compute_node_runtime_request_flow_delegates_to_relay_client():

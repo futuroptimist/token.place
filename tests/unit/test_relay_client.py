@@ -3,6 +3,7 @@ Unit tests for the relay client module.
 """
 import base64
 import json
+import math
 import pytest
 import sys
 import requests
@@ -945,6 +946,18 @@ class TestRelayClient:
             temperature=0.2,
             max_tokens=50,
         )
+        mock_crypto_manager.encrypt_message.assert_called_with(
+            {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": "req-123",
+                "client_public_key": request_data["client_public_key"],
+                "api_v1_response": {
+                    "message": {"role": "assistant", "content": "Hi there"},
+                },
+            },
+            base64.b64decode(request_data["client_public_key"], validate=True),
+        )
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/responses',
             json={
@@ -957,6 +970,44 @@ class TestRelayClient:
                 'iv': 'encrypted_iv',
             },
             timeout=relay_client._request_timeout,
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    @patch('api.v1.models.generate_response')
+    def test_process_client_request_api_v1_e2ee_posts_response_to_polling_relay(
+        self,
+        mock_generate_response,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """API v1 responses should be submitted to the relay that supplied the work."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        relay_client._last_api_v1_work_relay_url = 'https://relay-that-polled.example'
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-polled-relay",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_generate_response.return_value = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        assert mock_post.call_args.args[0] == (
+            'https://relay-that-polled.example/api/v1/relay/responses'
         )
 
     @patch('utils.networking.relay_client.requests.post')
@@ -1251,6 +1302,87 @@ class TestRelayClient:
 
         # Verify post was not called
         mock_post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        'bad_wait_seconds',
+        ['missing', None, 'soon', True, -1, math.nan, math.inf],
+    )
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_coerces_invalid_wait_and_keeps_polling(
+        self,
+        mock_sleep,
+        mock_process,
+        mock_poll,
+        relay_client,
+        bad_wait_seconds,
+    ):
+        """Malformed API v1 relay wait values should not stop future polling."""
+        invalid_response = {'protocol': 'tokenplace_api_v1_relay_e2ee'}
+        if bad_wait_seconds != 'missing':
+            invalid_response['next_ping_in_x_seconds'] = bad_wait_seconds
+        next_response = {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'next_ping_in_x_seconds': 0.25,
+        }
+        mock_poll.side_effect = [invalid_response, next_response]
+
+        def stop_after_second_sleep(seconds):
+            if mock_sleep.call_count >= 2:
+                relay_client.stop()
+            return None
+
+        mock_sleep.side_effect = stop_after_second_sleep
+
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        assert mock_poll.call_count == 2
+        assert [call.args[0] for call in mock_process.call_args_list] == [
+            invalid_response,
+            next_response,
+        ]
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [
+            relay_client._request_timeout,
+            0.25,
+        ]
+        assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_survives_poll_exception(
+        self,
+        mock_sleep,
+        mock_process,
+        mock_poll,
+        relay_client,
+    ):
+        """Unexpected API v1 poll errors should sleep and keep the daemon alive."""
+        next_response = {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'next_ping_in_x_seconds': 0.5,
+        }
+        mock_poll.side_effect = [RuntimeError('temporary relay failure'), next_response]
+
+        def stop_after_second_sleep(seconds):
+            if mock_sleep.call_count >= 2:
+                relay_client.stop()
+            return None
+
+        mock_sleep.side_effect = stop_after_second_sleep
+
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        assert mock_poll.call_count == 2
+        mock_process.assert_called_once_with(next_response)
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [
+            relay_client._request_timeout,
+            0.5,
+        ]
+        assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')

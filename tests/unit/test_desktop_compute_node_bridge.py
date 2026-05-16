@@ -46,7 +46,7 @@ class FakeRelayClientRouting(FakeRelayClient):
         return True
 
     def process_api_v1_chat_request(self, payload):
-        self.endpoint_calls.append(('/relay/api/v1/source', payload))
+        self.endpoint_calls.append(('/api/v1/relay/responses', payload))
         return True
 
 
@@ -118,12 +118,14 @@ class ApiV1Runtime(FakeRuntime):
         self.relay_client = FakeRelayClientRouting()
         self._responses = [
             {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-1',
+                'client_public_key': 'client-key',
+                'chat_history': 'ciphertext',
+                'cipherkey': 'key',
+                'iv': 'iv',
                 'next_ping_in_x_seconds': 0,
-                'api_v1_request': {
-                    'request_id': 'req-1',
-                    'model': 'llama-3-8b-instruct',
-                    'messages': [{'role': 'user', 'content': 'hello'}],
-                },
             },
         ]
         self._processed = []
@@ -131,6 +133,31 @@ class ApiV1Runtime(FakeRuntime):
     def process_relay_request(self, payload):
         self._processed.append(payload)
         return self.relay_client.process_api_v1_chat_request(payload)
+
+
+class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
+    last_instance = None
+
+    def __init__(self, _config):
+        MalformedWaitThenApiV1Runtime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClientRouting()
+        self.relay_client._request_timeout = 2
+        self._responses = [
+            {'next_ping_in_x_seconds': 'not-a-number', 'error': None},
+            {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': 'req-after-bad-wait',
+                'client_public_key': 'client-key',
+                'chat_history': 'ciphertext',
+                'cipherkey': 'key',
+                'iv': 'iv',
+                'next_ping_in_x_seconds': 0,
+            },
+        ]
+        self._processed = []
+
 
 class ProcessingFailureRuntime(FakeRuntime):
     def __init__(self, _config):
@@ -254,10 +281,18 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         **kwargs,
     )
     module.ComputeNodeRuntime = runtime_cls
-    module.is_legacy_relay_payload = (
-        lambda payload: {"client_public_key", "chat_history", "cipherkey", "iv"}.issubset(payload)
+    module.is_api_v1_relay_payload = lambda payload: (
+        isinstance(payload, dict)
+        and payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee'
+        and payload.get('version') == 1
+        and all(isinstance(payload.get(key), str) for key in (
+            'request_id',
+            'client_public_key',
+            'chat_history',
+            'cipherkey',
+            'iv',
+        ))
     )
-    module.is_api_v1_relay_payload = lambda payload: isinstance(payload, dict) and 'api_v1_request' in payload
     module.resolve_relay_url = lambda relay_url, **_kwargs: relay_url
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     module.SUPPORTED_COMPUTE_MODES = supported_modes
@@ -289,7 +324,7 @@ def _reset_cancel_queue():
     compute_node_bridge._stdin_reader_started = True
 
 
-def test_run_emits_operator_status_events_and_processes_requests(capsys, monkeypatch):
+def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)
 
@@ -597,7 +632,7 @@ def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(capsy
     assert events[-1]['type'] == 'stopped'
 
 
-def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, monkeypatch):
+def test_run_ignores_legacy_shaped_ciphertext_payload(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=StreamingRuntime)
 
@@ -620,24 +655,17 @@ def test_run_streaming_payload_uses_shared_runtime_relay_client_path(capsys, mon
 
     runtime = StreamingRuntime.last_instance
     assert runtime is not None
-    assert len(runtime._processed) == 1
-    assert runtime._processed[0]['stream'] is True
-    assert runtime._processed[0]['stream_session_id'] == 'session-123'
+    assert runtime._processed == []
+    assert runtime.relay_client.endpoint_calls == []
 
-    assert len(runtime.relay_client.endpoint_calls) == 1
-    endpoint, payload = runtime.relay_client.endpoint_calls[0]
-    assert endpoint == '/stream/source'
-    assert payload['stream'] is True
-    assert payload['stream_session_id'] == 'session-123'
-
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
+    assert 'legacy_payload' not in output.err
 
 
-
-
-def test_run_api_v1_payload_uses_relay_api_v1_source_endpoint(capsys, monkeypatch):
+def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=ApiV1Runtime)
 
@@ -661,16 +689,55 @@ def test_run_api_v1_payload_uses_relay_api_v1_source_endpoint(capsys, monkeypatc
     runtime = ApiV1Runtime.last_instance
     assert runtime is not None
     assert len(runtime._processed) == 1
-    assert runtime._processed[0]['api_v1_request']['request_id'] == 'req-1'
+    assert runtime._processed[0]['request_id'] == 'req-1'
 
     assert len(runtime.relay_client.endpoint_calls) == 1
     endpoint, payload = runtime.relay_client.endpoint_calls[0]
-    assert endpoint == '/relay/api/v1/source'
-    assert payload['api_v1_request']['request_id'] == 'req-1'
+    assert endpoint == '/api/v1/relay/responses'
+    assert payload['request_id'] == 'req-1'
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
+
+
+def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MalformedWaitThenApiV1Runtime)
+
+    sleep_values = []
+
+    def fake_sleep_with_cancel(seconds):
+        sleep_values.append(seconds)
+        return False
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', fake_sleep_with_cancel)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    runtime = MalformedWaitThenApiV1Runtime.last_instance
+    assert runtime is not None
+    assert [payload['request_id'] for payload in runtime._processed] == ['req-after-bad-wait']
+    assert sleep_values[:2] == [2.0, 0.0]
+
+    output = capsys.readouterr()
+    assert 'wait=2.0' in output.err
+    assert 'request_id=req-after-bad-wait' in output.err
+
 
 def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     _reset_cancel_queue()
@@ -769,7 +836,7 @@ def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch
     assert 'update relay.py to repo HEAD' in actionable_errors[0]['last_error']
 
 
-def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, monkeypatch):
+def test_run_ignores_legacy_shaped_processing_failure(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=ProcessingFailureRuntime)
     call_count = {'n': 0}
@@ -793,7 +860,7 @@ def test_run_reports_error_when_legacy_relay_request_processing_fails(capsys, mo
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
     assert status_events[0]['registered'] is True
-    assert status_events[0]['last_error'] == 'failed to process relay request'
+    assert status_events[0]['last_error'] is None
 
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes(monkeypatch):
@@ -863,7 +930,6 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
         **kwargs,
     )
     module.ComputeNodeRuntime = CapturingRuntime
-    module.is_legacy_relay_payload = lambda _payload: False
     module.is_api_v1_relay_payload = lambda _payload: False
     module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
     module.normalize_compute_mode = lambda mode: mode
@@ -1008,9 +1074,6 @@ def resolve_relay_url(relay_url, **_kwargs):
 def resolve_relay_port(relay_port, _relay_url):
     return relay_port
 
-
-def is_legacy_relay_payload(_payload):
-    return False
 
 
 def is_api_v1_relay_payload(_payload):

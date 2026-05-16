@@ -639,12 +639,18 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         client_public_key_pem = base64.b64decode(client_public_key, validate=True)
         assert b"-----BEGIN PUBLIC KEY-----" in client_public_key_pem
 
-        process_request_lines = [
+        work_received_lines = [
             line
             for line in stderr_lines
-            if "desktop.compute_node_bridge.process_request" in line
+            if "desktop.compute_node_bridge.api_v1_e2ee.work_received" in line
         ]
-        assert process_request_lines, "desktop bridge should process encrypted relay requests"
+        assert work_received_lines, "desktop bridge should receive API v1 encrypted relay work"
+        response_submitted_lines = [
+            line
+            for line in stderr_lines
+            if "desktop.compute_node_bridge.api_v1_e2ee.response_submitted" in line
+        ]
+        assert response_submitted_lines, "desktop bridge should submit API v1 encrypted responses"
         bridge_stderr_text = "".join(stderr_lines)
         assert "E2EE_SENTINEL_SHOULD_NEVER_REACH_RELAY_PLAINTEXT" not in bridge_stderr_text
         assert "E2EE_SENTINEL_SHOULD_NEVER_LEAVE_PROCESS_AS_PLAINTEXT" not in bridge_stderr_text

@@ -7,6 +7,7 @@ import ipaddress
 import json
 import jsonschema
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -368,6 +369,7 @@ class RelayClient:
         )
         self._active_relay_index = 0
         self._sink_start_index = 0
+        self._last_api_v1_work_relay_url: Optional[str] = None
 
     @staticmethod
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
@@ -729,6 +731,12 @@ class RelayClient:
                     continue
                 payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
+                self._last_api_v1_work_relay_url = candidate_url
+                log_info(
+                    "API v1 relay poll route=/api/v1/relay/servers/poll api_v1_payload={} request_id={}",
+                    payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee',
+                    payload.get('request_id', 'none'),
+                )
                 return payload
             except Exception as exc:
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
@@ -738,6 +746,11 @@ class RelayClient:
             'error': 'No relay targets responded',
             'next_ping_in_x_seconds': self._request_timeout,
         }
+
+    def _api_v1_response_relay_url(self) -> str:
+        """Return the relay URL that supplied the current API v1 work item."""
+
+        return self._last_api_v1_work_relay_url or self.relay_url
 
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
         """
@@ -784,8 +797,12 @@ class RelayClient:
 
                 def _post_api_v1_source(response_envelope: Dict[str, Any]) -> bool:
                     try:
+                        bound_response_envelope = {
+                            **response_envelope,
+                            "client_public_key": client_pub_key_b64,
+                        }
                         encrypted_response = self.crypto_manager.encrypt_message(
-                            response_envelope,
+                            bound_response_envelope,
                             client_pub_key,
                         )
                         source_payload = {
@@ -802,12 +819,22 @@ class RelayClient:
                         if headers:
                             request_kwargs["headers"] = headers
 
+                        response_url = self._build_api_v1_url(
+                            self._api_v1_response_relay_url(),
+                            "/relay/responses",
+                        )
                         source_response = requests.post(
-                            self._build_api_v1_url(self.relay_url, "/relay/responses"),
+                            response_url,
                             timeout=self._request_timeout,
                             **request_kwargs,
                         )
-                        return source_response.status_code == 200
+                        submitted = source_response.status_code == 200
+                        log_info(
+                            "API v1 E2EE response submission request_id={} route=/api/v1/relay/responses submitted={}",
+                            response_envelope["request_id"],
+                            submitted,
+                        )
+                        return submitted
                     except Exception:
                         log_error(
                             "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
@@ -1051,6 +1078,38 @@ class RelayClient:
 
         log_error("Rejected disabled relay API v1 payload dispatch")
         return False
+
+    def _normalise_poll_wait_seconds(self, wait_seconds: Any) -> float:
+        """Return a safe non-negative polling delay for relay-provided wait values."""
+
+        if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
+            return float(self._request_timeout)
+
+        normalised_wait = float(wait_seconds)
+        if not math.isfinite(normalised_wait) or normalised_wait < 0:
+            return float(self._request_timeout)
+        return normalised_wait
+
+    def poll_api_v1_encrypted_work_continuously(self):  # pragma: no cover
+        """Continuously poll API v1 E2EE relay routes and process encrypted work."""
+
+        self.stop_polling = False
+        log_info("Starting API v1 E2EE relay polling loop")
+        while not self.stop_polling:
+            try:
+                relay_response = self.poll_api_v1_encrypted_work()
+                wait_seconds = self._request_timeout
+                if isinstance(relay_response, dict):
+                    wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                    if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+                        self.process_client_request(relay_response)
+                else:
+                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                time.sleep(wait_seconds)
+            except Exception as e:
+                log_error("Exception during API v1 E2EE polling loop: {}", str(e), exc_info=True)
+                time.sleep(self._request_timeout)
 
     def poll_relay_continuously(self):  # pragma: no cover
         """

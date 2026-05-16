@@ -3,6 +3,7 @@ Unit tests for the relay client module.
 """
 import base64
 import json
+import math
 import pytest
 import sys
 import requests
@@ -1301,6 +1302,63 @@ class TestRelayClient:
 
         # Verify post was not called
         mock_post.assert_not_called()
+
+    @pytest.mark.parametrize('bad_wait_seconds', [None, 'soon', -1, math.nan, math.inf])
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_coerces_invalid_wait(
+        self,
+        mock_sleep,
+        mock_process,
+        mock_poll,
+        relay_client,
+        bad_wait_seconds,
+    ):
+        """Invalid API v1 relay wait values should not kill the polling loop."""
+        relay_response = {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'next_ping_in_x_seconds': bad_wait_seconds,
+        }
+        mock_poll.return_value = relay_response
+
+        def stop_after_sleep(seconds):
+            relay_client.stop()
+            return None
+
+        mock_sleep.side_effect = stop_after_sleep
+
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        mock_poll.assert_called_once_with()
+        mock_process.assert_called_once_with(relay_response)
+        mock_sleep.assert_called_once_with(relay_client._request_timeout)
+        assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_survives_poll_exception(
+        self,
+        mock_sleep,
+        mock_poll,
+        relay_client,
+    ):
+        """Unexpected API v1 poll errors should sleep and keep the daemon alive."""
+        mock_poll.side_effect = RuntimeError('temporary relay failure')
+
+        def stop_after_sleep(seconds):
+            relay_client.stop()
+            return None
+
+        mock_sleep.side_effect = stop_after_sleep
+
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        mock_poll.assert_called_once_with()
+        mock_sleep.assert_called_once_with(relay_client._request_timeout)
+        assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')

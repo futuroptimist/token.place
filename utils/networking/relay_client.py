@@ -7,6 +7,7 @@ import ipaddress
 import json
 import jsonschema
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1078,6 +1079,16 @@ class RelayClient:
         log_error("Rejected disabled relay API v1 payload dispatch")
         return False
 
+    def _normalise_poll_wait_seconds(self, wait_seconds: Any) -> float:
+        """Return a safe non-negative polling delay for relay-provided wait values."""
+
+        if not isinstance(wait_seconds, (int, float)):
+            return float(self._request_timeout)
+
+        normalised_wait = float(wait_seconds)
+        if not math.isfinite(normalised_wait) or normalised_wait < 0:
+            return float(self._request_timeout)
+        return normalised_wait
 
     def poll_api_v1_encrypted_work_continuously(self):  # pragma: no cover
         """Continuously poll API v1 E2EE relay routes and process encrypted work."""
@@ -1085,13 +1096,20 @@ class RelayClient:
         self.stop_polling = False
         log_info("Starting API v1 E2EE relay polling loop")
         while not self.stop_polling:
-            relay_response = self.poll_api_v1_encrypted_work()
-            wait_seconds = self._request_timeout
-            if isinstance(relay_response, dict):
-                wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
-                if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
-                    self.process_client_request(relay_response)
-            time.sleep(wait_seconds)
+            try:
+                relay_response = self.poll_api_v1_encrypted_work()
+                wait_seconds = self._request_timeout
+                if isinstance(relay_response, dict):
+                    wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                    if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+                        self.process_client_request(relay_response)
+                else:
+                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                time.sleep(wait_seconds)
+            except Exception as e:
+                log_error("Exception during API v1 E2EE polling loop: {}", str(e), exc_info=True)
+                time.sleep(self._request_timeout)
 
     def poll_relay_continuously(self):  # pragma: no cover
         """

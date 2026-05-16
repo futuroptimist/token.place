@@ -302,8 +302,10 @@ class ComputeNodeRuntime:
         poll_target = getattr(
             self.relay_client,
             "poll_api_v1_encrypted_work_continuously",
-            self.relay_client.poll_relay_continuously,
+            None,
         )
+        if poll_target is None:
+            poll_target = self.relay_client.poll_relay_continuously
         relay_thread = self._thread_factory(
             target=poll_target,
             daemon=True,

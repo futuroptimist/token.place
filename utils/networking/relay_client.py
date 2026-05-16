@@ -752,6 +752,201 @@ class RelayClient:
 
         return self._last_api_v1_work_relay_url or self.relay_url
 
+    def _post_api_v1_e2ee_response(
+        self,
+        response_envelope: Dict[str, Any],
+        client_pub_key_b64: str,
+        client_pub_key: bytes,
+    ) -> bool:
+        """Encrypt and submit an API v1 E2EE response to the relay that supplied work."""
+
+        try:
+            bound_response_envelope = {
+                **response_envelope,
+                "client_public_key": client_pub_key_b64,
+            }
+            encrypted_response = self.crypto_manager.encrypt_message(
+                bound_response_envelope,
+                client_pub_key,
+            )
+            source_payload = {
+                "client_public_key": client_pub_key_b64,
+                "request_id": response_envelope["request_id"],
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                **encrypted_response,
+            }
+            request_kwargs = {
+                "json": source_payload,
+            }
+            headers = self._auth_headers()
+            if headers:
+                request_kwargs["headers"] = headers
+
+            response_url = self._build_api_v1_url(
+                self._api_v1_response_relay_url(),
+                "/relay/responses",
+            )
+            source_response = requests.post(
+                response_url,
+                timeout=self._request_timeout,
+                **request_kwargs,
+            )
+            submitted = source_response.status_code == 200
+            log_info(
+                "API v1 E2EE response submission request_id={} route=/api/v1/relay/responses submitted={}",
+                response_envelope["request_id"],
+                submitted,
+            )
+            return submitted
+        except Exception:
+            log_error(
+                "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _api_v1_response_envelope(
+        request_id: str,
+        *,
+        message: Optional[Dict[str, Any]] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        api_v1_response: Dict[str, Any]
+        if message is not None:
+            api_v1_response = {"message": message}
+        else:
+            api_v1_response = {
+                "error": {
+                    "code": error_code or "compute_node_internal_error",
+                    "message": error_message or "Compute node failed to process the request",
+                }
+            }
+
+        return {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": request_id,
+            "api_v1_response": api_v1_response,
+        }
+
+    def _desktop_runtime_supports_api_v1_model(self, requested_model: str) -> bool:
+        """Return whether the attached desktop runtime can satisfy the requested model id."""
+
+        requested = requested_model.strip()
+        if not requested:
+            return False
+
+        # The landing-page/API v1 default is backed by the packaged desktop model.
+        supported_names = {"llama-3-8b-instruct"}
+        for attr in ("model_id", "model_name", "file_name"):
+            value = getattr(self.model_manager, attr, None)
+            if isinstance(value, str) and value.strip():
+                supported_names.add(value.strip())
+
+        model_path = getattr(self.model_manager, "model_path", None)
+        if isinstance(model_path, str) and model_path.strip():
+            basename = os.path.basename(model_path.strip())
+            supported_names.add(model_path.strip())
+            supported_names.add(basename)
+            if "." in basename:
+                supported_names.add(basename.rsplit(".", 1)[0])
+
+        return requested in supported_names
+
+    def _generate_api_v1_response_with_runtime_model(
+        self,
+        model_id: str,
+        messages: List[Dict[str, Any]],
+        options: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
+        """Generate an API v1 assistant message using the attached desktop model manager."""
+
+        if not self._desktop_runtime_supports_api_v1_model(model_id):
+            return None, {
+                "code": "compute_node_model_unsupported",
+                "message": "Requested model is not available on this compute node",
+            }
+
+        if not hasattr(self.model_manager, "llama_cpp_get_response"):
+            return None, {
+                "code": "compute_node_model_unsupported",
+                "message": "Compute node runtime does not expose a supported inference backend",
+            }
+
+        supported_options = {"max_tokens", "temperature", "top_p", "stop"}
+        unsupported_options = sorted(set(options) - supported_options)
+        if unsupported_options:
+            return None, {
+                "code": "compute_node_options_unsupported",
+                "message": "Requested generation options are not supported by this compute node",
+            }
+
+        config = getattr(self.model_manager, "config", None)
+        original_config_values: Dict[str, Any] = {}
+        option_to_config_key = {
+            "max_tokens": "model.max_tokens",
+            "temperature": "model.temperature",
+            "top_p": "model.top_p",
+            "stop": "model.stop_tokens",
+        }
+        can_override_config = isinstance(config, dict)
+        if can_override_config:
+            for option_name, config_key in option_to_config_key.items():
+                if option_name in options:
+                    original_config_values[config_key] = config.get(config_key)
+                    config[config_key] = options[option_name]
+
+        try:
+            response_history = self.model_manager.llama_cpp_get_response(messages)
+        except Exception:
+            log_error(
+                "Runtime-model execution failed for API v1 relay request",
+                exc_info=True,
+            )
+            return None, {
+                "code": "compute_node_model_error",
+                "message": "Compute node model execution failed",
+            }
+        finally:
+            if can_override_config:
+                for config_key, original_value in original_config_values.items():
+                    if original_value is None:
+                        config.pop(config_key, None)
+                    else:
+                        config[config_key] = original_value
+
+        if not isinstance(response_history, list) or not response_history:
+            log_error("Runtime model returned invalid API v1 response history")
+            return None, {
+                "code": "compute_node_internal_error",
+                "message": "LLM returned invalid response history",
+            }
+
+        assistant_message = response_history[-1]
+        if not isinstance(assistant_message, dict):
+            log_error("Runtime model returned invalid API v1 assistant message")
+            return None, {
+                "code": "compute_node_internal_error",
+                "message": "LLM returned invalid assistant message",
+            }
+
+        content = assistant_message.get("content")
+        if (
+            assistant_message.get("role") != "assistant"
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            log_error("Runtime model returned invalid API v1 assistant content")
+            return None, {
+                "code": "compute_node_internal_error",
+                "message": "LLM returned invalid assistant response content",
+            }
+
+        return assistant_message, None
+
     def process_client_request(self, request_data: Dict[str, Any]) -> bool:
         """
         Process a client request from the relay.
@@ -793,178 +988,28 @@ class RelayClient:
                 client_pub_key_b64,
             )
             if api_v1_request_payload is not None:
-                from api.v1.models import ModelError, generate_response
+                assistant_message, runtime_error = self._generate_api_v1_response_with_runtime_model(
+                    api_v1_request_payload["model"],
+                    api_v1_request_payload["messages"],
+                    dict(api_v1_request_payload["options"]),
+                )
+                if runtime_error is not None:
+                    response_envelope = self._api_v1_response_envelope(
+                        api_v1_request_payload["request_id"],
+                        error_code=runtime_error["code"],
+                        error_message=runtime_error["message"],
+                    )
+                else:
+                    response_envelope = self._api_v1_response_envelope(
+                        api_v1_request_payload["request_id"],
+                        message=assistant_message,
+                    )
 
-                def _post_api_v1_source(response_envelope: Dict[str, Any]) -> bool:
-                    try:
-                        bound_response_envelope = {
-                            **response_envelope,
-                            "client_public_key": client_pub_key_b64,
-                        }
-                        encrypted_response = self.crypto_manager.encrypt_message(
-                            bound_response_envelope,
-                            client_pub_key,
-                        )
-                        source_payload = {
-                            "client_public_key": client_pub_key_b64,
-                            "request_id": response_envelope["request_id"],
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            **encrypted_response,
-                        }
-                        request_kwargs = {
-                            "json": source_payload,
-                        }
-                        headers = self._auth_headers()
-                        if headers:
-                            request_kwargs["headers"] = headers
-
-                        response_url = self._build_api_v1_url(
-                            self._api_v1_response_relay_url(),
-                            "/relay/responses",
-                        )
-                        source_response = requests.post(
-                            response_url,
-                            timeout=self._request_timeout,
-                            **request_kwargs,
-                        )
-                        submitted = source_response.status_code == 200
-                        log_info(
-                            "API v1 E2EE response submission request_id={} route=/api/v1/relay/responses submitted={}",
-                            response_envelope["request_id"],
-                            submitted,
-                        )
-                        return submitted
-                    except Exception:
-                        log_error(
-                            "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
-                            exc_info=True,
-                        )
-                        return False
-
-                api_v1_options = dict(api_v1_request_payload["options"])
-                try:
-                    response_history = generate_response(
-                        api_v1_request_payload["model"],
-                        api_v1_request_payload["messages"],
-                        **api_v1_options,
-                    )
-                    if not isinstance(response_history, list) or not response_history:
-                        log_error("LLM returned invalid API v1 response history")
-                        return _post_api_v1_source(
-                            {
-                                "protocol": "tokenplace_api_v1_relay_e2ee",
-                                "version": 1,
-                                "request_id": api_v1_request_payload["request_id"],
-                                "api_v1_response": {
-                                    "error": {
-                                        "code": "compute_node_internal_error",
-                                        "message": "LLM returned invalid response history",
-                                    }
-                                },
-                            }
-                        )
-                    assistant_message = response_history[-1]
-                    if not isinstance(assistant_message, dict):
-                        log_error("LLM returned invalid API v1 assistant message")
-                        return _post_api_v1_source(
-                            {
-                                "protocol": "tokenplace_api_v1_relay_e2ee",
-                                "version": 1,
-                                "request_id": api_v1_request_payload["request_id"],
-                                "api_v1_response": {
-                                    "error": {
-                                        "code": "compute_node_internal_error",
-                                        "message": "LLM returned invalid assistant message",
-                                    }
-                                },
-                            }
-                        )
-
-                    return _post_api_v1_source(
-                        {
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            "request_id": api_v1_request_payload["request_id"],
-                            "api_v1_response": {
-                                "message": assistant_message,
-                            },
-                        }
-                    )
-                except ModelError as exc:
-                    error_type = getattr(exc, "error_type", "")
-                    if error_type in {"model_not_found", "model_load_error"} and hasattr(
-                        self.model_manager, "llama_cpp_get_response"
-                    ):
-                        log_info(
-                            "API v1 relay request model '%s' unavailable (%s); "
-                            "falling back to active compute-node runtime model",
-                            api_v1_request_payload["model"],
-                            error_type,
-                        )
-                        try:
-                            fallback_response_history = self.model_manager.llama_cpp_get_response(
-                                api_v1_request_payload["messages"]
-                            )
-                        except Exception as fallback_exc:
-                            log_error(
-                                "Fallback runtime-model execution failed for API v1 relay request: {}",
-                                str(fallback_exc),
-                                exc_info=True,
-                            )
-                        else:
-                            if isinstance(fallback_response_history, list) and fallback_response_history:
-                                fallback_assistant_message = fallback_response_history[-1]
-                                if isinstance(fallback_assistant_message, dict):
-                                    return _post_api_v1_source(
-                                        {
-                                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                                            "version": 1,
-                                            "request_id": api_v1_request_payload["request_id"],
-                                            "api_v1_response": {
-                                                "message": fallback_assistant_message,
-                                            },
-                                        }
-                                    )
-                            log_error("Fallback runtime-model execution returned invalid API v1 output")
-
-                    model_error_code = (
-                        "compute_node_model_unsupported"
-                        if error_type == "model_not_found"
-                        else "compute_node_model_error"
-                    )
-                    return _post_api_v1_source(
-                        {
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            "request_id": api_v1_request_payload["request_id"],
-                            "api_v1_response": {
-                                "error": {
-                                    "code": model_error_code,
-                                    "message": str(exc),
-                                }
-                            },
-                        }
-                    )
-                except Exception as exc:
-                    log_error(
-                        "Unexpected error processing API v1 relay request: {}",
-                        str(exc),
-                        exc_info=True,
-                    )
-                    return _post_api_v1_source(
-                        {
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            "request_id": api_v1_request_payload["request_id"],
-                            "api_v1_response": {
-                                "error": {
-                                    "code": "compute_node_internal_error",
-                                    "message": "Unexpected internal error during inference",
-                                }
-                            },
-                        }
-                    )
+                return self._post_api_v1_e2ee_response(
+                    response_envelope,
+                    client_pub_key_b64,
+                    client_pub_key,
+                )
 
             chat_history = _extract_chat_history_and_validate_key_binding(
                 decrypted_chat_history,

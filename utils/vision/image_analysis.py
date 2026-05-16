@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import imghdr
 import re
 import struct
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -106,6 +105,31 @@ def _derive_dimensions(image_type: Optional[str], data: BytesLike) -> Tuple[Opti
     if not dimensions:
         return None, None
     return dimensions
+
+
+def _detect_image_type(data: BytesLike) -> Optional[str]:
+    """Return a lightweight image format label from magic bytes."""
+
+    header = bytes(data[:32])
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if header.startswith(b"\xff\xd8"):
+        return "jpeg"
+    if header[:6] in {b"GIF87a", b"GIF89a"}:
+        return "gif"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+class _ImageHeaderDetector:
+    def what(self, _file: object = None, h: BytesLike | None = None) -> Optional[str]:
+        if h is None:
+            return None
+        return _detect_image_type(h)
+
+
+imghdr = _ImageHeaderDetector()
 
 
 def analyze_base64_image(encoded: str) -> AnalysisRecord:

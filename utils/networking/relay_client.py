@@ -225,6 +225,19 @@ def _extract_api_v1_request_payload(
     }
 
 
+
+def _is_api_v1_relay_response_payload(payload: Dict[str, Any]) -> bool:
+    """Return whether a relay poll response is API v1 E2EE work."""
+
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+        return False
+    if payload.get("version") != 1:
+        return False
+    required = ("request_id", "client_public_key", "chat_history", "cipherkey", "iv")
+    return all(isinstance(payload.get(field), str) and payload.get(field) for field in required)
+
 class RelayClient:
     """
     Client for communicating with relay servers.
@@ -829,6 +842,7 @@ class RelayClient:
                                 "protocol": "tokenplace_api_v1_relay_e2ee",
                                 "version": 1,
                                 "request_id": api_v1_request_payload["request_id"],
+                                "client_public_key": client_pub_key_b64,
                                 "api_v1_response": {
                                     "error": {
                                         "code": "compute_node_internal_error",
@@ -845,6 +859,7 @@ class RelayClient:
                                 "protocol": "tokenplace_api_v1_relay_e2ee",
                                 "version": 1,
                                 "request_id": api_v1_request_payload["request_id"],
+                                "client_public_key": client_pub_key_b64,
                                 "api_v1_response": {
                                     "error": {
                                         "code": "compute_node_internal_error",
@@ -859,6 +874,7 @@ class RelayClient:
                             "protocol": "tokenplace_api_v1_relay_e2ee",
                             "version": 1,
                             "request_id": api_v1_request_payload["request_id"],
+                            "client_public_key": client_pub_key_b64,
                             "api_v1_response": {
                                 "message": assistant_message,
                             },
@@ -894,6 +910,7 @@ class RelayClient:
                                             "protocol": "tokenplace_api_v1_relay_e2ee",
                                             "version": 1,
                                             "request_id": api_v1_request_payload["request_id"],
+                                            "client_public_key": client_pub_key_b64,
                                             "api_v1_response": {
                                                 "message": fallback_assistant_message,
                                             },
@@ -911,6 +928,7 @@ class RelayClient:
                             "protocol": "tokenplace_api_v1_relay_e2ee",
                             "version": 1,
                             "request_id": api_v1_request_payload["request_id"],
+                            "client_public_key": client_pub_key_b64,
                             "api_v1_response": {
                                 "error": {
                                     "code": model_error_code,
@@ -930,6 +948,7 @@ class RelayClient:
                             "protocol": "tokenplace_api_v1_relay_e2ee",
                             "version": 1,
                             "request_id": api_v1_request_payload["request_id"],
+                            "client_public_key": client_pub_key_b64,
                             "api_v1_response": {
                                 "error": {
                                     "code": "compute_node_internal_error",
@@ -1053,73 +1072,42 @@ class RelayClient:
         return False
 
     def poll_relay_continuously(self):  # pragma: no cover
-        """
-        Continuously poll the relay for new chat messages and process them.
-        This method runs in an infinite loop and should be called in a separate thread.
+        """Continuously poll API v1 E2EE relay routes and process encrypted work."""
 
-        Call start() before running this method to set stop_polling to False.
-        Call stop() to terminate the polling loop cleanly.
-
-        Example:
-            ```python
-            import threading
-
-            # Create a thread for polling
-            relay_client.start()  # Allow polling to run
-            thread = threading.Thread(target=relay_client.poll_relay_continuously)
-            thread.daemon = True  # Thread will exit when main program exits
-            thread.start()
-
-            # Main program continues...
-
-            # Later when you want to stop polling:
-            relay_client.stop()
-            thread.join(timeout=10)  # Wait for thread to finish
-            ```
-        """
         if self.stop_polling:
-            log_info("Starting relay polling")
+            log_info("Starting API v1 relay polling")
             self.stop_polling = False
 
         while not self.stop_polling:
             try:
-                # Ping the relay and check for client requests
-                relay_response = self.ping_relay()
-
-                # Validate the relay response contains expected fields
+                relay_response = self.poll_api_v1_encrypted_work()
                 if not isinstance(relay_response, dict):
-                    log_error("Invalid relay response type: {}", type(relay_response))
+                    log_error("Invalid API v1 relay response type: {}", type(relay_response))
                     time.sleep(self._request_timeout)
                     continue
 
-                if 'next_ping_in_x_seconds' not in relay_response:
-                    log_error("Missing 'next_ping_in_x_seconds' in relay response")
-                    time.sleep(self._request_timeout)
-                    continue
-
-                if 'error' in relay_response:
-                    log_error("Error from relay: {}", relay_response['error'])
-                else:
-                    # Avoid logging potentially sensitive ciphertext or keys.
-                    # Only log the top-level keys present in the relay response.
-                    log_info(
-                        "Received data from relay with keys: {}",
-                        list(relay_response.keys())
-                    )
-
-                    # Check if there's a client request to process
-                    required_fields = ['client_public_key', 'chat_history', 'cipherkey', 'iv']
-                    if all(field in relay_response for field in required_fields):
-                        log_info("Processing client request...")
-                        self.process_client_request(relay_response)
-                    else:
-                        log_info("No client request data in sink response.")
-
-                # Sleep before the next ping
                 sleep_duration = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                if relay_response.get('error'):
+                    log_error("Error from API v1 relay: {}", relay_response['error'])
+                elif _is_api_v1_relay_response_payload(relay_response):
+                    log_info(
+                        "Processing API v1 relay request request_id={} protocol={} version={}",
+                        relay_response.get('request_id'),
+                        relay_response.get('protocol'),
+                        relay_response.get('version'),
+                    )
+                    processed = self.process_client_request(relay_response)
+                    log_info(
+                        "API v1 relay request processed request_id={} response_submitted={}",
+                        relay_response.get('request_id'),
+                        processed,
+                    )
+                else:
+                    log_info("No API v1 relay work available.")
+
                 log_info("Sleeping for {} seconds...", sleep_duration)
                 time.sleep(sleep_duration)
 
             except Exception as e:
-                log_error("Exception during polling loop: {}", str(e), exc_info=True)
-                time.sleep(self._request_timeout)  # Sleep for 10 seconds on error
+                log_error("Exception during API v1 polling loop: {}", str(e), exc_info=True)
+                time.sleep(self._request_timeout)

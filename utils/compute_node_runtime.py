@@ -297,7 +297,7 @@ class ComputeNodeRuntime:
         return False
 
     def start_relay_polling(self) -> threading.Thread:
-        """Start relay polling in a background thread and return the thread."""
+        """Start API v1 E2EE relay polling in a background thread and return it."""
 
         relay_thread = self._thread_factory(
             target=self.relay_client.poll_relay_continuously,

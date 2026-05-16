@@ -900,6 +900,30 @@ class TestRelayClient:
             timeout=relay_client._request_timeout
         )
 
+
+    @patch('utils.networking.relay_client.time.sleep', side_effect=KeyboardInterrupt("stop"))
+    def test_poll_relay_continuously_uses_api_v1_routes_only(self, mock_sleep, relay_client):
+        """Continuous polling must not fall back to legacy sink/source routes."""
+        api_v1_payload = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-loop",
+            "client_public_key": TEST_VALID_RESPONSE["client_public_key"],
+            "chat_history": "encrypted-request",
+            "cipherkey": "encrypted-key",
+            "iv": "encrypted-iv",
+            "next_ping_in_x_seconds": 0,
+        }
+        relay_client.stop_polling = True
+        relay_client.poll_api_v1_encrypted_work = MagicMock(return_value=api_v1_payload)
+        relay_client.process_client_request = MagicMock(return_value=True)
+
+        with pytest.raises(KeyboardInterrupt):
+            relay_client.poll_relay_continuously()
+
+        relay_client.poll_api_v1_encrypted_work.assert_called_once_with()
+        relay_client.process_client_request.assert_called_once_with(api_v1_payload)
+
     @patch('utils.networking.relay_client.requests.post')
     @patch('api.v1.models.generate_response')
     def test_process_client_request_api_v1_e2ee_success(
@@ -939,6 +963,12 @@ class TestRelayClient:
         result = relay_client.process_client_request(request_data)
 
         assert result is True
+        encrypted_response_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_response_envelope["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert encrypted_response_envelope["version"] == 1
+        assert encrypted_response_envelope["request_id"] == "req-123"
+        assert encrypted_response_envelope["client_public_key"] == request_data["client_public_key"]
+        assert encrypted_response_envelope["api_v1_response"]["message"]["content"] == "Hi there"
         mock_generate_response.assert_called_once_with(
             "llama-3-8b-instruct",
             [{"role": "user", "content": "Hello"}],
@@ -1252,13 +1282,19 @@ class TestRelayClient:
         # Verify post was not called
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
+    def test_poll_relay_continuously_with_client_request(self, mock_sleep, mock_process, mock_poll, relay_client):
         """Test the continuous polling with a client request."""
-        # Setup to return a client request on first call
-        mock_ping.side_effect = [TEST_VALID_RESPONSE]
+        # Setup to return an API v1 client request on first call
+        api_v1_response = {
+            **TEST_VALID_RESPONSE,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-loop-existing",
+        }
+        mock_poll.side_effect = [api_v1_response]
 
         # Start polling
         relay_client.start()
@@ -1274,20 +1310,20 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
-        mock_process.assert_called_once_with(TEST_VALID_RESPONSE)
+        assert mock_poll.call_count == 1
+        mock_process.assert_called_once_with(api_v1_response)
         mock_sleep.assert_called_once_with(5)  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_no_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
+    def test_poll_relay_continuously_no_client_request(self, mock_sleep, mock_process, mock_poll, relay_client):
         """Test the continuous polling without a client request."""
-        # Setup mock ping to return response without client request
-        mock_ping.side_effect = [TEST_NO_REQUEST_RESPONSE]
+        # Setup mock API v1 poll to return response without client request
+        mock_poll.side_effect = [TEST_NO_REQUEST_RESPONSE]
 
         # Start polling
         relay_client.start()
@@ -1303,19 +1339,19 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
+        assert mock_poll.call_count == 1
         mock_process.assert_not_called()
         mock_sleep.assert_called_once_with(5)  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_error(self, mock_sleep, mock_ping, relay_client):
+    def test_poll_relay_continuously_with_error(self, mock_sleep, mock_poll, relay_client):
         """Test the continuous polling with an error in the response."""
-        # Setup mock ping to return an error response
-        mock_ping.side_effect = [TEST_ERROR_RESPONSE]
+        # Setup mock API v1 poll to return an error response
+        mock_poll.side_effect = [TEST_ERROR_RESPONSE]
 
         # Start polling
         relay_client.start()
@@ -1331,18 +1367,18 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
+        assert mock_poll.call_count == 1
         mock_sleep.assert_called_once_with(10)  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_invalid_response(self, mock_sleep, mock_ping, relay_client):
+    def test_poll_relay_continuously_with_invalid_response(self, mock_sleep, mock_poll, relay_client):
         """Test polling with an invalid response (missing required fields)."""
-        # Setup mock ping to return an invalid response
-        mock_ping.side_effect = [{'invalid': 'response'}]  # Missing next_ping_in_x_seconds
+        # Setup mock API v1 poll to return an invalid response
+        mock_poll.side_effect = [{'invalid': 'response'}]  # Missing next_ping_in_x_seconds
 
         # Start polling
         relay_client.start()
@@ -1358,7 +1394,7 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
+        assert mock_poll.call_count == 1
         mock_sleep.assert_called_once_with(relay_client._request_timeout)  # Direct check of sleep call
 
         # Verify that polling was stopped

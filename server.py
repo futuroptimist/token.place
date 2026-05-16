@@ -193,7 +193,11 @@ def main():
         os.environ['USE_MOCK_LLM'] = '1'
         print("Running in mock LLM mode")
 
-    relay_url = _resolve_relay_url(args.relay_url)
+    relay_url_arg = args.relay_url
+    default_relay_url = config.get("relay.server_url", "https://token.place")
+    if args.relay_port is not None and relay_url_arg == default_relay_url:
+        relay_url_arg = "http://localhost"
+    relay_url = _resolve_relay_url(relay_url_arg)
     relay_port = _resolve_relay_port(args.relay_port, relay_url)
 
     # Create and run the server

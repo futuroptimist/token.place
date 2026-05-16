@@ -100,7 +100,7 @@ def _relay_response_summary(relay_response: Dict[str, Any]) -> str:
     wait_seconds = relay_response.get("next_ping_in_x_seconds", "missing")
 
     return (
-        f"keys={keys} has_legacy_payload={has_payload} "
+        f"keys={keys} has_ciphertext_payload={has_payload} "
         f"has_heartbeat={has_heartbeat} wait={wait_seconds} "
         f"error={relay_error or 'none'}"
     )
@@ -204,7 +204,6 @@ def run(args: argparse.Namespace) -> int:
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_api_v1_relay_payload,
-            is_legacy_relay_payload,
             resolve_relay_port,
             resolve_relay_url,
         )
@@ -282,16 +281,15 @@ def run(args: argparse.Namespace) -> int:
             print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
-            legacy_payload = is_legacy_relay_payload(relay_response)
             api_v1_payload = is_api_v1_relay_payload(relay_response)
             relay_error = _relay_error_message(relay_response)
             has_heartbeat = "next_ping_in_x_seconds" in relay_response
-            registered = relay_error is None and (has_heartbeat or api_v1_payload or legacy_payload)
+            registered = relay_error is None and (has_heartbeat or api_v1_payload)
 
             print(
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
+                f"api_v1_payload={api_v1_payload} "
                 f"summary={_relay_response_summary(relay_response)}",
                 file=sys.stderr,
             )
@@ -299,7 +297,7 @@ def run(args: argparse.Namespace) -> int:
             print(
                 "desktop.compute_node_bridge.api_v1_e2ee.poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"legacy_payload={legacy_payload} api_v1_payload={api_v1_payload} "
+                f"api_v1_payload={api_v1_payload} "
                 f"summary={_relay_response_summary(relay_response)}",
                 file=sys.stderr,
             )
@@ -312,7 +310,7 @@ def run(args: argparse.Namespace) -> int:
                         "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
                         "operator; update relay.py to repo HEAD"
                     )
-            elif api_v1_payload or legacy_payload:
+            elif api_v1_payload:
                 print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,

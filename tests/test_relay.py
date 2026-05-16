@@ -1035,6 +1035,8 @@ def test_streaming_state_lifecycle(client):
 
 
 def test_api_v1_relay_route_contract_e2ee_flow(client):
+    plaintext_request_sentinel = "PLAINTEXT_REQUEST_SENTINEL_DO_NOT_STORE"
+    plaintext_response_sentinel = "PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE"
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     register = client.post('/api/v1/relay/servers/register', json=server_payload)
     assert register.status_code == 200
@@ -1051,6 +1053,7 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     }
     queued = client.post('/api/v1/relay/requests', json=request_payload)
     assert queued.status_code == 200
+    assert plaintext_request_sentinel not in json.dumps(client_inference_requests)
 
     poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 200
@@ -1074,8 +1077,19 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     }
     source = client.post('/api/v1/relay/responses', json=response_payload)
     assert source.status_code == 200
+    assert plaintext_response_sentinel not in json.dumps(client_responses)
 
-    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    stale = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'stale-req'},
+    )
+    assert stale.status_code == 404
+    assert DUMMY_CLIENT_PUB_KEY in client_responses
+
+    retrieved = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-123'},
+    )
     assert retrieved.status_code == 200
     retrieved_payload = retrieved.get_json()
     assert retrieved_payload['chat_history'] == 'ciphertext-response'

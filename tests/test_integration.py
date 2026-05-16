@@ -121,11 +121,21 @@ def test_faucet_endpoint(setup_servers):
     server_public_key_b64 = response.json()['server_public_key']
     server_public_key = base64.b64decode(server_public_key_b64)
 
-    # Prepare the chat history with the "hello" message
-    chat_history = [{"role": "user", "content": "hello"}]
+    request_id = "integration-api-v1-req"
+    request_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": request_id,
+        "client_public_key": public_key_b64,
+        "api_v1_request": {
+            "model": "llama-3-8b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+            "options": {},
+        },
+    }
 
-    # Encrypt the chat history
-    ciphertext_dict, cipherkey, iv = encrypt(json.dumps(chat_history).encode('utf-8'), server_public_key)
+    # Encrypt the API v1 E2EE envelope
+    ciphertext_dict, cipherkey, iv = encrypt(json.dumps(request_envelope).encode('utf-8'), server_public_key)
     encrypted_chat_history_b64 = base64.b64encode(ciphertext_dict['ciphertext']).decode('utf-8')
     iv_b64 = base64.b64encode(iv).decode('utf-8')
     encrypted_cipherkey_b64 = base64.b64encode(cipherkey).decode('utf-8')
@@ -134,6 +144,9 @@ def test_faucet_endpoint(setup_servers):
     payload = {
         "client_public_key": public_key_b64,
         "server_public_key": server_public_key_b64,
+        "request_id": request_id,
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
         "chat_history": encrypted_chat_history_b64,
         "cipherkey": encrypted_cipherkey_b64,
         "iv": iv_b64,
@@ -152,7 +165,10 @@ def test_faucet_endpoint(setup_servers):
     start_time = time.time()
     timeout = 60  # Timeout in seconds
     while True:
-        response = requests.post(f'{base_url}/api/v1/relay/responses/retrieve', json={"client_public_key": public_key_b64})
+        response = requests.post(
+            f'{base_url}/api/v1/relay/responses/retrieve',
+            json={"client_public_key": public_key_b64, "request_id": request_id},
+        )
         if response.status_code == 200:
             data = response.json()
             if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:
@@ -164,10 +180,11 @@ def test_faucet_endpoint(setup_servers):
 
                 if decrypted_chat_history is not None:
                     decrypted_response = json.loads(decrypted_chat_history.decode('utf-8'))
-                    assert len(decrypted_response) == 2
-                    assert decrypted_response[0]['role'] == 'user'
-                    assert decrypted_response[0]['content'] == 'hello'
-                    assert decrypted_response[1]['role'] == 'assistant'
+                    assert decrypted_response['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+                    assert decrypted_response['request_id'] == request_id
+                    assistant_message = decrypted_response['api_v1_response']['message']
+                    assert assistant_message['role'] == 'assistant'
+                    assert assistant_message['content']
                     return  # Exit the loop if the response is successfully decrypted
 
         elapsed_time = time.time() - start_time

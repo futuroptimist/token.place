@@ -40,13 +40,11 @@ class FakeRelayClientRouting(FakeRelayClient):
 
     def process_client_request(self, payload):
         endpoint = '/source'
-        if payload.get('stream') is True and payload.get('stream_session_id'):
+        if payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+            endpoint = '/api/v1/relay/responses'
+        elif payload.get('stream') is True and payload.get('stream_session_id'):
             endpoint = '/stream/source'
         self.endpoint_calls.append((endpoint, payload))
-        return True
-
-    def process_api_v1_chat_request(self, payload):
-        self.endpoint_calls.append(('/api/v1/relay/responses', payload))
         return True
 
 
@@ -132,7 +130,7 @@ class ApiV1Runtime(FakeRuntime):
 
     def process_relay_request(self, payload):
         self._processed.append(payload)
-        return self.relay_client.process_api_v1_chat_request(payload)
+        return self.relay_client.process_client_request(payload)
 
 
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
@@ -696,9 +694,13 @@ def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypa
     assert endpoint == '/api/v1/relay/responses'
     assert payload['request_id'] == 'req-1'
 
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.work_received' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
+    assert "ModuleNotFoundError: No module named 'api'" not in output.err
 
 
 def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):

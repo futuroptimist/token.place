@@ -845,7 +845,7 @@ class RelayClient:
 
     @staticmethod
     def _api_v1_content_is_valid(content: Any) -> bool:
-        """Mirror API v1 chat content validation before invoking a runtime."""
+        """Mirror API v1 text-only chat content validation before runtime use."""
 
         if isinstance(content, str):
             return True
@@ -859,26 +859,6 @@ class RelayClient:
             item_type = item.get("type")
             if item_type in {"input_text", "text"}:
                 if not isinstance(item.get("text"), str) or not item.get("text"):
-                    return False
-                continue
-
-            if item_type == "image_url":
-                image_url = item.get("image_url")
-                url_value = image_url.get("url") if isinstance(image_url, dict) else image_url
-                if not isinstance(url_value, str) or not url_value:
-                    return False
-                continue
-
-            if item_type == "input_image":
-                image_payload = item.get("image") or item.get("image_url")
-                if not isinstance(image_payload, dict):
-                    return False
-                encoded = (
-                    image_payload.get("b64_json")
-                    or image_payload.get("base64")
-                    or image_payload.get("data")
-                )
-                if not isinstance(encoded, str) or not encoded:
                     return False
                 continue
 
@@ -903,7 +883,7 @@ class RelayClient:
 
     @staticmethod
     def _api_v1_stringify_content_blocks(content: Any) -> Any:
-        """Collapse OpenAI-style content blocks into llama.cpp-compatible text."""
+        """Collapse text-only OpenAI-style content blocks for llama.cpp."""
 
         if isinstance(content, str) or content is None:
             return content
@@ -922,19 +902,6 @@ class RelayClient:
                     segments.append(text_value.strip())
                 continue
 
-            if block_type == "image_url":
-                image_url = block.get("image_url")
-                url_value = image_url.get("url") if isinstance(image_url, dict) else image_url
-                if isinstance(url_value, str) and url_value.strip():
-                    if url_value.lstrip().lower().startswith("data:"):
-                        segments.append("[Inline image attached]")
-                    else:
-                        segments.append(f"[Image: {url_value.strip()}]")
-                continue
-
-            if block_type in {"input_image", "image"}:
-                segments.append("[Inline image attached]")
-
         if not segments:
             return ""
         return "\n\n".join(segments)
@@ -943,7 +910,7 @@ class RelayClient:
     def _normalise_api_v1_chat_messages(
         cls, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Return API v1 messages with structured content blocks collapsed to text."""
+        """Return API v1 messages with text content blocks collapsed to text."""
 
         normalised: List[Dict[str, Any]] = []
         for message in messages:

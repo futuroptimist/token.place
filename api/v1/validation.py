@@ -290,48 +290,11 @@ def validate_chat_messages(messages: List[Dict[str, Any]]) -> None:
                         )
                     continue
 
-                if item_type == "image_url":
-                    image_url = item.get("image_url")
-                    if isinstance(image_url, dict):
-                        url_value = image_url.get("url")
-                    else:
-                        url_value = image_url
-                    if not isinstance(url_value, str) or not url_value:
-                        raise ValidationError(
-                            f"messages[{i}].content[{j}].image_url.url must be a non-empty string",
-                            field="messages",
-                        )
-                    continue
-
-                if item_type == "input_image":
-                    image_payload = item.get("image") or item.get("image_url")
-                    if not isinstance(image_payload, dict):
-                        raise ValidationError(
-                            f"messages[{i}].content[{j}].image must be an object",
-                            field="messages",
-                        )
-
-                    encoded = (
-                        image_payload.get("b64_json")
-                        or image_payload.get("base64")
-                        or image_payload.get("data")
+                if item_type in {"image_url", "input_image", "image"}:
+                    raise ValidationError(
+                        "API v1 chat completions are text-only and do not support image content",
+                        field="messages",
                     )
-
-                    if not isinstance(encoded, str) or not encoded:
-                        raise ValidationError(
-                            f"messages[{i}].content[{j}].image must include base64 data",
-                            field="messages",
-                        )
-
-                    try:
-                        base64.b64decode(encoded, validate=True)
-                    except Exception as exc:  # pragma: no cover - defensive branch
-                        raise ValidationError(
-                            f"messages[{i}].content[{j}].image must contain valid base64 data",
-                            field="messages",
-                        ) from exc
-
-                    continue
 
                 raise ValidationError(
                     f"Unsupported content type in messages[{i}]: {item_type}",
@@ -341,7 +304,7 @@ def validate_chat_messages(messages: List[Dict[str, Any]]) -> None:
             continue
 
         raise ValidationError(
-            f"messages[{i}].content must be a string or array of content blocks",
+            f"messages[{i}].content must be a string or array of text content blocks",
             field="messages",
         )
 

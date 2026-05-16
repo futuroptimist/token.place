@@ -1027,7 +1027,7 @@ class TestRelayClient:
         mock_crypto_manager,
         mock_model_manager,
     ):
-        """OpenAI-style content blocks should be flattened before llama.cpp inference."""
+        """OpenAI-style text content blocks are flattened before llama.cpp inference."""
 
         request_data = TEST_VALID_RESPONSE.copy()
         mock_crypto_manager.decrypt_message.return_value = {
@@ -1043,7 +1043,6 @@ class TestRelayClient:
                         "content": [
                             {"type": "text", "text": "First segment"},
                             {"type": "input_text", "text": "Second segment"},
-                            {"type": "image_url", "image_url": "https://example.test/a.png"},
                         ],
                     }
                 ],
@@ -1060,10 +1059,52 @@ class TestRelayClient:
             [
                 {
                     "role": "user",
-                    "content": "First segment\n\nSecond segment\n\n[Image: https://example.test/a.png]",
+                    "content": "First segment\n\nSecond segment",
                 }
             ]
         )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_image_content_blocks(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """API v1 relay chat is text-only and must fail closed for images."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-image-content",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Describe this."},
+                            {"type": "input_image", "image": {"b64_json": "ZmFrZQ=="}},
+                        ],
+                    }
+                ],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_invalid_request"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_e2ee_posts_response_to_polling_relay(

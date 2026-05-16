@@ -102,7 +102,7 @@ def test_analyze_base64_image_orientation_variants(monkeypatch):
     assert analysis["orientation"] == "portrait"
 
     # Force an unknown type to exercise the graceful fallback path
-    monkeypatch.setattr(ia.imghdr, "what", lambda *_a, **_k: None)
+    monkeypatch.setattr(ia, "_detect_image_type", lambda *_a, **_k: None)
     analysis = ia.analyze_base64_image(png_landscape)
     assert analysis["format"] is None
     assert analysis["width"] is None

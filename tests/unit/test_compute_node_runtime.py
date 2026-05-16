@@ -135,6 +135,36 @@ def test_compute_node_runtime_polling_thread_supports_api_v1_only_relay_client()
     thread.start.assert_called_once_with()
 
 
+def test_compute_node_runtime_polling_thread_falls_back_to_legacy_poller_when_api_v1_absent():
+    class LegacyOnlyRelayClient:
+        def __init__(self):
+            self.poll_relay_continuously = MagicMock()
+
+    relay_client = LegacyOnlyRelayClient()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+    thread = MagicMock()
+
+    def fake_thread_factory(*, target, daemon):
+        assert target == relay_client.poll_relay_continuously
+        assert daemon is True
+        return thread
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+        thread_factory=fake_thread_factory,
+    )
+
+    created_thread = runtime.start_relay_polling()
+
+    assert created_thread is thread
+    thread.start.assert_called_once_with()
+
+
 def test_compute_node_runtime_request_flow_delegates_to_relay_client():
     relay_client = MagicMock()
     relay_client.process_client_request.return_value = True

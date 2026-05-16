@@ -1082,7 +1082,7 @@ class RelayClient:
     def _normalise_poll_wait_seconds(self, wait_seconds: Any) -> float:
         """Return a safe non-negative polling delay for relay-provided wait values."""
 
-        if not isinstance(wait_seconds, (int, float)):
+        if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
             return float(self._request_timeout)
 
         normalised_wait = float(wait_seconds)

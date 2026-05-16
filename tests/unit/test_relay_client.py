@@ -1303,11 +1303,14 @@ class TestRelayClient:
         # Verify post was not called
         mock_post.assert_not_called()
 
-    @pytest.mark.parametrize('bad_wait_seconds', [None, 'soon', -1, math.nan, math.inf])
+    @pytest.mark.parametrize(
+        'bad_wait_seconds',
+        ['missing', None, 'soon', True, -1, math.nan, math.inf],
+    )
     @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_api_v1_encrypted_work_continuously_coerces_invalid_wait(
+    def test_poll_api_v1_encrypted_work_continuously_coerces_invalid_wait_and_keeps_polling(
         self,
         mock_sleep,
         mock_process,
@@ -1315,49 +1318,70 @@ class TestRelayClient:
         relay_client,
         bad_wait_seconds,
     ):
-        """Invalid API v1 relay wait values should not kill the polling loop."""
-        relay_response = {
+        """Malformed API v1 relay wait values should not stop future polling."""
+        invalid_response = {'protocol': 'tokenplace_api_v1_relay_e2ee'}
+        if bad_wait_seconds != 'missing':
+            invalid_response['next_ping_in_x_seconds'] = bad_wait_seconds
+        next_response = {
             'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'next_ping_in_x_seconds': bad_wait_seconds,
+            'next_ping_in_x_seconds': 0.25,
         }
-        mock_poll.return_value = relay_response
+        mock_poll.side_effect = [invalid_response, next_response]
 
-        def stop_after_sleep(seconds):
-            relay_client.stop()
+        def stop_after_second_sleep(seconds):
+            if mock_sleep.call_count >= 2:
+                relay_client.stop()
             return None
 
-        mock_sleep.side_effect = stop_after_sleep
+        mock_sleep.side_effect = stop_after_second_sleep
 
         relay_client.start()
         relay_client.poll_api_v1_encrypted_work_continuously()
 
-        mock_poll.assert_called_once_with()
-        mock_process.assert_called_once_with(relay_response)
-        mock_sleep.assert_called_once_with(relay_client._request_timeout)
+        assert mock_poll.call_count == 2
+        assert [call.args[0] for call in mock_process.call_args_list] == [
+            invalid_response,
+            next_response,
+        ]
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [
+            relay_client._request_timeout,
+            0.25,
+        ]
         assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
     def test_poll_api_v1_encrypted_work_continuously_survives_poll_exception(
         self,
         mock_sleep,
+        mock_process,
         mock_poll,
         relay_client,
     ):
         """Unexpected API v1 poll errors should sleep and keep the daemon alive."""
-        mock_poll.side_effect = RuntimeError('temporary relay failure')
+        next_response = {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'next_ping_in_x_seconds': 0.5,
+        }
+        mock_poll.side_effect = [RuntimeError('temporary relay failure'), next_response]
 
-        def stop_after_sleep(seconds):
-            relay_client.stop()
+        def stop_after_second_sleep(seconds):
+            if mock_sleep.call_count >= 2:
+                relay_client.stop()
             return None
 
-        mock_sleep.side_effect = stop_after_sleep
+        mock_sleep.side_effect = stop_after_second_sleep
 
         relay_client.start()
         relay_client.poll_api_v1_encrypted_work_continuously()
 
-        mock_poll.assert_called_once_with()
-        mock_sleep.assert_called_once_with(relay_client._request_timeout)
+        assert mock_poll.call_count == 2
+        mock_process.assert_called_once_with(next_response)
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [
+            relay_client._request_timeout,
+            0.5,
+        ]
         assert relay_client.stop_polling is True
 
     @patch('utils.networking.relay_client.RelayClient.ping_relay')

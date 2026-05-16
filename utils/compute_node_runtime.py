@@ -54,7 +54,7 @@ LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "
 
 
 def is_legacy_relay_payload(payload: Dict[str, Any]) -> bool:
-    """Return whether ``payload`` matches the legacy relay sink/source contract."""
+    """Return whether ``payload`` matches the deprecated relay contract."""
 
     if not isinstance(payload, dict):
         return False
@@ -91,7 +91,7 @@ class RelayRequestAdapter(Protocol):
 
 
 class LegacyRelayRequestAdapter:
-    """Compatibility adapter for the existing relay sink/source request shape."""
+    """Compatibility adapter for the existing deprecated relay request shape."""
 
     def __init__(self, relay_client: "RelayClient"):
         self._relay_client = relay_client
@@ -299,8 +299,13 @@ class ComputeNodeRuntime:
     def start_relay_polling(self) -> threading.Thread:
         """Start relay polling in a background thread and return the thread."""
 
+        poll_target = getattr(
+            self.relay_client,
+            "poll_api_v1_encrypted_work_continuously",
+            self.relay_client.poll_relay_continuously,
+        )
         relay_thread = self._thread_factory(
-            target=self.relay_client.poll_relay_continuously,
+            target=poll_target,
             daemon=True,
         )
         relay_thread.start()

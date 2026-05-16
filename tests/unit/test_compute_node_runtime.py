@@ -79,6 +79,7 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()
+    relay_client.poll_api_v1_encrypted_work_continuously = MagicMock()
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
     crypto_manager = MagicMock()
@@ -86,7 +87,7 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
     thread = MagicMock()
 
     def fake_thread_factory(*, target, daemon):
-        assert target == relay_client.poll_relay_continuously
+        assert target == relay_client.poll_api_v1_encrypted_work_continuously
         assert daemon is True
         return thread
 

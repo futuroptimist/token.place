@@ -945,6 +945,18 @@ class TestRelayClient:
             temperature=0.2,
             max_tokens=50,
         )
+        mock_crypto_manager.encrypt_message.assert_called_with(
+            {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": "req-123",
+                "client_public_key": request_data["client_public_key"],
+                "api_v1_response": {
+                    "message": {"role": "assistant", "content": "Hi there"},
+                },
+            },
+            base64.b64decode(request_data["client_public_key"], validate=True),
+        )
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/responses',
             json={
@@ -957,6 +969,44 @@ class TestRelayClient:
                 'iv': 'encrypted_iv',
             },
             timeout=relay_client._request_timeout,
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
+    @patch('api.v1.models.generate_response')
+    def test_process_client_request_api_v1_e2ee_posts_response_to_polling_relay(
+        self,
+        mock_generate_response,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """API v1 responses should be submitted to the relay that supplied the work."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        relay_client._last_api_v1_work_relay_url = 'https://relay-that-polled.example'
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-polled-relay",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_generate_response.return_value = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        assert mock_post.call_args.args[0] == (
+            'https://relay-that-polled.example/api/v1/relay/responses'
         )
 
     @patch('utils.networking.relay_client.requests.post')

@@ -979,6 +979,93 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_adapter_model_uses_shared_llama_runtime(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """API v1 adapter IDs should share the local Llama base runtime."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-adapter",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct:alignment",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        runtime_messages = mock_model_manager.llama_cpp_get_response.call_args.args[0]
+        assert runtime_messages[0]["role"] == "system"
+        assert runtime_messages[0]["name"] == "adapter:llama-3-8b-instruct:alignment"
+        assert "alignment-focused variant" in runtime_messages[0]["content"]
+        assert runtime_messages[1] == {"role": "user", "content": "Hello"}
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert "error" not in encrypted_envelope["api_v1_response"]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_normalises_multipart_content_blocks(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """OpenAI-style content blocks should be flattened before llama.cpp inference."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-multipart",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "First segment"},
+                            {"type": "input_text", "text": "Second segment"},
+                            {"type": "image_url", "image_url": "https://example.test/a.png"},
+                        ],
+                    }
+                ],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
+            [
+                {
+                    "role": "user",
+                    "content": "First segment\n\nSecond segment\n\n[Image: https://example.test/a.png]",
+                }
+            ]
+        )
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_e2ee_posts_response_to_polling_relay(
         self,
         mock_post,
@@ -1125,24 +1212,77 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_process_client_request_api_v1_unsupported_options_posts_encrypted_error(
+    def test_process_client_request_api_v1_forwards_openai_options_with_defaults(
         self,
         mock_post,
         relay_client,
         mock_crypto_manager,
-        mock_model_manager,
     ):
-        """Unsupported API v1 options produce encrypted errors instead of plaintext failures."""
+        """OpenAI-style API v1 options should pass through with manager defaults."""
+
+        class _Config:
+            def get(self, key, default):
+                return {
+                    "model.max_tokens": 64,
+                    "model.temperature": 0.7,
+                    "model.top_p": 0.9,
+                    "model.stop_tokens": ["</s>"],
+                }.get(key, default)
+
+        class _Runtime:
+            def __init__(self):
+                self.calls = []
+
+            def create_chat_completion(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Tool-aware response",
+                            }
+                        }
+                    ]
+                }
+
+        class _Manager:
+            use_mock_llm = False
+            api_model_id = None
+            model_id = None
+            file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+            model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+
+            def __init__(self):
+                self.config = _Config()
+                self.runtime = _Runtime()
+
+            def llama_cpp_get_response(self, _messages):
+                raise AssertionError("direct runtime should receive supported options")
+
+            def get_llm_instance(self):
+                return self.runtime
+
         request_data = TEST_VALID_RESPONSE.copy()
+        manager = _Manager()
+        relay_client.model_manager = manager
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
-            "request_id": "req-unsupported-options",
+            "request_id": "req-openai-options",
             "client_public_key": request_data["client_public_key"],
             "api_v1_request": {
                 "model": "llama-3-8b-instruct",
                 "messages": [{"role": "user", "content": "Hello"}],
-                "options": {"tools": []},
+                "options": {
+                    "frequency_penalty": 0.1,
+                    "presence_penalty": 0.2,
+                    "response_format": {"type": "text"},
+                    "seed": 7,
+                    "temperature": 0.2,
+                    "tools": [],
+                    "tool_choice": "none",
+                },
             },
         }
         source_response = MagicMock()
@@ -1151,12 +1291,24 @@ class TestRelayClient:
 
         assert relay_client.process_client_request(request_data) is True
 
+        assert len(manager.runtime.calls) == 1
+        completion_kwargs = manager.runtime.calls[0]
+        assert completion_kwargs["messages"] == [{"role": "user", "content": "Hello"}]
+        assert completion_kwargs["max_tokens"] == 64
+        assert completion_kwargs["top_p"] == 0.9
+        assert completion_kwargs["stop"] == ["</s>"]
+        assert completion_kwargs["stream"] is True
+        assert completion_kwargs["temperature"] == 0.2
+        assert completion_kwargs["frequency_penalty"] == 0.1
+        assert completion_kwargs["presence_penalty"] == 0.2
+        assert completion_kwargs["response_format"] == {"type": "text"}
+        assert completion_kwargs["seed"] == 7
+        assert completion_kwargs["tools"] == []
+        assert completion_kwargs["tool_choice"] == "none"
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_options_unsupported"
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
+            "Tool-aware response"
         )
-        mock_model_manager.llama_cpp_get_response.assert_not_called()
-        assert mock_post.call_args.kwargs["json"]["request_id"] == "req-unsupported-options"
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_rejects_mismatched_bound_client_key(

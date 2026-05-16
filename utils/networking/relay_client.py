@@ -857,6 +857,99 @@ class RelayClient:
                 return False
         return True
 
+    @staticmethod
+    def _api_v1_stringify_content_blocks(content: Any) -> Any:
+        """Collapse OpenAI-style content blocks into llama.cpp-compatible text."""
+
+        if isinstance(content, str) or content is None:
+            return content
+        if not isinstance(content, list):
+            return content
+
+        segments: List[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = block.get("type")
+            if block_type in {"input_text", "text"}:
+                text_value = block.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    segments.append(text_value.strip())
+                continue
+
+            if block_type == "image_url":
+                image_url = block.get("image_url")
+                url_value = image_url.get("url") if isinstance(image_url, dict) else image_url
+                if isinstance(url_value, str) and url_value.strip():
+                    if url_value.lstrip().lower().startswith("data:"):
+                        segments.append("[Inline image attached]")
+                    else:
+                        segments.append(f"[Image: {url_value.strip()}]")
+                continue
+
+            if block_type in {"input_image", "image"}:
+                segments.append("[Inline image attached]")
+
+        if not segments:
+            return ""
+        return "\n\n".join(segments)
+
+    @classmethod
+    def _normalise_api_v1_chat_messages(
+        cls, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Return API v1 messages with structured content blocks collapsed to text."""
+
+        normalised: List[Dict[str, Any]] = []
+        for message in messages:
+            updated = dict(message)
+            updated["content"] = cls._api_v1_stringify_content_blocks(
+                message.get("content")
+            )
+            normalised.append(updated)
+        return normalised
+
+    @staticmethod
+    def _api_v1_adapter_system_message(model_id: str) -> Optional[Dict[str, str]]:
+        """Return local API v1 adapter instructions that do not require server imports."""
+
+        adapter_instructions = {
+            "llama-3-8b-instruct:alignment": (
+                "You are the alignment-focused variant of Meta Llama 3.1 8B. "
+                "Follow the provided safety charter to remain helpful, honest, "
+                "harmless, and to call out uncertain answers."
+            ),
+        }
+        instructions = adapter_instructions.get(model_id.strip().lower())
+        if not instructions:
+            return None
+        return {
+            "role": "system",
+            "name": f"adapter:{model_id.strip().lower()}",
+            "content": instructions,
+        }
+
+    @classmethod
+    def _prepare_api_v1_runtime_messages(
+        cls, model_id: str, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Apply API v1 server-compatible adapter and content normalization."""
+
+        prepared = cls._normalise_api_v1_chat_messages(messages)
+        adapter_message = cls._api_v1_adapter_system_message(model_id)
+        if adapter_message is None:
+            return prepared
+
+        already_injected = any(
+            message.get("role") == "system"
+            and message.get("name") == adapter_message["name"]
+            for message in prepared
+        )
+        if not already_injected:
+            prepared.insert(0, adapter_message)
+        return prepared
+
     def _runtime_model_can_satisfy(self, model_id: str) -> bool:
         """Return whether the attached desktop runtime can serve the requested model.
 
@@ -869,6 +962,7 @@ class RelayClient:
         normalized_model = model_id.strip().lower()
         if not normalized_model:
             return False
+        base_model = normalized_model.split(":", 1)[0]
         if bool(getattr(self.model_manager, "use_mock_llm", False)):
             return True
 
@@ -882,13 +976,13 @@ class RelayClient:
             )
             if value
         }
-        if normalized_model in configured_ids:
+        if normalized_model in configured_ids or base_model in configured_ids:
             return True
 
         if not configured_ids and callable(
             getattr(self.model_manager, "llama_cpp_get_response", None)
         ):
-            return normalized_model.startswith("llama-")
+            return base_model.startswith("llama-")
 
         # The desktop runtime defaults to Meta Llama 3/3.1 GGUFs, while API v1
         # exposes the stable catalogue ID used by the landing-page chat.
@@ -898,15 +992,26 @@ class RelayClient:
             "meta/llama-3.1-8b-instruct",
             "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
         }
-        return llama_runtime and normalized_model in llama_api_ids
+        return llama_runtime and (
+            normalized_model in llama_api_ids or base_model in llama_api_ids
+        )
 
     @staticmethod
     def _api_v1_supported_options(options: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-        unsupported = sorted(
-            key
-            for key in options
-            if key not in {"max_tokens", "temperature", "top_p", "stop", "stream"}
-        )
+        passthrough_options = {
+            "frequency_penalty",
+            "max_tokens",
+            "presence_penalty",
+            "response_format",
+            "seed",
+            "stop",
+            "stream",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
+        }
+        unsupported = sorted(key for key in options if key not in passthrough_options)
         if unsupported:
             return False, ", ".join(unsupported)
         if options.get("stream") is True:
@@ -1013,6 +1118,54 @@ class RelayClient:
             )
         return self._api_v1_response_envelope(request_id, message=assistant_message)
 
+    def _api_v1_runtime_completion_kwargs(
+        self, safe_options: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Merge API v1 options with model-manager defaults for direct completions."""
+
+        config = getattr(self.model_manager, "config", None)
+        config_get = getattr(config, "get", None)
+
+        def configured(key: str, default: Any) -> Any:
+            if callable(config_get):
+                return config_get(key, default)
+            return default
+
+        completion_kwargs = {
+            "max_tokens": configured("model.max_tokens", 512),
+            "temperature": configured("model.temperature", 0.7),
+            "top_p": configured("model.top_p", 0.9),
+            "stop": configured("model.stop_tokens", []),
+            "stream": True,
+        }
+        completion_kwargs.update(safe_options)
+        return completion_kwargs
+
+    def _assistant_message_from_runtime_completion(
+        self, completion: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Extract an API v1 assistant message from direct llama.cpp output."""
+
+        if (
+            isinstance(completion, dict)
+            and isinstance(completion.get("choices"), list)
+            and completion["choices"]
+            and isinstance(completion["choices"][0], dict)
+        ):
+            return self._valid_api_v1_assistant_message(
+                completion["choices"][0].get("message")
+            )
+
+        consume_stream = getattr(self.model_manager, "_consume_streaming_completion", None)
+        if callable(consume_stream):
+            try:
+                return self._valid_api_v1_assistant_message(consume_stream(completion))
+            except Exception:
+                log_error("Failed to consume streaming API v1 runtime completion", exc_info=True)
+                return None
+
+        return None
+
     def _generate_api_v1_response_with_runtime_model(
         self,
         *,
@@ -1074,6 +1227,7 @@ class RelayClient:
             )
 
         safe_options = {key: value for key, value in options.items() if key != "stream"}
+        runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
             if safe_options and has_direct_runtime_completion:
@@ -1089,18 +1243,24 @@ class RelayClient:
                             ),
                         },
                     )
+
+                completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
                 completion = create_chat_completion(
-                    messages=list(messages),
-                    **safe_options,
+                    messages=runtime_messages,
+                    **completion_kwargs,
                 )
-                if (
-                    isinstance(completion, dict)
-                    and isinstance(completion.get("choices"), list)
-                    and completion["choices"]
-                    and isinstance(completion["choices"][0], dict)
-                ):
-                    assistant_message = self._valid_api_v1_assistant_message(
-                        completion["choices"][0].get("message")
+                assistant_message = self._assistant_message_from_runtime_completion(
+                    completion
+                )
+                if assistant_message is None and completion_kwargs.get("stream") is True:
+                    fallback_kwargs = dict(completion_kwargs)
+                    fallback_kwargs["stream"] = False
+                    completion = create_chat_completion(
+                        messages=runtime_messages,
+                        **fallback_kwargs,
+                    )
+                    assistant_message = self._assistant_message_from_runtime_completion(
+                        completion
                     )
             else:
                 if not has_runtime_chat:
@@ -1111,7 +1271,7 @@ class RelayClient:
                             "message": "Desktop runtime does not expose chat inference",
                         },
                     )
-                response_history = llama_cpp_get_response(list(messages))
+                response_history = llama_cpp_get_response(list(runtime_messages))
                 if isinstance(response_history, list) and response_history:
                     assistant_message = self._valid_api_v1_assistant_message(
                         response_history[-1]

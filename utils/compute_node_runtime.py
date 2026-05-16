@@ -304,8 +304,10 @@ class ComputeNodeRuntime:
             "poll_api_v1_encrypted_work_continuously",
             None,
         )
-        if poll_target is None:
-            poll_target = self.relay_client.poll_relay_continuously
+        if not callable(poll_target):
+            raise RuntimeError(
+                "API v1 E2EE relay polling is required; legacy relay polling is deprecated"
+            )
         relay_thread = self._thread_factory(
             target=poll_target,
             daemon=True,

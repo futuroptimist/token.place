@@ -389,6 +389,7 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
     assert captured["model"] == "llama-3-8b-instruct:alignment"
     assert captured["messages"] == [{"role": "user", "content": "hello"}]
     assert captured["options"] == {"temperature": 0.2, "max_tokens": 42}
+    assert crypto_stub.last_encrypted_payload["client_public_key"] == DUMMY_CLIENT_PUB_KEY
     assert crypto_stub.last_encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
 
 

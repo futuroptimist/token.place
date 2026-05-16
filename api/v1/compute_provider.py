@@ -212,6 +212,7 @@ class DistributedApiV1ComputeProvider:
             "version": 1,
             "request_id": relay_request_id,
             "client_public_key": crypto_manager.public_key_b64,
+            "server_public_key": server_public_key,
             "api_v1_request": {
                 "model": model_id,
                 "messages": messages,
@@ -316,6 +317,10 @@ class DistributedApiV1ComputeProvider:
                 continue
 
             if decrypted_response.get("request_id") != relay_request_id:
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                continue
+
+            if decrypted_response.get("client_public_key") != crypto_manager.public_key_b64:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 

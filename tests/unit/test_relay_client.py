@@ -960,6 +960,65 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_e2ee_uses_runtime_fallback_when_api_import_fails(
+        self,
+        mock_post,
+        monkeypatch,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """API v1 relay processing should still submit encrypted responses if API imports fail."""
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-import-fallback",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        mock_crypto_manager.encrypt_message.return_value = {
+            'chat_history': 'encrypted_chat_history',
+            'cipherkey': 'encrypted_key',
+            'iv': 'encrypted_iv',
+        }
+
+        real_import = __import__
+
+        def import_without_api_models(name, *args, **kwargs):
+            if name == 'api.v1.models':
+                raise ModuleNotFoundError("simulated unavailable API model module")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr('builtins.__import__', import_without_api_models)
+
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        result = relay_client.process_client_request(request_data)
+
+        assert result is True
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}]
+        )
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert encrypted_envelope["version"] == 1
+        assert encrypted_envelope["request_id"] == "req-import-fallback"
+        assert encrypted_envelope["client_public_key"] == request_data["client_public_key"]
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
+            "The capital of France is Paris."
+        )
+        posted_url = mock_post.call_args.args[0]
+        assert posted_url == 'http://localhost:5000/api/v1/relay/responses'
+        assert not posted_url.endswith('/source')
+
+    @patch('utils.networking.relay_client.requests.post')
     @patch('api.v1.models.generate_response')
     def test_process_client_request_api_v1_e2ee_rejects_mismatched_bound_key(
         self,
@@ -1252,13 +1311,19 @@ class TestRelayClient:
         # Verify post was not called
         mock_post.assert_not_called()
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
+    def test_poll_relay_continuously_with_client_request(self, mock_sleep, mock_process, mock_poll, relay_client):
         """Test the continuous polling with a client request."""
-        # Setup to return a client request on first call
-        mock_ping.side_effect = [TEST_VALID_RESPONSE]
+        # Setup to return an API v1 E2EE client request on first call
+        api_v1_work = {
+            **TEST_VALID_RESPONSE,
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'request_id': 'req-poll-loop',
+        }
+        mock_poll.side_effect = [api_v1_work]
 
         # Start polling
         relay_client.start()
@@ -1274,20 +1339,20 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
-        mock_process.assert_called_once_with(TEST_VALID_RESPONSE)
+        assert mock_poll.call_count == 1
+        mock_process.assert_called_once_with(api_v1_work)
         mock_sleep.assert_called_once_with(5)  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_no_client_request(self, mock_sleep, mock_process, mock_ping, relay_client):
+    def test_poll_relay_continuously_no_client_request(self, mock_sleep, mock_process, mock_poll, relay_client):
         """Test the continuous polling without a client request."""
-        # Setup mock ping to return response without client request
-        mock_ping.side_effect = [TEST_NO_REQUEST_RESPONSE]
+        # Setup mock poll to return response without client request
+        mock_poll.side_effect = [TEST_NO_REQUEST_RESPONSE]
 
         # Start polling
         relay_client.start()
@@ -1303,19 +1368,19 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
+        assert mock_poll.call_count == 1
         mock_process.assert_not_called()
         mock_sleep.assert_called_once_with(5)  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_error(self, mock_sleep, mock_ping, relay_client):
+    def test_poll_relay_continuously_with_error(self, mock_sleep, mock_poll, relay_client):
         """Test the continuous polling with an error in the response."""
-        # Setup mock ping to return an error response
-        mock_ping.side_effect = [TEST_ERROR_RESPONSE]
+        # Setup mock poll to return an error response
+        mock_poll.side_effect = [TEST_ERROR_RESPONSE]
 
         # Start polling
         relay_client.start()
@@ -1331,18 +1396,18 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
+        assert mock_poll.call_count == 1
         mock_sleep.assert_called_once_with(10)  # Direct check of sleep call
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
 
-    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
     @patch('utils.networking.relay_client.time.sleep')
-    def test_poll_relay_continuously_with_invalid_response(self, mock_sleep, mock_ping, relay_client):
+    def test_poll_relay_continuously_with_invalid_response(self, mock_sleep, mock_poll, relay_client):
         """Test polling with an invalid response (missing required fields)."""
-        # Setup mock ping to return an invalid response
-        mock_ping.side_effect = [{'invalid': 'response'}]  # Missing next_ping_in_x_seconds
+        # Setup mock poll to return an invalid response
+        mock_poll.side_effect = [{'invalid': 'response'}]  # Missing next_ping_in_x_seconds
 
         # Start polling
         relay_client.start()
@@ -1358,7 +1423,7 @@ class TestRelayClient:
         relay_client.poll_relay_continuously()
 
         # Verify mock calls
-        assert mock_ping.call_count == 1
+        assert mock_poll.call_count == 1
         mock_sleep.assert_called_once_with(relay_client._request_timeout)  # Direct check of sleep call
 
         # Verify that polling was stopped

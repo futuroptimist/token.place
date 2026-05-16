@@ -113,6 +113,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
                     "protocol": "legacy_protocol",
                     "version": 1,
                     "request_id": "stale",
+                    "client_public_key": fake_crypto.public_key_b64,
                     "api_v1_response": {
                         "message": {"role": "assistant", "content": "ignore stale"},
                     },
@@ -126,6 +127,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
                 "protocol": "tokenplace_api_v1_relay_e2ee",
                 "version": 1,
                 "request_id": fake_crypto._encrypted["cipher-1"]["request_id"],
+                "client_public_key": fake_crypto.public_key_b64,
                 "api_v1_response": {
                     "message": {"role": "assistant", "content": "Distributed secure response"},
                 },
@@ -149,7 +151,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
-    relay_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
+    encrypted_request = fake_crypto._encrypted["cipher-1"]
+    relay_request_id = encrypted_request["request_id"]
+    assert encrypted_request["server_public_key"] == "server-public-key"
     expected_retrieve_payload = {
         "client_public_key": fake_crypto.public_key_b64,
         "request_id": relay_request_id,
@@ -410,6 +414,7 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
                     "protocol": "tokenplace_api_v1_relay_e2ee",
                     "version": 1,
                     "request_id": latest_request_id,
+                    "client_public_key": fake_crypto.public_key_b64,
                     "api_v1_response": "not-a-dict",
                 }
             else:
@@ -417,6 +422,7 @@ def test_distributed_compute_provider_maps_compute_node_payload_errors(monkeypat
                     "protocol": "tokenplace_api_v1_relay_e2ee",
                     "version": 1,
                     "request_id": latest_request_id,
+                    "client_public_key": fake_crypto.public_key_b64,
                     "api_v1_response": {"error": {"code": "compute_node_model_error"}},
                 }
             encrypted_response = fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64)
@@ -631,6 +637,7 @@ def test_distributed_compute_provider_maps_missing_assistant_message(monkeypatch
                 "protocol": "tokenplace_api_v1_relay_e2ee",
                 "version": 1,
                 "request_id": latest_request_id,
+                "client_public_key": fake_crypto.public_key_b64,
                 "api_v1_response": {"message": "not-a-dict"},
             }
             encrypted_response = fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64)

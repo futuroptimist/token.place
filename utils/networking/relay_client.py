@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -753,7 +753,6 @@ class RelayClient:
 
         return self._last_api_v1_work_relay_url or self.relay_url
 
-
     @staticmethod
     def _api_v1_response_envelope(
         request_id: str,
@@ -845,7 +844,50 @@ class RelayClient:
         return None
 
     @staticmethod
-    def _messages_are_valid_api_v1_chat(messages: Any) -> bool:
+    def _api_v1_content_is_valid(content: Any) -> bool:
+        """Mirror API v1 chat content validation before invoking a runtime."""
+
+        if isinstance(content, str):
+            return True
+        if not isinstance(content, list) or not content:
+            return False
+
+        for item in content:
+            if not isinstance(item, dict):
+                return False
+
+            item_type = item.get("type")
+            if item_type in {"input_text", "text"}:
+                if not isinstance(item.get("text"), str) or not item.get("text"):
+                    return False
+                continue
+
+            if item_type == "image_url":
+                image_url = item.get("image_url")
+                url_value = image_url.get("url") if isinstance(image_url, dict) else image_url
+                if not isinstance(url_value, str) or not url_value:
+                    return False
+                continue
+
+            if item_type == "input_image":
+                image_payload = item.get("image") or item.get("image_url")
+                if not isinstance(image_payload, dict):
+                    return False
+                encoded = (
+                    image_payload.get("b64_json")
+                    or image_payload.get("base64")
+                    or image_payload.get("data")
+                )
+                if not isinstance(encoded, str) or not encoded:
+                    return False
+                continue
+
+            return False
+
+        return True
+
+    @classmethod
+    def _messages_are_valid_api_v1_chat(cls, messages: Any) -> bool:
         if not isinstance(messages, list) or not messages:
             return False
         for message in messages:
@@ -854,6 +896,8 @@ class RelayClient:
             if not isinstance(message.get("role"), str):
                 return False
             if "content" not in message:
+                return False
+            if not cls._api_v1_content_is_valid(message.get("content")):
                 return False
         return True
 
@@ -950,19 +994,110 @@ class RelayClient:
             prepared.insert(0, adapter_message)
         return prepared
 
-    def _runtime_model_can_satisfy(self, model_id: str) -> bool:
-        """Return whether the attached desktop runtime can serve the requested model.
+    @staticmethod
+    def _api_v1_models_module() -> Optional[Any]:
+        """Return the optional repo API v1 models module when it is importable."""
 
-        The packaged desktop bridge owns a single already-initialized runtime model.
-        Accept the API v1 landing-page Llama identifiers when the runtime is a
-        Llama-family manager or mock; reject unrelated model IDs instead of
-        silently substituting the desktop model as a successful response.
-        """
+        try:
+            return importlib.import_module("api.v1.models")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalised_model_ids_from_api_v1_entry(entry: Dict[str, Any]) -> Set[str]:
+        """Extract comparable model identifiers from one API v1 catalogue entry."""
+
+        ids = {
+            str(value).strip().lower()
+            for value in (
+                entry.get("id"),
+                entry.get("base_model_id"),
+                entry.get("file_name"),
+                os.path.basename(str(entry.get("file_name", ""))),
+            )
+            if value
+        }
+        return {model_id for model_id in ids if model_id}
+
+    @classmethod
+    def _api_v1_catalogue_ids_for_configured_runtime(
+        cls, configured_ids: Set[str]
+    ) -> Set[str]:
+        """Return API v1 catalogue IDs served by the configured local runtime."""
+
+        models_module = cls._api_v1_models_module()
+        if models_module is None:
+            return set()
+
+        get_models_info = getattr(models_module, "get_models_info", None)
+        if not callable(get_models_info):
+            return set()
+
+        try:
+            entries = get_models_info()
+        except Exception:
+            return set()
+
+        runtime_catalogue_ids: Set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_ids = cls._normalised_model_ids_from_api_v1_entry(entry)
+            if entry_ids & configured_ids:
+                runtime_catalogue_ids.update(entry_ids)
+
+        aliases = getattr(models_module, "MODEL_ALIASES", {})
+        if isinstance(aliases, dict):
+            for alias, target in aliases.items():
+                alias_id = str(alias).strip().lower()
+                target_id = str(target).strip().lower()
+                if target_id in runtime_catalogue_ids:
+                    runtime_catalogue_ids.add(alias_id)
+
+        return runtime_catalogue_ids
+
+    @classmethod
+    def _api_v1_catalogue_resolved_model_id(cls, model_id: str) -> str:
+        """Resolve API v1 model aliases when the catalogue module is available."""
+
+        models_module = cls._api_v1_models_module()
+        if models_module is None:
+            return model_id
+
+        resolve_model_alias = getattr(models_module, "resolve_model_alias", None)
+        if callable(resolve_model_alias):
+            try:
+                resolved = resolve_model_alias(model_id)
+            except Exception:
+                resolved = None
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved.strip().lower()
+
+        aliases = getattr(models_module, "MODEL_ALIASES", {})
+        if isinstance(aliases, dict):
+            resolved = aliases.get(model_id)
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved.strip().lower()
+
+        return model_id
+
+    def _runtime_model_can_satisfy(self, model_id: str) -> bool:
+        """Return whether the attached desktop runtime can serve the requested model."""
 
         normalized_model = model_id.strip().lower()
         if not normalized_model:
             return False
+
+        supports_api_v1_model = getattr(self.model_manager, "supports_api_v1_model", None)
+        manager_defines_supports_model = callable(
+            getattr(type(self.model_manager), "supports_api_v1_model", None)
+        )
+        if callable(supports_api_v1_model) and manager_defines_supports_model:
+            return bool(supports_api_v1_model(normalized_model))
+
         base_model = normalized_model.split(":", 1)[0]
+        resolved_model = self._api_v1_catalogue_resolved_model_id(normalized_model)
+        resolved_base_model = resolved_model.split(":", 1)[0]
         if bool(getattr(self.model_manager, "use_mock_llm", False)):
             return True
 
@@ -976,25 +1111,20 @@ class RelayClient:
             )
             if value
         }
-        if normalized_model in configured_ids or base_model in configured_ids:
+        requested_ids = {normalized_model, base_model, resolved_model, resolved_base_model}
+        if requested_ids & configured_ids:
             return True
 
-        if not configured_ids and callable(
-            getattr(self.model_manager, "llama_cpp_get_response", None)
-        ):
-            return base_model.startswith("llama-")
+        catalogue_ids = self._api_v1_catalogue_ids_for_configured_runtime(configured_ids)
+        if requested_ids & catalogue_ids:
+            return True
 
-        # The desktop runtime defaults to Meta Llama 3/3.1 GGUFs, while API v1
-        # exposes the stable catalogue ID used by the landing-page chat.
+        has_runtime_chat = callable(getattr(self.model_manager, "llama_cpp_get_response", None))
+        if not configured_ids and has_runtime_chat:
+            return "llama" in resolved_base_model
+
         llama_runtime = any("llama" in configured_id for configured_id in configured_ids)
-        llama_api_ids = {
-            "llama-3-8b-instruct",
-            "meta/llama-3.1-8b-instruct",
-            "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
-        }
-        return llama_runtime and (
-            normalized_model in llama_api_ids or base_model in llama_api_ids
-        )
+        return llama_runtime and "llama" in resolved_base_model
 
     @staticmethod
     def _api_v1_supported_options(options: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -1026,18 +1156,18 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         options: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Best-effort non-desktop API v1 model path for repo-local tests.
+        """Best-effort API v1 server-model fallback when the module is importable.
 
-        Packaged desktop success never depends on this optional server module.
+        Packaged desktop success never depends on this optional server module;
+        this fallback supports repo-local/server contexts that intentionally ship it.
         """
 
-        try:
-            models_module = importlib.import_module("api.v1.models")
-        except ModuleNotFoundError:
+        models_module = self._api_v1_models_module()
+        if models_module is None:
             return None
 
         model_error_cls = getattr(models_module, "ModelError", Exception)
-        response_generator = getattr(models_module, "generate_" + "response", None)
+        response_generator = getattr(models_module, "generate_response", None)
         if not callable(response_generator):
             return None
 
@@ -1227,6 +1357,17 @@ class RelayClient:
             )
 
         safe_options = {key: value for key, value in options.items() if key != "stream"}
+        if safe_options and not has_direct_runtime_completion:
+            return self._api_v1_response_envelope(
+                request_id,
+                error={
+                    "code": "compute_node_options_unsupported",
+                    "message": (
+                        "Requested options require direct runtime completion support"
+                    ),
+                },
+            )
+
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None

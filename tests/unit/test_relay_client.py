@@ -1212,6 +1212,120 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_uses_manager_model_support_hook(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Runtime-specific API v1 model support hooks are the source of truth."""
+
+        class _Manager:
+            use_mock_llm = False
+
+            def __init__(self):
+                self.checked_model_ids = []
+
+            def supports_api_v1_model(self, model_id):
+                self.checked_model_ids.append(model_id)
+                return model_id == "custom-local-api-v1-model"
+
+            def llama_cpp_get_response(self, messages):
+                return messages + [{"role": "assistant", "content": "custom ok"}]
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        manager = _Manager()
+        relay_client.model_manager = manager
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-hook-model",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "custom-local-api-v1-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        assert manager.checked_model_ids == ["custom-local-api-v1-model"]
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == "custom ok"
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_invalid_content_posts_invalid_request(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Invalid content types should fail before reaching llama.cpp."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-invalid-content",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": None}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_invalid_request"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_options_without_direct_runtime(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Supported options are not silently dropped when only chat-history APIs exist."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-options-no-direct-runtime",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {"temperature": 0.2},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_options_unsupported"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_forwards_openai_options_with_defaults(
         self,
         mock_post,

@@ -181,6 +181,7 @@ class TestRelayClient:
             {"role": "user", "content": "What is the capital of France?"},
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
+        mock.use_mock_llm = True
         return mock
 
     @pytest.fixture
@@ -1251,6 +1252,45 @@ class TestRelayClient:
         assert mock_post.call_args.kwargs["json"]["request_id"] == (
             "req-unsupported-model"
         )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_rejects_wrong_llama_family_model(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """A configured Llama runtime must not satisfy arbitrary Llama-family IDs."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/tmp/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-wrong-llama",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-70b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_model_unsupported"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_uses_manager_model_support_hook(

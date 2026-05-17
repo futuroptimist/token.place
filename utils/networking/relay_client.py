@@ -1064,8 +1064,7 @@ class RelayClient:
 
         base_model = normalized_model.split(":", 1)[0]
         resolved_model = self._api_v1_catalogue_resolved_model_id(normalized_model)
-        resolved_base_model = resolved_model.split(":", 1)[0]
-        if bool(getattr(self.model_manager, "use_mock_llm", False)):
+        if getattr(self.model_manager, "use_mock_llm", False) is True:
             return True
 
         configured_ids = {
@@ -1078,7 +1077,7 @@ class RelayClient:
             )
             if value
         }
-        requested_ids = {normalized_model, base_model, resolved_model, resolved_base_model}
+        requested_ids = {normalized_model, base_model, resolved_model}
         if requested_ids & configured_ids:
             return True
 
@@ -1086,12 +1085,7 @@ class RelayClient:
         if requested_ids & catalogue_ids:
             return True
 
-        has_runtime_chat = callable(getattr(self.model_manager, "llama_cpp_get_response", None))
-        if not configured_ids and has_runtime_chat:
-            return "llama" in resolved_base_model
-
-        llama_runtime = any("llama" in configured_id for configured_id in configured_ids)
-        return llama_runtime and "llama" in resolved_base_model
+        return False
 
     @staticmethod
     def _api_v1_supported_options(options: Dict[str, Any]) -> Tuple[bool, Optional[str]]:

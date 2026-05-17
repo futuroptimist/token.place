@@ -2296,3 +2296,21 @@ class TestRelayClient:
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
+
+
+def test_runtime_model_can_satisfy_packaged_llama_3_8b_file_alias():
+    class PackagedModelManager:
+        file_name = "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+
+        def llama_cpp_get_response(self, messages):  # pragma: no cover - not called
+            return [*messages, {"role": "assistant", "content": "ok"}]
+
+    relay_client = RelayClient(
+        base_url="http://localhost",
+        port=5000,
+        crypto_manager=MagicMock(),
+        model_manager=PackagedModelManager(),
+        include_configured_servers=False,
+    )
+
+    assert relay_client._runtime_model_can_satisfy("llama-3-8b-instruct") is True

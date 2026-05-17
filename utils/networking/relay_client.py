@@ -258,6 +258,7 @@ class RelayClient:
         "llama-3-8b-instruct",
         "meta/llama-3.1-8b-instruct",
         "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
+        "meta-llama-3-8b-instruct.q4_k_m.gguf",
     }
     _API_V1_LOCAL_MODEL_ALIASES = {
         "gpt-3.5-turbo": "llama-3-8b-instruct",

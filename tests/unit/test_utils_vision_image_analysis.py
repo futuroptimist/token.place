@@ -146,3 +146,31 @@ def test_summarize_analysis_variants():
     assert "2. UNKNOWN image" in summary
 
     assert ia.summarize_analysis([]) == "Vision analysis unavailable."
+
+
+def test_decode_base64_image_rejects_invalid_alphabet():
+    """Invalid base64 should raise the stable helper ValueError."""
+
+    with pytest.raises(ValueError, match="not valid base64"):
+        ia._decode_base64_image("not valid!!!")
+
+
+def test_detect_image_type_variants():
+    """Header detection replaces imghdr for supported formats."""
+
+    assert ia._detect_image_type(_make_png(1, 1)) == "png"
+    assert ia._detect_image_type(_make_gif(1, 2)) == "gif"
+    assert ia._detect_image_type(_make_jpeg(3, 4)) == "jpeg"
+    assert ia._detect_image_type(b"plain text") is None
+
+
+def test_jpeg_dimension_extractor_skips_padding_and_eoi_markers():
+    """JPEG parsing should tolerate non-marker bytes and stop cleanly at EOI."""
+
+    assert ia._extract_jpeg_dimensions(b"\xff\xd8\x00\xff\xd9") is None
+
+
+def test_summarize_analysis_omits_optional_segments_when_absent():
+    """Summaries should remain useful when dimensions and orientation are unavailable."""
+
+    assert ia.summarize_analysis({"format": "gif"}) == "Vision analysis: GIF image."

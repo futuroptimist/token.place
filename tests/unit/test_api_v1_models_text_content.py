@@ -97,3 +97,28 @@ def test_generate_response_normalises_text_blocks(monkeypatch):
     assert captured["messages"][0]["content"] == "First segment\n\nSecond segment"
     assert result[-1]["role"] == "assistant"
     assert result[-1]["content"] == "Acknowledged."
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (None, "content must be text-only"),
+        (123, "content must be text-only"),
+        ([{"type": "text", "text": ""}], "Invalid text-only content block"),
+        ([{"type": "text"}], "Invalid text-only content block"),
+        (["raw block"], "Invalid text-only content block"),
+    ],
+)
+def test_generate_response_rejects_invalid_text_content_shapes(monkeypatch, content, expected):
+    """API v1 should return precise request errors before runtime invocation."""
+
+    monkeypatch.setattr(models, "USE_MOCK_LLM", True)
+
+    with pytest.raises(models.ModelError) as exc:
+        models.generate_response(
+            "llama-3-8b-instruct",
+            [{"role": "user", "content": content}],
+        )
+
+    assert exc.value.status_code == 400
+    assert expected in exc.value.message

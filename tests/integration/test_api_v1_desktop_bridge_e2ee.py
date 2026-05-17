@@ -31,6 +31,27 @@ LEGACY_ROUTE_FRAGMENTS = (
 )
 
 
+class FakeDesktopRuntime:
+    """Non-streaming llama.cpp-compatible runtime used by the desktop bridge."""
+
+    def __init__(self):
+        self.calls = []
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        assert kwargs.get("stream") is False
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "pong from desktop",
+                    }
+                }
+            ]
+        }
+
+
 class FakeDesktopModelManager:
     """Small fake desktop model that never loads llama.cpp/GPU."""
 
@@ -40,8 +61,17 @@ class FakeDesktopModelManager:
     file_name = "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
     model_path = "/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
 
+    def __init__(self):
+        self.runtime = FakeDesktopRuntime()
+
+    def get_llm_instance(self):
+        return self.runtime
+
     def llama_cpp_get_response(self, messages):
-        return [*messages, {"role": "assistant", "content": "pong from desktop"}]
+        raise AssertionError(
+            "API v1 must not use legacy streaming llama_cpp_get_response "
+            "when direct completion exists"
+        )
 
 
 @contextmanager
@@ -113,11 +143,12 @@ def _assert_ciphertext_only(payload, *, forbidden_text):
 
 
 def _start_fake_desktop_loop(base_url, done_event):
+    model_manager = FakeDesktopModelManager()
     desktop_client = RelayClient(
         base_url=base_url,
         port=None,
         crypto_manager=CryptoManager(),
-        model_manager=FakeDesktopModelManager(),
+        model_manager=model_manager,
         include_configured_servers=False,
     )
     desktop_client._request_timeout = 2
@@ -134,7 +165,7 @@ def _start_fake_desktop_loop(base_url, done_event):
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    return thread
+    return thread, model_manager
 
 
 def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
@@ -167,7 +198,7 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
         )
 
         desktop_done = threading.Event()
-        desktop_thread = _start_fake_desktop_loop(base_url, desktop_done)
+        desktop_thread, model_manager = _start_fake_desktop_loop(base_url, desktop_done)
 
         browser_crypto = EncryptionManager()
         user_text = "ping from browser"
@@ -205,6 +236,8 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     completion = _decrypt_browser_response(browser_crypto, body)
     assert completion["object"] == "chat.completion"
     assert completion["choices"][0]["message"]["content"] == "pong from desktop"
+    assert len(model_manager.runtime.calls) == 1
+    assert model_manager.runtime.calls[0]["stream"] is False
 
     request_posts = [
         payload for path, payload in observed_posts if path == "/api/v1/relay/requests"

@@ -31,8 +31,29 @@ LEGACY_ROUTE_FRAGMENTS = (
 )
 
 
+class FakeDesktopRuntime:
+    """Small fake direct llama.cpp runtime that never loads llama.cpp/GPU."""
+
+    def __init__(self):
+        self.calls = []
+
+    def create_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        assert kwargs.get("stream") is False
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "pong from desktop",
+                    }
+                }
+            ]
+        }
+
+
 class FakeDesktopModelManager:
-    """Small fake desktop model that never loads llama.cpp/GPU."""
+    """Small fake desktop model that exposes direct and legacy runtimes."""
 
     use_mock_llm = False
     api_model_id = None
@@ -40,8 +61,17 @@ class FakeDesktopModelManager:
     file_name = "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
     model_path = "/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
 
-    def llama_cpp_get_response(self, messages):
-        return [*messages, {"role": "assistant", "content": "pong from desktop"}]
+    def __init__(self):
+        self.runtime = FakeDesktopRuntime()
+
+    def get_llm_instance(self):
+        return self.runtime
+
+    def llama_cpp_get_response(self, _messages):
+        raise AssertionError(
+            "API v1 must not use legacy streaming llama_cpp_get_response "
+            "when direct completion exists"
+        )
 
 
 @contextmanager

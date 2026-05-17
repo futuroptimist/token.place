@@ -832,14 +832,29 @@ class RelayClient:
             )
             submitted = source_response.status_code == 200
             log_info(
-                "API v1 E2EE response submission request_id={} route=/api/v1/relay/responses submitted={}",
+                "API v1 E2EE response submission "
+                "request_id={} protocol={} route=/api/v1/relay/responses "
+                "status={} submitted={}",
                 response_envelope["request_id"],
+                response_envelope.get("protocol"),
+                source_response.status_code,
                 submitted,
             )
+            if not submitted:
+                log_error(
+                    "API v1 E2EE response submission failed "
+                    "request_id={} protocol={} route=/api/v1/relay/responses status={}",
+                    response_envelope["request_id"],
+                    response_envelope.get("protocol"),
+                    source_response.status_code,
+                )
             return submitted
         except Exception:
             log_error(
-                "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
+                "Failed to encrypt or post API v1 response to relay "
+                "request_id={} protocol={} route=/api/v1/relay/responses",
+                response_envelope.get("request_id", "unknown"),
+                response_envelope.get("protocol", "unknown"),
                 exc_info=True,
             )
             return False

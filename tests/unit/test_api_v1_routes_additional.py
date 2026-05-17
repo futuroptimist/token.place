@@ -378,3 +378,163 @@ def test_legacy_completion_encrypted_response_sets_provider_headers(client, monk
     assert response.headers["X-Tokenplace-API-V1-Provider"] == "_LocalProvider"
     assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "local"
     assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
+
+
+def test_chat_completion_stream_true_queues_no_relay_work(client, monkeypatch):
+    relay.known_servers.clear()
+    relay.client_inference_requests.clear()
+    relay.known_servers["server-key"] = {
+        "public_key": "server-key",
+        "last_ping": routes.time.time(),
+        "last_ping_duration": 0,
+    }
+    provider_called = {"value": False}
+
+    class _DistributedProvider:
+        def complete_chat(self, model_id, messages, options):
+            provider_called["value"] = True
+            return {"role": "assistant", "content": "should not run"}
+
+    monkeypatch.setattr(
+        routes,
+        "get_api_v1_compute_provider_for_mode",
+        lambda **_kwargs: _DistributedProvider(),
+    )
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "stream": True,
+        "encrypted": True,
+        "client_public_key": "client-key",
+        "messages": {"ciphertext": "abc", "cipherkey": "def", "iv": "ghi"},
+        "metadata": {
+            "inference_target": "desktop_bridge_api_v1_e2ee",
+            "relay_path": "api_v1_e2ee",
+        },
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert response.get_json()["error"]["param"] == "stream"
+    assert provider_called["value"] is False
+    assert relay.client_inference_requests == {}
+
+
+def test_chat_completion_plaintext_image_content_queues_no_relay_work(client, monkeypatch):
+    relay.client_inference_requests.clear()
+    provider_called = {"value": False}
+
+    class _DistributedProvider:
+        def complete_chat(self, model_id, messages, options):
+            provider_called["value"] = True
+            return {"role": "assistant", "content": "should not run"}
+
+    monkeypatch.setattr(
+        routes,
+        "get_api_v1_compute_provider_for_mode",
+        lambda **_kwargs: _DistributedProvider(),
+    )
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        ],
+        "metadata": {
+            "inference_target": "desktop_bridge_api_v1_e2ee",
+            "relay_path": "api_v1_e2ee",
+        },
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert "do not support image content" in response.get_json()["error"]["message"]
+    assert provider_called["value"] is False
+    assert relay.client_inference_requests == {}
+
+
+def test_chat_completion_encrypted_image_content_queues_no_relay_work(client, monkeypatch):
+    relay.client_inference_requests.clear()
+    provider_called = {"value": False}
+    encrypted_messages = routes.encryption_manager.encrypt_message(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+            }
+        ],
+        routes.encryption_manager.public_key_b64,
+    )
+    assert encrypted_messages is not None
+
+    class _DistributedProvider:
+        def complete_chat(self, model_id, messages, options):
+            provider_called["value"] = True
+            return {"role": "assistant", "content": "should not run"}
+
+    monkeypatch.setattr(
+        routes,
+        "get_api_v1_compute_provider_for_mode",
+        lambda **_kwargs: _DistributedProvider(),
+    )
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "encrypted": True,
+        "client_public_key": routes.encryption_manager.public_key_b64,
+        "messages": encrypted_messages,
+        "metadata": {
+            "inference_target": "desktop_bridge_api_v1_e2ee",
+            "relay_path": "api_v1_e2ee",
+        },
+    }
+
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert "do not support image content" in response.get_json()["error"]["message"]
+    assert provider_called["value"] is False
+    assert relay.client_inference_requests == {}
+
+
+def test_api_v1_response_retrieve_by_request_id_preserves_mismatched_responses(client):
+    relay.client_responses.clear()
+    relay.client_responses["client-key"] = [
+        {
+            "client_public_key": "client-key",
+            "request_id": "other-request",
+            "chat_history": "cipher-other",
+            "cipherkey": "key-other",
+            "iv": "iv-other",
+        },
+        {
+            "client_public_key": "client-key",
+            "request_id": "wanted-request",
+            "chat_history": "cipher-wanted",
+            "cipherkey": "key-wanted",
+            "iv": "iv-wanted",
+        },
+    ]
+
+    missing = client.post(
+        "/api/v1/relay/responses/retrieve",
+        json={"client_public_key": "client-key", "request_id": "missing-request"},
+    )
+    assert missing.status_code == 404
+    assert len(relay.client_responses["client-key"]) == 2
+
+    matched = client.post(
+        "/api/v1/relay/responses/retrieve",
+        json={"client_public_key": "client-key", "request_id": "wanted-request"},
+    )
+    assert matched.status_code == 200
+    assert matched.get_json()["chat_history"] == "cipher-wanted"
+    assert relay.client_responses["client-key"]["request_id"] == "other-request"

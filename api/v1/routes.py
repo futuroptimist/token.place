@@ -351,8 +351,7 @@ def _handle_chat_completion_request(data):
                 "Streaming requested for API v1 chat completions; returning validation error"
             )
             return format_error_response(
-                "Streaming is not supported for API v1 chat completions. "
-                "Use /api/v2/chat/completions for Server-Sent Events.",
+                "Streaming is not supported for API v1 chat completions.",
                 error_type="invalid_request_error",
                 param="stream",
                 status_code=400,
@@ -610,8 +609,7 @@ def _handle_text_completion_request(data):
                 "Streaming requested for API v1 text completions; returning validation error"
             )
             return format_error_response(
-                "Streaming is not supported for API v1 completions. "
-                "Use /api/v2/chat/completions for Server-Sent Events.",
+                "Streaming is not supported for API v1 completions.",
                 error_type="invalid_request_error",
                 param="stream",
                 status_code=400,

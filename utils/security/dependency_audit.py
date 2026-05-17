@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-from pkg_resources import parse_version
+from packaging.version import parse as parse_version
 
 # Minimum safe versions derived from recent CVE disclosures.
 # Each entry documents the corresponding advisory to aid future updates.

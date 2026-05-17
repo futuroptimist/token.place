@@ -1383,26 +1383,37 @@ class RelayClient:
 
         safe_options = {key: value for key, value in options.items() if key != "stream"}
         options_require_direct_completion = bool(safe_options)
-        if "stream" in options:
-            safe_options["stream"] = False
-        if options_require_direct_completion and not has_direct_runtime_completion:
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": "compute_node_options_unsupported",
-                    "message": (
-                        "Requested options require direct runtime completion support"
-                    ),
-                },
-            )
 
         runtime_messages = self._prepare_api_v1_runtime_messages(model_id, messages)
         try:
             assistant_message: Optional[Dict[str, Any]] = None
-            if safe_options and has_direct_runtime_completion:
+            create_chat_completion = None
+            if has_direct_runtime_completion:
                 llm_instance = get_llm_instance()
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
-                if not callable(create_chat_completion):
+
+            if callable(create_chat_completion):
+                log_info(
+                    (
+                        "API v1 runtime generation branch selected: "
+                        "request_id={} model_id={} protocol={} branch={}"
+                    ),
+                    request_id,
+                    model_id,
+                    "tokenplace_api_v1_relay_e2ee",
+                    "direct_non_streaming_completion",
+                )
+                completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
+                completion_kwargs["stream"] = False
+                completion = create_chat_completion(
+                    messages=runtime_messages,
+                    **completion_kwargs,
+                )
+                assistant_message = self._assistant_message_from_runtime_completion(
+                    completion
+                )
+            else:
+                if options_require_direct_completion:
                     return self._api_v1_response_envelope(
                         request_id,
                         error={
@@ -1412,16 +1423,6 @@ class RelayClient:
                             ),
                         },
                     )
-
-                completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
-                completion = create_chat_completion(
-                    messages=runtime_messages,
-                    **completion_kwargs,
-                )
-                assistant_message = self._assistant_message_from_runtime_completion(
-                    completion
-                )
-            else:
                 if not has_runtime_chat:
                     return self._api_v1_response_envelope(
                         request_id,
@@ -1430,6 +1431,16 @@ class RelayClient:
                             "message": "Desktop runtime does not expose chat inference",
                         },
                     )
+                log_info(
+                    (
+                        "API v1 runtime generation branch selected: "
+                        "request_id={} model_id={} protocol={} branch={}"
+                    ),
+                    request_id,
+                    model_id,
+                    "tokenplace_api_v1_relay_e2ee",
+                    "legacy_llama_cpp_get_response_fallback",
+                )
                 response_history = llama_cpp_get_response(list(runtime_messages))
                 if isinstance(response_history, list) and response_history:
                     assistant_message = self._valid_api_v1_assistant_message(

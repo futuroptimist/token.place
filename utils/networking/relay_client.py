@@ -1268,6 +1268,9 @@ class RelayClient:
         if "stream" in options:
             safe_options["stream"] = False
         if not has_direct_runtime_completion:
+            # API v1 desktop relay generation must fail closed rather than
+            # falling back to legacy chat-history runtimes. This is intentional
+            # for empty options and explicit stream:false requests as well.
             return self._api_v1_response_envelope(
                 request_id,
                 error={

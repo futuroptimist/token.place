@@ -28,6 +28,10 @@ This document provides guidance specifically for LLM assistants (like Claude) to
   not reintroduce them as fallbacks.
 - Keep active inference paths aligned on API v1 E2EE routes for `server.py`, `relay.py`,
   `client.py`, desktop Tauri flows, and relay HTML chat UI.
+- API v1 desktop relay generation requires direct non-streaming runtime completion via
+  `get_llm_instance().create_chat_completion(..., stream=False)`. If that direct runtime API is
+  unavailable, fail closed with an encrypted API v1 error; do not fall back to legacy
+  `llama_cpp_get_response()` behavior, including for empty options or explicit `stream: false`.
 - Relay-visible surfaces must stay ciphertext-only (+ safe routing metadata). Plaintext prompts,
   messages, responses, tool arguments, or model output text must never appear in relay-owned
   state/logs/diagnostics/payloads.

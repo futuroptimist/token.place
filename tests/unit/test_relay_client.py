@@ -2296,3 +2296,27 @@ class TestRelayClient:
 
         # Verify that polling was stopped
         assert relay_client.stop_polling is True
+
+
+def test_runtime_model_can_satisfy_packaged_llama_3_filename_without_minor_version():
+    """Packaged Llama 3 file names should satisfy the default UI model alias."""
+
+    class _PackagedManager:
+        use_mock_llm = False
+        api_model_id = None
+        model_id = None
+        file_name = "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+        model_path = "/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+
+        def llama_cpp_get_response(self, messages):  # pragma: no cover - not used
+            return messages + [{"role": "assistant", "content": "ok"}]
+
+    client = RelayClient(
+        "http://localhost:5000",
+        None,
+        MagicMock(),
+        _PackagedManager(),
+        include_configured_servers=False,
+    )
+
+    assert client._runtime_model_can_satisfy("llama-3-8b-instruct") is True

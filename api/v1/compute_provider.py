@@ -18,6 +18,8 @@ from typing import Any, Dict, Optional, Protocol
 import requests
 
 from api.v1.models import generate_response
+
+_DEFAULT_GENERATE_RESPONSE = generate_response
 from utils.crypto.crypto_manager import CryptoManager
 
 logger = logging.getLogger("api.v1.compute_provider")
@@ -115,7 +117,20 @@ class LocalApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        updated_messages = generate_response(model_id, messages, **(options or {}))
+        # Preserve legacy route-level monkeypatch compatibility while the
+        # implementation is routed through compute providers.
+        response_generator = generate_response
+        if response_generator is _DEFAULT_GENERATE_RESPONSE:
+            try:
+                from api.v1 import routes as routes_module
+
+                route_generator = getattr(routes_module, "generate_response", None)
+                if callable(route_generator):
+                    response_generator = route_generator
+            except Exception:  # pragma: no cover - defensive fallback for import edges
+                response_generator = generate_response
+
+        updated_messages = response_generator(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
         assistant_message = updated_messages[-1]

@@ -258,6 +258,9 @@ class RelayClient:
         "llama-3-8b-instruct",
         "meta/llama-3.1-8b-instruct",
         "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
+        "meta-llama-3.1-8b-instruct.q4_k_m.gguf",
+        "meta-llama-3-8b-instruct-q4_k_m.gguf",
+        "meta-llama-3-8b-instruct.q4_k_m.gguf",
     }
     _API_V1_LOCAL_MODEL_ALIASES = {
         "gpt-3.5-turbo": "llama-3-8b-instruct",
@@ -836,6 +839,13 @@ class RelayClient:
                 response_envelope["request_id"],
                 submitted,
             )
+            if not submitted:
+                log_error(
+                    "API v1 E2EE response submission failed "
+                    "request_id={} route=/api/v1/relay/responses status_code={}",
+                    response_envelope["request_id"],
+                    source_response.status_code,
+                )
             return submitted
         except Exception:
             log_error(
@@ -989,19 +999,33 @@ class RelayClient:
             return None
 
     @staticmethod
-    def _normalised_model_ids_from_api_v1_entry(entry: Dict[str, Any]) -> Set[str]:
+    def _api_v1_model_id_equivalents(model_id: str) -> Set[str]:
+        """Return narrow local filename variants for API v1 model matching."""
+
+        normalized = str(model_id).strip().lower()
+        if not normalized:
+            return set()
+
+        equivalents = {normalized}
+        if ".q4_k_m.gguf" in normalized:
+            equivalents.add(normalized.replace(".q4_k_m.gguf", "-q4_k_m.gguf"))
+        if "-q4_k_m.gguf" in normalized:
+            equivalents.add(normalized.replace("-q4_k_m.gguf", ".q4_k_m.gguf"))
+        return equivalents
+
+    @classmethod
+    def _normalised_model_ids_from_api_v1_entry(cls, entry: Dict[str, Any]) -> Set[str]:
         """Extract comparable model identifiers from one API v1 catalogue entry."""
 
-        ids = {
-            str(value).strip().lower()
-            for value in (
-                entry.get("id"),
-                entry.get("base_model_id"),
-                entry.get("file_name"),
-                os.path.basename(str(entry.get("file_name", ""))),
-            )
-            if value
-        }
+        ids: Set[str] = set()
+        for value in (
+            entry.get("id"),
+            entry.get("base_model_id"),
+            entry.get("file_name"),
+            os.path.basename(str(entry.get("file_name", ""))),
+        ):
+            if value:
+                ids.update(cls._api_v1_model_id_equivalents(str(value)))
         return {model_id for model_id in ids if model_id}
 
     @classmethod
@@ -1010,7 +1034,9 @@ class RelayClient:
     ) -> Set[str]:
         """Return local API v1 aliases served by the packaged Llama runtime."""
 
-        local_ids = set(cls._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
+        local_ids: Set[str] = set()
+        for model_id in cls._API_V1_LOCAL_LLAMA_RUNTIME_IDS:
+            local_ids.update(cls._api_v1_model_id_equivalents(model_id))
         local_ids.update(cls._API_V1_LOCAL_MODEL_ALIASES)
         local_ids.update(cls._API_V1_LOCAL_MODEL_ALIASES.values())
         local_ids.update(cls._API_V1_LOCAL_ADAPTER_BASE_MODELS)
@@ -1024,7 +1050,7 @@ class RelayClient:
         """Return normalized API v1 ids that are equivalent for local matching."""
 
         normalized_model = model_id.strip().lower()
-        ids = {normalized_model}
+        ids = cls._api_v1_model_id_equivalents(normalized_model)
         alias_target = cls._API_V1_LOCAL_MODEL_ALIASES.get(normalized_model)
         if alias_target:
             ids.add(alias_target)

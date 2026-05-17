@@ -1,5 +1,4 @@
 import pytest
-import base64
 from api.v1 import validation as val
 
 
@@ -44,16 +43,13 @@ def test_validate_chat_messages_invalid_role():
         val.validate_chat_messages(messages)
 
 
-def test_validate_chat_messages_allows_inline_and_remote_images():
-    data_url = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y7ZlJ4AAAAASUVORK5CYII='
+def test_validate_chat_messages_allows_text_content_blocks():
     messages = [
         {
             'role': 'user',
             'content': [
                 {'type': 'input_text', 'text': 'hello'},
-                {'type': 'image_url', 'image_url': {'url': data_url}},
-                {'type': 'image_url', 'image_url': 'https://example.com/image.png'},
-                {'type': 'input_image', 'image': {'b64_json': base64.b64encode(b'x').decode()}},
+                {'type': 'text', 'text': 'world'},
             ],
         }
     ]
@@ -61,18 +57,19 @@ def test_validate_chat_messages_allows_inline_and_remote_images():
     assert val.validate_chat_messages(messages) is None
 
 
-def test_validate_chat_messages_rejects_invalid_base64():
-    messages = [
-        {
-            'role': 'user',
-            'content': [
-                {'type': 'input_image', 'image': {'b64_json': 'not-base64!!'}},
-            ],
-        }
-    ]
+@pytest.mark.parametrize('block', [
+    {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,aaa'}},
+    {'type': 'image_url', 'image_url': 'https://example.com/image.png'},
+    {'type': 'input_image', 'image': {'b64_json': 'ZmFrZQ=='}},
+    {'type': 'image'},
+])
+def test_validate_chat_messages_rejects_image_content_blocks(block):
+    messages = [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'hello'}, block]}]
 
-    with pytest.raises(val.ValidationError):
+    with pytest.raises(val.ValidationError) as exc:
         val.validate_chat_messages(messages)
+
+    assert 'text-only' in str(exc.value)
 
 
 def test_validate_encrypted_request_missing_fields():

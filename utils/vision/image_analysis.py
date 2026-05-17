@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import imghdr
 import re
 import struct
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -86,6 +85,18 @@ def _extract_jpeg_dimensions(data: BytesLike) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _detect_image_type(data: BytesLike) -> Optional[str]:
+    """Return a small imghdr-compatible type label for supported image headers."""
+
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:6] in {b"GIF87a", b"GIF89a"}:
+        return "gif"
+    if data[:2] == b"\xff\xd8":
+        return "jpeg"
+    return None
+
+
 _DIMENSION_EXTRACTORS = {
     "png": _extract_png_dimensions,
     "gif": _extract_gif_dimensions,
@@ -111,7 +122,7 @@ def _derive_dimensions(image_type: Optional[str], data: BytesLike) -> Tuple[Opti
 def analyze_base64_image(encoded: str) -> AnalysisRecord:
     """Return lightweight metadata for a base64-encoded image."""
     binary = _decode_base64_image(encoded)
-    image_type = imghdr.what(None, h=binary)
+    image_type = _detect_image_type(binary)
     width, height = _derive_dimensions(image_type, binary)
 
     orientation: Optional[str] = None

@@ -696,9 +696,14 @@ def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypa
     assert endpoint == '/api/v1/relay/responses'
     assert payload['request_id'] == 'req-1'
 
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
+    assert 'api_v1_payload=True' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.work_received' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
+    assert "ModuleNotFoundError: No module named 'api'" not in output.err
 
 
 def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):

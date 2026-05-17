@@ -11,7 +11,7 @@ import uuid
 import logging
 import os
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import encrypt
 
@@ -26,12 +26,108 @@ from api.v1.models import generate_response, get_model_instance, ModelError
 from api.v2.models import get_models_info
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
-    validate_chat_messages, validate_encrypted_request, validate_model_name
+    validate_encrypted_request, validate_model_name
 )
 from utils.providers import (
     get_provider_directory as _get_registry_provider_directory,
     ProviderRegistryError,
 )
+from utils.vision import analyze_base64_image, summarize_analysis
+
+
+def validate_chat_messages(messages):
+    """Validate API v2 chat messages with v2-only multimodal compatibility enabled."""
+
+    if not isinstance(messages, list):
+        raise ValidationError("Messages must be an array", field="messages")
+
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValidationError(f"messages[{i}] must be an object", field="messages")
+
+        validate_required_fields(message, ["role", "content"])
+        validate_field_type(message, "role", str)
+
+        if message.get("role") not in ["system", "user", "assistant", "function"]:
+            raise ValidationError(
+                f"Invalid role in messages[{i}]: {message.get('role')}",
+                field="messages",
+            )
+
+        content = message.get("content")
+        if isinstance(content, str):
+            continue
+
+        if not isinstance(content, list):
+            raise ValidationError(
+                f"messages[{i}].content must be a string or array of content blocks",
+                field="messages",
+            )
+        if not content:
+            raise ValidationError(
+                f"messages[{i}].content must contain at least one item",
+                field="messages",
+            )
+
+        for j, item in enumerate(content):
+            if not isinstance(item, dict):
+                raise ValidationError(
+                    f"messages[{i}].content[{j}] must be an object",
+                    field="messages",
+                )
+
+            item_type = item.get("type")
+            if item_type in {"input_text", "text"}:
+                text_value = item.get("text")
+                if not isinstance(text_value, str) or not text_value:
+                    raise ValidationError(
+                        f"messages[{i}].content[{j}].text must be a non-empty string",
+                        field="messages",
+                    )
+                continue
+
+            if item_type == "image_url":
+                image_url = item.get("image_url")
+                url_value = image_url.get("url") if isinstance(image_url, dict) else image_url
+                if not isinstance(url_value, str) or not url_value:
+                    raise ValidationError(
+                        f"messages[{i}].content[{j}].image_url.url must be a non-empty string",
+                        field="messages",
+                    )
+                continue
+
+            if item_type in {"input_image", "image"}:
+                image_payload = item.get("image") or item.get("image_url")
+                if not isinstance(image_payload, dict):
+                    raise ValidationError(
+                        f"messages[{i}].content[{j}].image must be an object",
+                        field="messages",
+                    )
+
+                encoded = (
+                    image_payload.get("b64_json")
+                    or image_payload.get("base64")
+                    or image_payload.get("data")
+                )
+                if not isinstance(encoded, str) or not encoded:
+                    raise ValidationError(
+                        f"messages[{i}].content[{j}].image must include base64 data",
+                        field="messages",
+                    )
+
+                try:
+                    base64.b64decode(encoded, validate=True)
+                except Exception as exc:  # pragma: no cover - defensive branch
+                    raise ValidationError(
+                        f"messages[{i}].content[{j}].image must contain valid base64 data",
+                        field="messages",
+                    ) from exc
+                continue
+
+            raise ValidationError(
+                f"Unsupported content type in messages[{i}]: {item_type}",
+                field="messages",
+            )
 
 # Expose directory loaders for tests and backwards compatibility
 get_community_provider_directory = _get_community_provider_directory
@@ -94,6 +190,75 @@ def iter_stream_content_chunks(content: str, *, max_chunk_size: int = 512):
     content_length = len(content)
     for start in range(0, content_length, max_chunk_size):
         yield content[start:start + max_chunk_size]
+
+
+def _extract_base64_payload(block: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"encoded": None, "skipped_remote": False}
+    block_type = block.get("type")
+
+    if block_type in {"input_image", "image"}:
+        image_payload = block.get("image") or block.get("image_url") or {}
+        if isinstance(image_payload, dict):
+            encoded = (
+                image_payload.get("b64_json")
+                or image_payload.get("base64")
+                or image_payload.get("data")
+            )
+            if isinstance(encoded, str) and encoded.strip():
+                payload["encoded"] = encoded
+    elif block_type == "image_url":
+        image_url = block.get("image_url")
+        url_value = image_url.get("url") if isinstance(image_url, dict) else image_url
+        if isinstance(url_value, str):
+            if url_value.startswith("data:"):
+                payload["encoded"] = url_value
+            else:
+                payload["skipped_remote"] = True
+
+    return payload
+
+
+def _build_v2_vision_summary(messages: Sequence[Dict[str, Any]]) -> Optional[str]:
+    analyses: List[Dict[str, Any]] = []
+    skipped_remote = False
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            payload = _extract_base64_payload(block)
+            encoded = payload.get("encoded")
+            if encoded:
+                try:
+                    analyses.append(analyze_base64_image(encoded))
+                except ValueError as exc:
+                    log_warning(f"Skipping invalid image payload: {exc}")
+                continue
+
+            if payload.get("skipped_remote"):
+                skipped_remote = True
+
+    if analyses:
+        summary_text = summarize_analysis(analyses)
+        if skipped_remote:
+            summary_text += (
+                " Additional attachments reference remote URLs; "
+                "provide base64 data for inline analysis."
+            )
+        return summary_text
+
+    if skipped_remote:
+        return (
+            "Vision analysis unavailable: remote image URLs require base64 "
+            "data URIs for inspection."
+        )
+
+    return None
 
 # Create a Blueprint for v2 API
 v2_bp = Blueprint('v2', __name__, url_prefix='/api/v2')
@@ -551,11 +716,17 @@ def create_chat_completion():
                 if key in data
             }
 
-            updated_messages = generate_response(
-                model_id,
-                messages,
-                **model_request_options,
-            )
+            vision_summary = _build_v2_vision_summary(messages)
+            if vision_summary:
+                updated_messages = list(messages) + [
+                    {"role": "assistant", "content": vision_summary}
+                ]
+            else:
+                updated_messages = generate_response(
+                    model_id,
+                    messages,
+                    **model_request_options,
+                )
 
             # Extract the last message (the model's response)
             assistant_message = updated_messages[-1]

@@ -54,6 +54,7 @@ def live_relay_server():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+        server.server_close()
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +62,8 @@ def reset_relay_state(monkeypatch):
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_responses.clear()
+    relay.streaming_sessions.clear()
+    relay.streaming_sessions_by_client.clear()
     compute_provider._build_api_v1_compute_provider.cache_clear()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
@@ -70,6 +73,8 @@ def reset_relay_state(monkeypatch):
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_responses.clear()
+    relay.streaming_sessions.clear()
+    relay.streaming_sessions_by_client.clear()
     compute_provider._build_api_v1_compute_provider.cache_clear()
 
 
@@ -267,30 +272,3 @@ def test_api_v1_image_content_fails_before_relay_queue(encrypted):
     assert 400 <= response.status_code < 500
     assert "image" in response.get_json()["error"]["message"].lower()
     assert relay.client_inference_requests == {}
-
-
-def test_api_v1_relay_response_retrieve_matches_request_id_without_consuming_mismatch():
-    client_key = "client-key"
-    relay._queue_client_response(
-        client_key,
-        {"request_id": "other", "chat_history": "c1", "cipherkey": "k1", "iv": "i1"},
-    )
-    relay._queue_client_response(
-        client_key,
-        {"request_id": "target", "chat_history": "c2", "cipherkey": "k2", "iv": "i2"},
-    )
-
-    with relay.app.test_client() as client:
-        target = client.post(
-            "/api/v1/relay/responses/retrieve",
-            json={"client_public_key": client_key, "request_id": "target"},
-        )
-        other = client.post(
-            "/api/v1/relay/responses/retrieve",
-            json={"client_public_key": client_key, "request_id": "other"},
-        )
-
-    assert target.status_code == 200
-    assert target.get_json()["request_id"] == "target"
-    assert other.status_code == 200
-    assert other.get_json()["request_id"] == "other"

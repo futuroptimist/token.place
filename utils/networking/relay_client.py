@@ -1179,106 +1179,6 @@ class RelayClient:
             return False, "stream"
         return True, None
 
-    def _generate_api_v1_response_with_server_model_if_available(
-        self,
-        *,
-        request_id: str,
-        model_id: str,
-        messages: List[Dict[str, Any]],
-        options: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """Best-effort API v1 server-model fallback when the module is importable.
-
-        Packaged desktop success never depends on this optional server module;
-        this fallback supports repo-local/server contexts that intentionally ship it.
-        """
-
-        models_module = self._api_v1_models_module()
-        if models_module is None:
-            return None
-
-        model_error_cls = getattr(models_module, "ModelError", Exception)
-        response_generator = getattr(models_module, "generate_response", None)
-        if not callable(response_generator):
-            return None
-
-        try:
-            response_history = response_generator(model_id, messages, **options)
-        except model_error_cls as exc:
-            error_type = getattr(exc, "error_type", "")
-            runtime_response = None
-            if error_type in {"model_not_found", "model_load_error"}:
-                runtime_response_fn = getattr(
-                    self.model_manager,
-                    "llama_cpp_get_response",
-                    None,
-                )
-                if callable(runtime_response_fn):
-                    try:
-                        runtime_response = runtime_response_fn(list(messages))
-                    except Exception:
-                        log_error(
-                            "Runtime-model execution failed for API v1 relay request",
-                            exc_info=True,
-                        )
-                    else:
-                        if isinstance(runtime_response, list) and runtime_response:
-                            assistant_message = self._valid_api_v1_assistant_message(
-                                runtime_response[-1]
-                            )
-                            if assistant_message is not None:
-                                return self._api_v1_response_envelope(
-                                    request_id,
-                                    message=assistant_message,
-                                )
-                        log_error(
-                            "Runtime-model execution returned invalid API v1 output"
-                        )
-
-            error_code = (
-                "compute_node_model_unsupported"
-                if error_type == "model_not_found"
-                else "compute_node_model_error"
-            )
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": error_code,
-                    "message": str(exc),
-                },
-            )
-        except Exception:
-            log_error(
-                "Optional repo API v1 model execution failed for relay request",
-                exc_info=True,
-            )
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": "compute_node_internal_error",
-                    "message": "Unexpected internal error during inference",
-                },
-            )
-
-        if not isinstance(response_history, list) or not response_history:
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": "compute_node_internal_error",
-                    "message": "LLM returned invalid response history",
-                },
-            )
-        assistant_message = response_history[-1]
-        if not isinstance(assistant_message, dict):
-            return self._api_v1_response_envelope(
-                request_id,
-                error={
-                    "code": "compute_node_internal_error",
-                    "message": "LLM returned invalid assistant message",
-                },
-            )
-        return self._api_v1_response_envelope(request_id, message=assistant_message)
-
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -1340,25 +1240,8 @@ class RelayClient:
                 },
             )
 
-        llama_cpp_get_response = getattr(self.model_manager, "llama_cpp_get_response", None)
-        has_runtime_chat = callable(llama_cpp_get_response)
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
-        manager_defines_llm_instance = callable(
-            getattr(type(self.model_manager), "get_llm_instance", None)
-        )
-        has_direct_runtime_completion = (
-            callable(get_llm_instance) and manager_defines_llm_instance
-        )
-        if not has_runtime_chat and not has_direct_runtime_completion:
-            server_response = self._generate_api_v1_response_with_server_model_if_available(
-                request_id=request_id,
-                model_id=model_id,
-                messages=messages,
-                options=options,
-            )
-            if server_response is not None:
-                return server_response
-
+        has_direct_runtime_completion = callable(get_llm_instance)
         if not self._runtime_model_can_satisfy(model_id):
             return self._api_v1_response_envelope(
                 request_id,
@@ -1384,13 +1267,14 @@ class RelayClient:
         safe_options = {key: value for key, value in options.items() if key != "stream"}
         if "stream" in options:
             safe_options["stream"] = False
-        if safe_options and not has_direct_runtime_completion:
+        if not has_direct_runtime_completion:
             return self._api_v1_response_envelope(
                 request_id,
                 error={
-                    "code": "compute_node_options_unsupported",
+                    "code": "compute_node_model_unsupported",
                     "message": (
-                        "Requested options require direct runtime completion support"
+                        "Desktop runtime does not expose API v1 non-streaming "
+                        "chat completion"
                     ),
                 },
             )
@@ -1424,41 +1308,6 @@ class RelayClient:
                 assistant_message = self._assistant_message_from_runtime_completion(
                     completion
                 )
-            else:
-                if safe_options:
-                    return self._api_v1_response_envelope(
-                        request_id,
-                        error={
-                            "code": "compute_node_options_unsupported",
-                            "message": (
-                                "Requested options require direct runtime completion support"
-                            ),
-                        },
-                    )
-                if not has_runtime_chat:
-                    return self._api_v1_response_envelope(
-                        request_id,
-                        error={
-                            "code": "compute_node_model_unsupported",
-                            "message": "Desktop runtime does not expose chat inference",
-                        },
-                    )
-                log_info(
-                    (
-                        "API v1 runtime generation branch selected: "
-                        "request_id={} model_id={} protocol={} route={} branch={}"
-                    ),
-                    request_id,
-                    model_id,
-                    "tokenplace_api_v1_relay_e2ee",
-                    "/api/v1/relay/responses",
-                    "legacy_llama_cpp_get_response_fallback",
-                )
-                response_history = llama_cpp_get_response(list(runtime_messages))
-                if isinstance(response_history, list) and response_history:
-                    assistant_message = self._valid_api_v1_assistant_message(
-                        response_history[-1]
-                    )
 
             if assistant_message is None:
                 log_error("Desktop runtime returned invalid API v1 assistant output")

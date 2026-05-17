@@ -266,6 +266,7 @@ class RelayClient:
     _API_V1_LOCAL_ADAPTER_BASE_MODELS = {
         "llama-3-8b-instruct:alignment": "llama-3-8b-instruct",
     }
+    _API_V1_ALLOWED_MESSAGE_ROLES = {"system", "user", "assistant", "function"}
 
     def __init__(
         self,
@@ -887,7 +888,10 @@ class RelayClient:
         for message in messages:
             if not isinstance(message, dict):
                 return False
-            if not isinstance(message.get("role"), str):
+            role = message.get("role")
+            if not isinstance(role, str):
+                return False
+            if role not in cls._API_V1_ALLOWED_MESSAGE_ROLES:
                 return False
             if "content" not in message:
                 return False

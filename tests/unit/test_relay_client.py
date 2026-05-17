@@ -1464,6 +1464,40 @@ class TestRelayClient:
         assert encrypted_envelope["api_v1_response"]["message"]["content"] == "custom ok"
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_invalid_role_posts_invalid_request(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """The desktop relay path must reject roles that API v1 rejects."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-invalid-role",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "developer", "content": "Do not accept me"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
+            "compute_node_invalid_request"
+        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_invalid_content_posts_invalid_request(
         self,
         mock_post,

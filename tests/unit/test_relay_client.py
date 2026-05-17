@@ -1607,35 +1607,51 @@ class TestRelayClient:
         mock_crypto_manager,
         mock_model_manager,
     ):
-        """Explicit stream:false is accepted, but legacy runtime fallback stays disabled."""
+        """Explicit stream:false follows omitted-stream option routing."""
 
         request_data = TEST_VALID_RESPONSE.copy()
         mock_model_manager.get_llm_instance = None
-        mock_crypto_manager.decrypt_message.return_value = {
-            "protocol": "tokenplace_api_v1_relay_e2ee",
-            "version": 1,
-            "request_id": "req-stream-false-no-direct-runtime",
-            "client_public_key": request_data["client_public_key"],
-            "api_v1_request": {
-                "model": "llama-3-8b-instruct",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "options": {"stream": False},
-            },
-        }
         source_response = MagicMock()
         source_response.status_code = 200
         mock_post.return_value = source_response
+        observed_error_codes = []
 
-        assert relay_client.process_client_request(request_data) is True
+        for request_id, options in (
+            ("req-stream-omitted-no-direct-runtime", {}),
+            ("req-stream-false-no-direct-runtime", {"stream": False}),
+        ):
+            mock_crypto_manager.reset_mock()
+            mock_model_manager.llama_cpp_get_response.reset_mock()
+            mock_crypto_manager.encrypt_message.return_value = {
+                'chat_history': 'encrypted_chat_history',
+                'cipherkey': 'encrypted_key',
+                'iv': 'encrypted_iv'
+            }
+            mock_crypto_manager.decrypt_message.return_value = {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": request_id,
+                "client_public_key": request_data["client_public_key"],
+                "api_v1_request": {
+                    "model": "llama-3-8b-instruct",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "options": options,
+                },
+            }
 
-        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_model_unsupported"
-        )
-        assert encrypted_envelope["api_v1_response"]["error"]["code"] != (
-            "compute_node_options_unsupported"
-        )
-        mock_model_manager.llama_cpp_get_response.assert_not_called()
+            assert relay_client.process_client_request(request_data) is True
+
+            encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+            observed_error_codes.append(
+                encrypted_envelope["api_v1_response"]["error"]["code"]
+            )
+            mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+        assert observed_error_codes == [
+            "compute_node_model_unsupported",
+            "compute_node_model_unsupported",
+        ]
+        assert "compute_node_options_unsupported" not in observed_error_codes
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_rejects_streaming_option(

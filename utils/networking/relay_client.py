@@ -1265,8 +1265,6 @@ class RelayClient:
             )
 
         safe_options = {key: value for key, value in options.items() if key != "stream"}
-        if "stream" in options:
-            safe_options["stream"] = False
         if not has_direct_runtime_completion:
             # API v1 desktop relay generation must fail closed rather than
             # falling back to legacy chat-history runtimes. This is intentional

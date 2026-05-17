@@ -253,6 +253,20 @@ class RelayClient:
         polling_thread.join(timeout=15)  # Wait for thread to finish
         ```
     """
+
+    _API_V1_LOCAL_LLAMA_RUNTIME_IDS = {
+        "llama-3-8b-instruct",
+        "meta/llama-3.1-8b-instruct",
+        "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
+    }
+    _API_V1_LOCAL_MODEL_ALIASES = {
+        "gpt-3.5-turbo": "llama-3-8b-instruct",
+        "gpt-5-chat-latest": "llama-3-8b-instruct",
+    }
+    _API_V1_LOCAL_ADAPTER_BASE_MODELS = {
+        "llama-3-8b-instruct:alignment": "llama-3-8b-instruct",
+    }
+
     def __init__(
         self,
         base_url: str,
@@ -987,6 +1001,38 @@ class RelayClient:
         return {model_id for model_id in ids if model_id}
 
     @classmethod
+    def _api_v1_local_model_ids_for_configured_runtime(
+        cls, configured_ids: Set[str]
+    ) -> Set[str]:
+        """Return local API v1 aliases served by the packaged Llama runtime."""
+
+        local_ids = set(cls._API_V1_LOCAL_LLAMA_RUNTIME_IDS)
+        local_ids.update(cls._API_V1_LOCAL_MODEL_ALIASES)
+        local_ids.update(cls._API_V1_LOCAL_MODEL_ALIASES.values())
+        local_ids.update(cls._API_V1_LOCAL_ADAPTER_BASE_MODELS)
+        local_ids.update(cls._API_V1_LOCAL_ADAPTER_BASE_MODELS.values())
+        if configured_ids & local_ids:
+            return local_ids
+        return set()
+
+    @classmethod
+    def _api_v1_requested_model_ids(cls, model_id: str) -> Set[str]:
+        """Return normalized API v1 ids that are equivalent for local matching."""
+
+        normalized_model = model_id.strip().lower()
+        ids = {normalized_model}
+        alias_target = cls._API_V1_LOCAL_MODEL_ALIASES.get(normalized_model)
+        if alias_target:
+            ids.add(alias_target)
+        adapter_base = cls._API_V1_LOCAL_ADAPTER_BASE_MODELS.get(normalized_model)
+        if adapter_base:
+            ids.add(adapter_base)
+        if ":" in normalized_model:
+            ids.add(normalized_model.split(":", 1)[0])
+        ids.add(cls._api_v1_catalogue_resolved_model_id(normalized_model))
+        return {value for value in ids if value}
+
+    @classmethod
     def _api_v1_catalogue_ids_for_configured_runtime(
         cls, configured_ids: Set[str]
     ) -> Set[str]:
@@ -1062,8 +1108,6 @@ class RelayClient:
         if callable(supports_api_v1_model) and manager_defines_supports_model:
             return bool(supports_api_v1_model(normalized_model))
 
-        base_model = normalized_model.split(":", 1)[0]
-        resolved_model = self._api_v1_catalogue_resolved_model_id(normalized_model)
         if getattr(self.model_manager, "use_mock_llm", False) is True:
             return True
 
@@ -1077,8 +1121,12 @@ class RelayClient:
             )
             if value
         }
-        requested_ids = {normalized_model, base_model, resolved_model}
+        requested_ids = self._api_v1_requested_model_ids(normalized_model)
         if requested_ids & configured_ids:
+            return True
+
+        local_ids = self._api_v1_local_model_ids_for_configured_runtime(configured_ids)
+        if requested_ids & local_ids:
             return True
 
         catalogue_ids = self._api_v1_catalogue_ids_for_configured_runtime(configured_ids)
@@ -1247,14 +1295,8 @@ class RelayClient:
                 completion["choices"][0].get("message")
             )
 
-        consume_stream = getattr(self.model_manager, "_consume_streaming_completion", None)
-        if callable(consume_stream):
-            try:
-                return self._valid_api_v1_assistant_message(consume_stream(completion))
-            except Exception:
-                log_error("Failed to consume streaming API v1 runtime completion", exc_info=True)
-                return None
-
+        # API v1 relay inference is explicitly non-streaming; runtimes must return
+        # a complete chat completion object for this path.
         return None
 
     def _generate_api_v1_response_with_runtime_model(

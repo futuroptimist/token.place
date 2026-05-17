@@ -980,6 +980,131 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_no_options_does_not_depend_on_api_imports(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+        monkeypatch,
+    ):
+        """Packaged desktop API v1 success must not require server-side api imports."""
+
+        def fail_api_import(name, *args, **kwargs):
+            if name == "api" or name.startswith("api."):
+                raise ModuleNotFoundError("No module named 'api'")
+            raise AssertionError(f"unexpected import_module call: {name}")
+
+        monkeypatch.setattr(
+            "utils.networking.relay_client.importlib.import_module",
+            fail_api_import,
+        )
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-no-api-import",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "gpt-5-chat-latest",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}]
+        )
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
+            "The capital of France is Paris."
+        )
+        mock_post.assert_called_once()
+        assert mock_post.call_args.args[0] == (
+            "http://localhost:5000/api/v1/relay/responses"
+        )
+
+    @pytest.mark.parametrize("model_id", ["gpt-3.5-turbo", "gpt-5-chat-latest"])
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_local_aliases_use_packaged_llama_runtime(
+        self,
+        mock_post,
+        model_id,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+        monkeypatch,
+    ):
+        """Local alias map preserves API v1 semantics without importing api.v1.models."""
+
+        monkeypatch.setattr(
+            "utils.networking.relay_client.importlib.import_module",
+            MagicMock(side_effect=ModuleNotFoundError("No module named 'api'")),
+        )
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.use_mock_llm = False
+        mock_model_manager.api_model_id = None
+        mock_model_manager.model_id = None
+        mock_model_manager.file_name = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_model_manager.model_path = "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": f"req-alias-{model_id}",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {},
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}]
+        )
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert "error" not in encrypted_envelope["api_v1_response"]
+
+    def test_api_v1_assistant_message_accepts_non_empty_content(self):
+        """Assistant messages with non-empty content remain valid API v1 output."""
+
+        message = {"role": "assistant", "content": "Hello"}
+
+        assert RelayClient._valid_api_v1_assistant_message(message) == message
+
+    def test_api_v1_assistant_message_accepts_tool_calls_without_content(self):
+        """Assistant tool-call messages remain valid even when content is empty."""
+
+        message = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        }
+
+        assert RelayClient._valid_api_v1_assistant_message(message) == message
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_adapter_model_uses_shared_llama_runtime(
         self,
         mock_post,
@@ -1439,6 +1564,83 @@ class TestRelayClient:
             "compute_node_options_unsupported"
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_forwards_supported_generation_options(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Supported API v1 generation options must reach direct runtime completion."""
+
+        class _Runtime:
+            def __init__(self):
+                self.calls = []
+
+            def create_chat_completion(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Options forwarded",
+                            }
+                        }
+                    ]
+                }
+
+        class _Manager:
+            use_mock_llm = False
+            api_model_id = "llama-3-8b-instruct"
+
+            def __init__(self):
+                self.runtime = _Runtime()
+
+            def llama_cpp_get_response(self, _messages):
+                raise AssertionError("options must not be silently dropped")
+
+            def get_llm_instance(self):
+                return self.runtime
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        manager = _Manager()
+        relay_client.model_manager = manager
+        mock_crypto_manager.decrypt_message.return_value = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-supported-options",
+            "client_public_key": request_data["client_public_key"],
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "options": {
+                    "max_tokens": 32,
+                    "temperature": 0.25,
+                    "top_p": 0.8,
+                    "stop": ["END"],
+                },
+            },
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.process_client_request(request_data) is True
+
+        assert len(manager.runtime.calls) == 1
+        completion_kwargs = manager.runtime.calls[0]
+        assert completion_kwargs["messages"] == [{"role": "user", "content": "Hello"}]
+        assert completion_kwargs["max_tokens"] == 32
+        assert completion_kwargs["temperature"] == 0.25
+        assert completion_kwargs["top_p"] == 0.8
+        assert completion_kwargs["stop"] == ["END"]
+        assert completion_kwargs["stream"] is False
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
+            "Options forwarded"
+        )
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_forwards_openai_options_with_defaults(

@@ -98,8 +98,6 @@ def validate_chat_messages(messages):
 
             if item_type in {"input_image", "image"}:
                 image_payload = item.get("image") or item.get("image_url")
-                if item_type == "image" and image_payload is None:
-                    continue
                 if not isinstance(image_payload, dict):
                     raise ValidationError(
                         f"messages[{i}].content[{j}].image must be an object",

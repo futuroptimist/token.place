@@ -258,6 +258,8 @@ class RelayClient:
         "llama-3-8b-instruct",
         "meta/llama-3.1-8b-instruct",
         "meta-llama-3.1-8b-instruct-q4_k_m.gguf",
+        "meta-llama-3-8b-instruct.q4_k_m.gguf",
+        "meta-llama-3-8b-instruct-q4_k_m.gguf",
     }
     _API_V1_LOCAL_MODEL_ALIASES = {
         "gpt-3.5-turbo": "llama-3-8b-instruct",
@@ -831,15 +833,31 @@ class RelayClient:
                 **request_kwargs,
             )
             submitted = source_response.status_code == 200
-            log_info(
-                "API v1 E2EE response submission request_id={} route=/api/v1/relay/responses submitted={}",
-                response_envelope["request_id"],
-                submitted,
-            )
+            route = "/api/v1/relay/responses"
+            protocol = "tokenplace_api_v1_relay_e2ee"
+            if submitted:
+                log_info(
+                    "API v1 E2EE response submission request_id={} protocol={} route={} submitted={}",
+                    response_envelope["request_id"],
+                    protocol,
+                    route,
+                    submitted,
+                )
+            else:
+                log_error(
+                    "API v1 E2EE response submission failed request_id={} protocol={} route={} http_status={}",
+                    response_envelope["request_id"],
+                    protocol,
+                    route,
+                    source_response.status_code,
+                )
             return submitted
         except Exception:
             log_error(
-                "Failed to encrypt or post API v1 response to relay /api/v1/relay/responses",
+                "Failed to encrypt or post API v1 response request_id={} protocol={} route={}",
+                response_envelope.get("request_id"),
+                response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
+                "/api/v1/relay/responses",
                 exc_info=True,
             )
             return False

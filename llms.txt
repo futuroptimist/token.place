@@ -38,5 +38,9 @@ Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python
   Do not use or extend them for active production paths.
 - Active inference paths for `server.py`, `relay.py`, `client.py`, desktop Tauri flows, and relay
   HTML chat UI should use API v1 E2EE routes.
+- API v1 desktop relay generation requires direct non-streaming runtime completion with
+  `get_llm_instance().create_chat_completion(..., stream=False)`. If unavailable, fail closed with
+  an encrypted API v1 error; do not fall back to legacy `llama_cpp_get_response()`, even for
+  empty options or explicit `stream: false`.
 - Relay must remain ciphertext-only (+ routing metadata). If E2EE is not possible, fail closed.
 - See docs/architecture/api_v1_e2ee_relay.md for migration context and follow-up alignment work.

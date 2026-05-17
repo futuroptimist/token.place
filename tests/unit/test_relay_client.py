@@ -181,6 +181,18 @@ class TestRelayClient:
             {"role": "user", "content": "What is the capital of France?"},
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
+        mock.runtime = MagicMock()
+        mock.runtime.create_chat_completion.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "The capital of France is Paris.",
+                    }
+                }
+            ]
+        }
+        mock.get_llm_instance.return_value = mock.runtime
         mock.use_mock_llm = True
         return mock
 
@@ -947,9 +959,11 @@ class TestRelayClient:
         result = relay_client.process_client_request(request_data)
 
         assert result is True
-        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
-            [{"role": "user", "content": "Hello"}]
-        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        mock_model_manager.runtime.create_chat_completion.assert_called_once()
+        assert mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
+            "messages"
+        ] == [{"role": "user", "content": "Hello"}]
         mock_crypto_manager.encrypt_message.assert_called_with(
             {
                 "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -1022,9 +1036,11 @@ class TestRelayClient:
 
         assert relay_client.process_client_request(request_data) is True
 
-        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
-            [{"role": "user", "content": "Hello"}]
-        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        mock_model_manager.runtime.create_chat_completion.assert_called_once()
+        assert mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
+            "messages"
+        ] == [{"role": "user", "content": "Hello"}]
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["message"]["content"] == (
             "The capital of France is Paris."
@@ -1074,9 +1090,11 @@ class TestRelayClient:
 
         assert relay_client.process_client_request(request_data) is True
 
-        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
-            [{"role": "user", "content": "Hello"}]
-        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        mock_model_manager.runtime.create_chat_completion.assert_called_once()
+        assert mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
+            "messages"
+        ] == [{"role": "user", "content": "Hello"}]
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert "error" not in encrypted_envelope["api_v1_response"]
 
@@ -1137,7 +1155,10 @@ class TestRelayClient:
 
         assert relay_client.process_client_request(request_data) is True
 
-        runtime_messages = mock_model_manager.llama_cpp_get_response.call_args.args[0]
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        runtime_messages = mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
+            "messages"
+        ]
         assert runtime_messages[0]["role"] == "system"
         assert runtime_messages[0]["name"] == "adapter:llama-3-8b-instruct:alignment"
         assert "alignment-focused variant" in runtime_messages[0]["content"]
@@ -1181,14 +1202,15 @@ class TestRelayClient:
 
         assert relay_client.process_client_request(request_data) is True
 
-        mock_model_manager.llama_cpp_get_response.assert_called_once_with(
-            [
-                {
-                    "role": "user",
-                    "content": "First segment\n\nSecond segment",
-                }
-            ]
-        )
+        mock_model_manager.llama_cpp_get_response.assert_not_called()
+        assert mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
+            "messages"
+        ] == [
+            {
+                "role": "user",
+                "content": "First segment\n\nSecond segment",
+            }
+        ]
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_rejects_image_content_blocks(
@@ -1313,9 +1335,9 @@ class TestRelayClient:
                 "options": {},
             },
         }
-        mock_model_manager.llama_cpp_get_response.return_value = [
-            {"role": "assistant", "content": ""},
-        ]
+        mock_model_manager.runtime.create_chat_completion.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": ""}}]
+        }
         mock_crypto_manager.encrypt_message.return_value = {
             'chat_history': 'encrypted_chat_history',
             'cipherkey': 'encrypted_key',
@@ -1429,15 +1451,26 @@ class TestRelayClient:
         class _Manager:
             use_mock_llm = False
 
-            def __init__(self):
-                self.checked_model_ids = []
-
             def supports_api_v1_model(self, model_id):
                 self.checked_model_ids.append(model_id)
                 return model_id == "custom-local-api-v1-model"
 
-            def llama_cpp_get_response(self, messages):
-                return messages + [{"role": "assistant", "content": "custom ok"}]
+            def __init__(self):
+                self.checked_model_ids = []
+                self.runtime = MagicMock()
+                self.runtime.create_chat_completion.return_value = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "custom ok",
+                            }
+                        }
+                    ]
+                }
+
+            def get_llm_instance(self):
+                return self.runtime
 
         request_data = TEST_VALID_RESPONSE.copy()
         manager = _Manager()
@@ -1542,6 +1575,7 @@ class TestRelayClient:
         """Supported options are not silently dropped when only chat-history APIs exist."""
 
         request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.get_llm_instance = None
         mock_crypto_manager.decrypt_message.return_value = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -1561,9 +1595,63 @@ class TestRelayClient:
 
         encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
         assert encrypted_envelope["api_v1_response"]["error"]["code"] == (
-            "compute_node_options_unsupported"
+            "compute_node_model_unsupported"
         )
         mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_process_client_request_api_v1_stream_false_without_direct_runtime_fails_closed(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Explicit stream:false follows omitted-stream option routing."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        mock_model_manager.get_llm_instance = None
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+        observed_error_codes = []
+
+        for request_id, options in (
+            ("req-stream-omitted-no-direct-runtime", {}),
+            ("req-stream-false-no-direct-runtime", {"stream": False}),
+        ):
+            mock_crypto_manager.reset_mock()
+            mock_model_manager.llama_cpp_get_response.reset_mock()
+            mock_crypto_manager.encrypt_message.return_value = {
+                'chat_history': 'encrypted_chat_history',
+                'cipherkey': 'encrypted_key',
+                'iv': 'encrypted_iv'
+            }
+            mock_crypto_manager.decrypt_message.return_value = {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": request_id,
+                "client_public_key": request_data["client_public_key"],
+                "api_v1_request": {
+                    "model": "llama-3-8b-instruct",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "options": options,
+                },
+            }
+
+            assert relay_client.process_client_request(request_data) is True
+
+            encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+            observed_error_codes.append(
+                encrypted_envelope["api_v1_response"]["error"]["code"]
+            )
+            mock_model_manager.llama_cpp_get_response.assert_not_called()
+
+        assert observed_error_codes == [
+            "compute_node_model_unsupported",
+            "compute_node_model_unsupported",
+        ]
+        assert "compute_node_options_unsupported" not in observed_error_codes
 
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_rejects_streaming_option(

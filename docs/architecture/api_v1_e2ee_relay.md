@@ -26,6 +26,19 @@ All active production inference paths must use API v1 E2EE routes:
 If a path cannot preserve API v1 E2EE invariants, it must **fail closed** instead of routing
 plaintext or using deprecated fallbacks.
 
+### Desktop runtime completion contract
+
+API v1 desktop bridge generation must use the direct OpenAI-compatible runtime completion API:
+`get_llm_instance().create_chat_completion(..., stream=False)`. This direct non-streaming
+completion path is required even when the client sends `options: {}` or explicitly sends
+`options: {"stream": false}`.
+
+A desktop runtime that only exposes legacy chat-history helpers such as
+`llama_cpp_get_response()` is **not** API v1-capable for relay inference. API v1 relay handling
+must return an encrypted fail-closed error, such as `compute_node_model_unsupported`, rather
+than silently falling back to legacy runtime behavior. Do not preserve, add, or suggest a legacy
+runtime fallback for API v1 desktop relay requests.
+
 ## API v2 status
 
 - API v2 exists in the repository, but it is currently incomplete.

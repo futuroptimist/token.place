@@ -7,6 +7,15 @@ from encrypt import encrypt
 from utils.crypto_helpers import CryptoClient, logger
 
 
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
 def _prep_client():
     client = CryptoClient('https://example.com', debug=True)
     client.server_public_key = b'k'
@@ -30,7 +39,8 @@ def test_send_chat_message_list_branch():
     msgs = [{'role': 'user', 'content': 'hi'}]
     with patch.object(client, 'fetch_server_public_key', return_value=True), \
          patch('utils.crypto_helpers.encrypt', return_value=({'ciphertext': b'c', 'iv': b'i'}, b'k', b'i')), \
-         patch.object(client, 'send_encrypted_message', side_effect=[{'success': True}, {'chat_history': 'c', 'cipherkey': 'k', 'iv': 'i'}]), \
+         patch.object(client, 'send_encrypted_message', return_value={'success': True}), \
+         patch('utils.crypto_helpers.requests.post', return_value=_FakeResponse(status_code=200, payload={'chat_history': 'c', 'cipherkey': 'k', 'iv': 'i'})), \
          patch.object(client, 'decrypt_message', return_value=msgs), \
          patch('utils.crypto_helpers.time.sleep'):
         assert client.send_chat_message(msgs) == msgs
@@ -38,7 +48,7 @@ def test_send_chat_message_list_branch():
 
 def test_retrieve_chat_response_error_list():
     client = _prep_client()
-    with patch.object(client, 'send_encrypted_message', return_value={'error': ['boom']}), \
+    with patch('utils.crypto_helpers.requests.post', return_value=_FakeResponse(status_code=200, payload={'error': ['boom']})), \
          patch('utils.crypto_helpers.time.sleep'):
         assert client.retrieve_chat_response(max_retries=1, retry_delay=0) is None
 

@@ -4,6 +4,15 @@ import pytest
 from utils.crypto_helpers import CryptoClient
 
 
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
 def _prep_client():
     client = CryptoClient('https://example.com')
     client.server_public_key = client.client_public_key
@@ -13,7 +22,10 @@ def _prep_client():
 
 def test_retrieve_chat_no_response(monkeypatch):
     client = _prep_client()
-    monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: None)
+    monkeypatch.setattr(
+        "utils.crypto_helpers.requests.post",
+        lambda *a, **k: _FakeResponse(status_code=405, payload={}),
+    )
     monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda x: None)
     result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert result is None
@@ -26,7 +38,10 @@ def test_retrieve_chat_invalid_decrypted(monkeypatch):
         'cipherkey': base64.b64encode(b'k').decode(),
         'iv': base64.b64encode(b'i').decode()
     }
-    monkeypatch.setattr(client, 'send_encrypted_message', MagicMock(return_value=enc))
+    monkeypatch.setattr(
+        "utils.crypto_helpers.requests.post",
+        lambda *a, **k: _FakeResponse(status_code=200, payload=enc),
+    )
     monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value='oops'))
     result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert result is None
@@ -38,7 +53,10 @@ def test_retrieve_chat_success(monkeypatch):
         'cipherkey': base64.b64encode(b'k').decode(),
         'iv': base64.b64encode(b'i').decode()
     }
-    monkeypatch.setattr(client, 'send_encrypted_message', MagicMock(return_value=enc))
+    monkeypatch.setattr(
+        "utils.crypto_helpers.requests.post",
+        lambda *a, **k: _FakeResponse(status_code=200, payload=enc),
+    )
     monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role':'assistant','content':'ok'}]))
     monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda x: None)
     result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
@@ -52,7 +70,10 @@ def test_retrieve_chat_invalid_message_structure(monkeypatch):
         'cipherkey': base64.b64encode(b'k').decode(),
         'iv': base64.b64encode(b'i').decode()
     }
-    monkeypatch.setattr(client, 'send_encrypted_message', MagicMock(return_value=enc))
+    monkeypatch.setattr(
+        "utils.crypto_helpers.requests.post",
+        lambda *a, **k: _FakeResponse(status_code=200, payload=enc),
+    )
     monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role': 'assistant'}]))
     res = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert res is None

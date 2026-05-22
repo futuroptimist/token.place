@@ -380,6 +380,8 @@ known_servers = {}
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
+client_inference_requests_lock = threading.Lock()
+client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -387,6 +389,8 @@ stream_lock = threading.Lock()
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
 SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
 DEFAULT_SERVER_STALE_SECONDS = 30
+API_V1_POLL_WAIT_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
+DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -405,6 +409,49 @@ def _server_stale_seconds() -> int:
     except ValueError:
         return DEFAULT_SERVER_STALE_SECONDS
     return max(value, 1)
+
+
+def _api_v1_poll_wait_seconds() -> float:
+    raw = os.environ.get(API_V1_POLL_WAIT_SECONDS_ENV, str(DEFAULT_API_V1_POLL_WAIT_SECONDS))
+    try:
+        wait_seconds = float(raw)
+    except ValueError:
+        return float(DEFAULT_API_V1_POLL_WAIT_SECONDS)
+    if wait_seconds < 0:
+        return 0.0
+    return wait_seconds
+
+
+def _pop_next_api_v1_request(public_key: str):
+    queued_requests = client_inference_requests.get(public_key, [])
+    if not queued_requests:
+        return None
+
+    first_request = None
+
+    def _is_legacy_ciphertext_payload(payload):
+        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
+
+    for idx, candidate in enumerate(queued_requests):
+        if bool(candidate.get('e2ee_v1')):
+            first_request = queued_requests.pop(idx)
+            break
+
+    if first_request is None:
+        while queued_requests:
+            candidate = queued_requests[0]
+            if _is_legacy_ciphertext_payload(candidate):
+                first_request = queued_requests.pop(0)
+                break
+            queued_requests.pop(0)
+
+    if first_request is not None and bool(first_request.get('e2ee_v1')):
+        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
+
+    if not queued_requests:
+        client_inference_requests.pop(public_key, None)
+
+    return first_request
 
 
 def _evict_stale_servers() -> list[str]:
@@ -435,7 +482,9 @@ def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     removed = known_servers.pop(server_public_key, None) is not None
-    client_inference_requests.pop(server_public_key, None)
+    with client_inference_requests_changed:
+        client_inference_requests.pop(server_public_key, None)
+        client_inference_requests_changed.notify_all()
 
     with stream_lock:
         stale_session_ids = [
@@ -820,7 +869,10 @@ def api_v1_relay_servers_register():
             'last_ping_duration': 10,
         }
 
-    return jsonify({'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration']}), 200
+    return jsonify({
+        'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
+        'poll_wait_seconds': _api_v1_poll_wait_seconds(),
+    }), 200
 
 
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
@@ -841,43 +893,35 @@ def api_v1_relay_servers_poll():
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
-    queued_requests = client_inference_requests.get(public_key, [])
-    if not queued_requests:
-        return jsonify({'message': 'No requests available'}), 200
-
-    first_request = None
-
-    def _is_legacy_ciphertext_payload(payload):
-        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
-
-    # Prefer explicit API v1 envelopes when both API v1 and legacy ciphertext payloads are queued.
-    for idx, candidate in enumerate(queued_requests):
-        if bool(candidate.get('e2ee_v1')):
-            first_request = queued_requests.pop(idx)
-            break
+    poll_wait_seconds = _api_v1_poll_wait_seconds()
+    with client_inference_requests_changed:
+        first_request = _pop_next_api_v1_request(public_key)
+        if first_request is None and poll_wait_seconds > 0:
+            deadline = time.monotonic() + poll_wait_seconds
+            while first_request is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                client_inference_requests_changed.wait(timeout=remaining)
+                first_request = _pop_next_api_v1_request(public_key)
 
     if first_request is None:
-        while queued_requests:
-            candidate = queued_requests[0]
-            if _is_legacy_ciphertext_payload(candidate):
-                first_request = queued_requests.pop(0)
-                break
-            queued_requests.pop(0)
-
-
-    if first_request is not None and bool(first_request.get('e2ee_v1')):
-        # When an API v1 envelope is available, keep API v1-only semantics by dropping
-        # legacy ciphertext payloads left in the same queue.
-        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
-
-    if first_request is None:
-        if not queued_requests:
-            client_inference_requests.pop(public_key, None)
         return jsonify({'message': 'No requests available'}), 200
 
-    if not queued_requests:
-        client_inference_requests.pop(public_key, None)
-
+    queue_wait_ms = None
+    queued_at = first_request.pop('_queued_at', None)
+    if isinstance(queued_at, (int, float)):
+        queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
+    LOGGER.info(
+        "relay.api_v1.request_dispatched",
+        extra={
+            "server_public_key": public_key,
+            "request_id": first_request.get("request_id"),
+            "queued_at_unix": queued_at,
+            "dispatched_at_unix": time.time(),
+            "queue_wait_ms": queue_wait_ms,
+        },
+    )
     return jsonify(first_request), 200
 
 
@@ -900,7 +944,21 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
-    client_inference_requests.setdefault(server_public_key, []).append(envelope)
+    queued_at = time.time()
+    envelope['_queued_at'] = queued_at
+    with client_inference_requests_changed:
+        client_inference_requests.setdefault(server_public_key, []).append(envelope)
+        queue_depth = len(client_inference_requests.get(server_public_key, []))
+        client_inference_requests_changed.notify_all()
+    LOGGER.info(
+        "relay.api_v1.request_queued",
+        extra={
+            "server_public_key": server_public_key,
+            "request_id": envelope.get("request_id"),
+            "queued_at_unix": queued_at,
+            "queue_depth": queue_depth,
+        },
+    )
     return jsonify({'message': 'Request received'}), 200
 
 
@@ -1017,13 +1075,15 @@ def faucet():
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     # Append the client's request to the list of requests for the server
-    client_inference_requests.setdefault(server_public_key, []).append({
-        'chat_history': chat_history_ciphertext,
-        'client_public_key': client_public_key,
-        'cipherkey': cipherkey,
-        'iv': iv,  # Include the IV in the saved client's request
-        'stream': stream_requested,
-    })
+    with client_inference_requests_changed:
+        client_inference_requests.setdefault(server_public_key, []).append({
+            'chat_history': chat_history_ciphertext,
+            'client_public_key': client_public_key,
+            'cipherkey': cipherkey,
+            'iv': iv,  # Include the IV in the saved client's request
+            'stream': stream_requested,
+        })
+        client_inference_requests_changed.notify_all()
     return jsonify({'message': 'Request received'}), 200
 
 @app.route('/sink', methods=['POST'])
@@ -1081,47 +1141,47 @@ def sink():
     }
 
     # Check if there are any client requests for this server
-    queued_requests = client_inference_requests.get(public_key, [])
-    if queued_requests:
-        batch = []
-        while queued_requests and len(batch) < max_batch_size:
-            request_payload = queued_requests[0]
-            if 'api_v1_request' in request_payload:
-                queued_requests.pop(0)
-                LOGGER.warning(
-                    "relay.api_v1_plaintext_payload_dropped",
-                    extra={"server_public_key": public_key},
-                )
-                continue
-            if request_payload.get('e2ee_v1'):
-                LOGGER.warning(
-                    "relay.api_v1_ciphertext_payload_skipped",
-                    extra={"server_public_key": public_key},
-                )
-                break
-            request_payload = queued_requests.pop(0)
-            if request_payload.get('stream'):
-                session = _register_stream_session(
-                    public_key,
-                    request_payload.get('client_public_key'),
-                )
-                if session is not None:
-                    request_payload['stream_session_id'] = session['session_id']
-            batch.append(request_payload)
+    with client_inference_requests_changed:
+        queued_requests = client_inference_requests.get(public_key, [])
+        if queued_requests:
+            batch = []
+            while queued_requests and len(batch) < max_batch_size:
+                request_payload = queued_requests[0]
+                if 'api_v1_request' in request_payload:
+                    queued_requests.pop(0)
+                    LOGGER.warning(
+                        "relay.api_v1_plaintext_payload_dropped",
+                        extra={"server_public_key": public_key},
+                    )
+                    continue
+                if request_payload.get('e2ee_v1'):
+                    LOGGER.warning(
+                        "relay.api_v1_ciphertext_payload_skipped",
+                        extra={"server_public_key": public_key},
+                    )
+                    break
+                request_payload = queued_requests.pop(0)
+                if request_payload.get('stream'):
+                    session = _register_stream_session(
+                        public_key,
+                        request_payload.get('client_public_key'),
+                    )
+                    if session is not None:
+                        request_payload['stream_session_id'] = session['session_id']
+                batch.append(request_payload)
+            if batch:
+                first_request = batch[0]
+                response_data['client_public_key'] = first_request.get('client_public_key')
+                response_data['chat_history'] = first_request.get('chat_history')
+                response_data['cipherkey'] = first_request.get('cipherkey')
+                response_data['iv'] = first_request.get('iv')
 
-        if batch:
-            first_request = batch[0]
-            response_data['client_public_key'] = first_request.get('client_public_key')
-            response_data['chat_history'] = first_request.get('chat_history')
-            response_data['cipherkey'] = first_request.get('cipherkey')
-            response_data['iv'] = first_request.get('iv')
+                if first_request.get('stream') and first_request.get('stream_session_id'):
+                    response_data['stream'] = True
+                    response_data['stream_session_id'] = first_request['stream_session_id']
 
-            if first_request.get('stream') and first_request.get('stream_session_id'):
-                response_data['stream'] = True
-                response_data['stream_session_id'] = first_request['stream_session_id']
-
-            if max_batch_size > 1:
-                response_data['batch'] = batch
+                if max_batch_size > 1:
+                    response_data['batch'] = batch
 
     return jsonify(response_data)
 

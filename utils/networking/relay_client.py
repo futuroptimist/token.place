@@ -701,6 +701,19 @@ class RelayClient:
             return f"{base}{normalized_route}"
         return f"{base}/api/v1{normalized_route}"
 
+    def _api_v1_poll_timeout_seconds(self, expected_wait_seconds: Any) -> float:
+        """Return a safe poll timeout that exceeds the server-side long-poll wait."""
+        base_timeout = float(self._request_timeout)
+        if isinstance(expected_wait_seconds, bool):
+            return base_timeout
+        try:
+            wait_seconds = float(expected_wait_seconds)
+        except (TypeError, ValueError):
+            return base_timeout
+        if not math.isfinite(wait_seconds) or wait_seconds < 0:
+            return base_timeout
+        return max(base_timeout, wait_seconds + 1.0)
+
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Register then poll API v1 relay routes for encrypted work."""
 
@@ -712,8 +725,10 @@ class RelayClient:
             try:
                 register_response = self.register_api_v1_compute_node(candidate_url)
                 register_wait = self._request_timeout
+                poll_wait = register_wait
                 if isinstance(register_response, dict):
                     register_wait = register_response.get('next_ping_in_x_seconds', self._request_timeout)
+                    poll_wait = register_response.get('poll_wait_seconds', register_wait)
                     if register_response.get('error'):
                         last_error = {
                             'error': register_response.get('error'),
@@ -723,7 +738,7 @@ class RelayClient:
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
+                    'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 headers = self._auth_headers()
                 if headers:
@@ -747,7 +762,14 @@ class RelayClient:
                         'next_ping_in_x_seconds': register_wait,
                     }
                     continue
-                payload.setdefault('next_ping_in_x_seconds', register_wait)
+                if (
+                    payload.get('message') == 'No requests available'
+                    and 'api_v1_request' not in payload
+                    and payload.get('protocol') != 'tokenplace_api_v1_relay_e2ee'
+                ):
+                    payload['next_ping_in_x_seconds'] = 0
+                else:
+                    payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
                 log_info(

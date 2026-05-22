@@ -382,6 +382,7 @@ client_responses = {}
 client_responses_lock = threading.Lock()
 client_pending_request_ids = {}
 client_pending_request_ids_lock = threading.Lock()
+PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 streaming_sessions = {}
@@ -484,9 +485,12 @@ def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     removed = known_servers.pop(server_public_key, None) is not None
+    dropped_requests = []
     with client_inference_requests_changed:
-        client_inference_requests.pop(server_public_key, None)
+        dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
         client_inference_requests_changed.notify_all()
+    for dropped in dropped_requests:
+        _clear_pending_request(dropped.get("client_public_key"), dropped.get("request_id"))
 
     with stream_lock:
         stale_session_ids = [
@@ -821,8 +825,8 @@ def _mark_request_pending(client_public_key, request_id):
     if not client_public_key or not request_id:
         return
     with client_pending_request_ids_lock:
-        pending_ids = client_pending_request_ids.setdefault(client_public_key, set())
-        pending_ids.add(request_id)
+        pending_ids = client_pending_request_ids.setdefault(client_public_key, {})
+        pending_ids[request_id] = time.time()
 
 
 def _clear_pending_request(client_public_key, request_id):
@@ -832,7 +836,7 @@ def _clear_pending_request(client_public_key, request_id):
         pending_ids = client_pending_request_ids.get(client_public_key)
         if not pending_ids:
             return
-        pending_ids.discard(request_id)
+        pending_ids.pop(request_id, None)
         if not pending_ids:
             client_pending_request_ids.pop(client_public_key, None)
 
@@ -842,7 +846,17 @@ def _is_request_pending(client_public_key, request_id):
         return False
     with client_pending_request_ids_lock:
         pending_ids = client_pending_request_ids.get(client_public_key)
-        return bool(pending_ids and request_id in pending_ids)
+        if not pending_ids:
+            return False
+        queued_at = pending_ids.get(request_id)
+        if queued_at is None:
+            return False
+        if PENDING_REQUEST_TTL_SECONDS > 0 and (time.time() - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS:
+            pending_ids.pop(request_id, None)
+            if not pending_ids:
+                client_pending_request_ids.pop(client_public_key, None)
+            return False
+        return True
 
 
 def _pop_client_response(client_public_key, request_id=None):
@@ -1035,6 +1049,8 @@ def api_v1_relay_responses_retrieve():
                 extra={"client_public_key": client_public_key, "request_id": request_id},
             )
             return jsonify({"status": "pending"}), 202
+        if request_id:
+            return jsonify({'error': {'message': f'Unknown request_id: {request_id}', 'code': 404}}), 404
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
     return jsonify(response), 200

@@ -395,10 +395,35 @@ class CryptoClient:
 
         for i in range(max_retries):
             logger.debug(f"Retrieve attempt {i+1}/{max_retries}")
-            response = self.send_encrypted_message('/api/v1/relay/responses/retrieve', payload)
-
-            if not response:
-                logger.error("Failed to retrieve response")
+            try:
+                raw_response = requests.post(
+                    f"{self.base_url}/api/v1/relay/responses/retrieve",
+                    json=payload,
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.error(
+                    "Exception while retrieving encrypted message: %s",
+                    e.__class__.__name__,
+                    exc_info=self.debug,
+                )
+                time.sleep(retry_delay)
+                continue
+            if raw_response.status_code == 202:
+                logger.debug("API v1 relay response is pending for request_id %s", expected_request_id)
+                time.sleep(retry_delay)
+                continue
+            if raw_response.status_code == 404:
+                logger.warning("API v1 relay response request_id %s not found", expected_request_id)
+                return None
+            if raw_response.status_code != 200:
+                logger.error("Failed to retrieve response, status=%s", raw_response.status_code)
+                time.sleep(retry_delay)
+                continue
+            try:
+                response = raw_response.json()
+            except ValueError:
+                logger.error("Server returned non-JSON response")
                 time.sleep(retry_delay)
                 continue
 

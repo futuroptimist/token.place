@@ -33,6 +33,7 @@ API_FALLBACK_URLS = [
 # Or use "http://localhost:5070" if targeting relay endpoints directly
 
 REQUEST_TIMEOUT = 10  # seconds
+UNKNOWN_REQUEST_ID = object()
 
 CLIENT_KEYS_DIR = "client_keys"
 CLIENT_PRIVATE_KEY_FILE = os.path.join(CLIENT_KEYS_DIR, "client_private.pem")
@@ -343,7 +344,7 @@ class ChatClient:
                         "API v1 relay response request_id %s not found.",
                         request_id,
                     )
-                    return None
+                    return UNKNOWN_REQUEST_ID
                 else:
                     logger.warning(
                         "Unexpected status code from /api/v1/relay/responses/retrieve endpoint: %s",
@@ -401,6 +402,9 @@ class ChatClient:
                 timeout = 60  # Adjust the timeout as needed
                 while True:
                     response = self.retrieve_response(request_id=request_id, chat_history=self.chat_history)
+                    if response is UNKNOWN_REQUEST_ID:
+                        logger.warning("Stopping polling for unknown request_id %s.", request_id)
+                        break
                     if response:
                         self.chat_history = response
                         return response

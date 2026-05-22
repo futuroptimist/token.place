@@ -1550,6 +1550,7 @@ def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypat
     assert not poll_thread.is_alive()
     assert result['status'] == 200
     assert result['json']['request_id'] == 'req-long-poll-dispatch'
+    assert '_queued_at' not in result['json']
 
 
 def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
@@ -1557,9 +1558,35 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.01')
 
+    started = time.monotonic()
     poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    elapsed = time.monotonic() - started
     assert poll.status_code == 200
     assert poll.get_json()['message'] == 'No requests available'
+    assert elapsed >= 0.008
+
+
+def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    for request_id in ("req-fifo-1", "req-fifo-2"):
+        queued = client.post('/api/v1/relay/requests', json={
+            'request_id': request_id,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': f'ciphertext-{request_id}',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+        })
+        assert queued.status_code == 200
+
+    first = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    second = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.get_json()['request_id'] == 'req-fifo-1'
+    assert second.get_json()['request_id'] == 'req-fifo-2'
 
 
 def test_api_v1_poll_long_wait_ignores_unrelated_server_wakeups(client, monkeypatch):

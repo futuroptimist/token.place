@@ -796,6 +796,40 @@ class TestRelayClient:
             "https://relay.cloudflare.workers.dev/api/v1", "/relay/servers/register"
         ) == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
 
+    @pytest.mark.parametrize(
+        "expected_wait, expected_timeout_offset",
+        [
+            (9, 0.0),
+            (10, 0.0),
+            (15.5, 1.5),
+            ("11", 0.0),
+            ("bad", 0.0),
+            (True, 0.0),
+            (False, 0.0),
+            (-1, 0.0),
+            (float("nan"), 0.0),
+            (float("inf"), 0.0),
+        ],
+    )
+    def test_api_v1_poll_timeout_seconds_defensive(self, relay_client, expected_wait, expected_timeout_offset):
+        expected_timeout = float(relay_client._request_timeout) + expected_timeout_offset
+        assert relay_client._api_v1_poll_timeout_seconds(expected_wait) == expected_timeout
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_uses_derived_poll_timeout(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 12}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_ok, poll_ok]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['next_ping_in_x_seconds'] == 12
+        assert mock_post.call_args_list[1].kwargs['timeout'] == max(
+            float(relay_client._request_timeout), 13.0
+        )
+
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_fails_over_and_uses_register_interval(self, mock_post, relay_client):
         relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')

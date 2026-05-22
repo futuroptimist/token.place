@@ -701,6 +701,19 @@ class RelayClient:
             return f"{base}{normalized_route}"
         return f"{base}/api/v1{normalized_route}"
 
+    def _api_v1_poll_timeout_seconds(self, expected_wait_seconds: Any) -> float:
+        """Return a safe poll timeout that exceeds the server-side long-poll wait."""
+        base_timeout = float(self._request_timeout)
+        if isinstance(expected_wait_seconds, bool):
+            return base_timeout
+        try:
+            wait_seconds = float(expected_wait_seconds)
+        except (TypeError, ValueError):
+            return base_timeout
+        if not math.isfinite(wait_seconds) or wait_seconds < 0:
+            return base_timeout
+        return max(base_timeout, wait_seconds + 1.0)
+
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Register then poll API v1 relay routes for encrypted work."""
 
@@ -723,7 +736,7 @@ class RelayClient:
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
+                    'timeout': self._api_v1_poll_timeout_seconds(register_wait),
                 }
                 headers = self._auth_headers()
                 if headers:

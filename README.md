@@ -419,13 +419,21 @@ source .venv/bin/activate
 
 #### windows
 
-```sh
-.\env\Scripts\activate
+PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
-If this command doesn't work (e.g. `Activate.ps1 cannot be loaded because running scripts is disabled on this system`), you may have to run the following command in an Administrator PowerShell session:
+Command Prompt:
 
-```sh
+```bat
+.\.venv\Scripts\activate.bat
+```
+
+If PowerShell activation doesn't work (e.g. `Activate.ps1 cannot be loaded because running scripts is disabled on this system`), run the following in PowerShell (no administrator rights required for `-Scope CurrentUser`):
+
+```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 

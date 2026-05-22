@@ -93,3 +93,43 @@ def test_streaming_chat_completion_requests_are_rate_limited(monkeypatch):
     body = limited_response.get_json()
     assert body is not None
     assert body["error"]["code"] == "rate_limit_exceeded"
+
+@patch.dict(os.environ, {}, clear=True)
+def test_development_allows_default_in_memory_rate_limit_storage():
+    """Development mode should keep local in-memory storage defaults."""
+
+    app = Flask(__name__)
+    init_app(app)
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "production"}, clear=True)
+def test_production_requires_explicit_rate_limit_storage_uri():
+    """Production mode should fail fast when no storage URI is configured."""
+
+    app = Flask(__name__)
+
+    try:
+        init_app(app)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - defensive assertion path
+        raise AssertionError("Expected RuntimeError for missing production limiter storage")
+
+    assert "TOKENPLACE_RATE_LIMIT_STORAGE_URI" in message
+
+
+@patch.dict(
+    os.environ,
+    {
+        "TOKEN_PLACE_ENV": "production",
+        "TOKENPLACE_RATE_LIMIT_STORAGE_URI": "memory://",
+    },
+    clear=True,
+)
+def test_production_uses_configured_rate_limit_storage_uri():
+    """Production mode should pass configured storage URI to Flask-Limiter."""
+
+    app = Flask(__name__)
+    limiter = init_app(app)
+
+    assert str(limiter._storage_uri) == "memory://"

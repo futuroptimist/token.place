@@ -75,6 +75,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | SERVICE_NAME    | token.place  | Service identifier returned by health endpoints (whitespace-only overrides
 |                 |              | fall back to `token.place`)                                             |
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
+| TOKENPLACE_RATE_LIMIT_STORAGE_URI | (empty) | Flask-Limiter backend URI. Required in `production`; optional in local development. |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
 | CONTENT_MODERATION_MODE | disabled     | Set to `block` to enable request filtering before inference           |
@@ -89,6 +90,10 @@ retry through a Cloudflare-hosted relay whenever the primary endpoint is unreach
 
 Set `TOKEN_PLACE_RELAY_CLOUDFLARE_URLS` (or `TOKEN_PLACE_RELAY_CLOUDFLARE_URL` for a single
 endpoint) so `server.py` can fail over to a Cloudflare tunnel when the local relays are down.
+
+Set `TOKENPLACE_RATE_LIMIT_STORAGE_URI` in production so Flask-Limiter uses persistent shared storage
+(for example `redis://redis:6379/0`). When `TOKEN_PLACE_ENV=production` and this value is missing,
+startup fails fast to prevent accidental in-memory rate-limit state.
 
 #### Configuration precedence
 

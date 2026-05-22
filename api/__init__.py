@@ -10,6 +10,34 @@ from prometheus_flask_exporter import PrometheusMetrics
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
+RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+
+
+def _token_place_env() -> str:
+    """Return the normalized deployment environment name."""
+
+    return (os.environ.get("TOKEN_PLACE_ENV", "development") or "development").strip().lower()
+
+
+def _is_production_env() -> bool:
+    return _token_place_env() == "production"
+
+
+def _resolve_rate_limit_storage_uri() -> str | None:
+    """Return the limiter storage URI while enforcing production guardrails."""
+
+    storage_uri = (os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "") or "").strip()
+    if storage_uri:
+        return storage_uri
+
+    if _is_production_env():
+        raise RuntimeError(
+            f"{RATE_LIMIT_STORAGE_URI_ENV} must be configured when TOKEN_PLACE_ENV=production. "
+            "Refusing to start relay/API with in-memory rate-limit storage."
+        )
+
+    return None
+
 
 def _build_rate_limit_response(exc: RateLimitExceeded):
     """Return an OpenAI-style JSON error response for rate limit breaches."""
@@ -40,14 +68,19 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 def init_app(app):
     """Initialize the API with the Flask app."""
 
-    limiter = Limiter(
-        get_remote_address,
-        app=app,
-        default_limits=[
+    limiter_kwargs = {
+        "key_func": get_remote_address,
+        "app": app,
+        "default_limits": [
             os.environ.get("API_RATE_LIMIT", "60/hour"),
             os.environ.get("API_DAILY_QUOTA", "1000/day"),
         ],
-    )
+    }
+    storage_uri = _resolve_rate_limit_storage_uri()
+    if storage_uri:
+        limiter_kwargs["storage_uri"] = storage_uri
+
+    limiter = Limiter(**limiter_kwargs)
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):

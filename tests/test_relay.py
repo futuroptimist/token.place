@@ -1281,6 +1281,15 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
     assert polled['request_id'] == 'req-no-sink-delegation'
 
 
+def test_api_v1_register_advertises_configured_poll_wait(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '30')
+    response = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['next_ping_in_x_seconds'] == 10
+    assert payload['poll_wait_seconds'] == 30.0
+
+
 def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     register = client.post('/api/v1/relay/servers/register', json=server_payload)

@@ -725,8 +725,10 @@ class RelayClient:
             try:
                 register_response = self.register_api_v1_compute_node(candidate_url)
                 register_wait = self._request_timeout
+                poll_wait = register_wait
                 if isinstance(register_response, dict):
                     register_wait = register_response.get('next_ping_in_x_seconds', self._request_timeout)
+                    poll_wait = register_response.get('poll_wait_seconds', register_wait)
                     if register_response.get('error'):
                         last_error = {
                             'error': register_response.get('error'),
@@ -736,7 +738,7 @@ class RelayClient:
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._api_v1_poll_timeout_seconds(register_wait),
+                    'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 headers = self._auth_headers()
                 if headers:

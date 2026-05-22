@@ -869,7 +869,10 @@ def api_v1_relay_servers_register():
             'last_ping_duration': 10,
         }
 
-    return jsonify({'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration']}), 200
+    return jsonify({
+        'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
+        'poll_wait_seconds': _api_v1_poll_wait_seconds(),
+    }), 200
 
 
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])

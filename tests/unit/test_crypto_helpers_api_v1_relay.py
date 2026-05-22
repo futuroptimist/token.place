@@ -258,3 +258,63 @@ def test_retrieve_chat_response_retries_on_non_pending_non_terminal_status(monke
         ({"client_public_key": "client-key", "request_id": "req-retry"}, 10),
         ({"client_public_key": "client-key", "request_id": "req-retry"}, 10),
     ]
+
+
+def test_retrieve_chat_response_retries_legacy_no_response_available_then_none(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        return _FakeResponse(200, {"error": "No response available"})
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+
+    assert client.retrieve_chat_response(
+        max_retries=3,
+        retry_delay=0,
+        expected_request_id="req-legacy",
+    ) is None
+    assert len(post_calls) == 3
+
+
+def test_retrieve_chat_response_retries_malformed_200_payload_then_none(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        return _FakeResponse(200, {"unexpected": "shape"})
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+
+    assert client.retrieve_chat_response(
+        max_retries=4,
+        retry_delay=0,
+        expected_request_id="req-malformed",
+    ) is None
+    assert len(post_calls) == 4
+
+
+def test_retrieve_chat_response_repeated_pending_with_zero_delay_returns_none(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        return _FakeResponse(202, {"status": "pending"})
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+
+    assert client.retrieve_chat_response(
+        max_retries=3,
+        retry_delay=0,
+        expected_request_id="req-pending",
+    ) is None
+    assert len(post_calls) == 3

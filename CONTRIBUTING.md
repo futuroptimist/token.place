@@ -40,6 +40,14 @@ chat as a primary path or fallback chain. Desktop local prompt smoke-test stream
    ```powershell
    .\.venv\Scripts\Activate.ps1
    ```
+   If PowerShell activation fails because scripts are disabled, run:
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   ```
+   Windows (Command Prompt):
+   ```bat
+   .\.venv\Scripts\activate.bat
+   ```
    Linux/macOS:
    ```bash
    source .venv/bin/activate

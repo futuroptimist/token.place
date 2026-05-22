@@ -431,9 +431,9 @@ Command Prompt:
 .\.venv\Scripts\activate.bat
 ```
 
-If PowerShell activation doesn't work (e.g. `Activate.ps1 cannot be loaded because running scripts is disabled on this system`), you may have to run the following command in an Administrator PowerShell session:
+If PowerShell activation doesn't work (e.g. `Activate.ps1 cannot be loaded because running scripts is disabled on this system`), run the following in PowerShell (no administrator rights required for `-Scope CurrentUser`):
 
-```sh
+```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 

@@ -1163,9 +1163,6 @@ def sink():
                 if session is not None:
                     request_payload['stream_session_id'] = session['session_id']
             batch.append(request_payload)
-        if not queued_requests:
-            client_inference_requests.pop(public_key, None)
-
         if batch:
             first_request = batch[0]
             response_data['client_public_key'] = first_request.get('client_public_key')

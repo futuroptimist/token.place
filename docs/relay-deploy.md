@@ -39,6 +39,9 @@ The container exposes port `5010` internally. Runtime environment variables:
   GPU hostname. Headless releases rely on the in-cluster DNS entry and derive their port from
   `TOKENPLACE_RELAY_UPSTREAM_URL`.
 - `TOKENPLACE_RELAY_UPSTREAM_URL` defaults to `http://gpu-server:<port>`.
+- `TOKENPLACE_RATE_LIMIT_STORAGE_URI` should point to a shared backend such as Redis in
+  production (for example `redis://redis.tokenplace.svc.cluster.local:6379/0`). When
+  `TOKEN_PLACE_ENV=production`, relay startup fails fast if this variable is missing.
 
 ## Ingress, TLS, and certificates
 

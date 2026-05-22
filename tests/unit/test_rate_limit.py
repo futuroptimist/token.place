@@ -3,8 +3,9 @@
 
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import pytest
 from flask import Flask
 
 from api import init_app
@@ -93,3 +94,44 @@ def test_streaming_chat_completion_requests_are_rate_limited(monkeypatch):
     body = limited_response.get_json()
     assert body is not None
     assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "development"}, clear=True)
+def test_development_without_rate_limit_storage_uri_still_initializes_limiter():
+    """Development environments should allow in-memory limiter storage for easy local setup."""
+
+    app = Flask(__name__)
+    limiter = init_app(app)
+
+    assert getattr(limiter, "_storage_uri", None) in (None, "memory://")
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "production"}, clear=True)
+def test_production_without_rate_limit_storage_uri_fails_fast():
+    """Production environments should require explicit limiter storage configuration."""
+
+    app = Flask(__name__)
+
+    with pytest.raises(RuntimeError, match="TOKENPLACE_RATE_LIMIT_STORAGE_URI"):
+        init_app(app)
+
+
+@patch.dict(
+    os.environ,
+    {
+        "TOKEN_PLACE_ENV": "production",
+        "TOKENPLACE_RATE_LIMIT_STORAGE_URI": "redis://redis:6379/0",
+    },
+    clear=True,
+)
+def test_production_with_rate_limit_storage_uri_uses_explicit_backend():
+    """Production should pass the configured storage URI to Flask-Limiter."""
+
+    app = Flask(__name__)
+    limiter_instance = MagicMock()
+
+    with patch("api.Limiter", return_value=limiter_instance) as limiter_cls:
+        limiter = init_app(app)
+
+    assert limiter is limiter_instance
+    assert limiter_cls.call_args.kwargs["storage_uri"] == "redis://redis:6379/0"

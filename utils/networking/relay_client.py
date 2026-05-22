@@ -693,6 +693,16 @@ class RelayClient:
         return response.json()
 
     @staticmethod
+    def _api_v1_poll_timeout_seconds(register_wait: Any, request_timeout: float) -> float:
+        if isinstance(register_wait, bool) or not isinstance(register_wait, (int, float)):
+            wait = float(request_timeout)
+        else:
+            wait = float(register_wait)
+        if not math.isfinite(wait) or wait < 0:
+            wait = float(request_timeout)
+        return max(float(request_timeout), wait + 1.0)
+
+    @staticmethod
     def _build_api_v1_url(relay_url: str, route: str) -> str:
         """Build API v1 URLs without duplicating a pre-existing /api/v1 suffix."""
         base = relay_url.rstrip("/")
@@ -723,7 +733,7 @@ class RelayClient:
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
+                    'timeout': self._api_v1_poll_timeout_seconds(register_wait, self._request_timeout),
                 }
                 headers = self._auth_headers()
                 if headers:

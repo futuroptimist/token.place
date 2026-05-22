@@ -378,6 +378,7 @@ def _validate_server_registration():
 
 known_servers = {}
 client_inference_requests = {}
+client_inference_requests_cv = threading.Condition()
 client_responses = {}
 client_responses_lock = threading.Lock()
 streaming_sessions = {}
@@ -387,6 +388,8 @@ stream_lock = threading.Lock()
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
 SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
 DEFAULT_SERVER_STALE_SECONDS = 30
+SERVER_POLL_LONG_WAIT_ENV = "TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
+DEFAULT_SERVER_POLL_LONG_WAIT_SECONDS = 10.0
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -416,6 +419,51 @@ def _evict_stale_servers() -> list[str]:
         if _unregister_server(server_public_key):
             evicted.append(server_public_key)
     return evicted
+
+
+def _server_poll_long_wait_seconds() -> float:
+    raw = os.environ.get(
+        SERVER_POLL_LONG_WAIT_ENV,
+        str(DEFAULT_SERVER_POLL_LONG_WAIT_SECONDS),
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SERVER_POLL_LONG_WAIT_SECONDS
+    if value < 0:
+        return 0.0
+    return value
+
+
+def _pop_next_server_request(public_key: str) -> dict[str, Any] | None:
+    queued_requests = client_inference_requests.get(public_key, [])
+    if not queued_requests:
+        return None
+
+    first_request = None
+
+    def _is_legacy_ciphertext_payload(payload):
+        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
+
+    for idx, candidate in enumerate(queued_requests):
+        if bool(candidate.get('e2ee_v1')):
+            first_request = queued_requests.pop(idx)
+            break
+
+    if first_request is None:
+        while queued_requests:
+            candidate = queued_requests[0]
+            if _is_legacy_ciphertext_payload(candidate):
+                first_request = queued_requests.pop(0)
+                break
+            queued_requests.pop(0)
+
+    if first_request is not None and bool(first_request.get('e2ee_v1')):
+        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
+
+    if not queued_requests:
+        client_inference_requests.pop(public_key, None)
+    return first_request
 
 
 def _live_server_diagnostics() -> list[dict[str, Any]]:
@@ -841,43 +889,34 @@ def api_v1_relay_servers_poll():
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
-    queued_requests = client_inference_requests.get(public_key, [])
-    if not queued_requests:
-        return jsonify({'message': 'No requests available'}), 200
-
     first_request = None
-
-    def _is_legacy_ciphertext_payload(payload):
-        return all(key in payload for key in ('client_public_key', 'chat_history', 'cipherkey', 'iv'))
-
-    # Prefer explicit API v1 envelopes when both API v1 and legacy ciphertext payloads are queued.
-    for idx, candidate in enumerate(queued_requests):
-        if bool(candidate.get('e2ee_v1')):
-            first_request = queued_requests.pop(idx)
-            break
+    wait_timeout = _server_poll_long_wait_seconds()
+    poll_started = time.time()
+    with client_inference_requests_cv:
+        first_request = _pop_next_server_request(public_key)
+        if first_request is None and wait_timeout > 0:
+            client_inference_requests_cv.wait(timeout=wait_timeout)
+            first_request = _pop_next_server_request(public_key)
 
     if first_request is None:
-        while queued_requests:
-            candidate = queued_requests[0]
-            if _is_legacy_ciphertext_payload(candidate):
-                first_request = queued_requests.pop(0)
-                break
-            queued_requests.pop(0)
-
-
-    if first_request is not None and bool(first_request.get('e2ee_v1')):
-        # When an API v1 envelope is available, keep API v1-only semantics by dropping
-        # legacy ciphertext payloads left in the same queue.
-        queued_requests[:] = [item for item in queued_requests if bool(item.get('e2ee_v1'))]
-
-    if first_request is None:
-        if not queued_requests:
-            client_inference_requests.pop(public_key, None)
         return jsonify({'message': 'No requests available'}), 200
 
-    if not queued_requests:
-        client_inference_requests.pop(public_key, None)
-
+    queued_at = first_request.get("relay_request_queued_at")
+    dispatched_at = time.time()
+    queue_wait_ms = None
+    if isinstance(queued_at, (int, float)):
+        queue_wait_ms = round(max(dispatched_at - queued_at, 0.0) * 1000.0, 3)
+    LOGGER.info(
+        "relay.api_v1.request_dispatched",
+        extra={
+            "server_public_key": public_key,
+            "request_id": first_request.get("request_id"),
+            "request_queued_at_unix": queued_at,
+            "request_dispatched_at_unix": round(dispatched_at, 6),
+            "queue_wait_ms": queue_wait_ms,
+            "poll_wait_ms": round(max(dispatched_at - poll_started, 0.0) * 1000.0, 3),
+        },
+    )
     return jsonify(first_request), 200
 
 
@@ -900,7 +939,19 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
-    client_inference_requests.setdefault(server_public_key, []).append(envelope)
+    envelope["relay_request_queued_at"] = time.time()
+    with client_inference_requests_cv:
+        client_inference_requests.setdefault(server_public_key, []).append(envelope)
+        client_inference_requests_cv.notify_all()
+    LOGGER.info(
+        "relay.api_v1.request_queued",
+        extra={
+            "server_public_key": server_public_key,
+            "request_id": envelope.get("request_id"),
+            "request_queued_at_unix": round(envelope["relay_request_queued_at"], 6),
+            "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+        },
+    )
     return jsonify({'message': 'Request received'}), 200
 
 

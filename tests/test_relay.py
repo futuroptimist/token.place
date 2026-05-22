@@ -1313,6 +1313,58 @@ def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
 
 
+def test_api_v1_poll_long_wait_dispatches_immediately_when_work_arrives(client, monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.25")
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    result: dict[str, object] = {}
+
+    def _poll() -> None:
+        with app.test_client() as thread_client:
+            poll_response = thread_client.post('/api/v1/relay/servers/poll', json=server_payload)
+            result["status"] = poll_response.status_code
+            result["payload"] = poll_response.get_json()
+
+    poll_thread = threading.Thread(target=_poll, daemon=True)
+    poll_thread.start()
+    time.sleep(0.05)
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-long-poll-immediate',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+    poll_thread.join(timeout=1.0)
+    assert not poll_thread.is_alive()
+    assert result["status"] == 200
+    payload = result["payload"]
+    assert isinstance(payload, dict)
+    assert payload["request_id"] == "req-long-poll-immediate"
+    assert "relay_request_queued_at" in payload
+
+
+def test_api_v1_poll_long_wait_timeout_returns_no_requests(client, monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.05")
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+
+    started = time.time()
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    elapsed = time.time() - started
+    assert poll.status_code == 200
+    assert poll.get_json() == {'message': 'No requests available'}
+    assert elapsed >= 0.04
+
+
 def test_api_v1_relay_response_plaintext_not_stored(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 

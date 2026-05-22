@@ -78,6 +78,47 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
     model_manager.download_model_if_needed.assert_called_once_with()
 
 
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
+    llm_instance = MagicMock()
+    llm_instance.create_chat_completion = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.download_model_if_needed.return_value = True
+    model_manager.get_llm_instance.return_value = llm_instance
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is True
+
+
+@pytest.mark.parametrize(
+    "get_instance,expected",
+    [
+        (None, False),
+        (lambda: None, False),
+        (lambda: object(), False),
+    ],
+)
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_failure_cases(get_instance, expected):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.download_model_if_needed.return_value = True
+    if get_instance is not None:
+        model_manager.get_llm_instance.side_effect = get_instance
+    else:
+        delattr(model_manager, "get_llm_instance")
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is expected
+
+
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()

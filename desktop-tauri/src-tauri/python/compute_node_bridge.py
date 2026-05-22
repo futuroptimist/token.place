@@ -266,11 +266,11 @@ def run(args: argparse.Namespace) -> int:
     apply_compute_mode(runtime.model_manager, args.mode)
 
     print("desktop.compute_node_bridge.model_init.start", file=sys.stderr)
-    if not runtime.ensure_model_ready():
+    if not runtime.ensure_api_v1_runtime_ready():
         emit(
             {
                 "type": "error",
-                "message": "failed to initialize model runtime",
+                "message": "failed to initialize API v1 model runtime",
                 "active_relay_url": runtime.relay_client.relay_url,
             }
         )

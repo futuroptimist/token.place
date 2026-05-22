@@ -69,6 +69,9 @@ class FakeRuntime:
     def ensure_model_ready(self):
         return True
 
+    def ensure_api_v1_runtime_ready(self):
+        return self.ensure_model_ready()
+
     def register_and_poll_once(self):
         if self._responses:
             return self._responses.pop(0)
@@ -361,7 +364,7 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     _reset_cancel_queue()
 
     class FailingRuntime(FakeRuntime):
-        def ensure_model_ready(self):
+        def ensure_api_v1_runtime_ready(self):
             return False
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingRuntime)
@@ -377,7 +380,32 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert status == 1
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
-    assert 'failed to initialize model runtime' in payload['message']
+    assert 'failed to initialize API v1 model runtime' in payload['message']
+
+
+def test_run_warms_runtime_before_register_and_poll(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class OrderedRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            calls.append('warm')
+            return True
+
+        def register_and_poll_once(self):
+            calls.append('poll')
+            return super().register_and_poll_once()
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=OrderedRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    status = compute_node_bridge.run(
+        SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    )
+    assert status == 0
+    assert calls[:1] == ['warm']
+    assert 'poll' not in calls
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
 
 
 def test_run_allows_runtime_reexec_when_cuda_runtime_is_repaired(capsys, monkeypatch):
@@ -919,6 +947,9 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
         def ensure_model_ready(self):
             return True
 
+        def ensure_api_v1_runtime_ready(self):
+            return self.ensure_model_ready()
+
         def register_and_poll_once(self):
             return {'next_ping_in_x_seconds': 0}
 
@@ -1107,6 +1138,9 @@ class ComputeNodeRuntime:
 
     def ensure_model_ready(self):
         return True
+
+    def ensure_api_v1_runtime_ready(self):
+        return self.ensure_model_ready()
 
     def register_and_poll_once(self):
         return {"next_ping_in_x_seconds": 1}

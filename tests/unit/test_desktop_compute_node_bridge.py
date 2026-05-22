@@ -1252,9 +1252,12 @@ def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
     _reset_cancel_queue()
 
     class FailingWarmupRuntime(FakeRuntime):
+        last_instance = None
+
         def __init__(self, config):
             super().__init__(config)
             self.poll_count = 0
+            FailingWarmupRuntime.last_instance = self
 
         def ensure_api_v1_runtime_ready(self):
             return False
@@ -1267,5 +1270,7 @@ def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
     assert status == 1
+    assert FailingWarmupRuntime.last_instance is not None
+    assert FailingWarmupRuntime.last_instance.poll_count == 0
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["type"] == "error"

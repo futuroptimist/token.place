@@ -1217,6 +1217,35 @@ def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
     assert pending.get_json() == {'status': 'pending'}
 
 
+def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(client, monkeypatch):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-long-running',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-long-running']
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 300.0)
+    monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 299.0)
+
+    pending = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-long-running'},
+    )
+    assert pending.status_code == 202
+    assert pending.get_json() == {'status': 'pending'}
+
+
 def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_queue(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     queued = client.post(

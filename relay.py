@@ -380,6 +380,8 @@ known_servers = {}
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
+client_pending_request_ids = {}
+client_pending_request_ids_lock = threading.Lock()
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 streaming_sessions = {}
@@ -815,6 +817,34 @@ def _queue_client_response(client_public_key, envelope):
         client_responses[client_public_key] = [existing, envelope]
 
 
+def _mark_request_pending(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_pending_request_ids_lock:
+        pending_ids = client_pending_request_ids.setdefault(client_public_key, set())
+        pending_ids.add(request_id)
+
+
+def _clear_pending_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_pending_request_ids_lock:
+        pending_ids = client_pending_request_ids.get(client_public_key)
+        if not pending_ids:
+            return
+        pending_ids.discard(request_id)
+        if not pending_ids:
+            client_pending_request_ids.pop(client_public_key, None)
+
+
+def _is_request_pending(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return False
+    with client_pending_request_ids_lock:
+        pending_ids = client_pending_request_ids.get(client_public_key)
+        return bool(pending_ids and request_id in pending_ids)
+
+
 def _pop_client_response(client_public_key, request_id=None):
     """Pop a queued encrypted response, optionally matching API v1 request id."""
     with client_responses_lock:
@@ -831,6 +861,7 @@ def _pop_client_response(client_public_key, request_id=None):
                             client_responses.pop(client_public_key, None)
                         elif len(queued) == 1:
                             client_responses[client_public_key] = queued[0]
+                        _clear_pending_request(client_public_key, response.get('request_id'))
                         return response
                 return None
             response = queued.pop(0)
@@ -838,11 +869,14 @@ def _pop_client_response(client_public_key, request_id=None):
                 client_responses.pop(client_public_key, None)
             elif len(queued) == 1:
                 client_responses[client_public_key] = queued[0]
+            _clear_pending_request(client_public_key, response.get('request_id'))
             return response
 
         if request_id and queued.get('request_id') != request_id:
             return None
-        return client_responses.pop(client_public_key)
+        response = client_responses.pop(client_public_key)
+        _clear_pending_request(client_public_key, response.get('request_id'))
+        return response
 
 
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
@@ -946,6 +980,7 @@ def api_v1_relay_requests():
     envelope['e2ee_v1'] = True
     queued_at = time.time()
     envelope['_queued_at'] = queued_at
+    _mark_request_pending(envelope.get('client_public_key'), envelope.get('request_id'))
     with client_inference_requests_changed:
         client_inference_requests.setdefault(server_public_key, []).append(envelope)
         queue_depth = len(client_inference_requests.get(server_public_key, []))
@@ -991,8 +1026,15 @@ def api_v1_relay_responses_retrieve():
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
 
     client_public_key = data['client_public_key']
-    response = _pop_client_response(client_public_key, data.get('request_id'))
+    request_id = data.get('request_id')
+    response = _pop_client_response(client_public_key, request_id)
     if response is None:
+        if _is_request_pending(client_public_key, request_id):
+            LOGGER.debug(
+                "relay.api_v1.response_pending",
+                extra={"client_public_key": client_public_key, "request_id": request_id},
+            )
+            return jsonify({"status": "pending"}), 202
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
     return jsonify(response), 200

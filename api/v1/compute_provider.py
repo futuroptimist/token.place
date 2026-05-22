@@ -278,6 +278,16 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
+            if retrieve_response.status_code == 202:
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                continue
+
+            if retrieve_response.status_code == 404:
+                raise _error_from_code(
+                    "compute_node_bridge_error",
+                    message="relay reported unknown API v1 response request id",
+                )
+
             if retrieve_response.status_code != 200:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue

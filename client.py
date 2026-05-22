@@ -287,7 +287,12 @@ class ChatClient:
                     },
                     timeout=REQUEST_TIMEOUT,
                 )
-                if response.status_code == 200:
+                if response.status_code == 202:
+                    logger.debug(
+                        "API v1 relay response for request_id %s is pending.",
+                        request_id,
+                    )
+                elif response.status_code == 200:
                     data = response.json()
                     if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:
                         encrypted_chat_history_b64 = data['chat_history']
@@ -333,6 +338,12 @@ class ChatClient:
                         logger.debug(
                             "Response data is incomplete, waiting for complete response..."
                         )
+                elif response.status_code == 404:
+                    logger.warning(
+                        "API v1 relay response request_id %s not found.",
+                        request_id,
+                    )
+                    return None
                 else:
                     logger.warning(
                         "Unexpected status code from /api/v1/relay/responses/retrieve endpoint: %s",

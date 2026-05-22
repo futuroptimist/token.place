@@ -489,8 +489,7 @@ def _unregister_server(server_public_key: str) -> bool:
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
         client_inference_requests_changed.notify_all()
-    for dropped in dropped_requests:
-        _clear_pending_request(dropped.get("client_public_key"), dropped.get("request_id"))
+    _clear_pending_requests_for_queued_items(dropped_requests)
 
     with stream_lock:
         stale_session_ids = [
@@ -839,6 +838,16 @@ def _clear_pending_request(client_public_key, request_id):
         pending_ids.pop(request_id, None)
         if not pending_ids:
             client_pending_request_ids.pop(client_public_key, None)
+
+
+def _clear_pending_requests_for_queued_items(queued_items):
+    """Clear pending markers for queued API v1 envelopes that are being dropped."""
+    for item in queued_items or []:
+        if not isinstance(item, dict):
+            continue
+        if not bool(item.get("e2ee_v1")):
+            continue
+        _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
 
 
 def _is_request_pending(client_public_key, request_id):

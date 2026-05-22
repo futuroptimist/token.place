@@ -1214,6 +1214,40 @@ def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
     assert pending.get_json() == {'status': 'pending'}
 
 
+def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_queue(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-abandoned',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+
+    pending = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
+    )
+    assert pending.status_code == 202
+    assert pending.get_json() == {'status': 'pending'}
+
+    unregistered = client.post('/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert unregistered.status_code == 200
+
+    unknown = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
+    )
+    assert unknown.status_code == 404
+
+
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
     response_payload = {
         'request_id': 'req-1',

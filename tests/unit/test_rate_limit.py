@@ -5,6 +5,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from flask import Flask
 
 from api import init_app
@@ -93,3 +94,34 @@ def test_streaming_chat_completion_requests_are_rate_limited(monkeypatch):
     body = limited_response.get_json()
     assert body is not None
     assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "development"}, clear=True)
+def test_rate_limiter_allows_in_memory_storage_in_development():
+    """Development mode should boot without explicit limiter storage backend."""
+    app = Flask(__name__)
+    limiter = init_app(app)
+    assert limiter is not None
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "production"}, clear=True)
+def test_rate_limiter_requires_storage_uri_in_production():
+    """Production mode should fail fast when limiter storage is not configured."""
+    app = Flask(__name__)
+    with pytest.raises(RuntimeError, match="TOKENPLACE_RATE_LIMIT_STORAGE_URI"):
+        init_app(app)
+
+
+@patch.dict(
+    os.environ,
+    {
+        "TOKEN_PLACE_ENV": "production",
+        "TOKENPLACE_RATE_LIMIT_STORAGE_URI": "memory://",
+    },
+    clear=True,
+)
+def test_rate_limiter_uses_explicit_storage_uri_in_production():
+    """Production mode should accept an explicit limiter storage backend URI."""
+    app = Flask(__name__)
+    limiter = init_app(app)
+    assert limiter._storage_uri == "memory://"

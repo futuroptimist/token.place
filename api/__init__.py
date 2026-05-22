@@ -10,6 +10,23 @@ from prometheus_flask_exporter import PrometheusMetrics
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
+RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+_PRODUCTION_ENV_VALUES = {"production", "prod"}
+
+
+def _is_production_env() -> bool:
+    token_place_env = os.environ.get("TOKEN_PLACE_ENV", "").strip().lower()
+    generic_env = os.environ.get("ENVIRONMENT", "").strip().lower()
+    return token_place_env in _PRODUCTION_ENV_VALUES or generic_env in _PRODUCTION_ENV_VALUES
+
+
+def _resolve_rate_limit_storage_uri() -> str | None:
+    value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
+    trimmed = value.strip()
+    if trimmed:
+        return trimmed
+    return None
+
 
 def _build_rate_limit_response(exc: RateLimitExceeded):
     """Return an OpenAI-style JSON error response for rate limit breaches."""
@@ -40,6 +57,14 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 def init_app(app):
     """Initialize the API with the Flask app."""
 
+    storage_uri = _resolve_rate_limit_storage_uri()
+    is_production = _is_production_env()
+    if is_production and not storage_uri:
+        raise RuntimeError(
+            f"{RATE_LIMIT_STORAGE_URI_ENV} must be set in production to avoid in-memory "
+            "rate-limit storage."
+        )
+
     limiter = Limiter(
         get_remote_address,
         app=app,
@@ -47,6 +72,7 @@ def init_app(app):
             os.environ.get("API_RATE_LIMIT", "60/hour"),
             os.environ.get("API_DAILY_QUOTA", "1000/day"),
         ],
+        storage_uri=storage_uri,
     )
 
     @app.errorhandler(RateLimitExceeded)

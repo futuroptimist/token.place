@@ -391,10 +391,12 @@ class CryptoClient:
         if expected_request_id:
             payload['request_id'] = expected_request_id
 
+        attempt = 0
+        max_attempts = max(int(max_retries), 1)
         logger.debug(f"Attempting to retrieve response, max retries: {max_retries}")
-
-        for i in range(max_retries):
-            logger.debug(f"Retrieve attempt {i+1}/{max_retries}")
+        pending_deadline = time.time() + max(max_attempts * max(retry_delay, 0), 1)
+        while attempt < max_attempts:
+            logger.debug(f"Retrieve attempt {attempt + 1}/{max_attempts}")
             try:
                 raw_response = requests.post(
                     f"{self.base_url}/api/v1/relay/responses/retrieve",
@@ -407,9 +409,13 @@ class CryptoClient:
                     e.__class__.__name__,
                     exc_info=self.debug,
                 )
+                attempt += 1
                 time.sleep(retry_delay)
                 continue
             if raw_response.status_code == 202:
+                if time.time() >= pending_deadline:
+                    logger.error("Timed out while waiting on pending API v1 relay response")
+                    return None
                 logger.debug("API v1 relay response is pending for request_id %s", expected_request_id)
                 time.sleep(retry_delay)
                 continue
@@ -418,12 +424,14 @@ class CryptoClient:
                 return None
             if raw_response.status_code != 200:
                 logger.error("Failed to retrieve response, status=%s", raw_response.status_code)
+                attempt += 1
                 time.sleep(retry_delay)
                 continue
             try:
                 response = raw_response.json()
             except ValueError:
                 logger.error("Server returned non-JSON response")
+                attempt += 1
                 time.sleep(retry_delay)
                 continue
 
@@ -449,6 +457,7 @@ class CryptoClient:
                     continue
                 else:
                     logger.error(f"Server error: {error_msg}")
+                    attempt += 1
                     return None
 
             if "chat_history" in response and "cipherkey" in response and "iv" in response:
@@ -464,6 +473,7 @@ class CryptoClient:
                     if isinstance(decrypted_data, dict):
                         if decrypted_data.get("protocol") != "tokenplace_api_v1_relay_e2ee":
                             logger.warning("Unexpected API v1 relay protocol in response")
+                            attempt += 1
                             return None
                         if expected_request_id and decrypted_data.get("request_id") != expected_request_id:
                             logger.debug("Ignoring response for a different relay request id")
@@ -472,18 +482,22 @@ class CryptoClient:
                         api_v1_response = decrypted_data.get("api_v1_response")
                         if not isinstance(api_v1_response, dict):
                             logger.warning("API v1 relay response missing api_v1_response object")
+                            attempt += 1
                             return None
                         if api_v1_response.get("error"):
                             logger.error("API v1 relay response error: %s", api_v1_response.get("error"))
+                            attempt += 1
                             return None
                         assistant_message = api_v1_response.get("message")
                         if not isinstance(assistant_message, dict):
                             logger.warning("API v1 relay response missing assistant message")
+                            attempt += 1
                             return None
                         if not isinstance(assistant_message.get("role"), str) or not isinstance(
                             assistant_message.get("content"), str
                         ):
                             logger.warning("Invalid assistant message format in API v1 relay response")
+                            attempt += 1
                             return None
                         if chat_history is None:
                             return [assistant_message]
@@ -494,10 +508,12 @@ class CryptoClient:
                         for msg in decrypted_data:
                             if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
                                 logger.warning("Invalid message format in response")
+                                attempt += 1
                                 return None
                         return decrypted_data
                     else:
                         logger.warning("Unexpected response format type: %s", type(decrypted_data).__name__)
+                        attempt += 1
                         return None
                 except Exception as e:
                     logger.error(
@@ -505,6 +521,7 @@ class CryptoClient:
                         e.__class__.__name__,
                         exc_info=self.debug,
                     )
+                    attempt += 1
                     return None
             else:
                 logger.debug("Response missing expected fields: %s", list(response.keys()))

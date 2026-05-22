@@ -148,8 +148,15 @@ def test_send_chat_message_fetch_key_fail(monkeypatch):
 
 def test_retrieve_chat_response_server_error(monkeypatch):
     client = _prep_client()
-    # First call to send_encrypted_message returns {'error': 'fail'} so it exits
-    monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'error': 'fail'})
+
+    class _FakeResponse:
+        status_code = 500
+        text = "fail"
+
+        def json(self):
+            return {"error": "fail"}
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **k: _FakeResponse())
     result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert result is None
 

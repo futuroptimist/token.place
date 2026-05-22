@@ -93,3 +93,58 @@ def test_streaming_chat_completion_requests_are_rate_limited(monkeypatch):
     body = limited_response.get_json()
     assert body is not None
     assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "development"}, clear=True)
+def test_development_defaults_to_in_memory_rate_limit_storage():
+    """Development mode should default to in-memory limiter storage."""
+
+    app = Flask(__name__)
+    limiter = init_app(app)
+
+    assert limiter._storage_uri == "memory://"
+
+
+@patch.dict(os.environ, {"TOKEN_PLACE_ENV": "production"}, clear=True)
+def test_production_requires_explicit_rate_limit_storage_uri():
+    """Production mode should fail fast when storage configuration is missing."""
+
+    app = Flask(__name__)
+
+    try:
+        init_app(app)
+    except RuntimeError as exc:
+        assert "TOKENPLACE_RATE_LIMIT_STORAGE_URI" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError when production storage URI is missing")
+
+
+@patch.dict(
+    os.environ,
+    {
+        "TOKEN_PLACE_ENV": "production",
+        "TOKENPLACE_RATE_LIMIT_STORAGE_URI": "redis://localhost:6379/5",
+    },
+    clear=True,
+)
+def test_production_uses_configured_rate_limit_storage_uri(monkeypatch):
+    """Production mode should pass configured storage URI to Flask-Limiter."""
+
+    captured = {}
+
+    class DummyLimiter:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def shared_limit(self, *_args, **_kwargs):
+            def _decorator(view_func):
+                return view_func
+
+            return _decorator
+
+    monkeypatch.setattr("api.Limiter", DummyLimiter)
+
+    app = Flask(__name__)
+    init_app(app)
+
+    assert captured["storage_uri"] == "redis://localhost:6379/5"

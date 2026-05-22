@@ -11,7 +11,44 @@ from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
 
+_RATE_LIMIT_STORAGE_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+
+
+def _resolve_runtime_env() -> str:
+    return (
+        os.environ.get("TOKEN_PLACE_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+
+
+def _is_production_env(env_name: str) -> bool:
+    return env_name in {"production", "prod"}
+
+
+def _resolve_rate_limit_storage_uri(app=None) -> str:
+    configured = os.environ.get(_RATE_LIMIT_STORAGE_ENV, "").strip()
+    runtime_env = _resolve_runtime_env()
+
+    if configured:
+        return configured
+
+    if _is_production_env(runtime_env):
+        raise RuntimeError(
+            "Rate-limit storage is required in production. "
+            f"Set {_RATE_LIMIT_STORAGE_ENV} to a durable backend URI (for example Redis)."
+        )
+
+    if app is not None:
+        app.logger.warning(
+            "rate_limit.storage.memory_fallback",
+            extra={"environment": runtime_env, "storage_backend": "memory"},
+        )
+    return "memory://"
+
+
 def _build_rate_limit_response(exc: RateLimitExceeded):
+
     """Return an OpenAI-style JSON error response for rate limit breaches."""
 
     rate_limit_description = str(exc.limit.limit)
@@ -43,6 +80,7 @@ def init_app(app):
     limiter = Limiter(
         get_remote_address,
         app=app,
+        storage_uri=_resolve_rate_limit_storage_uri(app),
         default_limits=[
             os.environ.get("API_RATE_LIMIT", "60/hour"),
             os.environ.get("API_DAILY_QUOTA", "1000/day"),

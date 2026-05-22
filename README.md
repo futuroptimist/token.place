@@ -72,6 +72,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 |-----------------|--------------|--------------------------------------------------------------------|
 | API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
 | API_STREAM_RATE_LIMIT | 30/minute   | Per-IP rate limit applied only to streaming chat completions          |
+| TOKENPLACE_RATE_LIMIT_STORAGE_URI | memory:// (dev only) | Flask-Limiter backend URI. Required in production (for example `redis://redis:6379/0`). |
 | SERVICE_NAME    | token.place  | Service identifier returned by health endpoints (whitespace-only overrides
 |                 |              | fall back to `token.place`)                                             |
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
@@ -89,6 +90,8 @@ retry through a Cloudflare-hosted relay whenever the primary endpoint is unreach
 
 Set `TOKEN_PLACE_RELAY_CLOUDFLARE_URLS` (or `TOKEN_PLACE_RELAY_CLOUDFLARE_URL` for a single
 endpoint) so `server.py` can fail over to a Cloudflare tunnel when the local relays are down.
+
+Set `TOKENPLACE_RATE_LIMIT_STORAGE_URI` in production to a durable backend (typically Redis) so relay rate limits persist across workers and restarts. Development defaults to in-memory storage for easy local startup.
 
 #### Configuration precedence
 

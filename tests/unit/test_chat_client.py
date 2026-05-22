@@ -104,3 +104,29 @@ def test_retrieve_response_decodes_api_v1_response_for_request_id():
         json={'client_public_key': client.public_key_b64, 'request_id': 'req-1'},
         timeout=REQUEST_TIMEOUT,
     )
+
+
+def test_retrieve_response_retries_when_status_is_pending():
+    client = ChatClient('http://test', relay_port=5000)
+    encrypted_response = {
+        'chat_history': base64.b64encode(b'ciphertext').decode('utf-8'),
+        'cipherkey': base64.b64encode(b'cipherkey').decode('utf-8'),
+        'iv': base64.b64encode(b'iv').decode('utf-8'),
+    }
+    decrypted_envelope = {
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'request_id': 'req-1',
+        'api_v1_response': {'message': {'role': 'assistant', 'content': 'ok'}},
+    }
+    with patch('client.requests.post') as m_post, patch('client.decrypt') as m_dec, patch('client.time.sleep'):
+        pending_resp = MagicMock(status_code=202)
+        pending_resp.json.return_value = {'status': 'pending'}
+        done_resp = MagicMock(status_code=200)
+        done_resp.json.return_value = encrypted_response
+        m_post.side_effect = [pending_resp, done_resp]
+        m_dec.return_value = json.dumps(decrypted_envelope).encode('utf-8')
+        response = client.retrieve_response(timeout=0.2, request_id='req-1')
+
+    assert response[-1] == {'role': 'assistant', 'content': 'ok'}
+    assert m_post.call_count == 2

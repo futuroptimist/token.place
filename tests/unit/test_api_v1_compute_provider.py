@@ -84,7 +84,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
             retrieve_calls.append(copy.deepcopy(json))
             retrieve_attempt["count"] += 1
             if retrieve_attempt["count"] == 1:
-                return _FakeResponse(503, {"error": "busy"})
+                return _FakeResponse(202, {"status": "pending"})
             if retrieve_attempt["count"] == 2:
                 return _FakeResponse(200, ValueError("not json"))
             if retrieve_attempt["count"] == 3:

@@ -278,6 +278,10 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
+            if retrieve_response.status_code == 202:
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                continue
+
             if retrieve_response.status_code != 200:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue

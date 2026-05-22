@@ -287,7 +287,12 @@ class ChatClient:
                     },
                     timeout=REQUEST_TIMEOUT,
                 )
-                if response.status_code == 200:
+                if response.status_code == 202:
+                    logger.debug(
+                        "API v1 relay response still pending for request_id=%s.",
+                        request_id,
+                    )
+                elif response.status_code == 200:
                     data = response.json()
                     if 'chat_history' in data and 'iv' in data and 'cipherkey' in data:
                         encrypted_chat_history_b64 = data['chat_history']

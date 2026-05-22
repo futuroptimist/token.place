@@ -57,12 +57,19 @@ def test_send_encrypted_message_invalid_json(monkeypatch):
 
 def test_retrieve_chat_response_retry(monkeypatch):
     client = _prep_client()
-    enc = {'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'}
-    seq = [
-        {'error': 'No response available'},
-        {**enc, 'chat_history': 'c'}
-    ]
-    monkeypatch.setattr(client, 'send_encrypted_message', MagicMock(side_effect=seq))
+    class _FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    seq = iter([
+        _FakeResponse(200, {'error': 'No response available'}),
+        _FakeResponse(200, {'chat_history': 'c', 'cipherkey': 'k', 'iv': 'i'}),
+    ])
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **k: next(seq))
     monkeypatch.setattr(client, 'decrypt_message', MagicMock(return_value=[{'role': 'assistant', 'content': 'ok'}]))
     result = client.retrieve_chat_response(max_retries=2, retry_delay=0)
     assert result[0]['content'] == 'ok'
@@ -141,8 +148,15 @@ def test_send_chat_message_fetch_key_fail(monkeypatch):
 
 def test_retrieve_chat_response_server_error(monkeypatch):
     client = _prep_client()
-    # First call to send_encrypted_message returns {'error': 'fail'} so it exits
-    monkeypatch.setattr(client, 'send_encrypted_message', lambda *a, **k: {'error': 'fail'})
+
+    class _FakeResponse:
+        status_code = 500
+        text = "fail"
+
+        def json(self):
+            return {"error": "fail"}
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *a, **k: _FakeResponse())
     result = client.retrieve_chat_response(max_retries=1, retry_delay=0)
     assert result is None
 

@@ -799,11 +799,17 @@ def test_retrieve_chat_response_filters_with_explicit_request_id(monkeypatch):
     client.client_public_key_b64 = 'client-key'
     sent_payloads = []
 
-    def fake_send(endpoint, payload):
-        sent_payloads.append((endpoint, dict(payload)))
-        return {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+    class _FakeResponse:
+        status_code = 200
 
-    monkeypatch.setattr(client, 'send_encrypted_message', fake_send)
+        def json(self):
+            return {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+
+    def fake_post(url, json=None, timeout=None):
+        sent_payloads.append((url, dict(json), timeout))
+        return _FakeResponse()
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', fake_post)
     monkeypatch.setattr(
         client,
         'decrypt_message',
@@ -824,7 +830,11 @@ def test_retrieve_chat_response_filters_with_explicit_request_id(monkeypatch):
     )
 
     assert sent_payloads == [
-        ('/api/v1/relay/responses/retrieve', {'client_public_key': 'client-key', 'request_id': 'req-1'})
+        (
+            'https://test-server.com/api/v1/relay/responses/retrieve',
+            {'client_public_key': 'client-key', 'request_id': 'req-1'},
+            10,
+        )
     ]
     assert response == [
         {'role': 'user', 'content': 'hi'},
@@ -834,8 +844,14 @@ def test_retrieve_chat_response_filters_with_explicit_request_id(monkeypatch):
 def test_retrieve_chat_response_api_v1_invalid_envelopes(monkeypatch):
     client = CryptoClient('https://test-server.com')
     client.client_public_key_b64 = 'client-key'
-    encrypted_response = {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
-    monkeypatch.setattr(client, 'send_encrypted_message', lambda _endpoint, _payload: encrypted_response)
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *args, **kwargs: _FakeResponse())
 
     invalid_envelopes = [
         {'protocol': 'unexpected', 'api_v1_response': {'message': {'role': 'assistant', 'content': 'done'}}},
@@ -853,8 +869,14 @@ def test_retrieve_chat_response_api_v1_invalid_envelopes(monkeypatch):
 def test_retrieve_chat_response_retries_mismatched_api_v1_request_id(monkeypatch):
     client = CryptoClient('https://test-server.com')
     client.client_public_key_b64 = 'client-key'
-    encrypted_response = {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
-    monkeypatch.setattr(client, 'send_encrypted_message', lambda _endpoint, _payload: encrypted_response)
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *args, **kwargs: _FakeResponse())
     monkeypatch.setattr(
         client,
         'decrypt_message',
@@ -878,11 +900,14 @@ def test_retrieve_chat_response_retries_mismatched_api_v1_request_id(monkeypatch
 def test_retrieve_chat_response_api_v1_message_without_original_history(monkeypatch):
     client = CryptoClient('https://test-server.com')
     client.client_public_key_b64 = 'client-key'
-    monkeypatch.setattr(
-        client,
-        'send_encrypted_message',
-        lambda _endpoint, _payload: {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
-    )
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {'chat_history': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.post', lambda *args, **kwargs: _FakeResponse())
     monkeypatch.setattr(
         client,
         'decrypt_message',

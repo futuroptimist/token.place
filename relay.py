@@ -380,6 +380,9 @@ known_servers = {}
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
+client_pending_request_ids = {}
+client_pending_request_ids_lock = threading.Lock()
+PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 streaming_sessions = {}
@@ -482,9 +485,11 @@ def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     removed = known_servers.pop(server_public_key, None) is not None
+    dropped_requests = []
     with client_inference_requests_changed:
-        client_inference_requests.pop(server_public_key, None)
+        dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
         client_inference_requests_changed.notify_all()
+    _clear_pending_requests_for_queued_items(dropped_requests)
 
     with stream_lock:
         stale_session_ids = [
@@ -815,6 +820,54 @@ def _queue_client_response(client_public_key, envelope):
         client_responses[client_public_key] = [existing, envelope]
 
 
+def _mark_request_pending(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_pending_request_ids_lock:
+        pending_ids = client_pending_request_ids.setdefault(client_public_key, {})
+        pending_ids[request_id] = time.time()
+
+
+def _clear_pending_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_pending_request_ids_lock:
+        pending_ids = client_pending_request_ids.get(client_public_key)
+        if not pending_ids:
+            return
+        pending_ids.pop(request_id, None)
+        if not pending_ids:
+            client_pending_request_ids.pop(client_public_key, None)
+
+
+def _clear_pending_requests_for_queued_items(queued_items):
+    """Clear pending markers for queued API v1 envelopes that are being dropped."""
+    for item in queued_items or []:
+        if not isinstance(item, dict):
+            continue
+        if not bool(item.get("e2ee_v1")):
+            continue
+        _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
+
+
+def _is_request_pending(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return False
+    with client_pending_request_ids_lock:
+        pending_ids = client_pending_request_ids.get(client_public_key)
+        if not pending_ids:
+            return False
+        queued_at = pending_ids.get(request_id)
+        if queued_at is None:
+            return False
+        if PENDING_REQUEST_TTL_SECONDS > 0 and (time.time() - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS:
+            pending_ids.pop(request_id, None)
+            if not pending_ids:
+                client_pending_request_ids.pop(client_public_key, None)
+            return False
+        return True
+
+
 def _pop_client_response(client_public_key, request_id=None):
     """Pop a queued encrypted response, optionally matching API v1 request id."""
     with client_responses_lock:
@@ -831,6 +884,7 @@ def _pop_client_response(client_public_key, request_id=None):
                             client_responses.pop(client_public_key, None)
                         elif len(queued) == 1:
                             client_responses[client_public_key] = queued[0]
+                        _clear_pending_request(client_public_key, response.get('request_id'))
                         return response
                 return None
             response = queued.pop(0)
@@ -838,11 +892,14 @@ def _pop_client_response(client_public_key, request_id=None):
                 client_responses.pop(client_public_key, None)
             elif len(queued) == 1:
                 client_responses[client_public_key] = queued[0]
+            _clear_pending_request(client_public_key, response.get('request_id'))
             return response
 
         if request_id and queued.get('request_id') != request_id:
             return None
-        return client_responses.pop(client_public_key)
+        response = client_responses.pop(client_public_key)
+        _clear_pending_request(client_public_key, response.get('request_id'))
+        return response
 
 
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
@@ -946,6 +1003,7 @@ def api_v1_relay_requests():
     envelope['e2ee_v1'] = True
     queued_at = time.time()
     envelope['_queued_at'] = queued_at
+    _mark_request_pending(envelope.get('client_public_key'), envelope.get('request_id'))
     with client_inference_requests_changed:
         client_inference_requests.setdefault(server_public_key, []).append(envelope)
         queue_depth = len(client_inference_requests.get(server_public_key, []))
@@ -991,8 +1049,17 @@ def api_v1_relay_responses_retrieve():
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
 
     client_public_key = data['client_public_key']
-    response = _pop_client_response(client_public_key, data.get('request_id'))
+    request_id = data.get('request_id')
+    response = _pop_client_response(client_public_key, request_id)
     if response is None:
+        if _is_request_pending(client_public_key, request_id):
+            LOGGER.debug(
+                "relay.api_v1.response_pending",
+                extra={"client_public_key": client_public_key, "request_id": request_id},
+            )
+            return jsonify({"status": "pending"}), 202
+        if request_id:
+            return jsonify({'error': {'message': f'Unknown request_id: {request_id}', 'code': 404}}), 404
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
     return jsonify(response), 200

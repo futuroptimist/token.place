@@ -19,6 +19,7 @@ from relay import app
 from relay import (
     known_servers,
     client_inference_requests,
+    client_pending_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -39,6 +40,7 @@ def client():
     # Reset state before each test
     known_servers.clear()
     client_inference_requests.clear()
+    client_pending_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -54,6 +56,7 @@ def client():
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     client_inference_requests.clear()
+    client_pending_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -1187,6 +1190,94 @@ def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_resp
     assert retrieved_one.status_code == 200
     assert retrieved_one.get_json()['request_id'] == 'req-1'
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-pending',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+
+    pending = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-pending'},
+    )
+    assert pending.status_code == 202
+    assert pending.get_json() == {'status': 'pending'}
+
+
+def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(client, monkeypatch):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-long-running',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-long-running']
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 300.0)
+    monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 299.0)
+
+    pending = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-long-running'},
+    )
+    assert pending.status_code == 202
+    assert pending.get_json() == {'status': 'pending'}
+
+
+def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_queue(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-abandoned',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+
+    pending = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
+    )
+    assert pending.status_code == 202
+    assert pending.get_json() == {'status': 'pending'}
+
+    unregistered = client.post('/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert unregistered.status_code == 200
+
+    unknown = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
+    )
+    assert unknown.status_code == 404
 
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):

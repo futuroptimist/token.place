@@ -278,6 +278,19 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
+            if retrieve_response.status_code == 202:
+                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                continue
+
+            if retrieve_response.status_code == 404:
+                raise _error_from_code(
+                    "compute_node_bridge_error",
+                    message=(
+                        "relay response retrieval reported unknown request id "
+                        f"for {relay_request_id}"
+                    ),
+                )
+
             if retrieve_response.status_code != 200:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue

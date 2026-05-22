@@ -379,6 +379,7 @@ def _validate_server_registration():
 known_servers = {}
 client_inference_requests = {}
 client_responses = {}
+pending_client_request_ids = {}
 client_responses_lock = threading.Lock()
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
@@ -845,6 +846,34 @@ def _pop_client_response(client_public_key, request_id=None):
         return client_responses.pop(client_public_key)
 
 
+def _mark_pending_client_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_responses_lock:
+        pending = pending_client_request_ids.setdefault(client_public_key, set())
+        pending.add(request_id)
+
+
+def _clear_pending_client_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_responses_lock:
+        pending = pending_client_request_ids.get(client_public_key)
+        if not pending:
+            return
+        pending.discard(request_id)
+        if not pending:
+            pending_client_request_ids.pop(client_public_key, None)
+
+
+def _is_pending_client_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return False
+    with client_responses_lock:
+        pending = pending_client_request_ids.get(client_public_key, set())
+        return request_id in pending
+
+
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
 def api_v1_relay_servers_register():
     """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
@@ -944,6 +973,7 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
+    _mark_pending_client_request(envelope.get("client_public_key"), envelope.get("request_id"))
     queued_at = time.time()
     envelope['_queued_at'] = queued_at
     with client_inference_requests_changed:
@@ -993,7 +1023,16 @@ def api_v1_relay_responses_retrieve():
     client_public_key = data['client_public_key']
     response = _pop_client_response(client_public_key, data.get('request_id'))
     if response is None:
+        request_id = data.get('request_id')
+        if _is_pending_client_request(client_public_key, request_id):
+            LOGGER.debug(
+                "relay.api_v1.response_pending",
+                extra={"client_public_key": client_public_key, "request_id": request_id},
+            )
+            return jsonify({'status': 'pending'}), 202
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
+
+    _clear_pending_client_request(client_public_key, response.get("request_id"))
 
     return jsonify(response), 200
 

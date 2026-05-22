@@ -333,6 +333,16 @@ class ChatClient:
                         logger.debug(
                             "Response data is incomplete, waiting for complete response..."
                         )
+                elif response.status_code == 202:
+                    logger.debug(
+                        "Relay response pending for request_id=%s",
+                        request_id,
+                    )
+                elif response.status_code == 404:
+                    logger.warning(
+                        "Relay response request_id=%s not found for client key.",
+                        request_id,
+                    )
                 else:
                     logger.warning(
                         "Unexpected status code from /api/v1/relay/responses/retrieve endpoint: %s",

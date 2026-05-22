@@ -19,6 +19,7 @@ from relay import app
 from relay import (
     known_servers,
     client_inference_requests,
+    pending_client_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -39,6 +40,7 @@ def client():
     # Reset state before each test
     known_servers.clear()
     client_inference_requests.clear()
+    pending_client_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -54,6 +56,7 @@ def client():
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     client_inference_requests.clear()
+    pending_client_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -1215,6 +1218,28 @@ def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(clie
     assert retrieved.status_code == 200
     assert retrieved.get_json()['request_id'] == 'req-1'
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_response_retrieve_returns_pending_for_known_inflight_request(client):
+    request_payload = {
+        'request_id': 'req-pending',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert client.post('/api/v1/relay/requests', json=request_payload).status_code == 200
+
+    pending = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-pending'},
+    )
+    assert pending.status_code == 202
+    assert pending.get_json() == {'status': 'pending'}
 
 
 def test_api_v1_relay_plaintext_messages_not_stored(client):

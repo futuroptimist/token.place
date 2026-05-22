@@ -1384,6 +1384,83 @@ def test_api_v1_register_does_not_dequeue_requests(client):
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests or len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 0
 
 
+def test_api_v1_poll_long_poll_dispatches_queued_work_immediately(client, monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_RELAY_POLL_WAIT_TIMEOUT_SECONDS", "1.5")
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    poll_result = {}
+
+    def _poll_in_background():
+        with relay_module.app.test_client() as bg_client:
+            started = time.time()
+            response = bg_client.post('/api/v1/relay/servers/poll', json=server_payload)
+            poll_result['elapsed_seconds'] = time.time() - started
+            poll_result['status_code'] = response.status_code
+            poll_result['payload'] = response.get_json()
+
+    poll_thread = threading.Thread(target=_poll_in_background)
+    poll_thread.start()
+    time.sleep(0.2)
+
+    request_payload = {
+        'request_id': 'req-long-poll-dispatch',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    }
+    assert client.post('/api/v1/relay/requests', json=request_payload).status_code == 200
+
+    poll_thread.join(timeout=3)
+    assert not poll_thread.is_alive()
+    assert poll_result['status_code'] == 200
+    assert poll_result['payload']['request_id'] == 'req-long-poll-dispatch'
+    assert poll_result['elapsed_seconds'] < 1.0
+
+
+def test_api_v1_poll_long_poll_timeout_returns_empty_message(client, monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_RELAY_POLL_WAIT_TIMEOUT_SECONDS", "0.2")
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    started = time.time()
+    response = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    elapsed = time.time() - started
+
+    assert response.status_code == 200
+    assert response.get_json() == {'message': 'No requests available'}
+    assert elapsed >= 0.15
+
+
+def test_api_v1_poll_preserves_fifo_order_across_multiple_requests(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    for request_id in ('req-order-1', 'req-order-2'):
+        payload = {
+            'request_id': request_id,
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': f'ciphertext-{request_id}',
+            'cipherkey': f'cipherkey-{request_id}',
+            'iv': f'iv-{request_id}',
+        }
+        assert client.post('/api/v1/relay/requests', json=payload).status_code == 200
+
+    first = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    second = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.get_json()['request_id'] == 'req-order-1'
+    assert second.get_json()['request_id'] == 'req-order-2'
+
+
 def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     known_servers[DUMMY_SERVER_PUB_KEY] = {

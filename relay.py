@@ -378,11 +378,24 @@ def _validate_server_registration():
 
 known_servers = {}
 client_inference_requests = {}
+client_inference_requests_condition = threading.Condition()
 client_responses = {}
 client_responses_lock = threading.Lock()
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
+
+
+def _relay_server_poll_wait_timeout_seconds() -> float:
+    raw = os.environ.get("TOKENPLACE_API_V1_RELAY_POLL_WAIT_TIMEOUT_SECONDS", "10")
+    try:
+        return max(float(raw), 0.0)
+    except (TypeError, ValueError):
+        LOGGER.warning(
+            "relay.api_v1.poll_wait_timeout.invalid",
+            extra={"configured_value": raw, "fallback_seconds": 10.0},
+        )
+        return 10.0
 
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
 SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
@@ -841,7 +854,15 @@ def api_v1_relay_servers_poll():
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
-    queued_requests = client_inference_requests.get(public_key, [])
+    wait_timeout_seconds = _relay_server_poll_wait_timeout_seconds()
+    poll_started_at = time.time()
+
+    with client_inference_requests_condition:
+        queued_requests = client_inference_requests.get(public_key, [])
+        if not queued_requests and wait_timeout_seconds > 0:
+            client_inference_requests_condition.wait(timeout=wait_timeout_seconds)
+            queued_requests = client_inference_requests.get(public_key, [])
+
     if not queued_requests:
         return jsonify({'message': 'No requests available'}), 200
 
@@ -878,6 +899,19 @@ def api_v1_relay_servers_poll():
     if not queued_requests:
         client_inference_requests.pop(public_key, None)
 
+    queue_wait_ms = int(max((time.time() - poll_started_at) * 1000, 0))
+    LOGGER.info(
+        "relay.api_v1.request_dispatched",
+        extra={
+            "request_id": first_request.get("request_id"),
+            "server_public_key": public_key,
+            "compute_node_selected": public_key,
+            "request_queued_at": first_request.get("queued_at"),
+            "request_dispatched_at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "queue_wait_ms": queue_wait_ms,
+            "queue_depth_after_dispatch": len(queued_requests),
+        },
+    )
     return jsonify(first_request), 200
 
 
@@ -900,7 +934,10 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
-    client_inference_requests.setdefault(server_public_key, []).append(envelope)
+    envelope['queued_at'] = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    with client_inference_requests_condition:
+        client_inference_requests.setdefault(server_public_key, []).append(envelope)
+        client_inference_requests_condition.notify_all()
     return jsonify({'message': 'Request received'}), 200
 
 

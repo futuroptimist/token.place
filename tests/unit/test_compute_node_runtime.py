@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import call, MagicMock
 
 import pytest
@@ -76,6 +77,64 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
 
     assert runtime.ensure_model_ready() is False
     model_manager.download_model_if_needed.assert_called_once_with()
+
+
+def test_ensure_api_v1_runtime_ready_success():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    llm_instance = MagicMock()
+    llm_instance.create_chat_completion = lambda *_args, **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_instance
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    model_manager.get_llm_instance.assert_called_once_with()
+
+
+def test_ensure_api_v1_runtime_ready_fails_when_get_llm_missing():
+    model_manager = MagicMock(spec=["use_mock_llm"])
+    model_manager.use_mock_llm = True
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is False
+
+
+def test_ensure_api_v1_runtime_ready_fails_when_get_llm_returns_none():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.get_llm_instance.return_value = None
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is False
+
+
+def test_ensure_api_v1_runtime_ready_fails_when_completion_not_callable():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    llm_instance = SimpleNamespace(create_chat_completion="not-callable")
+    model_manager.get_llm_instance.return_value = llm_instance
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is False
 
 
 def test_compute_node_runtime_polling_thread_delegates_to_relay():

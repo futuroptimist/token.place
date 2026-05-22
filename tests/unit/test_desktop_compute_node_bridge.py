@@ -51,7 +51,10 @@ class FakeRelayClientRouting(FakeRelayClient):
 
 
 class FakeRuntime:
+    last_instance = None
+
     def __init__(self, _config):
+        FakeRuntime.last_instance = self
         self.model_manager = FakeModelManager()
         self.relay_client = FakeRelayClient()
         self._responses = [
@@ -65,11 +68,16 @@ class FakeRuntime:
             },
         ]
         self._processed = []
+        self.call_order = []
 
-    def ensure_model_ready(self):
+    def ensure_api_v1_runtime_ready(self):
+        if hasattr(self, 'call_order'):
+            self.call_order.append('warmup')
         return True
 
     def register_and_poll_once(self):
+        if hasattr(self, 'call_order'):
+            self.call_order.append('poll')
         if self._responses:
             return self._responses.pop(0)
         return {'next_ping_in_x_seconds': 0}
@@ -361,7 +369,7 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     _reset_cancel_queue()
 
     class FailingRuntime(FakeRuntime):
-        def ensure_model_ready(self):
+        def ensure_api_v1_runtime_ready(self):
             return False
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingRuntime)
@@ -377,7 +385,58 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert status == 1
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
-    assert 'failed to initialize model runtime' in payload['message']
+    assert 'failed to initialize API v1 model runtime' in payload['message']
+
+
+def test_run_warms_runtime_before_first_relay_poll(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime)
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+    assert FakeRuntime.last_instance is not None
+    assert FakeRuntime.last_instance.call_order[:2] == ['warmup', 'poll']
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['type'] == 'started'
+
+
+def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class FailingWarmupRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            calls.append('warmup')
+            return False
+
+        def register_and_poll_once(self):
+            calls.append('poll')
+            return super().register_and_poll_once()
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FailingWarmupRuntime)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 1
+    assert calls == ['warmup']
 
 
 def test_run_allows_runtime_reexec_when_cuda_runtime_is_repaired(capsys, monkeypatch):
@@ -916,7 +975,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
             self.model_manager = FakeModelManager()
             self.relay_client = SimpleNamespace(relay_url=config.relay_url)
 
-        def ensure_model_ready(self):
+        def ensure_api_v1_runtime_ready(self):
             return True
 
         def register_and_poll_once(self):
@@ -1105,7 +1164,7 @@ class ComputeNodeRuntime:
         self.relay_client = _RelayClient(config.relay_url)
         self.model_manager = _ModelManager()
 
-    def ensure_model_ready(self):
+    def ensure_api_v1_runtime_ready(self):
         return True
 
     def register_and_poll_once(self):

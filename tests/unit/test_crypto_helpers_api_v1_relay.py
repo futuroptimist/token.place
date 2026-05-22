@@ -14,6 +14,11 @@ class _FakeResponse:
         return self._payload
 
 
+class _FakeNonJsonResponse(_FakeResponse):
+    def json(self):
+        raise ValueError("not json")
+
+
 ENCRYPTED_RELAY_RESPONSE = {
     "chat_history": "ciphertext",
     "cipherkey": "cipherkey",
@@ -318,3 +323,54 @@ def test_retrieve_chat_response_repeated_pending_with_zero_delay_returns_none(mo
         expected_request_id="req-pending",
     ) is None
     assert len(post_calls) == 3
+
+
+def test_retrieve_chat_response_retries_request_exception_then_succeeds(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        if len(post_calls) == 1:
+            raise RuntimeError("temporary failure")
+        return _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE)
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        client,
+        "decrypt_message",
+        lambda _encrypted: {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "request_id": "req-retry-exception",
+            "api_v1_response": {"message": {"role": "assistant", "content": "ok"}},
+        },
+    )
+
+    assert client.retrieve_chat_response(
+        max_retries=2,
+        retry_delay=0,
+        expected_request_id="req-retry-exception",
+    ) == [{"role": "assistant", "content": "ok"}]
+    assert len(post_calls) == 2
+
+
+def test_retrieve_chat_response_retries_non_json_200_then_none(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        return _FakeNonJsonResponse(200, None)
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+
+    assert client.retrieve_chat_response(
+        max_retries=2,
+        retry_delay=0,
+        expected_request_id="req-non-json",
+    ) is None
+    assert len(post_calls) == 2

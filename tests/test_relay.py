@@ -1517,3 +1517,46 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert retrieved_payload['request_id'] == 'req-provider-style'
     assert retrieved_payload['chat_history'] == 'ciphertext-response-provider-style'
     assert response_plaintext not in json.dumps(retrieved_payload)
+
+
+def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.5')
+
+    result = {}
+
+    def _poll():
+        with app.test_client() as polling_client:
+            response = polling_client.post('/api/v1/relay/servers/poll', json=server_payload)
+            result['status'] = response.status_code
+            result['json'] = response.get_json()
+
+    poll_thread = threading.Thread(target=_poll)
+    poll_thread.start()
+    time.sleep(0.05)
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-long-poll-dispatch',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll_thread.join(timeout=1.0)
+    assert not poll_thread.is_alive()
+    assert result['status'] == 200
+    assert result['json']['request_id'] == 'req-long-poll-dispatch'
+
+
+def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.01')
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    assert poll.get_json()['message'] == 'No requests available'

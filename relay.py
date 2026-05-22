@@ -1083,6 +1083,7 @@ def faucet():
             'iv': iv,  # Include the IV in the saved client's request
             'stream': stream_requested,
         })
+        client_inference_requests_changed.notify_all()
     return jsonify({'message': 'Request received'}), 200
 
 @app.route('/sink', methods=['POST'])

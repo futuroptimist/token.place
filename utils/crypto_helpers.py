@@ -477,6 +477,7 @@ class CryptoClient:
                             return None
                         if expected_request_id and decrypted_data.get("request_id") != expected_request_id:
                             logger.debug("Ignoring response for a different relay request id")
+                            attempt += 1
                             time.sleep(retry_delay)
                             continue
                         api_v1_response = decrypted_data.get("api_v1_response")

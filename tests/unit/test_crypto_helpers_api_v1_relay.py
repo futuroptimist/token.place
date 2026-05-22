@@ -5,6 +5,15 @@ import pytest
 from utils.crypto_helpers import CryptoClient
 
 
+class _FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
 ENCRYPTED_RELAY_RESPONSE = {
     "chat_history": "ciphertext",
     "cipherkey": "cipherkey",
@@ -18,11 +27,11 @@ def test_retrieve_chat_response_decodes_api_v1_envelope_with_request_id(monkeypa
     client.client_public_key_b64 = "client-key"
     sent_payloads = []
 
-    def fake_send(endpoint, payload):
-        sent_payloads.append((endpoint, dict(payload)))
-        return ENCRYPTED_RELAY_RESPONSE
+    def fake_post(url, json, timeout):
+        sent_payloads.append((url, dict(json), timeout))
+        return _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE)
 
-    monkeypatch.setattr(client, "send_encrypted_message", fake_send)
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
     monkeypatch.setattr(
         client,
         "decrypt_message",
@@ -44,8 +53,9 @@ def test_retrieve_chat_response_decodes_api_v1_envelope_with_request_id(monkeypa
 
     assert sent_payloads == [
         (
-            "/api/v1/relay/responses/retrieve",
+            "https://test-server.com/api/v1/relay/responses/retrieve",
             {"client_public_key": "client-key", "request_id": "req-1"},
+            10,
         )
     ]
     assert response == [
@@ -81,9 +91,8 @@ def test_retrieve_chat_response_rejects_invalid_api_v1_envelopes(
     client = CryptoClient("https://test-server.com")
     client.client_public_key_b64 = "client-key"
     monkeypatch.setattr(
-        client,
-        "send_encrypted_message",
-        lambda _endpoint, _payload: ENCRYPTED_RELAY_RESPONSE,
+        "utils.crypto_helpers.requests.post",
+        lambda _url, json, timeout: _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE),
     )
     monkeypatch.setattr(client, "decrypt_message", lambda _encrypted: decrypted_envelope)
 
@@ -97,9 +106,8 @@ def test_retrieve_chat_response_retries_mismatched_api_v1_request_id(monkeypatch
     sleep_calls = []
 
     monkeypatch.setattr(
-        client,
-        "send_encrypted_message",
-        lambda _endpoint, _payload: ENCRYPTED_RELAY_RESPONSE,
+        "utils.crypto_helpers.requests.post",
+        lambda _url, json, timeout: _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE),
     )
     monkeypatch.setattr(
         client,
@@ -128,9 +136,8 @@ def test_retrieve_chat_response_returns_api_v1_message_without_original_history(
     client.client_public_key_b64 = "client-key"
 
     monkeypatch.setattr(
-        client,
-        "send_encrypted_message",
-        lambda _endpoint, _payload: ENCRYPTED_RELAY_RESPONSE,
+        "utils.crypto_helpers.requests.post",
+        lambda _url, json, timeout: _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE),
     )
     monkeypatch.setattr(
         client,

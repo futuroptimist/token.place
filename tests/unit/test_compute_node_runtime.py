@@ -78,6 +78,84 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
     model_manager.download_model_if_needed.assert_called_once_with()
 
 
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.last_compute_diagnostics = {"requested_mode": "cpu"}
+    llm_runtime = MagicMock()
+    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_runtime
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager.last_compute_diagnostics["api_v1_runtime_ready"] is True
+
+
+@pytest.mark.parametrize(
+    "llm_instance,getter,expected",
+    [
+        (None, True, False),
+        (object(), True, False),
+        (MagicMock(create_chat_completion=None), True, False),
+        (MagicMock(create_chat_completion=lambda **_kwargs: {}), False, False),
+    ],
+)
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_failure_cases(
+    llm_instance, getter, expected
+):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    if getter:
+        model_manager.get_llm_instance.return_value = llm_instance
+    else:
+        delattr(model_manager, "get_llm_instance")
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is expected
+
+
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_handles_get_llm_exception():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.get_llm_instance.side_effect = RuntimeError("boom")
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+
+
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_without_diagnostics_dict():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.last_compute_diagnostics = "not-a-dict"
+    llm_runtime = MagicMock()
+    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_runtime
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager.last_compute_diagnostics == "not-a-dict"
+
+
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()

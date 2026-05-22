@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-21",
+  "slug": "api-v1-desktop-bridge-cold-runtime-timeout",
+  "summary": "Desktop API v1 relay requests timed out on first use because the bridge reported started after model asset checks but before llama.cpp runtime initialization.",
+  "impact": "First encrypted API v1 desktop relay chat completions could return 504 compute_node_timeout while the compute node was still cold-starting runtime state.",
+  "fix": "Bridge startup now requires ComputeNodeRuntime.ensure_api_v1_runtime_ready(), which warms get_llm_instance(), validates create_chat_completion availability, and fails startup before polling when warmup fails.",
+  "lessons": "Readiness gates must verify full API v1 runtime serving capability, not just model file presence, and startup tests must assert warm-before-poll ordering plus fail-closed behavior."
+}

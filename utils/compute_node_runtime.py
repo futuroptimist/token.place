@@ -296,6 +296,41 @@ class ComputeNodeRuntime:
         _log_error("Failed to download or verify model")
         return False
 
+    def ensure_api_v1_runtime_ready(self) -> bool:
+        """Warm and validate API v1 non-streaming runtime before polling."""
+
+        if not self.ensure_model_ready():
+            return False
+
+        get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
+        if not callable(get_llm_instance):
+            _log_error("Model manager missing get_llm_instance required for API v1 warmup")
+            return False
+
+        try:
+            llm_runtime = get_llm_instance()
+        except Exception:
+            _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
+            return False
+
+        if llm_runtime is None:
+            _log_error("API v1 runtime warmup failed: get_llm_instance returned None")
+            return False
+
+        create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)
+        if not callable(create_chat_completion):
+            _log_error(
+                "API v1 runtime warmup failed: runtime missing callable create_chat_completion"
+            )
+            return False
+
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            diagnostics["api_v1_runtime_ready"] = True
+            self.model_manager.last_compute_diagnostics = diagnostics
+
+        return True
+
     def start_relay_polling(self) -> threading.Thread:
         """Start relay polling in a background thread and return the thread."""
 

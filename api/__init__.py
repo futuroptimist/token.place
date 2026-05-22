@@ -11,6 +11,15 @@ from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
 
+RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+
+
+def _resolve_rate_limit_storage_uri() -> str | None:
+    raw_value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
+    storage_uri = raw_value.strip()
+    return storage_uri or None
+
+
 def _build_rate_limit_response(exc: RateLimitExceeded):
     """Return an OpenAI-style JSON error response for rate limit breaches."""
 
@@ -40,13 +49,20 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 def init_app(app):
     """Initialize the API with the Flask app."""
 
+    limiter_storage_uri = _resolve_rate_limit_storage_uri()
+    limiter_kwargs = {
+        "default_limits": [
+            os.environ.get("API_RATE_LIMIT", "60/hour"),
+            os.environ.get("API_DAILY_QUOTA", "1000/day"),
+        ]
+    }
+    if limiter_storage_uri:
+        limiter_kwargs["storage_uri"] = limiter_storage_uri
+
     limiter = Limiter(
         get_remote_address,
         app=app,
-        default_limits=[
-            os.environ.get("API_RATE_LIMIT", "60/hour"),
-            os.environ.get("API_DAILY_QUOTA", "1000/day"),
-        ],
+        **limiter_kwargs,
     )
 
     @app.errorhandler(RateLimitExceeded)

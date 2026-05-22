@@ -105,6 +105,7 @@ local shells retain ultimate control.
 
 The development requirements live in [requirements.txt](requirements.txt).
 
+
 ### Content moderation hooks
 
 Set `CONTENT_MODERATION_MODE=block` to enable pre-inference moderation for both

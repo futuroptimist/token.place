@@ -760,7 +760,14 @@ class RelayClient:
                         'next_ping_in_x_seconds': register_wait,
                     }
                     continue
-                payload.setdefault('next_ping_in_x_seconds', register_wait)
+                if (
+                    payload.get('message') == 'No requests available'
+                    and 'api_v1_request' not in payload
+                    and payload.get('protocol') != 'tokenplace_api_v1_relay_e2ee'
+                ):
+                    payload['next_ping_in_x_seconds'] = 0
+                else:
+                    payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
                 log_info(

@@ -825,10 +825,23 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 12
+        assert result['next_ping_in_x_seconds'] == 0
         assert mock_post.call_args_list[1].kwargs['timeout'] == max(
             float(relay_client._request_timeout), 13.0
         )
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_error_path_uses_register_backoff(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 14}
+        poll_err = MagicMock(status_code=503)
+        mock_post.side_effect = [register_ok, poll_err]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['error'] == 'HTTP 503'
+        assert result['next_ping_in_x_seconds'] == 14
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_fails_over_and_uses_register_interval(self, mock_post, relay_client):
@@ -844,7 +857,7 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 9
+        assert result['next_ping_in_x_seconds'] == 0
         assert relay_client._active_relay_index == 1
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [

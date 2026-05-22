@@ -482,7 +482,9 @@ def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     removed = known_servers.pop(server_public_key, None) is not None
-    client_inference_requests.pop(server_public_key, None)
+    with client_inference_requests_changed:
+        client_inference_requests.pop(server_public_key, None)
+        client_inference_requests_changed.notify_all()
 
     with stream_lock:
         stale_session_ids = [
@@ -892,8 +894,13 @@ def api_v1_relay_servers_poll():
     with client_inference_requests_changed:
         first_request = _pop_next_api_v1_request(public_key)
         if first_request is None and poll_wait_seconds > 0:
-            client_inference_requests_changed.wait(timeout=poll_wait_seconds)
-            first_request = _pop_next_api_v1_request(public_key)
+            deadline = time.monotonic() + poll_wait_seconds
+            while first_request is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                client_inference_requests_changed.wait(timeout=remaining)
+                first_request = _pop_next_api_v1_request(public_key)
 
     if first_request is None:
         return jsonify({'message': 'No requests available'}), 200
@@ -934,17 +941,19 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
-    envelope['_queued_at'] = time.time()
+    queued_at = time.time()
+    envelope['_queued_at'] = queued_at
     with client_inference_requests_changed:
         client_inference_requests.setdefault(server_public_key, []).append(envelope)
+        queue_depth = len(client_inference_requests.get(server_public_key, []))
         client_inference_requests_changed.notify_all()
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
             "server_public_key": server_public_key,
             "request_id": envelope.get("request_id"),
-            "queued_at_unix": envelope["_queued_at"],
-            "queue_depth": len(client_inference_requests.get(server_public_key, [])),
+            "queued_at_unix": queued_at,
+            "queue_depth": queue_depth,
         },
     )
     return jsonify({'message': 'Request received'}), 200
@@ -1063,13 +1072,15 @@ def faucet():
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     # Append the client's request to the list of requests for the server
-    client_inference_requests.setdefault(server_public_key, []).append({
-        'chat_history': chat_history_ciphertext,
-        'client_public_key': client_public_key,
-        'cipherkey': cipherkey,
-        'iv': iv,  # Include the IV in the saved client's request
-        'stream': stream_requested,
-    })
+    with client_inference_requests_changed:
+        client_inference_requests.setdefault(server_public_key, []).append({
+            'chat_history': chat_history_ciphertext,
+            'client_public_key': client_public_key,
+            'cipherkey': cipherkey,
+            'iv': iv,  # Include the IV in the saved client's request
+            'stream': stream_requested,
+        })
+        client_inference_requests_changed.notify_all()
     return jsonify({'message': 'Request received'}), 200
 
 @app.route('/sink', methods=['POST'])
@@ -1127,9 +1138,9 @@ def sink():
     }
 
     # Check if there are any client requests for this server
-    queued_requests = client_inference_requests.get(public_key, [])
-    if queued_requests:
-        batch = []
+    batch = []
+    with client_inference_requests_changed:
+        queued_requests = client_inference_requests.get(public_key, [])
         while queued_requests and len(batch) < max_batch_size:
             request_payload = queued_requests[0]
             if 'api_v1_request' in request_payload:
@@ -1154,20 +1165,22 @@ def sink():
                 if session is not None:
                     request_payload['stream_session_id'] = session['session_id']
             batch.append(request_payload)
+        if not queued_requests:
+            client_inference_requests.pop(public_key, None)
 
-        if batch:
-            first_request = batch[0]
-            response_data['client_public_key'] = first_request.get('client_public_key')
-            response_data['chat_history'] = first_request.get('chat_history')
-            response_data['cipherkey'] = first_request.get('cipherkey')
-            response_data['iv'] = first_request.get('iv')
+    if batch:
+        first_request = batch[0]
+        response_data['client_public_key'] = first_request.get('client_public_key')
+        response_data['chat_history'] = first_request.get('chat_history')
+        response_data['cipherkey'] = first_request.get('cipherkey')
+        response_data['iv'] = first_request.get('iv')
 
-            if first_request.get('stream') and first_request.get('stream_session_id'):
-                response_data['stream'] = True
-                response_data['stream_session_id'] = first_request['stream_session_id']
+        if first_request.get('stream') and first_request.get('stream_session_id'):
+            response_data['stream'] = True
+            response_data['stream_session_id'] = first_request['stream_session_id']
 
-            if max_batch_size > 1:
-                response_data['batch'] = batch
+        if max_batch_size > 1:
+            response_data['batch'] = batch
 
     return jsonify(response_data)
 

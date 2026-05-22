@@ -20,8 +20,6 @@ spec:
       env:
         - name: TOKEN_PLACE_ENV
           value: "production"
-        - name: TOKENPLACE_RATE_LIMIT_STORAGE_URI
-          value: "redis://redis:6379/0"
       ports:
         - containerPort: 5010
       resources:

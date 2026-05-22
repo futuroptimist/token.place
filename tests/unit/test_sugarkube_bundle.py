@@ -46,3 +46,10 @@ def test_bundle_values_pin_arm64_and_production_env():
     relay = values["relay"]
     assert relay["host"] == "0.0.0.0"
     assert relay["port"] == 5010
+
+
+def test_bundle_values_do_not_pin_redis_storage_backend():
+    """Sugarkube values must not require Redis-specific limiter env defaults."""
+    content = BUNDLE_VALUES_PATH.read_text()
+    assert "redis://" not in content
+    assert "TOKENPLACE_RATE_LIMIT_STORAGE_URI" not in content

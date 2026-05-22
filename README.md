@@ -77,7 +77,6 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
-| TOKENPLACE_RATE_LIMIT_STORAGE_URI | (empty) | Flask-Limiter storage backend URI (set to Redis in production; dev may use in-memory default) |
 | CONTENT_MODERATION_MODE | disabled     | Set to `block` to enable request filtering before inference           |
 | CONTENT_MODERATION_BLOCKLIST | (defaults)  | Comma-separated phrases added to the default safety blocklist         |
 | CONTENT_MODERATION_INCLUDE_DEFAULTS | 1            | Set to `0` to skip the built-in phrases when filtering requests        |
@@ -106,11 +105,6 @@ local shells retain ultimate control.
 
 The development requirements live in [requirements.txt](requirements.txt).
 
-
-Production guardrail: when `TOKEN_PLACE_ENV=production`, `TOKENPLACE_RATE_LIMIT_STORAGE_URI` must
-be set (for example `redis://redis:6379/0`) so rate-limit counters are stored in a shared backend
-instead of process-local memory. Development and testing environments can omit this setting for
-quick local startup.
 
 ### Content moderation hooks
 

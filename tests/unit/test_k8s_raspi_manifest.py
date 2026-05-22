@@ -25,3 +25,10 @@ def test_raspi_manifest_sets_production_env():
 
     env = {entry["name"]: entry["value"] for entry in container.get("env", [])}
     assert env.get("TOKEN_PLACE_ENV") == "production", "Set TOKEN_PLACE_ENV=production for k3s pod"
+
+
+def test_raspi_manifest_does_not_pin_redis_storage_backend():
+    """Production manifest must not require Redis-specific limiter env defaults."""
+    content = RASPI_MANIFEST_PATH.read_text()
+    assert "redis://" not in content
+    assert "TOKENPLACE_RATE_LIMIT_STORAGE_URI" not in content

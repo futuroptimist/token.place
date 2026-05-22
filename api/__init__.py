@@ -26,23 +26,6 @@ def _resolve_rate_limit_storage_uri() -> str | None:
     return storage_uri or None
 
 
-def _configure_rate_limit_storage() -> str | None:
-    storage_uri = _resolve_rate_limit_storage_uri()
-
-    if _is_production_environment():
-        if not storage_uri:
-            raise RuntimeError(
-                f"{RATE_LIMIT_STORAGE_URI_ENV} must be configured when TOKEN_PLACE_ENV is production "
-                "to avoid in-memory rate-limit storage."
-            )
-
-        if storage_uri.startswith("memory://"):
-            raise RuntimeError(
-                f"{RATE_LIMIT_STORAGE_URI_ENV} must not use in-memory backends when TOKEN_PLACE_ENV "
-                "is production."
-            )
-
-    return storage_uri
 
 
 def _build_rate_limit_response(exc: RateLimitExceeded):
@@ -74,15 +57,20 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
 def init_app(app):
     """Initialize the API with the Flask app."""
 
-    limiter_storage_uri = _configure_rate_limit_storage()
+    limiter_storage_uri = _resolve_rate_limit_storage_uri()
+    limiter_kwargs = {
+        "default_limits": [
+            os.environ.get("API_RATE_LIMIT", "60/hour"),
+            os.environ.get("API_DAILY_QUOTA", "1000/day"),
+        ]
+    }
+    if limiter_storage_uri:
+        limiter_kwargs["storage_uri"] = limiter_storage_uri
+
     limiter = Limiter(
         get_remote_address,
         app=app,
-        default_limits=[
-            os.environ.get("API_RATE_LIMIT", "60/hour"),
-            os.environ.get("API_DAILY_QUOTA", "1000/day"),
-        ],
-        storage_uri=limiter_storage_uri,
+        **limiter_kwargs,
     )
 
     @app.errorhandler(RateLimitExceeded)

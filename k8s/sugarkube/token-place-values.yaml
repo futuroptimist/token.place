@@ -11,7 +11,6 @@ relay:
 
 env:
   TOKEN_PLACE_ENV: production
-  TOKENPLACE_RATE_LIMIT_STORAGE_URI: redis://redis:6379/0
 
 nodeSelector:
   kubernetes.io/arch: arm64

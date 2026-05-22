@@ -34,11 +34,15 @@ chat as a primary path or fallback chain. Desktop local prompt smoke-test stream
 
 2. Create and activate a Python virtual environment:
    ```bash
-   python -m venv env
-   # Windows
-   env\Scripts\activate
-   # Linux/macOS
-   source env/bin/activate
+   python -m venv .venv
+   ```
+   Windows (PowerShell):
+   ```powershell
+   .\.venv\Scripts\Activate.ps1
+   ```
+   Linux/macOS:
+   ```bash
+   source .venv/bin/activate
    ```
 
 3. Install Python dependencies:

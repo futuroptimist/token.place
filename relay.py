@@ -378,6 +378,8 @@ def _validate_server_registration():
 
 known_servers = {}
 client_inference_requests = {}
+client_inference_requests_lock = threading.Lock()
+client_inference_requests_condition = threading.Condition(client_inference_requests_lock)
 client_responses = {}
 client_responses_lock = threading.Lock()
 streaming_sessions = {}
@@ -387,6 +389,8 @@ stream_lock = threading.Lock()
 IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
 SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
 DEFAULT_SERVER_STALE_SECONDS = 30
+API_V1_POLL_WAIT_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
+DEFAULT_API_V1_POLL_WAIT_SECONDS = 10.0
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -435,7 +439,9 @@ def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     removed = known_servers.pop(server_public_key, None) is not None
-    client_inference_requests.pop(server_public_key, None)
+    with client_inference_requests_condition:
+        client_inference_requests.pop(server_public_key, None)
+        client_inference_requests_condition.notify_all()
 
     with stream_lock:
         stale_session_ids = [
@@ -454,6 +460,23 @@ def _unregister_server(server_public_key: str) -> bool:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
     return removed
+
+
+def _api_v1_poll_wait_seconds() -> float:
+    raw = os.environ.get(API_V1_POLL_WAIT_SECONDS_ENV, str(DEFAULT_API_V1_POLL_WAIT_SECONDS))
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_API_V1_POLL_WAIT_SECONDS
+    return max(value, 0.0)
+
+
+def _queue_relay_request(server_public_key: str, envelope: dict[str, Any]) -> None:
+    with client_inference_requests_condition:
+        queue = client_inference_requests.setdefault(server_public_key, [])
+        envelope.setdefault("queued_at_epoch_ms", int(time.time() * 1000))
+        queue.append(envelope)
+        client_inference_requests_condition.notify_all()
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -841,9 +864,19 @@ def api_v1_relay_servers_poll():
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
-    queued_requests = client_inference_requests.get(public_key, [])
-    if not queued_requests:
-        return jsonify({'message': 'No requests available'}), 200
+    poll_wait_seconds = _api_v1_poll_wait_seconds()
+    requested_wait = data.get("wait_seconds")
+    if isinstance(requested_wait, (int, float)):
+        poll_wait_seconds = min(max(float(requested_wait), 0.0), poll_wait_seconds)
+    poll_started_at = time.time()
+    with client_inference_requests_condition:
+        queued_requests = client_inference_requests.get(public_key, [])
+        while not queued_requests:
+            remaining = poll_wait_seconds - (time.time() - poll_started_at)
+            if remaining <= 0:
+                return jsonify({'message': 'No requests available'}), 200
+            client_inference_requests_condition.wait(timeout=remaining)
+            queued_requests = client_inference_requests.get(public_key, [])
 
     first_request = None
 
@@ -878,6 +911,23 @@ def api_v1_relay_servers_poll():
     if not queued_requests:
         client_inference_requests.pop(public_key, None)
 
+    if first_request.get("e2ee_v1"):
+        queued_at_ms = first_request.get("queued_at_epoch_ms")
+        dispatched_at_ms = int(time.time() * 1000)
+        queue_wait_ms = None
+        if isinstance(queued_at_ms, (int, float)):
+            queue_wait_ms = max(0, dispatched_at_ms - int(queued_at_ms))
+        LOGGER.info(
+            "relay.api_v1_dispatch",
+            extra={
+                "server_public_key": public_key,
+                "request_id": first_request.get("request_id"),
+                "queued_at_epoch_ms": queued_at_ms,
+                "dispatched_at_epoch_ms": dispatched_at_ms,
+                "queue_wait_ms": queue_wait_ms,
+            },
+        )
+
     return jsonify(first_request), 200
 
 
@@ -900,7 +950,7 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
 
     envelope['e2ee_v1'] = True
-    client_inference_requests.setdefault(server_public_key, []).append(envelope)
+    _queue_relay_request(server_public_key, envelope)
     return jsonify({'message': 'Request received'}), 200
 
 
@@ -1017,7 +1067,7 @@ def faucet():
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     # Append the client's request to the list of requests for the server
-    client_inference_requests.setdefault(server_public_key, []).append({
+    _queue_relay_request(server_public_key, {
         'chat_history': chat_history_ciphertext,
         'client_public_key': client_public_key,
         'cipherkey': cipherkey,

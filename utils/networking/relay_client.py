@@ -722,8 +722,11 @@ class RelayClient:
                         continue
 
                 request_kwargs: Dict[str, Any] = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._request_timeout,
+                    'json': {
+                        'server_public_key': self.crypto_manager.public_key_b64,
+                        'wait_seconds': register_wait,
+                    },
+                    'timeout': max(self._request_timeout, float(register_wait) + 1.0),
                 }
                 headers = self._auth_headers()
                 if headers:

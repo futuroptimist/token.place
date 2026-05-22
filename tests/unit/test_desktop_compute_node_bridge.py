@@ -1250,27 +1250,21 @@ def test_run_warms_runtime_before_first_register_poll(capsys, monkeypatch):
 
 def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
     _reset_cancel_queue()
+    calls = []
 
     class FailingWarmupRuntime(FakeRuntime):
-        last_instance = None
-
-        def __init__(self, config):
-            super().__init__(config)
-            self.poll_count = 0
-            FailingWarmupRuntime.last_instance = self
-
         def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
             return False
 
         def register_and_poll_once(self):
-            self.poll_count += 1
+            calls.append("poll")
             return {"next_ping_in_x_seconds": 0}
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingWarmupRuntime)
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
     assert status == 1
-    assert FailingWarmupRuntime.last_instance is not None
-    assert FailingWarmupRuntime.last_instance.poll_count == 0
+    assert calls == ["warm"]
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["type"] == "error"

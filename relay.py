@@ -1136,48 +1136,49 @@ def sink():
     }
 
     # Check if there are any client requests for this server
-    batch = []
     queued_requests = client_inference_requests.get(public_key, [])
-    while queued_requests and len(batch) < max_batch_size:
-        request_payload = queued_requests[0]
-        if 'api_v1_request' in request_payload:
-            queued_requests.pop(0)
-            LOGGER.warning(
-                "relay.api_v1_plaintext_payload_dropped",
-                extra={"server_public_key": public_key},
-            )
-            continue
-        if request_payload.get('e2ee_v1'):
-            LOGGER.warning(
-                "relay.api_v1_ciphertext_payload_skipped",
-                extra={"server_public_key": public_key},
-            )
-            break
-        request_payload = queued_requests.pop(0)
-        if request_payload.get('stream'):
-            session = _register_stream_session(
-                public_key,
-                request_payload.get('client_public_key'),
-            )
-            if session is not None:
-                request_payload['stream_session_id'] = session['session_id']
-        batch.append(request_payload)
-    if not queued_requests:
-        client_inference_requests.pop(public_key, None)
+    if queued_requests:
+        batch = []
+        while queued_requests and len(batch) < max_batch_size:
+            request_payload = queued_requests[0]
+            if 'api_v1_request' in request_payload:
+                queued_requests.pop(0)
+                LOGGER.warning(
+                    "relay.api_v1_plaintext_payload_dropped",
+                    extra={"server_public_key": public_key},
+                )
+                continue
+            if request_payload.get('e2ee_v1'):
+                LOGGER.warning(
+                    "relay.api_v1_ciphertext_payload_skipped",
+                    extra={"server_public_key": public_key},
+                )
+                break
+            request_payload = queued_requests.pop(0)
+            if request_payload.get('stream'):
+                session = _register_stream_session(
+                    public_key,
+                    request_payload.get('client_public_key'),
+                )
+                if session is not None:
+                    request_payload['stream_session_id'] = session['session_id']
+            batch.append(request_payload)
+        if not queued_requests:
+            client_inference_requests.pop(public_key, None)
 
-    if batch:
-        first_request = batch[0]
-        response_data['client_public_key'] = first_request.get('client_public_key')
-        response_data['chat_history'] = first_request.get('chat_history')
-        response_data['cipherkey'] = first_request.get('cipherkey')
-        response_data['iv'] = first_request.get('iv')
+        if batch:
+            first_request = batch[0]
+            response_data['client_public_key'] = first_request.get('client_public_key')
+            response_data['chat_history'] = first_request.get('chat_history')
+            response_data['cipherkey'] = first_request.get('cipherkey')
+            response_data['iv'] = first_request.get('iv')
 
-        if first_request.get('stream') and first_request.get('stream_session_id'):
-            response_data['stream'] = True
-            response_data['stream_session_id'] = first_request['stream_session_id']
+            if first_request.get('stream') and first_request.get('stream_session_id'):
+                response_data['stream'] = True
+                response_data['stream_session_id'] = first_request['stream_session_id']
 
-        if max_batch_size > 1:
-            response_data['batch'] = batch
+            if max_batch_size > 1:
+                response_data['batch'] = batch
 
     return jsonify(response_data)
 

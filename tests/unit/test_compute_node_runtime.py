@@ -122,6 +122,40 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_failure_cases(
     assert runtime.ensure_api_v1_runtime_ready() is expected
 
 
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_handles_get_llm_exception():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.get_llm_instance.side_effect = RuntimeError("boom")
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+
+
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_without_diagnostics_dict():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.last_compute_diagnostics = "not-a-dict"
+    llm_runtime = MagicMock()
+    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_runtime
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager.last_compute_diagnostics == "not-a-dict"
+
+
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()

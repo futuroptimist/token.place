@@ -19,6 +19,7 @@ from relay import app
 from relay import (
     known_servers,
     client_inference_requests,
+    client_pending_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -39,6 +40,7 @@ def client():
     # Reset state before each test
     known_servers.clear()
     client_inference_requests.clear()
+    client_pending_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -54,6 +56,7 @@ def client():
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     client_inference_requests.clear()
+    client_pending_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()

@@ -156,3 +156,105 @@ def test_retrieve_chat_response_returns_api_v1_message_without_original_history(
         retry_delay=0,
         expected_request_id="req-1",
     ) == [{"role": "assistant", "content": "done"}]
+
+
+def test_retrieve_chat_response_handles_pending_then_success(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    sent_payloads = []
+    responses = iter([
+        _FakeResponse(202, {"status": "pending"}),
+        _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE),
+    ])
+
+    def fake_post(url, json, timeout):
+        sent_payloads.append((url, dict(json), timeout))
+        return next(responses)
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        client,
+        "decrypt_message",
+        lambda _encrypted: {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "request_id": "req-pending",
+            "api_v1_response": {"message": {"role": "assistant", "content": "ready"}},
+        },
+    )
+
+    assert client.retrieve_chat_response(
+        max_retries=2,
+        retry_delay=0,
+        expected_request_id="req-pending",
+    ) == [{"role": "assistant", "content": "ready"}]
+    assert sent_payloads == [
+        (
+            "https://test-server.com/api/v1/relay/responses/retrieve",
+            {"client_public_key": "client-key", "request_id": "req-pending"},
+            10,
+        ),
+        (
+            "https://test-server.com/api/v1/relay/responses/retrieve",
+            {"client_public_key": "client-key", "request_id": "req-pending"},
+            10,
+        ),
+    ]
+
+
+def test_retrieve_chat_response_404_is_terminal(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        return _FakeResponse(404, {"error": {"message": "unknown request id"}})
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+
+    assert client.retrieve_chat_response(
+        max_retries=5,
+        retry_delay=0,
+        expected_request_id="req-missing",
+    ) is None
+    assert post_calls == [({"client_public_key": "client-key", "request_id": "req-missing"}, 10)]
+
+
+def test_retrieve_chat_response_retries_on_non_pending_non_terminal_status(monkeypatch):
+    client = CryptoClient("https://test-server.com")
+    client.client_public_key_b64 = "client-key"
+    post_calls = []
+    responses = iter(
+        [
+            _FakeResponse(500, {"error": "boom"}),
+            _FakeResponse(200, ENCRYPTED_RELAY_RESPONSE),
+        ]
+    )
+
+    def fake_post(_url, json, timeout):
+        post_calls.append((dict(json), timeout))
+        return next(responses)
+
+    monkeypatch.setattr("utils.crypto_helpers.requests.post", fake_post)
+    monkeypatch.setattr("utils.crypto_helpers.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        client,
+        "decrypt_message",
+        lambda _encrypted: {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "request_id": "req-retry",
+            "api_v1_response": {"message": {"role": "assistant", "content": "ok"}},
+        },
+    )
+
+    assert client.retrieve_chat_response(
+        max_retries=2,
+        retry_delay=0,
+        expected_request_id="req-retry",
+    ) == [{"role": "assistant", "content": "ok"}]
+    assert post_calls == [
+        ({"client_public_key": "client-key", "request_id": "req-retry"}, 10),
+        ({"client_public_key": "client-key", "request_id": "req-retry"}, 10),
+    ]

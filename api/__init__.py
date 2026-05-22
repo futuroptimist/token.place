@@ -12,20 +12,12 @@ from api.v2 import routes as v2_routes
 
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
-_PRODUCTION_ENV_VALUES = {"production"}
-
-
-def _is_production_environment() -> bool:
-    env = os.environ.get("TOKEN_PLACE_ENV", "development").strip().lower()
-    return env in _PRODUCTION_ENV_VALUES
 
 
 def _resolve_rate_limit_storage_uri() -> str | None:
     raw_value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
     storage_uri = raw_value.strip()
     return storage_uri or None
-
-
 
 
 def _build_rate_limit_response(exc: RateLimitExceeded):

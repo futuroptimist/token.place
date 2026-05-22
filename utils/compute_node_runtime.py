@@ -296,6 +296,48 @@ class ComputeNodeRuntime:
         _log_error("Failed to download or verify model")
         return False
 
+    def ensure_api_v1_runtime_ready(self) -> bool:
+        """Warm the API v1 runtime and verify non-streaming completion support."""
+
+        if not self.ensure_model_ready():
+            return False
+
+        get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
+        if not callable(get_llm_instance):
+            _log_error("Model manager missing callable get_llm_instance for API v1 runtime warmup")
+            diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+            if isinstance(diagnostics, dict):
+                diagnostics["runtime_ready"] = False
+                diagnostics["runtime_ready_error"] = "missing_get_llm_instance"
+            return False
+
+        llm_runtime = get_llm_instance()
+        if llm_runtime is None:
+            _log_error("API v1 runtime warmup failed: get_llm_instance returned None")
+            diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+            if isinstance(diagnostics, dict):
+                diagnostics["runtime_ready"] = False
+                diagnostics["runtime_ready_error"] = "runtime_unavailable"
+            return False
+
+        create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)
+        if not callable(create_chat_completion):
+            _log_error(
+                "API v1 runtime warmup failed: runtime missing callable create_chat_completion"
+            )
+            diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+            if isinstance(diagnostics, dict):
+                diagnostics["runtime_ready"] = False
+                diagnostics["runtime_ready_error"] = "missing_create_chat_completion"
+            return False
+
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            diagnostics["runtime_ready"] = True
+            diagnostics["runtime_ready_error"] = None
+        _log_info("API v1 runtime warmed and ready for non-streaming completions")
+        return True
+
     def start_relay_polling(self) -> threading.Thread:
         """Start relay polling in a background thread and return the thread."""
 

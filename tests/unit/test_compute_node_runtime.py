@@ -78,6 +78,67 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
     model_manager.download_model_if_needed.assert_called_once_with()
 
 
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.download_model_if_needed.return_value = True
+    model_manager.last_compute_diagnostics = {"requested_mode": "auto"}
+    llm = MagicMock()
+    llm.create_chat_completion = MagicMock()
+    model_manager.get_llm_instance.return_value = llm
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is True
+    assert model_manager.last_compute_diagnostics["runtime_ready"] is True
+
+
+@pytest.mark.parametrize(
+    "manager_setup",
+    [
+        lambda manager: setattr(manager, "get_llm_instance", None),
+        lambda manager: setattr(manager.get_llm_instance, "return_value", None),
+    ],
+)
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_failures(manager_setup):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.download_model_if_needed.return_value = True
+    model_manager.last_compute_diagnostics = {"requested_mode": "auto"}
+    manager_setup(model_manager)
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_compute_diagnostics["runtime_ready"] is False
+
+
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_rejects_non_callable_completion():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.download_model_if_needed.return_value = True
+    model_manager.last_compute_diagnostics = {"requested_mode": "auto"}
+    model_manager.get_llm_instance.return_value = object()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_compute_diagnostics["runtime_ready_error"] == (
+        "missing_create_chat_completion"
+    )
+
+
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()

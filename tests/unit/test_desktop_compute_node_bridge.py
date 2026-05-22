@@ -69,6 +69,9 @@ class FakeRuntime:
     def ensure_model_ready(self):
         return True
 
+    def ensure_api_v1_runtime_ready(self):
+        return self.ensure_model_ready()
+
     def register_and_poll_once(self):
         if self._responses:
             return self._responses.pop(0)
@@ -364,6 +367,9 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
         def ensure_model_ready(self):
             return False
 
+        def ensure_api_v1_runtime_ready(self):
+            return self.ensure_model_ready()
+
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingRuntime)
 
     args = SimpleNamespace(
@@ -377,7 +383,7 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     assert status == 1
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload['type'] == 'error'
-    assert 'failed to initialize model runtime' in payload['message']
+    assert 'failed to warm API v1 model runtime' in payload['message']
 
 
 def test_run_allows_runtime_reexec_when_cuda_runtime_is_repaired(capsys, monkeypatch):
@@ -919,6 +925,9 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
         def ensure_model_ready(self):
             return True
 
+        def ensure_api_v1_runtime_ready(self):
+            return self.ensure_model_ready()
+
         def register_and_poll_once(self):
             return {'next_ping_in_x_seconds': 0}
 
@@ -1108,6 +1117,9 @@ class ComputeNodeRuntime:
     def ensure_model_ready(self):
         return True
 
+    def ensure_api_v1_runtime_ready(self):
+        return self.ensure_model_ready()
+
     def register_and_poll_once(self):
         return {"next_ping_in_x_seconds": 1}
 
@@ -1215,3 +1227,59 @@ def test_relay_response_summary_handles_non_dict_payloads():
 
 def test_relay_error_message_normalizes_non_string_truthy_values():
     assert compute_node_bridge._relay_error_message({"error": 503}) == "503"
+
+
+def test_bridge_warms_runtime_before_first_poll(monkeypatch):
+    events = []
+    calls = []
+
+    class OrderedRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
+            return True
+
+        def register_and_poll_once(self):
+            calls.append("poll")
+            return {"next_ping_in_x_seconds": 0, "error": None}
+
+    _install_fake_runtime_module(monkeypatch, OrderedRuntime)
+    monkeypatch.setattr(compute_node_bridge, "emit", lambda payload: events.append(payload))
+    monkeypatch.setattr(compute_node_bridge, "stop_requested", lambda: len(events) >= 2)
+    monkeypatch.setattr(compute_node_bridge.time, "sleep", lambda _seconds: None)
+
+    result = compute_node_bridge.run(
+        compute_node_bridge.argparse.Namespace(
+            model="/tmp/model.gguf", mode="auto", relay_url="https://token.place", relay_port=None
+        )
+    )
+    assert result == 0
+    assert calls[0] == "warm"
+    assert "poll" in calls[1:]
+
+
+def test_bridge_does_not_poll_when_runtime_warmup_fails(monkeypatch):
+    events = []
+
+    class FailedWarmRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.polled = 0
+
+        def ensure_api_v1_runtime_ready(self):
+            return False
+
+        def register_and_poll_once(self):
+            self.polled += 1
+            return super().register_and_poll_once()
+
+    _install_fake_runtime_module(monkeypatch, FailedWarmRuntime)
+    monkeypatch.setattr(compute_node_bridge, "emit", lambda payload: events.append(payload))
+
+    result = compute_node_bridge.run(
+        compute_node_bridge.argparse.Namespace(
+            model="/tmp/model.gguf", mode="auto", relay_url="https://token.place", relay_port=None
+        )
+    )
+    assert result == 1
+    assert events[0]["type"] == "error"
+    assert events[0]["message"] == "failed to warm API v1 model runtime"

@@ -101,9 +101,13 @@ def test_development_without_rate_limit_storage_uri_still_initializes_limiter():
     """Development environments should allow in-memory limiter storage for easy local setup."""
 
     app = Flask(__name__)
-    limiter = init_app(app)
+    limiter_instance = MagicMock()
 
-    assert getattr(limiter, "_storage_uri", None) in (None, "memory://")
+    with patch("api.Limiter", return_value=limiter_instance) as limiter_cls:
+        limiter = init_app(app)
+
+    assert limiter is limiter_instance
+    assert limiter_cls.call_args.kwargs["storage_uri"] is None
 
 
 @patch.dict(os.environ, {"TOKEN_PLACE_ENV": "production"}, clear=True)
@@ -113,6 +117,23 @@ def test_production_without_rate_limit_storage_uri_fails_fast():
     app = Flask(__name__)
 
     with pytest.raises(RuntimeError, match="TOKENPLACE_RATE_LIMIT_STORAGE_URI"):
+        init_app(app)
+
+
+@patch.dict(
+    os.environ,
+    {
+        "TOKEN_PLACE_ENV": "production",
+        "TOKENPLACE_RATE_LIMIT_STORAGE_URI": "memory://",
+    },
+    clear=True,
+)
+def test_production_rejects_in_memory_rate_limit_storage_uri():
+    """Production environments should reject in-memory limiter backends."""
+
+    app = Flask(__name__)
+
+    with pytest.raises(RuntimeError, match="must not use in-memory"):
         init_app(app)
 
 

@@ -12,7 +12,7 @@ from api.v2 import routes as v2_routes
 
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
-_PRODUCTION_ENV_VALUES = {"production", "prod"}
+_PRODUCTION_ENV_VALUES = {"production"}
 
 
 def _is_production_environment() -> bool:
@@ -28,16 +28,21 @@ def _resolve_rate_limit_storage_uri() -> str | None:
 
 def _configure_rate_limit_storage() -> str | None:
     storage_uri = _resolve_rate_limit_storage_uri()
-    if storage_uri:
-        return storage_uri
 
     if _is_production_environment():
-        raise RuntimeError(
-            f"{RATE_LIMIT_STORAGE_URI_ENV} must be configured when TOKEN_PLACE_ENV is production "
-            "to avoid in-memory rate-limit storage."
-        )
+        if not storage_uri:
+            raise RuntimeError(
+                f"{RATE_LIMIT_STORAGE_URI_ENV} must be configured when TOKEN_PLACE_ENV is production "
+                "to avoid in-memory rate-limit storage."
+            )
 
-    return None
+        if storage_uri.startswith("memory://"):
+            raise RuntimeError(
+                f"{RATE_LIMIT_STORAGE_URI_ENV} must not use in-memory backends when TOKEN_PLACE_ENV "
+                "is production."
+            )
+
+    return storage_uri
 
 
 def _build_rate_limit_response(exc: RateLimitExceeded):

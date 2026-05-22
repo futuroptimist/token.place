@@ -42,6 +42,8 @@ The container exposes port `5010` internally. Runtime environment variables:
 - `TOKENPLACE_RATE_LIMIT_STORAGE_URI` should point to a shared backend such as Redis in
   production (for example `redis://redis.tokenplace.svc.cluster.local:6379/0`). When
   `TOKEN_PLACE_ENV=production`, relay startup fails fast if this variable is missing.
+  The repository's production values files now include a starter value
+  (`redis://redis:6379/0`); override it per environment with your real shared Redis endpoint.
 
 ## Ingress, TLS, and certificates
 

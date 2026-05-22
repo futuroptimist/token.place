@@ -378,6 +378,7 @@ def _validate_server_registration():
 
 known_servers = {}
 client_inference_requests = {}
+pending_client_request_ids = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
 client_inference_requests_lock = threading.Lock()
@@ -805,6 +806,13 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
 def _queue_client_response(client_public_key, envelope):
     """Queue an encrypted response while preserving per-request retrieval."""
     with client_responses_lock:
+        request_id = envelope.get("request_id")
+        if request_id:
+            pending_ids = pending_client_request_ids.get(client_public_key)
+            if isinstance(pending_ids, set):
+                pending_ids.discard(request_id)
+                if not pending_ids:
+                    pending_client_request_ids.pop(client_public_key, None)
         existing = client_responses.get(client_public_key)
         if existing is None:
             client_responses[client_public_key] = envelope
@@ -843,6 +851,21 @@ def _pop_client_response(client_public_key, request_id=None):
         if request_id and queued.get('request_id') != request_id:
             return None
         return client_responses.pop(client_public_key)
+
+
+def _mark_pending_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return
+    with client_responses_lock:
+        pending_client_request_ids.setdefault(client_public_key, set()).add(request_id)
+
+
+def _is_pending_request(client_public_key, request_id=None):
+    with client_responses_lock:
+        pending_ids = pending_client_request_ids.get(client_public_key, set())
+        if request_id:
+            return request_id in pending_ids
+        return bool(pending_ids)
 
 
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
@@ -950,6 +973,7 @@ def api_v1_relay_requests():
         client_inference_requests.setdefault(server_public_key, []).append(envelope)
         queue_depth = len(client_inference_requests.get(server_public_key, []))
         client_inference_requests_changed.notify_all()
+    _mark_pending_request(envelope.get('client_public_key'), envelope.get('request_id'))
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
@@ -993,6 +1017,8 @@ def api_v1_relay_responses_retrieve():
     client_public_key = data['client_public_key']
     response = _pop_client_response(client_public_key, data.get('request_id'))
     if response is None:
+        if _is_pending_request(client_public_key, data.get('request_id')):
+            return jsonify({'status': 'pending'}), 202
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
     return jsonify(response), 200

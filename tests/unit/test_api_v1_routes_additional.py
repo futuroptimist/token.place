@@ -164,7 +164,6 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 
     monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
     monkeypatch.setattr(routes, 'validate_model_name', lambda *args, **kwargs: None)
-    monkeypatch.setattr(routes, 'get_model_instance', lambda model_id: object())
     monkeypatch.setattr(routes, 'resolve_model_alias', lambda model_id: None)
     monkeypatch.setattr(
         routes,
@@ -172,11 +171,12 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
         lambda messages: SimpleNamespace(allowed=True),
     )
 
-    def _generate(model_id, messages):
-        assert model_id == 'llama-3-8b-instruct'
-        return messages + [{'role': 'assistant', 'content': 'Mock reply'}]
+    class _Provider:
+        def complete_chat(self, model_id, messages, options):
+            assert model_id == 'llama-3-8b-instruct'
+            return {'role': 'assistant', 'content': 'Mock reply'}
 
-    monkeypatch.setattr(routes, 'generate_response', _generate)
+    monkeypatch.setattr(routes, 'get_api_v1_compute_provider', lambda: _Provider())
 
     response = client.post('/api/v1/chat/completions', json=payload)
     assert response.status_code == 200

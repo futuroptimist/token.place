@@ -76,7 +76,7 @@ def mock_llama():
     mock_instance = MagicMock()
     mock_instance.create_chat_completion.return_value = mock_response
     models_module = importlib.import_module("api.v1.models")
-    with patch.object(models_module, "Llama", return_value=mock_instance, autospec=True):
+    with patch.object(models_module, "Llama", MagicMock(return_value=mock_instance)):
         yield mock_instance
 # --- END NEW MOCK SETUP ---
 

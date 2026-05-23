@@ -254,11 +254,12 @@ jobs:
             else
               ref_slug="${GITHUB_REF_NAME:-manual}"
             fi
-            ref_slug="${ref_slug//\//-}"
-            dmg_path="release-artifacts/${app_name}_${ref_slug}_${{ matrix.tauri_target }}.dmg"
+            version="${ref_slug#desktop-v}"
+            version="${version//\//-}"
+            dmg_path="release-artifacts/token.place-desktop-${version}-apple-silicon.dmg"
 
             rm -f "${dmg_path}"
-            hdiutil create -volname "${app_name}" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
+            hdiutil create -volname "token.place desktop" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"
@@ -278,6 +279,31 @@ jobs:
             cp "${msi_files[@]}" release-artifacts/
           else
             echo "Unsupported runner.os: ${{ runner.os }}" >&2
+            exit 1
+          fi
+
+      - name: Validate macOS staged artifact branding, architecture, icon, and signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          set -euo pipefail
+          require_signing=false
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] || [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            require_signing=true
+          fi
+          python ../scripts/validate_desktop_tauri_release_artifacts.py \
+            --staging-dir release-artifacts \
+            ${require_signing:+--require-signing}
+
+      - name: Validate no stale Electron branding in staged artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rg -n "tokenplace Desktop|tokenplace Desktop Setup|desktop/electron-builder" release-artifacts; then
+            echo "::error::Stale Electron branding detected in staged release artifacts."
             exit 1
           fi
 

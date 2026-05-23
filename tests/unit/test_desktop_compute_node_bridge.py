@@ -378,7 +378,7 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     status = compute_node_bridge.run(args)
 
     assert status == 1
-    payload = json.loads(capsys.readouterr().out.strip())
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-2])
     assert payload['type'] == 'error'
     assert 'failed to initialize API v1 model runtime' in payload['message']
 
@@ -995,7 +995,7 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     status = compute_node_bridge.main()
 
     assert status == 1
-    payload = json.loads(capsys.readouterr().out.strip())
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload['type'] == 'error'
     assert payload['message'].startswith(
         'compute-node bridge exited before emitting a startup event:'
@@ -1226,7 +1226,7 @@ def test_relay_error_message_normalizes_non_string_truthy_values():
     assert compute_node_bridge._relay_error_message({"error": 503}) == "503"
 
 
-def test_run_warms_runtime_before_first_register_poll(capsys, monkeypatch):
+def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []
 
@@ -1240,15 +1240,16 @@ def test_run_warms_runtime_before_first_register_poll(capsys, monkeypatch):
             return {"next_ping_in_x_seconds": 0}
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=OrderedRuntime)
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: len(call_order) > 1)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: len(call_order) > 2)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
     assert status == 0
-    assert call_order[:2] == ["warm", "poll"]
+    assert call_order[:3] == ["poll", "warm", "poll"]
     _ = capsys.readouterr()
 
 
-def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
+def test_run_stops_when_post_registration_runtime_warmup_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     calls = []
 
@@ -1263,8 +1264,32 @@ def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingWarmupRuntime)
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     status = compute_node_bridge.run(args)
     assert status == 1
-    assert calls == ["warm"]
-    payload = json.loads(capsys.readouterr().out.strip())
+    assert calls == ["poll", "warm"]
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-2])
     assert payload["type"] == "error"
+
+
+def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
+    _reset_cancel_queue()
+    call_order = []
+
+    class OrderedRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            call_order.append("warm")
+            return True
+
+        def register_and_poll_once(self):
+            call_order.append("poll")
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=OrderedRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: len(call_order) > 1)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    status = compute_node_bridge.run(args)
+    assert status == 0
+    assert call_order == ["poll", "poll"]
+    _ = capsys.readouterr()

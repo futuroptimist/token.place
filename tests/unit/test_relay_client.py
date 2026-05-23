@@ -903,6 +903,48 @@ class TestRelayClient:
 
         assert result == {'error': 'HTTP 429', 'next_ping_in_x_seconds': 11}
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_does_not_reregister_every_poll(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 10, 'poll_wait_seconds': 10}
+        poll_ok_first = MagicMock(status_code=200)
+        poll_ok_first.json.return_value = {'message': 'No requests available'}
+        poll_ok_second = MagicMock(status_code=200)
+        poll_ok_second.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_ok, poll_ok_first, poll_ok_second]
+
+        first = relay_client.poll_api_v1_encrypted_work()
+        second = relay_client.poll_api_v1_encrypted_work()
+
+        assert first['next_ping_in_x_seconds'] == 0
+        assert second['next_ping_in_x_seconds'] == 0
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_reregisters_after_unknown_server(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 8, 'poll_wait_seconds': 10}
+        unknown_server = MagicMock(status_code=404)
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_ok, unknown_server, register_ok, poll_ok]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['next_ping_in_x_seconds'] == 0
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""
         # Setup request data with missing fields

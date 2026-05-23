@@ -917,7 +917,8 @@ def api_v1_relay_servers_register():
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
 
-    if public_key in known_servers:
+    is_reregister = public_key in known_servers
+    if is_reregister:
         known_servers[public_key]['last_ping'] = datetime.now()
     else:
         known_servers[public_key] = {
@@ -925,6 +926,14 @@ def api_v1_relay_servers_register():
             'last_ping': datetime.now(),
             'last_ping_duration': 10,
         }
+    LOGGER.info(
+        "server.registered",
+        extra={
+            "server_public_key": public_key,
+            "reregister": is_reregister,
+            "ttl_seconds": _server_stale_seconds(),
+        },
+    )
 
     return jsonify({
         'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
@@ -949,6 +958,14 @@ def api_v1_relay_servers_poll():
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+    known_servers[public_key]['last_ping'] = datetime.now()
+    LOGGER.info(
+        "server.heartbeat",
+        extra={
+            "server_public_key": public_key,
+            "ttl_seconds": _server_stale_seconds(),
+        },
+    )
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     with client_inference_requests_changed:

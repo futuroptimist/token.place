@@ -212,13 +212,15 @@ jobs:
 
       - name: Build Tauri bundles
         shell: bash
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
+            APPLE_SIGNING_IDENTITY="${{ secrets.APPLE_SIGNING_IDENTITY }}"
+            APPLE_CERTIFICATE_P12_BASE64="${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}"
+            APPLE_CERTIFICATE_PASSWORD="${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
+            APPLE_KEYCHAIN_PASSWORD="${{ secrets.APPLE_KEYCHAIN_PASSWORD }}"
+            # Prevent tauri-bundler from auto-reading an empty APPLE_SIGNING_IDENTITY
+            # from the job environment, which triggers a failing `codesign -s ""` path.
+            unset APPLE_SIGNING_IDENTITY
             if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
               KEYCHAIN_PATH="$RUNNER_TEMP/codesign.keychain-db"
               KEYCHAIN_PASSWORD="${APPLE_KEYCHAIN_PASSWORD:-temp_keychain_password}"

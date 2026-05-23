@@ -1689,6 +1689,26 @@ def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
     assert second.get_json()['request_id'] == 'req-fifo-2'
 
 
+def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    time.sleep(0.6)
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    time.sleep(0.6)
+    assert client.post('/api/v1/relay/servers/poll', json=server_payload).status_code == 200
+
+
+def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    time.sleep(1.2)
+    expired = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert expired.status_code == 404
+
+
 def test_api_v1_poll_long_wait_ignores_unrelated_server_wakeups(client, monkeypatch):
     server_one = base64.b64encode(b"server_public_key_1").decode("utf-8")
     server_two = base64.b64encode(b"server_public_key_2").decode("utf-8")

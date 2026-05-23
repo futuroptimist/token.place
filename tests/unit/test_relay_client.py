@@ -878,6 +878,46 @@ class TestRelayClient:
         ]
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_does_not_register_every_poll(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_ok, poll_ok, poll_ok]
+
+        relay_client.poll_api_v1_encrypted_work()
+        relay_client.poll_api_v1_encrypted_work()
+
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_reregisters_after_unknown_node(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        poll_404 = MagicMock(status_code=404)
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_ok, poll_404, register_ok, poll_ok]
+
+        first = relay_client.poll_api_v1_encrypted_work()
+        second = relay_client.poll_api_v1_encrypted_work()
+
+        assert first == {'error': 'HTTP 404', 'next_ping_in_x_seconds': 9}
+        assert second['message'] == 'No requests available'
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_non_dict_payload_returns_bounded_error(self, mock_post, relay_client):
         register_ok = MagicMock(status_code=200)
         register_ok.json.return_value = {'next_ping_in_x_seconds': 7}

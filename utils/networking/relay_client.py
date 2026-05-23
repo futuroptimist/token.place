@@ -388,6 +388,7 @@ class RelayClient:
         self._active_relay_index = 0
         self._sink_start_index = 0
         self._last_api_v1_work_relay_url: Optional[str] = None
+        self._api_v1_registered_relays: Set[str] = set()
 
     @staticmethod
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
@@ -715,7 +716,7 @@ class RelayClient:
         return max(base_timeout, wait_seconds + 1.0)
 
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
-        """Register then poll API v1 relay routes for encrypted work."""
+        """Poll API v1 relay routes for encrypted work with lease-aware registration."""
 
         last_error: Optional[Dict[str, Any]] = None
         for offset in range(len(self._relay_urls)):
@@ -723,18 +724,24 @@ class RelayClient:
             candidate_url = self._relay_urls[index]
 
             try:
-                register_response = self.register_api_v1_compute_node(candidate_url)
                 register_wait = self._request_timeout
                 poll_wait = register_wait
-                if isinstance(register_response, dict):
-                    register_wait = register_response.get('next_ping_in_x_seconds', self._request_timeout)
-                    poll_wait = register_response.get('poll_wait_seconds', register_wait)
-                    if register_response.get('error'):
-                        last_error = {
-                            'error': register_response.get('error'),
-                            'next_ping_in_x_seconds': register_wait,
-                        }
-                        continue
+                if candidate_url not in self._api_v1_registered_relays:
+                    register_response = self.register_api_v1_compute_node(candidate_url)
+                    if isinstance(register_response, dict):
+                        register_wait = register_response.get(
+                            'next_ping_in_x_seconds',
+                            self._request_timeout,
+                        )
+                        poll_wait = register_response.get('poll_wait_seconds', register_wait)
+                        if register_response.get('error'):
+                            last_error = {
+                                'error': register_response.get('error'),
+                                'next_ping_in_x_seconds': register_wait,
+                            }
+                            continue
+                    self._api_v1_registered_relays.add(candidate_url)
+                    log_info("server.registered relay={}", candidate_url)
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
@@ -750,6 +757,9 @@ class RelayClient:
                     **request_kwargs,
                 )
                 if response.status_code != 200:
+                    if response.status_code == 404:
+                        self._api_v1_registered_relays.discard(candidate_url)
+                        log_info("server.reregister reason=unknown_node relay={}", candidate_url)
                     last_error = {
                         'error': f'HTTP {response.status_code}',
                         'next_ping_in_x_seconds': register_wait,
@@ -772,6 +782,7 @@ class RelayClient:
                     payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
+                log_info("server.heartbeat relay={}", candidate_url)
                 log_info(
                     "API v1 relay poll route=/api/v1/relay/servers/poll api_v1_payload={} request_id={}",
                     payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee',
@@ -780,6 +791,7 @@ class RelayClient:
                 return payload
             except Exception as exc:
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
+                self._api_v1_registered_relays.discard(candidate_url)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
 
         return last_error or {

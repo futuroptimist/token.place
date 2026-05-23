@@ -558,10 +558,11 @@ def _handle_chat_completion_request(data):
             status_code=400,
         )
     except ModelError as e:
+        log_warning(f"Model error during chat completion: {e.message}")
         return format_error_response(
             e.message,
-            error_type="model_error",
-            status_code=400,
+            error_type=e.error_type,
+            status_code=e.status_code,
         )
     except ComputeProviderError as e:
         execution_backend_path = get_api_v1_last_backend_path()

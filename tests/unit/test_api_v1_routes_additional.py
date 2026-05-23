@@ -155,6 +155,38 @@ def test_chat_completion_alias_reroutes_to_canonical_model(client, monkeypatch):
     )
 
 
+def test_chat_completion_model_error_preserves_status_and_type(client, monkeypatch):
+    monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "llama-3-8b-instruct"}])
+    monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, "resolve_model_alias", lambda model_id: None)
+    monkeypatch.setattr(
+        routes,
+        "evaluate_messages_for_policy",
+        lambda messages: SimpleNamespace(allowed=True),
+    )
+
+    class _Provider:
+        def complete_chat(self, model_id, messages, options):
+            raise ModelError(
+                "llama-cpp-python is not installed. Install full server dependencies to load local models.",
+                status_code=503,
+                error_type="model_unavailable",
+            )
+
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _Provider())
+
+    payload = {
+        "model": "llama-3-8b-instruct",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+    response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert response.status_code == 503
+    body = response.get_json()
+    assert body["error"]["type"] == "model_unavailable"
+    assert "llama-cpp-python is not installed" in body["error"]["message"]
+
+
 def test_chat_completion_echoes_request_metadata(client, monkeypatch):
     payload = {
         'model': 'llama-3-8b-instruct',
@@ -164,7 +196,6 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
 
     monkeypatch.setattr(routes, 'get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
     monkeypatch.setattr(routes, 'validate_model_name', lambda *args, **kwargs: None)
-    monkeypatch.setattr(routes, 'get_model_instance', lambda model_id: object())
     monkeypatch.setattr(routes, 'resolve_model_alias', lambda model_id: None)
     monkeypatch.setattr(
         routes,
@@ -172,11 +203,12 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
         lambda messages: SimpleNamespace(allowed=True),
     )
 
-    def _generate(model_id, messages):
-        assert model_id == 'llama-3-8b-instruct'
-        return messages + [{'role': 'assistant', 'content': 'Mock reply'}]
+    class _Provider:
+        def complete_chat(self, model_id, messages, options):
+            assert model_id == 'llama-3-8b-instruct'
+            return {'role': 'assistant', 'content': 'Mock reply'}
 
-    monkeypatch.setattr(routes, 'generate_response', _generate)
+    monkeypatch.setattr(routes, 'get_api_v1_compute_provider', lambda: _Provider())
 
     response = client.post('/api/v1/chat/completions', json=payload)
     assert response.status_code == 200

@@ -7,9 +7,22 @@ import os
 import random
 import logging
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from llama_cpp import Llama
+try:
+    import llama_cpp as _llama_cpp_module
+    from llama_cpp import Llama as _llama_runtime
+except ImportError:  # pragma: no cover - exercised in relay-only installs
+    Llama = None  # type: ignore[assignment]
+else:
+    _repo_root = Path(__file__).resolve().parents[2]
+    _shim_path = _repo_root / "llama_cpp.py"
+    _module_origin = Path(getattr(_llama_cpp_module, "__file__", "")).resolve()
+    if _module_origin == _shim_path:
+        Llama = None  # type: ignore[assignment]
+    else:
+        Llama = _llama_runtime
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -257,6 +270,13 @@ def get_model_instance(model_id):
     if USE_MOCK_LLM:
         logger.info(f"Using mock LLM for model_id: {model_id} (mock mode enabled)")
         return "MOCK_MODEL"
+
+    if Llama is None:
+        raise ModelError(
+            "llama-cpp-python is not installed. Install full server dependencies to load local models.",
+            status_code=503,
+            error_type="model_unavailable",
+        )
 
     # In real operation, check if model is already loaded
     adapter_meta = model_meta.get("adapter")

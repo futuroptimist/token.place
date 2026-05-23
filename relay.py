@@ -993,6 +993,11 @@ def api_v1_relay_servers_poll():
     if server_payload is not None:
         server_payload.pop('polling_until_monotonic', None)
     else:
+        if first_request is not None:
+            with client_inference_requests_changed:
+                queued_requests = client_inference_requests.setdefault(public_key, [])
+                queued_requests.insert(0, first_request)
+                client_inference_requests_changed.notify_all()
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     if first_request is None:

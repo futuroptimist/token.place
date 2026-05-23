@@ -938,14 +938,16 @@ def api_v1_relay_servers_register():
 
     if public_key in known_servers:
         known_servers[public_key]['last_ping'] = datetime.now()
+        log_event = "server.reregister"
     else:
         known_servers[public_key] = {
             'public_key': public_key,
             'last_ping': datetime.now(),
             'last_ping_duration': _api_v1_lease_seconds(),
         }
+        log_event = "server.registered"
     known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
-    LOGGER.info("server.registered", extra={"server_public_key": public_key})
+    LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({
         'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],

@@ -736,7 +736,17 @@ class RelayClient:
                 cached_hints = relay_wait_hints.get(candidate_url, {})
                 register_wait = cached_hints.get('next_ping_in_x_seconds', self._request_timeout)
                 poll_wait = cached_hints.get('poll_wait_seconds', register_wait)
-                if candidate_url not in self._api_v1_registered_relays:
+                current_public_key = self.crypto_manager.public_key_b64
+                registered_public_key = cached_hints.get('server_public_key')
+                requires_register = candidate_url not in self._api_v1_registered_relays
+                if (
+                    not requires_register
+                    and isinstance(registered_public_key, str)
+                    and registered_public_key != current_public_key
+                ):
+                    requires_register = True
+
+                if requires_register:
                     register_response = self.register_api_v1_compute_node(candidate_url)
                     if not isinstance(register_response, dict):
                         last_error = {
@@ -758,6 +768,7 @@ class RelayClient:
                     relay_wait_hints[candidate_url] = {
                         'next_ping_in_x_seconds': register_wait,
                         'poll_wait_seconds': poll_wait,
+                        'server_public_key': current_public_key,
                     }
                     self._api_v1_registered_relays.add(candidate_url)
                     log_info("server.registered relay={}", candidate_url)
@@ -812,6 +823,7 @@ class RelayClient:
             except Exception as exc:
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
                 self._api_v1_registered_relays.discard(candidate_url)
+                relay_wait_hints.pop(candidate_url, None)
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
 
         return last_error or {

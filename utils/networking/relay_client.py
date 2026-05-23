@@ -525,6 +525,9 @@ class RelayClient:
         last_error: Optional[str] = None
         had_success = False
 
+        relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+        self._api_v1_relay_wait_hints = relay_wait_hints
+
         for offset in range(len(self._relay_urls)):
             index = (self._active_relay_index + offset) % len(self._relay_urls)
             candidate_url = self._relay_urls[index]
@@ -592,6 +595,9 @@ class RelayClient:
         """
         last_error: Optional[Dict[str, Any]] = None
         encountered_error = False
+
+        relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+        self._api_v1_relay_wait_hints = relay_wait_hints
 
         for offset in range(len(self._relay_urls)):
             index = (self._sink_start_index + offset) % len(self._relay_urls)
@@ -719,27 +725,40 @@ class RelayClient:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
 
         last_error: Optional[Dict[str, Any]] = None
+        relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
+        self._api_v1_relay_wait_hints = relay_wait_hints
+
         for offset in range(len(self._relay_urls)):
             index = (self._active_relay_index + offset) % len(self._relay_urls)
             candidate_url = self._relay_urls[index]
 
             try:
-                register_wait = self._request_timeout
-                poll_wait = register_wait
+                cached_hints = relay_wait_hints.get(candidate_url, {})
+                register_wait = cached_hints.get('next_ping_in_x_seconds', self._request_timeout)
+                poll_wait = cached_hints.get('poll_wait_seconds', register_wait)
                 if candidate_url not in self._api_v1_registered_relays:
                     register_response = self.register_api_v1_compute_node(candidate_url)
-                    if isinstance(register_response, dict):
-                        register_wait = register_response.get(
-                            'next_ping_in_x_seconds',
-                            self._request_timeout,
-                        )
-                        poll_wait = register_response.get('poll_wait_seconds', register_wait)
-                        if register_response.get('error'):
-                            last_error = {
-                                'error': register_response.get('error'),
-                                'next_ping_in_x_seconds': register_wait,
-                            }
-                            continue
+                    if not isinstance(register_response, dict):
+                        last_error = {
+                            'error': 'Invalid register response format: expected object payload',
+                            'next_ping_in_x_seconds': self._request_timeout,
+                        }
+                        continue
+                    register_wait = register_response.get(
+                        'next_ping_in_x_seconds',
+                        self._request_timeout,
+                    )
+                    poll_wait = register_response.get('poll_wait_seconds', register_wait)
+                    if register_response.get('error'):
+                        last_error = {
+                            'error': register_response.get('error'),
+                            'next_ping_in_x_seconds': register_wait,
+                        }
+                        continue
+                    relay_wait_hints[candidate_url] = {
+                        'next_ping_in_x_seconds': register_wait,
+                        'poll_wait_seconds': poll_wait,
+                    }
                     self._api_v1_registered_relays.add(candidate_url)
                     log_info("server.registered relay={}", candidate_url)
 
@@ -759,6 +778,7 @@ class RelayClient:
                 if response.status_code != 200:
                     if response.status_code == 404:
                         self._api_v1_registered_relays.discard(candidate_url)
+                        relay_wait_hints.pop(candidate_url, None)
                         log_info("server.reregister reason=unknown_node relay={}", candidate_url)
                     last_error = {
                         'error': f'HTTP {response.status_code}',

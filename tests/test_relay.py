@@ -1702,7 +1702,7 @@ def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):
 
 def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     time.sleep(1.2)
     expired = client.post('/api/v1/relay/servers/poll', json=server_payload)

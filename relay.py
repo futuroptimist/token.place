@@ -469,9 +469,17 @@ def _pop_next_api_v1_request(public_key: str):
 
 
 def _evict_stale_servers() -> list[str]:
-    stale_after = _server_stale_seconds()
+    default_stale_after = _server_stale_seconds()
+    now_monotonic = time.monotonic()
     evicted: list[str] = []
     for server_public_key, payload in list(known_servers.items()):
+        polling_until = payload.get("polling_until_monotonic")
+        if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+            continue
+        stale_after = payload.get("last_ping_duration", default_stale_after)
+        if not isinstance(stale_after, (int, float)):
+            stale_after = default_stale_after
+        stale_after = max(float(stale_after), 1.0)
         if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
             continue
         if _unregister_server(server_public_key):
@@ -967,6 +975,7 @@ def api_v1_relay_servers_poll():
     LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
+    known_servers[public_key]['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
     with client_inference_requests_changed:
         first_request = _pop_next_api_v1_request(public_key)
         if first_request is None and poll_wait_seconds > 0:
@@ -978,7 +987,10 @@ def api_v1_relay_servers_poll():
                 client_inference_requests_changed.wait(timeout=remaining)
                 first_request = _pop_next_api_v1_request(public_key)
 
+    known_servers.get(public_key, {}).pop('polling_until_monotonic', None)
+
     if first_request is None:
+        known_servers[public_key]['last_ping'] = datetime.now()
         return jsonify({'message': 'No requests available'}), 200
 
     queue_wait_ms = None

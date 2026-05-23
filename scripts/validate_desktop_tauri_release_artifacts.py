@@ -51,8 +51,8 @@ def main() -> None:
 
     if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
         _fail(f"dmg artifact missing or invalid: {dmg_path}")
-    if "apple-silicon" not in dmg_path.name:
-        _fail(f"DMG filename must include apple-silicon marker: {dmg_path.name}")
+    if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
+        _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -65,8 +65,11 @@ def main() -> None:
     info = plistlib.loads(info_plist.read_bytes())
 
     product_name = info.get("CFBundleName") or ""
+    display_name = info.get("CFBundleDisplayName") or ""
     if "tokenplace desktop" in str(product_name).lower():
         _fail("stale app bundle name tokenplace Desktop detected in CFBundleName")
+    if "tokenplace desktop" in str(display_name).lower():
+        _fail("stale app display name tokenplace Desktop detected in CFBundleDisplayName")
 
     config = json.loads(tauri_config.read_text(encoding="utf-8"))
     icons = config.get("bundle", {}).get("icon", [])
@@ -87,10 +90,13 @@ def main() -> None:
     macos_dir = app_path / "Contents" / "MacOS"
     if not macos_dir.exists() or not macos_dir.is_dir():
         _fail(f"missing app executable directory: {macos_dir}")
-    bins = [p for p in macos_dir.iterdir() if p.is_file()]
-    if not bins:
-        _fail(f"no executable found in {macos_dir}")
-    arch_out = _run(["lipo", "-archs", str(bins[0])])
+    executable_name = info.get("CFBundleExecutable")
+    if not executable_name:
+        _fail("CFBundleExecutable is missing from Info.plist")
+    executable_path = macos_dir / str(executable_name)
+    if not executable_path.exists() or not executable_path.is_file():
+        _fail(f"CFBundleExecutable not found in app bundle: {executable_path}")
+    arch_out = _run(["lipo", "-archs", str(executable_path)])
     arch_lower = arch_out.lower()
     if "arm64" not in arch_lower and "aarch64" not in arch_lower:
         _fail(f"binary is not Apple Silicon: {arch_out}")

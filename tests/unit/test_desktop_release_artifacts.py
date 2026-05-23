@@ -38,3 +38,20 @@ def test_tauri_icon_set_references_expected_files() -> None:
         'icons/32x32.png',
     }
     assert expected.issubset(icons)
+
+
+def test_workflow_sets_explicit_dmg_volume_name() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'hdiutil create -volname "token.place desktop"' in text
+
+
+def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'Expected exactly one staged macOS .dmg in release-artifacts' in text
+
+
+def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert 'CFBundleDisplayName' in text
+    assert 'CFBundleExecutable' in text
+    assert 'token.place-desktop-<version>-apple-silicon.dmg' in text

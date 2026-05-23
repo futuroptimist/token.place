@@ -288,7 +288,7 @@ jobs:
             dmg_path="release-artifacts/${dmg_name}"
 
             rm -f "${dmg_path}"
-            hdiutil create -volname "${app_name}" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
+            hdiutil create -volname "token.place desktop" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
             if [[ "${dmg_path}" == *"tokenplace Desktop"* ]] || [[ "${dmg_path}" == *"tokenplace Desktop Setup"* ]] || [[ "${dmg_path}" == *"desktop/electron-builder"* ]]; then
               echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
               exit 1
@@ -331,8 +331,8 @@ jobs:
             exit 1
           fi
           mapfile -t dmg_paths < <(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort)
-          if [ "${#dmg_paths[@]}" -eq 0 ]; then
-            echo "Expected at least one staged macOS .dmg in release-artifacts." >&2
+          if [ "${#dmg_paths[@]}" -ne 1 ]; then
+            echo "Expected exactly one staged macOS .dmg in release-artifacts; found ${#dmg_paths[@]}." >&2
             exit 1
           fi
 

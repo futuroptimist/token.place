@@ -40,6 +40,7 @@ cd token.place
 
 # Prefer Python 3.12 when available (brew install python@3.12)
 python3.12 -m venv .venv || python3 -m venv .venv
+# Windows PowerShell alternative: py -3.12 -m venv .venv
 source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip

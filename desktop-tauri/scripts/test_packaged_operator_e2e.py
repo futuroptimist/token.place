@@ -195,7 +195,16 @@ def main() -> int:
                     f"{bridge_output[-2000:]}"
                 )
 
-            bridge.wait(timeout=60)
+            try:
+                bridge.stdin.close()
+            except OSError:
+                pass
+
+            try:
+                bridge.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                bridge.terminate()
+                bridge.wait(timeout=15)
             if bridge.returncode != 0:
                 raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
 

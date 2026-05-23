@@ -18,6 +18,7 @@ from relay import app
 # Be cautious with direct manipulation in tests, prefer using API endpoints
 from relay import (
     known_servers,
+    _server_ping_age_seconds,
     client_inference_requests,
     client_pending_request_ids,
     client_responses,
@@ -1664,6 +1665,25 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     assert poll.status_code == 200
     assert poll.get_json()['message'] == 'No requests available'
     assert elapsed >= 0.008
+
+
+def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=5)
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0')
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    assert _server_ping_age_seconds(known_servers[DUMMY_SERVER_PUB_KEY]['last_ping']) < 2
+
+
+def test_api_v1_poll_unknown_server_requires_reregister(client):
+    poll = client.post(
+        '/api/v1/relay/servers/poll',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY},
+    )
+    assert poll.status_code == 404
 
 
 def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):

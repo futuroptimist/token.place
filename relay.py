@@ -394,6 +394,8 @@ SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
 DEFAULT_SERVER_STALE_SECONDS = 30
 API_V1_POLL_WAIT_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
 DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
+SERVER_HEARTBEAT_SECONDS_ENV = "TOKEN_PLACE_API_V1_SERVER_HEARTBEAT_SECONDS"
+DEFAULT_SERVER_HEARTBEAT_SECONDS = 10
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -423,6 +425,15 @@ def _api_v1_poll_wait_seconds() -> float:
     if wait_seconds < 0:
         return 0.0
     return wait_seconds
+
+
+def _server_heartbeat_seconds() -> float:
+    raw = os.environ.get(SERVER_HEARTBEAT_SECONDS_ENV, str(DEFAULT_SERVER_HEARTBEAT_SECONDS))
+    try:
+        heartbeat_seconds = float(raw)
+    except ValueError:
+        return float(DEFAULT_SERVER_HEARTBEAT_SECONDS)
+    return max(heartbeat_seconds, 1.0)
 
 
 def _pop_next_api_v1_request(public_key: str):
@@ -917,14 +928,19 @@ def api_v1_relay_servers_register():
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
 
-    if public_key in known_servers:
+    is_reregister = public_key in known_servers
+    if is_reregister:
         known_servers[public_key]['last_ping'] = datetime.now()
     else:
         known_servers[public_key] = {
             'public_key': public_key,
             'last_ping': datetime.now(),
-            'last_ping_duration': 10,
+            'last_ping_duration': _server_heartbeat_seconds(),
         }
+    LOGGER.info(
+        "server.reregister" if is_reregister else "server.registered",
+        extra={"server_public_key": public_key},
+    )
 
     return jsonify({
         'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
@@ -949,6 +965,8 @@ def api_v1_relay_servers_poll():
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+    known_servers[public_key]['last_ping'] = datetime.now()
+    LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     with client_inference_requests_changed:

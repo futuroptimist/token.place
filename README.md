@@ -87,6 +87,16 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 Set `API_FALLBACK_URLS=https://relay.cloudflare.workers.dev/api/v1` to let the bundled clients
 retry through a Cloudflare-hosted relay whenever the primary endpoint is unreachable.
 
+### Landing page Vue bundle mode
+
+The relay landing page (`static/index.html`) defaults to the Vue 2 production CDN
+artifact (`vue.min.js`) so production/static deployments and desktop packaged
+webviews do not emit Vue development-mode console warnings.
+
+For local debugging, you can explicitly opt into the Vue development bundle by
+loading the landing page from localhost with `?vue_dev=1` (for example
+`http://127.0.0.1:5000/?vue_dev=1`).
+
 Set `TOKEN_PLACE_RELAY_CLOUDFLARE_URLS` (or `TOKEN_PLACE_RELAY_CLOUDFLARE_URL` for a single
 endpoint) so `server.py` can fail over to a Cloudflare tunnel when the local relays are down.
 

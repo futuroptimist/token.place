@@ -58,3 +58,11 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     assert "The LLM server returned an invalid response. Please try again." in chat_js
     assert "distributed provider timed out contacting relay bridge" not in chat_js
     assert "distributed provider request failed" not in chat_js
+
+
+def test_landing_page_defaults_to_vue_production_bundle_and_allows_local_dev_opt_in():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert "vue.min.js" in index_html, "landing page must default to Vue production bundle"
+    assert "params.get('vue_dev') === '1'" in index_html
+    assert "localhost|127\\.0\\.0\\.1|::1" in index_html
+    assert "vue.js" in index_html, "landing page should preserve explicit local dev Vue opt-in"

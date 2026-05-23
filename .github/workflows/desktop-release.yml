@@ -213,6 +213,34 @@ jobs:
       - name: Build Tauri bundles
         shell: bash
         run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            CONFIGURED_APPLE_SIGNING_IDENTITY="${{ secrets.APPLE_SIGNING_IDENTITY }}"
+            APPLE_CERTIFICATE_P12_BASE64="${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}"
+            APPLE_CERTIFICATE_PASSWORD="${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
+            APPLE_KEYCHAIN_PASSWORD="${{ secrets.APPLE_KEYCHAIN_PASSWORD }}"
+            # Prevent tauri-bundler from auto-reading an empty APPLE_SIGNING_IDENTITY
+            # from the job environment, which triggers a failing `codesign -s ""` path.
+            unset APPLE_SIGNING_IDENTITY
+            if [ -n "${CONFIGURED_APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+              KEYCHAIN_PATH="$RUNNER_TEMP/codesign.keychain-db"
+              KEYCHAIN_PASSWORD="${APPLE_KEYCHAIN_PASSWORD:-temp_keychain_password}"
+              CERT_PATH="$RUNNER_TEMP/apple-signing-cert.p12"
+              echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+              security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+              security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+              export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY="$CONFIGURED_APPLE_SIGNING_IDENTITY"
+              export APPLE_SIGNING_IDENTITY="$CONFIGURED_APPLE_SIGNING_IDENTITY"
+              export APPLE_CERTIFICATE_IMPORTED=1
+            else
+              echo "::warning::Developer ID certificate and identity are not fully configured; using ad-hoc signing for preview/dev-only macOS artifacts."
+              export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'
+              export APPLE_SIGNING_IDENTITY='-'
+            fi
+          fi
           if [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ matrix.tauri_target }}" ]; then
             # Tauri's built-in DMG bundler is flaky for cross-target macOS builds in CI
             # (bundle_dmg.sh intermittently exits non-zero). Build the .app reliably, then
@@ -242,6 +270,10 @@ jobs:
 
             app_path="${app_files[0]}"
             app_name="$(basename "${app_path}" .app)"
+            if [[ "${app_name}" == *"tokenplace Desktop"* ]]; then
+              echo "stale Electron branding detected in app name: ${app_name}" >&2
+              exit 1
+            fi
             if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${INPUT_TAG_NAME:-}" ]; then
               case "${INPUT_TAG_NAME}" in
                 desktop-v*) ;;
@@ -255,10 +287,16 @@ jobs:
               ref_slug="${GITHUB_REF_NAME:-manual}"
             fi
             ref_slug="${ref_slug//\//-}"
-            dmg_path="release-artifacts/${app_name}_${ref_slug}_${{ matrix.tauri_target }}.dmg"
+            version="${ref_slug#desktop-v}"
+            dmg_name="token.place-desktop-${version}-apple-silicon.dmg"
+            dmg_path="release-artifacts/${dmg_name}"
 
             rm -f "${dmg_path}"
-            hdiutil create -volname "${app_name}" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
+            hdiutil create -volname "token.place desktop" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
+            if [[ "${dmg_path}" == *"tokenplace Desktop"* ]] || [[ "${dmg_path}" == *"tokenplace Desktop Setup"* ]] || [[ "${dmg_path}" == *"desktop/electron-builder"* ]]; then
+              echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
+              exit 1
+            fi
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"
@@ -280,6 +318,42 @@ jobs:
             echo "Unsupported runner.os: ${{ runner.os }}" >&2
             exit 1
           fi
+
+      - name: Validate macOS staged artifact guardrails
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARYTOOL_KEYCHAIN_PROFILE: ${{ secrets.APPLE_NOTARYTOOL_KEYCHAIN_PROFILE }}
+        run: |
+          set -euo pipefail
+          app_path="$(find src-tauri/target/${{ matrix.tauri_target }}/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "${app_path}" ]; then
+            echo "Expected macOS .app in bundle output." >&2
+            exit 1
+          fi
+          dmg_count="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d '[:space:]')"
+          if [ "${dmg_count}" -ne 1 ]; then
+            echo "Expected exactly one staged macOS .dmg in release-artifacts; found ${dmg_count}." >&2
+            exit 1
+          fi
+          dmg_path="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort | head -n 1)"
+          if [ -z "${dmg_path}" ]; then
+            echo "Expected staged macOS .dmg in release-artifacts." >&2
+            exit 1
+          fi
+
+          signing_flag=""
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+            signing_flag="--expect-signing"
+            if [ -n "${APPLE_NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]; then
+              echo "::warning::APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed in this workflow yet; skipping strict Gatekeeper notarization enforcement."
+            fi
+          fi
+
+          python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
 
       - name: Generate SHA256 checksums
         shell: bash

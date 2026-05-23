@@ -339,12 +339,11 @@ jobs:
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
-          generate_release_notes: true
+          token: ${{ github.token }}
+          generate_release_notes: ${{ github.event_name == 'push' }}
           fail_on_unmatched_files: true
           files: |
             release-assets/macos/*

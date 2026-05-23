@@ -1396,3 +1396,39 @@ def test_run_api_v1_payload_not_dropped_when_warm_not_started(capsys, monkeypatc
     assert calls == ["warm", "process"]
     output = capsys.readouterr()
     assert "runtime_path=bridge" in output.err
+
+
+def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class ApiPayloadWarmFailRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
+            return False
+
+        def register_and_poll_once(self):
+            return {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": "req-bridge-fail-1",
+                "client_public_key": "abc",
+                "chat_history": "ciphertext",
+                "cipherkey": "key",
+                "iv": "iv",
+                "next_ping_in_x_seconds": 0,
+            }
+
+        def process_relay_request(self, _payload):
+            calls.append("process")
+            return True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiPayloadWarmFailRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    status = compute_node_bridge.run(args)
+    assert status == 1
+    assert calls == ["warm"]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get("type") == "error")
+    assert error_event["warm_load_state"] == "failed"

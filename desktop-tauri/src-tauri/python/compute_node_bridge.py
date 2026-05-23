@@ -359,6 +359,26 @@ def run(args: argparse.Namespace) -> int:
         print(_runtime_diagnostics_summary(compute_mode_diagnostics(runtime.model_manager)), file=sys.stderr)
         return True
 
+    def fail_on_warm_load_error(*, active_relay_url: str) -> None:
+        nonlocal last_error, warm_load_fatal
+        last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+        emit_status_event(
+            registered=True,
+            active_relay_url=active_relay_url,
+            current_last_error=last_error,
+        )
+        emit(
+            {
+                "type": "error",
+                "message": last_error,
+                "active_relay_url": runtime.relay_client.relay_url,
+                "warm_load_state": warm_load_state,
+                "warm_load_duration_ms": warm_load_duration_ms,
+                "runtime_path": runtime_path,
+            }
+        )
+        warm_load_fatal = True
+
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     last_error: Optional[str] = None
     emit(
@@ -433,7 +453,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-            if registered and warm_load_enabled and warm_load_state == "not_started" and api_v1_payload:
+            if registered and api_v1_payload and warm_load_enabled and warm_load_state != "ready":
                 if not bridge_runtime_allowed:
                     warm_load_state = "not_started"
                     print(
@@ -443,23 +463,7 @@ def run(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                 elif not ensure_runtime_ready("api_v1_request", active_relay_url=active_relay_url):
-                    last_error = warm_load_failed or "failed to initialize API v1 model runtime"
-                    emit_status_event(
-                        registered=True,
-                        active_relay_url=active_relay_url,
-                        current_last_error=last_error,
-                    )
-                    emit(
-                        {
-                            "type": "error",
-                            "message": last_error,
-                            "active_relay_url": runtime.relay_client.relay_url,
-                            "warm_load_state": warm_load_state,
-                            "warm_load_duration_ms": warm_load_duration_ms,
-                            "runtime_path": runtime_path,
-                        }
-                    )
-                    warm_load_fatal = True
+                    fail_on_warm_load_error(active_relay_url=active_relay_url)
                     break
 
             if not registered:
@@ -516,23 +520,7 @@ def run(args: argparse.Namespace) -> int:
                     )
                 else:
                     if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
-                        last_error = warm_load_failed or "failed to initialize API v1 model runtime"
-                        emit_status_event(
-                            registered=True,
-                            active_relay_url=active_relay_url,
-                            current_last_error=last_error,
-                        )
-                        emit(
-                            {
-                                "type": "error",
-                                "message": last_error,
-                                "active_relay_url": runtime.relay_client.relay_url,
-                                "warm_load_state": warm_load_state,
-                                "warm_load_duration_ms": warm_load_duration_ms,
-                                "runtime_path": runtime_path,
-                            }
-                        )
-                        warm_load_fatal = True
+                        fail_on_warm_load_error(active_relay_url=active_relay_url)
                         break
             emit_status_event(
                 registered=registered,

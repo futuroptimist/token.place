@@ -992,10 +992,10 @@ def api_v1_relay_servers_poll():
     server_payload = known_servers.get(public_key)
     if server_payload is not None:
         server_payload.pop('polling_until_monotonic', None)
+    else:
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     if first_request is None:
-        if server_payload is None:
-            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
         server_payload['last_ping'] = datetime.now()
         return jsonify({'message': 'No requests available'}), 200
 

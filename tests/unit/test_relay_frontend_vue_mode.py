@@ -8,6 +8,12 @@ import relay
 INDEX_HTML_PATH = Path(relay.INDEX_HTML_PATH)
 
 
+def test_flask_builtin_static_route_is_disabled():
+    endpoints = {rule.endpoint for rule in relay.app.url_map.iter_rules()}
+
+    assert "static" not in endpoints
+
+
 def test_root_route_uses_production_vue_by_default(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
 

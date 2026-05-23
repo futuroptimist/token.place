@@ -337,16 +337,15 @@ jobs:
           fi
 
           signing_flag=""
-          notarization_flag=""
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
             signing_flag="--expect-signing"
             if [ -n "${APPLE_NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]; then
-              notarization_flag="--expect-notarization"
+              echo "::warning::APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed in this workflow yet; skipping strict Gatekeeper notarization enforcement."
             fi
           fi
 
           for dmg_path in "${dmg_paths[@]}"; do
-            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}               ${notarization_flag}
+            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
           done
 
       - name: Generate SHA256 checksums

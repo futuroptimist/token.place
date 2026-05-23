@@ -233,10 +233,12 @@ jobs:
               security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
               security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
               export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY="$CONFIGURED_APPLE_SIGNING_IDENTITY"
+              export APPLE_SIGNING_IDENTITY="$CONFIGURED_APPLE_SIGNING_IDENTITY"
               export APPLE_CERTIFICATE_IMPORTED=1
             else
               echo "::warning::Developer ID certificate and identity are not fully configured; using ad-hoc signing for preview/dev-only macOS artifacts."
               export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'
+              export APPLE_SIGNING_IDENTITY='-'
             fi
           fi
           if [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ matrix.tauri_target }}" ]; then

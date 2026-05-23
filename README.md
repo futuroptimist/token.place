@@ -131,6 +131,18 @@ Open `http://localhost:5000` or run `python client.py`. For a minimal client use
 `python client_simplified.py`; it clears the screen when running interactively using ANSI codes
 with flushed output. Metrics are exposed at `/metrics`.
 
+### Vue bundle mode (relay landing page)
+
+The relay landing page (`static/index.html`) now defaults to the production Vue bundle
+(`vue.min.js`) so production/static deployments and packaged desktop webviews do not emit Vue
+development-mode warnings.
+
+Local development keeps Vue dev ergonomics on loopback hosts (`localhost`, `127.0.0.1`, `::1`).
+You can force mode explicitly with query params:
+
+- `?vue=dev` → force development Vue bundle
+- `?vue=prod` → force production Vue bundle
+
 ## CI pass criteria
 
 All pull requests must:

@@ -485,8 +485,22 @@
         </div>
     </div>
 
-    <!-- Vue.js -->
-    <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
+    <!-- Vue.js: default to production bundle; allow localhost development override -->
+    <script>
+        (function loadVueBundle() {
+            const params = new URLSearchParams(window.location.search);
+            const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+            const forceDev = params.get('vue') === 'dev';
+            const forceProd = params.get('vue') === 'prod';
+            const useDevBundle = (forceDev || (isLocalhost && !forceProd));
+
+            const vueScript = document.createElement('script');
+            vueScript.src = useDevBundle
+                ? 'https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js'
+                : 'https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js';
+            document.head.appendChild(vueScript);
+        }());
+    </script>
     <!-- Use JSEncrypt 3.3.2 from jsDelivr, matching the test runner -->
     <script
         src="https://cdn.jsdelivr.net/npm/jsencrypt@3.3.2/bin/jsencrypt.min.js"

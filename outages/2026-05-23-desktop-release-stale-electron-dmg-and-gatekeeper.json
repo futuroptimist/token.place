@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-23",
+  "slug": "desktop-release-stale-electron-dmg-and-gatekeeper",
+  "summary": "Desktop release assets exposed stale Electron-style macOS naming and unclear Gatekeeper readiness for unsigned preview artifacts.",
+  "impact": "Users could download a confusingly named DMG, see legacy icon signals, and encounter Gatekeeper failures without clear preview-vs-signed labeling.",
+  "fix": "Enforced Tauri bundle-only staging, explicit apple-silicon DMG naming, stale-brand blocking, deterministic artifact validation, and clearer signed/notarized readiness signaling in CI and docs.",
+  "lessons": "Release automation must validate all staged artifacts, tie signing checks to real certificate/notarization availability, and maintain schema-tracked outage metadata alongside narrative writeups."
+}

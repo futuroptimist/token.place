@@ -214,10 +214,28 @@ jobs:
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
         run: |
-          if [ "${{ runner.os }}" = "macOS" ] && [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "::warning::APPLE_SIGNING_IDENTITY is not configured; using ad-hoc signing for preview/dev-only macOS artifacts."
-            export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+              KEYCHAIN_PATH="$RUNNER_TEMP/codesign.keychain-db"
+              KEYCHAIN_PASSWORD="${APPLE_KEYCHAIN_PASSWORD:-temp_keychain_password}"
+              CERT_PATH="$RUNNER_TEMP/apple-signing-cert.p12"
+              echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+              security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+              security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+              security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+              export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY"
+              export APPLE_CERTIFICATE_IMPORTED=1
+            else
+              echo "::warning::Developer ID certificate and identity are not fully configured; using ad-hoc signing for preview/dev-only macOS artifacts."
+              export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'
+            fi
           fi
           if [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ matrix.tauri_target }}" ]; then
             # Tauri's built-in DMG bundler is flaky for cross-target macOS builds in CI
@@ -302,24 +320,34 @@ jobs:
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARYTOOL_KEYCHAIN_PROFILE: ${{ secrets.APPLE_NOTARYTOOL_KEYCHAIN_PROFILE }}
         run: |
           set -euo pipefail
           app_path="$(find src-tauri/target/${{ matrix.tauri_target }}/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)"
-          dmg_path="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
-          if [ -z "${app_path}" ] || [ -z "${dmg_path}" ]; then
-            echo "Expected macOS .app and .dmg in staged artifacts." >&2
+          if [ -z "${app_path}" ]; then
+            echo "Expected macOS .app in bundle output." >&2
             exit 1
           fi
-          signing_flag=""
-          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            signing_flag="--expect-signing"
+          mapfile -t dmg_paths < <(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort)
+          if [ "${#dmg_paths[@]}" -eq 0 ]; then
+            echo "Expected at least one staged macOS .dmg in release-artifacts." >&2
+            exit 1
           fi
-          python ../scripts/validate_desktop_tauri_release_artifacts.py \
-            --app-path "${app_path}" \
-            --dmg-path "${dmg_path}" \
-            --tauri-config src-tauri/tauri.conf.json \
-            --expected-icon src-tauri/icons/icon.icns \
-            ${signing_flag}
+
+          signing_flag=""
+          notarization_flag=""
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+            signing_flag="--expect-signing"
+            if [ -n "${APPLE_NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]; then
+              notarization_flag="--expect-notarization"
+            fi
+          fi
+
+          for dmg_path in "${dmg_paths[@]}"; do
+            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}               ${notarization_flag}
+          done
 
       - name: Generate SHA256 checksums
         shell: bash

@@ -7,7 +7,7 @@ WORKFLOW = Path('.github/workflows/desktop-release.yml')
 TAURI_CONFIG = Path('desktop-tauri/src-tauri/tauri.conf.json')
 
 
-def test_workflow_stages_tauri_bundle_only() -> None:
+def test_workflow_stages_tauri_bundle_and_blocks_legacy_markers() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'src-tauri/target/${{ matrix.tauri_target }}/release/bundle' in text
     assert 'desktop/electron-builder' in text

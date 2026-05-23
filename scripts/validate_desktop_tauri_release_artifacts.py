@@ -6,7 +6,6 @@ import hashlib
 import json
 import plistlib
 import subprocess
-import sys
 from pathlib import Path
 
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
@@ -34,6 +33,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tauri-config", required=True)
     p.add_argument("--expected-icon", required=True)
     p.add_argument("--expect-signing", action="store_true")
+    p.add_argument("--expect-notarization", action="store_true")
     return p.parse_args()
 
 
@@ -45,15 +45,19 @@ def main() -> None:
     expected_icon = Path(args.expected_icon)
 
     for candidate in (app_path.name, dmg_path.name, str(dmg_path)):
-      for stale in STALE_BRANDS:
-        if stale.lower() in candidate.lower():
-            _fail(f"stale Electron branding detected: {stale} in {candidate}")
+        for stale in STALE_BRANDS:
+            if stale.lower() in candidate.lower():
+                _fail(f"stale Electron branding detected: {stale} in {candidate}")
 
+    if not dmg_path.exists() or dmg_path.suffix.lower() != '.dmg' or not dmg_path.is_file():
+        _fail(f"dmg artifact missing or invalid: {dmg_path}")
     if "apple-silicon" not in dmg_path.name:
         _fail(f"DMG filename must include apple-silicon marker: {dmg_path.name}")
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
+    if not expected_icon.exists() or not expected_icon.is_file():
+        _fail(f"expected icon missing or invalid: {expected_icon}")
 
     info_plist = app_path / "Contents" / "Info.plist"
     if not info_plist.exists():
@@ -81,6 +85,8 @@ def main() -> None:
         _fail("bundled icon hash does not match desktop-tauri/src-tauri/icons/icon.icns")
 
     macos_dir = app_path / "Contents" / "MacOS"
+    if not macos_dir.exists() or not macos_dir.is_dir():
+        _fail(f"missing app executable directory: {macos_dir}")
     bins = [p for p in macos_dir.iterdir() if p.is_file()]
     if not bins:
         _fail(f"no executable found in {macos_dir}")
@@ -93,7 +99,10 @@ def main() -> None:
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])
-        _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
+        if args.expect_notarization:
+            _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
+        else:
+            print("::warning::Signing configured without notarization credentials; skipping strict Gatekeeper assessment.")
     else:
         print("::warning::Signing credentials not configured; macOS artifact is preview/dev-only and may fail Gatekeeper.")
 

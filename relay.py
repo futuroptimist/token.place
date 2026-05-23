@@ -989,10 +989,14 @@ def api_v1_relay_servers_poll():
                 client_inference_requests_changed.wait(timeout=remaining)
                 first_request = _pop_next_api_v1_request(public_key)
 
-    known_servers.get(public_key, {}).pop('polling_until_monotonic', None)
+    server_payload = known_servers.get(public_key)
+    if server_payload is not None:
+        server_payload.pop('polling_until_monotonic', None)
 
     if first_request is None:
-        known_servers[public_key]['last_ping'] = datetime.now()
+        if server_payload is None:
+            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+        server_payload['last_ping'] = datetime.now()
         return jsonify({'message': 'No requests available'}), 200
 
     queue_wait_ms = None

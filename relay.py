@@ -394,6 +394,8 @@ SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
 DEFAULT_SERVER_STALE_SECONDS = 30
 API_V1_POLL_WAIT_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
 DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
+API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
+DEFAULT_API_V1_LEASE_SECONDS = 30
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -423,6 +425,15 @@ def _api_v1_poll_wait_seconds() -> float:
     if wait_seconds < 0:
         return 0.0
     return wait_seconds
+
+
+def _api_v1_lease_seconds() -> int:
+    raw = os.environ.get(API_V1_LEASE_SECONDS_ENV, str(DEFAULT_API_V1_LEASE_SECONDS))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_API_V1_LEASE_SECONDS
+    return max(value, 1)
 
 
 def _pop_next_api_v1_request(public_key: str):
@@ -458,9 +469,17 @@ def _pop_next_api_v1_request(public_key: str):
 
 
 def _evict_stale_servers() -> list[str]:
-    stale_after = _server_stale_seconds()
+    default_stale_after = _server_stale_seconds()
+    now_monotonic = time.monotonic()
     evicted: list[str] = []
     for server_public_key, payload in list(known_servers.items()):
+        polling_until = payload.get("polling_until_monotonic")
+        if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+            continue
+        stale_after = payload.get("last_ping_duration", default_stale_after)
+        if not isinstance(stale_after, (int, float)):
+            stale_after = default_stale_after
+        stale_after = max(float(stale_after), 1.0)
         if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
             continue
         if _unregister_server(server_public_key):
@@ -919,12 +938,16 @@ def api_v1_relay_servers_register():
 
     if public_key in known_servers:
         known_servers[public_key]['last_ping'] = datetime.now()
+        log_event = "server.reregister"
     else:
         known_servers[public_key] = {
             'public_key': public_key,
             'last_ping': datetime.now(),
-            'last_ping_duration': 10,
+            'last_ping_duration': _api_v1_lease_seconds(),
         }
+        log_event = "server.registered"
+    known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
+    LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({
         'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
@@ -949,8 +972,12 @@ def api_v1_relay_servers_poll():
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
     if public_key not in known_servers:
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+    known_servers[public_key]['last_ping'] = datetime.now()
+    known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
+    LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
+    known_servers[public_key]['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
     with client_inference_requests_changed:
         first_request = _pop_next_api_v1_request(public_key)
         if first_request is None and poll_wait_seconds > 0:
@@ -962,7 +989,19 @@ def api_v1_relay_servers_poll():
                 client_inference_requests_changed.wait(timeout=remaining)
                 first_request = _pop_next_api_v1_request(public_key)
 
+    server_payload = known_servers.get(public_key)
+    if server_payload is not None:
+        server_payload.pop('polling_until_monotonic', None)
+    else:
+        if first_request is not None:
+            with client_inference_requests_changed:
+                queued_requests = client_inference_requests.setdefault(public_key, [])
+                queued_requests.insert(0, first_request)
+                client_inference_requests_changed.notify_all()
+        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+
     if first_request is None:
+        server_payload['last_ping'] = datetime.now()
         return jsonify({'message': 'No requests available'}), 200
 
     queue_wait_ms = None

@@ -1619,6 +1619,38 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert response_plaintext not in json.dumps(retrieved_payload)
 
 
+def test_api_v1_poll_requeues_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-requeue-on-unregister-race',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    original_pop = relay_module._pop_next_api_v1_request
+
+    def _pop_then_unregister(public_key):
+        popped = original_pop(public_key)
+        if popped is not None:
+            known_servers.pop(public_key, None)
+        return popped
+
+    monkeypatch.setattr(relay_module, '_pop_next_api_v1_request', _pop_then_unregister)
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 404
+
+    queued_after = client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
+    assert len(queued_after) == 1
+    assert queued_after[0]['request_id'] == 'req-requeue-on-unregister-race'
+
+
 def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
@@ -1687,6 +1719,27 @@ def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
     assert second.status_code == 200
     assert first.get_json()['request_id'] == 'req-fifo-1'
     assert second.get_json()['request_id'] == 'req-fifo-2'
+
+
+def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    time.sleep(0.6)
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    time.sleep(0.6)
+    assert client.post('/api/v1/relay/servers/poll', json=server_payload).status_code == 200
+
+
+def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=2)
+    expired = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert expired.status_code == 404
 
 
 def test_api_v1_poll_long_wait_ignores_unrelated_server_wakeups(client, monkeypatch):

@@ -880,17 +880,19 @@ def test_create_completion_encrypted_success(client, monkeypatch, mock_llama):
 
 
 def test_create_chat_completion_model_error(client, monkeypatch, mock_llama):
-    class DummyErr(Exception):
-        pass
     from api.v1.models import ModelError
     monkeypatch.setattr(
         'api.v1.compute_provider.generate_response',
-        lambda m, msgs, **kwargs: (_ for _ in ()).throw(ModelError('boom')),
+        lambda m, msgs, **kwargs: (_ for _ in ()).throw(
+            ModelError('boom', status_code=404, error_type='model_not_found')
+        ),
     )
     payload = {'model':'llama-3-8b-instruct','messages':[{'role':'user','content':'hi'}]}
     res = client.post('/api/v1/chat/completions', json=payload)
-    assert res.status_code == 400
-    assert 'error' in res.get_json()
+    assert res.status_code == 404
+    body = res.get_json()
+    assert 'error' in body
+    assert body['error']['type'] == 'model_not_found'
 
 
 def test_create_completion_exception(client, monkeypatch, mock_llama):

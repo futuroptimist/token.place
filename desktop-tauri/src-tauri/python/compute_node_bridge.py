@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import queue
 import sys
 import threading
@@ -56,6 +57,8 @@ _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
+WARM_LOAD_DEFAULT = "1"
+RUNTIME_PATH_DEFAULT = "bridge"
 
 
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
@@ -148,6 +151,18 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
         f"offloaded_layers={diagnostics.get('offloaded_layers', diagnostics.get('n_gpu_layers'))} "
         f"kv_cache_device={diagnostics.get('kv_cache_device') or 'unknown'}"
     )
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _runtime_path_from_env() -> str:
+    value = os.getenv("TOKENPLACE_DESKTOP_RUNTIME_PATH", RUNTIME_PATH_DEFAULT)
+    if value.strip().lower() == "sidecar":
+        return "sidecar"
+    return "bridge"
 
 
 def _start_stdin_reader() -> None:
@@ -265,21 +280,106 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.model_path = args.model
     apply_compute_mode(runtime.model_manager, args.mode)
 
-    print("desktop.compute_node_bridge.model_init.start", file=sys.stderr)
-    if not runtime.ensure_api_v1_runtime_ready():
+    warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
+    runtime_path = _runtime_path_from_env()
+    dual_runtime_enabled = _env_enabled("TOKENPLACE_DESKTOP_DUAL_RUNTIME", "0")
+    bridge_runtime_allowed = runtime_path == "bridge" or dual_runtime_enabled
+    warm_load_state = "not_started"
+    warm_load_started_at = 0.0
+    warm_load_duration_ms: Optional[int] = None
+    warm_load_failed: Optional[str] = None
+    warm_load_fatal = False
+
+    def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
+        diagnostics = compute_mode_diagnostics(runtime.model_manager)
+        emit(
+            {
+                "type": "status",
+                "running": True,
+                "registered": registered,
+                "active_relay_url": active_relay_url,
+                "requested_mode": diagnostics.get("requested_mode"),
+                "effective_mode": diagnostics.get("effective_mode"),
+                "backend_available": diagnostics.get("backend_available"),
+                "backend_selected": diagnostics.get("backend_selected"),
+                "backend_used": diagnostics.get("backend_used"),
+                "offloaded_layers": diagnostics.get(
+                    "offloaded_layers", diagnostics.get("n_gpu_layers")
+                ),
+                "kv_cache_device": diagnostics.get("kv_cache_device"),
+                "fallback_reason": diagnostics.get("fallback_reason"),
+                "interpreter": runtime_setup.get("interpreter", sys.executable),
+                "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+                "model_path": args.model,
+                "last_error": current_last_error,
+                "warm_load_state": warm_load_state,
+                "warm_load_enabled": warm_load_enabled,
+                "warm_load_duration_ms": warm_load_duration_ms,
+                "runtime_path": runtime_path,
+            }
+        )
+
+    def ensure_runtime_ready(reason: str, *, active_relay_url: str) -> bool:
+        nonlocal warm_load_state, warm_load_started_at, warm_load_duration_ms, warm_load_failed
+        if warm_load_state == "ready":
+            return True
+        if warm_load_state == "warming":
+            return False
+        warm_load_state = "warming"
+        warm_load_failed = None
+        warm_load_duration_ms = None
+        warm_load_started_at = time.perf_counter()
+        emit_status_event(
+            registered=True,
+            active_relay_url=active_relay_url,
+            current_last_error=last_error,
+        )
+        print(
+            "desktop.compute_node_bridge.model_init.start "
+            f"reason={reason} state={warm_load_state}",
+            file=sys.stderr,
+        )
+        ready = runtime.ensure_api_v1_runtime_ready()
+        warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
+        if not ready:
+            warm_load_state = "failed"
+            warm_load_failed = "failed to initialize API v1 model runtime"
+            print(
+                "desktop.compute_node_bridge.model_init.failed "
+                f"reason={reason} state={warm_load_state} duration_ms={warm_load_duration_ms}",
+                file=sys.stderr,
+            )
+            return False
+        warm_load_state = "ready"
+        print(
+            "desktop.compute_node_bridge.model_init.ready "
+            f"reason={reason} state={warm_load_state} duration_ms={warm_load_duration_ms}",
+            file=sys.stderr,
+        )
+        print(_runtime_diagnostics_summary(compute_mode_diagnostics(runtime.model_manager)), file=sys.stderr)
+        return True
+
+    def fail_on_warm_load_error(*, active_relay_url: str) -> None:
+        nonlocal last_error, warm_load_fatal
+        last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+        emit_status_event(
+            registered=True,
+            active_relay_url=active_relay_url,
+            current_last_error=last_error,
+        )
         emit(
             {
                 "type": "error",
-                "message": "failed to initialize API v1 model runtime",
+                "message": last_error,
                 "active_relay_url": runtime.relay_client.relay_url,
+                "warm_load_state": warm_load_state,
+                "warm_load_duration_ms": warm_load_duration_ms,
+                "runtime_path": runtime_path,
             }
         )
-        print("desktop.compute_node_bridge.model_init.failed", file=sys.stderr)
-        return 1
+        warm_load_fatal = True
 
-    print("desktop.compute_node_bridge.model_init.ready", file=sys.stderr)
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
-    print(_runtime_diagnostics_summary(diagnostics), file=sys.stderr)
     last_error: Optional[str] = None
     emit(
         {
@@ -301,8 +401,17 @@ def run(args: argparse.Namespace) -> int:
             "use_mock_llm": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
             "model_path": args.model,
             "last_error": None,
+            "warm_load_state": warm_load_state,
+            "warm_load_enabled": warm_load_enabled,
+            "runtime_path": runtime_path,
         }
     )
+    if runtime_path == "sidecar" and dual_runtime_enabled:
+        print(
+            "desktop.compute_node_bridge.runtime_path.dual_mode_enabled "
+            "runtime_path=sidecar dual_runtime_enabled=True",
+            file=sys.stderr,
+        )
 
     try:
         while not stop_requested():
@@ -344,6 +453,19 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+            if registered and api_v1_payload and warm_load_enabled and warm_load_state != "ready":
+                if not bridge_runtime_allowed:
+                    warm_load_state = "not_started"
+                    print(
+                        "desktop.compute_node_bridge.model_init.skipped "
+                        f"reason=api_v1_request runtime_path={runtime_path} "
+                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
+                        file=sys.stderr,
+                    )
+                elif not ensure_runtime_ready("api_v1_request", active_relay_url=active_relay_url):
+                    fail_on_warm_load_error(active_relay_url=active_relay_url)
+                    break
+
             if not registered:
                 if relay_error is not None:
                     last_error = relay_error
@@ -353,6 +475,10 @@ def run(args: argparse.Namespace) -> int:
                         "operator; update relay.py to repo HEAD"
                     )
             elif api_v1_payload:
+                print(
+                    f"desktop.compute_node_bridge.request_route runtime_path={runtime_path}",
+                    file=sys.stderr,
+                )
                 print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,
@@ -383,28 +509,23 @@ def run(args: argparse.Namespace) -> int:
                         "operator; update relay.py to repo HEAD"
                     )
 
-            diagnostics = compute_mode_diagnostics(runtime.model_manager)
-            emit(
-                {
-                    "type": "status",
-                    "running": True,
-                    "registered": registered,
-                    "active_relay_url": active_relay_url,
-                    "requested_mode": diagnostics.get("requested_mode"),
-                    "effective_mode": diagnostics.get("effective_mode"),
-                    "backend_available": diagnostics.get("backend_available"),
-                    "backend_selected": diagnostics.get("backend_selected"),
-                    "backend_used": diagnostics.get("backend_used"),
-                    "offloaded_layers": diagnostics.get(
-                        "offloaded_layers", diagnostics.get("n_gpu_layers")
-                    ),
-                    "kv_cache_device": diagnostics.get("kv_cache_device"),
-                    "fallback_reason": diagnostics.get("fallback_reason"),
-                    "interpreter": runtime_setup.get("interpreter", sys.executable),
-                    "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
-                    "model_path": args.model,
-                    "last_error": last_error,
-                }
+            if registered and warm_load_enabled and warm_load_state == "not_started":
+                if not bridge_runtime_allowed:
+                    warm_load_state = "not_started"
+                    print(
+                        "desktop.compute_node_bridge.model_init.skipped "
+                        f"reason=post_registration runtime_path={runtime_path} "
+                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
+                        file=sys.stderr,
+                    )
+                else:
+                    if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
+                        fail_on_warm_load_error(active_relay_url=active_relay_url)
+                        break
+            emit_status_event(
+                registered=registered,
+                active_relay_url=active_relay_url,
+                current_last_error=last_error,
             )
 
             if _sleep_with_cancel(wait_seconds):
@@ -431,10 +552,14 @@ def run(args: argparse.Namespace) -> int:
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
-            "last_error": None,
+            "last_error": last_error,
+            "warm_load_state": warm_load_state,
+            "warm_load_enabled": warm_load_enabled,
+            "warm_load_duration_ms": warm_load_duration_ms,
+            "runtime_path": runtime_path,
         }
     )
-    return 0
+    return 1 if warm_load_fatal else 0
 
 
 def main() -> int:

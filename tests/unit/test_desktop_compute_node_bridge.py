@@ -378,7 +378,8 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     status = compute_node_bridge.run(args)
 
     assert status == 1
-    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-2])
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get("type") == "error")
     assert payload['type'] == 'error'
     assert 'failed to initialize API v1 model runtime' in payload['message']
 
@@ -995,7 +996,8 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     status = compute_node_bridge.main()
 
     assert status == 1
-    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get("type") == "error")
     assert payload['type'] == 'error'
     assert payload['message'].startswith(
         'compute-node bridge exited before emitting a startup event:'
@@ -1268,7 +1270,8 @@ def test_run_stops_when_post_registration_runtime_warmup_fails(capsys, monkeypat
     status = compute_node_bridge.run(args)
     assert status == 1
     assert calls == ["poll", "warm"]
-    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-2])
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
 
 

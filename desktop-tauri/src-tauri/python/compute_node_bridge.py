@@ -279,14 +279,49 @@ def run(args: argparse.Namespace) -> int:
     warm_load_failed: Optional[str] = None
     warm_load_fatal = False
 
-    def ensure_runtime_ready(reason: str) -> bool:
+    def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
+        diagnostics = compute_mode_diagnostics(runtime.model_manager)
+        emit(
+            {
+                "type": "status",
+                "running": True,
+                "registered": registered,
+                "active_relay_url": active_relay_url,
+                "requested_mode": diagnostics.get("requested_mode"),
+                "effective_mode": diagnostics.get("effective_mode"),
+                "backend_available": diagnostics.get("backend_available"),
+                "backend_selected": diagnostics.get("backend_selected"),
+                "backend_used": diagnostics.get("backend_used"),
+                "offloaded_layers": diagnostics.get(
+                    "offloaded_layers", diagnostics.get("n_gpu_layers")
+                ),
+                "kv_cache_device": diagnostics.get("kv_cache_device"),
+                "fallback_reason": diagnostics.get("fallback_reason"),
+                "interpreter": runtime_setup.get("interpreter", sys.executable),
+                "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+                "model_path": args.model,
+                "last_error": current_last_error,
+                "warm_load_state": warm_load_state,
+                "warm_load_enabled": warm_load_enabled,
+                "warm_load_duration_ms": warm_load_duration_ms,
+            }
+        )
+
+    def ensure_runtime_ready(reason: str, *, active_relay_url: str) -> bool:
         nonlocal warm_load_state, warm_load_started_at, warm_load_duration_ms, warm_load_failed
         if warm_load_state == "ready":
             return True
         if warm_load_state == "warming":
             return False
         warm_load_state = "warming"
+        warm_load_failed = None
+        warm_load_duration_ms = None
         warm_load_started_at = time.perf_counter()
+        emit_status_event(
+            registered=True,
+            active_relay_url=active_relay_url,
+            current_last_error=last_error,
+        )
         print(
             "desktop.compute_node_bridge.model_init.start "
             f"reason={reason} state={warm_load_state}",
@@ -388,18 +423,6 @@ def run(args: argparse.Namespace) -> int:
                         "operator; update relay.py to repo HEAD"
                     )
             elif api_v1_payload:
-                if warm_load_enabled and warm_load_state == "not_started":
-                    if not ensure_runtime_ready("post_registration"):
-                        emit(
-                            {
-                                "type": "error",
-                                "message": warm_load_failed or "failed to initialize API v1 model runtime",
-                                "active_relay_url": runtime.relay_client.relay_url,
-                                "warm_load_state": warm_load_state,
-                            }
-                        )
-                        warm_load_fatal = True
-                        break
                 print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,
@@ -430,45 +453,30 @@ def run(args: argparse.Namespace) -> int:
                         "operator; update relay.py to repo HEAD"
                     )
 
-            diagnostics = compute_mode_diagnostics(runtime.model_manager)
-            emit(
-                {
-                    "type": "status",
-                    "running": True,
-                    "registered": registered,
-                    "active_relay_url": active_relay_url,
-                    "requested_mode": diagnostics.get("requested_mode"),
-                    "effective_mode": diagnostics.get("effective_mode"),
-                    "backend_available": diagnostics.get("backend_available"),
-                    "backend_selected": diagnostics.get("backend_selected"),
-                    "backend_used": diagnostics.get("backend_used"),
-                    "offloaded_layers": diagnostics.get(
-                        "offloaded_layers", diagnostics.get("n_gpu_layers")
-                    ),
-                    "kv_cache_device": diagnostics.get("kv_cache_device"),
-                    "fallback_reason": diagnostics.get("fallback_reason"),
-                    "interpreter": runtime_setup.get("interpreter", sys.executable),
-                    "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
-                    "model_path": args.model,
-                    "last_error": last_error,
-                    "warm_load_state": warm_load_state,
-                    "warm_load_enabled": warm_load_enabled,
-                    "warm_load_duration_ms": warm_load_duration_ms,
-                }
-            )
-
             if registered and warm_load_enabled and warm_load_state == "not_started":
-                if not ensure_runtime_ready("post_registration"):
+                if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
+                    last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+                    emit_status_event(
+                        registered=True,
+                        active_relay_url=active_relay_url,
+                        current_last_error=last_error,
+                    )
                     emit(
                         {
                             "type": "error",
-                            "message": warm_load_failed or "failed to initialize API v1 model runtime",
+                            "message": last_error,
                             "active_relay_url": runtime.relay_client.relay_url,
                             "warm_load_state": warm_load_state,
+                            "warm_load_duration_ms": warm_load_duration_ms,
                         }
                     )
                     warm_load_fatal = True
                     break
+            emit_status_event(
+                registered=registered,
+                active_relay_url=active_relay_url,
+                current_last_error=last_error,
+            )
 
             if _sleep_with_cancel(wait_seconds):
                 break
@@ -494,7 +502,10 @@ def run(args: argparse.Namespace) -> int:
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "model_path": args.model,
-            "last_error": None,
+            "last_error": last_error,
+            "warm_load_state": warm_load_state,
+            "warm_load_enabled": warm_load_enabled,
+            "warm_load_duration_ms": warm_load_duration_ms,
         }
     )
     return 1 if warm_load_fatal else 0

@@ -433,6 +433,35 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+            if registered and warm_load_enabled and warm_load_state == "not_started" and api_v1_payload:
+                if not bridge_runtime_allowed:
+                    warm_load_state = "not_started"
+                    print(
+                        "desktop.compute_node_bridge.model_init.skipped "
+                        f"reason=api_v1_request runtime_path={runtime_path} "
+                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
+                        file=sys.stderr,
+                    )
+                elif not ensure_runtime_ready("api_v1_request", active_relay_url=active_relay_url):
+                    last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+                    emit_status_event(
+                        registered=True,
+                        active_relay_url=active_relay_url,
+                        current_last_error=last_error,
+                    )
+                    emit(
+                        {
+                            "type": "error",
+                            "message": last_error,
+                            "active_relay_url": runtime.relay_client.relay_url,
+                            "warm_load_state": warm_load_state,
+                            "warm_load_duration_ms": warm_load_duration_ms,
+                            "runtime_path": runtime_path,
+                        }
+                    )
+                    warm_load_fatal = True
+                    break
+
             if not registered:
                 if relay_error is not None:
                     last_error = relay_error
@@ -446,30 +475,6 @@ def run(args: argparse.Namespace) -> int:
                     f"desktop.compute_node_bridge.request_route runtime_path={runtime_path}",
                     file=sys.stderr,
                 )
-                if (
-                    warm_load_enabled
-                    and warm_load_state == "not_started"
-                    and bridge_runtime_allowed
-                ):
-                    if not ensure_runtime_ready("api_v1_request", active_relay_url=active_relay_url):
-                        last_error = warm_load_failed or "failed to initialize API v1 model runtime"
-                        emit_status_event(
-                            registered=True,
-                            active_relay_url=active_relay_url,
-                            current_last_error=last_error,
-                        )
-                        emit(
-                            {
-                                "type": "error",
-                                "message": last_error,
-                                "active_relay_url": runtime.relay_client.relay_url,
-                                "warm_load_state": warm_load_state,
-                                "warm_load_duration_ms": warm_load_duration_ms,
-                                "runtime_path": runtime_path,
-                            }
-                        )
-                        warm_load_fatal = True
-                        break
                 print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,

@@ -674,6 +674,21 @@ To exit, press Ctrl+C/Cmd+C.
 
 Alternatively, you can visit http://localhost:5000 in your browser to use the web interface.
 
+#### Vue bundle mode for relay landing page
+
+The relay landing page (`static/index.html`) now loads the Vue 2 production
+bundle by default, which avoids shipping dev-mode warnings in production/static
+assets and desktop-packaged web views.
+
+- Default behavior (recommended for production and packaged desktop builds):
+  `https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js`
+- Local debugging override (development only):
+  append `?vue=dev` to the landing-page URL, for example
+  `http://localhost:5000/?vue=dev`.
+
+This preserves local development ergonomics while ensuring the default served
+asset path is production-safe.
+
 ### Raspberry Pi 5 deployment
 
 For a complete walkthrough of the Raspberry Pi 5 setup—including hardware recommendations, Docker instructions, k3s cluster steps, and troubleshooting (including rpi-clone prompts)—see [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials).

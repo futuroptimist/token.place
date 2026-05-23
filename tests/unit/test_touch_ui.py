@@ -10,6 +10,14 @@ def test_send_button_has_touch_optimized_binding():
     )
 
 
+def test_landing_page_defaults_to_production_vue_bundle():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert "dist/vue.min.js" in index_html, "landing page must load Vue production bundle by default"
+    assert "params.get('vue') === 'dev'" in index_html, (
+        "landing page must support explicit Vue dev mode toggle for local debugging"
+    )
+
+
 def test_chat_js_defines_touch_detection_hook():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "isTouchInput" in chat_js, "chat.js must expose touch detection state"

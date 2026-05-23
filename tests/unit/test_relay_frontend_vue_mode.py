@@ -1,21 +1,15 @@
 from __future__ import annotations
 
-import importlib
+from pathlib import Path
+
+import relay
 
 
-def _load_relay_module(monkeypatch, mode: str | None):
-    if mode is None:
-        monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
-    else:
-        monkeypatch.setenv("TOKENPLACE_FRONTEND_MODE", mode)
-
-    import relay
-
-    return importlib.reload(relay)
+INDEX_HTML_PATH = Path(relay.INDEX_HTML_PATH)
 
 
 def test_relay_uses_production_vue_by_default(monkeypatch):
-    relay = _load_relay_module(monkeypatch, None)
+    monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
 
     html = relay._render_index_html()
 
@@ -25,7 +19,7 @@ def test_relay_uses_production_vue_by_default(monkeypatch):
 
 
 def test_relay_uses_development_vue_when_explicitly_requested(monkeypatch):
-    relay = _load_relay_module(monkeypatch, "development")
+    monkeypatch.setenv("TOKENPLACE_FRONTEND_MODE", "development")
 
     html = relay._render_index_html()
 
@@ -34,8 +28,40 @@ def test_relay_uses_development_vue_when_explicitly_requested(monkeypatch):
 
 
 def test_static_index_uses_runtime_vue_placeholder() -> None:
-    with open("static/index.html", encoding="utf-8") as index_file:
-        html = index_file.read()
+    html = INDEX_HTML_PATH.read_text(encoding="utf-8")
 
-    assert "__TOKENPLACE_VUE_SCRIPT_SRC__" in html
+    assert relay.VUE_SCRIPT_PLACEHOLDER in html
     assert "dist/vue.js" not in html
+
+
+def test_render_index_html_reads_from_module_anchored_path(monkeypatch):
+    monkeypatch.chdir("/")
+
+    html = relay._render_index_html()
+
+    assert "<html" in html
+
+
+def test_static_index_route_uses_runtime_rendering(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_FRONTEND_MODE", "development")
+
+    with relay.app.test_request_context("/static/index.html"):
+        response = relay.serve_static("index.html")
+
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert relay.VUE_DEV_SCRIPT_SRC in body
+    assert relay.VUE_SCRIPT_PLACEHOLDER not in body
+
+
+def test_index_route_supports_conditional_get(monkeypatch):
+    monkeypatch.delenv("TOKENPLACE_FRONTEND_MODE", raising=False)
+
+    with relay.app.test_client() as client:
+        first_response = client.get("/")
+        etag = first_response.headers.get("ETag")
+        assert etag
+
+        second_response = client.get("/", headers={"If-None-Match": etag})
+
+    assert second_response.status_code == 304

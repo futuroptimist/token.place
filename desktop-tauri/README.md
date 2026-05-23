@@ -89,6 +89,19 @@ Desktop binaries are published by the GitHub Actions workflow
    ```
 2. GitHub Actions builds `desktop-tauri/` artifacts on macOS and Windows and
    uploads them to the GitHub Release named `desktop-v0.1.0`.
+3. For Apple Silicon Macs (M1/M2/M3/M4), Releases must show one obvious DMG named
+   `token.place-desktop-<version>-apple-silicon.dmg`.
+
+Release guardrails in `.github/workflows/desktop-release.yml` enforce:
+- Tauri-only staging from `desktop-tauri/src-tauri/target/.../bundle` (no legacy Electron assets).
+- Rejection of stale Electron markers (`tokenplace Desktop`, `tokenplace Desktop Setup`,
+  `desktop/electron-builder`).
+- macOS bundle icon validation against `desktop-tauri/src-tauri/icons/icon.icns`.
+
+Signing/notarization expectations:
+- If Apple signing identity/secrets are configured, CI verifies with `codesign` and `spctl`.
+- If signing identity/secrets are absent, CI emits an explicit preview/dev-only warning;
+  unsigned or ad-hoc-signed builds are not treated as fully Gatekeeper-ready notarized releases.
 
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.

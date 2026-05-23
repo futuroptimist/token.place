@@ -656,7 +656,7 @@ python server.py
 
 Compute-node entrypoints now default their relay target to `https://token.place`.
 For local development, pass an explicit override such as
-`--relay_url http://127.0.0.1:5010` or `--relay_url http://localhost:5000`.
+`--relay_url http://127.0.0.1:5010` or `--relay_url http://localhost:5010`.
 
 For testing with mock LLM (faster startup):
 
@@ -1240,7 +1240,7 @@ docker compose up -d  # starts the relay service
 
 1. Clone the repository
 2. Run `docker compose up` to build and start the relay container
-3. Open `http://localhost:5000` in your browser to begin chatting
+3. Open `http://localhost:5010` in your browser to begin chatting
 
 ## Development
 
@@ -1277,10 +1277,10 @@ Always use explicit IPv4 addresses for reliable network testing:
 
 ```powershell
 # Preferred:
-curl http://127.0.0.1:5000/test
+curl http://127.0.0.1:5010/api/v1/health
 
 # May cause issues:
-curl http://localhost:5000/test
+curl http://localhost:5010/api/v1/health
 ```
 
 ## Contributing

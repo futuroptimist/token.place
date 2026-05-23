@@ -15,7 +15,14 @@ fi
 
 echo "Using interpreter: $($PYTHON --version)"
 
-if [[ ! -d .venv ]]; then
+if [[ -d .venv ]]; then
+    VENV_VERSION="$(".venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    SELECTED_VERSION="$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [[ "$VENV_VERSION" != "$SELECTED_VERSION" ]]; then
+        echo ".venv uses Python $VENV_VERSION; remove it or recreate it with $PYTHON before continuing." >&2
+        exit 1
+    fi
+else
     "$PYTHON" -m venv .venv
 fi
 

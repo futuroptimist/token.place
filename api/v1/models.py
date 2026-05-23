@@ -9,7 +9,10 @@ import logging
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
-from llama_cpp import Llama
+try:
+    from llama_cpp import Llama
+except ImportError:  # pragma: no cover - exercised in relay-only installs
+    Llama = None  # type: ignore[assignment]
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set
@@ -257,6 +260,13 @@ def get_model_instance(model_id):
     if USE_MOCK_LLM:
         logger.info(f"Using mock LLM for model_id: {model_id} (mock mode enabled)")
         return "MOCK_MODEL"
+
+    if Llama is None:
+        raise ModelError(
+            "llama-cpp-python is not installed. Install full server dependencies to load local models.",
+            status_code=503,
+            error_type="model_unavailable",
+        )
 
     # In real operation, check if model is already loaded
     adapter_meta = model_meta.get("adapter")

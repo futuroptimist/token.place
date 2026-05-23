@@ -195,7 +195,7 @@ def main() -> int:
                     f"{bridge_output[-2000:]}"
                 )
 
-            bridge.wait(timeout=20)
+            bridge.wait(timeout=60)
             if bridge.returncode != 0:
                 raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
 

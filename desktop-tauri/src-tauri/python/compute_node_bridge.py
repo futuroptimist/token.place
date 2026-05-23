@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import queue
 import sys
 import threading
@@ -198,6 +199,13 @@ def _sleep_with_cancel(seconds: float) -> bool:
     return stop_requested()
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def run(args: argparse.Namespace) -> int:
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
@@ -265,19 +273,34 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.model_path = args.model
     apply_compute_mode(runtime.model_manager, args.mode)
 
-    print("desktop.compute_node_bridge.model_init.start", file=sys.stderr)
-    if not runtime.ensure_api_v1_runtime_ready():
-        emit(
-            {
-                "type": "error",
-                "message": "failed to initialize API v1 model runtime",
-                "active_relay_url": runtime.relay_client.relay_url,
-            }
+    warm_load_enabled = _env_bool("TOKENPLACE_DESKTOP_WARM_LOAD", True)
+    sidecar_mode_enabled = _env_bool("TOKENPLACE_DESKTOP_SIDECAR_MODE", False)
+    dual_runtime_enabled = _env_bool("TOKENPLACE_DESKTOP_DUAL_RUNTIME", False)
+    if sidecar_mode_enabled and not dual_runtime_enabled:
+        warm_load_enabled = False
+        print(
+            "desktop.compute_node_bridge.warm_load.skipped sidecar_mode=enabled dual_runtime=disabled",
+            file=sys.stderr,
         )
-        print("desktop.compute_node_bridge.model_init.failed", file=sys.stderr)
-        return 1
+    elif sidecar_mode_enabled and dual_runtime_enabled:
+        print("desktop.compute_node_bridge.runtime_mode dual_mode=enabled", file=sys.stderr)
 
-    print("desktop.compute_node_bridge.model_init.ready", file=sys.stderr)
+    if warm_load_enabled:
+        print("desktop.compute_node_bridge.model_init.start", file=sys.stderr)
+        if not runtime.ensure_api_v1_runtime_ready():
+            emit(
+                {
+                    "type": "error",
+                    "message": "failed to initialize API v1 model runtime",
+                    "active_relay_url": runtime.relay_client.relay_url,
+                }
+            )
+            print("desktop.compute_node_bridge.model_init.failed", file=sys.stderr)
+            return 1
+
+        print("desktop.compute_node_bridge.model_init.ready", file=sys.stderr)
+    else:
+        print("desktop.compute_node_bridge.model_init.not_started", file=sys.stderr)
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     print(_runtime_diagnostics_summary(diagnostics), file=sys.stderr)
     last_error: Optional[str] = None

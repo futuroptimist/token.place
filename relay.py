@@ -98,6 +98,30 @@ LOGGER = setup_logging()
 
 DRAINING = threading.Event()
 _ORIGINAL_SIGNAL_HANDLERS: dict[int, Any] = {}
+STATIC_DIR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+INDEX_HTML_PATH = os.path.join(STATIC_DIR_PATH, "index.html")
+VUE_SCRIPT_PLACEHOLDER = "__TOKENPLACE_VUE_SCRIPT_SRC__"
+VUE_DEV_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"
+VUE_PROD_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js"
+
+
+def _frontend_mode() -> str:
+    """Resolve frontend asset mode for relay-served static HTML."""
+
+    mode = os.environ.get("TOKENPLACE_FRONTEND_MODE", "production").strip().lower()
+    if mode in {"dev", "development"}:
+        return "development"
+    return "production"
+
+
+def _vue_script_src_for_mode(mode: str) -> str:
+    return VUE_DEV_SCRIPT_SRC if mode == "development" else VUE_PROD_SCRIPT_SRC
+
+
+def _render_index_html() -> str:
+    with open(INDEX_HTML_PATH, encoding="utf-8") as index_file:
+        html = index_file.read()
+    return html.replace(VUE_SCRIPT_PLACEHOLDER, _vue_script_src_for_mode(_frontend_mode()))
 
 
 def _handle_shutdown_signal(signum: int, frame: Any) -> None:
@@ -279,7 +303,7 @@ def _load_public_base_url() -> str | None:
 def create_app() -> Flask:
     """Instantiate and configure the Flask application."""
 
-    flask_app = Flask(__name__)
+    flask_app = Flask(__name__, static_folder=None)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
     try:
@@ -695,12 +719,18 @@ def _pop_stream_chunks_for_client(client_public_key):
 
 @app.route('/')
 def index():
-    return send_from_directory('static', 'index.html')
+    response = Response(_render_index_html(), mimetype='text/html')
+    response.last_modified = os.path.getmtime(INDEX_HTML_PATH)
+    response.add_etag()
+    response.make_conditional(request)
+    return response
 
 # Generic route for serving static files
 @app.route('/static/<path:path>')
 def serve_static(path):
-    return send_from_directory('static', path)
+    if path == 'index.html':
+        return index()
+    return send_from_directory(STATIC_DIR_PATH, path)
 
 
 

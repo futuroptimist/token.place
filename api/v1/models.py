@@ -7,12 +7,22 @@ import os
 import random
 import logging
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 try:
-    from llama_cpp import Llama
+    import llama_cpp as _llama_cpp_module
+    from llama_cpp import Llama as _llama_runtime
 except ImportError:  # pragma: no cover - exercised in relay-only installs
     Llama = None  # type: ignore[assignment]
+else:
+    _repo_root = Path(__file__).resolve().parents[2]
+    _shim_path = _repo_root / "llama_cpp.py"
+    _module_origin = Path(getattr(_llama_cpp_module, "__file__", "")).resolve()
+    if _module_origin == _shim_path:
+        Llama = None  # type: ignore[assignment]
+    else:
+        Llama = _llama_runtime
 
 # Check environment
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'dev')  # Default to 'dev' if not set

@@ -1484,6 +1484,21 @@ def test_api_v1_register_does_not_dequeue_requests(client):
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests or len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 0
 
 
+def test_api_v1_poll_refreshes_server_lease_timestamp(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    register = client.post('/api/v1/relay/servers/register', json=server_payload)
+    assert register.status_code == 200
+    first_ping = known_servers[DUMMY_SERVER_PUB_KEY]['last_ping']
+    assert isinstance(first_ping, datetime)
+
+    time.sleep(0.01)
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    second_ping = known_servers[DUMMY_SERVER_PUB_KEY]['last_ping']
+    assert isinstance(second_ping, datetime)
+    assert second_ping >= first_ping
+
+
 def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     known_servers[DUMMY_SERVER_PUB_KEY] = {

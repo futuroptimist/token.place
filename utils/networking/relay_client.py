@@ -297,6 +297,12 @@ class RelayClient:
         self.model_manager = model_manager
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._registration_token: Optional[str] = None
+        self._api_v1_registered_relays: Set[str] = set()
+        self._api_v1_registration_refresh_seconds = max(
+            float(os.getenv("TOKEN_PLACE_API_V1_REGISTER_REFRESH_SECONDS", "300")),
+            1.0,
+        )
+        self._api_v1_last_register_at: Dict[str, float] = {}
         configured_servers: List[Any] = []
         self._cluster_only = False
 
@@ -715,7 +721,7 @@ class RelayClient:
         return max(base_timeout, wait_seconds + 1.0)
 
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
-        """Register then poll API v1 relay routes for encrypted work."""
+        """Poll API v1 relay routes, registering once and re-registering as needed."""
 
         last_error: Optional[Dict[str, Any]] = None
         for offset in range(len(self._relay_urls)):
@@ -723,18 +729,28 @@ class RelayClient:
             candidate_url = self._relay_urls[index]
 
             try:
-                register_response = self.register_api_v1_compute_node(candidate_url)
                 register_wait = self._request_timeout
                 poll_wait = register_wait
-                if isinstance(register_response, dict):
-                    register_wait = register_response.get('next_ping_in_x_seconds', self._request_timeout)
-                    poll_wait = register_response.get('poll_wait_seconds', register_wait)
-                    if register_response.get('error'):
-                        last_error = {
-                            'error': register_response.get('error'),
-                            'next_ping_in_x_seconds': register_wait,
-                        }
-                        continue
+                should_register = candidate_url not in self._api_v1_registered_relays
+                if not should_register:
+                    last_registered_at = self._api_v1_last_register_at.get(candidate_url, 0.0)
+                    should_register = (
+                        time.time() - float(last_registered_at)
+                    ) >= self._api_v1_registration_refresh_seconds
+                if should_register:
+                    register_response = self.register_api_v1_compute_node(candidate_url)
+                    if isinstance(register_response, dict):
+                        register_wait = register_response.get('next_ping_in_x_seconds', self._request_timeout)
+                        poll_wait = register_response.get('poll_wait_seconds', register_wait)
+                        if register_response.get('error'):
+                            last_error = {
+                                'error': register_response.get('error'),
+                                'next_ping_in_x_seconds': register_wait,
+                            }
+                            continue
+                    self._api_v1_registered_relays.add(candidate_url)
+                    self._api_v1_last_register_at[candidate_url] = time.time()
+                    log_info("server.registered relay={}", candidate_url)
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
@@ -750,6 +766,10 @@ class RelayClient:
                     **request_kwargs,
                 )
                 if response.status_code != 200:
+                    if response.status_code == 404:
+                        self._api_v1_registered_relays.discard(candidate_url)
+                        self._api_v1_last_register_at.pop(candidate_url, None)
+                        log_info("server.reregister reason=unknown_node relay={}", candidate_url)
                     last_error = {
                         'error': f'HTTP {response.status_code}',
                         'next_ping_in_x_seconds': register_wait,
@@ -772,6 +792,7 @@ class RelayClient:
                     payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
+                log_info("server.heartbeat relay={}", candidate_url)
                 log_info(
                     "API v1 relay poll route=/api/v1/relay/servers/poll api_v1_payload={} request_id={}",
                     payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee',

@@ -334,9 +334,14 @@ jobs:
             echo "Expected macOS .app in bundle output." >&2
             exit 1
           fi
-          mapfile -t dmg_paths < <(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort)
-          if [ "${#dmg_paths[@]}" -ne 1 ]; then
-            echo "Expected exactly one staged macOS .dmg in release-artifacts; found ${#dmg_paths[@]}." >&2
+          dmg_count="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d '[:space:]')"
+          if [ "${dmg_count}" -ne 1 ]; then
+            echo "Expected exactly one staged macOS .dmg in release-artifacts; found ${dmg_count}." >&2
+            exit 1
+          fi
+          dmg_path="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort | head -n 1)"
+          if [ -z "${dmg_path}" ]; then
+            echo "Expected staged macOS .dmg in release-artifacts." >&2
             exit 1
           fi
 
@@ -348,9 +353,7 @@ jobs:
             fi
           fi
 
-          for dmg_path in "${dmg_paths[@]}"; do
-            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
-          done
+          python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
 
       - name: Generate SHA256 checksums
         shell: bash

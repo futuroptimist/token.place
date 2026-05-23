@@ -776,8 +776,8 @@ def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     stderr = output.err
     assert 'desktop.compute_node_bridge.start' in stderr
     assert 'desktop.compute_node_bridge.relay_target.resolved' in stderr
-    assert 'desktop.compute_node_bridge.model_init.start' in stderr
-    assert 'desktop.compute_node_bridge.model_init.ready' in stderr
+    assert 'desktop.compute_node_bridge.model_warm_load.start' in stderr
+    assert 'desktop.compute_node_bridge.model_warm_load.ready' in stderr
     assert 'desktop.compute_node_bridge.runtime_state' in stderr
     assert 'desktop.compute_node_bridge.relay_poll' in stderr
     assert 'desktop.compute_node_bridge.stop' in stderr
@@ -1226,7 +1226,7 @@ def test_relay_error_message_normalizes_non_string_truthy_values():
     assert compute_node_bridge._relay_error_message({"error": 503}) == "503"
 
 
-def test_run_warms_runtime_before_first_register_poll(capsys, monkeypatch):
+def test_run_starts_warm_load_after_successful_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []
 
@@ -1240,15 +1240,15 @@ def test_run_warms_runtime_before_first_register_poll(capsys, monkeypatch):
             return {"next_ping_in_x_seconds": 0}
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=OrderedRuntime)
-    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: len(call_order) > 1)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: len(call_order) > 2)
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
     assert status == 0
-    assert call_order[:2] == ["warm", "poll"]
+    assert call_order[:2] == ["poll", "warm"]
     _ = capsys.readouterr()
 
 
-def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
+def test_run_reports_retry_when_runtime_warmup_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     calls = []
 
@@ -1262,9 +1262,13 @@ def test_run_does_not_poll_when_runtime_warmup_fails(capsys, monkeypatch):
             return {"next_ping_in_x_seconds": 0}
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingWarmupRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: len(calls) > 2)
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
-    assert status == 1
-    assert calls == ["warm"]
-    payload = json.loads(capsys.readouterr().out.strip())
-    assert payload["type"] == "error"
+    assert status == 0
+    assert calls[:2] == ["poll", "warm"]
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    status_events = [event for event in events if event.get("type") == "status"]
+    assert status_events
+    assert "desktop.compute_node_bridge.model_warm_load.failed" in captured.err

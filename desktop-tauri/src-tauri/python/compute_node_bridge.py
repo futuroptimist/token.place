@@ -58,6 +58,7 @@ _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
+RUNTIME_PATH_DEFAULT = "bridge"
 
 
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
@@ -155,6 +156,13 @@ def _runtime_diagnostics_summary(diagnostics: Dict[str, Any]) -> str:
 def _env_enabled(name: str, default: str = "0") -> bool:
     value = os.getenv(name, default)
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _runtime_path_from_env() -> str:
+    value = os.getenv("TOKENPLACE_DESKTOP_RUNTIME_PATH", RUNTIME_PATH_DEFAULT)
+    if value.strip().lower() == "sidecar":
+        return "sidecar"
+    return "bridge"
 
 
 def _start_stdin_reader() -> None:
@@ -273,6 +281,9 @@ def run(args: argparse.Namespace) -> int:
     apply_compute_mode(runtime.model_manager, args.mode)
 
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
+    runtime_path = _runtime_path_from_env()
+    dual_runtime_enabled = _env_enabled("TOKENPLACE_DESKTOP_DUAL_RUNTIME", "0")
+    bridge_runtime_allowed = runtime_path == "bridge" or dual_runtime_enabled
     warm_load_state = "not_started"
     warm_load_started_at = 0.0
     warm_load_duration_ms: Optional[int] = None
@@ -304,6 +315,7 @@ def run(args: argparse.Namespace) -> int:
                 "warm_load_state": warm_load_state,
                 "warm_load_enabled": warm_load_enabled,
                 "warm_load_duration_ms": warm_load_duration_ms,
+                "runtime_path": runtime_path,
             }
         )
 
@@ -371,8 +383,15 @@ def run(args: argparse.Namespace) -> int:
             "last_error": None,
             "warm_load_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
+            "runtime_path": runtime_path,
         }
     )
+    if runtime_path == "sidecar" and dual_runtime_enabled:
+        print(
+            "desktop.compute_node_bridge.runtime_path.dual_mode_enabled "
+            "runtime_path=sidecar dual_runtime_enabled=True",
+            file=sys.stderr,
+        )
 
     try:
         while not stop_requested():
@@ -424,6 +443,34 @@ def run(args: argparse.Namespace) -> int:
                     )
             elif api_v1_payload:
                 print(
+                    f"desktop.compute_node_bridge.request_route runtime_path={runtime_path}",
+                    file=sys.stderr,
+                )
+                if (
+                    warm_load_enabled
+                    and warm_load_state == "not_started"
+                    and bridge_runtime_allowed
+                ):
+                    if not ensure_runtime_ready("api_v1_request", active_relay_url=active_relay_url):
+                        last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+                        emit_status_event(
+                            registered=True,
+                            active_relay_url=active_relay_url,
+                            current_last_error=last_error,
+                        )
+                        emit(
+                            {
+                                "type": "error",
+                                "message": last_error,
+                                "active_relay_url": runtime.relay_client.relay_url,
+                                "warm_load_state": warm_load_state,
+                                "warm_load_duration_ms": warm_load_duration_ms,
+                                "runtime_path": runtime_path,
+                            }
+                        )
+                        warm_load_fatal = True
+                        break
+                print(
                     "desktop.compute_node_bridge.process_request",
                     file=sys.stderr,
                 )
@@ -454,24 +501,34 @@ def run(args: argparse.Namespace) -> int:
                     )
 
             if registered and warm_load_enabled and warm_load_state == "not_started":
-                if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
-                    last_error = warm_load_failed or "failed to initialize API v1 model runtime"
-                    emit_status_event(
-                        registered=True,
-                        active_relay_url=active_relay_url,
-                        current_last_error=last_error,
+                if not bridge_runtime_allowed:
+                    warm_load_state = "not_started"
+                    print(
+                        "desktop.compute_node_bridge.model_init.skipped "
+                        f"reason=post_registration runtime_path={runtime_path} "
+                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
+                        file=sys.stderr,
                     )
-                    emit(
-                        {
-                            "type": "error",
-                            "message": last_error,
-                            "active_relay_url": runtime.relay_client.relay_url,
-                            "warm_load_state": warm_load_state,
-                            "warm_load_duration_ms": warm_load_duration_ms,
-                        }
-                    )
-                    warm_load_fatal = True
-                    break
+                else:
+                    if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
+                        last_error = warm_load_failed or "failed to initialize API v1 model runtime"
+                        emit_status_event(
+                            registered=True,
+                            active_relay_url=active_relay_url,
+                            current_last_error=last_error,
+                        )
+                        emit(
+                            {
+                                "type": "error",
+                                "message": last_error,
+                                "active_relay_url": runtime.relay_client.relay_url,
+                                "warm_load_state": warm_load_state,
+                                "warm_load_duration_ms": warm_load_duration_ms,
+                                "runtime_path": runtime_path,
+                            }
+                        )
+                        warm_load_fatal = True
+                        break
             emit_status_event(
                 registered=registered,
                 active_relay_url=active_relay_url,
@@ -506,6 +563,7 @@ def run(args: argparse.Namespace) -> int:
             "warm_load_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
             "warm_load_duration_ms": warm_load_duration_ms,
+            "runtime_path": runtime_path,
         }
     )
     return 1 if warm_load_fatal else 0

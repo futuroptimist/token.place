@@ -303,7 +303,7 @@ def _load_public_base_url() -> str | None:
 def create_app() -> Flask:
     """Instantiate and configure the Flask application."""
 
-    flask_app = Flask(__name__)
+    flask_app = Flask(__name__, static_folder=None)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
     try:

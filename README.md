@@ -122,9 +122,13 @@ python server.py
 ```
 
 Relay-served static assets default to **production frontend mode**. In this
-mode `static/index.html` is rendered with Vue's minified production CDN build,
-so deployed relay/static assets and desktop-packaged relay UI avoid Vue
-development-mode warnings.
+mode, requests to `/` (and `/static/index.html`) are rendered with Vue's
+minified production CDN build (`vue.min.js`) to avoid Vue development-mode
+warnings in relay-served HTML flows.
+
+Desktop packaging remains a separate path: `desktop-tauri/frontendDist`
+contains the packaged React/Vite UI assets, so this Vue CDN switch applies only
+to relay-served static HTML and does not change desktop runtime behavior.
 
 For local debugging, opt into development Vue with:
 

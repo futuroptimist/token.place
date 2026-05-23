@@ -121,6 +121,19 @@ python relay.py
 python server.py
 ```
 
+Relay-served static assets default to **production frontend mode**. In this
+mode `static/index.html` is rendered with Vue's minified production CDN build,
+so deployed relay/static assets and desktop-packaged relay UI avoid Vue
+development-mode warnings.
+
+For local debugging, opt into development Vue with:
+
+```bash
+TOKENPLACE_FRONTEND_MODE=development python relay.py
+```
+
+Any value other than `development`/`dev` keeps production Vue.
+
 Or start both services with Docker Compose:
 
 ```bash

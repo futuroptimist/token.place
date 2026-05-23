@@ -98,6 +98,29 @@ LOGGER = setup_logging()
 
 DRAINING = threading.Event()
 _ORIGINAL_SIGNAL_HANDLERS: dict[int, Any] = {}
+INDEX_HTML_PATH = os.path.join("static", "index.html")
+VUE_SCRIPT_PLACEHOLDER = "__TOKENPLACE_VUE_SCRIPT_SRC__"
+VUE_DEV_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"
+VUE_PROD_SCRIPT_SRC = "https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js"
+
+
+def _frontend_mode() -> str:
+    """Resolve frontend asset mode for relay-served static HTML."""
+
+    mode = os.environ.get("TOKENPLACE_FRONTEND_MODE", "production").strip().lower()
+    if mode in {"dev", "development"}:
+        return "development"
+    return "production"
+
+
+def _vue_script_src_for_mode(mode: str) -> str:
+    return VUE_DEV_SCRIPT_SRC if mode == "development" else VUE_PROD_SCRIPT_SRC
+
+
+def _render_index_html() -> str:
+    with open(INDEX_HTML_PATH, encoding="utf-8") as index_file:
+        html = index_file.read()
+    return html.replace(VUE_SCRIPT_PLACEHOLDER, _vue_script_src_for_mode(_frontend_mode()))
 
 
 def _handle_shutdown_signal(signum: int, frame: Any) -> None:
@@ -695,7 +718,7 @@ def _pop_stream_chunks_for_client(client_public_key):
 
 @app.route('/')
 def index():
-    return send_from_directory('static', 'index.html')
+    return Response(_render_index_html(), mimetype='text/html')
 
 # Generic route for serving static files
 @app.route('/static/<path:path>')

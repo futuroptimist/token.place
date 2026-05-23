@@ -27,20 +27,41 @@ Secure peer-to-peer generative AI platform
 
 # Quickstart
 
-Ensure you have Node.js 18+ installed (`nvm use` respects the included .nvmrc).
+**Prerequisites**
+
+- **Python 3.11 or 3.12** (matches CI and Docker images; see [macOS relay setup](#macos-relay-only-quick-start) below)
+- **Node.js 18+** (`nvm use` respects the included `.nvmrc`)
+
+Create and activate a virtual environment before installing Python packages (recommended on all platforms, especially macOS where `pip` may be missing but `pip3` is available):
 
 ```bash
 git clone https://github.com/futuroptimist/token.place.git
 cd token.place
-pip install -r config/requirements_server.txt
-pip install -r config/requirements_relay.txt
-pip install -r requirements.txt
+
+# Prefer Python 3.12 when available (brew install python@3.12)
+python3.12 -m venv .venv || python3 -m venv .venv
+source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -r config/requirements_relay.txt
+```
+
+**Relay only (fast path):** after activating `.venv`, run `python relay.py` and open `http://127.0.0.1:5010/api/v1/health`. Or run `./scripts/setup-relay-venv.sh` to create the venv and install relay dependencies in one step.
+
+**Full development setup** (compute node, tests, and pre-commit):
+
+```bash
+source .venv/bin/activate
+python -m pip install -r config/requirements_server.txt
+python -m pip install -r requirements.txt
 npm ci
 playwright install --with-deps chromium
-pip install pre-commit
+python -m pip install pre-commit
 pre-commit install
 pre-commit run --all-files
 ```
+
+On macOS, use `python3` / `pip3` (or the venv’s `python` / `pip` after activation) if the unversioned `python` / `pip` commands are not on your `PATH`.
 
 ### Developer workflow quick reference
 
@@ -114,12 +135,14 @@ Requests containing phrases from the built-in safety blocklist (or any terms sup
 `CONTENT_MODERATION_BLOCKLIST`) are rejected with a standardized `content_policy_violation` error before they reach the model.
 Set `CONTENT_MODERATION_INCLUDE_DEFAULTS=0` if you only want to enforce your custom blocklist.
 
-Run the relay and server in separate terminals:
+Run the relay and server in separate terminals (with `.venv` activated):
 
 ```bash
 python relay.py
 python server.py
 ```
+
+The relay listens on **port 5010** by default (`http://127.0.0.1:5010`). Override with `--port` or `RELAY_PORT`.
 
 Relay-served static assets default to **production frontend mode**. In this
 mode, requests to `/` (and `/static/index.html`) are rendered with Vue's
@@ -144,7 +167,7 @@ Or start both services with Docker Compose:
 docker compose up --build
 ```
 
-Open `http://localhost:5000` or run `python client.py`. For a minimal client use
+Open `http://127.0.0.1:5010` (or the port you configured) or run `python client.py`. For a minimal client use
 `python client_simplified.py`; it clears the screen when running interactively using ANSI codes
 with flushed output. Metrics are exposed at `/metrics`.
 
@@ -472,6 +495,36 @@ xcode-select --install  # if not already installed
 brew install cmake
 ```
 
+### macOS relay-only quick start
+
+Use this path when you only need `relay.py` (no local `llama-cpp-python` build):
+
+1. Install Python 3.12 (Homebrew’s default `python3` may be 3.14, which lacks wheels for some pinned packages):
+
+   ```sh
+   brew install python@3.12
+   ```
+
+2. Create a venv and install relay dependencies:
+
+   ```sh
+   cd token.place
+   ./scripts/setup-relay-venv.sh
+   # or manually:
+   python3.12 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r config/requirements_relay.txt
+   ```
+
+3. Start the relay and verify health:
+
+   ```sh
+   python relay.py
+   curl http://127.0.0.1:5010/api/v1/health
+   ```
+
+If `pip install` fails building Pillow, install JPEG support (`brew install jpeg`) or use Python 3.12 as above so pip can install a prebuilt wheel.
+
 On other Linux distributions, use your package manager to install the equivalents of `build-essential` and `cmake`. For example on Fedora:
 
 ```sh
@@ -586,13 +639,13 @@ CMAKE_ARGS="-DLLAMA_OPENBLAS=on" FORCE_CMAKE=1 pip install llama-cpp-python --fo
 
 You'll need a way to switch between terminal tabs (e.g. tmux, VS Code terminal tabs).
 
-Launch the relay, which runs on http://localhost:5000:
+Launch the relay, which runs on http://127.0.0.1:5010 by default:
 
 ```sh
 python relay.py
 ```
 
-The relay listens on port 5000. It automatically connects to the default server
+The relay listens on port **5010** (override with `--port` or `RELAY_PORT`). It automatically connects to the default server
 address baked into the project, so no environment variables are required.
 
 In a separate terminal, launch the server, which binds to `0.0.0.0` on port 3000 (accessible via http://localhost:3000):
@@ -689,7 +742,7 @@ Type your message when prompted and press Enter. All of this is now happening on
 
 To exit, press Ctrl+C/Cmd+C.
 
-Alternatively, you can visit http://localhost:5000 in your browser to use the web interface.
+Alternatively, you can visit http://127.0.0.1:5010 in your browser to use the web interface.
 
 ### Raspberry Pi 5 deployment
 

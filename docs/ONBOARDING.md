@@ -58,14 +58,22 @@ The `.gitignore` file keeps OS artifacts like `.DS_Store` and `Thumbs.db` out of
 
 ## Local checks
 
+Create a virtual environment first (recommended on macOS):
+
+```bash
+python3.12 -m venv .venv || python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
 Set up development dependencies and run the full test suite before pushing changes:
 
 ```bash
-pip install pre-commit
+python -m pip install pre-commit
 npm ci
-pip install -r config/requirements_server.txt
-pip install -r config/requirements_relay.txt
-pip install -r requirements.txt
+python -m pip install -r config/requirements_server.txt
+python -m pip install -r config/requirements_relay.txt
+python -m pip install -r requirements.txt
 npm run lint
 npm run type-check
 npm run build

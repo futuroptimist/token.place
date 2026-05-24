@@ -256,6 +256,9 @@ jobs:
         shell: bash
         env:
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
@@ -299,7 +302,7 @@ jobs:
             fi
 
             preview_notice="release-artifacts/README-macos-apple-silicon-preview.txt"
-            if [ -n "${CONFIGURED_APPLE_SIGNING_IDENTITY:-}" ]; then
+            if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
               printf '%s\n' \
                 "token.place desktop macOS Apple Silicon preview build" \
                 "" \

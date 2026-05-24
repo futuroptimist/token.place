@@ -86,3 +86,11 @@ def test_workflow_writes_preview_notice_via_printf() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert "printf '%s\\n' \\" in text
     assert '> "${preview_notice}"' in text
+
+
+def test_preview_notice_uses_full_signing_decision_in_stage_step() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}' in text
+    assert 'APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}' in text
+    assert 'APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}' in text
+    assert 'if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then' in text

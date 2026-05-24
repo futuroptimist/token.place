@@ -1,0 +1,159 @@
+name: Build and publish GHCR relay image
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (branch, tag, or SHA) to build
+        required: false
+        default: main
+
+jobs:
+  build-and-smoke:
+    name: Build and smoke test relay image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      immutable_tag: ${{ steps.meta.outputs.immutable_tag }}
+      image_repository: ${{ steps.meta.outputs.image_repository }}
+      created: ${{ steps.meta.outputs.created }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          image_repository="ghcr.io/futuroptimist/tokenplace-relay"
+          immutable_tag="main-${short_sha}"
+          sha_tag="sha-${short_sha}"
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_repository=${image_repository}" >> "$GITHUB_OUTPUT"
+          echo "immutable_tag=${immutable_tag}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
+          echo "created=${created}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: tokenplace-relay:smoke
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          cache-from: type=gha,scope=ci-image
+          cache-to: type=gha,mode=max,scope=ci-image
+
+      - name: Smoke test container
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            docker logs tokenplace-relay-smoke || true
+            docker stop tokenplace-relay-smoke || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --rm --name tokenplace-relay-smoke \
+            -p 127.0.0.1:5010:5010 \
+            -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
+            tokenplace-relay:smoke
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5010/livez \
+              && curl -fsS http://127.0.0.1:5010/healthz \
+              && curl -fsS http://127.0.0.1:5010/ >/dev/null \
+              && curl -fsS http://127.0.0.1:5010/metrics >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          cmdline="$(docker exec tokenplace-relay-smoke tr '\0' ' ' </proc/1/cmdline)"
+          echo "Container command line: ${cmdline}"
+          echo "${cmdline}" | grep -Eq -- '--workers +1( |$)'
+
+      - name: Summarize immutable tag
+        run: |
+          echo "### Relay image tag" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Immutable: \
+          \\`${{ steps.meta.outputs.image_repository }}:${{ steps.meta.outputs.immutable_tag }}\\`" >> "$GITHUB_STEP_SUMMARY"
+
+  push-image:
+    name: Publish multi-arch image to GHCR
+    runs-on: ubuntu-latest
+    needs: build-and-smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ needs.build-and-smoke.outputs.image_repository }}:${{ needs.build-and-smoke.outputs.immutable_tag }}
+            ${{ needs.build-and-smoke.outputs.image_repository }}:main-latest
+            ${{ needs.build-and-smoke.outputs.image_repository }}:sha-${{ needs.build-and-smoke.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ needs.build-and-smoke.outputs.created }}
+          cache-from: type=gha,scope=ci-image
+          cache-to: type=gha,mode=max,scope=ci-image
+
+      - name: Summarize published tags
+        run: |
+          echo "### Published relay image tags" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Immutable: \
+          \\`${{ needs.build-and-smoke.outputs.image_repository }}:${{ needs.build-and-smoke.outputs.immutable_tag }}\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Mutable: \
+          \\`${{ needs.build-and-smoke.outputs.image_repository }}:main-latest\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Compatibility: \
+          \\`${{ needs.build-and-smoke.outputs.image_repository }}:sha-${{ needs.build-and-smoke.outputs.short_sha }}\\`" >> "$GITHUB_STEP_SUMMARY"

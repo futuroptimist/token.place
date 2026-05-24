@@ -15,14 +15,18 @@ on:
         default: main
 
 jobs:
-  relay-image:
-    name: Build, smoke-test, and publish relay image
+  build-and-smoke:
+    name: Build and smoke-test relay image
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     outputs:
-      immutable_image_tag: ${{ steps.tags.outputs.branch_tag }}
+      short_sha: ${{ steps.tags.outputs.short_sha }}
+      created: ${{ steps.tags.outputs.created }}
+      repository: ${{ steps.tags.outputs.repository }}
+      branch_tag: ${{ steps.tags.outputs.branch_tag }}
+      latest_tag: ${{ steps.tags.outputs.latest_tag }}
+      sha_tag: ${{ steps.tags.outputs.sha_tag }}
 
     steps:
       - name: Checkout repository
@@ -42,17 +46,11 @@ jobs:
           echo "created=${created}" >> "$GITHUB_OUTPUT"
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "branch_tag=${repository}:main-${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "default_tag=${repository}:main" >> "$GITHUB_OUTPUT"
           echo "latest_tag=${repository}:main-latest" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${repository}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Set up QEMU (arm64 for push)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/arm64
 
       - name: Build relay image locally for smoke test
         uses: docker/build-push-action@v6
@@ -90,7 +88,8 @@ jobs:
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:5010/livez \
               && curl -fsS http://127.0.0.1:5010/healthz \
-              && curl -fsS http://127.0.0.1:5010/ >/dev/null; then
+              && curl -fsS http://127.0.0.1:5010/ >/dev/null \
+              && curl -fsS http://127.0.0.1:5010/metrics >/dev/null; then
               break
             fi
             sleep 1
@@ -99,11 +98,32 @@ jobs:
           curl -fsS http://127.0.0.1:5010/livez >/dev/null
           curl -fsS http://127.0.0.1:5010/healthz >/dev/null
           curl -fsS http://127.0.0.1:5010/ >/dev/null
+          curl -fsS http://127.0.0.1:5010/metrics >/dev/null
 
           docker exec tokenplace-relay-smoke sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+  publish:
+    name: Publish relay image
+    runs-on: ubuntu-latest
+    needs: build-and-smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU (arm64 for push)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
       - name: Log in to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -111,7 +131,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-arch relay image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -120,13 +139,13 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ steps.tags.outputs.branch_tag }}
-            ${{ steps.tags.outputs.default_tag }}
-            ${{ steps.tags.outputs.latest_tag }}
+            ${{ needs.build-and-smoke.outputs.branch_tag }}
+            ${{ needs.build-and-smoke.outputs.latest_tag }}
+            ${{ needs.build-and-smoke.outputs.sha_tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
-            org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+            org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
+            org.opencontainers.image.created=${{ needs.build-and-smoke.outputs.created }}
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
@@ -135,9 +154,9 @@ jobs:
           {
             echo "## Relay image tags"
             echo ""
-            echo "Immutable tag: \`${{ steps.tags.outputs.branch_tag }}\`"
-            echo "Default mutable tag: \`${{ steps.tags.outputs.default_tag }}\`"
-            echo "Mutable tag: \`${{ steps.tags.outputs.latest_tag }}\`"
+            echo "Immutable tag: \`${{ needs.build-and-smoke.outputs.branch_tag }}\`"
+            echo "Mutable tag: \`${{ needs.build-and-smoke.outputs.latest_tag }}\`"
+            echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
             echo ""
-            echo "Pushed: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+            echo "Pushed: true"
           } >> "$GITHUB_STEP_SUMMARY"

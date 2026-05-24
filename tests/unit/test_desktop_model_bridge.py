@@ -99,12 +99,12 @@ def test_get_model_manager_reports_missing_dependency(capsys):
     assert capsys.readouterr().out.strip() == ''
 
 
-def test_get_model_manager_treats_import_failure_as_nonfatal_for_inspect(capsys):
+def test_get_model_manager_treats_optional_import_failure_as_nonfatal_for_inspect(capsys):
     real_import = __import__
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == 'utils.llm.model_manager':
-            raise ModuleNotFoundError("No module named 'requests'", name='requests')
+            raise ModuleNotFoundError("No module named 'psutil'", name='psutil')
         return real_import(name, globals, locals, fromlist, level)
 
     with patch('builtins.__import__', side_effect=_fake_import):
@@ -135,7 +135,7 @@ def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
     assert 'Missing Python dependency for model downloads' in response['error']
 
 
-def test_inspect_returns_fallback_metadata_when_requests_missing(capsys):
+def test_inspect_returns_error_when_requests_missing(capsys):
     real_import = __import__
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -146,13 +146,13 @@ def test_inspect_returns_fallback_metadata_when_requests_missing(capsys):
     with patch('builtins.__import__', side_effect=_fake_import):
         status = model_bridge.inspect_model()
 
-    assert status == 0
+    assert status == 1
     response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is True
-    assert set(('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes')).issubset(response['payload'].keys())
+    assert response['ok'] is False
+    assert "No module named 'requests'" in response['error']
 
 
-def test_inspect_returns_fallback_metadata_when_dotenv_missing(capsys):
+def test_inspect_returns_error_when_dotenv_missing(capsys):
     real_import = __import__
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -166,10 +166,10 @@ def test_inspect_returns_fallback_metadata_when_dotenv_missing(capsys):
     with patch('builtins.__import__', side_effect=_fake_import):
         status = model_bridge.inspect_model()
 
-    assert status == 0
+    assert status == 1
     response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is True
-    assert set(('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes')).issubset(response['payload'].keys())
+    assert response['ok'] is False
+    assert "No module named 'dotenv'" in response['error']
 
 
 def test_main_dispatches_inspect_action():

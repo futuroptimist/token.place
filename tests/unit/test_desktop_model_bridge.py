@@ -43,7 +43,8 @@ def test_inspect_returns_bridge_error_when_manager_init_fails(capsys):
         status = model_bridge.inspect_model()
 
     assert status == 1
-    assert capsys.readouterr().out.strip() == ''
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response == {'ok': False, 'error': 'Model bridge failure: 1'}
 
 
 def test_download_returns_actionable_error_when_download_fails(capsys):
@@ -89,13 +90,22 @@ def test_download_returns_metadata_when_download_succeeds(capsys):
 
 def test_get_model_manager_reports_missing_dependency(capsys):
     with patch.dict('sys.modules', {'utils.llm.model_manager': None}):
-        manager, error_status = model_bridge._get_model_manager()
+        manager, manager_error = model_bridge._get_model_manager()
 
     assert manager is None
-    assert error_status == 1
+    assert isinstance(manager_error, ModuleNotFoundError)
+    assert capsys.readouterr().out.strip() == ''
+
+
+def test_inspect_returns_fallback_metadata_when_optional_download_dependency_is_missing(capsys):
+    missing = ModuleNotFoundError("No module named 'psutil'")
+    with patch.object(model_bridge, '_get_model_manager', return_value=(None, missing)):
+        with patch.object(model_bridge, '_fallback_model_metadata', return_value={'filename': 'fallback.gguf'}):
+            status = model_bridge.inspect_model()
+
+    assert status == 0
     response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is False
-    assert 'Missing Python dependency for model downloads' in response['error']
+    assert response == {'ok': True, 'payload': {'filename': 'fallback.gguf'}}
 
 
 def test_main_dispatches_inspect_action():

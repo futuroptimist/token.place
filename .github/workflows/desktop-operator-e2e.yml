@@ -9,6 +9,7 @@ on:
       - 'desktop-tauri/src-tauri/python/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/scripts/test_packaged_model_bridge_smoke.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'utils/**'
       - 'config.py'
@@ -24,6 +25,7 @@ on:
       - 'desktop-tauri/src-tauri/python/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/scripts/test_packaged_model_bridge_smoke.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'utils/**'
       - 'config.py'
@@ -124,3 +126,17 @@ jobs:
 
       - name: Run packaged operator bridge e2e (Windows)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
+  desktop-operator-packaged-smoke-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run packaged model bridge startup smoke (macOS)
+        run: python desktop-tauri/scripts/test_packaged_model_bridge_smoke.py

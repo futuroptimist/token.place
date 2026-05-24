@@ -260,7 +260,7 @@ describe('desktop app start failure handling', () => {
       invokeMock.mock.calls.filter(([command]) => command === 'start_compute_node')
     ).toHaveLength(1);
     expect(startOperatorButton.disabled).toBe(true);
-    expect(stopOperatorButton.disabled).toBe(false);
+    expect(stopOperatorButton.disabled).toBe(true);
 
     resolveStart?.();
   });

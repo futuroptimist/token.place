@@ -443,7 +443,7 @@ export function App() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
-            disabled={!computeStatus.running && !isStartingComputeNode}
+            disabled={!computeStatus.running}
             onClick={stopComputeNode}
           >
             Stop operator

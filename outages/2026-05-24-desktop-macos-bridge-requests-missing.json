@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-macos-bridge-requests-missing",
+  "summary": "macOS desktop operator startup failed with `No module named 'requests'` before bridge startup events in clean packaged/runtime environments.",
+  "impact": "Operators could not start from the desktop app unless the host Python environment happened to provide `requests`.",
+  "fix": "Bundled a stdlib-backed `requests` compatibility module with desktop Python resources and aligned packaged e2e fixtures/resource guards to enforce deterministic bridge imports.",
+  "lessons": "Desktop bridge startup dependencies must be explicitly packaged and tested in clean environments that do not inherit global/site Python modules."
+}

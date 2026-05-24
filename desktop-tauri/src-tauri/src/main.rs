@@ -442,6 +442,7 @@ mod tests {
             "python/inference_sidecar.py",
             "python/model_bridge.py",
             "python/path_bootstrap.py",
+            "python/requests.py",
             "../../utils",
             "../../config.py",
             "../../encrypt.py",

@@ -138,10 +138,10 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (macOS packaged e2e)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r config/requirements_codex_verification.txt
 
       - name: Run packaged operator bridge e2e (macOS)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py

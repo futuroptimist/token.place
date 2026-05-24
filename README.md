@@ -247,9 +247,22 @@ See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay
 
 ## sugarkube deployment
 
-`relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
-operationally separate from GPU-heavy compute nodes.
-In the short-to-medium term architecture, sugarkube scope remains relay-only.
+`relay.py` is the only token.place runtime component deployed in Sugarkube for the near-term phase.
+`server.py` and desktop/host compute nodes remain external.
+
+Current relay operations model in Sugarkube:
+
+- one pod, one Gunicorn worker, one replica
+- in-memory relay state (registrations/queued messages/replies)
+- accepted state loss on pod replacement until shared-state architecture lands
+
+Artifact references:
+
+- Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
+- OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Preferred staging/prod tag: immutable `main-<shortsha>` (`main-latest` is convenience-only)
+
+Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo.
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
@@ -749,7 +762,7 @@ Alternatively, you can visit http://127.0.0.1:5010 in your browser to use the we
 
 For a complete walkthrough of the Raspberry Pi 5 setup—including hardware recommendations, Docker instructions, k3s cluster steps, and troubleshooting (including rpi-clone prompts)—see [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials).
 
-If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, copy the Helm bundle from [`k8s/sugarkube/`](k8s/sugarkube/) into `/etc/sugarkube/helm-bundles.d/` so the relay deploys automatically once k3s is ready.
+If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, deploy token.place via Sugarkube's Helm OCI install/upgrade flow using the published token.place chart and image tags (see the Sugarkube runbooks linked above), rather than local chart bundle copies.
 
 ## Testing
 

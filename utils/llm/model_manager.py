@@ -4,11 +4,12 @@ Model manager module for handling LLM model downloading, initialization and infe
 import os
 import time
 import logging
-import requests
 import json
 import sys
 import importlib
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 from threading import Lock
 from unittest.mock import MagicMock
 from typing import Dict, List, Any, Optional, Union, Tuple, Iterable
@@ -120,6 +121,33 @@ def llama_cpp_verbose_logging_enabled() -> bool:
         os.getenv('TOKEN_PLACE_VERBOSE_LLM_LOGS') == '1'
         or os.getenv('TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS') == '1'
     )
+
+
+class _UrllibResponseAdapter:
+    def __init__(self, response):
+        self._response = response
+        self.status_code = getattr(response, 'status', 200)
+        self.headers = response.headers
+
+    def iter_content(self, chunk_size: int):
+        while True:
+            data = self._response.read(chunk_size)
+            if data == b'':
+                return
+            yield data
+
+
+class _RequestsCompat:
+    RequestException = URLError
+
+    @staticmethod
+    def get(url: str, *, stream: bool = True, timeout: int | float | None = None):
+        del stream
+        response = urlopen(url, timeout=timeout)  # noqa: S310
+        return _UrllibResponseAdapter(response)
+
+
+requests = _RequestsCompat()
 
 
 class ModelManager:
@@ -324,7 +352,11 @@ class ModelManager:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        response = requests.get(url, stream=True, timeout=self.download_timeout)
+        try:
+            response = requests.get(url, stream=True, timeout=self.download_timeout)
+        except requests.RequestException as exc:
+            self.log_error(f"Error: Unable to download file: {exc}")
+            return False
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")

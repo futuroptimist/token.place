@@ -65,15 +65,22 @@ def _response(ok: bool, *, payload: Dict[str, Any] | None = None, error: str = "
     return 0 if ok else 1
 
 
-def _is_missing_module_error(exc: ModuleNotFoundError) -> bool:
-    return "No module named" in str(exc)
+_INSPECT_OPTIONAL_IMPORTS = {"psutil", "urllib3"}
+
+
+def _is_inspect_optional_missing(exc: ModuleNotFoundError) -> bool:
+    missing_name = getattr(exc, "name", None)
+    if missing_name in _INSPECT_OPTIONAL_IMPORTS:
+        return True
+    message = str(exc)
+    return any(f"No module named '{name}'" in message for name in _INSPECT_OPTIONAL_IMPORTS)
 
 
 def _get_model_manager(*, allow_inspect_fallback: bool = False):
     try:
         from utils.llm.model_manager import get_model_manager
     except ModuleNotFoundError as exc:
-        if allow_inspect_fallback and _is_missing_module_error(exc):
+        if allow_inspect_fallback and _is_inspect_optional_missing(exc):
             return None, {"ok": True, "payload": _fallback_model_metadata()}
         return None, {
             "ok": False,

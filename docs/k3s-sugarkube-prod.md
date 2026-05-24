@@ -1,61 +1,67 @@
 # token.place relay on k3s+sugarkube (prod)
 
-> **Environment status:** **Planned / post-staging promotion target**.
-> Production runbook is prepared now for future onboarding and consistent operations.
+> **Environment status:** production runbook for controlled relay-only rollout.
 
 ## Scope
 
-Run `relay.py` on sugarkube production with strict change control. Compute nodes remain external
-until parity and later API v1 migration phases are complete.
+Production sugarkube deploys `relay.py` only.
 
-## Prerequisites
+- In-cluster: one pod / one Gunicorn worker / one replica
+- External: `server.py`, desktop Tauri compute nodes, Macs, Windows PCs, Raspberry Pi GPU/AI hat
+  nodes, and other compute nodes
+- No required in-cluster backend/GPU service in this phase
 
-- production cluster access with audited credentials
-- approved production image tag and release notes
-- production Cloudflare hostname/tunnel configured
-- production secrets/config material validated
-- rollback owner/on-call identified
+The relay keeps operational state in memory (registrations/messages/replies), so state loss on pod
+restart/death is accepted in the current model.
 
-## Topology
+## Artifacts and tag policy
 
-- Public ingress terminates through Cloudflare+tunnel to sugarkube Traefik
-- relay pods run in dedicated namespace with health probes and resource limits
-- external compute nodes connect via approved relay URL
-  - workstation focus remains Windows CUDA / macOS Metal; Raspberry Pi remains a later target
+- Image: `ghcr.io/futuroptimist/tokenplace-relay`
+- Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Use the same staging-approved immutable tag: `main-<shortsha>`
+- `main-latest` is mutable convenience and is not valid for production sign-off
 
-## Release model
+## Deployment workflow (from sugarkube checkout)
 
-- staged promotion only (dev -> staging -> prod)
-- immutable tag requirement for production rollout
-- maintenance window or controlled rollout policy per operator team
+Run from sugarkube checkout (not token.place).
 
-## Deployment workflow (template)
+Install (first-time):
 
 ```bash
-# TODO: replace with production-approved sugarkube command wrapper when finalized.
-# Run from the repository root so ./deploy/charts/tokenplace-relay resolves.
-helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
-  --namespace tokenplace --create-namespace
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
-## Validation checklist
+Upgrade (existing release):
 
-- [ ] production relay endpoints reachable and healthy
-- [ ] registration/polling from external compute nodes succeeds
-- [ ] error rate/latency within expected baseline
-- [ ] rollback command and previous revision confirmed before sign-off
+```bash
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+```
+
+Sugarkube-specific token.place wrappers may be added in follow-up prompts.
+
+## Hostname
+
+Default production hostname is `https://token.place`.
+Operators may override hostnames in sugarkube values and Cloudflare routes.
+
+## Validation
+
+```bash
+kubectl -n tokenplace get deploy,po,svc,ingress
+kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+curl -fsS https://token.place/livez
+curl -fsS https://token.place/healthz
+curl -fsS https://token.place/
+```
 
 ## Rollback
 
-Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
+- Inspect release history: `helm history tokenplace -n tokenplace`
+- Roll back to previous known-good revision/tag
+- Re-run validation commands
+- Capture deployment outcome and follow-ups
 
-- immediate rollback to prior known-good Helm revision/image tag
-- validate health and request flow
-- record deployment outcome and follow-up actions
+## Guardrails
 
-## Operator notes
-
-- Keep relay lightweight in-cluster; avoid coupling production relay rollout to simultaneous
-  compute-runtime migrations.
-- Post-API-v1 target state should align all token.place components on API v1 contracts, but that is
-  a later phase and not assumed by this runbook today.
+- Preserve API v1 relay-blind E2EE invariants.
+- Do not assume legacy relay routes are the active production runtime path.

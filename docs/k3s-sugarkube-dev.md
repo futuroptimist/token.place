@@ -9,7 +9,7 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 
 - ingress/tunnel plumbing
 - relay image/chart updates
-- registration and polling behavior with external compute nodes
+- registration and polling behavior with external compute nodes (API v1/E2EE guardrails intact)
 
 ## Prerequisites
 
@@ -21,23 +21,20 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 ## Topology
 
 - In-cluster: `relay.py` deployment + service + ingress
-- External: `server.py` and/or desktop compute nodes using legacy relay contract
+- External: `server.py` and/or desktop compute nodes
   - Typical external operators: Windows 11 CUDA or macOS Apple Silicon Metal; CPU fallback valid.
 
 ## Release model
 
 - Use mutable dev tags for fast iteration when needed.
 - Prefer pinned immutable tags before promotion to staging.
-- If token.place-specific `just` helpers are unavailable, run Helm commands directly and track
-  the missing automation as follow-up work.
+- Use immutable tags when promoting to staging/prod; mutable tags are dev convenience only.
 
 ## Deployment workflow (template)
 
 ```bash
-# TODO: replace with token.place-specific sugarkube wrapper once finalized.
-# Run from the repository root so ./deploy/charts/tokenplace-relay resolves.
-helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
-  --namespace tokenplace --create-namespace
+# Run from a sugarkube checkout (not token.place):
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist

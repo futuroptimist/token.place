@@ -1,63 +1,67 @@
 # token.place relay on k3s+sugarkube (staging)
 
-> **Environment status:** **Current + planned hardening**.
-> Staging is used to validate relay operations before production rollout.
+> **Environment status:** current validation environment before production promotion.
 
 ## Scope
 
-Relay-only staging at `staging.token.place` (or equivalent environment hostname), with external
-compute nodes still using legacy sink/source contract.
+Staging runs **relay only** at `https://staging.token.place` by default.
 
-## Prerequisites
+- In-cluster: `relay.py` only (one pod, one worker, one replica)
+- External: `server.py` and all compute nodes (desktop Tauri, Macs, Windows PCs, Raspberry Pi GPU
+  / AI hats, and other nodes)
+- No required in-cluster backend or GPU service in this phase
 
-- staging cluster namespace access
-- relay image tag selected (prefer immutable)
-- Cloudflare tunnel + DNS route for staging hostname
-- environment config/secrets prepared
+The relay is currently stateful in-memory (registrations/messages/replies). State loss on pod death
+is accepted for now.
 
-## Topology
+## Artifacts and tags
 
-- Client -> Cloudflare -> tunnel -> Traefik ingress -> relay service/pod
-- compute nodes (`server.py`, later desktop parity nodes) remain external
-  - expected operators are workstation nodes (Windows CUDA, macOS Metal, CPU fallback)
+- Image: `ghcr.io/futuroptimist/tokenplace-relay`
+- Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Preferred tag for sign-off: immutable `main-<shortsha>`
+- `main-latest` is convenience only and should not be used for production sign-off.
 
-## Release model
+## Deployment workflow (from sugarkube checkout)
 
-- Promote tested dev artifacts into staging.
-- Prefer immutable tags (`main-<sha>` / `sha-<sha>`) over mutable latest tags.
-- Maintain changelog notes for each staging deploy.
+Run these commands from a sugarkube repo checkout (not token.place):
 
-## Deployment workflow (template)
-
-Run from the repository root so the chart path resolves (`./deploy/charts/tokenplace-relay`).
-Use agreed sugarkube wrapper once available; until then:
+First install:
 
 ```bash
-helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
-  --namespace tokenplace --create-namespace \
-  --set ingress.hosts[0].host=staging.token.place \
-  --set gpuExternalName.host=<staging-gpu-hostname>
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.staging.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
-> Replace placeholder values with finalized staging values (or a staging values file) before
-> rollout.
+Upgrade existing release:
 
-## Validation checklist
+```bash
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.staging.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+```
 
-- [ ] relay pod(s) healthy and stable
-- [ ] ingress route serves `https://staging.token.place/healthz`
-- [ ] relay receives expected registration/poll traffic from external nodes
-- [ ] smoke test request flow succeeds end-to-end on legacy contract
+Sugarkube-specific token.place wrappers may be added as follow-up ergonomics.
+
+## Hostname
+
+Default staging hostname is `https://staging.token.place`.
+Operators may override this in sugarkube values and Cloudflare routes.
+
+## Validation
+
+```bash
+kubectl -n tokenplace get deploy,po,svc,ingress
+kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+curl -fsS https://staging.token.place/livez
+curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/
+```
 
 ## Rollback
 
-Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
+- Inspect release history first: `helm history tokenplace -n tokenplace`
+- Roll back to previous known-good revision/tag
+- Re-run validation commands above
+- Record incident notes if user-visible impact occurred
 
-- revert Helm release revision and/or pinned image tag
-- confirm health endpoint and registration flow after rollback
-- capture incident notes in outages/ if customer-visible
+## Guardrails
 
-## Operator notes
-
-- Staging should mirror production ingress/security posture where practical.
-- Do not assume API v1 distributed compute is enabled yet; this environment is still pre-migration.
+- Keep API v1 relay-blind E2EE invariants intact.
+- Do not treat legacy relay routes as active production-path requirements.

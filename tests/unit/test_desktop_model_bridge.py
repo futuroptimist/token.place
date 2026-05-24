@@ -108,6 +108,24 @@ def test_fallback_model_metadata_uses_platform_specific_models_dir(monkeypatch):
     payload = model_bridge._fallback_model_metadata()
     assert '/Library/Application Support/' not in payload['models_dir']
 
+
+def test_default_models_dir_windows_uses_appdata_when_present(monkeypatch):
+    monkeypatch.setattr(model_bridge, 'sys', SimpleNamespace(platform='win32'))
+    monkeypatch.setattr(model_bridge, 'os', SimpleNamespace(name='nt', environ={'APPDATA': r'C:\\Users\\runner\\AppData\\Roaming'}))
+
+    models_dir = model_bridge._default_models_dir()
+
+    assert str(models_dir) == r'C:\\Users\\runner\\AppData\\Roaming/token.place/models'
+
+
+def test_default_models_dir_uses_xdg_data_home_on_posix(monkeypatch):
+    monkeypatch.setattr(model_bridge, 'sys', SimpleNamespace(platform='linux'))
+    monkeypatch.setattr(model_bridge, 'os', SimpleNamespace(name='posix', environ={'XDG_DATA_HOME': '/tmp/xdg-data'}))
+
+    models_dir = model_bridge._default_models_dir()
+
+    assert str(models_dir) == '/tmp/xdg-data/token.place/models'
+
 def test_get_model_manager_treats_optional_import_failure_as_nonfatal_for_inspect(capsys):
     real_import = __import__
 

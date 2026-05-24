@@ -6,6 +6,7 @@ import hashlib
 import json
 import plistlib
 import subprocess
+import tempfile
 from pathlib import Path
 
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
@@ -24,6 +25,33 @@ def _run(cmd: list[str]) -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_preview_readme_in_dmg(dmg_path: Path) -> None:
+    required_phrases = (
+        "ad-hoc signed",
+        "not notarized",
+        "Apple could not verify",
+        "Privacy & Security",
+        "Developer ID",
+        "notarization",
+    )
+    with tempfile.TemporaryDirectory(prefix="token-place-dmg-") as mount_dir:
+        mount_path = Path(mount_dir)
+        _run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", str(mount_path), str(dmg_path)])
+        try:
+            apps = sorted(path for path in mount_path.glob("*.app") if path.is_dir())
+            if len(apps) != 1:
+                _fail(f"DMG must contain exactly one .app at root; found {len(apps)}")
+            readme_path = mount_path / "README BEFORE OPENING.txt"
+            if not readme_path.exists() or not readme_path.is_file():
+                _fail(f"DMG is missing preview README at root: {readme_path.name}")
+            readme_text = readme_path.read_text(encoding="utf-8")
+            for phrase in required_phrases:
+                if phrase not in readme_text:
+                    _fail(f"DMG preview README missing required phrase: {phrase}")
+        finally:
+            _run(["hdiutil", "detach", str(mount_path)])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -102,6 +130,7 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+    _validate_preview_readme_in_dmg(dmg_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

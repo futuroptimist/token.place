@@ -108,10 +108,16 @@ Desktop binaries are published by the GitHub Actions workflow
   Apple Developer Program account.
 - These preview builds use ad-hoc signing and are not notarized, so Gatekeeper
   warnings after browser/GitHub download are expected.
+- The mounted DMG includes:
+  - `token.place desktop.app`
+  - `README BEFORE OPENING.txt` with step-by-step manual allow/open guidance
+  - `Applications` symlink for drag-install flow
 - Users must manually open/whitelist trusted previews:
-  - Control-click (or right-click) the app and choose **Open**, or
-  - after a blocked launch, use **System Settings → Privacy & Security**
+  - drag/copy the app to `Applications`, open once, click **Done** if blocked,
+  - then use **System Settings → Privacy & Security**
     to allow/open the app.
+- This guidance does **not** remove Gatekeeper warnings for unpaid previews; it
+  explains the expected manual flow.
 - No-warning public distribution generally requires paid
   Developer ID signing plus notarization.
 

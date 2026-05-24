@@ -43,6 +43,8 @@ def test_tauri_icon_set_references_expected_files() -> None:
 def test_workflow_sets_explicit_dmg_volume_name() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'hdiutil create -volname "token.place desktop"' in text
+    assert '-srcfolder "${dmg_stage_dir}"' in text
+    assert '-srcfolder "${app_path}"' not in text
 
 
 def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
@@ -67,12 +69,22 @@ def test_workflow_does_not_gate_release_on_notary_profile() -> None:
 def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'README-macos-apple-silicon-preview.txt' in text
-    assert 'This DMG is ad-hoc signed and is not notarized.' in text
-    assert 'This DMG is signed with a configured Apple signing identity but is not notarized.' in text
-    assert 'Apple could not verify ... is free of malware.' in text
-    assert 'System Settings -> Privacy & Security' in text
-    assert 'paid Apple Developer ID' in text
-    assert 'signing plus notarization' in text
+    assert 'This preview app is ad-hoc signed and not notarized.' in text
+    assert 'Apple could not verify' in text
+    assert 'Done.' in text
+    assert 'System Settings -> Privacy & Security.' in text
+    assert 'Open Anyway / Allow / Open' in text
+    assert 'paid Developer ID signing' in text
+    assert 'plus notarization' in text
+
+
+def test_workflow_stages_dmg_with_app_readme_and_applications_symlink() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'dmg_stage_dir="release-artifacts/macos-dmg-stage"' in text
+    assert 'cp -R "${app_path}" "${dmg_stage_dir}/token.place desktop.app"' in text
+    assert 'cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"' in text
+    assert 'ln -s /Applications "${dmg_stage_dir}/Applications"' in text
+    assert 'preview_notice_name="README BEFORE OPENING.txt"' in text
 
 
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
@@ -80,6 +92,9 @@ def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     assert 'CFBundleDisplayName' in text
     assert 'CFBundleExecutable' in text
     assert 'token.place-desktop-<version>-apple-silicon.dmg' in text
+    assert 'DMG must contain exactly one .app at root' in text
+    assert 'README BEFORE OPENING.txt' in text
+    assert 'DMG preview README missing required phrase' in text
 
 
 def test_workflow_writes_preview_notice_via_printf() -> None:

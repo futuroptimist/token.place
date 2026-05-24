@@ -38,6 +38,36 @@ def test_inspect_returns_shared_model_manager_metadata(capsys):
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': True, 'payload': metadata}
 
 
+def test_inspect_returns_graceful_metadata_when_optional_deps_missing(capsys):
+    with patch.object(model_bridge, '_get_model_manager', return_value=(None, 1)):
+        with patch.dict('sys.modules', {'utils.llm.model_manager': None}):
+            with patch.object(model_bridge, '_inspect_without_model_manager', return_value=0) as fallback:
+                status = model_bridge.inspect_model()
+
+    assert status == 0
+    fallback.assert_called_once()
+    assert capsys.readouterr().out.strip() == ''
+
+
+def test_inspect_without_model_manager_returns_non_error_payload(capsys, tmp_path):
+    models_dir = tmp_path / 'models'
+    models_dir.mkdir(parents=True)
+    with patch('config.get_config') as get_config:
+        get_config.return_value.get.side_effect = lambda key: {
+            'model.filename': 'mini.gguf',
+            'model.url': 'https://example.com/mini.gguf',
+            'model.canonical_family_url': 'https://example.com/family',
+            'paths.models_dir': str(models_dir),
+        }[key]
+        status = model_bridge._inspect_without_model_manager("No module named 'psutil'")
+
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload['ok'] is True
+    assert payload['payload']['downloads_available'] is False
+    assert "No module named 'psutil'" in payload['payload']['downloads_unavailable_reason']
+
+
 def test_inspect_returns_bridge_error_when_manager_init_fails(capsys):
     with patch.object(model_bridge, '_get_model_manager', return_value=(None, 1)):
         status = model_bridge.inspect_model()

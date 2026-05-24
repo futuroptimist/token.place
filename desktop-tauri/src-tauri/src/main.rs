@@ -34,6 +34,8 @@ struct ModelArtifactInfo {
     resolved_model_path: String,
     exists: bool,
     size_bytes: Option<u64>,
+    downloads_available: Option<bool>,
+    downloads_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

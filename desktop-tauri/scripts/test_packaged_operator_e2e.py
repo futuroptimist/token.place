@@ -91,6 +91,29 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
+        model_bridge_script = bridge_script.parent / "model_bridge.py"
+
+        inspect_env = env.copy()
+        inspect_env["TOKEN_PLACE_DESKTOP_TEST_MISSING_MODEL_DEPS"] = "1"
+        inspect_env["PYTHONNOUSERSITE"] = "1"
+        inspect_result = subprocess.run(
+            [sys.executable, str(model_bridge_script), "inspect"],
+            cwd=tmpdir,
+            env=inspect_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if inspect_result.returncode != 0:
+            raise RuntimeError(
+                "packaged model inspect should gracefully succeed when optional deps are missing; "
+                f"stdout={inspect_result.stdout}; stderr={inspect_result.stderr}"
+            )
+        if "Missing Python dependency for model downloads" in inspect_result.stdout:
+            raise RuntimeError(
+                "packaged model inspect surfaced startup dependency error unexpectedly; "
+                f"stdout={inspect_result.stdout}"
+            )
 
         relay = subprocess.Popen(  # noqa: S603
             [

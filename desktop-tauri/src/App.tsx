@@ -41,6 +41,8 @@ interface ModelArtifactInfo {
   resolved_model_path: string;
   exists: boolean;
   size_bytes: number | null;
+  downloads_available?: boolean;
+  downloads_unavailable_reason?: string;
 }
 
 interface SidecarEvent {
@@ -379,10 +381,19 @@ export function App() {
           onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
         />
         <button type="button" onClick={chooseModelPath}>Browse</button>
-        <button type="button" onClick={downloadModel} disabled={isDownloadingModel}>
+        <button
+          type="button"
+          onClick={downloadModel}
+          disabled={isDownloadingModel || artifact?.downloads_available === false}
+        >
           {isDownloadingModel ? 'Downloading…' : 'Download'}
         </button>
       </div>
+      {artifact?.downloads_available === false && artifact.downloads_unavailable_reason && (
+        <p style={{ marginTop: 8, color: '#555' }}>
+          Model download unavailable: {artifact.downloads_unavailable_reason}
+        </p>
+      )}
       {artifact && (
         <section style={{ marginTop: 8, fontSize: 14 }}>
           <div>

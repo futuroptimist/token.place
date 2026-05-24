@@ -5,58 +5,34 @@
 
 ## Scope
 
-Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
+Deploy `relay.py` to sugarkube dev for iterative validation.
 
-- ingress/tunnel plumbing
-- relay image/chart updates
-- registration and polling behavior with external compute nodes
+- In-cluster: relay deployment only.
+- External: `server.py` and desktop compute nodes.
+- No in-cluster backend/GPU service required.
 
-## Prerequisites
+## Deployment workflow (from sugarkube checkout)
 
-- sugarkube dev cluster access
-- helm/kubectl tooling
-- relay image tag available
-- dev hostname and Cloudflare tunnel route configured
-
-## Topology
-
-- In-cluster: `relay.py` deployment + service + ingress
-- External: `server.py` and/or desktop compute nodes using legacy relay contract
-  - Typical external operators: Windows 11 CUDA or macOS Apple Silicon Metal; CPU fallback valid.
-
-## Release model
-
-- Use mutable dev tags for fast iteration when needed.
-- Prefer pinned immutable tags before promotion to staging.
-- If token.place-specific `just` helpers are unavailable, run Helm commands directly and track
-  the missing automation as follow-up work.
-
-## Deployment workflow (template)
+Use OCI chart/image flows from a **sugarkube** checkout:
 
 ```bash
-# TODO: replace with token.place-specific sugarkube wrapper once finalized.
-# Run from the repository root so ./deploy/charts/tokenplace-relay resolves.
-helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
-  --namespace tokenplace --create-namespace
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+```
+
+Upgrade existing release:
+
+```bash
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist
 
-- [ ] `kubectl get pods` shows ready relay pod(s)
-- [ ] ingress host resolves in dev
-- [ ] `GET /livez` returns `{"status":"alive"}`
-- [ ] `GET /healthz` returns ready status (200)
-- [ ] external compute node can register/poll relay
+```bash
+kubectl -n tokenplace get deploy,po,svc,ingress
+kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+curl -fsS https://staging.token.place/livez
+curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/
+```
 
-## Rollback
-
-Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
-
-- Roll back to previous image tag and/or Helm revision.
-- Verify readiness and `/healthz` immediately after rollback.
-
-## Operator notes
-
-- Keep this environment permissive for debugging, but avoid introducing config assumptions that
-  cannot be promoted.
-- Legacy contract is expected here until post-parity API v1 migration.
+Dev hostname/routing can be overridden in sugarkube values and Cloudflare tunnel settings.

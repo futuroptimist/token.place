@@ -1,97 +1,87 @@
 # Relay on sugarkube onboarding (token.place)
 
-This guide explains how and why to run `relay.py` on sugarkube before full desktop/server
-migration is complete.
+This guide explains the near-term token.place deployment split for sugarkube.
 
-## Why relay.py belongs on sugarkube
+## Scope and architecture (current phase)
 
-`relay.py` is lightweight compared with compute nodes and is operationally a good fit for k3s:
+Sugarkube scope is **relay-only** and deploys `relay.py` only.
 
-- stateless request relay behavior
-- modest CPU/memory footprint
-- clear readiness endpoint (`/healthz`) and liveness endpoint (`/livez`)
-- easier centralized ingress/tunnel management
+- In-cluster on sugarkube: `relay.py`.
+- Out-of-cluster (external compute plane): `server.py`, desktop Tauri compute nodes,
+  Macs, Windows PCs, Raspberry Pi GPU/AI hats, and other compute nodes.
+- No in-cluster backend/GPU service is required in this phase.
 
-This allows token.place to improve relay availability and operator workflows while GPU-heavy
-compute nodes (`server.py` and later desktop compute nodes) remain external during parity phases.
-Workstation targets for those external compute nodes are Windows 11 + CUDA/NVIDIA and macOS Apple
-Silicon + Metal, with CPU fallback available and Raspberry Pi planned later.
+The relay is technically stateful today because server registrations, client messages, and
+server replies are kept in process memory. Operationally this means:
 
-Roadmap alignment: [desktop compute-node migration roadmap](roadmap/desktop_compute_node_migration.md).
+- one pod
+- one Gunicorn worker
+- one replica
+- accepted state loss when the pod exits/restarts
 
-## Current status
+Redis/shared in-memory database and multi-replica relay architecture are future work and out of
+scope for this phase.
 
-- **Current:** relay can run locally or in Kubernetes; staging-oriented docs exist.
-- **Planned near-term:** standardized dev/staging/prod sugarkube runbooks for relay.
-- **Not yet:** full post-API-v1 distributed deployment model.
+## Artifact ownership and references
 
-## Minimal requirements
+token.place publishes the runtime artifacts consumed by sugarkube operators:
 
-- k3s/sugarkube cluster access (`kubectl`, `helm`)
-- container image access for relay
-- DNS + Cloudflare tunnel route for chosen hostname
-- upstream compute node endpoint(s) reachable from relay route consumers
+- Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
+- Canonical chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 
-## Networking expectations
+Tag guidance:
 
-Expected edge path:
+- Preferred for staging/prod sign-off: immutable `main-<shortsha>`.
+- `main-latest` is convenience-only and not production sign-off material.
 
-`Client -> Cloudflare -> Tunnel -> Traefik Ingress -> relay Service -> relay Pod`
+## Hostnames
 
-Notes:
+Default hostnames for this phase:
 
-- relay remains HTTP inside cluster unless platform policy requires in-cluster TLS.
-- public hostnames should be environment-specific (dev/staging/prod).
-- allow overriding relay URL in desktop/server configs during phased rollout.
+- staging: `https://staging.token.place`
+- production: `https://token.place`
 
-## Secrets and config expectations
+Operators may override hostnames in sugarkube values and Cloudflare routes/tunnels.
 
-At minimum, plan for:
+## Sugarkube command patterns (run from sugarkube checkout)
 
-- relay registration/auth token material (if enabled)
-- environment-scoped relay public URL and host settings
-- any upstream allowlists or routing config
+Run the following from a **sugarkube repository checkout**, not from token.place.
 
-If exact secret names or chart keys are unsettled, treat them as explicit follow-up tasks rather
-than inventing values.
-
-## Health checks and validation
-
-`relay.py` probe semantics:
-
-- `GET /livez` returns `200 {"status":"alive"}` while process is alive.
-- `GET /healthz` returns `200` when ready, `503` when draining or degraded.
-- When relay is shutting down (SIGTERM/SIGINT), `/healthz` returns `status=draining` and `Retry-After: 0` to speed pod replacement.
-
-Minimum operator checks after deploy:
-
-1. Pod readiness and restart counts are stable.
-2. Ingress host resolves and serves `/healthz`.
-3. Relay can accept registration/polling traffic from external compute nodes.
-
-Example checks:
+First install pattern:
 
 ```bash
-kubectl -n tokenplace get pods
-kubectl -n tokenplace get ingress
-curl -fsS https://<env-host>/livez
-curl -fsS https://<env-host>/healthz
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.staging.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
-## Current limitations
+Existing release upgrade pattern:
 
-- Compute nodes are still external during parity phases.
-- Legacy sink/source contract remains active until post-parity API v1 migration.
-- Final sugarkube automation wrappers may still be in progress per environment.
+```bash
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.staging.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+```
 
-## How this fits the broader roadmap
+Production pattern uses `docs/examples/tokenplace.values.prod.yaml` with the same approved
+immutable `main-<shortsha>` tag.
 
-- Relay-on-sugarkube is a **pre-API-v1** operational improvement.
-- Desktop parity and shared compute runtime come first for compute-plane migration.
-- API v1 distributed compute is a later phase once parity and relay ops are stable.
+Sugarkube-specific token.place wrappers are expected to exist as follow-up work; these generic OCI
+helpers remain valid in the meantime.
 
-## Environment runbooks
+## Validation
 
-- [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md)
-- [k3s-sugarkube-staging.md](k3s-sugarkube-staging.md)
-- [k3s-sugarkube-prod.md](k3s-sugarkube-prod.md)
+Staging checks:
+
+```bash
+kubectl -n tokenplace get deploy,po,svc,ingress
+kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+curl -fsS https://staging.token.place/livez
+curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/
+```
+
+Production uses the same checks with `https://token.place`.
+
+## Guardrails
+
+- Keep relay-blind E2EE invariant: relay state/logs carry ciphertext plus safe routing metadata
+  only.
+- Keep API v1 as the active runtime path for `v0.1.0` and keep it non-streaming.
+- Do not treat legacy relay routes as active production path guidance.

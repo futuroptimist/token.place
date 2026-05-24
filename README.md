@@ -235,21 +235,28 @@ See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay
 
 ## Deployment topology
 
-- **Current / legacy local flow (today):** local or self-hosted `relay.py` + `server.py` on the
-  deprecated legacy sink/source contract (historical compatibility only; not for active production paths).
-- **Near-term multi-node legacy flow (deprecated/historical migration context only):** multiple
-  compute nodes (including desktop-tauri after parity) register through `relay.py` using the same
-  legacy contract until API v1 distributed migration is complete.
-- **Future distributed API v1 flow (post-parity):** distributed compute migrates to API v1-aligned
-  contracts after parity and operational readiness gates are complete.
-- **Operator platform targets:** Windows 11 + NVIDIA/CUDA and macOS Apple Silicon + Metal first,
-  CPU fallback always supported, Raspberry Pi as a later low-power compute-node target.
+- **Sugarkube runtime scope (current phase):** `relay.py` only.
+- **External compute plane (current phase):** `server.py`, desktop Tauri compute nodes, Macs,
+  Windows PCs, Raspberry Pi GPU/AI hats, and other compute nodes remain out-of-cluster.
+- **No in-cluster backend/GPU dependency:** sugarkube relay deployment does not require an
+  in-cluster compute service in this phase.
+- **Current relay operational model:** one pod, one Gunicorn worker, one replica.
+- **State model:** relay-owned registrations/messages/replies are in-memory; state loss on pod
+  death is accepted for now.
+- **Future work:** shared state (Redis/in-memory DB) + multi-replica relay architecture.
 
 ## sugarkube deployment
 
-`relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
-operationally separate from GPU-heavy compute nodes.
-In the short-to-medium term architecture, sugarkube scope remains relay-only.
+token.place publishes relay artifacts; sugarkube owns environment values and deployment wrappers.
+
+- Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
+- Canonical Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Preferred staging/prod tags: immutable `main-<shortsha>`
+- `main-latest` is convenience-only and not production sign-off material.
+- Default hostnames: staging `https://staging.token.place`, production `https://token.place`
+  (operators may override via sugarkube values and Cloudflare routes).
+
+Runbooks:
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

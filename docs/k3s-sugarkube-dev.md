@@ -34,10 +34,10 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 
 ```bash
 # Run from sugarkube checkout.
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA
 
 # Upgrade existing release.
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist
@@ -50,7 +50,7 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 
 ## Rollback
 
-Record the current revision before rollout (`helm history tokenplace -n tokenplace`) so rollback targets are explicit.
+Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
 
 - Roll back to previous image tag and/or Helm revision.
 - Verify readiness and `/healthz` immediately after rollback.

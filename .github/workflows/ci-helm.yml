@@ -1,4 +1,6 @@
 name: Publish Helm chart
+env:
+  HELM_VERSION: v3.17.3
 
 on:
   pull_request:
@@ -33,6 +35,8 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
 
       - name: Build chart dependencies when lock file exists
         if: ${{ hashFiles('charts/tokenplace/Chart.lock') != '' }}
@@ -55,8 +59,9 @@ jobs:
           set -euo pipefail
           chart_name="$(helm show chart charts/tokenplace | awk -F': ' '/^name:/{print $2}')"
           chart_version="$(helm show chart charts/tokenplace | awk -F': ' '/^version:/{print $2}')"
+          registry_owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
           echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
-          echo "chart_ref=oci://ghcr.io/futuroptimist/charts/${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "chart_ref=oci://ghcr.io/${registry_owner}/charts/${chart_name}" >> "$GITHUB_OUTPUT"
 
       - name: Package chart
         id: package
@@ -64,7 +69,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           helm package charts/tokenplace --destination dist
-          package_file="$(find dist -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
+          mapfile -t package_files < <(find dist -maxdepth 1 -type f -name '*.tgz' | sort)
+          if [ "${#package_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one packaged chart in dist, found ${#package_files[@]}." >&2
+            printf '%s\n' "${package_files[@]}" >&2 || true
+            exit 1
+          fi
+          package_file="${package_files[0]}"
           echo "package_file=${package_file}" >> "$GITHUB_OUTPUT"
 
       - name: Upload chart package artifact
@@ -87,7 +98,7 @@ jobs:
     name: Publish chart to GHCR OCI
     runs-on: ubuntu-latest
     needs: validate-and-package
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.repository == 'futuroptimist/token.place'
     permissions:
       contents: read
       packages: write
@@ -101,6 +112,8 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
 
       - name: Log in to GHCR
         run: |
@@ -112,9 +125,20 @@ jobs:
         id: push
         run: |
           set -euo pipefail
-          package_file="$(find dist -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
+          mapfile -t package_files < <(find dist -maxdepth 1 -type f -name '*.tgz' | sort)
+          if [ "${#package_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one packaged chart artifact in dist, found ${#package_files[@]}." >&2
+            printf '%s\n' "${package_files[@]}" >&2 || true
+            exit 1
+          fi
+          package_file="${package_files[0]}"
           chart_ref="${{ needs.validate-and-package.outputs.chart_ref }}"
-          helm push "${package_file}" "oci://ghcr.io/futuroptimist/charts"
+          chart_registry="${chart_ref%/*}"
+          if helm show chart "${chart_ref}" --version "${{ needs.validate-and-package.outputs.chart_version }}" >/dev/null 2>&1; then
+            echo "Chart ${chart_ref}:${{ needs.validate-and-package.outputs.chart_version }} already exists. Bump charts/tokenplace/Chart.yaml version before publishing." >&2
+            exit 1
+          fi
+          helm push "${package_file}" "${chart_registry}"
           echo "chart_ref=${chart_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Publish chart summary

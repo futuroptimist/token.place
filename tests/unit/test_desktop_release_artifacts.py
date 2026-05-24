@@ -79,7 +79,8 @@ def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
     assert 'preview_notice_name="README BEFORE OPENING.txt"' in text
     assert 'README-macos-apple-silicon-preview.txt' in text
     assert 'This preview build is ad-hoc signed and not notarized.' in text
-    assert 'This preview build is signed with the configured Apple identity but not notarized for public Gatekeeper trust.' in text
+    assert 'This preview build is signed with the configured Apple signing identity, but it is not notarized.' in text
+    assert 'This preview build is ad-hoc signed and not notarized for public Gatekeeper trust.' not in text
     assert 'Apple could not verify' in text
     assert 'token.place desktop' in text
     assert 'click Done' in text

@@ -22,7 +22,7 @@ DMG_PREVIEW_REQUIRED_PHRASES = (
 )
 DMG_PREVIEW_SIGNING_PHRASE_OPTIONS = (
     "ad-hoc signed",
-    "signed with the configured Apple identity",
+    "signed with the configured Apple signing identity",
 )
 
 
@@ -73,7 +73,7 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
             if expect_signing:
                 if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
                     _fail(
-                        "DMG preview README must describe configured Apple identity signing when --expect-signing is set"
+                        "DMG preview README must describe configured Apple signing identity when --expect-signing is set"
                     )
             elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
                 _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")

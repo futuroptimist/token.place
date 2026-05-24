@@ -107,13 +107,39 @@ def test_get_model_manager_treats_optional_download_dependency_as_nonfatal(capsy
         return real_import(name, globals, locals, fromlist, level)
 
     with patch('builtins.__import__', side_effect=_fake_import):
-        manager, error_status = model_bridge._get_model_manager()
+        manager, error_status = model_bridge._get_model_manager(allow_optional_missing=True)
 
     assert manager is None
     assert error_status == 0
     response = json.loads(capsys.readouterr().out.strip())
     assert response['ok'] is True
     assert 'error' not in response
+    assert response['payload'] == {
+        'canonical_family_url': '',
+        'filename': '',
+        'url': '',
+        'models_dir': '',
+        'resolved_model_path': '',
+        'exists': False,
+        'size_bytes': None,
+    }
+
+
+def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'psutil'", name='psutil')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.download_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert 'Missing Python dependency for model downloads' in response['error']
 
 
 def test_main_dispatches_inspect_action():

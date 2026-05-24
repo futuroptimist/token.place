@@ -194,6 +194,7 @@ fn should_force_fake_sidecar() -> bool {
 }
 
 fn configure_runtime_pythonpath(command: &mut Command, sidecar_path: &str) {
+    command.env("PYTHONNOUSERSITE", "1");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(import_root) =
         resolve_runtime_import_root(Some(Path::new(sidecar_path)), manifest_dir)

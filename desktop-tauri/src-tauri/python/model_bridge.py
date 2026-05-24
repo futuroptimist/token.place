@@ -22,6 +22,13 @@ ensure_runtime_import_paths(__file__)
 _OPTIONAL_MODEL_MANAGER_IMPORTS = {"psutil", "urllib3"}
 
 
+def _is_direct_optional_missing(exc: ModuleNotFoundError) -> bool:
+    missing_name = (exc.name or "").split(".", 1)[0]
+    if missing_name not in _OPTIONAL_MODEL_MANAGER_IMPORTS:
+        return False
+    return str(exc) == f"No module named '{missing_name}'"
+
+
 def _response(ok: bool, *, payload: Dict[str, Any] | None = None, error: str = "") -> int:
     data: Dict[str, Any] = {"ok": ok}
     if payload is not None:
@@ -32,12 +39,11 @@ def _response(ok: bool, *, payload: Dict[str, Any] | None = None, error: str = "
     return 0 if ok else 1
 
 
-def _get_model_manager():
+def _get_model_manager(*, allow_optional_missing: bool = False):
     try:
         from utils.llm.model_manager import get_model_manager
     except ModuleNotFoundError as exc:
-        missing_name = (exc.name or "").split(".", 1)[0]
-        if missing_name in _OPTIONAL_MODEL_MANAGER_IMPORTS:
+        if allow_optional_missing and _is_direct_optional_missing(exc):
             return None, _response(
                 True,
                 payload={
@@ -62,7 +68,7 @@ def _get_model_manager():
 
 
 def inspect_model() -> int:
-    manager, error_status = _get_model_manager()
+    manager, error_status = _get_model_manager(allow_optional_missing=True)
     if error_status is not None:
         return error_status
     return _response(True, payload=manager.get_model_artifact_metadata())

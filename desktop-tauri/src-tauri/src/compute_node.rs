@@ -143,6 +143,7 @@ fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> 
 }
 
 fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, bridge_script: &str) {
+    command.env("PYTHONNOUSERSITE", "1");
     if let Some(import_root) =
         resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir)
     {

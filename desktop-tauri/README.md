@@ -106,6 +106,14 @@ You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.
 
 
+### Unpaid macOS preview releases
+
+- No paid Apple Developer Program account is required to publish preview Apple Silicon DMGs.
+- Preview DMGs are ad-hoc signed and not notarized, so Gatekeeper warnings after browser/GitHub download are expected.
+- Users must manually open/whitelist the app (right-click/control-click → **Open**, or allow it from **System Settings → Privacy & Security** after a blocked launch).
+- Public no-warning distribution requires paid **Developer ID signing + notarization**.
+
+
 The local prompt panel still uses `src-tauri/python/inference_sidecar.py` as a smoke test for local model setup.
 
 

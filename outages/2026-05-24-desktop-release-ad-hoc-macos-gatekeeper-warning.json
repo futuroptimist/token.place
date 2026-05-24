@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-release-ad-hoc-macos-gatekeeper-warning",
+  "summary": "Apple Silicon preview DMGs can correctly ship Tauri branding while still showing expected Gatekeeper warnings because builds are ad-hoc signed and not notarized.",
+  "impact": "Users may interpret macOS verification warnings as an artifact mismatch unless release assets explicitly document unpaid preview behavior and manual-open instructions.",
+  "fix": "Kept ad-hoc signing fallback, preserved artifact guardrails, and added a macOS preview warning asset plus docs to explain expected Gatekeeper behavior.",
+  "lessons": "Correct artifact provenance and honest trust messaging must both be validated so preview release UX is explicit without requiring paid signing secrets."
+}

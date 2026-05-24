@@ -19,6 +19,8 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__)
 
+_OPTIONAL_MODEL_MANAGER_IMPORTS = {"psutil", "urllib3"}
+
 
 def _response(ok: bool, *, payload: Dict[str, Any] | None = None, error: str = "") -> int:
     data: Dict[str, Any] = {"ok": ok}
@@ -34,6 +36,20 @@ def _get_model_manager():
     try:
         from utils.llm.model_manager import get_model_manager
     except ModuleNotFoundError as exc:
+        missing_name = (exc.name or "").split(".", 1)[0]
+        if missing_name in _OPTIONAL_MODEL_MANAGER_IMPORTS:
+            return None, _response(
+                True,
+                payload={
+                    "canonical_family_url": "",
+                    "filename": "",
+                    "url": "",
+                    "models_dir": "",
+                    "resolved_model_path": "",
+                    "exists": False,
+                    "size_bytes": None,
+                },
+            )
         return None, _response(
             False,
             error=(

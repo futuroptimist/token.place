@@ -98,6 +98,7 @@ fn configure_runtime_pythonpath(command: &mut std::process::Command, bridge_scri
     if let Some(import_root) =
         python_runtime::resolve_runtime_import_root(Some(bridge_script), manifest_dir)
     {
+        command.env("PYTHONNOUSERSITE", "1");
         command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
         match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {

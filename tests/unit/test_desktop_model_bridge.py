@@ -98,6 +98,24 @@ def test_get_model_manager_reports_missing_dependency(capsys):
     assert 'Missing Python dependency for model downloads' in response['error']
 
 
+def test_get_model_manager_treats_optional_download_dependency_as_nonfatal(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'psutil'", name='psutil')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        manager, error_status = model_bridge._get_model_manager()
+
+    assert manager is None
+    assert error_status == 0
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is True
+    assert 'error' not in response
+
+
 def test_main_dispatches_inspect_action():
     with patch.object(model_bridge.argparse.ArgumentParser, 'parse_args', return_value=SimpleNamespace(action='inspect')):
         with patch.object(model_bridge, 'inspect_model', return_value=0) as inspect_model:

@@ -294,28 +294,37 @@ jobs:
             dmg_name="token.place-desktop-${version}-apple-silicon.dmg"
             dmg_path="release-artifacts/${dmg_name}"
 
+            dmg_staging_dir="release-artifacts/dmg-staging"
+            rm -rf "${dmg_staging_dir}"
+            mkdir -p "${dmg_staging_dir}"
+
+            cp -R "${app_path}" "${dmg_staging_dir}/"
+            ln -s /Applications "${dmg_staging_dir}/Applications"
+
             rm -f "${dmg_path}"
-            hdiutil create -volname "token.place desktop" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
             if [[ "${dmg_path}" == *"tokenplace Desktop"* ]] || [[ "${dmg_path}" == *"tokenplace Desktop Setup"* ]] || [[ "${dmg_path}" == *"desktop/electron-builder"* ]]; then
               echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
               exit 1
             fi
 
             preview_notice="release-artifacts/README-macos-apple-silicon-preview.txt"
+            dmg_notice="${dmg_staging_dir}/README BEFORE OPENING.txt"
             if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
               printf '%s\n' \
                 "token.place desktop macOS Apple Silicon preview build" \
                 "" \
-                "This DMG is signed with a configured Apple signing identity but is not notarized." \
-                "Because notarization/stapling is not part of this workflow yet," \
-                "macOS may still show Gatekeeper warnings such as:" \
+                "This preview DMG is signed with a configured Apple signing identity and is not notarized." \
+                "The first normal double-click may show: \"Apple could not verify ... is free of malware.\"" \
+                "This is expected for unpaid/non-notarized GitHub preview releases." \
                 "\"Apple could not verify ... is free of malware.\"" \
                 "" \
                 "If you trust this source and the release checksums:" \
-                "1) Open the DMG, then Control-click (or right-click) the app and choose Open." \
-                "2) If macOS blocks it after first launch attempt, go to:" \
-                "   System Settings -> Privacy & Security" \
-                "   and use the Allow/Open option for the app." \
+                "1) Drag or copy token.place desktop.app to Applications." \
+                "2) Try opening once from Applications." \
+                "3) If macOS blocks it, click Done." \
+                "4) Open System Settings -> Privacy & Security." \
+                "5) Click Open Anyway / Allow / Open for token.place desktop." \
+                "6) Or Control-click/right-click the app and choose Open when available." \
                 "" \
                 "Only install and run this preview build when you trust the release source" \
                 "and checksum file." \
@@ -326,18 +335,20 @@ jobs:
               printf '%s\n' \
                 "token.place desktop macOS Apple Silicon preview build" \
                 "" \
-                "This DMG is ad-hoc signed and is not notarized." \
-                "Because this preview build does not use paid Apple Developer ID notarization," \
-                "macOS may show Gatekeeper warnings such as:" \
+                "This preview DMG is ad-hoc signed and is not notarized." \
+                "The first normal double-click may show: \"Apple could not verify ... is free of malware.\"" \
+                "This is expected for unpaid/non-notarized GitHub preview releases." \
                 "\"Apple could not verify ... is free of malware.\"" \
                 "" \
                 "This is expected for unpaid/ad-hoc preview distribution." \
                 "" \
                 "If you trust this source and the release checksums:" \
-                "1) Open the DMG, then Control-click (or right-click) the app and choose Open." \
-                "2) If macOS blocks it after first launch attempt, go to:" \
-                "   System Settings -> Privacy & Security" \
-                "   and use the Allow/Open option for the app." \
+                "1) Drag or copy token.place desktop.app to Applications." \
+                "2) Try opening once from Applications." \
+                "3) If macOS blocks it, click Done." \
+                "4) Open System Settings -> Privacy & Security." \
+                "5) Click Open Anyway / Allow / Open for token.place desktop." \
+                "6) Or Control-click/right-click the app and choose Open when available." \
                 "" \
                 "Only install and run this preview build when you trust the release source" \
                 "and checksum file." \
@@ -345,6 +356,8 @@ jobs:
                 "For no-warning public macOS distribution, use paid Apple Developer ID" \
                 "signing plus notarization." > "${preview_notice}"
             fi
+            cp "${preview_notice}" "${dmg_notice}"
+            hdiutil create -volname "token.place desktop" -srcfolder "${dmg_staging_dir}" -ov -format UDZO "${dmg_path}"
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"

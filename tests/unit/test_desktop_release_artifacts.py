@@ -43,6 +43,8 @@ def test_tauri_icon_set_references_expected_files() -> None:
 def test_workflow_sets_explicit_dmg_volume_name() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'hdiutil create -volname "token.place desktop"' in text
+    assert '-srcfolder "${dmg_staging_dir}"' in text
+    assert '-srcfolder "${app_path}"' not in text
 
 
 def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
@@ -67,8 +69,8 @@ def test_workflow_does_not_gate_release_on_notary_profile() -> None:
 def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'README-macos-apple-silicon-preview.txt' in text
-    assert 'This DMG is ad-hoc signed and is not notarized.' in text
-    assert 'This DMG is signed with a configured Apple signing identity but is not notarized.' in text
+    assert 'This preview DMG is ad-hoc signed and is not notarized.' in text
+    assert 'This preview DMG is signed with a configured Apple signing identity and is not notarized.' in text
     assert 'Apple could not verify ... is free of malware.' in text
     assert 'System Settings -> Privacy & Security' in text
     assert 'paid Apple Developer ID' in text
@@ -94,3 +96,48 @@ def test_preview_notice_uses_full_signing_decision_in_stage_step() -> None:
     assert 'APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}' in text
     assert 'APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}' in text
     assert 'if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then' in text
+
+
+def test_workflow_stages_dmg_with_app_readme_and_applications_link() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'dmg_staging_dir="release-artifacts/dmg-staging"' in text
+    assert 'cp -R "${app_path}" "${dmg_staging_dir}/"' in text
+    assert 'ln -s /Applications "${dmg_staging_dir}/Applications"' in text
+    assert 'dmg_notice="${dmg_staging_dir}/README BEFORE OPENING.txt"' in text
+    assert 'cp "${preview_notice}" "${dmg_notice}"' in text
+
+
+def test_preview_notice_includes_gatekeeper_manual_open_guidance() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'Apple could not verify ... is free of malware.' in text
+    assert 'click Done.' in text
+    assert 'System Settings -> Privacy & Security' in text
+    assert 'Open Anyway / Allow / Open' in text
+    assert 'ad-hoc signed' in text
+    assert 'not notarized' in text
+    assert 'paid Apple Developer ID' in text
+    assert 'notarization' in text
+
+
+def test_validator_checks_dmg_readme_content_requirements() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert 'README BEFORE OPENING.txt' in text
+    assert 'README-macos-apple-silicon-preview.txt' in text
+    assert 'DMG must contain exactly one .app bundle at root' in text
+    for phrase in (
+        'ad-hoc signed',
+        'not notarized',
+        'Apple could not verify',
+        'Privacy & Security',
+        'Developer ID',
+        'notarization',
+    ):
+        assert phrase in text
+
+
+def test_validator_uses_hdiutil_attach_for_dmg_validation() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert 'hdiutil' in text
+    assert 'attach' in text
+    assert '-readonly' in text
+    assert 'hdiutil", "detach"' in text

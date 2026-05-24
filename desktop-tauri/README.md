@@ -106,14 +106,25 @@ Desktop binaries are published by the GitHub Actions workflow
 
 - token.place can publish Apple Silicon preview DMGs without a paid
   Apple Developer Program account.
-- These preview builds use ad-hoc signing and are not notarized, so Gatekeeper
-  warnings after browser/GitHub download are expected.
-- Users must manually open/whitelist trusted previews:
-  - Control-click (or right-click) the app and choose **Open**, or
-  - after a blocked launch, use **System Settings → Privacy & Security**
-    to allow/open the app.
-- No-warning public distribution generally requires paid
-  Developer ID signing plus notarization.
+- These preview builds use ad-hoc signing and are not notarized, so the first
+  normal double-click may show Gatekeeper warnings such as
+  “Apple could not verify ... is free of malware.”
+- This workflow does not remove that warning path for unpaid previews.
+- The mounted DMG now includes an inline opening guide (`README BEFORE OPENING.txt`)
+  plus `token.place desktop.app` (and an `Applications` shortcut) so users see
+  the expected manual-open steps before launch.
+- The release page still includes `README-macos-apple-silicon-preview.txt`
+  as a sidecar copy of the same guidance.
+- Expected unpaid/trusted-release flow:
+  1. Drag or copy the app to Applications.
+  2. Try opening once.
+  3. If blocked, click **Done**.
+  4. Go to **System Settings → Privacy & Security**.
+  5. Click **Open Anyway / Allow / Open** for token.place desktop.
+  6. Or Control-click/right-click the app and choose **Open**.
+- Only install if you trust the GitHub release source and checksum files.
+- No-warning public distribution requires paid Developer ID signing plus
+  notarization.
 
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.

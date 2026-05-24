@@ -6,9 +6,18 @@ import hashlib
 import json
 import plistlib
 import subprocess
+import tempfile
 from pathlib import Path
 
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
+README_REQUIRED_PHRASES = (
+    "ad-hoc signed",
+    "not notarized",
+    "Apple could not verify",
+    "Privacy & Security",
+    "Developer ID",
+    "notarization",
+)
 
 
 def _fail(msg: str) -> None:
@@ -24,6 +33,41 @@ def _run(cmd: list[str]) -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_dmg_contents(dmg_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="token-place-dmg-") as tmp:
+        mount_point = Path(tmp) / "mount"
+        mount_point.mkdir(parents=True, exist_ok=True)
+        _run(
+            [
+                "hdiutil",
+                "attach",
+                str(dmg_path),
+                "-readonly",
+                "-nobrowse",
+                "-noautoopen",
+                "-mountpoint",
+                str(mount_point),
+            ]
+        )
+        try:
+            apps = sorted(p for p in mount_point.glob("*.app") if p.is_dir())
+            if len(apps) != 1:
+                _fail(f"DMG must contain exactly one .app bundle at root; found {len(apps)}")
+            readme_candidates = [
+                mount_point / "README BEFORE OPENING.txt",
+                mount_point / "README-macos-apple-silicon-preview.txt",
+            ]
+            readme_path = next((p for p in readme_candidates if p.exists() and p.is_file()), None)
+            if readme_path is None:
+                _fail("DMG root must include README BEFORE OPENING.txt or README-macos-apple-silicon-preview.txt")
+            readme_text = readme_path.read_text(encoding="utf-8")
+            for phrase in README_REQUIRED_PHRASES:
+                if phrase not in readme_text:
+                    _fail(f"DMG preview README is missing required phrase: {phrase}")
+        finally:
+            _run(["hdiutil", "detach", str(mount_point)])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -102,6 +146,8 @@ def main() -> None:
         _fail(f"binary is not Apple Silicon: {arch_out}")
     if "x86_64" in arch_lower and "arm64" not in arch_lower:
         _fail(f"binary is x86_64-only: {arch_out}")
+
+    _validate_dmg_contents(dmg_path)
 
     if args.expect_signing:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)])

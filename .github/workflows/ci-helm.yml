@@ -1,0 +1,136 @@
+name: Publish Helm chart
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to publish
+        required: false
+        default: main
+
+jobs:
+  helm-validate-and-package:
+    name: Lint, template, and package Helm chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      chart_version: ${{ steps.chart_meta.outputs.chart_version }}
+      chart_name: ${{ steps.chart_meta.outputs.chart_name }}
+      chart_archive: ${{ steps.package.outputs.chart_archive }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build chart dependencies when lockfile exists
+        run: |
+          set -euo pipefail
+          if [ -f charts/tokenplace/Chart.lock ]; then
+            helm dependency build charts/tokenplace
+          else
+            echo "No Chart.lock found; skipping dependency build."
+          fi
+
+      - name: Read chart metadata
+        id: chart_meta
+        run: |
+          set -euo pipefail
+          chart_name="$(helm show chart charts/tokenplace | awk -F': ' '/^name:/{print $2}')"
+          chart_version="$(helm show chart charts/tokenplace | awk -F': ' '/^version:/{print $2}')"
+          echo "chart_name=${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Lint chart
+        run: helm lint charts/tokenplace
+
+      - name: Template smoke render (staging-like)
+        run: |
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set ingress.enabled=true \
+            --set ingress.host=staging.token.place \
+            --set image.tag=main-deadbee
+
+      - name: Package chart
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          helm package charts/tokenplace --destination .artifacts
+          chart_archive=".artifacts/${{ steps.chart_meta.outputs.chart_name }}-${{ steps.chart_meta.outputs.chart_version }}.tgz"
+          test -f "${chart_archive}"
+          echo "chart_archive=${chart_archive}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish chart to GHCR OCI
+    runs-on: ubuntu-latest
+    needs: helm-validate-and-package
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build chart dependencies when lockfile exists
+        run: |
+          set -euo pipefail
+          if [ -f charts/tokenplace/Chart.lock ]; then
+            helm dependency build charts/tokenplace
+          else
+            echo "No Chart.lock found; skipping dependency build."
+          fi
+
+      - name: Package chart
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          helm package charts/tokenplace --destination .artifacts
+
+      - name: Authenticate to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push chart to OCI registry
+        id: push
+        run: |
+          set -euo pipefail
+          chart_archive=".artifacts/${{ needs.helm-validate-and-package.outputs.chart_name }}-${{ needs.helm-validate-and-package.outputs.chart_version }}.tgz"
+          chart_ref="oci://ghcr.io/futuroptimist/charts/${{ needs.helm-validate-and-package.outputs.chart_name }}"
+
+          helm push "${chart_archive}" oci://ghcr.io/futuroptimist/charts
+
+          echo "chart_ref=${chart_ref}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${{ needs.helm-validate-and-package.outputs.chart_version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish workflow summary
+        run: |
+          {
+            echo "## Helm chart publish"
+            echo ""
+            echo "Chart reference: \`${{ steps.push.outputs.chart_ref }}\`"
+            echo "Chart version: \`${{ steps.push.outputs.chart_version }}\`"
+            echo ""
+            echo "Pushed: true"
+          } >> "$GITHUB_STEP_SUMMARY"

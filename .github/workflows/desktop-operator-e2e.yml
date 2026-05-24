@@ -138,6 +138,11 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
+      - name: Run dependency-isolated model bridge inspect smoke (macOS)
+        env:
+          TOKEN_PLACE_INSPECT_ONLY: "1"
+        run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
       - name: Install Python dependencies (macOS packaged e2e)
         run: |
           python -m pip install --upgrade pip

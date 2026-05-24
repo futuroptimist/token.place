@@ -90,11 +90,26 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     assert result.returncode == 0, combined
     parsed = json.loads(result.stdout.strip())
     assert parsed.get("ok") is True, combined
+    payload = parsed.get("payload")
+    assert isinstance(payload, dict), combined
+    required_keys = {
+        "canonical_family_url",
+        "filename",
+        "url",
+        "models_dir",
+        "resolved_model_path",
+        "exists",
+        "size_bytes",
+    }
+    assert required_keys.issubset(payload.keys()), combined
 
     forbidden_any_output = [
         "Missing Python dependency for model downloads",
         "No module named 'psutil'",
+        "No module named 'requests'",
+        "No module named 'dotenv'",
         "NotOpenSSLWarning",
+        "~/Library/Python",
     ]
     for marker in forbidden_any_output:
         assert marker not in combined, combined
@@ -126,6 +141,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
         run_model_bridge_inspect_probe(Path(tmpdir))
+
+        if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
+            return 0
 
         relay = subprocess.Popen(  # noqa: S603
             [

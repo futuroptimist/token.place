@@ -99,27 +99,22 @@ def test_get_model_manager_reports_missing_dependency(capsys):
     assert capsys.readouterr().out.strip() == ''
 
 
-def test_get_model_manager_treats_optional_download_dependency_as_nonfatal(capsys):
+def test_get_model_manager_treats_import_failure_as_nonfatal_for_inspect(capsys):
     real_import = __import__
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == 'utils.llm.model_manager':
-            raise ModuleNotFoundError("No module named 'psutil'", name='psutil')
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
         return real_import(name, globals, locals, fromlist, level)
 
     with patch('builtins.__import__', side_effect=_fake_import):
-        manager, error_status = model_bridge._get_model_manager(allow_optional_missing=True)
+        manager, error_status = model_bridge._get_model_manager(allow_inspect_fallback=True)
 
     assert manager is None
-    assert error_status == {'ok': True, 'payload': {
-        'canonical_family_url': '',
-        'filename': '',
-        'url': '',
-        'models_dir': '',
-        'resolved_model_path': '',
-        'exists': False,
-        'size_bytes': None,
-    }}
+    assert error_status['ok'] is True
+    payload = error_status['payload']
+    for key in ('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes'):
+        assert key in payload
     assert capsys.readouterr().out.strip() == ''
 
 
@@ -128,7 +123,7 @@ def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == 'utils.llm.model_manager':
-            raise ModuleNotFoundError("No module named 'psutil'", name='psutil')
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
         return real_import(name, globals, locals, fromlist, level)
 
     with patch('builtins.__import__', side_effect=_fake_import):
@@ -140,7 +135,7 @@ def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
     assert 'Missing Python dependency for model downloads' in response['error']
 
 
-def test_inspect_does_not_treat_nonoptional_dependency_as_nonfatal(capsys):
+def test_inspect_returns_fallback_metadata_when_requests_missing(capsys):
     real_import = __import__
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -151,30 +146,30 @@ def test_inspect_does_not_treat_nonoptional_dependency_as_nonfatal(capsys):
     with patch('builtins.__import__', side_effect=_fake_import):
         status = model_bridge.inspect_model()
 
-    assert status == 1
+    assert status == 0
     response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is False
-    assert "No module named 'requests'" in response['error']
+    assert response['ok'] is True
+    assert set(('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes')).issubset(response['payload'].keys())
 
 
-def test_optional_missing_requires_direct_module_error_message(capsys):
+def test_inspect_returns_fallback_metadata_when_dotenv_missing(capsys):
     real_import = __import__
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == 'utils.llm.model_manager':
             raise ModuleNotFoundError(
-                "No module named 'urllib3.contrib'",
-                name='urllib3.contrib',
+                "No module named 'dotenv'",
+                name='dotenv',
             )
         return real_import(name, globals, locals, fromlist, level)
 
     with patch('builtins.__import__', side_effect=_fake_import):
         status = model_bridge.inspect_model()
 
-    assert status == 1
+    assert status == 0
     response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is False
-    assert "No module named 'urllib3.contrib'" in response['error']
+    assert response['ok'] is True
+    assert set(('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes')).issubset(response['payload'].keys())
 
 
 def test_main_dispatches_inspect_action():
@@ -236,3 +231,37 @@ def get_model_manager():
     assert payload['ok'] is True
     assert payload['payload']['filename'] == 'mock.gguf'
     assert "Missing Python dependency for model downloads" not in result.stdout
+
+
+def test_download_returns_error_when_requests_missing(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.download_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert "No module named 'requests'" in response['error']
+
+
+def test_download_returns_error_when_dotenv_missing(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'dotenv'", name='dotenv')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.download_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert "No module named 'dotenv'" in response['error']

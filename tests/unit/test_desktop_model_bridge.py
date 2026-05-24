@@ -39,11 +39,11 @@ def test_inspect_returns_shared_model_manager_metadata(capsys):
 
 
 def test_inspect_returns_bridge_error_when_manager_init_fails(capsys):
-    with patch.object(model_bridge, '_get_model_manager', return_value=(None, 1)):
+    with patch.object(model_bridge, '_get_model_manager', return_value=(None, {'ok': False, 'error': 'boom'})):
         status = model_bridge.inspect_model()
 
     assert status == 1
-    assert capsys.readouterr().out.strip() == ''
+    assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'boom'}
 
 
 def test_download_returns_actionable_error_when_download_fails(capsys):
@@ -92,10 +92,130 @@ def test_get_model_manager_reports_missing_dependency(capsys):
         manager, error_status = model_bridge._get_model_manager()
 
     assert manager is None
-    assert error_status == 1
+    assert error_status == {
+        'ok': False,
+        'error': "Missing Python dependency for model downloads (import of utils.llm.model_manager halted; None in sys.modules).",
+    }
+    assert capsys.readouterr().out.strip() == ''
+
+
+
+
+def test_fallback_model_metadata_uses_platform_specific_models_dir(monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_MODELS_DIR', raising=False)
+    monkeypatch.setattr(model_bridge, 'sys', SimpleNamespace(platform='linux'))
+    monkeypatch.setattr(model_bridge, 'os', SimpleNamespace(name='posix', environ={}))
+    payload = model_bridge._fallback_model_metadata()
+    assert '/Library/Application Support/' not in payload['models_dir']
+
+
+def test_default_models_dir_windows_uses_appdata_when_present(monkeypatch):
+    monkeypatch.setattr(model_bridge, 'sys', SimpleNamespace(platform='win32'))
+    monkeypatch.setattr(model_bridge, 'os', SimpleNamespace(name='nt', environ={'APPDATA': r'C:\\Users\\runner\\AppData\\Roaming'}))
+
+    models_dir = model_bridge._default_models_dir()
+
+    assert str(models_dir) == r'C:\\Users\\runner\\AppData\\Roaming/token.place/models'
+
+
+def test_default_models_dir_uses_xdg_data_home_on_posix(monkeypatch):
+    monkeypatch.setattr(model_bridge, 'sys', SimpleNamespace(platform='linux'))
+    monkeypatch.setattr(model_bridge, 'os', SimpleNamespace(name='posix', environ={'XDG_DATA_HOME': '/tmp/xdg-data'}))
+
+    models_dir = model_bridge._default_models_dir()
+
+    assert str(models_dir) == '/tmp/xdg-data/token.place/models'
+
+def test_get_model_manager_treats_optional_import_failure_as_nonfatal_for_inspect(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'psutil'", name='psutil')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        manager, error_status = model_bridge._get_model_manager(allow_inspect_fallback=True)
+
+    assert manager is None
+    assert error_status['ok'] is True
+    payload = error_status['payload']
+    for key in ('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes'):
+        assert key in payload
+    assert capsys.readouterr().out.strip() == ''
+
+
+def test_is_inspect_optional_missing_matches_exception_name():
+    assert model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'psutil'", name='psutil')
+    )
+    assert model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'requests'", name='requests')
+    )
+
+
+def test_is_inspect_optional_missing_matches_message_when_name_absent():
+    assert model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'urllib3'")
+    )
+    assert model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'dotenv'")
+    )
+
+
+def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.download_model()
+
+    assert status == 1
     response = json.loads(capsys.readouterr().out.strip())
     assert response['ok'] is False
     assert 'Missing Python dependency for model downloads' in response['error']
+
+
+def test_inspect_returns_fallback_when_requests_missing(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.inspect_model()
+
+    assert status == 0
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is True
+    for key in ('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes'):
+        assert key in response['payload']
+
+def test_inspect_returns_fallback_when_dotenv_missing(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError(
+                "No module named 'dotenv'",
+                name='dotenv',
+            )
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.inspect_model()
+
+    assert status == 0
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is True
+    for key in ('canonical_family_url','filename','url','models_dir','resolved_model_path','exists','size_bytes'):
+        assert key in response['payload']
 
 
 def test_main_dispatches_inspect_action():
@@ -157,3 +277,37 @@ def get_model_manager():
     assert payload['ok'] is True
     assert payload['payload']['filename'] == 'mock.gguf'
     assert "Missing Python dependency for model downloads" not in result.stdout
+
+
+def test_download_returns_error_when_requests_missing(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.download_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert "No module named 'requests'" in response['error']
+
+
+def test_download_returns_error_when_dotenv_missing(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'dotenv'", name='dotenv')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.download_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert "No module named 'dotenv'" in response['error']

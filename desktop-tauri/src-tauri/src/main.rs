@@ -92,6 +92,7 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
 }
 
 fn configure_runtime_pythonpath(command: &mut std::process::Command, bridge_script: &Path) {
+    command.env("PYTHONNOUSERSITE", "1");
     // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
     // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

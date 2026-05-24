@@ -21,6 +21,11 @@ Relay state is in-memory (registrations, queued messages, replies). Current prod
 State loss on pod death/replacement is an accepted risk for this phase. Durable/shared state and
 multi-replica relay topology are future work.
 
+Kubernetes `Deployment` upgrades may temporarily run more than one pod with default
+`RollingUpdate` behavior (`maxSurge`). If strict single-pod relay operation is required during
+upgrade windows, set an explicit single-pod rollout strategy (for example `Recreate` or
+`maxSurge=0` with compatible availability settings) in Sugarkube values.
+
 ## Artifacts and release tags
 
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
@@ -35,13 +40,13 @@ multi-replica relay topology are future work.
 First install:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml,docs/examples/tokenplace-relay.values.prod.yaml default_tag=main-REPLACE_SHORTSHA
 ```
 
 Upgrade existing release:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml,docs/examples/tokenplace-relay.values.prod.yaml default_tag=main-REPLACE_SHORTSHA
 ```
 
 Sugarkube-specific tokenplace wrapper commands may exist after follow-up Sugarkube work.
@@ -50,17 +55,21 @@ Sugarkube-specific tokenplace wrapper commands may exist after follow-up Sugarku
 
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
-kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+kubectl -n tokenplace rollout status deploy/tokenplace-relay --timeout=180s
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
+# relay traffic smoke test (requires at least one healthy external compute node)
+curl -fsS https://token.place/api/v1/models
+# optional: run an end-to-end encrypted /api/v1/chat/completions probe through the
+# standard client flow to validate real relay request handling.
 ```
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 
 ## Rollback
 
-- Record baseline revision: `helm history tokenplace -n tokenplace`
+- Record baseline revision: `helm history tokenplace-relay -n tokenplace`
 - Roll back to prior approved revision/tag.
 - Re-run validation and document outcome.
 

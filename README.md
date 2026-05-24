@@ -256,6 +256,11 @@ Current relay operations model in Sugarkube:
 - in-memory relay state (registrations/queued messages/replies)
 - accepted state loss on pod replacement until shared-state architecture lands
 
+Because the relay runs as a Kubernetes `Deployment`, default `RollingUpdate` behavior can
+temporarily create an extra pod during upgrades (`maxSurge`). Operators that require strict
+single-pod semantics during upgrades should enforce a single-pod rollout strategy (for example
+`Recreate` or `maxSurge=0`) in Sugarkube values.
+
 Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`

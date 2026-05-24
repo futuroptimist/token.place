@@ -22,6 +22,10 @@ replies are held in process memory. Current operating model:
 Multi-replica + shared state (Redis or similar) is explicitly future work and out of scope for
 this phase.
 
+Note on upgrades: because relay is deployed via Kubernetes `Deployment`, default `RollingUpdate`
+can briefly run more than one pod during upgrades. If strict one-pod behavior is required, enforce
+single-pod rollout settings (for example `Recreate` or `maxSurge=0`) in Sugarkube values.
+
 ## Artifact ownership and source of truth
 
 token.place publishes deployable artifacts; Sugarkube owns environment values, wrappers, and
@@ -46,16 +50,16 @@ Operators can override hostnames in Sugarkube values and Cloudflare route config
 First install pattern:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.staging.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml,docs/examples/tokenplace-relay.values.staging.yaml default_tag=main-REPLACE_SHORTSHA
 ```
 
 Existing release upgrade pattern:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.staging.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml,docs/examples/tokenplace-relay.values.staging.yaml default_tag=main-REPLACE_SHORTSHA
 ```
 
-Production pattern uses `docs/examples/tokenplace.values.prod.yaml` with the same approved
+Production pattern uses `docs/examples/tokenplace-relay.values.prod.yaml` with the same approved
 immutable tag.
 
 Tokenplace-specific Sugarkube wrappers may also exist after Sugarkube follow-up prompts; those
@@ -65,10 +69,13 @@ wrappers should call into the same Helm OCI install/upgrade flow.
 
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
-kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+kubectl -n tokenplace rollout status deploy/tokenplace-relay --timeout=180s
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/
+# relay traffic smoke test (compute node required)
+curl -fsS https://staging.token.place/api/v1/models
+# optional: execute an encrypted /api/v1/chat/completions smoke request via client flow.
 ```
 
 For production validation, replace the host with `https://token.place`.

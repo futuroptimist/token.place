@@ -54,20 +54,11 @@ service:
 ingress:
   enabled: false
   className: ""
+  host: ""
   annotations: {}
-  hosts: []
-  tls: []
-
-networkPolicy:
-  enabled: true
-  allowDNS: true
-  dnsNamespace: kube-system
-  kubeDNSSelector:
-    matchLabels:
-      k8s-app: kube-dns
-  ingressNamespaces: []
-  extraIngress: []
-  extraEgress: []
+  tls:
+    enabled: false
+    secretName: ""
 
 env: {}
 extraEnv: []

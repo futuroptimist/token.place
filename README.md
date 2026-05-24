@@ -247,9 +247,28 @@ See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay
 
 ## sugarkube deployment
 
-`relay.py` is the first token.place component targeted for sugarkube because it is lightweight and
-operationally separate from GPU-heavy compute nodes.
-In the short-to-medium term architecture, sugarkube scope remains relay-only.
+`relay.py` is the first token.place component targeted for sugarkube. In the near-term deployment
+model, sugarkube scope is relay-only.
+
+Current architecture constraints:
+
+- In-cluster component: `relay.py` only.
+- External components: `server.py`, desktop Tauri compute nodes, Macs, Windows PCs, Raspberry Pi
+  GPU/AI hats, and other compute nodes.
+- No in-cluster backend/GPU service is required for this phase.
+- Relay state is in-memory (registrations/messages/replies), so operations currently target one
+  pod, one Gunicorn worker, one replica, with accepted state loss on pod death.
+- Redis/multi-replica relay state architecture is future work and out of scope for this phase.
+
+Canonical deployment artifacts:
+
+- Image: `ghcr.io/futuroptimist/tokenplace-relay`
+- Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Preferred validation tags: immutable `main-<shortsha>`
+- Mutable `main-latest` is convenience-only and not for production sign-off
+
+Sugarkube command wrappers and values live in the sugarkube repo; token.place owns and publishes
+the runtime/image/chart artifacts.
 
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:

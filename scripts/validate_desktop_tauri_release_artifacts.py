@@ -14,12 +14,15 @@ from pathlib import Path
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
 DMG_PREVIEW_README_NAMES = ("README BEFORE OPENING.txt",)
 DMG_PREVIEW_REQUIRED_PHRASES = (
-    "ad-hoc signed",
     "not notarized",
     "Apple could not verify",
     "Privacy & Security",
     "Developer ID",
     "notarization",
+)
+DMG_PREVIEW_SIGNING_PHRASE_OPTIONS = (
+    "ad-hoc signed",
+    "signed with the configured Apple identity",
 )
 
 
@@ -49,7 +52,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _validate_dmg_contents(dmg_path: Path) -> None:
+def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
@@ -67,6 +70,13 @@ def _validate_dmg_contents(dmg_path: Path) -> None:
             missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
             if missing:
                 _fail(f"DMG preview README missing required phrases: {missing}")
+            if expect_signing:
+                if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
+                    _fail(
+                        "DMG preview README must describe configured Apple identity signing when --expect-signing is set"
+                    )
+            elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
+                _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
         finally:
             _run(["hdiutil", "detach", mount_dir])
 
@@ -87,7 +97,7 @@ def main() -> None:
         _fail(f"dmg artifact missing or invalid: {dmg_path}")
     if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
         _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-    _validate_dmg_contents(dmg_path)
+    _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")

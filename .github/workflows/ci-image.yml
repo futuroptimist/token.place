@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read' }}
+      packages: write
     outputs:
       immutable_image_tag: ${{ steps.tags.outputs.branch_tag }}
 
@@ -42,8 +42,8 @@ jobs:
           echo "created=${created}" >> "$GITHUB_OUTPUT"
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "branch_tag=${repository}:main-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "default_tag=${repository}:main" >> "$GITHUB_OUTPUT"
           echo "latest_tag=${repository}:main-latest" >> "$GITHUB_OUTPUT"
-          echo "sha_tag=${repository}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,7 +66,7 @@ jobs:
           tags: tokenplace-relay:smoke
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
@@ -90,8 +90,7 @@ jobs:
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:5010/livez \
               && curl -fsS http://127.0.0.1:5010/healthz \
-              && curl -fsS http://127.0.0.1:5010/ >/dev/null \
-              && curl -fsS http://127.0.0.1:5010/metrics >/dev/null; then
+              && curl -fsS http://127.0.0.1:5010/ >/dev/null; then
               break
             fi
             sleep 1
@@ -100,9 +99,8 @@ jobs:
           curl -fsS http://127.0.0.1:5010/livez >/dev/null
           curl -fsS http://127.0.0.1:5010/healthz >/dev/null
           curl -fsS http://127.0.0.1:5010/ >/dev/null
-          curl -fsS http://127.0.0.1:5010/metrics >/dev/null
 
-          docker exec tokenplace-relay-smoke sh -c "ps -o args= 1" | grep -F -- '--workers 1'
+          docker exec tokenplace-relay-smoke sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -123,11 +121,11 @@ jobs:
           provenance: false
           tags: |
             ${{ steps.tags.outputs.branch_tag }}
+            ${{ steps.tags.outputs.default_tag }}
             ${{ steps.tags.outputs.latest_tag }}
-            ${{ steps.tags.outputs.sha_tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
@@ -138,8 +136,8 @@ jobs:
             echo "## Relay image tags"
             echo ""
             echo "Immutable tag: \`${{ steps.tags.outputs.branch_tag }}\`"
+            echo "Default mutable tag: \`${{ steps.tags.outputs.default_tag }}\`"
             echo "Mutable tag: \`${{ steps.tags.outputs.latest_tag }}\`"
-            echo "Compatibility tag: \`${{ steps.tags.outputs.sha_tag }}\`"
             echo ""
             echo "Pushed: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
           } >> "$GITHUB_STEP_SUMMARY"

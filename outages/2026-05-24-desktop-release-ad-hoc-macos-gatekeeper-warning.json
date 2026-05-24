@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-release-ad-hoc-macos-gatekeeper-warning",
+  "summary": "Correctly named/iconed Apple Silicon Tauri DMGs still showed Gatekeeper verification warnings because preview builds are ad-hoc signed and not notarized.",
+  "impact": "Users may interpret expected Gatekeeper prompts as packaging breakage unless preview/non-notarized behavior is explicitly documented in release assets.",
+  "fix": "Kept unpaid ad-hoc signing fallback, added a macOS preview warning text asset alongside the DMG, and documented trusted manual-open steps while preserving artifact validation guardrails.",
+  "lessons": "Preview release pipelines should clearly separate artifact correctness checks from paid Developer ID notarization requirements and communicate expected Gatekeeper behavior up front."
+}

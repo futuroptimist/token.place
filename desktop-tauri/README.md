@@ -102,6 +102,19 @@ Desktop binaries are published by the GitHub Actions workflow
    - If signing credentials are configured, CI validates with `codesign` and
      `spctl` so signed builds fail fast when trust checks break.
 
+### Unpaid macOS preview releases
+
+- token.place can publish Apple Silicon preview DMGs without a paid
+  Apple Developer Program account.
+- These preview builds use ad-hoc signing and are not notarized, so Gatekeeper
+  warnings after browser/GitHub download are expected.
+- Users must manually open/whitelist trusted previews:
+  - Control-click (or right-click) the app and choose **Open**, or
+  - after a blocked launch, use **System Settings → Privacy & Security**
+    to allow/open the app.
+- No-warning public distribution generally requires paid
+  Developer ID signing plus notarization.
+
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.
 

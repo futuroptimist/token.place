@@ -50,6 +50,30 @@ def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
     assert 'Expected exactly one staged macOS .dmg in release-artifacts' in text
 
 
+def test_workflow_uses_ad_hoc_signing_fallback_without_paid_secrets() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert "export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" in text
+    assert "export APPLE_SIGNING_IDENTITY='-'" in text
+    assert 'using ad-hoc signing for preview/dev-only macOS artifacts' in text
+
+
+def test_workflow_does_not_gate_release_on_notary_profile() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed' in text
+    assert 'skipping strict Gatekeeper notarization enforcement' in text
+    assert 'signing_flag="--expect-signing"' in text
+
+
+def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'README-macos-apple-silicon-preview.txt' in text
+    assert 'This DMG is ad-hoc signed and is not notarized.' in text
+    assert 'Apple could not verify ... is free of malware.' in text
+    assert 'System Settings -> Privacy & Security' in text
+    assert 'paid Apple Developer ID' in text
+    assert 'signing plus notarization' in text
+
+
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert 'CFBundleDisplayName' in text

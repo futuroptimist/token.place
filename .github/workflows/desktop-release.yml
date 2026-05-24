@@ -297,6 +297,30 @@ jobs:
               echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
               exit 1
             fi
+
+            preview_notice="release-artifacts/README-macos-apple-silicon-preview.txt"
+            cat > "${preview_notice}" <<'EOF'
+            token.place desktop macOS Apple Silicon preview build
+
+            This DMG is ad-hoc signed and is not notarized.
+            Because this preview build does not use paid Apple Developer ID notarization,
+            macOS may show Gatekeeper warnings such as:
+            "Apple could not verify ... is free of malware."
+
+            This is expected for unpaid/ad-hoc preview distribution.
+
+            If you trust this source and the release checksums:
+            1) Open the DMG, then Control-click (or right-click) the app and choose Open.
+            2) If macOS blocks it after first launch attempt, go to:
+               System Settings -> Privacy & Security
+               and use the Allow/Open option for the app.
+
+            Only install and run this preview build when you trust the release source
+            and checksum file.
+
+            For no-warning public macOS distribution, use paid Apple Developer ID
+            signing plus notarization.
+            EOF
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"
@@ -342,6 +366,10 @@ jobs:
           dmg_path="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort | head -n 1)"
           if [ -z "${dmg_path}" ]; then
             echo "Expected staged macOS .dmg in release-artifacts." >&2
+            exit 1
+          fi
+          if [ ! -f release-artifacts/README-macos-apple-silicon-preview.txt ]; then
+            echo "Expected release-artifacts/README-macos-apple-silicon-preview.txt for macOS preview guidance." >&2
             exit 1
           fi
 

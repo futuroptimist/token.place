@@ -131,6 +131,13 @@ def diagnostics_message(
         f"page_source_tail={page_source_tail}"
     )
 
+def capture_failure_screenshot(driver: webdriver.Remote | None, logs_dir: Path, name: str) -> None:
+    if driver is None:
+        return
+    screenshot_path = logs_dir / name
+    with contextlib.suppress(Exception):
+        driver.save_screenshot(str(screenshot_path))
+
 
 def assert_model_path_exists(path: str) -> None:
     if not path.strip():
@@ -499,6 +506,13 @@ def main() -> int:
         wait_for_ui_ready(driver)
 
         runtime_resolved_path = read_runtime_resolved_path(driver)
+        initial_model_path = driver.find_element(
+            By.XPATH,
+            "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
+        ).get_attribute("value")
+        assert initial_model_path == "", (
+            "expected first-launch Model GGUF path input to be blank when no user config exists"
+        )
         with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
             model_path = model_file.name
         if runtime_resolved_path:
@@ -528,6 +542,9 @@ def main() -> int:
                 "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
             )
         )
+        time.sleep(3)
+        running_text = driver.find_element(By.XPATH, "//p[contains(.,'Running:')]//strong").text
+        assert running_text.strip().lower() == "yes", "operator running state was not stable"
 
         prompt = driver.find_element(
             By.XPATH,
@@ -555,12 +572,15 @@ def main() -> int:
         )
         assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
     except TimeoutException as exc:
+        capture_failure_screenshot(driver, logs_dir, "desktop-ui-e2e-timeout.png")
         raise RuntimeError(diagnostics_message("desktop UI e2e timed out", relay_log, driver_log, driver)) from exc
     except AssertionError as exc:
+        capture_failure_screenshot(driver, logs_dir, "desktop-ui-e2e-assertion.png")
         raise RuntimeError(
             diagnostics_message(f"desktop UI e2e assertion failed: {exc}", relay_log, driver_log, driver)
         ) from exc
     except WebDriverException as exc:
+        capture_failure_screenshot(driver, logs_dir, "desktop-ui-e2e-webdriver.png")
         raise RuntimeError(
             diagnostics_message(f"desktop UI e2e webdriver failure: {exc}", relay_log, driver_log, driver)
         ) from exc

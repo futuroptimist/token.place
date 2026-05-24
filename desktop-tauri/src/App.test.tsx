@@ -249,7 +249,7 @@ describe('desktop app start failure handling', () => {
     const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
     await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
     fireEvent.click(startOperatorButton);
-    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
 
     const computeHandler = eventHandlers.get('compute_node_event');
     expect(computeHandler).toBeTruthy();
@@ -267,6 +267,58 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Last error:/).textContent).toContain(
       'before emitting a startup event'
     );
+  });
+
+  it('keeps first-launch model path empty when no saved path exists', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'detect_backend') {
+        return Promise.resolve({
+          platform_label: 'macos',
+          preferred_mode: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
+        });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          active_relay_url: '',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '',
+          last_error: null,
+        });
+      }
+      if (command === 'inspect_model_artifact') {
+        return Promise.resolve({
+          canonical_family_url: 'https://example.test/models',
+          filename: 'model.gguf',
+          url: 'https://example.test/model.gguf',
+          models_dir: '/tmp',
+          resolved_model_path: 'C:\\\\Users\\\\dev\\\\model.gguf',
+          exists: false,
+          size_bytes: null,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<App />);
+    const modelInput = (await screen.findAllByRole('textbox'))[0] as HTMLInputElement;
+    await waitFor(() => expect(modelInput.value).toBe(''));
+    expect(invokeMock).not.toHaveBeenCalledWith('save_config', expect.anything());
   });
 
   it('keeps running state healthy when started and status events are healthy', async () => {

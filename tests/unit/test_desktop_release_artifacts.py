@@ -68,6 +68,7 @@ def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'README-macos-apple-silicon-preview.txt' in text
     assert 'This DMG is ad-hoc signed and is not notarized.' in text
+    assert 'This DMG is signed with a configured Apple signing identity but is not notarized.' in text
     assert 'Apple could not verify ... is free of malware.' in text
     assert 'System Settings -> Privacy & Security' in text
     assert 'paid Apple Developer ID' in text
@@ -79,3 +80,9 @@ def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     assert 'CFBundleDisplayName' in text
     assert 'CFBundleExecutable' in text
     assert 'token.place-desktop-<version>-apple-silicon.dmg' in text
+
+
+def test_workflow_writes_preview_notice_via_printf() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert "printf '%s\\n' \\" in text
+    assert '> "${preview_notice}"' in text

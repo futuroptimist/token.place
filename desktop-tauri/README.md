@@ -99,8 +99,8 @@ Desktop binaries are published by the GitHub Actions workflow
      an explicit preview warning and uses ad-hoc signing for dev/preview builds.
      Those builds are not equivalent to fully Developer ID signed + notarized
      Gatekeeper-ready releases.
-   - If signing credentials are configured, CI validates with `codesign` and
-     `spctl` so signed builds fail fast when trust checks break.
+  - If signing credentials are configured, CI validates with `codesign`.
+    Strict Gatekeeper notarization checks are skipped unless notarization is added.
 
 ### Unpaid macOS preview releases
 

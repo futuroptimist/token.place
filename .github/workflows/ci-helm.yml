@@ -1,0 +1,124 @@
+name: Publish Helm chart
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to publish
+        required: false
+        default: main
+
+jobs:
+  helm-validate-and-package:
+    name: Lint, template, and package chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      chart_name: ${{ steps.meta.outputs.chart_name }}
+      chart_version: ${{ steps.meta.outputs.chart_version }}
+      package_file: ${{ steps.meta.outputs.package_file }}
+      chart_ref: ${{ steps.meta.outputs.chart_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Read chart metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          chart_name="$(helm show chart charts/tokenplace | awk -F': ' '$1 == "name" {print $2; exit}')"
+          chart_version="$(helm show chart charts/tokenplace | awk -F': ' '$1 == "version" {print $2; exit}')"
+          package_file="${chart_name}-${chart_version}.tgz"
+          chart_ref="oci://ghcr.io/futuroptimist/charts/${chart_name}"
+
+          echo "chart_name=${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
+          echo "package_file=${package_file}" >> "$GITHUB_OUTPUT"
+          echo "chart_ref=${chart_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Build chart dependencies (if present)
+        run: |
+          set -euo pipefail
+          if [ -f charts/tokenplace/Chart.lock ] || [ -d charts/tokenplace/charts ]; then
+            helm dependency build charts/tokenplace
+          else
+            echo "No chart dependencies detected; skipping helm dependency build"
+          fi
+
+      - name: Helm lint
+        run: helm lint charts/tokenplace
+
+      - name: Helm template smoke render
+        run: |
+          set -euo pipefail
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set ingress.enabled=true \
+            --set ingress.host=staging.token.place \
+            --set image.tag=main-deadbee >/dev/null
+
+      - name: Package chart
+        run: helm package charts/tokenplace
+
+      - name: Upload packaged chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-chart
+          path: ${{ steps.meta.outputs.package_file }}
+
+  publish-chart:
+    name: Publish chart to GHCR OCI
+    runs-on: ubuntu-latest
+    needs: helm-validate-and-package
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download packaged chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: packaged-chart
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Authenticate to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push chart to GHCR OCI
+        run: |
+          set -euo pipefail
+          helm push "${{ needs.helm-validate-and-package.outputs.package_file }}" \
+            oci://ghcr.io/futuroptimist/charts
+
+      - name: Publish workflow summary
+        run: |
+          {
+            echo "## Helm chart publish"
+            echo ""
+            echo "Chart: \
+\`${{ needs.helm-validate-and-package.outputs.chart_name }}\`"
+            echo "Version: \
+\`${{ needs.helm-validate-and-package.outputs.chart_version }}\`"
+            echo "Reference: \
+\`${{ needs.helm-validate-and-package.outputs.chart_ref }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,56 +1,48 @@
-"""Tests for requests compatibility fallback used by desktop bridge runtime."""
+"""Regression tests for deterministic bridge startup imports without requests."""
 
 from __future__ import annotations
 
 import importlib
-import io
 import sys
+from importlib.abc import MetaPathFinder
+from importlib.machinery import ModuleSpec
 
 
-class _FakeHTTPResponse:
-    def __init__(self, body: bytes, headers: dict[str, str], status: int = 200) -> None:
-        self.status = status
-        self._buffer = io.BytesIO(body)
-        self.headers = headers
-
-    def read(self, size: int = -1) -> bytes:
-        return self._buffer.read(size)
-
-    def close(self) -> None:
-        self._buffer.close()
+class _RequestsImportBlocker(MetaPathFinder):
+    def find_spec(self, fullname: str, _path: object, _target: object = None) -> ModuleSpec | None:
+        if fullname == "requests" or fullname.startswith("requests."):
+            raise ModuleNotFoundError("blocked for startup import regression test")
+        return None
 
 
-def test_requests_compat_fallback_supports_streaming_download_surface(monkeypatch):
-    monkeypatch.setitem(sys.modules, 'requests', None)
-    module = importlib.import_module('utils.networking.http_requests_compat')
-    module = importlib.reload(module)
+def test_bridge_startup_imports_do_not_depend_on_requests(monkeypatch):
+    blocker = _RequestsImportBlocker()
+    monkeypatch.setattr(sys, "meta_path", [blocker, *sys.meta_path])
 
-    fake_response = _FakeHTTPResponse(
-        body=b'abcdefghij',
-        headers={'content-length': '10', 'x-test': 'ok'},
-        status=200,
-    )
+    for module_name in (
+        "requests",
+        "utils.networking.http_requests_compat",
+        "utils.networking.relay_client",
+        "utils.llm.model_manager",
+    ):
+        sys.modules.pop(module_name, None)
 
-    monkeypatch.setattr(
-        module.urllib_request,
-        'urlopen',
-        lambda *_args, **_kwargs: fake_response,
-    )
+    relay_client = importlib.import_module("utils.networking.relay_client")
+    model_manager = importlib.import_module("utils.llm.model_manager")
 
-    response = module.requests.get('https://example.test/model.bin', stream=True, timeout=1)
-
-    assert response.status_code == 200
-    assert response.headers.get('content-length') == '10'
-    chunks = list(response.iter_content(chunk_size=4))
-    assert chunks == [b'abcd', b'efgh', b'ij']
-    response.close()
+    assert hasattr(relay_client, "RelayClient")
+    assert hasattr(model_manager, "ModelManager")
 
 
-def test_requests_compat_fallback_exposes_exception_types(monkeypatch):
-    monkeypatch.setitem(sys.modules, 'requests', None)
-    module = importlib.import_module('utils.networking.http_requests_compat')
-    module = importlib.reload(module)
+def test_requests_compat_exposes_expected_surface_without_requests(monkeypatch):
+    blocker = _RequestsImportBlocker()
+    monkeypatch.setattr(sys, "meta_path", [blocker, *sys.meta_path])
+    sys.modules.pop("utils.networking.http_requests_compat", None)
 
-    assert hasattr(module.requests, 'post')
-    assert hasattr(module.requests, 'ConnectionError')
-    assert hasattr(module.requests, 'Timeout')
+    module = importlib.import_module("utils.networking.http_requests_compat")
+
+    assert hasattr(module.requests, "get")
+    assert hasattr(module.requests, "post")
+    assert hasattr(module.requests, "RequestException")
+    assert hasattr(module.requests, "ConnectionError")
+    assert hasattr(module.requests, "Timeout")

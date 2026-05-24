@@ -113,13 +113,6 @@ export function App() {
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
 
-        if (loadedConfig.model_path.trim()) {
-          return;
-        }
-
-        const next = { ...loadedConfig, model_path: info.resolved_model_path };
-        await invoke('save_config', { config: next });
-        setConfig(next);
       } catch (e) {
         setError(formatErrorMessage(e));
       }
@@ -159,6 +152,14 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
+      const nextLastError =
+        payload.last_error === null
+          ? null
+          : typeof payload.last_error === 'string'
+            ? payload.last_error
+            : typeof payload.message === 'string'
+              ? payload.message
+              : null;
       setComputeStatus((prev) => ({
         running:
           typeof payload.running === 'boolean'
@@ -192,15 +193,11 @@ export function App() {
               ? payload.fallback_reason
               : prev.fallback_reason,
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
-        last_error:
-          payload.last_error === null
-            ? null
-            : typeof payload.last_error === 'string'
-              ? payload.last_error
-              : typeof payload.message === 'string'
-                ? payload.message
-                : prev.last_error,
+        last_error: nextLastError ?? prev.last_error,
       }));
+      if (nextLastError) {
+        setError(nextLastError);
+      }
     });
 
     return () => {
@@ -313,7 +310,7 @@ export function App() {
       setError('');
       setComputeStatus((prev) => ({
         ...prev,
-        running: true,
+        running: false,
         registered: false,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,

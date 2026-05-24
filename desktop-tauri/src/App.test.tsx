@@ -43,7 +43,7 @@ describe('desktop app start failure handling', () => {
       }
       if (command === 'load_config') {
         return Promise.resolve({
-          model_path: '/tmp/model.gguf',
+          model_path: '',
           relay_base_url: 'https://token.place',
           preferred_mode: 'auto',
         });
@@ -199,6 +199,13 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('keeps model path blank on first launch when config is empty', async () => {
+    render(<App />);
+    const modelInput = (await screen.findAllByRole('textbox'))[0] as HTMLInputElement;
+    expect(modelInput.value).toBe('');
+    expect(invokeMock).not.toHaveBeenCalledWith('save_config', expect.anything());
+  });
+
   it('surfaces bridge startup exits through compute_node_event errors', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_compute_node') {
@@ -249,7 +256,7 @@ describe('desktop app start failure handling', () => {
     const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
     await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
     fireEvent.click(startOperatorButton);
-    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
 
     const computeHandler = eventHandlers.get('compute_node_event');
     expect(computeHandler).toBeTruthy();
@@ -267,10 +274,13 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Last error:/).textContent).toContain(
       'before emitting a startup event'
     );
+    expect(screen.getByText(/Error:/).textContent).toContain('before emitting a startup event');
   });
 
   it('keeps running state healthy when started and status events are healthy', async () => {
     render(<App />);
+    const modelInput = (await screen.findAllByRole('textbox'))[0] as HTMLInputElement;
+    fireEvent.change(modelInput, { target: { value: '/tmp/model.gguf' } });
     const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
     await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
     fireEvent.click(startOperatorButton);
@@ -301,6 +311,8 @@ describe('desktop app start failure handling', () => {
 
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
+    const modelInput = (await screen.findAllByRole('textbox'))[0] as HTMLInputElement;
+    fireEvent.change(modelInput, { target: { value: '/tmp/model.gguf' } });
     const promptArea = (await screen.findByText('Prompt'))
       .parentElement?.querySelector('textarea');
     expect(promptArea).toBeTruthy();

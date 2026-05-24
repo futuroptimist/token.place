@@ -497,6 +497,13 @@ def main() -> int:
         driver = start_driver(app_binary)
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
+        model_input = driver.find_element(
+            By.XPATH,
+            "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
+        )
+        assert model_input.get_attribute("value") == "", (
+            "Model GGUF path must be blank on first launch before user selection"
+        )
 
         runtime_resolved_path = read_runtime_resolved_path(driver)
         with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
@@ -505,10 +512,6 @@ def main() -> int:
             # Capture for diagnostics, but keep temp path deterministic for CI.
             print(f"Runtime resolved path (not used as primary test path): {runtime_resolved_path}")
         fill_input_by_label(driver, "Model GGUF path", model_path)
-        model_input = driver.find_element(
-            By.XPATH,
-            "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
-        )
         assert model_input.get_attribute("value") == model_path
         assert_model_path_exists(model_path)
         fill_input_by_label(driver, "Relay URL", relay_url)
@@ -526,6 +529,12 @@ def main() -> int:
             lambda d: d.find_element(
                 By.XPATH,
                 "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
+            )
+        )
+        WebDriverWait(driver, 5).until(
+            lambda d: d.find_element(
+                By.XPATH,
+                "//p[contains(.,'Running:')]//strong[normalize-space()='yes']",
             )
         )
 

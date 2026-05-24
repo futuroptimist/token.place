@@ -28,16 +28,28 @@ Keep dev aligned with the same relay-only contract used for staging/prod:
 > - `<DEV_VALUES_FILE>` (dev values file path)
 > - either `<VERSION_FILE>` or an explicit `version=`/`tag=` argument
 
-First install:
+First install with a version file:
 
 ```bash
 just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> version_file=<VERSION_FILE> default_tag=main-REPLACE_SHORTSHA
 ```
 
-Upgrade existing release:
+First install with an explicit tag:
+
+```bash
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> tag=main-REPLACE_SHORTSHA default_tag=main-REPLACE_SHORTSHA
+```
+
+Upgrade existing release with a version file:
 
 ```bash
 just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> version_file=<VERSION_FILE> default_tag=main-REPLACE_SHORTSHA
+```
+
+Upgrade existing release with an explicit tag:
+
+```bash
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> tag=main-REPLACE_SHORTSHA default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist

@@ -113,13 +113,6 @@ export function App() {
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
 
-        if (loadedConfig.model_path.trim()) {
-          return;
-        }
-
-        const next = { ...loadedConfig, model_path: info.resolved_model_path };
-        await invoke('save_config', { config: next });
-        setConfig(next);
       } catch (e) {
         setError(formatErrorMessage(e));
       }
@@ -201,6 +194,15 @@ export function App() {
                 ? payload.message
                 : prev.last_error,
       }));
+      if (payload.type === 'error') {
+        const computeMessage =
+          typeof payload.last_error === 'string'
+            ? payload.last_error
+            : typeof payload.message === 'string'
+              ? payload.message
+              : 'compute-node operator failed';
+        setError(computeMessage);
+      }
     });
 
     return () => {
@@ -313,7 +315,7 @@ export function App() {
       setError('');
       setComputeStatus((prev) => ({
         ...prev,
-        running: true,
+        running: false,
         registered: false,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,

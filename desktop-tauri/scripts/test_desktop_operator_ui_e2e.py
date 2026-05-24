@@ -139,6 +139,24 @@ def assert_model_path_exists(path: str) -> None:
         raise AssertionError(f"model path does not exist: {path}")
 
 
+def wait_for_running_stability(
+    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0
+) -> None:
+    status_xpath = "//p[contains(.,'Running:')]//strong"
+    wait = WebDriverWait(driver, 45, poll_frequency=0.25)
+    wait.until(
+        lambda d: d.find_element(By.XPATH, status_xpath).text.strip().lower() == expected.lower()
+    )
+    deadline = time.time() + stable_seconds
+    while time.time() < deadline:
+        current = driver.find_element(By.XPATH, status_xpath).text.strip().lower()
+        if current != expected.lower():
+            raise AssertionError(
+                f"Running state became unstable: expected {expected!r}, observed {current!r}"
+            )
+        time.sleep(0.2)
+
+
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
     locator = (
         f"(//label[normalize-space()='{label_text}']/following::input[1] | "
@@ -499,6 +517,13 @@ def main() -> int:
         wait_for_ui_ready(driver)
 
         runtime_resolved_path = read_runtime_resolved_path(driver)
+        initial_model_value = driver.find_element(
+            By.XPATH,
+            "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
+        ).get_attribute("value")
+        assert initial_model_value == "", (
+            f"expected first-launch model path to be blank; got {initial_model_value!r}"
+        )
         with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
             model_path = model_file.name
         if runtime_resolved_path:
@@ -516,12 +541,7 @@ def main() -> int:
         wait_for_start_operator_enabled(driver, relay_log, driver_log)
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
 
-        wait.until(
-            lambda d: d.find_element(
-                By.XPATH,
-                "//p[contains(.,'Running:')]//strong[normalize-space()='yes']",
-            )
-        )
+        wait_for_running_stability(driver, "yes", stable_seconds=3.0)
         wait.until(
             lambda d: d.find_element(
                 By.XPATH,

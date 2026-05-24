@@ -36,40 +36,40 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 ## Deployment commands (run from Sugarkube repo)
 
 > Run from a **Sugarkube checkout**, not from token.place.
+>
+> `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are
+> **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
 
 First install:
 
 ```bash
-just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml,docs/examples/tokenplace-relay.values.prod.yaml default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
 Upgrade existing release:
 
 ```bash
-just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml,docs/examples/tokenplace-relay.values.prod.yaml default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
-
-Sugarkube-specific tokenplace wrapper commands may exist after follow-up Sugarkube work.
 
 ## Validation checklist
 
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
-kubectl -n tokenplace rollout status deploy/tokenplace-relay --timeout=180s
+kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
-# relay traffic smoke test (requires at least one healthy external compute node)
-curl -fsS https://token.place/api/v1/models
-# optional: run an end-to-end encrypted /api/v1/chat/completions probe through the
-# standard client flow to validate real relay request handling.
 ```
+
+Optional note: true relay traffic validation requires a registered external compute node plus an
+E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 
 ## Rollback
 
-- Record baseline revision: `helm history tokenplace-relay -n tokenplace`
+- Record baseline revision: `helm history tokenplace -n tokenplace`
 - Roll back to prior approved revision/tag.
 - Re-run validation and document outcome.
 

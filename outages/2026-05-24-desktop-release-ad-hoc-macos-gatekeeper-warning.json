@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-release-ad-hoc-macos-gatekeeper-warning",
+  "summary": "Correctly named and validated Apple Silicon DMGs can still show Gatekeeper warnings when distributed via ad-hoc/non-notarized preview signing.",
+  "impact": "Users may see Apple verification warnings even when artifact provenance and naming are correct, which can be misinterpreted as a packaging regression.",
+  "fix": "Kept ad-hoc signing fallback, added explicit preview warning asset with manual-open guidance, and documented unpaid preview vs paid notarized distribution paths.",
+  "lessons": "Artifact correctness and macOS trust-policy posture are separate concerns; preview releases must communicate expected Gatekeeper behavior clearly."
+}

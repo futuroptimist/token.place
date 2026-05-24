@@ -45,6 +45,23 @@ def test_workflow_sets_explicit_dmg_volume_name() -> None:
     assert 'hdiutil create -volname "token.place desktop"' in text
 
 
+def test_workflow_has_ad_hoc_signing_fallback_without_paid_secrets() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert "TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" in text
+    assert 'using ad-hoc signing for preview/dev-only macOS artifacts' in text
+    assert 'APPLE_NOTARYTOOL_KEYCHAIN_PROFILE' not in text
+
+
+def test_workflow_stages_preview_warning_readme_asset() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'README-macos-apple-silicon-preview.txt' in text
+    assert 'ad-hoc signed and NOT notarized' in text
+    assert 'Apple could not verify' in text
+    assert 'System Settings -> Privacy & Security' in text
+    assert 'Developer ID' in text
+    assert 'notarization' in text
+
+
 def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'Expected exactly one staged macOS .dmg in release-artifacts' in text

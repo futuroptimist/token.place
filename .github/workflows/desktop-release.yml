@@ -293,6 +293,28 @@ jobs:
 
             rm -f "${dmg_path}"
             hdiutil create -volname "token.place desktop" -srcfolder "${app_path}" -ov -format UDZO "${dmg_path}"
+            cat > release-artifacts/README-macos-apple-silicon-preview.txt <<'EOF'
+            token.place Desktop macOS preview (Apple Silicon)
+            ================================================
+
+            This preview build is ad-hoc signed and NOT notarized.
+            macOS Gatekeeper may show:
+            "Apple could not verify ... is free of malware" or similar wording.
+
+            This is expected for unpaid/non-notarized preview distribution without
+            a paid Apple Developer Program notarization path.
+
+            Manual open options:
+            1) In Finder, Control-click (or right-click) token.place desktop.app and choose Open.
+            2) If macOS blocks it first, open System Settings -> Privacy & Security,
+               then allow/open token.place desktop from the recent security prompt.
+
+            Only install this app if you trust this repository/release and verify
+            the published checksum file before opening.
+
+            No-warning public macOS distribution normally requires paid Developer ID
+            signing plus Apple notarization.
+            EOF
             if [[ "${dmg_path}" == *"tokenplace Desktop"* ]] || [[ "${dmg_path}" == *"tokenplace Desktop Setup"* ]] || [[ "${dmg_path}" == *"desktop/electron-builder"* ]]; then
               echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
               exit 1
@@ -326,7 +348,6 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_NOTARYTOOL_KEYCHAIN_PROFILE: ${{ secrets.APPLE_NOTARYTOOL_KEYCHAIN_PROFILE }}
         run: |
           set -euo pipefail
           app_path="$(find src-tauri/target/${{ matrix.tauri_target }}/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)"
@@ -348,9 +369,6 @@ jobs:
           signing_flag=""
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
             signing_flag="--expect-signing"
-            if [ -n "${APPLE_NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]; then
-              echo "::warning::APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed in this workflow yet; skipping strict Gatekeeper notarization enforcement."
-            fi
           fi
 
           python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}

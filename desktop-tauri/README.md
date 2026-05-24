@@ -105,6 +105,17 @@ Desktop binaries are published by the GitHub Actions workflow
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.
 
+### Unpaid macOS preview releases
+
+- token.place can publish Apple Silicon preview DMGs without a paid
+  $99/year Apple Developer account by using ad-hoc signing.
+- Because these preview builds are not notarized, macOS Gatekeeper will likely
+  show an "Apple could not verify..." warning after browser/GitHub download.
+- Users can still open the app manually (Control-click/right-click app -> Open),
+  or use **System Settings -> Privacy & Security** after the first blocked open.
+- No-warning public macOS distribution normally requires paid Developer ID
+  signing + notarization.
+
 
 The local prompt panel still uses `src-tauri/python/inference_sidecar.py` as a smoke test for local model setup.
 

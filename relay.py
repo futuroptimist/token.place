@@ -245,6 +245,14 @@ UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
 PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_COMPAT_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
+REQUIRE_UPSTREAM_HEALTH_ENV = "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -306,6 +314,7 @@ def create_app() -> Flask:
     flask_app = Flask(__name__, static_folder=None)
     configure_app_logging(flask_app)
     flask_app.config.update(UPSTREAM_CONFIG)
+    flask_app.config["require_upstream_health"] = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     try:
         from config import get_config
 
@@ -631,7 +640,8 @@ def healthz():
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    if gpu_host and not _can_resolve_gpu_host(gpu_host):
+    require_upstream_health = app.config.get("require_upstream_health", False)
+    if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
         LOGGER.warning(

@@ -842,6 +842,47 @@ def test_livez_remains_alive_when_draining(client):
     assert response.status_code == 200
     assert response.get_json()["status"] == "alive"
 
+
+def test_healthz_relay_only_default_does_not_require_unresolvable_upstream(client):
+    """Healthz remains ready by default even if upstream host cannot resolve."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    app.config["require_upstream_health"] = False
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "ok"
+    assert payload["gpuHost"] == "definitely-not-resolvable.invalid"
+
+
+def test_healthz_can_enforce_unresolvable_upstream_failure(client):
+    """Opt-in upstream health gate should preserve degraded readiness behavior."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    app.config["require_upstream_health"] = True
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "degraded"
+    assert payload["details"]["gpuHostResolution"] == "failed"
+
+
+def test_relay_entrypoint_defaults_to_one_worker():
+    """Container relay entrypoint should default Gunicorn to one worker."""
+    entrypoint = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "docker",
+        "relay",
+        "entrypoint.sh",
+    )
+    with open(entrypoint, encoding="utf-8") as handle:
+        script = handle.read()
+
+    assert 'WORKERS="${RELAY_WORKERS:-1}"' in script
+
 # --- Test /source ---
 
 def test_source_submit_response(client):

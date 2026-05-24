@@ -3,6 +3,7 @@ import time
 import threading
 import base64
 import json
+from pathlib import Path
 from flask import Flask
 import sys
 import os
@@ -52,7 +53,6 @@ def client():
         os.environ.pop("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", None)
     else:
         os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
-
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     client_inference_requests.clear()
@@ -778,9 +778,9 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
 
 
-def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
+def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monkeypatch):
     """Healthz should separate configured upstream URLs from live registered nodes."""
-    app.config["gpu_host"] = None
+    monkeypatch.setitem(app.config, "gpu_host", None)
     configured_servers = [
         "https://configured-one.example.com:8000",
         "https://configured-two.example.com:8000",
@@ -841,6 +841,43 @@ def test_livez_remains_alive_when_draining(client):
 
     assert response.status_code == 200
     assert response.get_json()["status"] == "alive"
+
+
+def test_healthz_default_allows_unresolvable_upstream_host(client, monkeypatch):
+    """healthz should stay ready by default for relay-only deployments."""
+    monkeypatch.setitem(app.config, "gpu_host", "definitely-not-resolvable.invalid")
+    monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["gpuHost"] == "definitely-not-resolvable.invalid"
+    assert payload.get("details", {}).get("gpuHostResolution") != "failed"
+
+
+def test_healthz_requires_upstream_health_when_env_enabled(client, monkeypatch):
+    """healthz should degrade when upstream resolution is required and fails."""
+    monkeypatch.setitem(app.config, "gpu_host", "definitely-not-resolvable.invalid")
+    monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "1")
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert payload["status"] == "degraded"
+    assert payload["details"]["gpuHostResolution"] == "failed"
+
+
+def test_relay_entrypoint_defaults_to_one_worker():
+    """Container entrypoint should default to one worker process."""
+    entrypoint_path = Path(__file__).resolve().parents[1] / "docker" / "relay" / "entrypoint.sh"
+    with entrypoint_path.open(encoding="utf-8") as file:
+        content = file.read()
+    assert 'WORKERS="${RELAY_WORKERS:-1}"' in content
 
 # --- Test /source ---
 

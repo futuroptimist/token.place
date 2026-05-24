@@ -14,7 +14,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
-import requests
+from utils.networking.http_requests_compat import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')

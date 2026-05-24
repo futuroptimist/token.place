@@ -4,7 +4,7 @@ Model manager module for handling LLM model downloading, initialization and infe
 import os
 import time
 import logging
-import requests
+from utils.networking.http_requests_compat import requests
 import json
 import sys
 import importlib

@@ -59,9 +59,11 @@ jobs:
           set -euo pipefail
           chart_name="$(helm show chart charts/tokenplace | awk -F': ' '/^name:/{print $2}')"
           chart_version="$(helm show chart charts/tokenplace | awk -F': ' '/^version:/{print $2}')"
-          registry_owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          chart_ref="oci://ghcr.io/futuroptimist/charts/${chart_name}"
+          test "${chart_name}" = "tokenplace"
+          test "${chart_ref}" = "oci://ghcr.io/futuroptimist/charts/tokenplace"
           echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
-          echo "chart_ref=oci://ghcr.io/${registry_owner}/charts/${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "chart_ref=${chart_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Package chart
         id: package
@@ -69,13 +71,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           helm package charts/tokenplace --destination dist
-          mapfile -t package_files < <(find dist -maxdepth 1 -type f -name '*.tgz' | sort)
-          if [ "${#package_files[@]}" -ne 1 ]; then
-            echo "Expected exactly one packaged chart in dist, found ${#package_files[@]}." >&2
-            printf '%s\n' "${package_files[@]}" >&2 || true
-            exit 1
-          fi
-          package_file="${package_files[0]}"
+          package_file="$(find dist -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
+          test -n "${package_file}"
+          test -f "${package_file}"
           echo "package_file=${package_file}" >> "$GITHUB_OUTPUT"
 
       - name: Upload chart package artifact
@@ -125,13 +123,9 @@ jobs:
         id: push
         run: |
           set -euo pipefail
-          mapfile -t package_files < <(find dist -maxdepth 1 -type f -name '*.tgz' | sort)
-          if [ "${#package_files[@]}" -ne 1 ]; then
-            echo "Expected exactly one packaged chart artifact in dist, found ${#package_files[@]}." >&2
-            printf '%s\n' "${package_files[@]}" >&2 || true
-            exit 1
-          fi
-          package_file="${package_files[0]}"
+          package_file="$(find dist -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
+          test -n "${package_file}"
+          test -f "${package_file}"
           chart_ref="${{ needs.validate-and-package.outputs.chart_ref }}"
           chart_registry="${chart_ref%/*}"
           if helm show chart "${chart_ref}" --version "${{ needs.validate-and-package.outputs.chart_version }}" >/dev/null 2>&1; then

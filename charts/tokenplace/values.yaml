@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
-  tag: ""
+  tag: "main"
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -54,15 +54,41 @@ service:
 ingress:
   enabled: false
   className: ""
-  host: ""
   annotations: {}
-  tls:
-    enabled: false
-    secretName: ""
+  hosts: []
+  tls: []
+
+networkPolicy:
+  enabled: true
+  allowDNS: true
+  dnsNamespace: kube-system
+  kubeDNSSelector:
+    matchLabels:
+      k8s-app: kube-dns
+  ingressNamespaces: []
+  extraIngress: []
+  extraEgress: []
 
 env: {}
 extraEnv: []
 envFrom: []
+
+terminationGracePeriodSeconds: 30
+preStop:
+  enabled: true
+  sleepSeconds: 5
+
+probes:
+  liveness:
+    initialDelaySeconds: 20
+    periodSeconds: 20
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 6
 
 nodeSelector: {}
 tolerations: []

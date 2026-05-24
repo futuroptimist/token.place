@@ -1,4 +1,10 @@
 {{- if .Values.ingress.enabled }}
+{{- if eq (len .Values.ingress.hosts) 0 }}
+{{- fail "ingress.enabled=true requires ingress.hosts with at least one host entry" }}
+{{- end }}
+{{- if eq (len .Values.ingress.tls) 0 }}
+{{- fail "ingress.enabled=true requires ingress.tls with at least one TLS secret/host mapping" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -14,20 +20,26 @@ spec:
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+    {{- range .Values.ingress.hosts }}
+    - host: {{ required "ingress.hosts[].host is required" .host | quote }}
       http:
         paths:
-          - path: /
-            pathType: Prefix
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
             backend:
               service:
-                name: {{ include "tokenplace.fullname" . }}
+                name: {{ include "tokenplace.fullname" $ }}
                 port:
                   name: http
-  {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.secretName }}
+          {{- end }}
+    {{- end }}
   tls:
-    - hosts:
-        - {{ .Values.ingress.host | quote }}
-      secretName: {{ .Values.ingress.tls.secretName }}
-  {{- end }}
+    {{- range .Values.ingress.tls }}
+    - secretName: {{ required "ingress.tls[].secretName is required when ingress is enabled" .secretName }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}
 {{- end }}

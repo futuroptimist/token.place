@@ -149,7 +149,11 @@ def wait_for_running_stability(
     )
     deadline = time.time() + stable_seconds
     while time.time() < deadline:
-        current = driver.find_element(By.XPATH, status_xpath).text.strip().lower()
+        try:
+            current = driver.find_element(By.XPATH, status_xpath).text.strip().lower()
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            time.sleep(0.2)
+            continue
         if current != expected.lower():
             raise AssertionError(
                 f"Running state became unstable: expected {expected!r}, observed {current!r}"
@@ -462,6 +466,14 @@ def main() -> int:
     env["PYTHONPATH"] = (
         f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)
     )
+    isolated_home = Path(tempfile.mkdtemp(prefix="token-place-desktop-e2e-home-"))
+    env["HOME"] = str(isolated_home)
+    env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
+    env["XDG_DATA_HOME"] = str(isolated_home / ".local" / "share")
+    env["APPDATA"] = str(isolated_home / "AppData" / "Roaming")
+    Path(env["XDG_CONFIG_HOME"]).mkdir(parents=True, exist_ok=True)
+    Path(env["XDG_DATA_HOME"]).mkdir(parents=True, exist_ok=True)
+    Path(env["APPDATA"]).mkdir(parents=True, exist_ok=True)
 
     relay = subprocess.Popen(  # noqa: S603
         [
@@ -592,6 +604,7 @@ def main() -> int:
                 Path(model_path).unlink()
         terminate_process(tauri_driver)
         terminate_process(relay)
+        shutil.rmtree(isolated_home, ignore_errors=True)
 
     return 0
 

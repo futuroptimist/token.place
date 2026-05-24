@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-macos-start-operator-e2e-gap",
+  "summary": "Desktop Tauri operator UI regressed by showing a machine-specific model path on first launch and by allowing macOS start failures to appear as brief running transitions without a visible in-app error.",
+  "impact": "New users saw misleading pre-filled GGUF paths, and macOS users could click Start operator and observe a revert to Running: no without actionable failure context in the UI.",
+  "fix": "Removed first-launch model-path auto-save from runtime artifact inspection, made operator lifecycle rely on backend events instead of optimistic running flips, surfaced compute-node error events in the visible error banner, and hardened desktop e2e checks for blank-first-launch state and running-state stability.",
+  "lessons": "Desktop startup UX must guard against duplicate/in-flight starts, always surface backend startup errors in visible UI state, and isolate persisted app config in e2e runs to avoid false first-launch assumptions."
+}

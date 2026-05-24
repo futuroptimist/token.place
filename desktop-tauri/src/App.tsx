@@ -95,6 +95,7 @@ export function App() {
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
@@ -194,6 +195,9 @@ export function App() {
                 ? payload.message
                 : prev.last_error,
       }));
+      if (payload.type === 'started' || payload.type === 'error') {
+        setIsStartingComputeNode(false);
+      }
       if (payload.type === 'error') {
         const computeMessage =
           typeof payload.last_error === 'string'
@@ -228,8 +232,8 @@ export function App() {
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running,
-    [config.model_path, computeStatus.running]
+    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode]
   );
   const availableBackend = backend?.available_backend ?? 'cpu';
   const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
@@ -312,6 +316,7 @@ export function App() {
 
   const startComputeNode = async () => {
     try {
+      setIsStartingComputeNode(true);
       setError('');
       setComputeStatus((prev) => ({
         ...prev,
@@ -335,6 +340,7 @@ export function App() {
         },
       });
     } catch (e) {
+      setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       setComputeStatus((prev) => ({
         ...prev,
@@ -373,9 +379,10 @@ export function App() {
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop compute node</h1>
       <p>Platform GPU availability: <strong>{backend?.availability_label ?? 'loading...'}</strong></p>
-      <label>Model GGUF path</label>
+      <label htmlFor="model-path-input">Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
         <input
+          id="model-path-input"
           value={config.model_path}
           style={{ width: '100%' }}
           onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}

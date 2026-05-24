@@ -246,7 +246,7 @@ describe('desktop app start failure handling', () => {
     });
 
     render(<App />);
-    const modelInput = (await screen.findAllByRole('textbox'))[0];
+    const modelInput = (await screen.findByLabelText('Model GGUF path')) as HTMLInputElement;
     await waitFor(() => expect((modelInput as HTMLInputElement).value).toBe(''));
     expect(
       invokeMock.mock.calls.some(
@@ -260,7 +260,7 @@ describe('desktop app start failure handling', () => {
 
   it('restores persisted user-selected model path from saved config', async () => {
     render(<App />);
-    const modelInput = (await screen.findAllByRole('textbox'))[0];
+    const modelInput = (await screen.findByLabelText('Model GGUF path')) as HTMLInputElement;
     await waitFor(() => expect((modelInput as HTMLInputElement).value).toBe('/tmp/model.gguf'));
   });
 

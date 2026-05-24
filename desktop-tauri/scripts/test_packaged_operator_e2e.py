@@ -58,6 +58,7 @@ def create_packaged_layout(tmp_root: Path) -> Path:
         "inference_sidecar.py",
         "model_bridge.py",
         "path_bootstrap.py",
+        "requests.py",
     ):
         shutil.copy2(
             REPO_ROOT / "desktop-tauri" / "src-tauri" / "python" / filename,
@@ -75,7 +76,10 @@ def create_packaged_layout(tmp_root: Path) -> Path:
 def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
-    env.pop("PYTHONPATH", None)
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(tmp_root / "resources" / "python"),
+        str(tmp_root / "resources"),
+    ])
 
     model_bridge = tmp_root / "resources" / "python" / "model_bridge.py"
     result = subprocess.run(  # noqa: S603

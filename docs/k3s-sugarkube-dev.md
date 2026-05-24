@@ -32,12 +32,14 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 
 ## Deployment workflow (template)
 
+Before running the helper commands, set `image.repository: ghcr.io/futuroptimist/tokenplace-relay` in `docs/examples/tokenplace-relay.values.dev.yaml` in the sugarkube checkout.
+
 ```bash
 # Run from sugarkube checkout.
-just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA set=image.repository=ghcr.io/futuroptimist/tokenplace-relay
+just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA
 
 # Upgrade existing release.
-just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA set=image.repository=ghcr.io/futuroptimist/tokenplace-relay
+just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist

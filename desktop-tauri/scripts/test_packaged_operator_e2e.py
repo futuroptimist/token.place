@@ -91,15 +91,19 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     parsed = json.loads(result.stdout.strip())
     assert parsed.get("ok") is True, combined
 
-    forbidden = [
+    forbidden_any_output = [
         "Missing Python dependency for model downloads",
         "No module named 'psutil'",
         "NotOpenSSLWarning",
-        "/Users/",
-        "~/Library/Python",
     ]
-    for marker in forbidden:
+    for marker in forbidden_any_output:
         assert marker not in combined, combined
+
+    # model_bridge inspect JSON payload can legitimately include absolute model paths
+    # in stdout, so user-home leakage checks are constrained to stderr diagnostics.
+    forbidden_stderr_only = ["/Users/", "~/Library/Python"]
+    for marker in forbidden_stderr_only:
+        assert marker not in result.stderr, combined
 
 
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:

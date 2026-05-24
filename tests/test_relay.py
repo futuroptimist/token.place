@@ -814,6 +814,44 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
     }
 
 
+
+
+def test_healthz_default_does_not_require_upstream_resolution(client, monkeypatch):
+    """Default healthz readiness should ignore unresolved upstream hostnames."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    app.config["require_upstream_health"] = False
+    monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda host: False)
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "ok"
+    assert payload["gpuHost"] == "definitely-not-resolvable.invalid"
+
+
+def test_healthz_require_upstream_health_enforces_resolution(client, monkeypatch):
+    """Opt-in upstream health gate should degrade when host resolution fails."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    app.config["require_upstream_health"] = True
+    monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda host: False)
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "degraded"
+    assert payload["details"]["gpuHostResolution"] == "failed"
+
+
+def test_relay_entrypoint_defaults_to_single_worker():
+    """Container entrypoint should default to one Gunicorn worker for in-memory state."""
+    entrypoint = os.path.join(os.path.dirname(__file__), "..", "docker", "relay", "entrypoint.sh")
+    with open(entrypoint, encoding="utf-8") as file_handle:
+        contents = file_handle.read()
+
+    assert 'WORKERS="${RELAY_WORKERS:-1}"' in contents
+
 def test_healthz_returns_draining_when_shutdown_flag_set(client):
     """healthz should switch to draining status and 503 during shutdown."""
     relay_module.DRAINING.set()

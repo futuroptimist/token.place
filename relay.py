@@ -245,6 +245,15 @@ UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
 PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_COMPAT_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
+REQUIRE_UPSTREAM_HEALTH_ENV = "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -314,6 +323,7 @@ def create_app() -> Flask:
         LOGGER.debug("relay.config.load_failed", exc_info=exc)
         configured_servers = []
     flask_app.config["relay_configured_servers"] = list(configured_servers)
+    flask_app.config["require_upstream_health"] = _env_flag(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     public_base_url = _load_public_base_url()
     if public_base_url:
         flask_app.config["public_base_url"] = public_base_url
@@ -631,7 +641,9 @@ def healthz():
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    if gpu_host and not _can_resolve_gpu_host(gpu_host):
+    require_upstream_health = bool(app.config.get("require_upstream_health", False))
+
+    if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
         LOGGER.warning(

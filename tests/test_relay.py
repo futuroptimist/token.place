@@ -814,6 +814,46 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client):
     }
 
 
+
+
+def test_healthz_allows_unresolvable_upstream_by_default(client):
+    """Default readiness should ignore unresolved upstream hostnames."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    app.config["require_upstream_health"] = False
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "ok"
+    assert "details" not in payload or payload["details"].get("gpuHostResolution") != "failed"
+
+
+def test_healthz_requires_upstream_when_enabled(client, monkeypatch):
+    """Enabling upstream health gate should keep unresolved hosts as degraded."""
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "1")
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    app.config["require_upstream_health"] = relay_module._env_truthy(
+        "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH",
+        default=False,
+    )
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "degraded"
+    assert payload["details"]["gpuHostResolution"] == "failed"
+
+
+def test_relay_entrypoint_defaults_to_single_worker():
+    """Relay container entrypoint should default to one Gunicorn worker."""
+    entrypoint = os.path.join(os.path.dirname(__file__), "..", "docker", "relay", "entrypoint.sh")
+    with open(entrypoint, encoding="utf-8") as script_file:
+        script = script_file.read()
+
+    assert 'WORKERS="${RELAY_WORKERS:-1}"' in script
+
 def test_healthz_returns_draining_when_shutdown_flag_set(client):
     """healthz should switch to draining status and 503 during shutdown."""
     relay_module.DRAINING.set()

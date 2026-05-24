@@ -1,5 +1,11 @@
 {{- if .Values.ingress.enabled }}
-{{- $host := required "ingress.host is required when ingress.enabled=true" .Values.ingress.host }}
+{{- $hosts := required "ingress.hosts is required when ingress.enabled=true" .Values.ingress.hosts }}
+{{- if not (kindIs "slice" $hosts) }}
+{{- fail "ingress.hosts must be a list when ingress.enabled=true" }}
+{{- end }}
+{{- if eq (len $hosts) 0 }}
+{{- fail "ingress.hosts must contain at least one host when ingress.enabled=true" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -15,20 +21,33 @@ spec:
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
   rules:
+    {{- range $hostEntry := $hosts }}
+    {{- $host := required "ingress.hosts[].host is required when ingress.enabled=true" $hostEntry.host }}
     - host: {{ $host | quote }}
       http:
         paths:
+          {{- if not $hostEntry.paths }}
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: {{ include "tokenplace.fullname" . }}
+                name: {{ include "tokenplace.fullname" $ }}
                 port:
                   name: http
-  {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.secretName }}
+          {{- else }}
+          {{- range $path := $hostEntry.paths }}
+          - path: {{ default "/" $path.path }}
+            pathType: {{ default "Prefix" $path.pathType }}
+            backend:
+              service:
+                name: {{ include "tokenplace.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
+          {{- end }}
+    {{- end }}
+  {{- with .Values.ingress.tls }}
   tls:
-    - hosts:
-        - {{ $host | quote }}
-      secretName: {{ .Values.ingress.tls.secretName }}
+    {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}

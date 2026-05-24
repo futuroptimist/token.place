@@ -245,6 +245,14 @@ UPSTREAM_URL_ENV = "TOKENPLACE_RELAY_UPSTREAM_URL"
 PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_COMPAT_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
+REQUIRE_UPSTREAM_HEALTH_ENV = "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -631,12 +639,13 @@ def healthz():
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    if gpu_host and not _can_resolve_gpu_host(gpu_host):
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
         LOGGER.warning(
             "healthz.resolution_failed",
-            extra={"gpu_host": gpu_host},
+            extra={"gpu_host": gpu_host, "require_upstream_health": require_upstream_health},
         )
         return jsonify(status), 503
 

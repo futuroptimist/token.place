@@ -36,6 +36,7 @@ def client():
     """Create a Flask test client fixture."""
     app.config['TESTING'] = True
     previous_legacy_flag = os.environ.get("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES")
+    previous_require_upstream = os.environ.get("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH")
     os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
@@ -52,6 +53,10 @@ def client():
         os.environ.pop("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", None)
     else:
         os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
+    if previous_require_upstream is None:
+        os.environ.pop("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", None)
+    else:
+        os.environ["TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"] = previous_require_upstream
 
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
@@ -841,6 +846,40 @@ def test_livez_remains_alive_when_draining(client):
 
     assert response.status_code == 200
     assert response.get_json()["status"] == "alive"
+
+
+def test_healthz_default_allows_unresolvable_upstream_host(client):
+    """healthz should stay ready by default for relay-only deployments."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    os.environ.pop("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", None)
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["gpuHost"] == "definitely-not-resolvable.invalid"
+    assert payload.get("details", {}).get("gpuHostResolution") != "failed"
+
+
+def test_healthz_requires_upstream_health_when_env_enabled(client):
+    """healthz should degrade when upstream resolution is required and fails."""
+    app.config["gpu_host"] = "definitely-not-resolvable.invalid"
+    os.environ["TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"] = "1"
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert payload["status"] == "degraded"
+    assert payload["details"]["gpuHostResolution"] == "failed"
+
+
+def test_relay_entrypoint_defaults_to_one_worker():
+    """Container entrypoint should default to one worker process."""
+    with open("docker/relay/entrypoint.sh", encoding="utf-8") as file:
+        content = file.read()
+    assert 'WORKERS="${RELAY_WORKERS:-1}"' in content
 
 # --- Test /source ---
 

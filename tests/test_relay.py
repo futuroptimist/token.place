@@ -37,7 +37,6 @@ def client():
     """Create a Flask test client fixture."""
     app.config['TESTING'] = True
     previous_legacy_flag = os.environ.get("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES")
-    previous_require_upstream = os.environ.get("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH")
     os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
@@ -54,11 +53,6 @@ def client():
         os.environ.pop("TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES", None)
     else:
         os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
-    if previous_require_upstream is None:
-        os.environ.pop("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", None)
-    else:
-        os.environ["TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"] = previous_require_upstream
-
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
     client_inference_requests.clear()
@@ -853,7 +847,7 @@ def test_healthz_default_allows_unresolvable_upstream_host(client, monkeypatch):
     """healthz should stay ready by default for relay-only deployments."""
     monkeypatch.setitem(app.config, "gpu_host", "definitely-not-resolvable.invalid")
     monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: False)
-    os.environ.pop("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", None)
+    monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)
 
     response = client.get("/healthz")
     payload = response.get_json()
@@ -868,7 +862,7 @@ def test_healthz_requires_upstream_health_when_env_enabled(client, monkeypatch):
     """healthz should degrade when upstream resolution is required and fails."""
     monkeypatch.setitem(app.config, "gpu_host", "definitely-not-resolvable.invalid")
     monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: False)
-    os.environ["TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"] = "1"
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "1")
 
     response = client.get("/healthz")
     payload = response.get_json()

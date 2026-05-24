@@ -39,11 +39,11 @@ def test_inspect_returns_shared_model_manager_metadata(capsys):
 
 
 def test_inspect_returns_bridge_error_when_manager_init_fails(capsys):
-    with patch.object(model_bridge, '_get_model_manager', return_value=(None, 1)):
+    with patch.object(model_bridge, '_get_model_manager', return_value=(None, {'ok': False, 'error': 'boom'})):
         status = model_bridge.inspect_model()
 
     assert status == 1
-    assert capsys.readouterr().out.strip() == ''
+    assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'boom'}
 
 
 def test_download_returns_actionable_error_when_download_fails(capsys):
@@ -92,10 +92,11 @@ def test_get_model_manager_reports_missing_dependency(capsys):
         manager, error_status = model_bridge._get_model_manager()
 
     assert manager is None
-    assert error_status == 1
-    response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is False
-    assert 'Missing Python dependency for model downloads' in response['error']
+    assert error_status == {
+        'ok': False,
+        'error': "Missing Python dependency for model downloads (import of utils.llm.model_manager halted; None in sys.modules).",
+    }
+    assert capsys.readouterr().out.strip() == ''
 
 
 def test_get_model_manager_treats_optional_download_dependency_as_nonfatal(capsys):
@@ -110,11 +111,7 @@ def test_get_model_manager_treats_optional_download_dependency_as_nonfatal(capsy
         manager, error_status = model_bridge._get_model_manager(allow_optional_missing=True)
 
     assert manager is None
-    assert error_status == 0
-    response = json.loads(capsys.readouterr().out.strip())
-    assert response['ok'] is True
-    assert 'error' not in response
-    assert response['payload'] == {
+    assert error_status == {'ok': True, 'payload': {
         'canonical_family_url': '',
         'filename': '',
         'url': '',
@@ -122,7 +119,8 @@ def test_get_model_manager_treats_optional_download_dependency_as_nonfatal(capsy
         'resolved_model_path': '',
         'exists': False,
         'size_bytes': None,
-    }
+    }}
+    assert capsys.readouterr().out.strip() == ''
 
 
 def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):

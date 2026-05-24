@@ -44,9 +44,9 @@ def _get_model_manager(*, allow_optional_missing: bool = False):
         from utils.llm.model_manager import get_model_manager
     except ModuleNotFoundError as exc:
         if allow_optional_missing and _is_direct_optional_missing(exc):
-            return None, _response(
-                True,
-                payload={
+            return None, {
+                "ok": True,
+                "payload": {
                     "canonical_family_url": "",
                     "filename": "",
                     "url": "",
@@ -55,14 +55,11 @@ def _get_model_manager(*, allow_optional_missing: bool = False):
                     "exists": False,
                     "size_bytes": None,
                 },
-            )
-        return None, _response(
-            False,
-            error=(
-                "Missing Python dependency for model downloads "
-                f"({exc}). Run `pip install -r requirements.txt`."
-            ),
-        )
+            }
+        return None, {
+            "ok": False,
+            "error": f"Missing Python dependency for model downloads ({exc}).",
+        }
 
     return get_model_manager(), None
 
@@ -70,14 +67,22 @@ def _get_model_manager(*, allow_optional_missing: bool = False):
 def inspect_model() -> int:
     manager, error_status = _get_model_manager(allow_optional_missing=True)
     if error_status is not None:
-        return error_status
+        return _response(**error_status)
     return _response(True, payload=manager.get_model_artifact_metadata())
 
 
 def download_model() -> int:
     manager, error_status = _get_model_manager()
     if error_status is not None:
-        return error_status
+        if error_status.get("ok") and error_status.get("payload") is not None:
+            return _response(
+                False,
+                error=(
+                    "Local model download unavailable in this packaged runtime because "
+                    "required optional download dependencies are missing."
+                ),
+            )
+        return _response(**error_status)
 
     if not manager.download_model_if_needed():
         return _response(

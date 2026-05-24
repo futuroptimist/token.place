@@ -72,6 +72,36 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
+def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("PYTHONPATH", None)
+
+    model_bridge = tmp_root / "resources" / "python" / "model_bridge.py"
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(model_bridge), "inspect"],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    parsed = json.loads(result.stdout.strip())
+    assert parsed.get("ok") is True, combined
+
+    forbidden = [
+        "Missing Python dependency for model downloads",
+        "No module named 'psutil'",
+        "NotOpenSSLWarning",
+        "/Users/",
+        "~/Library/Python",
+    ]
+    for marker in forbidden:
+        assert marker not in combined, combined
+
+
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
     if not hasattr(stdout, "readline"):
         return
@@ -91,6 +121,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
+        run_model_bridge_inspect_probe(Path(tmpdir))
 
         relay = subprocess.Popen(  # noqa: S603
             [

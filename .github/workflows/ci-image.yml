@@ -1,0 +1,145 @@
+name: Build and publish GHCR relay image
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build
+        required: false
+        default: main
+
+jobs:
+  relay-image:
+    name: Build, smoke-test, and publish relay image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read' }}
+    outputs:
+      immutable_image_tag: ${{ steps.tags.outputs.branch_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Compute image metadata and tags
+        id: tags
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          repository="ghcr.io/futuroptimist/tokenplace-relay"
+
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "created=${created}" >> "$GITHUB_OUTPUT"
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "branch_tag=${repository}:main-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${repository}:main-latest" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${repository}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU (arm64 for push)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
+      - name: Build relay image locally for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          provenance: false
+          tags: tokenplace-relay:smoke
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+          cache-from: type=gha,scope=relay-image
+          cache-to: type=gha,mode=max,scope=relay-image
+
+      - name: Smoke test relay container
+        run: |
+          set -euo pipefail
+
+          docker run -d --rm --name tokenplace-relay-smoke \
+            -p 127.0.0.1:5010:5010 \
+            -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
+            tokenplace-relay:smoke
+
+          cleanup() {
+            echo "--- container logs ---"
+            docker logs tokenplace-relay-smoke || true
+            docker stop tokenplace-relay-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5010/livez \
+              && curl -fsS http://127.0.0.1:5010/healthz \
+              && curl -fsS http://127.0.0.1:5010/ >/dev/null \
+              && curl -fsS http://127.0.0.1:5010/metrics >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:5010/livez >/dev/null
+          curl -fsS http://127.0.0.1:5010/healthz >/dev/null
+          curl -fsS http://127.0.0.1:5010/ >/dev/null
+          curl -fsS http://127.0.0.1:5010/metrics >/dev/null
+
+          docker exec tokenplace-relay-smoke sh -c "ps -o args= 1" | grep -F -- '--workers 1'
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch relay image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.tags.outputs.branch_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+            ${{ steps.tags.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+          cache-from: type=gha,scope=relay-image
+          cache-to: type=gha,mode=max,scope=relay-image
+
+      - name: Publish workflow summary
+        run: |
+          {
+            echo "## Relay image tags"
+            echo ""
+            echo "Immutable tag: \`${{ steps.tags.outputs.branch_tag }}\`"
+            echo "Mutable tag: \`${{ steps.tags.outputs.latest_tag }}\`"
+            echo "Compatibility tag: \`${{ steps.tags.outputs.sha_tag }}\`"
+            echo ""
+            echo "Pushed: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+          } >> "$GITHUB_STEP_SUMMARY"

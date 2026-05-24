@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tokenplace
+description: Canonical Helm chart for deploying token.place relay
+version: 0.1.0
+appVersion: "0.1.0"
+type: application

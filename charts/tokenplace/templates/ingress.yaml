@@ -6,6 +6,35 @@
 {{- if eq (len $hosts) 0 }}
 {{- fail "ingress.hosts must contain at least one host when ingress.enabled=true" }}
 {{- end }}
+{{- $tls := required "ingress.tls is required when ingress.enabled=true" .Values.ingress.tls }}
+{{- if not (kindIs "slice" $tls) }}
+{{- fail "ingress.tls must be a list when ingress.enabled=true" }}
+{{- end }}
+{{- if eq (len $tls) 0 }}
+{{- fail "ingress.tls must contain at least one TLS entry when ingress.enabled=true" }}
+{{- end }}
+{{- $tlsHosts := dict }}
+{{- range $tlsEntry := $tls }}
+{{- if not $tlsEntry.secretName }}
+{{- fail "ingress.tls[].secretName is required when ingress.enabled=true" }}
+{{- end }}
+{{- $entryHosts := required "ingress.tls[].hosts is required when ingress.enabled=true" $tlsEntry.hosts }}
+{{- if not (kindIs "slice" $entryHosts) }}
+{{- fail "ingress.tls[].hosts must be a list when ingress.enabled=true" }}
+{{- end }}
+{{- if eq (len $entryHosts) 0 }}
+{{- fail "ingress.tls[].hosts must contain at least one host when ingress.enabled=true" }}
+{{- end }}
+{{- range $tlsHost := $entryHosts }}
+{{- $_ := set $tlsHosts $tlsHost true }}
+{{- end }}
+{{- end }}
+{{- range $hostEntry := $hosts }}
+{{- $host := required "ingress.hosts[].host is required when ingress.enabled=true" $hostEntry.host }}
+{{- if not (hasKey $tlsHosts $host) }}
+{{- fail (printf "ingress host %q must be covered by ingress.tls[].hosts when ingress.enabled=true" $host) }}
+{{- end }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -46,8 +75,6 @@ spec:
           {{- end }}
           {{- end }}
     {{- end }}
-  {{- with .Values.ingress.tls }}
   tls:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- toYaml $tls | nindent 4 }}
 {{- end }}

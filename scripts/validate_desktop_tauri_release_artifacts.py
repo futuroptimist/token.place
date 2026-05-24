@@ -9,6 +9,15 @@ import subprocess
 from pathlib import Path
 
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
+DMG_README_NAMES = ("README BEFORE OPENING.txt", "README-macos-apple-silicon-preview.txt")
+REQUIRED_README_PHRASES = (
+    "ad-hoc signed",
+    "not notarized",
+    "Apple could not verify",
+    "Privacy & Security",
+    "Developer ID",
+    "notarization",
+)
 
 
 def _fail(msg: str) -> None:
@@ -37,6 +46,42 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _validate_dmg_contents(dmg_path: Path) -> None:
+    attach_output = _run(
+        [
+            "hdiutil",
+            "attach",
+            "-readonly",
+            "-nobrowse",
+            "-noautoopen",
+            str(dmg_path),
+        ]
+    )
+    mountpoint = ""
+    for line in attach_output.splitlines():
+        if "/Volumes/" in line:
+            mountpoint = line.rsplit("\t", 1)[-1].strip()
+    if not mountpoint:
+        _fail(f"Unable to determine mounted DMG path for: {dmg_path}")
+
+    mount_path = Path(mountpoint)
+    try:
+        app_entries = [p for p in mount_path.iterdir() if p.suffix == ".app"]
+        if len(app_entries) != 1:
+            _fail(f"Expected exactly one .app at DMG root; found {len(app_entries)} in {mount_path}")
+
+        readme_path = next((mount_path / name for name in DMG_README_NAMES if (mount_path / name).exists()), None)
+        if readme_path is None:
+            expected = ", ".join(DMG_README_NAMES)
+            _fail(f"Expected preview README at DMG root ({expected}) in {mount_path}")
+        readme_text = readme_path.read_text(encoding="utf-8")
+        for phrase in REQUIRED_README_PHRASES:
+            if phrase not in readme_text:
+                _fail(f"DMG preview README missing required phrase {phrase!r}: {readme_path}")
+    finally:
+        _run(["hdiutil", "detach", mountpoint])
+
+
 def main() -> None:
     args = _parse_args()
     app_path = Path(args.app_path)
@@ -53,6 +98,7 @@ def main() -> None:
         _fail(f"dmg artifact missing or invalid: {dmg_path}")
     if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
         _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
+    _validate_dmg_contents(dmg_path)
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")

@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-release-preview-dmg-missing-inline-gatekeeper-guidance",
+  "summary": "Correct Apple Silicon preview DMGs still showed expected Gatekeeper warnings, but inline user guidance was missing from the mounted DMG.",
+  "impact": "Users naturally double-clicked the app in the DMG and saw 'Apple could not verify' without immediate instructions, increasing support confusion.",
+  "fix": "Stage the DMG from app + inline README (+ Applications symlink), keep the sidecar README release asset, and validate DMG-root README presence/content in artifact checks.",
+  "lessons": "When unpaid ad-hoc/non-notarized distribution is intentional, opening guidance must be embedded at first user touchpoint; no-warning UX still requires paid Developer ID notarization."
+}

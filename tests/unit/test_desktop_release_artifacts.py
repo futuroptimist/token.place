@@ -67,12 +67,26 @@ def test_workflow_does_not_gate_release_on_notary_profile() -> None:
 def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'README-macos-apple-silicon-preview.txt' in text
-    assert 'This DMG is ad-hoc signed and is not notarized.' in text
-    assert 'This DMG is signed with a configured Apple signing identity but is not notarized.' in text
-    assert 'Apple could not verify ... is free of malware.' in text
+    assert 'README BEFORE OPENING.txt' in text
+    assert 'This preview build is ad-hoc signed and not notarized.' in text
+    assert 'Apple could not verify \\"token.place desktop\\" is free of malware.' in text
+    assert 'Done.' in text
     assert 'System Settings -> Privacy & Security' in text
-    assert 'paid Apple Developer ID' in text
-    assert 'signing plus notarization' in text
+    assert 'Open Anyway / Allow / Open' in text
+    assert 'Developer ID signing + notarization' in text
+    assert 'This is expected for unpaid/non-notarized GitHub preview releases.' in text
+    assert 'System Settings -> Privacy & Security' in text
+    assert 'Only install if you trust this GitHub release and checksum files.' in text
+
+
+def test_workflow_stages_macos_dmg_with_app_readme_and_applications_symlink() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'dmg_stage_dir="$RUNNER_TEMP/token-place-desktop-dmg-stage"' in text
+    assert 'cp "${preview_notice}" "${dmg_stage_dir}/README BEFORE OPENING.txt"' in text
+    assert 'cp -R "${app_path}" "${dmg_stage_dir}/$(basename "${app_path}")"' in text
+    assert 'ln -s /Applications "${dmg_stage_dir}/Applications"' in text
+    assert 'hdiutil create -volname "token.place desktop" -srcfolder "${dmg_stage_dir}"' in text
+    assert 'hdiutil create -volname "token.place desktop" -srcfolder "${app_path}"' not in text
 
 
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
@@ -86,6 +100,19 @@ def test_workflow_writes_preview_notice_via_printf() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert "printf '%s\\n' \\" in text
     assert '> "${preview_notice}"' in text
+
+
+def test_validator_checks_dmg_root_preview_readme_contents() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert 'README BEFORE OPENING.txt' in text
+    assert 'README-macos-apple-silicon-preview.txt' in text
+    assert 'Expected exactly one .app at DMG root' in text
+    assert 'ad-hoc signed' in text
+    assert 'not notarized' in text
+    assert 'Apple could not verify' in text
+    assert 'Privacy & Security' in text
+    assert 'Developer ID' in text
+    assert 'notarization' in text
 
 
 def test_preview_notice_uses_full_signing_decision_in_stage_step() -> None:

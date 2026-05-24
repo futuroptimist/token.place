@@ -4,3 +4,4 @@ description: Helm chart for deploying the token.place relay service
 version: 0.1.0
 appVersion: "0.1.0"
 type: application
+deprecated: true

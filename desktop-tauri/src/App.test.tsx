@@ -199,6 +199,137 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+  it('blocks duplicate start clicks while compute-node startup is pending', async () => {
+    let resolveStart: (() => void) | undefined;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      if (command === 'detect_backend') {
+        return Promise.resolve({
+          platform_label: 'macos',
+          preferred_mode: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
+        });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          active_relay_url: '',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '',
+          last_error: null,
+        });
+      }
+      return Promise.resolve({
+        canonical_family_url: 'https://example.test/models',
+        filename: 'model.gguf',
+        url: 'https://example.test/model.gguf',
+        models_dir: '/tmp',
+        resolved_model_path: '/tmp/model.gguf',
+        exists: true,
+        size_bytes: 1,
+      });
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    const stopOperatorButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+
+    fireEvent.click(startOperatorButton);
+    fireEvent.click(startOperatorButton);
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === 'start_compute_node')
+    ).toHaveLength(1);
+    expect(startOperatorButton.disabled).toBe(true);
+    expect(stopOperatorButton.disabled).toBe(true);
+
+    resolveStart?.();
+  });
+
+  it('keeps model path blank on first launch when config has no persisted model path', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'detect_backend') {
+        return Promise.resolve({
+          platform_label: 'macos',
+          preferred_mode: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
+        });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          active_relay_url: '',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '',
+          last_error: null,
+        });
+      }
+      if (command === 'inspect_model_artifact') {
+        return Promise.resolve({
+          canonical_family_url: 'https://example.test/models',
+          filename: 'model.gguf',
+          url: 'https://example.test/model.gguf',
+          models_dir: '/tmp',
+          resolved_model_path: 'C:\\Users\\dev\\Downloads\\model.gguf',
+          exists: false,
+          size_bytes: null,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<App />);
+    const modelInput = (await screen.findByLabelText('Model GGUF path')) as HTMLInputElement;
+    await waitFor(() => expect((modelInput as HTMLInputElement).value).toBe(''));
+    expect(
+      invokeMock.mock.calls.some(
+        (call) =>
+          call[0] === 'save_config' &&
+          typeof call[1]?.config?.model_path === 'string' &&
+          call[1].config.model_path.includes('C:\\Users\\dev')
+      )
+    ).toBe(false);
+  });
+
+  it('restores persisted user-selected model path from saved config', async () => {
+    render(<App />);
+    const modelInput = (await screen.findByLabelText('Model GGUF path')) as HTMLInputElement;
+    await waitFor(() => expect((modelInput as HTMLInputElement).value).toBe('/tmp/model.gguf'));
+  });
+
   it('surfaces bridge startup exits through compute_node_event errors', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_compute_node') {
@@ -249,7 +380,6 @@ describe('desktop app start failure handling', () => {
     const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
     await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
     fireEvent.click(startOperatorButton);
-    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
 
     const computeHandler = eventHandlers.get('compute_node_event');
     expect(computeHandler).toBeTruthy();

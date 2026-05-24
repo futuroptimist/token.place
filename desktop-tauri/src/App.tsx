@@ -95,6 +95,7 @@ export function App() {
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
@@ -113,13 +114,6 @@ export function App() {
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
 
-        if (loadedConfig.model_path.trim()) {
-          return;
-        }
-
-        const next = { ...loadedConfig, model_path: info.resolved_model_path };
-        await invoke('save_config', { config: next });
-        setConfig(next);
       } catch (e) {
         setError(formatErrorMessage(e));
       }
@@ -201,6 +195,18 @@ export function App() {
                 ? payload.message
                 : prev.last_error,
       }));
+      if (payload.type === 'started' || payload.type === 'error') {
+        setIsStartingComputeNode(false);
+      }
+      if (payload.type === 'error') {
+        const computeMessage =
+          typeof payload.last_error === 'string'
+            ? payload.last_error
+            : typeof payload.message === 'string'
+              ? payload.message
+              : 'compute-node operator failed';
+        setError(computeMessage);
+      }
     });
 
     return () => {
@@ -226,8 +232,8 @@ export function App() {
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running,
-    [config.model_path, computeStatus.running]
+    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode]
   );
   const availableBackend = backend?.available_backend ?? 'cpu';
   const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
@@ -310,10 +316,11 @@ export function App() {
 
   const startComputeNode = async () => {
     try {
+      setIsStartingComputeNode(true);
       setError('');
       setComputeStatus((prev) => ({
         ...prev,
-        running: true,
+        running: false,
         registered: false,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
@@ -333,6 +340,7 @@ export function App() {
         },
       });
     } catch (e) {
+      setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       setComputeStatus((prev) => ({
         ...prev,
@@ -371,9 +379,10 @@ export function App() {
     <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
       <h1>token.place desktop compute node</h1>
       <p>Platform GPU availability: <strong>{backend?.availability_label ?? 'loading...'}</strong></p>
-      <label>Model GGUF path</label>
+      <label htmlFor="model-path-input">Model GGUF path</label>
       <div style={{ display: 'flex', gap: 8 }}>
         <input
+          id="model-path-input"
           value={config.model_path}
           style={{ width: '100%' }}
           onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
@@ -433,7 +442,12 @@ export function App() {
         <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
-          <button disabled={!computeStatus.running} onClick={stopComputeNode}>Stop operator</button>
+          <button
+            disabled={!computeStatus.running}
+            onClick={stopComputeNode}
+          >
+            Stop operator
+          </button>
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>

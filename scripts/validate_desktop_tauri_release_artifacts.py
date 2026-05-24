@@ -5,13 +5,14 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import plistlib
 import subprocess
 import tempfile
 from pathlib import Path
 
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
-DMG_PREVIEW_README_NAMES = ("README BEFORE OPENING.txt", "README-macos-apple-silicon-preview.txt")
+DMG_PREVIEW_README_NAMES = ("README BEFORE OPENING.txt",)
 DMG_PREVIEW_REQUIRED_PHRASES = (
     "ad-hoc signed",
     "not notarized",
@@ -49,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _validate_dmg_contents(dmg_path: Path) -> None:
-    if os.uname().sysname != "Darwin":
+    if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
     with tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-") as mount_dir:

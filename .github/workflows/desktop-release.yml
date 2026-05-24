@@ -301,7 +301,7 @@ jobs:
               printf '%s\n' \
                 "token.place desktop macOS Apple Silicon preview build" \
                 "" \
-                "This preview build is ad-hoc signed and not notarized for public Gatekeeper trust." \
+                "This preview build is signed with the configured Apple identity but not notarized for public Gatekeeper trust." \
                 "Even with CI signing credentials, this workflow does not perform Developer ID notarization." \
                 "The first normal double-click may show:" \
                 "\"Apple could not verify \\\"token.place desktop\\\" is free of malware.\"" \

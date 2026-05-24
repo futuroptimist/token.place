@@ -79,7 +79,7 @@ def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
     assert 'preview_notice_name="README BEFORE OPENING.txt"' in text
     assert 'README-macos-apple-silicon-preview.txt' in text
     assert 'This preview build is ad-hoc signed and not notarized.' in text
-    assert 'This preview build is ad-hoc signed and not notarized for public Gatekeeper trust.' in text
+    assert 'This preview build is signed with the configured Apple identity but not notarized for public Gatekeeper trust.' in text
     assert 'Apple could not verify' in text
     assert 'token.place desktop' in text
     assert 'click Done' in text
@@ -97,6 +97,7 @@ def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     assert 'token.place-desktop-<version>-apple-silicon.dmg' in text
     assert 'DMG_PREVIEW_README_NAMES' in text
     assert 'DMG_PREVIEW_REQUIRED_PHRASES' in text
+    assert 'platform.system()' in text
     assert 'hdiutil' in text
 
 

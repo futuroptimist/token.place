@@ -99,6 +99,15 @@ def test_get_model_manager_reports_missing_dependency(capsys):
     assert capsys.readouterr().out.strip() == ''
 
 
+
+
+def test_fallback_model_metadata_uses_platform_specific_models_dir(monkeypatch):
+    monkeypatch.delenv('TOKEN_PLACE_MODELS_DIR', raising=False)
+    monkeypatch.setattr(model_bridge, 'sys', SimpleNamespace(platform='linux'))
+    monkeypatch.setattr(model_bridge, 'os', SimpleNamespace(name='posix', environ={}))
+    payload = model_bridge._fallback_model_metadata()
+    assert '/Library/Application Support/' not in payload['models_dir']
+
 def test_get_model_manager_treats_optional_import_failure_as_nonfatal_for_inspect(capsys):
     real_import = __import__
 

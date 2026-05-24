@@ -20,8 +20,22 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__)
 
+def _default_models_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "token.place" / "models"
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "token.place" / "models"
+        return Path.home() / "AppData" / "Roaming" / "token.place" / "models"
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home) / "token.place" / "models"
+    return Path.home() / ".local" / "share" / "token.place" / "models"
+
+
 def _fallback_model_metadata() -> Dict[str, Any]:
-    models_dir = Path.home() / "Library" / "Application Support" / "token.place" / "models"
+    models_dir = _default_models_dir()
     models_dir_override = os.environ.get("TOKEN_PLACE_MODELS_DIR")
     if models_dir_override:
         models_dir = Path(models_dir_override)

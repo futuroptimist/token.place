@@ -140,6 +140,43 @@ def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
     assert 'Missing Python dependency for model downloads' in response['error']
 
 
+def test_inspect_does_not_treat_nonoptional_dependency_as_nonfatal(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError("No module named 'requests'", name='requests')
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.inspect_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert "No module named 'requests'" in response['error']
+
+
+def test_optional_missing_requires_direct_module_error_message(capsys):
+    real_import = __import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == 'utils.llm.model_manager':
+            raise ModuleNotFoundError(
+                "No module named 'urllib3.contrib'",
+                name='urllib3.contrib',
+            )
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch('builtins.__import__', side_effect=_fake_import):
+        status = model_bridge.inspect_model()
+
+    assert status == 1
+    response = json.loads(capsys.readouterr().out.strip())
+    assert response['ok'] is False
+    assert "No module named 'urllib3.contrib'" in response['error']
+
+
 def test_main_dispatches_inspect_action():
     with patch.object(model_bridge.argparse.ArgumentParser, 'parse_args', return_value=SimpleNamespace(action='inspect')):
         with patch.object(model_bridge, 'inspect_model', return_value=0) as inspect_model:

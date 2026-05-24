@@ -145,6 +145,24 @@ def test_get_model_manager_treats_optional_import_failure_as_nonfatal_for_inspec
     assert capsys.readouterr().out.strip() == ''
 
 
+def test_is_inspect_optional_missing_matches_exception_name():
+    assert model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'psutil'", name='psutil')
+    )
+    assert not model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'requests'", name='requests')
+    )
+
+
+def test_is_inspect_optional_missing_matches_message_when_name_absent():
+    assert model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'urllib3'")
+    )
+    assert not model_bridge._is_inspect_optional_missing(
+        ModuleNotFoundError("No module named 'dotenv'")
+    )
+
+
 def test_download_does_not_treat_optional_dependency_as_nonfatal(capsys):
     real_import = __import__
 

@@ -442,7 +442,12 @@ export function App() {
         <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
-          <button disabled={!computeStatus.running} onClick={stopComputeNode}>Stop operator</button>
+          <button
+            disabled={!computeStatus.running && !isStartingComputeNode}
+            onClick={stopComputeNode}
+          >
+            Stop operator
+          </button>
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>

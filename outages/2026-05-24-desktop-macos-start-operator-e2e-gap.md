@@ -45,6 +45,13 @@ without a visible UI error.
 - Updated desktop UI e2e to verify blank initial path and running-state stability.
 
 ## Follow-up
-- Keep macOS desktop UI e2e in CI coverage where runner capacity permits; if execution scope
-  changes, preserve the stability assertion and blank-initial-path check in whichever workflow owns
-  desktop operator verification.
+- Current CI limitation: `.github/workflows/desktop-operator-e2e.yml` runs
+  `test_desktop_operator_ui_e2e.py` only on Linux because it depends on `tauri-driver` +
+  WebKitGTK/Xvfb orchestration that is currently provisioned only in the Ubuntu job.
+- Strongest automated macOS substitute currently in CI is
+  `desktop-operator-packaged-e2e-macos`, which runs
+  `desktop-tauri/scripts/test_packaged_operator_e2e.py` (including inspect-only and full packaged
+  bridge coverage) to validate macOS operator startup/bridge behavior.
+- When macOS Tauri UI WebDriver plumbing is added to CI, add an explicit macOS job for
+  `test_desktop_operator_ui_e2e.py` without weakening the blank-initial-path or running-stability
+  assertions.

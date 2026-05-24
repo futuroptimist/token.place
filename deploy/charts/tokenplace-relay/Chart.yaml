@@ -1,6 +1,6 @@
 apiVersion: v2
 name: tokenplace-relay
-description: Helm chart for deploying the token.place relay service
+description: DEPRECATED: use charts/tokenplace (canonical token.place relay chart)
 version: 0.1.0
 appVersion: "0.1.0"
 type: application

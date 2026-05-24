@@ -74,14 +74,6 @@ def inspect_model() -> int:
 def download_model() -> int:
     manager, error_status = _get_model_manager()
     if error_status is not None:
-        if error_status.get("ok") and error_status.get("payload") is not None:
-            return _response(
-                False,
-                error=(
-                    "Local model download unavailable in this packaged runtime because "
-                    "required optional download dependencies are missing."
-                ),
-            )
         return _response(**error_status)
 
     if not manager.download_model_if_needed():

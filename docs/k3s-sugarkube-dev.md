@@ -34,10 +34,10 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 
 ```bash
 # Run from sugarkube checkout.
-just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA set=image.repository=ghcr.io/futuroptimist/tokenplace-relay
 
 # Upgrade existing release.
-just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace-relay namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace-relay.values.dev.yaml default_tag=main-REPLACE_SHORTSHA set=image.repository=ghcr.io/futuroptimist/tokenplace-relay
 ```
 
 ## Validation checklist

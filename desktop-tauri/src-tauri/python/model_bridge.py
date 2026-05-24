@@ -79,7 +79,7 @@ def _response(ok: bool, *, payload: Dict[str, Any] | None = None, error: str = "
     return 0 if ok else 1
 
 
-_INSPECT_OPTIONAL_IMPORTS = {"psutil", "urllib3"}
+_INSPECT_OPTIONAL_IMPORTS = {"psutil", "urllib3", "requests", "dotenv"}
 
 
 def _is_inspect_optional_missing(exc: ModuleNotFoundError) -> bool:

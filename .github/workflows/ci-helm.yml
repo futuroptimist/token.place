@@ -1,0 +1,130 @@
+name: Publish Helm chart
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to publish
+        required: false
+        default: main
+
+jobs:
+  validate:
+    name: Lint, render, and package chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      chart_version: ${{ steps.chart.outputs.chart_version }}
+      chart_name: ${{ steps.chart.outputs.chart_name }}
+      chart_package: ${{ steps.package.outputs.chart_package }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Capture chart metadata
+        id: chart
+        run: |
+          set -euo pipefail
+          chart_name="$(helm show chart charts/tokenplace | awk -F': ' '/^name:/{print $2}')"
+          chart_version="$(helm show chart charts/tokenplace | awk -F': ' '/^version:/{print $2}')"
+          echo "chart_name=${chart_name}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${chart_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build chart dependencies (if lockfile exists)
+        if: ${{ hashFiles('charts/tokenplace/Chart.lock') != '' }}
+        run: helm dependency build charts/tokenplace
+
+      - name: Lint chart
+        run: helm lint charts/tokenplace
+
+      - name: Render staging-like template smoke test
+        run: |
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set ingress.enabled=true \
+            --set ingress.host=staging.token.place \
+            --set image.tag=main-deadbee
+
+      - name: Package chart
+        id: package
+        run: |
+          set -euo pipefail
+          package_output="$(helm package charts/tokenplace --destination .)"
+          echo "${package_output}"
+          chart_package="$(printf '%s' "${package_output}" | awk -F': ' '/Successfully packaged chart and saved it to:/{print $2}')"
+          echo "chart_package=${chart_package}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish validation summary
+        run: |
+          {
+            echo "## Helm chart validation"
+            echo ""
+            echo "Chart: \`${{ steps.chart.outputs.chart_name }}\`"
+            echo "Version: \`${{ steps.chart.outputs.chart_version }}\`"
+            echo "Package: \`${{ steps.package.outputs.chart_package }}\`"
+            echo "Publish event: \`${{ github.event_name != 'pull_request' && 'yes' || 'no' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish chart to GHCR OCI
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build chart dependencies (if lockfile exists)
+        if: ${{ hashFiles('charts/tokenplace/Chart.lock') != '' }}
+        run: helm dependency build charts/tokenplace
+
+      - name: Package chart
+        run: helm package charts/tokenplace --destination .
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push chart to GHCR OCI
+        id: push
+        run: |
+          set -euo pipefail
+          chart_ref_base="oci://ghcr.io/futuroptimist/charts"
+          chart_package="tokenplace-${{ needs.validate.outputs.chart_version }}.tgz"
+          helm push "${chart_package}" "${chart_ref_base}"
+          full_ref="${chart_ref_base}/${{ needs.validate.outputs.chart_name }}:${{ needs.validate.outputs.chart_version }}"
+          echo "full_ref=${full_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish chart reference summary
+        run: |
+          {
+            echo "## Helm chart published"
+            echo ""
+            echo "Reference: \`${{ steps.push.outputs.full_ref }}\`"
+            echo "Chart: \`${{ needs.validate.outputs.chart_name }}\`"
+            echo "Version: \`${{ needs.validate.outputs.chart_version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

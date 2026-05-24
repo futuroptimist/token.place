@@ -497,6 +497,13 @@ def main() -> int:
         driver = start_driver(app_binary)
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
+        initial_model_input = driver.find_element(
+            By.XPATH,
+            "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
+        )
+        assert initial_model_input.get_attribute("value") == "", (
+            "first-launch model path must be blank before user selection"
+        )
 
         runtime_resolved_path = read_runtime_resolved_path(driver)
         with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
@@ -528,6 +535,14 @@ def main() -> int:
                 "//p[contains(.,'Registered:')]//strong[normalize-space()='yes']",
             )
         )
+        time.sleep(2)
+        assert (
+            driver.find_element(
+                By.XPATH,
+                "//p[contains(.,'Running:')]//strong",
+            ).text.strip().lower()
+            == "yes"
+        ), "operator running state did not remain stable after startup"
 
         prompt = driver.find_element(
             By.XPATH,

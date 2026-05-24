@@ -23,6 +23,73 @@ describe('desktop app start failure handling', () => {
     cleanup();
   });
 
+  it('keeps model path blank on first launch when config has no saved model path', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      return Promise.resolve(
+        command === 'detect_backend'
+          ? {
+              platform_label: 'macos',
+              preferred_mode: 'auto',
+              available_backend: 'metal',
+              availability_label: 'Metal-capable platform (Apple Silicon)',
+            }
+          : command === 'get_compute_node_status'
+            ? {
+                running: false,
+                registered: false,
+                active_relay_url: '',
+                requested_mode: 'auto',
+                effective_mode: 'cpu',
+                backend_available: 'unknown',
+                backend_selected: 'cpu',
+                backend_used: 'cpu',
+                fallback_reason: null,
+                model_path: '',
+                last_error: null,
+              }
+            : {
+                canonical_family_url: 'https://example.test/models',
+                filename: 'model.gguf',
+                url: 'https://example.test/model.gguf',
+                models_dir: '/tmp',
+                resolved_model_path: '/tmp/runtime-default.gguf',
+                exists: false,
+                size_bytes: null,
+              }
+      );
+    });
+
+    render(<App />);
+    const modelInput = document.querySelectorAll('input')[0] as HTMLInputElement | undefined;
+    expect(modelInput).toBeTruthy();
+    if (!modelInput) {
+      return;
+    }
+    expect(modelInput.value).toBe('');
+    expect(
+      invokeMock.mock.calls.some(
+        (args) => args[0] === 'save_config' && args[1]?.config?.model_path === '/tmp/runtime-default.gguf'
+      )
+    ).toBe(false);
+  });
+
+  it('restores persisted model path when previously saved by the user', async () => {
+    render(<App />);
+    const modelInput = document.querySelectorAll('input')[0] as HTMLInputElement | undefined;
+    expect(modelInput).toBeTruthy();
+    if (!modelInput) {
+      return;
+    }
+    await waitFor(() => expect(modelInput.value).toBe('/tmp/model.gguf'));
+  });
+
   beforeEach(() => {
     invokeMock.mockReset();
     listenMock.mockReset();
@@ -249,10 +316,17 @@ describe('desktop app start failure handling', () => {
     const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
     await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
     fireEvent.click(startOperatorButton);
-    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
-
     const computeHandler = eventHandlers.get('compute_node_event');
     expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        last_error: null,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     computeHandler?.({
       payload: {
         type: 'error',

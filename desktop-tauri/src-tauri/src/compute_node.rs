@@ -438,7 +438,7 @@ pub async fn start_compute_node(
             *stdin_slot = pending_stdin.take();
             let mut status = state.status.lock().await;
             *status = ComputeNodeStatus {
-                running: true,
+                running: false,
                 registered: false,
                 active_relay_url: request.relay_base_url.clone(),
                 requested_mode: format!("{:?}", request.mode).to_lowercase(),

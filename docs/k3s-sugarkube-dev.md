@@ -22,19 +22,22 @@ Keep dev aligned with the same relay-only contract used for staging/prod:
 
 > These commands run from a **Sugarkube checkout**, not from token.place.
 >
-> `docs/examples/tokenplace.values.dev.yaml` and `docs/apps/tokenplace.version` are
-> **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
+> Use Sugarkube-owned dev inputs that exist in your checkout.
+>
+> Required before running commands:
+> - `<DEV_VALUES_FILE>` (dev values file path)
+> - either `<VERSION_FILE>` or an explicit `version=`/`tag=` argument
 
 First install:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> version_file=<VERSION_FILE> default_tag=main-REPLACE_SHORTSHA
 ```
 
 Upgrade existing release:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> version_file=<VERSION_FILE> default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist
@@ -42,10 +45,12 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
-curl -fsS https://staging.token.place/livez
-curl -fsS https://staging.token.place/healthz
-curl -fsS https://staging.token.place/
+curl -fsS https://<DEV_HOST>/livez
+curl -fsS https://<DEV_HOST>/healthz
+curl -fsS https://<DEV_HOST>/
 ```
+
+Use the actual dev ingress host for `<DEV_HOST>` (do not validate against staging).
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
 E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.

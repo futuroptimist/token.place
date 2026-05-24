@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -45,10 +46,43 @@ def _get_model_manager():
     return get_model_manager(), None
 
 
+def _fallback_model_metadata() -> Dict[str, Any]:
+    """Build model metadata without importing heavy optional download dependencies."""
+    from config import get_config  # lazy import to preserve script bootstrap behavior
+
+    cfg = get_config()
+    filename = cfg.get("model.filename", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf")
+    url = cfg.get(
+        "model.url",
+        (
+            "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/"
+            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        ),
+    )
+    canonical_family_url = cfg.get(
+        "model.canonical_family_url", "https://huggingface.co/meta-llama/Meta-Llama-3-8B"
+    )
+    models_dir = cfg.get("paths.models_dir")
+    resolved_model_path = os.path.join(models_dir, filename)
+    exists = os.path.exists(resolved_model_path)
+    return {
+        "canonical_family_url": canonical_family_url,
+        "filename": filename,
+        "url": url,
+        "models_dir": models_dir,
+        "resolved_model_path": resolved_model_path,
+        "exists": exists,
+        "size_bytes": os.path.getsize(resolved_model_path) if exists else None,
+    }
+
+
 def inspect_model() -> int:
     manager, error_status = _get_model_manager()
     if error_status is not None:
-        return error_status
+        return _response(
+            True,
+            payload=_fallback_model_metadata(),
+        )
     return _response(True, payload=manager.get_model_artifact_metadata())
 
 

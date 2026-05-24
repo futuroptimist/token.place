@@ -91,6 +91,36 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
+        model_bridge_script = bridge_script.parent / "model_bridge.py"
+
+        model_probe_env = env.copy()
+        model_probe_env["PYTHONNOUSERSITE"] = "1"
+        model_probe = subprocess.run(
+            [sys.executable, str(model_bridge_script), "inspect"],
+            cwd=tmpdir,
+            env=model_probe_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if model_probe.returncode != 0:
+            raise RuntimeError(
+                "packaged model bridge inspect failed unexpectedly: "
+                f"stdout={model_probe.stdout} stderr={model_probe.stderr}"
+            )
+        combined_probe_output = f"{model_probe.stdout}\n{model_probe.stderr}"
+        forbidden_fragments = (
+            "Missing Python dependency for model downloads",
+            "No module named 'psutil'",
+            "No module named \"psutil\"",
+            "NotOpenSSLWarning",
+        )
+        for fragment in forbidden_fragments:
+            if fragment in combined_probe_output:
+                raise RuntimeError(
+                    "packaged model bridge startup emitted dependency/runtime warning: "
+                    f"{fragment}; output={combined_probe_output}"
+                )
 
         relay = subprocess.Popen(  # noqa: S603
             [

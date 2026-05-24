@@ -38,9 +38,27 @@ def test_inspect_returns_shared_model_manager_metadata(capsys):
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': True, 'payload': metadata}
 
 
-def test_inspect_returns_bridge_error_when_manager_init_fails(capsys):
+def test_inspect_returns_fallback_metadata_when_manager_init_fails(capsys):
+    fallback_metadata = {
+        'canonical_family_url': 'https://example.com/family',
+        'filename': 'fallback.gguf',
+        'url': 'https://example.com/fallback.gguf',
+        'models_dir': '/tmp/models',
+        'resolved_model_path': '/tmp/models/fallback.gguf',
+        'exists': False,
+        'size_bytes': None,
+    }
+    with patch.object(model_bridge, '_fallback_model_metadata', return_value=fallback_metadata):
+        with patch.object(model_bridge, '_get_model_manager', return_value=(None, 1)):
+            status = model_bridge.inspect_model()
+
+    assert status == 0
+    assert json.loads(capsys.readouterr().out.strip()) == {'ok': True, 'payload': fallback_metadata}
+
+
+def test_download_returns_bridge_error_when_manager_init_fails(capsys):
     with patch.object(model_bridge, '_get_model_manager', return_value=(None, 1)):
-        status = model_bridge.inspect_model()
+        status = model_bridge.download_model()
 
     assert status == 1
     assert capsys.readouterr().out.strip() == ''

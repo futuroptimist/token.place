@@ -55,3 +55,25 @@ def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     assert 'CFBundleDisplayName' in text
     assert 'CFBundleExecutable' in text
     assert 'token.place-desktop-<version>-apple-silicon.dmg' in text
+
+
+def test_workflow_has_adhoc_signing_fallback_without_paid_secrets() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert "export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" in text
+    assert 'using ad-hoc signing for preview/dev-only macOS artifacts' in text
+
+
+def test_workflow_does_not_require_notarization_or_paid_secrets_for_artifact_generation() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed' in text
+    assert 'skip' in text.lower()
+    assert '--expect-notarization' not in text
+
+
+def test_workflow_emits_macos_preview_warning_asset() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'README-macos-apple-silicon-preview.txt' in text
+    assert 'ad-hoc signed and is not notarized' in text
+    assert 'Apple could not verify' in text
+    assert 'System Settings → Privacy & Security' in text
+    assert 'Developer ID + notarization path' in text

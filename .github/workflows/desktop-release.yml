@@ -297,6 +297,25 @@ jobs:
               echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
               exit 1
             fi
+
+            cat > release-artifacts/README-macos-apple-silicon-preview.txt <<'EOF'
+            token.place desktop macOS Apple Silicon preview build
+
+            This preview DMG is ad-hoc signed and is not notarized.
+            Because it is not notarized, macOS Gatekeeper may show warnings such as
+            “Apple could not verify "token.place desktop" is free of malware...”
+            after download from browser/GitHub.
+
+            This warning is expected for unpaid/ad-hoc preview distribution without
+            a paid Apple Developer Program Developer ID + notarization path.
+
+            If you trust this release and its published checksums, you can open manually:
+            1) Control-click (or right-click) token.place desktop.app and choose Open.
+            2) If macOS still blocks first launch, open System Settings → Privacy & Security,
+               then allow/open the app from the security prompt.
+
+            Only install and run this preview build when you trust the source and checksums.
+            EOF
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/release/bundle/nsis"
             msi_dir="src-tauri/target/release/bundle/msi"

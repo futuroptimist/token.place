@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-24",
+  "slug": "desktop-release-ad-hoc-macos-gatekeeper-warning",
+  "summary": "Correct Tauri Apple Silicon DMGs still showed expected macOS Gatekeeper verification warnings under ad-hoc/non-notarized preview distribution.",
+  "impact": "Users could interpret expected Gatekeeper warnings as a packaging defect unless preview behavior and manual-open steps were explicitly documented.",
+  "fix": "Preserved ad-hoc fallback, added a release warning text asset, and documented manual-open expectations while retaining deterministic Tauri/icon/architecture/stale-marker validations.",
+  "lessons": "Artifact correctness and trust-readiness are separate concerns; preview releases must clearly label non-notarized behavior and user-open steps."
+}

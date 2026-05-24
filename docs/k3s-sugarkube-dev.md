@@ -1,7 +1,7 @@
 # token.place relay on k3s+sugarkube (dev)
 
 > **Environment status:** **Planned / active development target**.
-> Focus is relay-only deployment; compute nodes stay external in this phase.
+> Keep dev secondary to staging/prod and limited to relay-only validation.
 
 ## Scope
 
@@ -21,23 +21,23 @@ Deploy `relay.py` to the sugarkube dev environment for iterative validation of:
 ## Topology
 
 - In-cluster: `relay.py` deployment + service + ingress
-- External: `server.py` and/or desktop compute nodes using legacy relay contract
-  - Typical external operators: Windows 11 CUDA or macOS Apple Silicon Metal; CPU fallback valid.
+- External: `server.py` and/or desktop compute nodes (Windows/macOS/Raspberry Pi)
+  - No required in-cluster backend/GPU service.
 
 ## Release model
 
 - Use mutable dev tags for fast iteration when needed.
 - Prefer pinned immutable tags before promotion to staging.
-- If token.place-specific `just` helpers are unavailable, run Helm commands directly and track
-  the missing automation as follow-up work.
+- Preserve API v1 relay-blind E2EE guardrails (relay handles ciphertext + routing metadata only).
 
 ## Deployment workflow (template)
 
 ```bash
-# TODO: replace with token.place-specific sugarkube wrapper once finalized.
-# Run from the repository root so ./deploy/charts/tokenplace-relay resolves.
-helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
-  --namespace tokenplace --create-namespace
+# Run from sugarkube checkout.
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+
+# Upgrade existing release.
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
 ```
 
 ## Validation checklist
@@ -50,7 +50,7 @@ helm upgrade --install tokenplace-relay ./deploy/charts/tokenplace-relay \
 
 ## Rollback
 
-Record the current revision before rollout (`helm history tokenplace-relay -n tokenplace`) so rollback targets are explicit.
+Record the current revision before rollout (`helm history tokenplace -n tokenplace`) so rollback targets are explicit.
 
 - Roll back to previous image tag and/or Helm revision.
 - Verify readiness and `/healthz` immediately after rollback.
@@ -59,4 +59,4 @@ Record the current revision before rollout (`helm history tokenplace-relay -n to
 
 - Keep this environment permissive for debugging, but avoid introducing config assumptions that
   cannot be promoted.
-- Legacy contract is expected here until post-parity API v1 migration.
+- Treat dev as relay-only: cluster runs `relay.py`; compute remains external.

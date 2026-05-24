@@ -377,6 +377,10 @@ class ModelManager:
         except Exception as e:
             self.log_error(f"Error during file download: {e}")
             return False
+        finally:
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
 
         if os.path.exists(file_path) and os.path.getsize(file_path) == total_size_in_bytes:
             self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")

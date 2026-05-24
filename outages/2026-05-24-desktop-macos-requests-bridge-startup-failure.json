@@ -3,18 +3,6 @@
   "slug": "desktop-macos-requests-bridge-startup-failure",
   "summary": "macOS desktop operator startup failed because bridge runtime imported modules with a hard requests dependency unavailable in packaged/clean Python.",
   "impact": "Start operator failed before stable startup; UI showed startup failure in Last error.",
-  "symptoms": [
-    "compute-node bridge exited before startup event",
-    "No module named 'requests' surfaced in startup error"
-  ],
-  "root_cause": "Import-time requests dependency in relay_client/model_manager on desktop bridge startup path.",
-  "why_missed": "Tests did not assert import-time startup dependency behavior when requests was absent.",
-  "fix": [
-    "Added utils/networking/http_requests_compat.py with stdlib urllib fallback",
-    "Updated relay_client.py and model_manager.py to import requests via compatibility layer",
-    "Added fallback regression test tests/unit/test_http_requests_compat.py"
-  ],
-  "follow_up": [
-    "Strengthen macOS desktop e2e CI startup checks in clean Python dependency conditions"
-  ]
+  "fix": "Added a requests compatibility shim with streaming support and routed bridge-startup imports through it so missing third-party requests no longer crashes bridge startup.",
+  "lessons": "Fallback shims must match all response features used by import-chain call sites (headers plus iter_content for model downloads) and outage JSON records must remain schema-compliant."
 }

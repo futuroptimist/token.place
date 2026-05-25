@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-25",
+  "slug": "desktop-macos-runtime-deps-and-relay-autostart-guard",
+  "summary": "Packaged-like macOS desktop launches could fail before bridge startup when psutil was missing from the resolved interpreter, and desktop coverage lacked explicit no-relay-autostart lifecycle guards.",
+  "impact": "Start operator could fail with an early bridge exit and desktop lifecycle regressions around unintended relay startup on localhost:5010 were not explicitly guarded.",
+  "fix": "Bundled a curated desktop runtime dependency manifest, added deterministic dependency bootstrap in desktop_runtime_setup for the chosen interpreter, made resource_monitor resilient to missing psutil, added static no-relay-autostart tests, and added a macOS lifecycle e2e guard script asserting no relay.py/localhost:5010 leakage after app close.",
+  "lessons": "Packaged desktop runtime dependencies must be app-owned and validated against the exact interpreter path with PYTHONNOUSERSITE semantics, and desktop lifecycle tests should explicitly guard against accidental local relay autostart."
+}

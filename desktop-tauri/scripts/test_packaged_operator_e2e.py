@@ -58,6 +58,7 @@ def create_packaged_layout(tmp_root: Path) -> Path:
         "inference_sidecar.py",
         "model_bridge.py",
         "path_bootstrap.py",
+        "requirements_desktop_runtime.txt",
     ):
         shutil.copy2(
             REPO_ROOT / "desktop-tauri" / "src-tauri" / "python" / filename,

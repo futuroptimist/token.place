@@ -17,7 +17,10 @@ def _gpu_headroom_multiplier(headroom_percent: float) -> float:
         percent = 0.0
     return 1.0 + (percent / 100.0 if percent > 1.0 else percent)
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:  # pragma: no cover - packaged probes can run without psutil installed
+    psutil = None
 
 
 GpuMetrics = Dict[str, float | int | bool]
@@ -166,6 +169,13 @@ def _cpu_interval_for_platform(platform: str) -> float | None:
 
 def collect_resource_usage() -> Dict[str, float | int | bool]:
     """Return current CPU, memory, and GPU utilisation metrics."""
+
+    if psutil is None:
+        return {
+            'cpu_percent': 0.0,
+            'memory_percent': 0.0,
+            **_collect_gpu_metrics(),
+        }
 
     interval = _cpu_interval_for_platform(sys.platform)
 

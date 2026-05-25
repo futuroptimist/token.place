@@ -36,6 +36,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
 INSTALL_ERROR_SUMMARY_MAX_LEN = 512
+DEPENDENCY_BOOTSTRAP_TIMEOUT_SECONDS = 300
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
@@ -441,11 +442,53 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
+def _resolve_desktop_runtime_requirements_path(target_root: Path) -> Path:
+    candidates = [
+        target_root / "python" / "requirements_desktop_runtime.txt",
+        target_root / "resources" / "python" / "requirements_desktop_runtime.txt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _ensure_desktop_runtime_dependencies(target_root: Path) -> tuple[bool, str, str]:
+    requirements_path = _resolve_desktop_runtime_requirements_path(target_root)
+    if not requirements_path.exists():
+        return True, "manifest_missing", f"desktop runtime requirements manifest not found at {requirements_path}"
+
+    cmd = [sys.executable, "-m", "pip", "install", "-r", str(requirements_path)]
+    ok, output = _run_pip_install(
+        cmd,
+        os.environ.copy(),
+        timeout_seconds=DEPENDENCY_BOOTSTRAP_TIMEOUT_SECONDS,
+    )
+    if ok:
+        return True, "installed", "desktop runtime dependencies available"
+    return False, "install_failed", _summarize_install_error(output)
+
+
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
     target_root = _resolve_runtime_root(repo_root=repo_root)
+    dep_ok, dep_action, dep_reason = _ensure_desktop_runtime_dependencies(target_root)
+    if not dep_ok:
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"desktop runtime dependency bootstrap failed (action={dep_action}, "
+                f"interpreter={sys.executable}): {dep_reason}"
+            ),
+            "runtime_action": "dependency_bootstrap_failed",
+            "detected_device": "cpu",
+            "interpreter": sys.executable,
+            "prefix": sys.prefix,
+            "interpreter_prefix": sys.prefix,
+            "llama_module_path": "unknown",
+        }
     before = _probe_runtime(target_root)
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {

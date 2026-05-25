@@ -240,14 +240,6 @@ def run(args: argparse.Namespace) -> int:
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
     )
-    repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
-        runtime_setup.get("llama_module_path", "")
-    )
-    print(
-        "desktop.runtime_setup.import_guard "
-        f"repo_llama_cpp_shim_imported={repo_llama_cpp_shim_imported}",
-        file=sys.stderr,
-    )
     dependency_setup = ensure_desktop_python_dependencies()
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
@@ -262,6 +254,14 @@ def run(args: argparse.Namespace) -> int:
             ),
         })
         return 1
+    repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
+        runtime_setup.get("llama_module_path", "")
+    )
+    print(
+        "desktop.runtime_setup.import_guard "
+        f"repo_llama_cpp_shim_imported={repo_llama_cpp_shim_imported}",
+        file=sys.stderr,
+    )
 
     gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
     if gpu_runtime_error:

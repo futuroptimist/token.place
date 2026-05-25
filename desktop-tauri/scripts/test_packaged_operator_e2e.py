@@ -55,9 +55,12 @@ def create_packaged_layout(tmp_root: Path) -> Path:
 
     for filename in (
         "compute_node_bridge.py",
+        "desktop_runtime_setup.py",
+        "desktop_gpu_packaging.py",
         "inference_sidecar.py",
         "model_bridge.py",
         "path_bootstrap.py",
+        "requirements_desktop_runtime.txt",
     ):
         shutil.copy2(
             REPO_ROOT / "desktop-tauri" / "src-tauri" / "python" / filename,
@@ -119,6 +122,21 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     forbidden_stderr_only = ["/Users/", "~/Library/Python"]
     for marker in forbidden_stderr_only:
         assert marker not in result.stderr, combined
+
+    check_imports = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            "import psutil,requests,dotenv; print('desktop-runtime-imports-ok')",
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check_imports.returncode == 0, f"{check_imports.stdout}\n{check_imports.stderr}"
+    assert "desktop-runtime-imports-ok" in check_imports.stdout
 
 
 
@@ -296,6 +314,15 @@ def main() -> int:
                 bridge.wait(timeout=15)
             if bridge.returncode != 0:
                 raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
+            forbidden_output = (
+                "No module named",
+                "ModuleNotFoundError",
+                "ImportError",
+                "compute-node bridge exited before emitting a startup event",
+                "desktop_runtime_setup module missing",
+            )
+            for marker in forbidden_output:
+                assert marker not in bridge_output, bridge_output
 
         finally:
             if bridge is not None and bridge.poll() is None:

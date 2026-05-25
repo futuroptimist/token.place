@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import socket
 import sys
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec
@@ -46,3 +47,18 @@ def test_requests_compat_exposes_expected_surface_without_requests(monkeypatch):
     assert hasattr(module.requests, "RequestException")
     assert hasattr(module.requests, "ConnectionError")
     assert hasattr(module.requests, "Timeout")
+
+
+def test_requests_compat_maps_direct_socket_timeout_to_timeout(monkeypatch):
+    module = importlib.import_module("utils.networking.http_requests_compat")
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(module.urllib_request, "urlopen", _raise_timeout)
+
+    try:
+        module.requests.get("https://example.test", timeout=0.01)
+        assert False, "expected timeout exception"
+    except module.requests.Timeout:
+        pass

@@ -105,6 +105,8 @@ def _request(
         if isinstance(reason, socket.timeout):
             raise Timeout(str(exc)) from exc
         raise ConnectionError(str(exc)) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise Timeout(str(exc)) from exc
 
 
 class _CompatRequests:

@@ -1728,7 +1728,6 @@ class RelayClient:
             try:
                 # Ping the relay and check for client requests
                 relay_response = self.ping_relay()
-                consecutive_failures = 0
 
                 # Validate the relay response contains expected fields
                 if not isinstance(relay_response, dict):

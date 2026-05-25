@@ -324,7 +324,16 @@ class ModelManager:
             bool: True if download was successful, False otherwise
         """
         chunk_size_bytes = chunk_size_mb * 1024 * 1024  # Convert MB to bytes
-        response = requests.get(url, stream=True, timeout=self.download_timeout)
+        response = None
+
+        try:
+            response = requests.get(url, stream=True, timeout=self.download_timeout)
+        except requests.Timeout as e:
+            self.log_error(f"Error: Download request timed out: {e}")
+            return False
+        except requests.RequestException as e:
+            self.log_error(f"Error: Unable to start download request: {e}")
+            return False
 
         if response.status_code != 200:
             self.log_error(f"Error: Unable to download file, status code {response.status_code}")
@@ -378,9 +387,10 @@ class ModelManager:
             self.log_error(f"Error during file download: {e}")
             return False
         finally:
-            close = getattr(response, 'close', None)
-            if callable(close):
-                close()
+            if response is not None:
+                close = getattr(response, 'close', None)
+                if callable(close):
+                    close()
 
         if os.path.exists(file_path) and os.path.getsize(file_path) == total_size_in_bytes:
             self.log_info(f"File Size Immediately After Download: {os.path.getsize(file_path)} bytes")

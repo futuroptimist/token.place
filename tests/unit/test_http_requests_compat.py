@@ -7,6 +7,7 @@ import socket
 import sys
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec
+from pathlib import Path
 
 
 class _RequestsImportBlocker(MetaPathFinder):
@@ -62,3 +63,28 @@ def test_requests_compat_maps_direct_socket_timeout_to_timeout(monkeypatch):
         assert False, "expected timeout exception"
     except module.requests.Timeout:
         pass
+
+
+def test_model_download_timeout_returns_false(monkeypatch, tmp_path: Path):
+    model_manager_module = importlib.import_module("utils.llm.model_manager")
+
+    class _Config:
+        is_production = False
+
+        def get(self, key, default=None):
+            values = {
+                "paths.models_dir": str(tmp_path),
+                "model.filename": "model.gguf",
+                "model.url": "https://example.test/model.gguf",
+                "model.download_chunk_size_mb": 1,
+                "model.download_timeout": 1,
+            }
+            return values.get(key, default)
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise model_manager_module.requests.Timeout("timed out")
+
+    monkeypatch.setattr(model_manager_module.requests, "get", _raise_timeout)
+    manager = model_manager_module.ModelManager(config=_Config())
+
+    assert manager.download_file_in_chunks(str(tmp_path / "model.gguf"), manager.url, 1) is False

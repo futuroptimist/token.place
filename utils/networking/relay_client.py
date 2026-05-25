@@ -29,6 +29,48 @@ def _load_jsonschema():
         ) from exc
 
 
+def _validate_with_fallback(instance: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """Validate JSON payloads even when jsonschema is unavailable in packaged runtimes."""
+    try:
+        jsonschema = _load_jsonschema()
+        try:
+            jsonschema.validate(instance=instance, schema=schema)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
+        return
+    except ModuleNotFoundError:
+        pass
+    except RuntimeError as exc:
+        if "jsonschema is required" not in str(exc):
+            raise
+    except AssertionError:
+        pass
+
+    if not isinstance(instance, dict):
+        raise ValueError("Payload must be an object")
+
+    required_fields = schema.get("required", [])
+    properties = schema.get("properties", {})
+    type_by_name = {
+        "string": str,
+        "number": (int, float),
+        "object": dict,
+    }
+
+    for field in required_fields:
+        if field not in instance:
+            raise ValueError(f"Missing required field: {field}")
+
+    for field, value in instance.items():
+        field_schema = properties.get(field)
+        if not field_schema:
+            continue
+        expected = field_schema.get("type")
+        expected_types = type_by_name.get(expected)
+        if expected_types is not None and not isinstance(value, expected_types):
+            raise ValueError(f"Invalid type for field '{field}': expected {expected}")
+
+
 def get_config_lazy():
     """Lazy import of config to avoid circular imports"""
     from config import get_config
@@ -650,8 +692,8 @@ class RelayClient:
 
                 relay_response = response.json()
                 try:
-                    _load_jsonschema().validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
-                except _load_jsonschema().exceptions.ValidationError as exc:
+                    _validate_with_fallback(relay_response, RELAY_RESPONSE_SCHEMA)
+                except ValueError as exc:
                     log_error("Invalid relay response format: {}", str(exc))
                     last_error = {
                         'error': f"Invalid response format: {str(exc)}",
@@ -1422,8 +1464,8 @@ class RelayClient:
         """
         try:
             try:
-                _load_jsonschema().validate(instance=request_data, schema=MESSAGE_SCHEMA)
-            except _load_jsonschema().exceptions.ValidationError as e:
+                _validate_with_fallback(request_data, MESSAGE_SCHEMA)
+            except ValueError as e:
                 log_error("Invalid request data format: {}", str(e))
                 return False
 
@@ -1518,8 +1560,8 @@ class RelayClient:
             }
 
             try:
-                _load_jsonschema().validate(instance=source_payload, schema=MESSAGE_SCHEMA)
-            except _load_jsonschema().exceptions.ValidationError as e:
+                _validate_with_fallback(source_payload, MESSAGE_SCHEMA)
+            except ValueError as e:
                 log_error("Invalid response payload format: {}", str(e))
                 return False
 

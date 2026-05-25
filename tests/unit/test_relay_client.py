@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
+from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
 
 # Common test data
@@ -35,6 +36,38 @@ TEST_ERROR_RESPONSE = {
 TEST_NO_REQUEST_RESPONSE = {
     'next_ping_in_x_seconds': 5
 }
+
+
+def test_validate_with_fallback_accepts_message_schema_without_jsonschema():
+    payload = {
+        "client_public_key": "abc",
+        "chat_history": "def",
+        "cipherkey": "ghi",
+        "iv": "jkl",
+    }
+
+    with patch.object(
+        relay_client_module,
+        "_load_jsonschema",
+        side_effect=RuntimeError("jsonschema is required for relay schema validation at runtime"),
+    ):
+        relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
+
+
+def test_validate_with_fallback_rejects_missing_required_field_without_jsonschema():
+    payload = {
+        "client_public_key": "abc",
+        "chat_history": "def",
+        "cipherkey": "ghi",
+    }
+
+    with patch.object(
+        relay_client_module,
+        "_load_jsonschema",
+        side_effect=RuntimeError("jsonschema is required for relay schema validation at runtime"),
+    ):
+        with pytest.raises(ValueError, match="Missing required field: iv"):
+            relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
 
 # Create a better time mock with a context manager
 class TimeMock:
@@ -2250,7 +2283,7 @@ class TestRelayClient:
         call = mock_post.call_args
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
-    @patch('utils.networking.relay_client.jsonschema.validate', side_effect=jsonschema.exceptions.ValidationError("bad"))
+    @patch('utils.networking.relay_client._validate_with_fallback', side_effect=ValueError("bad"))
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_invalid_payload(self, mock_post, mock_validate, relay_client):
         """Handle schema validation error for outgoing payload."""

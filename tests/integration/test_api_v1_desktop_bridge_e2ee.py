@@ -17,6 +17,7 @@ import relay
 from api.v1 import compute_provider, routes
 from api.v1.encryption import EncryptionManager, encryption_manager
 from utils.crypto.crypto_manager import CryptoManager
+from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient
 
 
@@ -173,6 +174,7 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
 
     observed_posts = []
     real_request = requests.sessions.Session.request
+    real_relay_post = relay_client_module.requests.post
 
     def guard_legacy_requests(self, method, url, **kwargs):
         path = urlparse(url).path
@@ -185,7 +187,19 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
             observed_posts.append((path, kwargs.get("json")))
         return real_request(self, method, url, **kwargs)
 
+    def guard_relay_client_post(url, *args, **kwargs):
+        path = urlparse(url).path
+        if any(fragment in path for fragment in LEGACY_ROUTE_FRAGMENTS):
+            raise AssertionError(f"legacy/API v2 route used in API v1 bridge: {path}")
+        if path in {
+            "/api/v1/relay/requests",
+            "/api/v1/relay/responses",
+        }:
+            observed_posts.append((path, kwargs.get("json")))
+        return real_relay_post(url, *args, **kwargs)
+
     monkeypatch.setattr(requests.sessions.Session, "request", guard_legacy_requests)
+    monkeypatch.setattr(relay_client_module.requests, "post", guard_relay_client_post)
 
     with live_relay_server() as base_url:
         monkeypatch.setattr(

@@ -191,3 +191,34 @@ def test_requests_compat_maps_urlerror_to_connection_error(monkeypatch):
         assert False, "expected connection error"
     except module.requests.ConnectionError:
         pass
+
+
+def test_requests_compat_iter_content_from_buffer_and_iter_lines():
+    module = importlib.import_module("utils.networking.http_requests_compat")
+    response = module._Response(status_code=200, _body=b"line1\nline2\n")
+
+    assert list(response.iter_content(chunk_size=0)) == [
+        b"l",
+        b"i",
+        b"n",
+        b"e",
+        b"1",
+        b"\n",
+        b"l",
+        b"i",
+        b"n",
+        b"e",
+        b"2",
+        b"\n",
+    ]
+    assert list(response.iter_lines()) == [b"line1", b"line2"]
+
+
+def test_requests_compat_normalize_headers_none_and_plain_text():
+    module = importlib.import_module("utils.networking.http_requests_compat")
+
+    class _NoHeaders:
+        pass
+
+    assert module._normalize_headers(_NoHeaders()) == {}
+    assert module._Response(status_code=200, _body=b"ok").text == "ok"

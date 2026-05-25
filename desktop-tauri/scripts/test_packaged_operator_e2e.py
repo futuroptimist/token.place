@@ -121,6 +121,41 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
         assert marker not in result.stderr, combined
 
 
+
+def run_compute_bridge_import_probe(tmp_root: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("PYTHONPATH", None)
+
+    compute_bridge = tmp_root / "resources" / "python" / "compute_node_bridge.py"
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib.util, pathlib; "
+                "path = pathlib.Path(r'" + str(compute_bridge) + "'); "
+                "spec = importlib.util.spec_from_file_location('compute_node_bridge_probe', path); "
+                "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+
+    forbidden_any_output = [
+        "No module named 'requests'",
+        "ModuleNotFoundError",
+        "ImportError",
+    ]
+    for marker in forbidden_any_output:
+        assert marker not in combined, combined
+
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
     if not hasattr(stdout, "readline"):
         return
@@ -141,6 +176,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
         run_model_bridge_inspect_probe(Path(tmpdir))
+        run_compute_bridge_import_probe(Path(tmpdir))
 
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0

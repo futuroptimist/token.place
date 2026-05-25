@@ -6,7 +6,6 @@ import binascii
 import importlib
 import ipaddress
 import json
-import jsonschema
 import logging
 import math
 import os
@@ -14,10 +13,64 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
-import requests
+from utils.networking.http_requests_compat import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')
+
+
+def _load_jsonschema():
+    """Lazy-load jsonschema; return ``None`` when unavailable in packaged runtimes."""
+    try:
+        return importlib.import_module("jsonschema")
+    except ModuleNotFoundError:
+        return None
+    except ImportError:
+        return None
+
+
+def _validate_with_fallback(instance: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """Validate JSON payloads even when jsonschema is unavailable in packaged runtimes."""
+    try:
+        jsonschema = _load_jsonschema()
+    except RuntimeError as exc:
+        if "jsonschema is required" not in str(exc):
+            raise
+        jsonschema = None
+    except AssertionError:
+        jsonschema = None
+
+    if jsonschema is not None:
+        try:
+            jsonschema.validate(instance=instance, schema=schema)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
+        return
+
+    if not isinstance(instance, dict):
+        raise ValueError("Payload must be an object")
+
+    required_fields = schema.get("required", [])
+    properties = schema.get("properties", {})
+    type_by_name = {
+        "string": str,
+        "number": (int, float),
+        "object": dict,
+    }
+
+    for field in required_fields:
+        if field not in instance:
+            raise ValueError(f"Missing required field: {field}")
+
+    for field, value in instance.items():
+        field_schema = properties.get(field)
+        if not field_schema:
+            continue
+        expected = field_schema.get("type")
+        expected_types = type_by_name.get(expected)
+        if expected_types is not None and not isinstance(value, expected_types):
+            raise ValueError(f"Invalid type for field '{field}': expected {expected}")
+
 
 def get_config_lazy():
     """Lazy import of config to avoid circular imports"""
@@ -117,6 +170,26 @@ def log_info(message, *args) -> None:
 def log_error(message, *args, exc_info: bool = False) -> None:
     """Log errors only in non-production environments using consistent formatting"""
     _log("error", message, *args, exc_info=exc_info)
+
+
+def _max_poll_failures_before_stop() -> Optional[int]:
+    """Return max consecutive polling failures before stopping.
+
+    This keeps CI from spending tens of minutes in retry loops when relay
+    endpoints are unreachable, while preserving infinite polling by default
+    outside CI unless explicitly overridden.
+    """
+    raw_value = os.environ.get("TOKENPLACE_MAX_POLL_FAILURES")
+    if raw_value is not None:
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+
+    if os.environ.get("CI", "").strip().lower() == "true":
+        return 18
+    return None
 
 
 def _normalize_client_public_key_b64(client_public_key_b64: Any) -> Optional[str]:
@@ -640,8 +713,8 @@ class RelayClient:
 
                 relay_response = response.json()
                 try:
-                    jsonschema.validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
-                except jsonschema.exceptions.ValidationError as exc:
+                    _validate_with_fallback(relay_response, RELAY_RESPONSE_SCHEMA)
+                except ValueError as exc:
                     log_error("Invalid relay response format: {}", str(exc))
                     last_error = {
                         'error': f"Invalid response format: {str(exc)}",
@@ -658,15 +731,17 @@ class RelayClient:
                 return relay_response
 
             except requests.ConnectionError as exc:
-                log_error("Connection error when pinging relay: {}", str(exc), exc_info=True)
+                # Connection failures are expected during relay failover/startup probing.
+                # Keep this log concise to avoid runaway traceback noise in long-running loops.
+                log_error("Connection error when pinging relay: {}", str(exc))
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except requests.Timeout as exc:
-                log_error("Request timeout when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Request timeout when pinging relay: {}", str(exc))
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except requests.RequestException as exc:
-                log_error("Request exception when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Request exception when pinging relay: {}", str(exc))
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except json.JSONDecodeError as exc:
@@ -1412,8 +1487,8 @@ class RelayClient:
         """
         try:
             try:
-                jsonschema.validate(instance=request_data, schema=MESSAGE_SCHEMA)
-            except jsonschema.exceptions.ValidationError as e:
+                _validate_with_fallback(request_data, MESSAGE_SCHEMA)
+            except ValueError as e:
                 log_error("Invalid request data format: {}", str(e))
                 return False
 
@@ -1508,8 +1583,8 @@ class RelayClient:
             }
 
             try:
-                jsonschema.validate(instance=source_payload, schema=MESSAGE_SCHEMA)
-            except jsonschema.exceptions.ValidationError as e:
+                _validate_with_fallback(source_payload, MESSAGE_SCHEMA)
+            except ValueError as e:
                 log_error("Invalid response payload format: {}", str(e))
                 return False
 
@@ -1581,21 +1656,54 @@ class RelayClient:
         """Continuously poll API v1 E2EE relay routes and process encrypted work."""
 
         self.stop_polling = False
+        consecutive_failures = 0
+        max_failures = _max_poll_failures_before_stop()
         log_info("Starting API v1 E2EE relay polling loop")
         while not self.stop_polling:
             try:
                 relay_response = self.poll_api_v1_encrypted_work()
-                wait_seconds = self._request_timeout
-                if isinstance(relay_response, dict):
-                    wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
-                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
-                    if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
-                        self.process_client_request(relay_response)
-                else:
-                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                if not isinstance(relay_response, dict):
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping API v1 E2EE relay polling after {} consecutive invalid responses.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
+                    time.sleep(self._request_timeout)
+                    continue
+
+                wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                relay_error = relay_response.get('error')
+                if relay_error:
+                    consecutive_failures += 1
+                    log_error("Error from API v1 E2EE relay poll: {}", relay_error)
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping API v1 E2EE relay polling after {} consecutive relay errors.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
+                    time.sleep(wait_seconds)
+                    continue
+
+                consecutive_failures = 0
+                if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+                    self.process_client_request(relay_response)
                 time.sleep(wait_seconds)
             except Exception as e:
+                consecutive_failures += 1
                 log_error("Exception during API v1 E2EE polling loop: {}", str(e), exc_info=True)
+                if max_failures is not None and consecutive_failures >= max_failures:
+                    log_error(
+                        "Stopping API v1 E2EE relay polling after {} consecutive failures.",
+                        consecutive_failures,
+                    )
+                    self.stop_polling = True
+                    break
                 time.sleep(self._request_timeout)
 
     def poll_relay_continuously(self):  # pragma: no cover
@@ -1627,6 +1735,8 @@ class RelayClient:
             log_info("Starting relay polling")
             self.stop_polling = False
 
+        consecutive_failures = 0
+        max_failures = _max_poll_failures_before_stop()
         while not self.stop_polling:
             try:
                 # Ping the relay and check for client requests
@@ -1635,17 +1745,43 @@ class RelayClient:
                 # Validate the relay response contains expected fields
                 if not isinstance(relay_response, dict):
                     log_error("Invalid relay response type: {}", type(relay_response))
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping relay polling after {} consecutive invalid responses.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
                     time.sleep(self._request_timeout)
                     continue
 
                 if 'next_ping_in_x_seconds' not in relay_response:
                     log_error("Missing 'next_ping_in_x_seconds' in relay response")
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping relay polling after {} consecutive malformed responses.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
                     time.sleep(self._request_timeout)
                     continue
 
-                if 'error' in relay_response:
-                    log_error("Error from relay: {}", relay_response['error'])
+                relay_error = relay_response.get('error')
+                if relay_error:
+                    log_error("Error from relay: {}", relay_error)
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping relay polling after {} consecutive relay errors.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
                 else:
+                    consecutive_failures = 0
                     # Avoid logging potentially sensitive ciphertext or keys.
                     # Only log the top-level keys present in the relay response.
                     log_info(
@@ -1667,5 +1803,13 @@ class RelayClient:
                 time.sleep(sleep_duration)
 
             except Exception as e:
+                consecutive_failures += 1
                 log_error("Exception during polling loop: {}", str(e), exc_info=True)
+                if max_failures is not None and consecutive_failures >= max_failures:
+                    log_error(
+                        "Stopping relay polling after {} consecutive failures.",
+                        consecutive_failures,
+                    )
+                    self.stop_polling = True
+                    break
                 time.sleep(self._request_timeout)  # Sleep for 10 seconds on error

@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
+from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA
 
 # Common test data
@@ -35,6 +36,60 @@ TEST_ERROR_RESPONSE = {
 TEST_NO_REQUEST_RESPONSE = {
     'next_ping_in_x_seconds': 5
 }
+
+
+
+
+def test_load_jsonschema_returns_none_on_import_error(monkeypatch):
+    import importlib
+
+    def _raise_import_error(name: str):
+        raise ImportError("simulated transitive import failure")
+
+    monkeypatch.setattr(importlib, "import_module", _raise_import_error)
+    assert relay_client_module._load_jsonschema() is None
+
+
+def test_max_poll_failures_defaults_in_ci(monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.delenv("TOKENPLACE_MAX_POLL_FAILURES", raising=False)
+    assert relay_client_module._max_poll_failures_before_stop() == 18
+
+
+def test_max_poll_failures_honours_override(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_MAX_POLL_FAILURES", "3")
+    assert relay_client_module._max_poll_failures_before_stop() == 3
+
+def test_validate_with_fallback_accepts_message_schema_without_jsonschema():
+    payload = {
+        "client_public_key": "abc",
+        "chat_history": "def",
+        "cipherkey": "ghi",
+        "iv": "jkl",
+    }
+
+    with patch.object(
+        relay_client_module,
+        "_load_jsonschema",
+        side_effect=RuntimeError("jsonschema is required for relay schema validation at runtime"),
+    ):
+        relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
+
+
+def test_validate_with_fallback_rejects_missing_required_field_without_jsonschema():
+    payload = {
+        "client_public_key": "abc",
+        "chat_history": "def",
+        "cipherkey": "ghi",
+    }
+
+    with patch.object(
+        relay_client_module,
+        "_load_jsonschema",
+        side_effect=RuntimeError("jsonschema is required for relay schema validation at runtime"),
+    ):
+        with pytest.raises(ValueError, match="Missing required field: iv"):
+            relay_client_module._validate_with_fallback(payload, MESSAGE_SCHEMA)
 
 # Create a better time mock with a context manager
 class TimeMock:
@@ -2250,7 +2305,7 @@ class TestRelayClient:
         call = mock_post.call_args
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
 
-    @patch('utils.networking.relay_client.jsonschema.validate', side_effect=jsonschema.exceptions.ValidationError("bad"))
+    @patch('utils.networking.relay_client._validate_with_fallback', side_effect=ValueError("bad"))
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_invalid_payload(self, mock_post, mock_validate, relay_client):
         """Handle schema validation error for outgoing payload."""
@@ -2408,6 +2463,50 @@ class TestRelayClient:
         ]
         assert relay_client.stop_polling is True
 
+    @patch('utils.networking.relay_client._max_poll_failures_before_stop', return_value=2)
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work', return_value=False)
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_stops_after_invalid_responses(
+        self,
+        mock_sleep,
+        mock_poll,
+        _mock_max_failures,
+        relay_client,
+    ):
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        assert mock_poll.call_count == 2
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(relay_client._request_timeout)
+        assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client._max_poll_failures_before_stop', return_value=2)
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_stops_after_repeated_error_responses(
+        self,
+        mock_sleep,
+        mock_poll,
+        mock_process,
+        _mock_max_failures,
+        relay_client,
+    ):
+        mock_poll.side_effect = [
+            {"error": "HTTP 503", "next_ping_in_x_seconds": 0},
+            {"error": "HTTP 503", "next_ping_in_x_seconds": 0},
+        ]
+
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        assert mock_poll.call_count == 2
+        mock_process.assert_not_called()
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(0.0)
+        assert relay_client.stop_polling is True
+
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')
@@ -2518,4 +2617,46 @@ class TestRelayClient:
         mock_sleep.assert_called_once_with(relay_client._request_timeout)  # Direct check of sleep call
 
         # Verify that polling was stopped
+        assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_relay_continuously_stops_after_repeated_error_response(
+        self,
+        mock_sleep,
+        mock_ping,
+        relay_client,
+        monkeypatch,
+    ):
+        """Error-shaped responses should respect the consecutive failure cap."""
+        monkeypatch.setenv("TOKENPLACE_MAX_POLL_FAILURES", "2")
+        mock_ping.side_effect = [TEST_ERROR_RESPONSE, TEST_ERROR_RESPONSE]
+
+        relay_client.start()
+        relay_client.poll_relay_continuously()
+
+        assert mock_ping.call_count == 2
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(10)
+        assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_relay_continuously_stops_after_repeated_invalid_response(
+        self,
+        mock_sleep,
+        mock_ping,
+        relay_client,
+        monkeypatch,
+    ):
+        """Invalid sink payloads should respect the consecutive failure cap."""
+        monkeypatch.setenv("TOKENPLACE_MAX_POLL_FAILURES", "2")
+        mock_ping.side_effect = [{'invalid': 'response'}, {'invalid': 'response'}]
+
+        relay_client.start()
+        relay_client.poll_relay_continuously()
+
+        assert mock_ping.call_count == 2
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(relay_client._request_timeout)
         assert relay_client.stop_polling is True

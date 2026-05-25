@@ -2595,6 +2595,27 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_relay_continuously_stops_after_repeated_error_response(
+        self,
+        mock_sleep,
+        mock_ping,
+        relay_client,
+        monkeypatch,
+    ):
+        """Error-shaped responses should respect the consecutive failure cap."""
+        monkeypatch.setenv("TOKENPLACE_MAX_POLL_FAILURES", "2")
+        mock_ping.side_effect = [TEST_ERROR_RESPONSE, TEST_ERROR_RESPONSE]
+
+        relay_client.start()
+        relay_client.poll_relay_continuously()
+
+        assert mock_ping.call_count == 2
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(10)
+        assert relay_client.stop_polling is True
+
+    @patch('utils.networking.relay_client.RelayClient.ping_relay')
+    @patch('utils.networking.relay_client.time.sleep')
     def test_poll_relay_continuously_stops_after_repeated_invalid_response(
         self,
         mock_sleep,

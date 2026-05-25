@@ -1756,11 +1756,18 @@ class RelayClient:
                     time.sleep(self._request_timeout)
                     continue
 
-                consecutive_failures = 0
-
                 if 'error' in relay_response:
                     log_error("Error from relay: {}", relay_response['error'])
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping relay polling after {} consecutive relay errors.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
                 else:
+                    consecutive_failures = 0
                     # Avoid logging potentially sensitive ciphertext or keys.
                     # Only log the top-level keys present in the relay response.
                     log_info(

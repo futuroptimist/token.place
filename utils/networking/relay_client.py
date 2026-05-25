@@ -6,7 +6,6 @@ import binascii
 import importlib
 import ipaddress
 import json
-import jsonschema
 import logging
 import math
 import os
@@ -18,6 +17,17 @@ from utils.networking.http_requests_compat import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')
+
+
+def _load_jsonschema():
+    """Lazy-load jsonschema so bridge startup imports do not require it."""
+    try:
+        return importlib.import_module("jsonschema")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "jsonschema is required for relay schema validation at runtime"
+        ) from exc
+
 
 def get_config_lazy():
     """Lazy import of config to avoid circular imports"""
@@ -640,8 +650,8 @@ class RelayClient:
 
                 relay_response = response.json()
                 try:
-                    jsonschema.validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
-                except jsonschema.exceptions.ValidationError as exc:
+                    _load_jsonschema().validate(instance=relay_response, schema=RELAY_RESPONSE_SCHEMA)
+                except _load_jsonschema().exceptions.ValidationError as exc:
                     log_error("Invalid relay response format: {}", str(exc))
                     last_error = {
                         'error': f"Invalid response format: {str(exc)}",
@@ -1412,8 +1422,8 @@ class RelayClient:
         """
         try:
             try:
-                jsonschema.validate(instance=request_data, schema=MESSAGE_SCHEMA)
-            except jsonschema.exceptions.ValidationError as e:
+                _load_jsonschema().validate(instance=request_data, schema=MESSAGE_SCHEMA)
+            except _load_jsonschema().exceptions.ValidationError as e:
                 log_error("Invalid request data format: {}", str(e))
                 return False
 
@@ -1508,8 +1518,8 @@ class RelayClient:
             }
 
             try:
-                jsonschema.validate(instance=source_payload, schema=MESSAGE_SCHEMA)
-            except jsonschema.exceptions.ValidationError as e:
+                _load_jsonschema().validate(instance=source_payload, schema=MESSAGE_SCHEMA)
+            except _load_jsonschema().exceptions.ValidationError as e:
                 log_error("Invalid response payload format: {}", str(e))
                 return False
 

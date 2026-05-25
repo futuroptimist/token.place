@@ -63,7 +63,9 @@ if not hasattr(model_manager, "ModelManager"):
 
 
 def test_requests_compat_exposes_expected_surface_without_requests(monkeypatch):
-    class _RequestsImportBlocker(importlib.abc.MetaPathFinder):
+    from importlib.abc import MetaPathFinder
+
+    class _RequestsImportBlocker(MetaPathFinder):
         def find_spec(self, fullname: str, _path: object, _target: object = None):
             if fullname == "requests" or fullname.startswith("requests."):
                 raise ModuleNotFoundError("blocked for startup import regression test")

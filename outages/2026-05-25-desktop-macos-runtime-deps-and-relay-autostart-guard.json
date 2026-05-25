@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-25",
+  "slug": "desktop-macos-runtime-deps-and-relay-autostart-guard",
+  "summary": "Packaged-like macOS desktop operator startup could fail before startup events when psutil was missing under PYTHONNOUSERSITE=1, and desktop coverage lacked explicit guardrails preventing relay.py autostart ownership paths.",
+  "impact": "Operator startup was nondeterministic on clean interpreter launches and desktop relay ownership boundaries were not protected by dedicated static guard tests.",
+  "fix": "Resource monitoring now tolerates missing psutil without import-time crash, desktop unit tests now enforce no relay.py/localhost:5010 autostart markers in startup paths, and Tauri bundle resource tests now explicitly forbid relay resources.",
+  "lessons": "Desktop packaged-like runtime checks must not rely on developer-global packages, and desktop-vs-relay ownership boundaries require explicit regression guardrails."
+}

@@ -460,5 +460,11 @@ mod tests {
                 "missing bundled python resource: {script}"
             );
         }
+        for forbidden in ["relay.py", "../../relay.py", "python/relay.py"] {
+            assert!(
+                resources.iter().all(|entry| entry.as_str() != Some(forbidden)),
+                "forbidden relay resource found in desktop bundle: {forbidden}"
+            );
+        }
     }
 }

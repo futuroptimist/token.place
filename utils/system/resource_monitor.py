@@ -17,7 +17,10 @@ def _gpu_headroom_multiplier(headroom_percent: float) -> float:
         percent = 0.0
     return 1.0 + (percent / 100.0 if percent > 1.0 else percent)
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:  # pragma: no cover - exercised via import-time guard tests
+    psutil = None
 
 
 GpuMetrics = Dict[str, float | int | bool]
@@ -169,25 +172,29 @@ def collect_resource_usage() -> Dict[str, float | int | bool]:
 
     interval = _cpu_interval_for_platform(sys.platform)
 
-    try:
-        cpu_percent_raw = psutil.cpu_percent(interval=interval)
-        if interval == 0.0:
-            try:
-                cpu_value = float(cpu_percent_raw)
-            except Exception:
-                cpu_value = None
-            if cpu_value == 0.0:
-                try:
-                    cpu_percent_raw = psutil.cpu_percent(interval=None)
-                except Exception:
-                    pass
-    except Exception:
+    if psutil is None:
         cpu_percent_raw = None
-
-    try:
-        memory_stats = psutil.virtual_memory()
-    except Exception:
         memory_stats = None
+    else:
+        try:
+            cpu_percent_raw = psutil.cpu_percent(interval=interval)
+            if interval == 0.0:
+                try:
+                    cpu_value = float(cpu_percent_raw)
+                except Exception:
+                    cpu_value = None
+                if cpu_value == 0.0:
+                    try:
+                        cpu_percent_raw = psutil.cpu_percent(interval=None)
+                    except Exception:
+                        pass
+        except Exception:
+            cpu_percent_raw = None
+
+        try:
+            memory_stats = psutil.virtual_memory()
+        except Exception:
+            memory_stats = None
 
     cpu_percent = float(cpu_percent_raw) if cpu_percent_raw is not None else 0.0
     memory_percent = float(getattr(memory_stats, 'percent', 0.0)) if memory_stats else 0.0

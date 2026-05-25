@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -587,6 +588,54 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     }
 
 
+
+
+def ensure_desktop_python_dependencies(*, runtime_root: Optional[Path] = None) -> Dict[str, str]:
+    """Ensure baseline desktop bridge Python dependencies are importable."""
+
+    root = _resolve_runtime_root(repo_root=runtime_root)
+    requirements_path = root / "python" / "requirements_desktop_runtime.txt"
+    if not requirements_path.is_file():
+        requirements_path = root / "resources" / "python" / "requirements_desktop_runtime.txt"
+
+    required_modules = ("psutil", "requests", "dotenv")
+    missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    if not missing:
+        return {"ok": "true", "action": "already_satisfied", "missing": ""}
+
+    if not requirements_path.is_file():
+        return {
+            "ok": "false",
+            "action": "requirements_missing",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+        }
+
+    env = os.environ.copy()
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements_path)]
+    ok, output = _run_pip_install(cmd, env)
+    if not ok:
+        return {
+            "ok": "false",
+            "action": "install_failed",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+            "detail": _summarize_install_error(output),
+        }
+
+    missing_after = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    return {
+        "ok": "true" if not missing_after else "false",
+        "action": "installed" if not missing_after else "post_install_missing",
+        "missing": ",".join(missing_after),
+        "interpreter": sys.executable,
+        "import_root": str(root),
+        "requirements": str(requirements_path),
+    }
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()
     if detected_platform.startswith("win"):

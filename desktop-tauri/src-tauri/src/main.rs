@@ -442,9 +442,13 @@ mod tests {
             "python/inference_sidecar.py",
             "python/model_bridge.py",
             "python/path_bootstrap.py",
+            "python/desktop_gpu_packaging.py",
+            "python/desktop_runtime_setup.py",
+            "python/requirements_desktop_runtime.txt",
             "../../utils",
             "../../config.py",
             "../../encrypt.py",
+            "../../requirements.txt",
         ];
 
         // Intentional strict count: this guards against accidental bundle bloat.
@@ -452,6 +456,13 @@ mod tests {
             resources.len(),
             required.len(),
             "bundle.resources should only include required Python bridge/runtime resources"
+        );
+
+
+
+        assert!(
+            resources.iter().all(|entry| !entry.as_str().unwrap_or_default().contains("relay.py")),
+            "bundle.resources must never include relay.py"
         );
 
         for script in required {

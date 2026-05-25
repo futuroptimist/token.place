@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-25",
+  "slug": "desktop-macos-runtime-deps-and-relay-autostart-guard",
+  "summary": "Packaged-like macOS desktop operator startup could fail early on missing psutil, and desktop needed explicit anti-regression guardrails to prevent relay.py bundling/autostart ownership.",
+  "impact": "Desktop operator startup could fail before status events and produced brittle diagnostics; desktop relay lifecycle boundaries were under-guarded.",
+  "fix": "Added desktop runtime dependency manifest and preflight bootstrap, made resource metrics resilient when psutil is missing, and added desktop no-relay-autostart static guards.",
+  "lessons": "Desktop packaged interpreters require app-owned dependency preflight, and desktop-vs-relay process boundaries need explicit static/lifecycle guard coverage."
+}

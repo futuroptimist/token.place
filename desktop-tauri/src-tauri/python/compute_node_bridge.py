@@ -26,6 +26,7 @@ try:
     from desktop_runtime_setup import (
         desktop_gpu_runtime_failure_message,
         ensure_desktop_llama_runtime,
+        ensure_desktop_python_dependencies,
         maybe_reexec_for_runtime_refresh,
     )
 except ModuleNotFoundError:
@@ -40,6 +41,9 @@ except ModuleNotFoundError:
             "fallback_reason": "desktop_runtime_setup module missing",
         }
 
+    def ensure_desktop_python_dependencies(*, runtime_root: Optional[Path] = None) -> Dict[str, str]:
+        return {"ok": "true", "action": "desktop_runtime_setup module missing", "missing": ""}
+
     def maybe_reexec_for_runtime_refresh(
         _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
     ) -> None:
@@ -47,11 +51,13 @@ except ModuleNotFoundError:
 
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
-try:
-    from utils.llm.model_manager import _is_repo_llama_cpp_shim
-except ModuleNotFoundError:
-    def _is_repo_llama_cpp_shim(_module_path: Any) -> bool:
+
+def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
+    try:
+        from utils.llm.model_manager import _is_repo_llama_cpp_shim as _shim_detector
+    except ModuleNotFoundError:
         return False
+    return _shim_detector(module_path)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
@@ -235,6 +241,21 @@ def run(args: argparse.Namespace) -> int:
         f"repo_llama_cpp_shim_imported={repo_llama_cpp_shim_imported}",
         file=sys.stderr,
     )
+    dependency_setup = ensure_desktop_python_dependencies()
+    if dependency_setup.get("ok") != "true":
+        missing = dependency_setup.get("missing") or "unknown"
+        detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
+        emit({
+            "type": "error",
+            "message": (
+                "desktop runtime dependency preflight failed "
+                f"(interpreter={dependency_setup.get('interpreter', sys.executable)} "
+                f"import_root={dependency_setup.get('import_root', 'unknown')} "
+                f"missing={missing}): {detail}"
+            ),
+        })
+        return 1
+
     gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
     if gpu_runtime_error:
         emit({"type": "error", "message": gpu_runtime_error})

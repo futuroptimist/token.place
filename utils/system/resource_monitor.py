@@ -17,7 +17,10 @@ def _gpu_headroom_multiplier(headroom_percent: float) -> float:
         percent = 0.0
     return 1.0 + (percent / 100.0 if percent > 1.0 else percent)
 
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:  # pragma: no cover - exercised via import fallback test
+    psutil = None
 
 
 GpuMetrics = Dict[str, float | int | bool]
@@ -170,6 +173,8 @@ def collect_resource_usage() -> Dict[str, float | int | bool]:
     interval = _cpu_interval_for_platform(sys.platform)
 
     try:
+        if psutil is None:
+            raise RuntimeError("psutil unavailable")
         cpu_percent_raw = psutil.cpu_percent(interval=interval)
         if interval == 0.0:
             try:
@@ -185,6 +190,8 @@ def collect_resource_usage() -> Dict[str, float | int | bool]:
         cpu_percent_raw = None
 
     try:
+        if psutil is None:
+            raise RuntimeError("psutil unavailable")
         memory_stats = psutil.virtual_memory()
     except Exception:
         memory_stats = None

@@ -1674,10 +1674,23 @@ class RelayClient:
                     time.sleep(self._request_timeout)
                     continue
 
-                consecutive_failures = 0
-                wait_seconds = self._request_timeout
                 wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
                 wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                relay_error = relay_response.get('error')
+                if relay_error:
+                    consecutive_failures += 1
+                    log_error("Error from API v1 E2EE relay poll: {}", relay_error)
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping API v1 E2EE relay polling after {} consecutive relay errors.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
+                    time.sleep(wait_seconds)
+                    continue
+
+                consecutive_failures = 0
                 if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
                     self.process_client_request(relay_response)
                 time.sleep(wait_seconds)
@@ -1756,8 +1769,9 @@ class RelayClient:
                     time.sleep(self._request_timeout)
                     continue
 
-                if 'error' in relay_response:
-                    log_error("Error from relay: {}", relay_response['error'])
+                relay_error = relay_response.get('error')
+                if relay_error:
+                    log_error("Error from relay: {}", relay_error)
                     consecutive_failures += 1
                     if max_failures is not None and consecutive_failures >= max_failures:
                         log_error(

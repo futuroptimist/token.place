@@ -2481,6 +2481,32 @@ class TestRelayClient:
         mock_sleep.assert_called_with(relay_client._request_timeout)
         assert relay_client.stop_polling is True
 
+    @patch('utils.networking.relay_client._max_poll_failures_before_stop', return_value=2)
+    @patch('utils.networking.relay_client.RelayClient.process_client_request')
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work')
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_stops_after_repeated_error_responses(
+        self,
+        mock_sleep,
+        mock_poll,
+        mock_process,
+        _mock_max_failures,
+        relay_client,
+    ):
+        mock_poll.side_effect = [
+            {"error": "HTTP 503", "next_ping_in_x_seconds": 0},
+            {"error": "HTTP 503", "next_ping_in_x_seconds": 0},
+        ]
+
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        assert mock_poll.call_count == 2
+        mock_process.assert_not_called()
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(0.0)
+        assert relay_client.stop_polling is True
+
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')

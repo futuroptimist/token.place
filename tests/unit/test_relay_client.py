@@ -38,6 +38,17 @@ TEST_NO_REQUEST_RESPONSE = {
 }
 
 
+
+
+def test_load_jsonschema_returns_none_on_import_error(monkeypatch):
+    import importlib
+
+    def _raise_import_error(name: str):
+        raise ImportError("simulated transitive import failure")
+
+    monkeypatch.setattr(importlib, "import_module", _raise_import_error)
+    assert relay_client_module._load_jsonschema() is None
+
 def test_validate_with_fallback_accepts_message_schema_without_jsonschema():
     payload = {
         "client_public_key": "abc",

@@ -25,6 +25,8 @@ def _load_jsonschema():
         return importlib.import_module("jsonschema")
     except ModuleNotFoundError:
         return None
+    except ImportError:
+        return None
 
 
 def _validate_with_fallback(instance: Dict[str, Any], schema: Dict[str, Any]) -> None:

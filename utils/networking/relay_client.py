@@ -20,31 +20,30 @@ logger = logging.getLogger('relay_client')
 
 
 def _load_jsonschema():
-    """Lazy-load jsonschema so bridge startup imports do not require it."""
+    """Lazy-load jsonschema; return ``None`` when unavailable in packaged runtimes."""
     try:
         return importlib.import_module("jsonschema")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "jsonschema is required for relay schema validation at runtime"
-        ) from exc
+    except ModuleNotFoundError:
+        return None
 
 
 def _validate_with_fallback(instance: Dict[str, Any], schema: Dict[str, Any]) -> None:
     """Validate JSON payloads even when jsonschema is unavailable in packaged runtimes."""
     try:
         jsonschema = _load_jsonschema()
+    except RuntimeError as exc:
+        if "jsonschema is required" not in str(exc):
+            raise
+        jsonschema = None
+    except AssertionError:
+        jsonschema = None
+
+    if jsonschema is not None:
         try:
             jsonschema.validate(instance=instance, schema=schema)
         except Exception as exc:
             raise ValueError(str(exc)) from exc
         return
-    except ModuleNotFoundError:
-        pass
-    except RuntimeError as exc:
-        if "jsonschema is required" not in str(exc):
-            raise
-    except AssertionError:
-        pass
 
     if not isinstance(instance, dict):
         raise ValueError("Payload must be an object")

@@ -172,6 +172,26 @@ def log_error(message, *args, exc_info: bool = False) -> None:
     _log("error", message, *args, exc_info=exc_info)
 
 
+def _max_poll_failures_before_stop() -> Optional[int]:
+    """Return max consecutive polling failures before stopping.
+
+    This keeps CI from spending tens of minutes in retry loops when relay
+    endpoints are unreachable, while preserving infinite polling by default
+    outside CI unless explicitly overridden.
+    """
+    raw_value = os.environ.get("TOKENPLACE_MAX_POLL_FAILURES")
+    if raw_value is not None:
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+
+    if os.environ.get("CI", "").strip().lower() == "true":
+        return 18
+    return None
+
+
 def _normalize_client_public_key_b64(client_public_key_b64: Any) -> Optional[str]:
     """Normalize relay metadata key format for consistent decode/binding checks."""
     if not isinstance(client_public_key_b64, str):
@@ -1636,10 +1656,13 @@ class RelayClient:
         """Continuously poll API v1 E2EE relay routes and process encrypted work."""
 
         self.stop_polling = False
+        consecutive_failures = 0
+        max_failures = _max_poll_failures_before_stop()
         log_info("Starting API v1 E2EE relay polling loop")
         while not self.stop_polling:
             try:
                 relay_response = self.poll_api_v1_encrypted_work()
+                consecutive_failures = 0
                 wait_seconds = self._request_timeout
                 if isinstance(relay_response, dict):
                     wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
@@ -1650,7 +1673,15 @@ class RelayClient:
                     wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
                 time.sleep(wait_seconds)
             except Exception as e:
+                consecutive_failures += 1
                 log_error("Exception during API v1 E2EE polling loop: {}", str(e), exc_info=True)
+                if max_failures is not None and consecutive_failures >= max_failures:
+                    log_error(
+                        "Stopping API v1 E2EE relay polling after {} consecutive failures.",
+                        consecutive_failures,
+                    )
+                    self.stop_polling = True
+                    break
                 time.sleep(self._request_timeout)
 
     def poll_relay_continuously(self):  # pragma: no cover
@@ -1682,10 +1713,13 @@ class RelayClient:
             log_info("Starting relay polling")
             self.stop_polling = False
 
+        consecutive_failures = 0
+        max_failures = _max_poll_failures_before_stop()
         while not self.stop_polling:
             try:
                 # Ping the relay and check for client requests
                 relay_response = self.ping_relay()
+                consecutive_failures = 0
 
                 # Validate the relay response contains expected fields
                 if not isinstance(relay_response, dict):
@@ -1722,5 +1756,13 @@ class RelayClient:
                 time.sleep(sleep_duration)
 
             except Exception as e:
+                consecutive_failures += 1
                 log_error("Exception during polling loop: {}", str(e), exc_info=True)
+                if max_failures is not None and consecutive_failures >= max_failures:
+                    log_error(
+                        "Stopping relay polling after {} consecutive failures.",
+                        consecutive_failures,
+                    )
+                    self.stop_polling = True
+                    break
                 time.sleep(self._request_timeout)  # Sleep for 10 seconds on error

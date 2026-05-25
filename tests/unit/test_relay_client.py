@@ -49,6 +49,17 @@ def test_load_jsonschema_returns_none_on_import_error(monkeypatch):
     monkeypatch.setattr(importlib, "import_module", _raise_import_error)
     assert relay_client_module._load_jsonschema() is None
 
+
+def test_max_poll_failures_defaults_in_ci(monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.delenv("TOKENPLACE_MAX_POLL_FAILURES", raising=False)
+    assert relay_client_module._max_poll_failures_before_stop() == 18
+
+
+def test_max_poll_failures_honours_override(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_MAX_POLL_FAILURES", "3")
+    assert relay_client_module._max_poll_failures_before_stop() == 3
+
 def test_validate_with_fallback_accepts_message_schema_without_jsonschema():
     payload = {
         "client_public_key": "abc",

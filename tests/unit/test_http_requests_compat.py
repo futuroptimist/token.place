@@ -122,3 +122,72 @@ def test_model_download_timeout_returns_false(monkeypatch, tmp_path: Path):
     manager = model_manager_module.ModelManager(config=_Config())
 
     assert manager.download_file_in_chunks(str(tmp_path / "model.gguf"), manager.url, 1) is False
+
+
+def test_requests_compat_stream_response_and_iter_content(monkeypatch):
+    module = importlib.import_module("utils.networking.http_requests_compat")
+
+    class _Handle:
+        status = 200
+        headers = {"Content-Length": "6", "X-Test": "yes"}
+
+        def __init__(self):
+            self._chunks = [b"ab", b"cd", b"ef", b""]
+            self.closed = False
+
+        def read(self, _size: int = -1):
+            return self._chunks.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    handle = _Handle()
+    monkeypatch.setattr(module.urllib_request, "urlopen", lambda *_a, **_k: handle)
+
+    response = module.requests.get("https://example.test", stream=True)
+    assert response.status_code == 200
+    assert response.headers["content-length"] == "6"
+    assert b"".join(response.iter_content(chunk_size=2)) == b"abcdef"
+    response.close()
+    assert handle.closed is True
+
+
+def test_requests_compat_http_error_returns_response(monkeypatch):
+    module = importlib.import_module("utils.networking.http_requests_compat")
+
+    class _HttpErr(module.urllib_error.HTTPError):
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self):
+            super().__init__(
+                url="https://example.test",
+                code=503,
+                msg="fail",
+                hdrs={"Content-Type": "application/json"},
+                fp=None,
+            )
+
+        def read(self):
+            return b'{"error":"down"}'
+
+    monkeypatch.setattr(module.urllib_request, "urlopen", lambda *_a, **_k: (_ for _ in ()).throw(_HttpErr()))
+
+    response = module.requests.post("https://example.test", json={"x": 1})
+    assert response.status_code == 503
+    assert response.json()["error"] == "down"
+    assert response.headers["content-type"] == "application/json"
+
+
+def test_requests_compat_maps_urlerror_to_connection_error(monkeypatch):
+    module = importlib.import_module("utils.networking.http_requests_compat")
+
+    def _raise_urlerror(*_args, **_kwargs):
+        raise module.urllib_error.URLError("connection refused")
+
+    monkeypatch.setattr(module.urllib_request, "urlopen", _raise_urlerror)
+
+    try:
+        module.requests.get("https://example.test")
+        assert False, "expected connection error"
+    except module.requests.ConnectionError:
+        pass

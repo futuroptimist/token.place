@@ -711,15 +711,17 @@ class RelayClient:
                 return relay_response
 
             except requests.ConnectionError as exc:
-                log_error("Connection error when pinging relay: {}", str(exc), exc_info=True)
+                # Connection failures are expected during relay failover/startup probing.
+                # Keep this log concise to avoid runaway traceback noise in long-running loops.
+                log_error("Connection error when pinging relay: {}", str(exc))
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except requests.Timeout as exc:
-                log_error("Request timeout when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Request timeout when pinging relay: {}", str(exc))
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except requests.RequestException as exc:
-                log_error("Request exception when pinging relay: {}", str(exc), exc_info=True)
+                log_error("Request exception when pinging relay: {}", str(exc))
                 last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
                 encountered_error = True
             except json.JSONDecodeError as exc:

@@ -1662,15 +1662,24 @@ class RelayClient:
         while not self.stop_polling:
             try:
                 relay_response = self.poll_api_v1_encrypted_work()
+                if not isinstance(relay_response, dict):
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping API v1 E2EE relay polling after {} consecutive invalid responses.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
+                    time.sleep(self._request_timeout)
+                    continue
+
                 consecutive_failures = 0
                 wait_seconds = self._request_timeout
-                if isinstance(relay_response, dict):
-                    wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
-                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
-                    if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
-                        self.process_client_request(relay_response)
-                else:
-                    wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                wait_seconds = relay_response.get('next_ping_in_x_seconds', self._request_timeout)
+                wait_seconds = self._normalise_poll_wait_seconds(wait_seconds)
+                if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+                    self.process_client_request(relay_response)
                 time.sleep(wait_seconds)
             except Exception as e:
                 consecutive_failures += 1
@@ -1724,13 +1733,31 @@ class RelayClient:
                 # Validate the relay response contains expected fields
                 if not isinstance(relay_response, dict):
                     log_error("Invalid relay response type: {}", type(relay_response))
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping relay polling after {} consecutive invalid responses.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
                     time.sleep(self._request_timeout)
                     continue
 
                 if 'next_ping_in_x_seconds' not in relay_response:
                     log_error("Missing 'next_ping_in_x_seconds' in relay response")
+                    consecutive_failures += 1
+                    if max_failures is not None and consecutive_failures >= max_failures:
+                        log_error(
+                            "Stopping relay polling after {} consecutive malformed responses.",
+                            consecutive_failures,
+                        )
+                        self.stop_polling = True
+                        break
                     time.sleep(self._request_timeout)
                     continue
+
+                consecutive_failures = 0
 
                 if 'error' in relay_response:
                     log_error("Error from relay: {}", relay_response['error'])

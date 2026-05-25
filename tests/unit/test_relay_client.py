@@ -2463,6 +2463,24 @@ class TestRelayClient:
         ]
         assert relay_client.stop_polling is True
 
+    @patch('utils.networking.relay_client._max_poll_failures_before_stop', return_value=2)
+    @patch('utils.networking.relay_client.RelayClient.poll_api_v1_encrypted_work', return_value=False)
+    @patch('utils.networking.relay_client.time.sleep')
+    def test_poll_api_v1_encrypted_work_continuously_stops_after_invalid_responses(
+        self,
+        mock_sleep,
+        mock_poll,
+        _mock_max_failures,
+        relay_client,
+    ):
+        relay_client.start()
+        relay_client.poll_api_v1_encrypted_work_continuously()
+
+        assert mock_poll.call_count == 2
+        assert mock_sleep.call_count == 1
+        mock_sleep.assert_called_with(relay_client._request_timeout)
+        assert relay_client.stop_polling is True
+
     @patch('utils.networking.relay_client.RelayClient.ping_relay')
     @patch('utils.networking.relay_client.RelayClient.process_client_request')
     @patch('utils.networking.relay_client.time.sleep')

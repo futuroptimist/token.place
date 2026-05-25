@@ -1,0 +1,16 @@
+{
+  "date": "2026-05-25",
+  "area": "desktop-tauri operator startup and lifecycle",
+  "symptoms": [
+    "Start operator failed early with No module named 'psutil'",
+    "Reported phantom localhost:5010 relay process after desktop lifecycle"
+  ],
+  "root_cause": [
+    "Bridge import path could fail before startup event when desktop interpreter lacked psutil",
+    "Desktop guardrails did not include explicit no-relay-autostart static coverage"
+  ],
+  "fix": "Added dependency preflight diagnostics in compute bridge startup, introduced reusable dependency verifier in desktop_runtime_setup, and added static no-relay-autostart tests for desktop startup sources and bundle config.",
+  "tests": [
+    "python -m pytest tests/unit/test_desktop_runtime_setup.py tests/unit/test_desktop_compute_node_bridge.py tests/unit/test_resource_monitor.py tests/unit/test_desktop_no_relay_autostart.py"
+  ]
+}

@@ -26,6 +26,7 @@ try:
     from desktop_runtime_setup import (
         desktop_gpu_runtime_failure_message,
         ensure_desktop_llama_runtime,
+        ensure_desktop_python_dependencies,
         maybe_reexec_for_runtime_refresh,
     )
 except ModuleNotFoundError:
@@ -39,6 +40,9 @@ except ModuleNotFoundError:
             "runtime_action": "unavailable",
             "fallback_reason": "desktop_runtime_setup module missing",
         }
+
+    def ensure_desktop_python_dependencies(_required_modules: list[str]) -> Dict[str, str]:
+        return {"ok": "1", "missing": ""}
 
     def maybe_reexec_for_runtime_refresh(
         _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
@@ -213,7 +217,27 @@ def _sleep_with_cancel(seconds: float) -> bool:
     return stop_requested()
 
 
+def _required_desktop_modules() -> list[str]:
+    return ["psutil", "requests", "dotenv", "jsonschema"]
+
+
 def run(args: argparse.Namespace) -> int:
+    dependency_check = ensure_desktop_python_dependencies(_required_desktop_modules())
+    if dependency_check.get("ok") != "1":
+        missing = dependency_check.get("missing", "unknown")
+        interpreter = dependency_check.get("interpreter", sys.executable)
+        prefix = dependency_check.get("prefix", sys.prefix)
+        emit({
+            "type": "status",
+            "running": False,
+            "registered": False,
+            "last_error": (
+                "desktop Python dependency preflight failed before startup event: "
+                f"missing [{missing}] interpreter={interpreter} prefix={prefix}"
+            ),
+        })
+        return 1
+
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(

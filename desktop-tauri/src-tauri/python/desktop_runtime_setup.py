@@ -441,6 +441,28 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
+
+
+def ensure_desktop_python_dependencies(required_modules: list[str]) -> dict[str, str]:
+    """Verify required desktop bridge dependencies and return actionable diagnostics."""
+
+    missing: list[str] = []
+    for module_name in required_modules:
+        try:
+            __import__(module_name)
+        except ModuleNotFoundError:
+            missing.append(module_name)
+
+    if not missing:
+        return {"ok": "1", "missing": ""}
+
+    return {
+        "ok": "0",
+        "missing": ", ".join(sorted(set(missing))),
+        "interpreter": sys.executable,
+        "prefix": sys.prefix,
+    }
+
 def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 

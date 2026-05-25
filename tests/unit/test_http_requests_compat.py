@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 import importlib
+import os
 import socket
+import subprocess
+import sys
+from pathlib import Path
+
+
+def test_bridge_startup_imports_do_not_depend_on_requests():
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    script = """
+import importlib
 import sys
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec
-from pathlib import Path
-
 
 class _RequestsImportBlocker(MetaPathFinder):
     def find_spec(self, fullname: str, _path: object, _target: object = None) -> ModuleSpec | None:
@@ -16,27 +29,46 @@ class _RequestsImportBlocker(MetaPathFinder):
             raise ModuleNotFoundError("blocked for startup import regression test")
         return None
 
+sys.meta_path = [_RequestsImportBlocker(), *sys.meta_path]
 
-def test_bridge_startup_imports_do_not_depend_on_requests(monkeypatch):
-    blocker = _RequestsImportBlocker()
-    monkeypatch.setattr(sys, "meta_path", [blocker, *sys.meta_path])
+for module_name in (
+    "requests",
+    "utils.networking.http_requests_compat",
+    "utils.networking.relay_client",
+    "utils.llm.model_manager",
+):
+    sys.modules.pop(module_name, None)
 
-    for module_name in (
-        "requests",
-        "utils.networking.http_requests_compat",
-        "utils.networking.relay_client",
-        "utils.llm.model_manager",
-    ):
-        sys.modules.pop(module_name, None)
+relay_client = importlib.import_module("utils.networking.relay_client")
+model_manager = importlib.import_module("utils.llm.model_manager")
 
-    relay_client = importlib.import_module("utils.networking.relay_client")
-    model_manager = importlib.import_module("utils.llm.model_manager")
+if not hasattr(relay_client, "RelayClient"):
+    raise AssertionError("RelayClient missing")
+if not hasattr(model_manager, "ModelManager"):
+    raise AssertionError("ModelManager missing")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
 
-    assert hasattr(relay_client, "RelayClient")
-    assert hasattr(model_manager, "ModelManager")
+    assert result.returncode == 0, (
+        "startup import regression subprocess failed\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
 
 
 def test_requests_compat_exposes_expected_surface_without_requests(monkeypatch):
+    class _RequestsImportBlocker(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname: str, _path: object, _target: object = None):
+            if fullname == "requests" or fullname.startswith("requests."):
+                raise ModuleNotFoundError("blocked for startup import regression test")
+            return None
+
     blocker = _RequestsImportBlocker()
     monkeypatch.setattr(sys, "meta_path", [blocker, *sys.meta_path])
     sys.modules.pop("utils.networking.http_requests_compat", None)

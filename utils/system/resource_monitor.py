@@ -19,7 +19,7 @@ def _gpu_headroom_multiplier(headroom_percent: float) -> float:
 
 try:
     import psutil
-except ModuleNotFoundError:  # pragma: no cover - exercised via import fallback test
+except (ImportError, OSError):  # pragma: no cover - exercised via import fallback test
     psutil = None
 
 

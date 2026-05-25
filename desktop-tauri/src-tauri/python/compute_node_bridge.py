@@ -41,8 +41,15 @@ except ModuleNotFoundError:
             "fallback_reason": "desktop_runtime_setup module missing",
         }
 
-    def ensure_desktop_python_dependencies(*, runtime_root: Optional[Path] = None) -> Dict[str, str]:
-        return {"ok": "true", "action": "desktop_runtime_setup module missing", "missing": ""}
+    def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> Dict[str, str]:
+        return {
+            "ok": "false",
+            "action": "desktop_runtime_setup module missing",
+            "missing": "unknown",
+            "interpreter": sys.executable,
+            "import_root": str(repo_root) if repo_root is not None else "unknown",
+            "detail": "desktop_runtime_setup module missing",
+        }
 
     def maybe_reexec_for_runtime_refresh(
         _runtime_setup: Dict[str, str], *, allow_reexec: bool = True

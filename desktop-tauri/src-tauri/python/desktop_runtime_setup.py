@@ -590,13 +590,23 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 
 
 
-def ensure_desktop_python_dependencies(*, runtime_root: Optional[Path] = None) -> Dict[str, str]:
+def _resolve_desktop_requirements_path(repo_root: Path) -> Path:
+    candidates = [
+        repo_root / "python" / "requirements_desktop_runtime.txt",
+        repo_root / "resources" / "python" / "requirements_desktop_runtime.txt",
+        Path(__file__).resolve().parent / "requirements_desktop_runtime.txt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure baseline desktop bridge Python dependencies are importable."""
 
-    root = _resolve_runtime_root(repo_root=runtime_root)
-    requirements_path = root / "python" / "requirements_desktop_runtime.txt"
-    if not requirements_path.is_file():
-        requirements_path = root / "resources" / "python" / "requirements_desktop_runtime.txt"
+    root = _resolve_runtime_root(repo_root=repo_root)
+    requirements_path = _resolve_desktop_requirements_path(root)
 
     required_modules = ("psutil", "requests", "dotenv")
     missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
@@ -614,6 +624,7 @@ def ensure_desktop_python_dependencies(*, runtime_root: Optional[Path] = None) -
         }
 
     env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "0"
     cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements_path)]
     ok, output = _run_pip_install(cmd, env)
     if not ok:

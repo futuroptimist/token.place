@@ -624,8 +624,16 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
         }
 
     env = os.environ.copy()
-    env["PYTHONNOUSERSITE"] = "0"
-    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements_path)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-user",
+        "-r",
+        str(requirements_path),
+    ]
     ok, output = _run_pip_install(cmd, env)
     if not ok:
         return {
@@ -638,6 +646,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
             "detail": _summarize_install_error(output),
         }
 
+    importlib.invalidate_caches()
     missing_after = [name for name in required_modules if importlib.util.find_spec(name) is None]
     return {
         "ok": "true" if not missing_after else "false",

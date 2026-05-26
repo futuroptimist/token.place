@@ -11,6 +11,7 @@ SCAN_ROOTS = (
     REPO_ROOT / "desktop-tauri" / "src-tauri" / "python",
     REPO_ROOT / "utils",
     REPO_ROOT / "config.py",
+    REPO_ROOT / "encrypt.py",
 )
 
 

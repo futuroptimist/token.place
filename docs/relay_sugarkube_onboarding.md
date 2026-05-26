@@ -45,6 +45,8 @@ operator workflow.
 - Production default: `https://token.place`
 
 Operators can override hostnames in Sugarkube values and Cloudflare route configuration.
+Cloudflare Tunnel still owns public hostname routing to Traefik; Helm values only control
+Kubernetes resources (for example `Ingress`, including `spec.tls`).
 
 ## Sugarkube deployment command patterns
 
@@ -68,14 +70,25 @@ immutable tag.
 ## Validation (staging example)
 
 ```bash
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' docs/apps/tokenplace.version | head -n1)" --namespace tokenplace -f docs/examples/tokenplace.values.dev.yaml -f docs/examples/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
+grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/
 ```
 
 For production validation, replace the host with `https://token.place`.
+For production render checks, use `docs/examples/tokenplace.values.prod.yaml` and verify
+`spec.tls.hosts: [token.place]` with `spec.tls.secretName: tokenplace-prod-tls`.
+
+Assumption: cert-manager is installed and the referenced `ClusterIssuer` (for example
+`letsencrypt-prod`) already exists.
 
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).

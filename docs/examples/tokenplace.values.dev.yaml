@@ -1,0 +1,6 @@
+ingress:
+  enabled: true
+  className: traefik
+
+env:
+  TOKEN_PLACE_ENV: production

@@ -1,0 +1,7 @@
+ingress:
+  host: token.place
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    secretName: tokenplace-prod-tls

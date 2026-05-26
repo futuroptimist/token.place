@@ -10,6 +10,10 @@ GPU/AI hat nodes, and other compute hosts).
 
 No in-cluster backend/GPU service is required in this phase.
 
+Cloudflare Tunnel continues to route the public hostname to the in-cluster Traefik entrypoint.
+Helm values configure Kubernetes `Ingress` and TLS, but do **not** create/manage Cloudflare
+DNS/tunnel routes.
+
 ## Stateful behavior and replica policy
 
 Relay runtime state (registrations, queued messages, replies) is currently in-memory.
@@ -56,12 +60,23 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ## Validation checklist
 
 ```bash
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' docs/apps/tokenplace.version | head -n1)" --namespace tokenplace -f docs/examples/tokenplace.values.dev.yaml -f docs/examples/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
+grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/
 ```
+
+If `cert-manager.io/cluster-issuer: letsencrypt-prod` is used, confirm that cert-manager and the
+`letsencrypt-prod` ClusterIssuer already exist in the target cluster before deploy. The rendered
+Ingress must include `spec.tls.hosts: [staging.token.place]` and
+`spec.tls.secretName: tokenplace-staging-tls`.
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
 E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.

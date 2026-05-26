@@ -75,12 +75,21 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
-def run_desktop_dependency_preflight(tmp_root: Path) -> None:
+def _packaged_env(tmp_root: Path) -> dict[str, str]:
     resources_root = tmp_root / "resources"
+    home_dir = tmp_root / "home"
+    home_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
+    env["HOME"] = str(home_dir)
     env["PYTHONNOUSERSITE"] = "1"
     env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
     env["PYTHONPATH"] = str(resources_root / "python")
+    return env
+
+
+def run_desktop_dependency_preflight(tmp_root: Path) -> None:
+    resources_root = tmp_root / "resources"
+    env = _packaged_env(tmp_root)
 
     result = subprocess.run(  # noqa: S603
         [
@@ -106,9 +115,7 @@ def run_desktop_dependency_preflight(tmp_root: Path) -> None:
 
 
 def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
-    env = os.environ.copy()
-    env["PYTHONNOUSERSITE"] = "1"
-    env.pop("PYTHONPATH", None)
+    env = _packaged_env(tmp_root)
 
     model_bridge = tmp_root / "resources" / "python" / "model_bridge.py"
     result = subprocess.run(  # noqa: S603
@@ -158,7 +165,16 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
         [
             sys.executable,
             "-c",
-            "import psutil,requests,dotenv,cryptography; print('desktop-runtime-imports-ok')",
+            (
+                "import pathlib,sys; "
+                "python_dir=pathlib.Path(r'" + str(model_bridge.parent) + "'); "
+                "sys.path.insert(0,str(python_dir)); "
+                "import desktop_runtime_setup as mod; "
+                "payload=mod.ensure_desktop_python_dependencies(); "
+                "assert payload.get('ok')=='true', payload; "
+                "import psutil,requests,dotenv,cryptography; "
+                "print('desktop-runtime-imports-ok')"
+            ),
         ],
         cwd=tmp_root,
         env=env,
@@ -172,9 +188,7 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
 
 
 def run_compute_bridge_import_probe(tmp_root: Path) -> None:
-    env = os.environ.copy()
-    env["PYTHONNOUSERSITE"] = "1"
-    env.pop("PYTHONPATH", None)
+    env = _packaged_env(tmp_root)
 
     compute_bridge = tmp_root / "resources" / "python" / "compute_node_bridge.py"
     result = subprocess.run(  # noqa: S603

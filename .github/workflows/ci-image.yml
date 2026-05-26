@@ -59,7 +59,7 @@ jobs:
           elif [[ "${event_name}" == "push" && "${ref}" == refs/tags/* ]]; then
             ref_kind="tag"
             semver_tag="${ref#refs/tags/}"
-            if [[ ! "${semver_tag}" =~ ^v[0-9]+([.][0-9]+){2}([-.][0-9A-Za-z.-]+)?$ ]]; then
+            if [[ ! "${semver_tag}" =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?$ ]]; then
               echo "Malformed semver tag ref: ${ref}" >&2
               exit 1
             fi

@@ -144,6 +144,11 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     assert required_keys.issubset(payload.keys()), combined
 
     forbidden_any_output = [
+        "Model bridge failure",
+        "unsupported operand type(s) for |",
+        "No module named",
+        "ModuleNotFoundError",
+        "ImportError",
         "Missing Python dependency for model downloads",
         "No module named 'psutil'",
         "No module named 'requests'",

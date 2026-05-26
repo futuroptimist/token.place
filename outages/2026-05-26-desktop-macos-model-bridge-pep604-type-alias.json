@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-26",
+  "slug": "desktop-macos-model-bridge-pep604-type-alias",
+  "summary": "Desktop macOS model bridge startup failed on Python 3.9 because a runtime-evaluated PEP 604 type-alias assignment raised TypeError during import.",
+  "impact": "Operator startup and model bridge inspect could fail before inference, surfacing as a generic model bridge failure.",
+  "fix": "Replaced runtime-evaluated PEP 604 alias assignments in desktop-packaged Python imports with Python 3.9-safe typing forms, added AST/static regression guards, expanded packaged inspect failure markers, and extended macOS desktop lifecycle CI coverage.",
+  "lessons": "Type-syntax compatibility must be enforced against runtime assignment contexts in packaged Python import paths; desktop app lifecycle remains independent from relay.py ownership."
+}

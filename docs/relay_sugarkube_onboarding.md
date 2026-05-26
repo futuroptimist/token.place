@@ -22,9 +22,9 @@ replies are held in process memory. Current operating model:
 Multi-replica + shared state (Redis or similar) is explicitly future work and out of scope for
 this phase.
 
-Note on upgrades: because relay is deployed via Kubernetes `Deployment`, default `RollingUpdate`
-can briefly run more than one pod during upgrades. If strict one-pod behavior is required, enforce
-single-pod rollout settings (for example `Recreate` or `maxSurge=0`) in Sugarkube values.
+Upgrade behavior is now locked to strict single-pod semantics by default in the canonical
+token.place chart: `replicaCount: 1`, `strategy.type: Recreate`, and `RELAY_WORKERS=1`. Keep
+that posture for this in-memory relay-state phase.
 
 ## Artifact ownership and source of truth
 

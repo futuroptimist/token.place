@@ -41,11 +41,20 @@ def _assert_no_relay_port_listener() -> None:
 
 
 def main() -> int:
+    require_no_relay_e2e = os.getenv("TOKENPLACE_REQUIRE_NO_RELAY_E2E") == "1"
+
     if platform.system() != "Darwin":
-        print("SKIP: desktop no-relay lifecycle e2e is macOS-only")
+        message = "desktop no-relay lifecycle e2e is macOS-only"
+        if require_no_relay_e2e:
+            raise AssertionError(message)
+        print(f"SKIP: {message}")
         return 0
+
     if not DESKTOP_APP.exists():
-        print(f"SKIP: desktop app binary not found: {DESKTOP_APP}")
+        message = f"desktop app binary not found: {DESKTOP_APP}"
+        if require_no_relay_e2e:
+            raise AssertionError(message)
+        print(f"SKIP: {message}")
         return 0
 
     env = os.environ.copy()

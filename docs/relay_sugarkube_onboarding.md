@@ -34,6 +34,7 @@ operator workflow.
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
+- Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
 
 ## Default hostnames

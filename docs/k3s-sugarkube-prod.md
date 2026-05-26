@@ -37,10 +37,30 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 ## Deployment commands (run from Sugarkube repo)
 
 > Run from a **Sugarkube checkout**, not from token.place.
+
+Use the values files and version file that live in Sugarkube for your environment; `PATH/TO/*` placeholders below are intentionally repo-local to Sugarkube.
 >
-> `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are
-> **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
->
+## Ingress TLS + Cloudflare Tunnel contract
+
+- Cloudflare Tunnel still owns public DNS/Tunnel routing for `token.place` to Traefik.
+- Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes.
+- Production values must explicitly set `ingress.tls.enabled: true` or chart output omits `spec.tls`.
+- Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-production` exists.
+
+Expected production overlay keys:
+
+```yaml
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+  host: token.place
+  tls:
+    enabled: true
+    secretName: tokenplace-prod-tls
+```
+
 > Tag selection: use `default_tag=main-REPLACE_SHORTSHA` while validating a staging candidate.
 > After pushing the real Git release tag (for example `v0.1.0`), use `default_tag=v0.1.0` as the
 > canonical production release image tag.
@@ -48,13 +68,13 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 First install:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=vX.Y.Z
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.prod.yaml version_file=PATH/TO/tokenplace.version default_tag=v0.1.0
 ```
 
 Upgrade existing release:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=vX.Y.Z
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.prod.yaml version_file=PATH/TO/tokenplace.version default_tag=v0.1.0
 ```
 
 ## Validation checklist
@@ -62,6 +82,13 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.prod.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-prod-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
+grep -n "token.place" /tmp/tokenplace-prod-render.yaml
+grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://token.place/
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
 curl -fsS https://token.place/

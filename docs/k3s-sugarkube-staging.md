@@ -33,6 +33,8 @@ operations, operators should configure a single-pod rollout policy (for example 
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Preferred tag for validation/sign-off: immutable `main-<shortsha>`
 - `main-latest` is convenience-only
+- Release Git tags (example: `v0.1.0`) publish matching semver image tags
+  (`ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`) for final release promotion
 
 ## Deployment commands (run from Sugarkube repo)
 

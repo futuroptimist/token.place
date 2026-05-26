@@ -35,6 +35,9 @@ operator workflow.
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - `main-latest` is convenience-only and not production sign-off material
+- Final release Git tags (example: `v0.1.0`) also publish matching semver image tags
+  (example: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`), which become the canonical
+  production release image tags
 
 > The `tokenplace.*` values/version files in command examples below are **Sugarkube-owned future
 > contract artifacts** expected after follow-up Sugarkube prompts land.

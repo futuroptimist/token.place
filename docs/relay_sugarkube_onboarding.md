@@ -97,7 +97,20 @@ curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/
 ```
 
-For production validation, replace the host with `https://token.place`.
+Production validation:
+
+```bash
+CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.prod.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-prod-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
+grep -n "token.place" /tmp/tokenplace-prod-render.yaml
+grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://token.place/
+curl -fsS https://token.place/livez
+curl -fsS https://token.place/healthz
+curl -fsS https://token.place/
+```
 
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).

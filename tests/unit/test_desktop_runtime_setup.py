@@ -896,3 +896,41 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
     assert result['missing'] == 'dotenv'
+
+
+def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
+    monkeypatch, tmp_path
+):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil\nrequests\npython-dotenv\n', encoding='utf-8')
+    runtime_root = tmp_path / 'runtime'
+    runtime_root.mkdir(parents=True)
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: runtime_root)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+    captured = {}
+
+    def _capture_run(cmd, *_args, **_kwargs):
+        captured['cmd'] = cmd
+        return False, 'install failed: boom'
+
+    original_mkdir = desktop_runtime_setup.Path.mkdir
+
+    def _fake_mkdir(path_obj, parents=False, exist_ok=False):
+        if str(path_obj).endswith('.token_place_desktop_site') and runtime_root in path_obj.parents:
+            raise PermissionError('read-only bundle')
+        return original_mkdir(path_obj, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'mkdir', _fake_mkdir)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=runtime_root)
+
+    assert result['action'] == 'install_failed'
+    assert '--target' in captured['cmd']
+    target_idx = captured['cmd'].index('--target') + 1
+    assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')

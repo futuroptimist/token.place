@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -606,6 +607,22 @@ def _desktop_dependency_target(runtime_root: Path) -> Path:
     return runtime_root / ".token_place_desktop_site"
 
 
+def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    preferred_targets = [
+        _desktop_dependency_target(runtime_root),
+        Path.home() / ".token_place_desktop_site",
+        Path(tempfile.gettempdir()) / ".token_place_desktop_site",
+    ]
+    errors: list[str] = []
+    for candidate in preferred_targets:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate, None
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    return None, "; ".join(errors) if errors else "no writable install target"
+
+
 def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure baseline desktop bridge Python dependencies are importable."""
 
@@ -628,8 +645,17 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
         }
 
     env = os.environ.copy()
-    target_dir = _desktop_dependency_target(root)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir, target_error = _resolve_desktop_dependency_target(root)
+    if target_dir is None:
+        return {
+            "ok": "false",
+            "action": "install_target_unavailable",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+            "detail": target_error or "unable to create desktop dependency install target",
+        }
     target_dir_str = str(target_dir)
     if target_dir_str not in sys.path:
         sys.path.insert(0, target_dir_str)

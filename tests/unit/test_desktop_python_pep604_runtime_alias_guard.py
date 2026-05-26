@@ -40,17 +40,44 @@ def _is_runtime_union_alias(value: ast.AST) -> bool:
     return False
 
 
+def _contains_type_alias_annotation(annotation: ast.AST | None) -> bool:
+    if annotation is None:
+        return False
+    for node in ast.walk(annotation):
+        if isinstance(node, ast.Name) and node.id == "TypeAlias":
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "TypeAlias":
+            return True
+    return False
+
+
+def _is_alias_like_target(target: ast.AST) -> bool:
+    return isinstance(target, ast.Name) and bool(target.id) and target.id[0].isupper()
+
+
 def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignments() -> None:
     violations: list[str] = []
 
     for path in _iter_python_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = node.targets
+                alias_like = all(_is_alias_like_target(target) for target in targets)
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                targets = [node.target]
+                alias_like = _contains_type_alias_annotation(node.annotation) or _is_alias_like_target(node.target)
+            else:
                 continue
-            if _is_runtime_union_alias(node.value):
-                targets = [ast.unparse(target) for target in node.targets]
+
+            if value is None or not alias_like:
+                continue
+
+            if _is_runtime_union_alias(value):
+                target_names = [ast.unparse(target) for target in targets]
                 rel = path.relative_to(REPO_ROOT)
-                violations.append(f"{rel}:{node.lineno} assigns runtime union alias: {', '.join(targets)}")
+                violations.append(f"{rel}:{node.lineno} assigns runtime union alias: {', '.join(target_names)}")
 
     assert not violations, "\n".join(violations)

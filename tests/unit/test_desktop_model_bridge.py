@@ -30,8 +30,9 @@ def test_inspect_returns_shared_model_manager_metadata(capsys):
     manager = MagicMock()
     manager.get_model_artifact_metadata.return_value = metadata
 
-    with patch.object(model_bridge, '_get_model_manager', return_value=(manager, None)):
-        status = model_bridge.inspect_model()
+    with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': True}):
+        with patch.object(model_bridge, '_get_model_manager', return_value=(manager, None)):
+            status = model_bridge.inspect_model()
 
     assert status == 0
     manager.get_model_artifact_metadata.assert_called_once_with()
@@ -39,8 +40,9 @@ def test_inspect_returns_shared_model_manager_metadata(capsys):
 
 
 def test_inspect_returns_bridge_error_when_manager_init_fails(capsys):
-    with patch.object(model_bridge, '_get_model_manager', return_value=(None, {'ok': False, 'error': 'boom'})):
-        status = model_bridge.inspect_model()
+    with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': True}):
+        with patch.object(model_bridge, '_get_model_manager', return_value=(None, {'ok': False, 'error': 'boom'})):
+            status = model_bridge.inspect_model()
 
     assert status == 1
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'boom'}
@@ -50,8 +52,9 @@ def test_download_returns_actionable_error_when_download_fails(capsys):
     manager = MagicMock()
     manager.download_model_if_needed.return_value = False
 
-    with patch.object(model_bridge, '_get_model_manager', return_value=(manager, None)):
-        status = model_bridge.download_model()
+    with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': True}):
+        with patch.object(model_bridge, '_get_model_manager', return_value=(manager, None)):
+            status = model_bridge.download_model()
 
     assert status == 1
     manager.download_model_if_needed.assert_called_once_with()
@@ -78,13 +81,22 @@ def test_download_returns_metadata_when_download_succeeds(capsys):
     manager.download_model_if_needed.return_value = True
     manager.get_model_artifact_metadata.return_value = metadata
 
-    with patch.object(model_bridge, '_get_model_manager', return_value=(manager, None)):
-        status = model_bridge.download_model()
+    with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': True}):
+        with patch.object(model_bridge, '_get_model_manager', return_value=(manager, None)):
+            status = model_bridge.download_model()
 
     assert status == 0
     manager.download_model_if_needed.assert_called_once_with()
     manager.get_model_artifact_metadata.assert_called_once_with()
     assert json.loads(capsys.readouterr().out.strip()) == {'ok': True, 'payload': metadata}
+
+
+def test_inspect_fails_when_dependency_preflight_fails(capsys):
+    with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': False, 'error': 'deps bad'}):
+        status = model_bridge.inspect_model()
+
+    assert status == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'deps bad'}
 
 
 def test_get_model_manager_reports_missing_dependency(capsys):
@@ -246,6 +258,11 @@ def test_inspect_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_
     (python_dir / 'model_bridge.py').write_text(MODULE_PATH.read_text(encoding='utf-8'), encoding='utf-8')
     path_bootstrap_path = MODULE_PATH.parent / 'path_bootstrap.py'
     (python_dir / 'path_bootstrap.py').write_text(path_bootstrap_path.read_text(encoding='utf-8'), encoding='utf-8')
+    desktop_runtime_setup_path = MODULE_PATH.parent / 'desktop_runtime_setup.py'
+    (python_dir / 'desktop_runtime_setup.py').write_text(desktop_runtime_setup_path.read_text(encoding='utf-8'), encoding='utf-8')
+    desktop_gpu_packaging_path = MODULE_PATH.parent / 'desktop_gpu_packaging.py'
+    (python_dir / 'desktop_gpu_packaging.py').write_text(desktop_gpu_packaging_path.read_text(encoding='utf-8'), encoding='utf-8')
+    (python_dir / 'requirements_desktop_runtime.txt').write_text('psutil==7.1.0\nrequests==2.32.5\npython-dotenv==1.1.1\ncryptography==46.0.1\n', encoding='utf-8')
     (import_root / 'utils' / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_llm_dir / 'model_manager.py').write_text(

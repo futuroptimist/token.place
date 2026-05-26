@@ -145,6 +145,11 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
 
     forbidden_any_output = [
         "Missing Python dependency for model downloads",
+        "Model bridge failure",
+        "unsupported operand type(s) for |",
+        "No module named",
+        "ModuleNotFoundError",
+        "ImportError",
         "No module named 'psutil'",
         "No module named 'requests'",
         "No module named 'dotenv'",

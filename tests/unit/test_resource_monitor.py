@@ -1,4 +1,5 @@
 """Unit tests for the resource monitoring utilities."""
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -518,3 +519,16 @@ def test_can_allocate_gpu_memory_ignores_shutdown_errors(monkeypatch):
 
     assert rm.can_allocate_gpu_memory(4_000_000_000) is False
     assert shutdown_calls == 1
+
+
+def test_gpu_metrics_alias_avoids_runtime_pep604_union():
+    """Regression: alias assignment must remain Python 3.9-safe."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "utils"
+        / "system"
+        / "resource_monitor.py"
+    ).read_text(encoding="utf-8")
+
+    assert "GpuMetrics = Dict[str, float | int | bool]" not in source
+    assert "GpuMetrics = Dict[str, Union[float, int, bool]]" in source

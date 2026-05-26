@@ -10,6 +10,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
+      - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -25,6 +26,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
+      - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -138,6 +140,28 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
+      - name: Set up Node.js (macOS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: Install desktop Node dependencies (macOS)
+        working-directory: desktop-tauri
+        run: npm ci
+
+      - name: Set up Rust (macOS)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build desktop frontend assets (macOS)
+        working-directory: desktop-tauri
+        run: npm run build
+
+      - name: Build desktop binary (macOS debug, no bundle)
+        working-directory: desktop-tauri
+        run: npm run tauri build -- --debug --no-bundle
+
       - name: Run dependency-isolated model bridge inspect smoke (macOS)
         env:
           TOKEN_PLACE_INSPECT_ONLY: "1"
@@ -150,3 +174,6 @@ jobs:
 
       - name: Run packaged operator bridge e2e (macOS)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
+      - name: Run desktop no-relay lifecycle e2e (macOS)
+        run: python desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py

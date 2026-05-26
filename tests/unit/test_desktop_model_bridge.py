@@ -328,3 +328,37 @@ def test_download_returns_error_when_dotenv_missing(capsys):
     response = json.loads(capsys.readouterr().out.strip())
     assert response['ok'] is False
     assert "No module named 'dotenv'" in response['error']
+
+
+def test_run_dependency_preflight_formats_failure_context():
+    with patch.object(
+        model_bridge,
+        'ensure_desktop_python_dependencies',
+        return_value={'ok': 'false', 'missing': 'cryptography', 'action': 'install_failed', 'detail': 'permission denied'},
+    ):
+        payload = model_bridge._run_dependency_preflight()
+
+    assert payload['ok'] is False
+    assert 'missing=cryptography' in payload['error']
+    assert 'action=install_failed' in payload['error']
+    assert 'detail=permission denied' in payload['error']
+
+
+def test_main_returns_json_error_on_unhandled_exception(capsys):
+    with patch.object(model_bridge.argparse.ArgumentParser, 'parse_args', return_value=SimpleNamespace(action='inspect')):
+        with patch.object(model_bridge, 'inspect_model', side_effect=RuntimeError('unexpected boom')):
+            status = model_bridge.main()
+
+    assert status == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        'ok': False,
+        'error': 'Model bridge failure: unexpected boom',
+    }
+
+
+def test_download_fails_when_dependency_preflight_fails(capsys):
+    with patch.object(model_bridge, '_run_dependency_preflight', return_value={'ok': False, 'error': 'deps bad'}):
+        status = model_bridge.download_model()
+
+    assert status == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {'ok': False, 'error': 'deps bad'}

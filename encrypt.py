@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Made with help from https://www.youtube.com/watch?v=pOx2TYwR590
 # Github: https://github.com/cgossi/fundamental_cryptography_with_python
 

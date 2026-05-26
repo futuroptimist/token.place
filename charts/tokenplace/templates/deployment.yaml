@@ -11,17 +11,19 @@ spec:
       so the manifest never renders `type: <no value>`.
   */}}
   {{- $strategyType := default "Recreate" .Values.strategy.type }}
+  {{- $existing := lookup "apps/v1" "Deployment" .Release.Namespace (include "tokenplace.fullname" .) }}
+  {{- $existingHasRollingUpdate := and $existing $existing.spec $existing.spec.strategy $existing.spec.strategy.rollingUpdate }}
   strategy:
     type: {{ $strategyType }}
     {{- /*
-        Keep the default Recreate render free of `rollingUpdate` keys.
-        Helm's three-way merge compares chart-rendered old/new manifests, so when this
-        chart does not render rollingUpdate for Recreate, the desired state omits it.
-        CI verifies the Recreate default and the sparse-strategy override render shape.
+        Keep default Recreate renders free of rollingUpdate keys, but clear the live
+        field during upgrades from older defaulted RollingUpdate Deployments.
     */}}
     {{- if and (eq $strategyType "RollingUpdate") .Values.strategy.rollingUpdate }}
     rollingUpdate:
       {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}
+    {{- else if and (eq $strategyType "Recreate") $existingHasRollingUpdate }}
+    rollingUpdate: null
     {{- end }}
   selector:
     matchLabels:

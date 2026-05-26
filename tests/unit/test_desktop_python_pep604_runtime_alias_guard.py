@@ -55,16 +55,32 @@ def _is_alias_like_target(target: ast.AST) -> bool:
     return isinstance(target, ast.Name) and bool(target.id) and target.id[0].isupper()
 
 
+def _iter_import_time_child_bodies(node: ast.AST) -> list[list[ast.stmt]]:
+    if isinstance(node, ast.ClassDef):
+        return [node.body]
+    if isinstance(node, ast.If):
+        return [node.body, node.orelse]
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        return [node.body, node.orelse]
+    if isinstance(node, ast.With):
+        return [node.body]
+    if isinstance(node, ast.Try):
+        bodies: list[list[ast.stmt]] = [node.body, node.orelse, node.finalbody]
+        bodies.extend(handler.body for handler in node.handlers)
+        return bodies
+    if isinstance(node, ast.Match):
+        return [case.body for case in node.cases]
+    return []
+
+
 def _iter_import_time_assignment_nodes(tree: ast.AST):
-    stack = [tree]
+    stack: list[list[ast.stmt]] = [getattr(tree, "body", [])]
     while stack:
-        scope = stack.pop()
-        body = getattr(scope, "body", [])
+        body = stack.pop()
         for node in body:
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 yield node
-            if isinstance(node, ast.ClassDef):
-                stack.append(node)
+            stack.extend(_iter_import_time_child_bodies(node))
 
 
 def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignments() -> None:

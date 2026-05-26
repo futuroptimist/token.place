@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -611,7 +610,6 @@ def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Pat
     preferred_targets = [
         _desktop_dependency_target(runtime_root),
         Path.home() / ".token_place_desktop_site",
-        Path(tempfile.gettempdir()) / ".token_place_desktop_site",
     ]
     errors: list[str] = []
     for candidate in preferred_targets:

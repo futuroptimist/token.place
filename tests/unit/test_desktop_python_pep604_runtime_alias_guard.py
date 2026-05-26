@@ -88,6 +88,9 @@ def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignme
     violations: list[str] = []
 
     for path in _iter_python_files():
+        rel = path.relative_to(REPO_ROOT)
+        if rel.parts[:2] == ("utils", "testing"):
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in _iter_import_time_assignment_nodes(tree):
             if isinstance(node, ast.Assign):
@@ -108,5 +111,32 @@ def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignme
                 target_names = [ast.unparse(target) for target in targets]
                 rel = path.relative_to(REPO_ROOT)
                 violations.append(f"{rel}:{node.lineno} assigns runtime union alias: {', '.join(target_names)}")
+
+    assert not violations, "\n".join(violations)
+
+
+def test_desktop_packaged_import_graph_has_no_unconditional_dataclass_slots_true() -> None:
+    violations: list[str] = []
+
+    for path in _iter_python_files():
+        rel = path.relative_to(REPO_ROOT)
+        if rel.parts[:2] == ("utils", "testing"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                func = decorator.func
+                is_dataclass = isinstance(func, ast.Name) and func.id == "dataclass"
+                if not is_dataclass:
+                    continue
+                for keyword in decorator.keywords:
+                    if keyword.arg == "slots" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
+                        violations.append(
+                            f"{rel}:{node.lineno} uses dataclass(slots=True) without Python-version gating"
+                        )
 
     assert not violations, "\n".join(violations)

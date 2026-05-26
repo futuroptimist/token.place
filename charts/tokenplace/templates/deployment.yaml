@@ -6,11 +6,14 @@ metadata:
     {{- include "tokenplace.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- $strategyType := default "Recreate" .Values.strategy.type }}
   strategy:
-    type: {{ .Values.strategy.type }}
-    {{- if and (eq .Values.strategy.type "RollingUpdate") .Values.strategy.rollingUpdate }}
+    type: {{ $strategyType }}
+    {{- if and (eq $strategyType "RollingUpdate") .Values.strategy.rollingUpdate }}
     rollingUpdate:
       {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}
+    {{- else if eq $strategyType "Recreate" }}
+    rollingUpdate: null
     {{- end }}
   selector:
     matchLabels:

@@ -57,6 +57,7 @@ jobs:
           grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
           grep -n "type: Recreate" /tmp/tokenplace-render.yaml
           grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml
+          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n "value: \"1\""
 
       - name: Capture chart metadata
         id: chart_meta

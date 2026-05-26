@@ -855,12 +855,12 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'requirements_missing'
-    assert result['missing'] == 'psutil,requests,dotenv'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
 
 
 def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, tmp_path):
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
-    requirements.write_text('psutil\nrequests\npython-dotenv\n', encoding='utf-8')
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
@@ -884,10 +884,10 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
 
 def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
-    requirements.write_text('psutil\nrequests\npython-dotenv\n', encoding='utf-8')
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
-    sequence = iter([None, None, None, object(), object(), None])
+    sequence = iter([None, None, None, None, object(), object(), object(), None])
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
     monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
 
@@ -895,14 +895,14 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 
     assert result['ok'] == 'false'
     assert result['action'] == 'post_install_missing'
-    assert result['missing'] == 'dotenv'
+    assert result['missing'] == 'cryptography'
 
 
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
     monkeypatch, tmp_path
 ):
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
-    requirements.write_text('psutil\nrequests\npython-dotenv\n', encoding='utf-8')
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     runtime_root = tmp_path / 'runtime'
     runtime_root.mkdir(parents=True)
     home_dir = tmp_path / 'home'

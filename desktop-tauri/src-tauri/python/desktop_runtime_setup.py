@@ -629,7 +629,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
     root = _resolve_runtime_root(repo_root=repo_root)
     requirements_path = _resolve_desktop_requirements_path(root)
 
-    required_modules = ("psutil", "requests", "dotenv")
+    required_modules = ("psutil", "requests", "dotenv", "cryptography")
     missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
     if not missing:
         return {"ok": "true", "action": "already_satisfied", "missing": ""}

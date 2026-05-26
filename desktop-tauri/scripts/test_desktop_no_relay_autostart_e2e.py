@@ -74,8 +74,12 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-no-relay-home-") as home:
         env["HOME"] = home
+        if desktop_target.suffix == ".app":
+            launch_cmd = ["open", "-W", str(desktop_target)]
+        else:
+            launch_cmd = [str(desktop_target)]
         app = subprocess.Popen(
-            ["open", "-W", str(desktop_target)],
+            launch_cmd,
             cwd=REPO_ROOT,
             env=env,
             stdout=subprocess.PIPE,

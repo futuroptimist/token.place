@@ -88,9 +88,6 @@ def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignme
     violations: list[str] = []
 
     for path in _iter_python_files():
-        rel = path.relative_to(REPO_ROOT)
-        if rel.parts[:2] == ("utils", "testing"):
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in _iter_import_time_assignment_nodes(tree):
             if isinstance(node, ast.Assign):
@@ -119,9 +116,6 @@ def test_desktop_packaged_import_graph_has_no_unconditional_dataclass_slots_true
     violations: list[str] = []
 
     for path in _iter_python_files():
-        rel = path.relative_to(REPO_ROOT)
-        if rel.parts[:2] == ("utils", "testing"):
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):

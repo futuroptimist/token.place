@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -9,7 +10,7 @@ from typing import Optional
 import encrypt
 
 
-@dataclass(slots=True)
+@dataclass(**({"slots": True} if sys.version_info >= (3, 10) else {}))
 class StreamEncryptionStressResult:
     """Summary of a streaming encryption stress run."""
 

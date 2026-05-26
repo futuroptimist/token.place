@@ -15,7 +15,17 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DESKTOP_APP = REPO_ROOT / "desktop-tauri" / "src-tauri" / "target" / "debug" / "token.place desktop.app"
+DESKTOP_TARGET_DIR = REPO_ROOT / "desktop-tauri" / "src-tauri" / "target" / "debug"
+DESKTOP_APP_BUNDLE = DESKTOP_TARGET_DIR / "token.place desktop.app"
+DESKTOP_APP_BIN = DESKTOP_TARGET_DIR / "token-place-desktop-tauri"
+
+
+def _resolve_desktop_app_target() -> Path | None:
+    if DESKTOP_APP_BUNDLE.exists():
+        return DESKTOP_APP_BUNDLE
+    if DESKTOP_APP_BIN.exists():
+        return DESKTOP_APP_BIN
+    return None
 
 
 def _port_in_use(port: int) -> bool:
@@ -50,8 +60,9 @@ def main() -> int:
         print(f"SKIP: {message}")
         return 0
 
-    if not DESKTOP_APP.exists():
-        message = f"desktop app binary not found: {DESKTOP_APP}"
+    desktop_target = _resolve_desktop_app_target()
+    if desktop_target is None:
+        message = f"desktop app binary not found: {DESKTOP_APP_BUNDLE} or {DESKTOP_APP_BIN}"
         if require_no_relay_e2e:
             raise AssertionError(message)
         print(f"SKIP: {message}")
@@ -64,7 +75,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="token-place-no-relay-home-") as home:
         env["HOME"] = home
         app = subprocess.Popen(
-            ["open", "-W", str(DESKTOP_APP)],
+            ["open", "-W", str(desktop_target)],
             cwd=REPO_ROOT,
             env=env,
             stdout=subprocess.PIPE,

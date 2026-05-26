@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-26",
+  "slug": "desktop-macos-model-bridge-pep604-type-alias",
+  "summary": "Desktop macOS startup could fail with a model bridge error when Python 3.9 evaluated a runtime PEP 604 union type-alias assignment in resource_monitor.",
+  "impact": "Desktop operator inspect/start paths could fail before runtime initialization in Python 3.9 environments, surfacing as a generic model bridge failure.",
+  "fix": "Replaced runtime-evaluated PEP 604 alias usage with Python 3.9-safe typing, added AST regression guards across packaged desktop Python imports, and hardened packaged inspect/UI error assertions.",
+  "lessons": "Runtime assignments using PEP 604 unions in packaged import paths are a compatibility hazard for Python 3.9 and require both static and runtime CI coverage; desktop and relay lifecycles must remain separate."
+}

@@ -125,6 +125,23 @@ jobs:
       - name: Run packaged operator bridge e2e (Windows)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
 
+
+  desktop-operator-packaged-inspect-python39-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Run dependency-isolated model bridge inspect smoke (macOS, Python 3.9)
+        env:
+          TOKEN_PLACE_INSPECT_ONLY: "1"
+        run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
   desktop-operator-packaged-e2e-macos:
     runs-on: macos-latest
     timeout-minutes: 20

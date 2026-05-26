@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import importlib
 import sys
-from typing import Dict
+from typing import Dict, Union
 
 
 def _gpu_headroom_multiplier(headroom_percent: float) -> float:
@@ -23,7 +23,7 @@ except (ImportError, OSError):  # pragma: no cover - exercised via import fallba
     psutil = None
 
 
-GpuMetrics = Dict[str, float | int | bool]
+GpuMetrics = Dict[str, Union[float, int, bool]]
 
 
 def _gpu_metrics_default(*, available: bool = False, count: int = 0) -> GpuMetrics:
@@ -167,7 +167,7 @@ def _cpu_interval_for_platform(platform: str) -> float | None:
     return None
 
 
-def collect_resource_usage() -> Dict[str, float | int | bool]:
+def collect_resource_usage() -> Dict[str, Union[float, int, bool]]:
     """Return current CPU, memory, and GPU utilisation metrics."""
 
     interval = _cpu_interval_for_platform(sys.platform)

@@ -576,15 +576,17 @@ def main() -> int:
 
         last_error_text = driver.find_element(By.XPATH, "//p[contains(.,'Last error:')]").text
         lowered_last_error = last_error_text.lower()
-        assert "bridge failure" not in lowered_last_error, (
-            f"Last error still indicates bridge failure: {last_error_text}"
-        )
-        assert "no module named" not in lowered_last_error, (
-            f"Last error still indicates import failure: {last_error_text}"
-        )
-        assert "importerror" not in lowered_last_error, (
-            f"Last error still indicates import failure: {last_error_text}"
-        )
+        for marker in (
+            "bridge failure",
+            "unsupported operand",
+            "no module named",
+            "modulenotfounderror",
+            "importerror",
+            "model path not found",
+        ):
+            assert marker not in lowered_last_error, (
+                f"Last error contains forbidden marker `{marker}`: {last_error_text}"
+            )
         assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
     except TimeoutException as exc:
         raise RuntimeError(diagnostics_message("desktop UI e2e timed out", relay_log, driver_log, driver)) from exc

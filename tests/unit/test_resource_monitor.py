@@ -1,4 +1,5 @@
 """Unit tests for the resource monitoring utilities."""
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -518,3 +519,11 @@ def test_can_allocate_gpu_memory_ignores_shutdown_errors(monkeypatch):
 
     assert rm.can_allocate_gpu_memory(4_000_000_000) is False
     assert shutdown_calls == 1
+
+
+def test_resource_monitor_source_avoids_runtime_pep604_alias_assignment() -> None:
+    """Regression: Python 3.9 cannot evaluate ``Dict[..., float | int | bool]`` at runtime."""
+    source = Path(__file__).resolve().parents[2].joinpath("utils", "system", "resource_monitor.py").read_text(
+        encoding="utf-8"
+    )
+    assert "GpuMetrics = Dict[str, float | int | bool]" not in source

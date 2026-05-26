@@ -56,8 +56,8 @@ jobs:
           grep -n "replicas: 1" /tmp/tokenplace-render.yaml
           grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
           grep -n "type: Recreate" /tmp/tokenplace-render.yaml
-          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml
-          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n "value: \"1\""
+          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "1"'
+          ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
 
       - name: Capture chart metadata
         id: chart_meta

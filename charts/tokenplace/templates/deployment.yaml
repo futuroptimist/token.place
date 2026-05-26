@@ -12,8 +12,6 @@ spec:
     {{- if and (eq $strategyType "RollingUpdate") .Values.strategy.rollingUpdate }}
     rollingUpdate:
       {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}
-    {{- else if eq $strategyType "Recreate" }}
-    rollingUpdate: null
     {{- end }}
   selector:
     matchLabels:

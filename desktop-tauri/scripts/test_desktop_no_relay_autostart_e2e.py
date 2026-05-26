@@ -74,7 +74,8 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-no-relay-home-") as home:
         env["HOME"] = home
-        if desktop_target.suffix == ".app":
+        launched_app_bundle = desktop_target.suffix == ".app"
+        if launched_app_bundle:
             launch_cmd = ["open", "-W", str(desktop_target)]
         else:
             launch_cmd = [str(desktop_target)]
@@ -87,7 +88,12 @@ def main() -> int:
             text=True,
         )
         time.sleep(2)
-        subprocess.run(["osascript", "-e", 'tell application "token.place desktop" to quit'], check=False)
+        if launched_app_bundle:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "token.place desktop" to quit'], check=False
+            )
+        else:
+            app.terminate()
         app.wait(timeout=60)
 
     assert not _has_process_matching("relay.py"), "relay.py process exists after desktop shutdown"

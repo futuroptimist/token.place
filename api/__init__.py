@@ -1,5 +1,7 @@
 """token.place API package."""
 
+from __future__ import annotations
+
 import os
 from flask import jsonify, request
 from flask_limiter import Limiter

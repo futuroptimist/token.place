@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DESKTOP_APP = REPO_ROOT / "desktop-tauri" / "src-tauri" / "target" / "debug" / "token.place.app"
+DESKTOP_APP = REPO_ROOT / "desktop-tauri" / "src-tauri" / "target" / "debug" / "token.place desktop.app"
 
 
 def _port_in_use(port: int) -> bool:

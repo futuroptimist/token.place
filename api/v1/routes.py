@@ -3,6 +3,8 @@ API routes for token.place API v1
 This module follows OpenAI API conventions to serve as a drop-in replacement.
 """
 
+from __future__ import annotations
+
 from flask import Blueprint, request, jsonify
 import base64
 import time

@@ -3,6 +3,8 @@ API routes for token.place API v2.
 This module extends the OpenAI-compatible surface with enhanced capabilities.
 """
 
+from __future__ import annotations
+
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 import base64
 import time

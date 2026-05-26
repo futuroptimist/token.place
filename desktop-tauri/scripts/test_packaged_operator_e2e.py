@@ -141,6 +141,7 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
         "No module named 'psutil'",
         "No module named 'requests'",
         "No module named 'dotenv'",
+        "No module named 'cryptography'",
         "NotOpenSSLWarning",
         "~/Library/Python",
     ]

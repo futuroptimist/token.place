@@ -6,9 +6,19 @@ metadata:
     {{- include "tokenplace.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- /*
+      Resolve strategy type from a potentially sparse object (e.g. --set-json strategy={})
+      so the manifest never renders `type: <no value>`.
+  */}}
   {{- $strategyType := default "Recreate" .Values.strategy.type }}
   strategy:
     type: {{ $strategyType }}
+    {{- /*
+        Keep the default Recreate render free of `rollingUpdate` keys.
+        Helm's three-way merge compares chart-rendered old/new manifests, so when this
+        chart does not render rollingUpdate for Recreate, the desired state omits it.
+        CI verifies the Recreate default and the sparse-strategy override render shape.
+    */}}
     {{- if and (eq $strategyType "RollingUpdate") .Values.strategy.rollingUpdate }}
     rollingUpdate:
       {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}

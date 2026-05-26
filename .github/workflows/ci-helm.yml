@@ -59,6 +59,16 @@ jobs:
           grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "1"'
           ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
 
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set ingress.enabled=true \
+            --set ingress.host=staging.token.place \
+            --set image.tag=main-deadbee \
+            --set-json strategy={} > /tmp/tokenplace-render-strategy-empty.yaml
+
+          grep -n "type: Recreate" /tmp/tokenplace-render-strategy-empty.yaml
+          ! grep -n "rollingUpdate:" /tmp/tokenplace-render-strategy-empty.yaml
+
       - name: Capture chart metadata
         id: chart_meta
         run: |

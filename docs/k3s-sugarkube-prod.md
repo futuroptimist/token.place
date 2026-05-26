@@ -30,7 +30,8 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Required sign-off tag style: immutable `main-<shortsha>`
+- Required sign-off tag style: immutable semver release tag `vX.Y.Z` (published from a signed-off main artifact)
+- Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only and not production sign-off
 
 ## Deployment commands (run from Sugarkube repo)
@@ -39,17 +40,21 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 >
 > `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are
 > **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
+>
+> Tag selection: use `default_tag=main-REPLACE_SHORTSHA` while validating a staging candidate.
+> After pushing the real Git release tag (for example `v0.1.0`), use `default_tag=v0.1.0` as the
+> canonical production release image tag.
 
 First install:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=vX.Y.Z
 ```
 
 Upgrade existing release:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=docs/examples/tokenplace.values.dev.yaml,docs/examples/tokenplace.values.prod.yaml version_file=docs/apps/tokenplace.version default_tag=vX.Y.Z
 ```
 
 ## Validation checklist

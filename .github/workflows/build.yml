@@ -38,7 +38,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     env:
-      PUSH_IMAGE: ${{ github.event_name == 'push' && github.repository == 'futuroptimist/token.place' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+      PUSH_IMAGE: ${{ github.event_name == 'push' && github.repository == 'futuroptimist/token.place' && github.ref == 'refs/heads/main' }}
     permissions:
       contents: read
       packages: write

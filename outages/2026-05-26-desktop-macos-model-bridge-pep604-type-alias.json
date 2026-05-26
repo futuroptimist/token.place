@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-26",
+  "slug": "desktop-macos-model-bridge-pep604-type-alias",
+  "summary": "Desktop macOS model bridge could fail during import on Python 3.9 due to runtime-evaluated PEP 604 union type alias assignment.",
+  "impact": "Model bridge inspect/download startup could return Model bridge failure with unsupported operand type(s) for | before operator runtime start.",
+  "fix": "Converted runtime alias unions in resource_monitor to Python 3.9-safe typing forms, added static alias guard, tightened packaged inspect failure assertions, and added macOS Python 3.9 inspect-only workflow coverage.",
+  "lessons": "Desktop packaged import paths must avoid runtime-evaluated PEP 604 alias expressions when Python 3.9 may be selected, and relay lifecycle ownership must remain separate from desktop app startup."
+}

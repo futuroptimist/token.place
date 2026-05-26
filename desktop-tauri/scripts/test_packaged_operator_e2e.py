@@ -127,7 +127,7 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
         [
             sys.executable,
             "-c",
-            "import psutil,requests,dotenv; print('desktop-runtime-imports-ok')",
+            "import psutil,requests,dotenv,cryptography; print('desktop-runtime-imports-ok')",
         ],
         cwd=tmp_root,
         env=env,

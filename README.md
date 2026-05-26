@@ -265,7 +265,8 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Preferred staging/prod tag: immutable `main-<shortsha>` (`main-latest` is convenience-only)
+- Staging candidate tag: immutable `main-<shortsha>` (`main-latest` is convenience-only)
+- Canonical release tag after `git tag v0.1.0` push: `v0.1.0`
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo.
 

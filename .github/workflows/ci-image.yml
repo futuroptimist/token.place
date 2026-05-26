@@ -7,6 +7,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       ref:
@@ -24,9 +26,12 @@ jobs:
       short_sha: ${{ steps.tags.outputs.short_sha }}
       created: ${{ steps.tags.outputs.created }}
       repository: ${{ steps.tags.outputs.repository }}
+      image_tags: ${{ steps.tags.outputs.image_tags }}
       branch_tag: ${{ steps.tags.outputs.branch_tag }}
       latest_tag: ${{ steps.tags.outputs.latest_tag }}
+      semver_tag: ${{ steps.tags.outputs.semver_tag }}
       sha_tag: ${{ steps.tags.outputs.sha_tag }}
+      publish_reason: ${{ steps.tags.outputs.publish_reason }}
 
     steps:
       - name: Checkout repository
@@ -45,9 +50,48 @@ jobs:
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
           echo "created=${created}" >> "$GITHUB_OUTPUT"
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
-          echo "branch_tag=${repository}:main-${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=${repository}:main-latest" >> "$GITHUB_OUTPUT"
-          echo "sha_tag=${repository}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          branch_tag="${repository}:main-${short_sha}"
+          latest_tag="${repository}:main-latest"
+          sha_tag="${repository}:sha-${short_sha}"
+          semver_tag=""
+          publish_reason=""
+          image_tags=""
+
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            publish_reason="main"
+            image_tags="$(printf '%s\n%s\n%s' "${branch_tag}" "${latest_tag}" "${sha_tag}")"
+          elif [[ "${GITHUB_REF}" =~ ^refs/tags/v[0-9].* ]]; then
+            release_tag="${GITHUB_REF#refs/tags/}"
+            if [[ ! "${release_tag}" =~ ^v[0-9]+(\.[0-9]+){2}([-.][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Malformed release tag: ${release_tag}" >&2
+              exit 1
+            fi
+            semver_tag="${repository}:${release_tag}"
+            publish_reason="tag"
+            image_tags="$(printf '%s\n%s' "${semver_tag}" "${sha_tag}")"
+          else
+            publish_reason="none"
+            image_tags="${sha_tag}"
+          fi
+
+          if [[ -z "${sha_tag}" ]]; then
+            echo "Unsafe empty sha tag output" >&2
+            exit 1
+          fi
+
+          if [[ -z "${publish_reason}" ]]; then
+            echo "Publish reason must be set" >&2
+            exit 1
+          fi
+
+          echo "image_tags<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${image_tags}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "branch_tag=${branch_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "semver_tag=${semver_tag}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
+          echo "publish_reason=${publish_reason}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -106,7 +150,7 @@ jobs:
     name: Publish relay image
     runs-on: ubuntu-latest
     needs: build-and-smoke
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       packages: write
@@ -138,10 +182,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
-          tags: |
-            ${{ needs.build-and-smoke.outputs.branch_tag }}
-            ${{ needs.build-and-smoke.outputs.latest_tag }}
-            ${{ needs.build-and-smoke.outputs.sha_tag }}
+          tags: ${{ needs.build-and-smoke.outputs.image_tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
@@ -154,8 +195,12 @@ jobs:
           {
             echo "## Relay image tags"
             echo ""
-            echo "Immutable tag: \`${{ needs.build-and-smoke.outputs.branch_tag }}\`"
-            echo "Mutable tag: \`${{ needs.build-and-smoke.outputs.latest_tag }}\`"
+            if [[ "${{ needs.build-and-smoke.outputs.publish_reason }}" == "main" ]]; then
+              echo "Immutable tag: \`${{ needs.build-and-smoke.outputs.branch_tag }}\`"
+              echo "Mutable tag: \`${{ needs.build-and-smoke.outputs.latest_tag }}\`"
+            elif [[ "${{ needs.build-and-smoke.outputs.publish_reason }}" == "tag" ]]; then
+              echo "Semver tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
+            fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
             echo ""
             echo "Pushed: true"

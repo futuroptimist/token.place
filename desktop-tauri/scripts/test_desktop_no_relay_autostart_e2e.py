@@ -72,7 +72,7 @@ def main() -> int:
             text=True,
         )
         time.sleep(2)
-        subprocess.run(["osascript", "-e", 'tell application "token.place" to quit'], check=False)
+        subprocess.run(["osascript", "-e", 'tell application "token.place desktop" to quit'], check=False)
         app.wait(timeout=60)
 
     assert not _has_process_matching("relay.py"), "relay.py process exists after desktop shutdown"

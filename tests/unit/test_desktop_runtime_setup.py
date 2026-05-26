@@ -864,13 +864,22 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
     monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
-    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (False, 'install failed: boom'))
+    captured = {}
+
+    def _capture_run(cmd, *_args, **_kwargs):
+        captured['cmd'] = cmd
+        return False, 'install failed: boom'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
 
     result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
 
     assert result['ok'] == 'false'
     assert result['action'] == 'install_failed'
     assert result['detail'] == 'install failed: boom'
+    assert '--target' in captured['cmd']
+    target_idx = captured['cmd'].index('--target') + 1
+    assert captured['cmd'][target_idx] == str(tmp_path / '.token_place_desktop_site')
 
 
 def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):

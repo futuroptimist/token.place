@@ -602,6 +602,10 @@ def _resolve_desktop_requirements_path(repo_root: Path) -> Path:
     return candidates[0]
 
 
+def _desktop_dependency_target(runtime_root: Path) -> Path:
+    return runtime_root / ".token_place_desktop_site"
+
+
 def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure baseline desktop bridge Python dependencies are importable."""
 
@@ -624,13 +628,20 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
         }
 
     env = os.environ.copy()
+    target_dir = _desktop_dependency_target(root)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir_str = str(target_dir)
+    if target_dir_str not in sys.path:
+        sys.path.insert(0, target_dir_str)
+
     cmd = [
         sys.executable,
         "-m",
         "pip",
         "install",
         "--disable-pip-version-check",
-        "--no-user",
+        "--target",
+        target_dir_str,
         "-r",
         str(requirements_path),
     ]

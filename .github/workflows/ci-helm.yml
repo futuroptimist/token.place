@@ -51,7 +51,28 @@ jobs:
             --namespace tokenplace \
             --set ingress.enabled=true \
             --set ingress.host=staging.token.place \
-            --set image.tag=main-deadbee
+            --set image.tag=main-deadbee > /tmp/tokenplace-render.yaml
+
+          grep -n "replicas: 1" /tmp/tokenplace-render.yaml
+          grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
+          grep -n "type: Recreate" /tmp/tokenplace-render.yaml
+          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "1"'
+          ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
+
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set ingress.enabled=true \
+            --set ingress.host=staging.token.place \
+            --set image.tag=main-deadbee \
+            --set-json strategy={} > /tmp/tokenplace-render-strategy-empty.yaml
+
+          grep -n "type: Recreate" /tmp/tokenplace-render-strategy-empty.yaml
+          ! grep -n "rollingUpdate:" /tmp/tokenplace-render-strategy-empty.yaml
+
+          # Upgrade-path guard: template retains explicit stale-field clear branch
+          # when switching live defaulted RollingUpdate Deployments to Recreate.
+          grep -n 'else if and (eq $strategyType "Recreate") $existingHasRollingUpdate' charts/tokenplace/templates/deployment.yaml
+          grep -n 'rollingUpdate: null' charts/tokenplace/templates/deployment.yaml
 
       - name: Capture chart metadata
         id: chart_meta

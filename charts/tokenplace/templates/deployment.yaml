@@ -6,6 +6,25 @@ metadata:
     {{- include "tokenplace.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- /*
+      Resolve strategy type from a potentially sparse object (e.g. --set-json strategy={})
+      so the manifest never renders `type: <no value>`.
+  */}}
+  {{- $strategyType := default "Recreate" .Values.strategy.type }}
+  {{- $existing := lookup "apps/v1" "Deployment" .Release.Namespace (include "tokenplace.fullname" .) }}
+  {{- $existingHasRollingUpdate := and $existing $existing.spec $existing.spec.strategy $existing.spec.strategy.rollingUpdate }}
+  strategy:
+    type: {{ $strategyType }}
+    {{- /*
+        Keep default Recreate renders free of rollingUpdate keys, but clear the live
+        field during upgrades from older defaulted RollingUpdate Deployments.
+    */}}
+    {{- if and (eq $strategyType "RollingUpdate") .Values.strategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}
+    {{- else if and (eq $strategyType "Recreate") $existingHasRollingUpdate }}
+    rollingUpdate: null
+    {{- end }}
   selector:
     matchLabels:
       {{- include "tokenplace.selectorLabels" . | nindent 6 }}

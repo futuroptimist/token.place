@@ -44,7 +44,7 @@ Use the values files and version file that live in Sugarkube for your environmen
 - Cloudflare Tunnel still owns public DNS/Tunnel routing for `token.place` to Traefik.
 - Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes.
 - Production values must explicitly set `ingress.tls.enabled: true` or chart output omits `spec.tls`.
-- Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-prod` exists.
+- Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-production` exists.
 
 Expected production overlay keys:
 
@@ -53,7 +53,7 @@ ingress:
   enabled: true
   className: traefik
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-prod
+    cert-manager.io/cluster-issuer: letsencrypt-production
   host: token.place
   tls:
     enabled: true

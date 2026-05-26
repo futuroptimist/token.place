@@ -45,7 +45,7 @@ operations, operators should configure a single-pod rollout policy (for example 
 - Cloudflare Tunnel still owns public DNS/Tunnel routing for `staging.token.place` to Traefik.
 - Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes.
 - Staging values must explicitly set `ingress.tls.enabled: true` or chart output omits `spec.tls`.
-- Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-prod` exists.
+- Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-production` exists.
 
 Expected staging overlay keys:
 
@@ -54,7 +54,7 @@ ingress:
   enabled: true
   className: traefik
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-prod
+    cert-manager.io/cluster-issuer: letsencrypt-production
   host: staging.token.place
   tls:
     enabled: true

@@ -50,10 +50,11 @@ Cloudflare Tunnel continues to route public hostnames to Traefik, while Helm val
 Kubernetes objects. Helm does not manage Cloudflare routes.
 
 Staging/prod overlays must set `ingress.tls.enabled: true`; cert-manager annotation/secret names
-alone are not enough to render `spec.tls` in the chart.
+alone are not enough to render `spec.tls` in the chart. Operators must verify the rendered Ingress
+TLS block (`spec.tls`) before deploy.
 
 Assumption: cert-manager is installed and the configured ClusterIssuer (for example
-`letsencrypt-prod`) exists.
+`letsencrypt-production`) exists.
 
 - Staging: host `staging.token.place`, TLS secret `tokenplace-staging-tls`
 - Production: host `token.place`, TLS secret `tokenplace-prod-tls`
@@ -84,6 +85,13 @@ immutable tag.
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
+grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/

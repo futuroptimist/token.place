@@ -20,6 +20,29 @@ from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__)
 
+try:
+    from desktop_runtime_setup import ensure_desktop_python_dependencies
+except ModuleNotFoundError:
+    def ensure_desktop_python_dependencies() -> Dict[str, str]:
+        return {"ok": "false", "action": "desktop_runtime_setup_missing", "missing": "unknown"}
+
+
+def _run_dependency_preflight() -> Dict[str, Any]:
+    result = ensure_desktop_python_dependencies()
+    if result.get("ok") == "true":
+        return {"ok": True}
+    missing = result.get("missing") or "unknown"
+    action = result.get("action") or "dependency bootstrap failed"
+    detail = result.get("detail") or action
+    return {
+        "ok": False,
+        "error": (
+            "Missing Python dependency for model downloads "
+            f"(missing={missing}; interpreter={result.get('interpreter', sys.executable)}; "
+            f"import_root={result.get('import_root', 'unknown')}; action={action}; detail={detail})."
+        ),
+    }
+
 def _default_models_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "token.place" / "models"
@@ -105,6 +128,9 @@ def _get_model_manager(*, allow_inspect_fallback: bool = False):
 
 
 def inspect_model() -> int:
+    preflight = _run_dependency_preflight()
+    if not preflight.get("ok", False):
+        return _response(**preflight)
     manager, error_status = _get_model_manager(allow_inspect_fallback=True)
     if error_status is not None:
         return _response(**error_status)
@@ -112,6 +138,9 @@ def inspect_model() -> int:
 
 
 def download_model() -> int:
+    preflight = _run_dependency_preflight()
+    if not preflight.get("ok", False):
+        return _response(**preflight)
     manager, error_status = _get_model_manager()
     if error_status is not None:
         return _response(**error_status)

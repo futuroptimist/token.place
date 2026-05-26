@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -587,6 +588,109 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     }
 
 
+
+
+def _resolve_desktop_requirements_path(repo_root: Path) -> Path:
+    candidates = [
+        repo_root / "python" / "requirements_desktop_runtime.txt",
+        repo_root / "resources" / "python" / "requirements_desktop_runtime.txt",
+        Path(__file__).resolve().parent / "requirements_desktop_runtime.txt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _desktop_dependency_target(runtime_root: Path) -> Path:
+    return runtime_root / ".token_place_desktop_site"
+
+
+def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    preferred_targets = [
+        _desktop_dependency_target(runtime_root),
+        Path.home() / ".token_place_desktop_site",
+    ]
+    errors: list[str] = []
+    for candidate in preferred_targets:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate, None
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    return None, "; ".join(errors) if errors else "no writable install target"
+
+
+def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> Dict[str, str]:
+    """Ensure baseline desktop bridge Python dependencies are importable."""
+
+    root = _resolve_runtime_root(repo_root=repo_root)
+    requirements_path = _resolve_desktop_requirements_path(root)
+
+    required_modules = ("psutil", "requests", "dotenv", "cryptography")
+    missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    if not missing:
+        return {"ok": "true", "action": "already_satisfied", "missing": ""}
+
+    if not requirements_path.is_file():
+        return {
+            "ok": "false",
+            "action": "requirements_missing",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+        }
+
+    env = os.environ.copy()
+    target_dir, target_error = _resolve_desktop_dependency_target(root)
+    if target_dir is None:
+        return {
+            "ok": "false",
+            "action": "install_target_unavailable",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+            "detail": target_error or "unable to create desktop dependency install target",
+        }
+    target_dir_str = str(target_dir)
+    if target_dir_str not in sys.path:
+        sys.path.insert(0, target_dir_str)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--target",
+        target_dir_str,
+        "-r",
+        str(requirements_path),
+    ]
+    ok, output = _run_pip_install(cmd, env)
+    if not ok:
+        return {
+            "ok": "false",
+            "action": "install_failed",
+            "missing": ",".join(missing),
+            "interpreter": sys.executable,
+            "import_root": str(root),
+            "requirements": str(requirements_path),
+            "detail": _summarize_install_error(output),
+        }
+
+    importlib.invalidate_caches()
+    missing_after = [name for name in required_modules if importlib.util.find_spec(name) is None]
+    return {
+        "ok": "true" if not missing_after else "false",
+        "action": "installed" if not missing_after else "post_install_missing",
+        "missing": ",".join(missing_after),
+        "interpreter": sys.executable,
+        "import_root": str(root),
+        "requirements": str(requirements_path),
+    }
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()
     if detected_platform.startswith("win"):

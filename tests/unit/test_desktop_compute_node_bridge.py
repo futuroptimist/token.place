@@ -1052,6 +1052,26 @@ def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_pat
         path_bootstrap_path.read_text(encoding='utf-8'),
         encoding='utf-8',
     )
+    (python_dir / 'desktop_runtime_setup.py').write_text(
+        """
+def desktop_gpu_runtime_failure_message(_mode, _runtime_setup):
+    return None
+
+
+def ensure_desktop_llama_runtime(_mode):
+    return {"selected_backend": "cpu", "detected_device": "cpu", "runtime_action": "skipped"}
+
+
+def ensure_desktop_python_dependencies(*, repo_root=None):
+    return {"ok": "true", "action": "already_satisfied", "missing": ""}
+
+
+def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
+    return None
+""".strip()
+        + "\n",
+        encoding='utf-8',
+    )
     (utils_dir / '__init__.py').write_text('', encoding='utf-8')
     (utils_dir / 'compute_node_runtime.py').write_text(
         """
@@ -1432,3 +1452,26 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     error_event = next(event for event in events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
+
+
+def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {
+            'ok': 'false',
+            'action': 'requirements_missing',
+            'missing': 'psutil',
+            'interpreter': 'python',
+            'import_root': '/runtime',
+            'detail': 'requirements missing',
+        },
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    status = compute_node_bridge.run(args)
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get("type") == "error")
+    assert "dependency preflight failed" in error_event["message"]

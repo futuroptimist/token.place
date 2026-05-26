@@ -265,6 +265,16 @@ def test_collect_resource_usage_windows_handles_non_numeric_retry(monkeypatch):
     assert usage['memory_percent'] == pytest.approx(58.0)
 
 
+def test_collect_resource_usage_handles_missing_psutil_module(monkeypatch):
+    from utils.system import resource_monitor as rm
+
+    monkeypatch.setattr(rm, 'psutil', None, raising=False)
+    usage = rm.collect_resource_usage()
+
+    assert usage['cpu_percent'] == 0.0
+    assert usage['memory_percent'] == 0.0
+
+
 def test_collect_resource_usage_windows_handles_retry_errors(monkeypatch):
     """Errors during the immediate retry should be swallowed."""
     from utils.system import resource_monitor as rm

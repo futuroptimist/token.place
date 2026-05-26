@@ -838,3 +838,99 @@ def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
 
     module_path = str(shim.resolve()).upper()
     assert desktop_runtime_setup._is_repo_local_llama_module(module_path, repo_root) is True
+
+
+def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'runtime'
+    (runtime_root / 'utils').mkdir(parents=True)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: runtime_root)
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_requirements_path',
+        lambda _root: runtime_root / 'python' / 'requirements_desktop_runtime.txt',
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=runtime_root)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'requirements_missing'
+    assert result['missing'] == 'psutil,requests,dotenv,cryptography'
+
+
+def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+    captured = {}
+
+    def _capture_run(cmd, *_args, **_kwargs):
+        captured['cmd'] = cmd
+        return False, 'install failed: boom'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'install_failed'
+    assert result['detail'] == 'install failed: boom'
+    assert '--target' in captured['cmd']
+    target_idx = captured['cmd'].index('--target') + 1
+    assert captured['cmd'][target_idx] == str(tmp_path / '.token_place_desktop_site')
+
+
+def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    sequence = iter([None, None, None, None, object(), object(), object(), None])
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: next(sequence))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=tmp_path)
+
+    assert result['ok'] == 'false'
+    assert result['action'] == 'post_install_missing'
+    assert result['missing'] == 'cryptography'
+
+
+def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
+    monkeypatch, tmp_path
+):
+    requirements = tmp_path / 'requirements_desktop_runtime.txt'
+    requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
+    runtime_root = tmp_path / 'runtime'
+    runtime_root.mkdir(parents=True)
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: runtime_root)
+    monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: requirements)
+    monkeypatch.setattr(desktop_runtime_setup.importlib.util, 'find_spec', lambda _name: None)
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+    captured = {}
+
+    def _capture_run(cmd, *_args, **_kwargs):
+        captured['cmd'] = cmd
+        return False, 'install failed: boom'
+
+    original_mkdir = desktop_runtime_setup.Path.mkdir
+
+    def _fake_mkdir(path_obj, parents=False, exist_ok=False):
+        if str(path_obj).endswith('.token_place_desktop_site') and runtime_root in path_obj.parents:
+            raise PermissionError('read-only bundle')
+        return original_mkdir(path_obj, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'mkdir', _fake_mkdir)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
+
+    result = desktop_runtime_setup.ensure_desktop_python_dependencies(repo_root=runtime_root)
+
+    assert result['action'] == 'install_failed'
+    assert '--target' in captured['cmd']
+    target_idx = captured['cmd'].index('--target') + 1
+    assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')

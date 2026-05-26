@@ -55,9 +55,12 @@ def create_packaged_layout(tmp_root: Path) -> Path:
 
     for filename in (
         "compute_node_bridge.py",
+        "desktop_runtime_setup.py",
+        "desktop_gpu_packaging.py",
         "inference_sidecar.py",
         "model_bridge.py",
         "path_bootstrap.py",
+        "requirements_desktop_runtime.txt",
     ):
         shutil.copy2(
             REPO_ROOT / "desktop-tauri" / "src-tauri" / "python" / filename,
@@ -72,10 +75,47 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
-def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
+def _packaged_env(tmp_root: Path) -> dict[str, str]:
+    resources_root = tmp_root / "resources"
+    home_dir = tmp_root / "home"
+    home_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
+    env["HOME"] = str(home_dir)
     env["PYTHONNOUSERSITE"] = "1"
-    env.pop("PYTHONPATH", None)
+    env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
+    env["PYTHONPATH"] = str(resources_root / "python")
+    return env
+
+
+def run_desktop_dependency_preflight(tmp_root: Path) -> None:
+    resources_root = tmp_root / "resources"
+    env = _packaged_env(tmp_root)
+
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, sys; "
+                "sys.path.insert(0, r'" + str(resources_root / 'python') + "'); "
+                "import desktop_runtime_setup as mod; "
+                "print(json.dumps(mod.ensure_desktop_python_dependencies()))"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    payload = json.loads(result.stdout.strip())
+    assert payload.get("ok") == "true", combined
+
+
+def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
+    env = _packaged_env(tmp_root)
 
     model_bridge = tmp_root / "resources" / "python" / "model_bridge.py"
     result = subprocess.run(  # noqa: S603
@@ -108,6 +148,7 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
         "No module named 'psutil'",
         "No module named 'requests'",
         "No module named 'dotenv'",
+        "No module named 'cryptography'",
         "NotOpenSSLWarning",
         "~/Library/Python",
     ]
@@ -120,12 +161,34 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     for marker in forbidden_stderr_only:
         assert marker not in result.stderr, combined
 
+    check_imports = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,sys; "
+                "python_dir=pathlib.Path(r'" + str(model_bridge.parent) + "'); "
+                "sys.path.insert(0,str(python_dir)); "
+                "import desktop_runtime_setup as mod; "
+                "payload=mod.ensure_desktop_python_dependencies(); "
+                "assert payload.get('ok')=='true', payload; "
+                "import psutil,requests,dotenv,cryptography; "
+                "print('desktop-runtime-imports-ok')"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check_imports.returncode == 0, f"{check_imports.stdout}\n{check_imports.stderr}"
+    assert "desktop-runtime-imports-ok" in check_imports.stdout
+
 
 
 def run_compute_bridge_import_probe(tmp_root: Path) -> None:
-    env = os.environ.copy()
-    env["PYTHONNOUSERSITE"] = "1"
-    env.pop("PYTHONPATH", None)
+    env = _packaged_env(tmp_root)
 
     compute_bridge = tmp_root / "resources" / "python" / "compute_node_bridge.py"
     result = subprocess.run(  # noqa: S603
@@ -175,6 +238,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
+        run_desktop_dependency_preflight(Path(tmpdir))
         run_model_bridge_inspect_probe(Path(tmpdir))
         run_compute_bridge_import_probe(Path(tmpdir))
 
@@ -296,6 +360,15 @@ def main() -> int:
                 bridge.wait(timeout=15)
             if bridge.returncode != 0:
                 raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
+            forbidden_output = (
+                "No module named",
+                "ModuleNotFoundError",
+                "ImportError",
+                "compute-node bridge exited before emitting a startup event",
+                "desktop_runtime_setup module missing",
+            )
+            for marker in forbidden_output:
+                assert marker not in bridge_output, bridge_output
 
         finally:
             if bridge is not None and bridge.poll() is None:

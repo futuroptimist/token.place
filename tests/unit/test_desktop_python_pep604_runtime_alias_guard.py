@@ -55,12 +55,24 @@ def _is_alias_like_target(target: ast.AST) -> bool:
     return isinstance(target, ast.Name) and bool(target.id) and target.id[0].isupper()
 
 
+def _iter_import_time_assignment_nodes(tree: ast.AST):
+    stack = [tree]
+    while stack:
+        scope = stack.pop()
+        body = getattr(scope, "body", [])
+        for node in body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                yield node
+            if isinstance(node, ast.ClassDef):
+                stack.append(node)
+
+
 def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignments() -> None:
     violations: list[str] = []
 
     for path in _iter_python_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in tree.body:
+        for node in _iter_import_time_assignment_nodes(tree):
             if isinstance(node, ast.Assign):
                 value = node.value
                 targets = node.targets

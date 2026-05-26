@@ -36,15 +36,27 @@ operator workflow.
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - `main-latest` is convenience-only and not production sign-off material
 
-> The `tokenplace.*` values/version files in command examples below are **Sugarkube-owned future
-> contract artifacts** expected after follow-up Sugarkube prompts land.
-
 ## Default hostnames
 
 - Staging default: `https://staging.token.place`
 - Production default: `https://token.place`
 
 Operators can override hostnames in Sugarkube values and Cloudflare route configuration.
+
+
+## Ingress TLS expectations for staging/prod
+
+Cloudflare Tunnel continues to route public hostnames to Traefik, while Helm values control only
+Kubernetes objects. Helm does not manage Cloudflare routes.
+
+Staging/prod overlays must set `ingress.tls.enabled: true`; cert-manager annotation/secret names
+alone are not enough to render `spec.tls` in the chart.
+
+Assumption: cert-manager is installed and the configured ClusterIssuer (for example
+`letsencrypt-prod`) exists.
+
+- Staging: host `staging.token.place`, TLS secret `tokenplace-staging-tls`
+- Production: host `token.place`, TLS secret `tokenplace-prod-tls`
 
 ## Sugarkube deployment command patterns
 

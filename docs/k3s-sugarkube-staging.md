@@ -38,8 +38,26 @@ operations, operators should configure a single-pod rollout policy (for example 
 
 > These commands run from a **Sugarkube checkout**, not from token.place.
 >
-> `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are
-> **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
+## Ingress TLS + Cloudflare Tunnel contract
+
+- Cloudflare Tunnel still owns public DNS/Tunnel routing for `staging.token.place` to Traefik.
+- Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes.
+- Staging values must explicitly set `ingress.tls.enabled: true` or chart output omits `spec.tls`.
+- Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-prod` exists.
+
+Expected staging overlay keys:
+
+```yaml
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: staging.token.place
+  tls:
+    enabled: true
+    secretName: tokenplace-staging-tls
+```
 
 First install:
 
@@ -58,6 +76,12 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' docs/apps/tokenplace.version | head -n1)" --namespace tokenplace -f docs/examples/tokenplace.values.dev.yaml -f docs/examples/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
+grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/

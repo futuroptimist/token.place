@@ -51,7 +51,12 @@ jobs:
             --namespace tokenplace \
             --set ingress.enabled=true \
             --set ingress.host=staging.token.place \
-            --set image.tag=main-deadbee
+            --set image.tag=main-deadbee > /tmp/tokenplace-render.yaml
+
+          grep -n "replicas: 1" /tmp/tokenplace-render.yaml
+          grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
+          grep -n "type: Recreate" /tmp/tokenplace-render.yaml
+          grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml
 
       - name: Capture chart metadata
         id: chart_meta

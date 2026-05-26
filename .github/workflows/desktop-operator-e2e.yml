@@ -83,12 +83,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r config/requirements_codex_verification.txt
           pip install selenium
 
       - name: Run desktop operator UI e2e
@@ -117,12 +117,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r config/requirements_codex_verification.txt
 
       - name: Run packaged operator bridge e2e (Windows)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
@@ -181,12 +181,11 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies (macOS packaged e2e)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
           pip install -r config/requirements_codex_verification.txt
 
       - name: Run dependency-isolated model bridge inspect smoke (macOS)

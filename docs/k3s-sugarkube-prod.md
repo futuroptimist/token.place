@@ -21,10 +21,9 @@ Relay state is in-memory (registrations, queued messages, replies). Current prod
 State loss on pod death/replacement is an accepted risk for this phase. Durable/shared state and
 multi-replica relay topology are future work.
 
-Kubernetes `Deployment` upgrades may temporarily run more than one pod with default
-`RollingUpdate` behavior (`maxSurge`). If strict single-pod relay operation is required during
-upgrade windows, set an explicit single-pod rollout strategy (for example `Recreate` or
-`maxSurge=0` with compatible availability settings) in Sugarkube values.
+The canonical `tokenplace` Helm chart now defaults `Deployment` strategy to
+`Recreate`, preserving strict single-pod relay operation during production upgrades for this
+in-memory-state phase.
 
 ## Artifacts and release tags
 

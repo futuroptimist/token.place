@@ -47,12 +47,17 @@ jobs:
 
       - name: Template smoke render (staging-like)
         run: |
+          set -euo pipefail
+          rendered="/tmp/tokenplace-render.yaml"
           helm template tokenplace charts/tokenplace \
             --namespace tokenplace \
             --set ingress.enabled=true \
             --set ingress.host=staging.token.place \
-            --set image.tag=main-deadbee
-
+            --set image.tag=main-deadbee > "${rendered}"
+          grep -n "replicas: 1" "${rendered}"
+          grep -n "strategy:" -A4 "${rendered}"
+          grep -n "type: Recreate" "${rendered}"
+          grep -n "name: RELAY_WORKERS" -A2 "${rendered}"
       - name: Capture chart metadata
         id: chart_meta
         run: |

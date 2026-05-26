@@ -1,0 +1,4 @@
+# Base token.place values for Sugarkube environments.
+# Environment overlays (staging/prod) provide hostnames and TLS secrets.
+ingress:
+  enabled: true

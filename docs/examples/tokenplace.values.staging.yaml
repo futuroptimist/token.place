@@ -1,0 +1,8 @@
+ingress:
+  className: traefik
+  host: staging.token.place
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    secretName: tokenplace-staging-tls

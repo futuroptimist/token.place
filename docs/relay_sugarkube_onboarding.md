@@ -36,8 +36,8 @@ operator workflow.
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - `main-latest` is convenience-only and not production sign-off material
 
-> The `tokenplace.*` values/version files in command examples below are **Sugarkube-owned future
-> contract artifacts** expected after follow-up Sugarkube prompts land.
+> The `tokenplace.*` values/version files in command examples below are Sugarkube contract
+> artifacts used to render ingress + TLS consistently.
 
 ## Default hostnames
 
@@ -45,6 +45,21 @@ operator workflow.
 - Production default: `https://token.place`
 
 Operators can override hostnames in Sugarkube values and Cloudflare route configuration.
+
+
+## Ingress TLS contract for staging/prod
+
+Cloudflare Tunnel still owns public DNS/Tunnel routing to Traefik; Helm does **not** manage
+Cloudflare routes. Sugarkube values must explicitly enable chart TLS rendering per environment:
+
+- staging overlay: `ingress.tls.enabled: true` + `ingress.tls.secretName: tokenplace-staging-tls`
+- prod overlay: `ingress.tls.enabled: true` + `ingress.tls.secretName: tokenplace-prod-tls`
+- both overlays keep Traefik ingress class and `cert-manager.io/cluster-issuer` annotation
+
+Assumption: the referenced cert-manager ClusterIssuer exists in the target cluster and can mint
+certificates for the configured hostnames.
+
+Operators should verify the rendered Ingress `spec.tls` block before deploy.
 
 ## Sugarkube deployment command patterns
 

@@ -38,8 +38,8 @@ operations, operators should configure a single-pod rollout policy (for example 
 
 > These commands run from a **Sugarkube checkout**, not from token.place.
 >
-> `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are
-> **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
+> `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are the
+> Sugarkube contract artifacts consumed by these commands.
 
 First install:
 
@@ -56,15 +56,24 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ## Validation checklist
 
 ```bash
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' docs/apps/tokenplace.version | head -n1)" --namespace tokenplace -f docs/examples/tokenplace.values.dev.yaml -f docs/examples/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
+grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
-curl -fsS https://staging.token.place/livez
-curl -fsS https://staging.token.place/healthz
-curl -fsS https://staging.token.place/
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/livez
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/healthz
+kubectl -n tokenplace get ingress tokenplace -o yaml
+curl -vI https://staging.token.place/
 ```
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
 E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
+
+The rendered Ingress should include `spec.tls[0].hosts[0]=staging.token.place` and `spec.tls[0].secretName=tokenplace-staging-tls` before deploy.
 
 If operators use a non-default staging hostname, apply the same checks with that host.
 

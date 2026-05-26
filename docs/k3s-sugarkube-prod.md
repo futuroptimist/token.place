@@ -55,11 +55,17 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ## Validation checklist
 
 ```bash
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' docs/apps/tokenplace.version | head -n1)" --namespace tokenplace -f docs/examples/tokenplace.values.dev.yaml -f docs/examples/tokenplace.values.prod.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-prod-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
+grep -n "token.place" /tmp/tokenplace-prod-render.yaml
+grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
 kubectl -n tokenplace get deploy,po,svc,ingress
+kubectl -n tokenplace get ingress tokenplace -o yaml
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
+curl -vI https://token.place/
 ```
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
@@ -76,6 +82,12 @@ If operators override hostname/routing, use the equivalent production host in th
 ## Notes
 
 - Preserve API v1 relay-blind E2EE guardrails (relay sees ciphertext + routing metadata only).
+- Cloudflare Tunnel continues to route the public hostname (`token.place`) to Traefik; chart
+  values only control Kubernetes ingress manifests/TLS rendering.
+- Production values intentionally set `ingress.tls.enabled: true` with secret
+  `tokenplace-prod-tls` so rendered `Ingress.spec.tls` is present.
+- This runbook assumes cert-manager is installed and `letsencrypt-dns01` is a valid
+  `ClusterIssuer`.
 - Do not rely on local chart path deployment (`./deploy/charts/tokenplace-relay`) for
   Sugarkube steady-state operations.
 - Do not require `gpuExternalName` or `TOKENPLACE_RELAY_UPSTREAM_URL` for production relay

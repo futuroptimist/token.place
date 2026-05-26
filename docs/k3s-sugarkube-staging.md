@@ -56,11 +56,17 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 ## Validation checklist
 
 ```bash
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' docs/apps/tokenplace.version | head -n1)" --namespace tokenplace -f docs/examples/tokenplace.values.dev.yaml -f docs/examples/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
+grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get deploy,po,svc,ingress
+kubectl -n tokenplace get ingress tokenplace -o yaml
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/
+curl -vI https://staging.token.place/
 ```
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
@@ -77,6 +83,12 @@ If operators use a non-default staging hostname, apply the same checks with that
 ## Notes
 
 - Keep API v1 relay-blind E2EE guardrails intact.
+- Cloudflare Tunnel continues to route public hostname traffic (`staging.token.place`) to Traefik;
+  Helm values only define Kubernetes-side ingress and TLS rendering.
+- Staging values intentionally set `ingress.tls.enabled: true` with secret
+  `tokenplace-staging-tls` so rendered `Ingress.spec.tls` matches operator expectations.
+- This runbook assumes cert-manager is already installed and `letsencrypt-dns01` exists as a
+  valid `ClusterIssuer`.
 - Do not depend on local chart path deployment (`./deploy/charts/tokenplace-relay`) for
   Sugarkube steady-state operations.
 - Do not require `gpuExternalName` or `TOKENPLACE_RELAY_UPSTREAM_URL` for staging relay readiness.

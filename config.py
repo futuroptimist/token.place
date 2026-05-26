@@ -3,6 +3,8 @@ Configuration file for token.place application
 Values are loaded from environment variables with sensible defaults
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import platform

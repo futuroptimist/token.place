@@ -33,7 +33,9 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
+- Preferred deploy tag for staging candidate validation: immutable `main-<shortsha>`
+- Git release tag push example: `v0.1.0` also publishes `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Production can use validated `main-<shortsha>` or canonical release tag `v0.1.0` after tag push
 - `main-latest` is convenience-only and not production sign-off material
 
 > The `tokenplace.*` values/version files in command examples below are **Sugarkube-owned future

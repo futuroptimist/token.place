@@ -31,6 +31,8 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Required sign-off tag style: immutable `main-<shortsha>`
+- Canonical release tag after Git tag push example: `v0.1.0` → `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Production may deploy either validated `main-<shortsha>` or release `v0.1.0`; release tag is canonical post-tag
 - `main-latest` is convenience-only and not production sign-off
 
 ## Deployment commands (run from Sugarkube repo)

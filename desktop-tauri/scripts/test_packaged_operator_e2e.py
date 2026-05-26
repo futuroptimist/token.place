@@ -75,6 +75,36 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
+def run_desktop_dependency_preflight(tmp_root: Path) -> None:
+    resources_root = tmp_root / "resources"
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
+    env["PYTHONPATH"] = str(resources_root / "python")
+
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, sys; "
+                "sys.path.insert(0, r'" + str(resources_root / 'python') + "'); "
+                "import desktop_runtime_setup as mod; "
+                "print(json.dumps(mod.ensure_desktop_python_dependencies()))"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    payload = json.loads(result.stdout.strip())
+    assert payload.get("ok") == "true", combined
+
+
 def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
@@ -193,6 +223,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         bridge_script = create_packaged_layout(Path(tmpdir))
+        run_desktop_dependency_preflight(Path(tmpdir))
         run_model_bridge_inspect_probe(Path(tmpdir))
         run_compute_bridge_import_probe(Path(tmpdir))
 

@@ -1,4 +1,6 @@
 replicaCount: 1
+strategy:
+  type: Recreate
 
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay

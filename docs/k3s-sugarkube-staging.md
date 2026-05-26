@@ -22,10 +22,9 @@ Operational policy for staging is intentionally:
 State loss on pod restart/replacement is accepted for now. Shared-state and multi-replica relay
 architecture are future work and out of scope.
 
-Kubernetes `Deployment` upgrades may briefly run more than one pod under the default
-`RollingUpdate` strategy (`maxSurge`). To preserve strict single-pod semantics for stateful relay
-operations, operators should configure a single-pod rollout policy (for example `Recreate` or
-`maxSurge=0` with matching availability constraints) in Sugarkube values.
+The canonical token.place chart defaults to strict single-pod rollout behavior for this stateful
+phase (`replicaCount: 1`, `strategy.type: Recreate`, `RELAY_WORKERS=1`), so upgrades do not
+temporarily create a second relay pod.
 
 ## Artifacts and tags
 

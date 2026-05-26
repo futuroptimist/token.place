@@ -59,8 +59,12 @@ jobs:
           elif [[ "${event_name}" == "push" && "${ref}" == refs/tags/* ]]; then
             ref_kind="tag"
             semver_tag="${ref#refs/tags/}"
-            if [[ ! "${semver_tag}" =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?$ ]]; then
-              echo "Malformed semver tag ref: ${ref}" >&2
+            if [[ ! "${semver_tag}" =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$ ]]; then
+              echo "Malformed semver tag ref (expected vX.Y.Z with optional prerelease): ${ref}" >&2
+              exit 1
+            fi
+            if [[ "${semver_tag}" == *+* ]]; then
+              echo "Build metadata (+...) is not allowed for Docker tag safety: ${semver_tag}" >&2
               exit 1
             fi
             if [[ "${semver_tag}" =~ [^A-Za-z0-9._-] ]]; then

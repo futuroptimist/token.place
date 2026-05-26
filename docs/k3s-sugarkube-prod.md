@@ -40,6 +40,10 @@ upgrade windows, set an explicit single-pod rollout strategy (for example `Recre
 >
 > `docs/examples/tokenplace.values.*.yaml` and `docs/apps/tokenplace.version` are
 > **Sugarkube-owned future contract artifacts** expected after follow-up Sugarkube prompts land.
+>
+> Tag selection: use `default_tag=main-REPLACE_SHORTSHA` while validating a staging candidate.
+> After pushing the real Git release tag (for example `v0.1.0`), use `default_tag=v0.1.0` as the
+> canonical production release image tag.
 
 First install:
 

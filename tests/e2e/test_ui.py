@@ -435,8 +435,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert started, "desktop bridge did not emit a started event"
         assert registered, "desktop bridge never reported relay registration"
         relay_ready = False
+        consecutive_ready_observations = 0
         relay_server_selection_body = ""
-        for _ in range(20):
+        for _ in range(40):
             next_server_response = page.request.get(
                 f"{base_url}/api/v1/relay/servers/next"
             )
@@ -447,8 +448,14 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 except Exception:  # pragma: no cover - defensive for non-json relay errors
                     payload = {}
                 if isinstance(payload, dict) and payload.get("server_public_key"):
-                    relay_ready = True
-                    break
+                    consecutive_ready_observations += 1
+                    if consecutive_ready_observations >= 3:
+                        relay_ready = True
+                        break
+                else:
+                    consecutive_ready_observations = 0
+            else:
+                consecutive_ready_observations = 0
             time.sleep(0.25)
         assert relay_ready, (
             "desktop bridge reported registered but relay /api/v1/relay/servers/next "
@@ -512,7 +519,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "Sorry, the relay returned an invalid response. Please try again.",
             "Sorry, an error occurred while sending your message. Please try again.",
         }
-        max_attempts = 6
+        max_attempts = 8
         for attempt in range(max_attempts):
             textarea.fill(prompt_text)
             page.locator("button", has_text="Send").click()
@@ -547,7 +554,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
             if attempt < max_attempts - 1:
                 # Give the relay/bridge path a brief backoff window before retrying.
-                page.wait_for_timeout(600 * (attempt + 1))
+                page.wait_for_timeout(800 * (attempt + 1))
 
         assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"

@@ -63,7 +63,14 @@ ingress:
     enabled: false
     secretName: ""
 
-env: {}
+env:
+  RELAY_WORKERS: "1"
+  TOKENPLACE_FRONTEND_MODE: "production"
+  TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH: "0"
+  XDG_CONFIG_HOME: /tmp/.config
+  XDG_DATA_HOME: /tmp/.local/share
+  XDG_CACHE_HOME: /tmp/.cache
+  XDG_STATE_HOME: /tmp/.local/state
 extraEnv: []
 envFrom: []
 

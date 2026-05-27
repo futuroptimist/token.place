@@ -67,7 +67,16 @@ spec:
           {{- $mergedEnv := deepCopy $defaultEnv }}
           {{- if kindIs "map" .Values.env }}
           {{- range $key, $val := .Values.env }}
-          {{- $_ := set $mergedEnv (printf "%v" $key) (dict "name" (printf "%v" $key) "value" (printf "%v" $val)) }}
+          {{- $name := (printf "%v" $key) }}
+          {{- if kindIs "map" $val }}
+          {{- $entry := deepCopy $val }}
+          {{- if not (hasKey $entry "name") }}
+          {{- $_ := set $entry "name" $name }}
+          {{- end }}
+          {{- $_ := set $mergedEnv $name $entry }}
+          {{- else }}
+          {{- $_ := set $mergedEnv $name (dict "name" $name "value" (printf "%v" $val)) }}
+          {{- end }}
           {{- end }}
           {{- else if kindIs "slice" .Values.env }}
           {{- range $item := .Values.env }}

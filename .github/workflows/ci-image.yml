@@ -137,6 +137,43 @@ jobs:
 
           docker exec tokenplace-relay-smoke sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+      - name: Smoke test relay container on read-only rootfs
+        run: |
+          set -euo pipefail
+
+          docker run -d --rm --name tokenplace-relay-smoke-readonly \
+            --read-only --tmpfs /tmp \
+            -p 127.0.0.1:5011:5010 \
+            -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
+            -e XDG_CONFIG_HOME=/tmp/.config \
+            -e XDG_DATA_HOME=/tmp/.local/share \
+            -e XDG_CACHE_HOME=/tmp/.cache \
+            -e XDG_STATE_HOME=/tmp/.local/state \
+            tokenplace-relay:smoke
+
+          cleanup() {
+            echo "--- readonly container logs ---"
+            docker logs tokenplace-relay-smoke-readonly || true
+            docker stop tokenplace-relay-smoke-readonly >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5011/livez \
+              && curl -fsS http://127.0.0.1:5011/healthz \
+              && curl -fsS http://127.0.0.1:5011/ >/dev/null \
+              && curl -fsS http://127.0.0.1:5011/metrics >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:5011/livez >/dev/null
+          curl -fsS http://127.0.0.1:5011/healthz >/dev/null
+          curl -fsS http://127.0.0.1:5011/ >/dev/null
+          curl -fsS http://127.0.0.1:5011/metrics >/dev/null
+          docker exec tokenplace-relay-smoke-readonly sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
+
   publish:
     name: Publish relay image
     runs-on: ubuntu-latest

@@ -57,6 +57,47 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: relay
+          {{- $defaultEnv := dict
+                "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
+                "RELAY_PORT" (dict "name" "RELAY_PORT" "value" (printf "%v" .Values.containerPort))
+                "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
+                "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
+                "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
+                "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
+                "XDG_DATA_HOME" (dict "name" "XDG_DATA_HOME" "value" "/tmp/.local/share")
+                "XDG_CACHE_HOME" (dict "name" "XDG_CACHE_HOME" "value" "/tmp/.cache")
+                "XDG_STATE_HOME" (dict "name" "XDG_STATE_HOME" "value" "/tmp/.local/state")
+          }}
+          {{- $mergedEnv := deepCopy $defaultEnv }}
+          {{- if kindIs "map" .Values.env }}
+          {{- range $key, $val := .Values.env }}
+          {{- $name := (printf "%v" $key) }}
+          {{- if kindIs "map" $val }}
+          {{- $entry := deepCopy $val }}
+          {{- if not (hasKey $entry "name") }}
+          {{- $_ := set $entry "name" $name }}
+          {{- end }}
+          {{- $_ := set $mergedEnv $name $entry }}
+          {{- else }}
+          {{- $_ := set $mergedEnv $name (dict "name" $name "value" (printf "%v" $val)) }}
+          {{- end }}
+          {{- end }}
+          {{- else if kindIs "slice" .Values.env }}
+          {{- range $item := .Values.env }}
+          {{- if and (kindIs "map" $item) (hasKey $item "name") }}
+          {{- $name := (printf "%v" (get $item "name")) }}
+          {{- $_ := set $mergedEnv $name (deepCopy $item) }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if kindIs "slice" .Values.extraEnv }}
+          {{- range $item := .Values.extraEnv }}
+          {{- if and (kindIs "map" $item) (hasKey $item "name") }}
+          {{- $name := (printf "%v" (get $item "name")) }}
+          {{- $_ := set $mergedEnv $name (deepCopy $item) }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
           image: {{ include "tokenplace.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
@@ -64,22 +105,17 @@ spec:
               containerPort: {{ .Values.containerPort }}
               protocol: TCP
           env:
-            - name: RELAY_HOST
-              value: "0.0.0.0"
-            - name: RELAY_PORT
-              value: "{{ .Values.containerPort }}"
-            - name: RELAY_WORKERS
-              value: "1"
-            - name: TOKENPLACE_FRONTEND_MODE
-              value: "production"
-            - name: TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH
-              value: "0"
-            {{- range $key, $val := .Values.env }}
+            {{- range $key := keys $mergedEnv | sortAlpha }}
+            {{- $entry := get $mergedEnv $key }}
             - name: {{ $key }}
-              value: {{ $val | quote }}
-            {{- end }}
-            {{- with .Values.extraEnv }}
-            {{- toYaml . | nindent 12 }}
+              {{- if and (kindIs "map" $entry) (hasKey $entry "valueFrom") }}
+              valueFrom:
+                {{- toYaml (get $entry "valueFrom") | nindent 16 }}
+              {{- else if and (kindIs "map" $entry) (hasKey $entry "value") }}
+              value: {{ get $entry "value" | quote }}
+              {{- else }}
+              value: ""
+              {{- end }}
             {{- end }}
           {{- with .Values.envFrom }}
           envFrom:

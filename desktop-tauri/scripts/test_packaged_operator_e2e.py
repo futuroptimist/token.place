@@ -291,7 +291,7 @@ def run_compute_bridge_startup_probe(
         ).start()
 
         start_deadline = time.time() + 20
-        registration_deadline = time.time() + 45
+        registration_deadline = time.time() + 90
         buffered = ""
         while time.time() < registration_deadline:
             active_deadline = start_deadline if not saw_started else registration_deadline

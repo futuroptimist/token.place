@@ -75,6 +75,10 @@ def test_landing_page_does_not_document_forbidden_or_optional_relay_e2ee_shapes(
     for snippet in forbidden_snippets:
         assert snippet not in html
 
+    assert '"encrypted": true' in html
+    assert '"data": {' in html
+    assert '"ENCRYPTED_RESPONSE_PAYLOAD_HERE"' in html
+
 
 def test_runtime_relay_state_never_stores_plaintext_sentinel_when_distributed_disabled(relay_client):
     payload = {

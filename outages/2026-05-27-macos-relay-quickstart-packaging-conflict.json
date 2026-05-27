@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "macos-relay-quickstart-packaging-conflict",
+  "summary": "Fresh macOS relay quickstart installs failed because requirements_relay pinned packaging==25.0 while Flask-Limiter's transitive limits dependency requires packaging<25.",
+  "impact": "pip install -r config/requirements_relay.txt failed on clean environments and relay.py could not start due to missing Flask.",
+  "fix": "Pinned packaging to 24.2 in relay requirements and updated quickstart/onboarding docs to use python3 -m venv instead of hardcoding python3.12.",
+  "lessons": "Keep shared dependency constraints aligned with transitive package caps and avoid brittle interpreter version commands in first-run docs."
+}

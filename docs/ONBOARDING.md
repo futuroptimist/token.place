@@ -61,7 +61,7 @@ The `.gitignore` file keeps OS artifacts like `.DS_Store` and `Thumbs.db` out of
 Create a virtual environment first (recommended on macOS):
 
 ```bash
-python3.12 -m venv .venv || python3 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 ```

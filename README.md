@@ -29,7 +29,7 @@ Secure peer-to-peer generative AI platform
 
 **Prerequisites**
 
-- **Python 3.11 or 3.12** (matches CI and Docker images; see [macOS relay setup](#macos-relay-only-quick-start) below)
+- **Python 3.11+** (3.11/3.12/3.13/3.14 are supported for relay quickstart; see [macOS relay setup](#macos-relay-only-quick-start) below)
 - **Node.js 18+** (`nvm use` respects the included `.nvmrc`)
 
 Create and activate a virtual environment before installing Python packages (recommended on all platforms, especially macOS where `pip` may be missing but `pip3` is available):
@@ -38,9 +38,9 @@ Create and activate a virtual environment before installing Python packages (rec
 git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 
-# Prefer Python 3.12 when available (brew install python@3.12)
-python3.12 -m venv .venv || python3 -m venv .venv
-# Windows PowerShell alternative: py -3.12 -m venv .venv
+# Use whichever Python 3 is available on your system
+python3 -m venv .venv
+# Windows PowerShell alternative: py -3 -m venv .venv
 source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
@@ -467,7 +467,7 @@ Depending on your environment, you may need to replace `python` in the above com
 On Debian-based distributions, you may additionally need to install venv first, if it's not already installed:
 
 ```sh
-apt install python3.12-venv
+apt install python3-venv
 ```
 
 activate the virtual environment:
@@ -531,7 +531,7 @@ Use this path when you only need `relay.py` (no local `llama-cpp-python` build):
    cd token.place
    ./scripts/setup-relay-venv.sh
    # or manually:
-   python3.12 -m venv .venv
+   python3 -m venv .venv
    source .venv/bin/activate
    python -m pip install -r config/requirements_relay.txt
    ```

@@ -1171,9 +1171,9 @@ def faucet():
     with a list of chat messages between the user and the assistant. Clients and servers may implement
     diffing mechanisms to determine if conversations were altered, but this is intentionally built in a
     stateless manner to minimize complexity and maximize scalability. It's trivially easy to identify
-    tampering from either party, so enforcing it on the relay is a non-goal, especially since communication
-    between the client and the server is intended to be end-to-end-encrypted. Servers and clients can choose
-    how to handle this as they see fit.
+    tampering from either party, so enforcing it on the relay is a non-goal. Communication between
+    clients and servers is expected to remain end-to-end encrypted by design, with relay-managed transport
+    carrying ciphertext envelopes and routing metadata rather than plaintext chat content.
 
     Example request:
 

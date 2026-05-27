@@ -60,6 +60,17 @@ def test_static_forbidden_plaintext_patterns_regression_guard():
     )
 
 
+def test_landing_page_does_not_document_forbidden_or_optional_relay_e2ee_shapes():
+    html = (Path(__file__).resolve().parents[2] / "static" / "index.html").read_text(encoding="utf-8")
+    forbidden_snippets = [
+        'For enhanced privacy',
+        'optional privacy',
+        '"encrypted": true,\n  "client_public_key": "YOUR_PUBLIC_KEY_HERE",\n  "messages": {',
+    ]
+    for snippet in forbidden_snippets:
+        assert snippet not in html
+
+
 def test_runtime_relay_state_never_stores_plaintext_sentinel_when_distributed_disabled(relay_client):
     payload = {
         "model": "llama-3",
@@ -102,7 +113,7 @@ def test_legacy_sink_and_faucet_contract_remains_ciphertext_only(monkeypatch, re
     assert sink_payload["client_public_key"] == ciphertext_envelope["client_public_key"]
     assert "messages" not in _to_text(sink_payload)
 
-    faucet_response = relay_client.post(
+    faucet_plaintext_response = relay_client.post(
         "/faucet",
         json={
             "chat_history": "rsp",
@@ -110,11 +121,23 @@ def test_legacy_sink_and_faucet_contract_remains_ciphertext_only(monkeypatch, re
             "iv": "v",
             "server_public_key": "server-key",
             "client_public_key": "client-key",
+            "messages": [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}],
         },
     )
-    assert faucet_response.status_code == 200
-    faucet_payload = faucet_response.get_json()
-    assert faucet_payload["message"] == "Request received"
+    assert faucet_plaintext_response.status_code == 400
+
+    faucet_unexpected_response = relay_client.post(
+        "/faucet",
+        json={
+            "chat_history": "rsp",
+            "cipherkey": "k",
+            "iv": "v",
+            "server_public_key": "server-key",
+            "client_public_key": "client-key",
+            "assistant_output": "unexpected",
+        },
+    )
+    assert faucet_unexpected_response.status_code == 400
     assert E2EE_SENTINEL_RELAY_STATE not in _to_text(relay.client_responses)
 
 
@@ -240,7 +263,7 @@ def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client)
     )
 
     assert resp.status_code == 400
-    assert "Plaintext relay payload fields are forbidden" in resp.get_json()["error"]["message"]
+    assert "forbidden" in resp.get_json()["error"]["message"]
 
 
 def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client):
@@ -264,7 +287,7 @@ def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch,
     )
 
     assert resp.status_code == 400
-    assert "Plaintext relay payload fields are forbidden" in resp.get_json()["error"]["message"]
+    assert "forbidden" in resp.get_json()["error"]["message"]
 
 
 def test_api_v1_relay_rejects_unexpected_fields_on_request_envelope(relay_client):

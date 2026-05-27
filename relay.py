@@ -893,6 +893,21 @@ def _payload_has_unexpected_relay_fields(payload, *, allow_server_public_key):
     return any(field not in allowed_fields for field in payload)
 
 
+def _payload_has_unexpected_faucet_fields(payload):
+    """Reject unknown top-level keys on legacy /faucet envelopes."""
+    if not isinstance(payload, dict):
+        return False
+    allowed_fields = {
+        "client_public_key",
+        "server_public_key",
+        "chat_history",
+        "cipherkey",
+        "iv",
+        "stream",
+    }
+    return any(field not in allowed_fields for field in payload)
+
+
 def _queue_client_response(client_public_key, envelope):
     """Queue an encrypted response while preserving per-request retrieval."""
     with client_responses_lock:
@@ -1232,6 +1247,13 @@ def faucet():
             'error': {
                 'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only',
                 'code': 400
+            }
+        }), 400
+    if _payload_has_unexpected_faucet_fields(data):
+        return jsonify({
+            'error': {
+                'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only',
+                'code': 400,
             }
         }), 400
 

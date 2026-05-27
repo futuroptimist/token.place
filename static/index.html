@@ -442,25 +442,22 @@
         </div>
 
         <h3>E2EE Usage and Relay Envelope</h3>
-        <p>Main API requests can be plaintext or encrypted; set <code>"encrypted": true</code> to require encrypted handling for <code>/api/v1/chat/completions</code> and <code>/api/v1/completions</code>. Relay endpoints are always ciphertext-only and reject plaintext or unexpected top-level fields.</p>
+        <p>Main API requests can be plaintext or encrypted; set <code>"encrypted": true</code> when using encrypted handling for <code>/api/v1/chat/completions</code> and <code>/api/v1/completions</code>. Relay endpoints are always ciphertext-only and reject plaintext-like or unexpected top-level fields.</p>
         <ol>
             <li>Get the server's public key from <code>/api/v1/public-key</code></li>
             <li>Generate your own RSA key pair on the client</li>
-            <li>Encrypt your messages with the server's public key</li>
-            <li>Send encrypted main API payloads with <code>"encrypted": true</code> when using chat/completions routes</li>
-            <li>The server will encrypt its response with your public key</li>
+            <li>Encrypt payload data with the server's public key</li>
+            <li>For main API chat/completions routes, include <code>"encrypted": true</code> when sending encrypted payloads</li>
+            <li>For relay routes, send only ciphertext envelope keys</li>
         </ol>
 
-        <p><strong>Example Encrypted Main API Request:</strong></p>
+        <p><strong>Example API v1 Relay Request Envelope:</strong></p>
         <pre>{
-  "model": "llama-3-8b-instruct",
-  "encrypted": true,
-  "client_public_key": "YOUR_PUBLIC_KEY_HERE",
-  "messages": {
-    "ciphertext": "ENCRYPTED_DATA_HERE",
-    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
-    "iv": "INITIALIZATION_VECTOR_HERE"
-  }
+  "server_public_key": "SERVER_PUBLIC_KEY_HERE",
+  "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
+  "ciphertext": "ENCRYPTED_DATA_HERE",
+  "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+  "iv": "INITIALIZATION_VECTOR_HERE"
 }</pre>
 
         <hr>

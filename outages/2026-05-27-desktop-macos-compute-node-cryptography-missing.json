@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "desktop-macos-compute-node-cryptography-missing",
+  "summary": "macOS desktop compute-node startup imported runtime modules before dependency preflight, causing cryptography missing errors before startup events.",
+  "impact": "Start operator failed before started/status lifecycle; UI showed compute-node bridge exited before emitting startup event with No module named 'cryptography'.",
+  "fix": "Moved compute mode normalization out of early main() imports and into run() after dependency preflight/runtime setup, and added macOS .app/Contents/Resources packaged e2e coverage.",
+  "lessons": "Desktop bridge entrypoints must avoid importing dependency-heavy runtime modules before preflight; packaged regression tests must include real macOS bundle layout, not only synthetic resources roots."
+}

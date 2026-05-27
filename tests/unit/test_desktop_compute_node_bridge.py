@@ -999,21 +999,16 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     payload = next(event for event in events if event.get("type") == "error")
     assert payload['type'] == 'error'
-    assert payload['message'].startswith(
-        'compute-node bridge exited before emitting a startup event:'
-    )
+    assert payload['message'].startswith('runtime unavailable:')
 
 
-def test_main_normalizes_mode_before_run(monkeypatch):
+def test_main_sanitizes_mode_before_run(monkeypatch):
     captured = {}
 
     def fake_run(args):
         captured['mode'] = args.mode
         return 0
 
-    module = ModuleType('utils.compute_node_runtime')
-    module.normalize_compute_mode = lambda mode: {'cuda': 'gpu'}.get(str(mode).lower(), 'auto')
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
     monkeypatch.setattr(
         sys,
@@ -1023,7 +1018,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'gpu'
+    assert captured['mode'] == 'cuda'
 
     monkeypatch.setattr(
         sys,
@@ -1033,7 +1028,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'auto'
+    assert captured['mode'] == 'unsupported'
 
 
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):

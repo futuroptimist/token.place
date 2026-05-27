@@ -48,8 +48,7 @@ def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: flo
     raise RuntimeError(f"relay did not become live on port {port}: {last_error}")
 
 
-def create_packaged_layout(tmp_root: Path) -> Path:
-    resources_root = tmp_root / "resources"
+def _populate_packaged_resources(resources_root: Path) -> Path:
     python_dir = resources_root / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,8 +74,18 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
+def create_packaged_layout(tmp_root: Path) -> Path:
+    return _populate_packaged_resources(tmp_root / "resources")
+
+
+def create_macos_app_packaged_layout(tmp_root: Path) -> Path:
+    return _populate_packaged_resources(tmp_root / "token.place.app" / "Contents" / "Resources")
+
+
 def _packaged_env(tmp_root: Path) -> dict[str, str]:
     resources_root = tmp_root / "resources"
+    if not resources_root.exists():
+        resources_root = tmp_root / "Resources"
     home_dir = tmp_root / "home"
     home_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -192,6 +201,8 @@ def run_compute_bridge_import_probe(tmp_root: Path) -> None:
     env = _packaged_env(tmp_root)
 
     compute_bridge = tmp_root / "resources" / "python" / "compute_node_bridge.py"
+    if not compute_bridge.exists():
+        compute_bridge = tmp_root / "Resources" / "python" / "compute_node_bridge.py"
     result = subprocess.run(  # noqa: S603
         [
             sys.executable,
@@ -242,6 +253,9 @@ def main() -> int:
         run_desktop_dependency_preflight(Path(tmpdir))
         run_model_bridge_inspect_probe(Path(tmpdir))
         run_compute_bridge_import_probe(Path(tmpdir))
+        macos_root = Path(tmpdir) / "macos-layout"
+        create_macos_app_packaged_layout(macos_root)
+        run_compute_bridge_import_probe(macos_root / "token.place.app" / "Contents")
 
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0

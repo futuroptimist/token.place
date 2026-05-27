@@ -275,12 +275,15 @@ def run(args: argparse.Namespace) -> int:
             ComputeNodeRuntime,
             ComputeNodeRuntimeConfig,
             is_api_v1_relay_payload,
+            normalize_compute_mode,
             resolve_relay_port,
             resolve_relay_url,
         )
     except ModuleNotFoundError as exc:
         emit({"type": "error", "message": f"runtime unavailable: {exc}"})
         return 1
+
+    args.mode = normalize_compute_mode(args.mode)
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
     relay_port = resolve_relay_port(args.relay_port, relay_url)
@@ -599,9 +602,6 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        from utils.compute_node_runtime import normalize_compute_mode
-
-        args.mode = normalize_compute_mode(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})

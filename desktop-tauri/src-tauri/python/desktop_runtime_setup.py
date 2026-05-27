@@ -594,6 +594,7 @@ def _resolve_desktop_requirements_path(repo_root: Path) -> Path:
     candidates = [
         repo_root / "python" / "requirements_desktop_runtime.txt",
         repo_root / "resources" / "python" / "requirements_desktop_runtime.txt",
+        repo_root / "Resources" / "python" / "requirements_desktop_runtime.txt",
         Path(__file__).resolve().parent / "requirements_desktop_runtime.txt",
     ]
     for candidate in candidates:

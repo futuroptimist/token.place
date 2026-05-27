@@ -999,21 +999,17 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     payload = next(event for event in events if event.get("type") == "error")
     assert payload['type'] == 'error'
-    assert payload['message'].startswith(
-        'compute-node bridge exited before emitting a startup event:'
-    )
+    assert payload['message'].startswith('runtime unavailable:')
 
 
-def test_main_normalizes_mode_before_run(monkeypatch):
+def test_main_does_not_import_compute_runtime_before_run(monkeypatch):
     captured = {}
 
     def fake_run(args):
         captured['mode'] = args.mode
         return 0
 
-    module = ModuleType('utils.compute_node_runtime')
-    module.normalize_compute_mode = lambda mode: {'cuda': 'gpu'}.get(str(mode).lower(), 'auto')
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.delitem(sys.modules, 'utils.compute_node_runtime', raising=False)
     monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
     monkeypatch.setattr(
         sys,
@@ -1023,17 +1019,7 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 
     status = compute_node_bridge.main()
     assert status == 0
-    assert captured['mode'] == 'gpu'
-
-    monkeypatch.setattr(
-        sys,
-        'argv',
-        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'unsupported'],
-    )
-
-    status = compute_node_bridge.main()
-    assert status == 0
-    assert captured['mode'] == 'auto'
+    assert captured['mode'] == 'CUDA'
 
 
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):
@@ -1454,6 +1440,49 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
     assert error_event["warm_load_state"] == "failed"
 
 
+
+
+def test_run_normalizes_mode_after_dependency_preflight(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class _Runtime:
+        def __init__(self, *_args, **_kwargs):
+            relay_client = SimpleNamespace(relay_url='https://token.place', _request_timeout=1)
+            model_manager = SimpleNamespace(model_path='', use_mock_llm=False)
+            self.relay_client = relay_client
+            self.model_manager = model_manager
+
+        def stop(self):
+            return None
+
+        def register_and_poll_once(self):
+            return {'next_ping_in_x_seconds': 0}
+
+    runtime_module = ModuleType('utils.compute_node_runtime')
+    runtime_module.normalize_compute_mode = lambda mode: {'cuda': 'gpu'}.get(str(mode).lower(), 'auto')
+    runtime_module.apply_compute_mode = lambda manager, mode: setattr(manager, 'applied_mode', mode)
+    runtime_module.compute_mode_diagnostics = lambda _manager: {}
+    runtime_module.ComputeNodeRuntime = _Runtime
+    runtime_module.ComputeNodeRuntimeConfig = lambda **kwargs: kwargs
+    runtime_module.is_api_v1_relay_payload = lambda _payload: False
+    runtime_module.resolve_relay_port = lambda relay_port, _relay_url: relay_port
+    runtime_module.resolve_relay_url = lambda relay_url, prefer_cli=True: relay_url
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', runtime_module)
+
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_llama_runtime', lambda _mode: {})
+    monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(compute_node_bridge, 'desktop_gpu_runtime_failure_message', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(compute_node_bridge, '_is_repo_llama_cpp_shim', lambda _path: False)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='CUDA', relay_url='https://token.place', relay_port=None)
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert args.mode == 'gpu'
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert events[0]['type'] == 'started'
 def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

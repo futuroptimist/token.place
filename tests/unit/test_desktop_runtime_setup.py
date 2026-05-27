@@ -771,6 +771,17 @@ def test_resolve_requirements_path_prefers_packaged_resources_when_repo_root_mis
     assert resolved == packaged_requirements
 
 
+
+
+def test_resolve_desktop_requirements_path_supports_macos_contents_resources(tmp_path):
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents'
+    requirements = runtime_root / 'Resources' / 'python' / 'requirements_desktop_runtime.txt'
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text('cryptography==46.0.1\n', encoding='utf-8')
+
+    resolved = desktop_runtime_setup._resolve_desktop_requirements_path(runtime_root)
+
+    assert resolved == requirements
 def test_windows_runtime_bootstrap_passes_resolved_packaged_requirements_before_unpinned_fallback(
     monkeypatch, tmp_path
 ):

@@ -80,7 +80,12 @@ def create_macos_bundle_layout(tmp_root: Path) -> Path:
     return create_packaged_layout(resources_tmp_root, resources_dir_name="Resources")
 
 
-def _packaged_env(tmp_root: Path, resources_root: Path | None = None) -> dict[str, str]:
+def _packaged_env(
+    tmp_root: Path,
+    resources_root: Path | None = None,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     resources_root = resources_root or (tmp_root / "resources")
     home_dir = tmp_root / "home"
     home_dir.mkdir(parents=True, exist_ok=True)
@@ -89,6 +94,8 @@ def _packaged_env(tmp_root: Path, resources_root: Path | None = None) -> dict[st
     env["PYTHONNOUSERSITE"] = "1"
     env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
     env["PYTHONPATH"] = str(resources_root / "python")
+    if extra_env:
+        env.update(extra_env)
     return env
 
 
@@ -245,8 +252,13 @@ def run_compute_bridge_startup_probe(
     *,
     relay_port: int,
     resources_root: Path | None = None,
+    layout_label: str = "standard resources",
 ) -> None:
-    env = _packaged_env(tmp_root, resources_root)
+    env = _packaged_env(tmp_root, resources_root, extra_env={"USE_MOCK_LLM": "1"})
+    log_dir = REPO_ROOT / ".desktop-e2e-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_layout_label = layout_label.replace(" ", "_").replace("/", "_")
+    log_file = log_dir / f"packaged-bridge-startup-{safe_layout_label}.log"
     bridge = subprocess.Popen(  # noqa: S603
         [
             sys.executable,
@@ -317,13 +329,13 @@ def run_compute_bridge_startup_probe(
 
         if not saw_started:
             raise RuntimeError(
-                "bridge did not emit started/running event; output="
-                f"{bridge_output[-2000:]}"
+                f"[{layout_label}] bridge did not emit started/running event; output="
+                f"{bridge_output[-4000:]}"
             )
         if not saw_registered:
             raise RuntimeError(
-                "bridge never reported registered=true (relay connection missing); output="
-                f"{bridge_output[-2000:]}"
+                f"[{layout_label}] bridge never reported registered=true "
+                f"(relay connection missing); output={bridge_output[-4000:]}"
             )
 
         try:
@@ -337,7 +349,10 @@ def run_compute_bridge_startup_probe(
             bridge.terminate()
             bridge.wait(timeout=15)
         if bridge.returncode != 0:
-            raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
+            raise RuntimeError(
+                f"[{layout_label}] bridge exited non-zero ({bridge.returncode}): "
+                f"{bridge_output[-4000:]}"
+            )
 
         forbidden_output = (
             "No module named 'cryptography'",
@@ -349,6 +364,7 @@ def run_compute_bridge_startup_probe(
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
     finally:
+        log_file.write_text(bridge_output, encoding="utf-8")
         if bridge.poll() is None:
             bridge.kill()
 
@@ -393,12 +409,18 @@ def main() -> int:
 
         try:
             wait_for_livez(relay, relay_port)
-            run_compute_bridge_startup_probe(tmp_path, bridge_script, relay_port=relay_port)
+            run_compute_bridge_startup_probe(
+                tmp_path,
+                bridge_script,
+                relay_port=relay_port,
+                layout_label="standard resources",
+            )
             run_compute_bridge_startup_probe(
                 tmp_path,
                 mac_bridge_script,
                 relay_port=relay_port,
                 resources_root=mac_resources_root,
+                layout_label="macOS Contents/Resources",
             )
 
         finally:

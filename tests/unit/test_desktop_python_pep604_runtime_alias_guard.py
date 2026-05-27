@@ -48,6 +48,7 @@ def _is_typing_like_name(node: ast.AST) -> bool:
         "Collection", "MutableSequence", "MutableSet",
         "DefaultDict", "Deque", "Callable",
         "Optional", "Union", "Literal", "Annotated",
+        "Type", "Final", "Generator",
     }
     builtins_generics = {"dict", "list", "set", "frozenset", "tuple"}
     if isinstance(node, ast.Name):
@@ -59,8 +60,14 @@ def _is_typing_like_name(node: ast.AST) -> bool:
 
 def _is_simple_type_atom(node: ast.AST) -> bool:
     if isinstance(node, ast.Name):
-        return node.id[0].islower()
+        # Builtin/simple runtime types frequently used directly in aliases.
+        if node.id in {"str", "bytes", "int", "float", "bool", "object", "None"}:
+            return True
+        # Imported/project type names are usually CapWords, while ALL_CAPS is
+        # typically a runtime constant used in bitwise expressions.
+        return bool(node.id) and node.id[0].isupper() and not node.id.isupper()
     if isinstance(node, ast.Attribute):
+        # e.g. pathlib.Path, decimal.Decimal, module.TreeNode
         return True
     if isinstance(node, ast.Constant):
         return node.value is None or node.value is Ellipsis
@@ -217,6 +224,16 @@ def test_runtime_typing_union_alias_detection_regressions() -> None:
     )
     assert isinstance(callable_alias_assign, ast.Assign)
     assert _is_runtime_typing_union_alias(callable_alias_assign.value)
+
+    capitalized_alias_assign = _first_assignment_from_source("PathLike = str | Path\n")
+    assert isinstance(capitalized_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(capitalized_alias_assign.value)
+
+    wrapper_alias_assign = _first_assignment_from_source(
+        "from typing import Type\nTypePath = Type[str | Path]\n"
+    )
+    assert isinstance(wrapper_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(wrapper_alias_assign.value)
 
     bitwise_assign = _first_assignment_from_source("FLAGS = READ | WRITE\n")
     assert isinstance(bitwise_assign, ast.Assign)

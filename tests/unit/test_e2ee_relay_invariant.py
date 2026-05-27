@@ -60,6 +60,26 @@ def test_static_forbidden_plaintext_patterns_regression_guard():
     )
 
 
+def test_landing_page_does_not_document_forbidden_or_optional_relay_e2ee_shapes():
+    html = (Path(__file__).resolve().parents[2] / "static" / "index.html").read_text(encoding="utf-8")
+    forbidden_snippets = [
+        'For enhanced privacy',
+        'optional privacy',
+        'Main API requests can be plaintext',
+        'plaintext or encrypted',
+        '"prompt": "Write a poem about AI"',
+        '"content": "Hello!"',
+        '"content": "Hello! How can I assist you today?"',
+        '"choices": [',
+    ]
+    for snippet in forbidden_snippets:
+        assert snippet not in html
+
+    assert '"encrypted": true' in html
+    assert '"data": {' in html
+    assert '"ENCRYPTED_RESPONSE_PAYLOAD_HERE"' in html
+
+
 def test_runtime_relay_state_never_stores_plaintext_sentinel_when_distributed_disabled(relay_client):
     payload = {
         "model": "llama-3",
@@ -102,7 +122,7 @@ def test_legacy_sink_and_faucet_contract_remains_ciphertext_only(monkeypatch, re
     assert sink_payload["client_public_key"] == ciphertext_envelope["client_public_key"]
     assert "messages" not in _to_text(sink_payload)
 
-    faucet_response = relay_client.post(
+    faucet_plaintext_response = relay_client.post(
         "/faucet",
         json={
             "chat_history": "rsp",
@@ -110,11 +130,23 @@ def test_legacy_sink_and_faucet_contract_remains_ciphertext_only(monkeypatch, re
             "iv": "v",
             "server_public_key": "server-key",
             "client_public_key": "client-key",
+            "messages": [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}],
         },
     )
-    assert faucet_response.status_code == 200
-    faucet_payload = faucet_response.get_json()
-    assert faucet_payload["message"] == "Request received"
+    assert faucet_plaintext_response.status_code == 400
+
+    faucet_unexpected_response = relay_client.post(
+        "/faucet",
+        json={
+            "chat_history": "rsp",
+            "cipherkey": "k",
+            "iv": "v",
+            "server_public_key": "server-key",
+            "client_public_key": "client-key",
+            "assistant_output": "unexpected",
+        },
+    )
+    assert faucet_unexpected_response.status_code == 400
     assert E2EE_SENTINEL_RELAY_STATE not in _to_text(relay.client_responses)
 
 
@@ -218,3 +250,73 @@ def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(monkeypatch, caplog
     diagnostics_text = _to_text(relay_client.get("/relay/diagnostics").get_json())
     assert E2EE_SENTINEL_LOGS not in diagnostics_text
     assert _to_text(sink_response.get_json()).find(E2EE_SENTINEL_LOGS) == -1
+
+
+def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client):
+    relay.known_servers["server-key"] = {
+        "public_key": "server-key",
+        "last_ping": relay.datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    resp = relay_client.post(
+        "/api/v1/relay/requests",
+        json={
+            "server_public_key": "server-key",
+            "client_public_key": "client-key",
+            "ciphertext": "c",
+            "cipherkey": "k",
+            "iv": "i",
+            "messages": [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "forbidden" in resp.get_json()["error"]["message"]
+
+
+def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client):
+    monkeypatch.setenv("TOKENPLACE_RELAY_SERVER_BEARER_TOKEN", "token")
+    relay.known_servers["server-key"] = {
+        "public_key": "server-key",
+        "last_ping": relay.datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    resp = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-key",
+            "ciphertext": "c",
+            "cipherkey": "k",
+            "iv": "i",
+            "content": E2EE_SENTINEL_RELAY_STATE,
+        },
+        headers={"Authorization": "Bearer token"},
+    )
+
+    assert resp.status_code == 400
+    assert "forbidden" in resp.get_json()["error"]["message"]
+
+
+def test_api_v1_relay_rejects_unexpected_fields_on_request_envelope(relay_client):
+    relay.known_servers["server-key"] = {
+        "public_key": "server-key",
+        "last_ping": relay.datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    resp = relay_client.post(
+        "/api/v1/relay/requests",
+        json={
+            "server_public_key": "server-key",
+            "client_public_key": "client-key",
+            "ciphertext": "c",
+            "cipherkey": "k",
+            "iv": "i",
+            "assistant_output": "plaintext-like-but-renamed",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "Unexpected relay payload fields are forbidden" in resp.get_json()["error"]["message"]

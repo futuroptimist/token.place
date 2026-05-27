@@ -391,45 +391,31 @@
             <p><strong>Request Body:</strong></p>
             <pre>{
   "model": "llama-3-8b-instruct",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-  ]
+  "encrypted": true,
+  "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
+  "messages": {
+    "ciphertext": "ENCRYPTED_MESSAGES_PAYLOAD_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
+  }
 }</pre>
-            <p><strong>Example Response:</strong></p>
+            <p><strong>Example Encrypted Response:</strong></p>
             <pre>{
-  "id": "chatcmpl-123abc456def",
-  "object": "chat.completion",
-  "created": 1677858242,
-  "model": "llama-3-8b-instruct",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "Hello! How can I assist you today?"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
+  "encrypted": true,
+  "data": {
+    "encrypted": true,
+    "ciphertext": "ENCRYPTED_RESPONSE_PAYLOAD_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
   }
 }</pre>
         </div>
 
         <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/completions</span></h3>
-            <p>Creates a completion for the prompt (traditional completion API).</p>
-            <p><strong>Request Body:</strong></p>
-            <pre>{
-  "model": "llama-3-8b-instruct",
-  "prompt": "Write a poem about AI",
-  "max_tokens": 256
-}</pre>
-            <p><strong>Example Response:</strong> (Same format as chat/completions)</p>
+            <p>Creates a completion for a legacy plaintext prompt payload. For ciphertext-envelope-first API v1 usage, prefer <code>/api/v1/chat/completions</code> with encrypted request mode.</p>
+            <p><strong>Note:</strong> This endpoint is retained for compatibility with legacy clients that send a plaintext <code>prompt</code>. Relay-blind E2EE deployments should use <code>/api/v1/chat/completions</code> encrypted mode and relay ciphertext envelopes.</p>
+            <p><strong>Response format:</strong> Same schema family as chat/completions (text completion object).</p>
         </div>
 
         <div class="api-endpoint">
@@ -441,26 +427,23 @@
 }</pre>
         </div>
 
-        <h3>Encrypted API Usage</h3>
-        <p>For enhanced privacy, you can use end-to-end encryption with the API:</p>
+        <h3>E2EE Usage and Relay Envelope</h3>
+        <p>API v1 relay traffic is mandatory end-to-end encrypted: relay endpoints are ciphertext-only and reject plaintext-like or unexpected top-level fields. Use ciphertext envelope payloads in API-facing examples.</p>
         <ol>
             <li>Get the server's public key from <code>/api/v1/public-key</code></li>
             <li>Generate your own RSA key pair on the client</li>
-            <li>Encrypt your messages with the server's public key</li>
-            <li>Send the encrypted request with <code>"encrypted": true</code> flag</li>
-            <li>The server will encrypt its response with your public key</li>
+            <li>Encrypt payload data with the server's public key</li>
+            <li>For API v1 relay routes, send only ciphertext envelope keys</li>
+            <li>Do not send plaintext top-level keys such as <code>messages</code>, <code>prompt</code>, <code>input</code>, <code>content</code>, <code>response</code>, or <code>text</code></li>
         </ol>
 
-        <p><strong>Example Encrypted Request:</strong></p>
+        <p><strong>Example API v1 Relay Request Envelope:</strong></p>
         <pre>{
-  "model": "llama-3-8b-instruct",
-  "encrypted": true,
-  "client_public_key": "YOUR_PUBLIC_KEY_HERE",
-  "messages": {
-    "ciphertext": "ENCRYPTED_DATA_HERE",
-    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
-    "iv": "INITIALIZATION_VECTOR_HERE"
-  }
+  "server_public_key": "SERVER_PUBLIC_KEY_HERE",
+  "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
+  "ciphertext": "ENCRYPTED_DATA_HERE",
+  "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+  "iv": "INITIALIZATION_VECTOR_HERE"
 }</pre>
 
         <hr>
@@ -478,7 +461,7 @@
         <p>Learn more about our goals and how you can be a part of this initiative on our <a href="https://github.com/futuroptimist/token.place">GitHub repository</a>.</p>
 
         <h3>Privacy Notice</h3>
-        <p><strong>All communications are now end-to-end encrypted for enhanced privacy. For maximum security, consider self-hosting by following the README on the GitHub repository.</strong></p>
+        <p><strong>All communications are end-to-end encrypted by default and relay-mediated by design. Relay components must stay ciphertext-only (plus safe routing metadata). For maximum control, consider self-hosting via the README.</strong></p>
 
         <div class="mode-toggle-container">
             <button id="toggleMode"></button>

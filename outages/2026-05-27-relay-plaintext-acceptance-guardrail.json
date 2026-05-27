@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "relay-plaintext-acceptance-guardrail",
+  "summary": "Relay API v1 envelope endpoints and legacy /faucet accepted extra plaintext-like fields alongside ciphertext envelopes, creating a regression risk against relay-blind E2EE requirements.",
+  "impact": "Malformed clients could include plaintext fields in relay payloads. Relay behavior was not guaranteed to fail closed on these fields.",
+  "fix": "Added explicit fail-closed validation in relay API v1 request/response envelope handlers and legacy /faucet to reject plaintext-like or unexpected fields, and updated relay landing-page encryption wording to remove optional relay framing.",
+  "lessons": "Ciphertext-only invariants need both runtime validation and regression tests so optional-language docs or tolerant payload parsing cannot reintroduce plaintext paths."
+}

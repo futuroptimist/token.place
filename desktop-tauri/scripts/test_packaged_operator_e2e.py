@@ -266,9 +266,11 @@ def run_compute_bridge_startup_probe(
         text=False,
     )
     bridge_output = ""
-    saw_structured_event = False
+    saw_started = False
+    saw_registered = False
     try:
         assert bridge.stdout is not None
+        assert bridge.stdin is not None
         output_queue: queue.Queue[bytes] = queue.Queue()
         threading.Thread(
             target=enqueue_bridge_stdout,
@@ -300,21 +302,49 @@ def run_compute_bridge_startup_probe(
                     payload = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if payload.get("type") in {"started", "status", "error"}:
-                    saw_structured_event = True
+                if payload.get("type") == "error":
+                    raise RuntimeError(f"bridge emitted error event: {payload}")
+                if payload.get("type") == "started" and payload.get("running") is True:
+                    saw_started = True
+                if payload.get("registered") is True:
+                    saw_registered = True
+                if saw_started and saw_registered:
+                    bridge.stdin.write(b'{"type":"cancel"}\n')
+                    bridge.stdin.flush()
                     break
-            if saw_structured_event:
+            if saw_started and saw_registered:
                 break
 
-        assert saw_structured_event, (
-            "compute-node bridge exited before emitting a startup event; output="
-            f"{bridge_output[-2000:]}"
-        )
+        if not saw_started:
+            raise RuntimeError(
+                "bridge did not emit started/running event; output="
+                f"{bridge_output[-2000:]}"
+            )
+        if not saw_registered:
+            raise RuntimeError(
+                "bridge never reported registered=true (relay connection missing); output="
+                f"{bridge_output[-2000:]}"
+            )
+
+        try:
+            bridge.stdin.close()
+        except OSError:
+            pass
+
+        try:
+            bridge.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            bridge.terminate()
+            bridge.wait(timeout=15)
+        if bridge.returncode != 0:
+            raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
+
         forbidden_output = (
             "No module named 'cryptography'",
             "ModuleNotFoundError",
             "ImportError",
             "compute-node bridge exited before emitting a startup event",
+            "desktop_runtime_setup module missing",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output

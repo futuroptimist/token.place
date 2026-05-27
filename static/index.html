@@ -422,14 +422,18 @@
 
         <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/completions</span></h3>
-            <p>Creates a completion for the prompt (traditional completion API).</p>
-            <p><strong>Request Body:</strong></p>
+            <p>Creates a completion request envelope (content must remain encrypted end-to-end).</p>
+            <p><strong>Request Body (ciphertext envelope):</strong></p>
             <pre>{
   "model": "llama-3-8b-instruct",
-  "prompt": "Write a poem about AI",
-  "max_tokens": 256
+  "client_public_key": "YOUR_PUBLIC_KEY_HERE",
+  "prompt": {
+    "ciphertext": "ENCRYPTED_DATA_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
+  }
 }</pre>
-            <p><strong>Example Response:</strong> (Same format as chat/completions)</p>
+            <p><strong>Example Response:</strong> (ciphertext envelope shape matches chat/completions)</p>
         </div>
 
         <div class="api-endpoint">
@@ -441,20 +445,19 @@
 }</pre>
         </div>
 
-        <h3>Encrypted API Usage</h3>
-        <p>For enhanced privacy, you can use end-to-end encryption with the API:</p>
+        <h3>End-to-End Encryption (always on)</h3>
+        <p>token.place relay traffic is relay-blind E2EE by design. Plaintext payloads are not a supported mode.</p>
         <ol>
-            <li>Get the server's public key from <code>/api/v1/public-key</code></li>
-            <li>Generate your own RSA key pair on the client</li>
-            <li>Encrypt your messages with the server's public key</li>
-            <li>Send the encrypted request with <code>"encrypted": true</code> flag</li>
-            <li>The server will encrypt its response with your public key</li>
+            <li>Fetch the server key material from <code>/api/v1/public-key</code></li>
+            <li>Generate a client key pair on-device</li>
+            <li>Encrypt message content into a ciphertext envelope (<code>ciphertext</code>, <code>cipherkey</code>, <code>iv</code>)</li>
+            <li>Include your <code>client_public_key</code> so only your client can decrypt the response envelope</li>
+            <li>Send ciphertext-only payloads through relay routes; if E2EE cannot be preserved, relay fails closed</li>
         </ol>
 
-        <p><strong>Example Encrypted Request:</strong></p>
+        <p><strong>Example Chat Request (ciphertext-only):</strong></p>
         <pre>{
   "model": "llama-3-8b-instruct",
-  "encrypted": true,
   "client_public_key": "YOUR_PUBLIC_KEY_HERE",
   "messages": {
     "ciphertext": "ENCRYPTED_DATA_HERE",

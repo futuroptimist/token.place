@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "relay-landing-page-e2ee-optional-wording",
+  "summary": "The relay landing page documented E2EE as an optional enhanced-privacy mode and included optional \"encrypted\": true guidance, which conflicted with token.place's mandatory relay-blind E2EE invariant.",
+  "impact": "Users and integrators could incorrectly infer that plaintext relay payloads were acceptable, increasing regression risk toward non-E2EE implementations.",
+  "fix": "Updated relay-served / route documentation to state E2EE is always on, removed optional-encryption wording, and reinforced ciphertext-only request examples.",
+  "lessons": "Security invariants must be expressed as mandatory language in user-facing docs and guarded by tests to prevent policy drift."
+}

@@ -67,6 +67,18 @@ def test_inference_endpoint_removed(client):
     response = client.post("/inference", json={})
     assert response.status_code == 404
 
+
+
+def test_index_documents_e2ee_as_mandatory(client):
+    response = client.get('/')
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+
+    assert 'End-to-End Encryption (always on)' in body
+    assert 'Plaintext payloads are not a supported mode' in body
+    assert 'For enhanced privacy, you can use end-to-end encryption with the API' not in body
+    assert '"encrypted": true' not in body
+
 # --- Test /next_server ---
 
 def test_next_server_no_servers(client):

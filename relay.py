@@ -894,7 +894,7 @@ def _payload_has_unexpected_relay_fields(payload, *, allow_server_public_key):
 
 
 def _payload_has_unexpected_faucet_fields(payload):
-    """Reject unknown top-level keys on legacy /faucet envelopes."""
+    """Reject unknown top-level keys on the legacy faucet envelopes."""
     if not isinstance(payload, dict):
         return False
     allowed_fields = {

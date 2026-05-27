@@ -32,6 +32,26 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only and not production sign-off
 
+## 0.1.0 release alignment
+
+- Chart version: `0.1.0`
+- Chart `appVersion`: `0.1.0`
+- Git tag: `v0.1.0`
+- Release image tag: `v0.1.0`
+- Staging candidate image tag: `main-<shortsha>`
+
+## Pre-flight chart availability check
+
+Before Step 1 install/upgrade, verify the 0.1.0 OCI chart exists **after** token.place publishes
+the current chart:
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+If this command succeeds before final token.place chart publish, treat the result as potentially
+stale and confirm it is the intended 0.1.0 artifact before deploying.
+
 ## Deployment commands (run from Sugarkube repo)
 
 > Run from a **Sugarkube checkout**, not from token.place.
@@ -59,7 +79,7 @@ ingress:
     secretName: tokenplace-prod-tls
 ```
 
-> Tag selection: use `default_tag=main-REPLACE_SHORTSHA` while validating a staging candidate.
+> Tag selection: use `default_tag=main-<shortsha>` while validating a staging candidate.
 > After pushing the real Git release tag (for example `v0.1.0`), use `default_tag=v0.1.0` as the
 > canonical production release image tag.
 
@@ -81,10 +101,12 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.prod.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-prod-render.yaml
-grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.prod.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-prod-render.yaml
+grep -n "tls:" -A8 /tmp/tokenplace-prod-render.yaml
 grep -n "token.place" /tmp/tokenplace-prod-render.yaml
 grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-prod-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez

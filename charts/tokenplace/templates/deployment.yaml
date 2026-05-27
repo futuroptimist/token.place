@@ -65,8 +65,29 @@ spec:
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "0"
           }}
           {{- $mergedEnv := deepCopy $defaultEnv }}
+          {{- if kindIs "map" .Values.env }}
           {{- range $key, $val := .Values.env }}
-          {{- $_ := set $mergedEnv $key (printf "%v" $val) }}
+          {{- $_ := set $mergedEnv (printf "%v" $key) (printf "%v" $val) }}
+          {{- end }}
+          {{- else if kindIs "slice" .Values.env }}
+          {{- range $item := .Values.env }}
+          {{- if and (kindIs "map" $item) (hasKey $item "name") }}
+          {{- $name := (printf "%v" (get $item "name")) }}
+          {{- if hasKey $item "value" }}
+          {{- $_ := set $mergedEnv $name (printf "%v" (get $item "value")) }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if kindIs "slice" .Values.extraEnv }}
+          {{- range $item := .Values.extraEnv }}
+          {{- if and (kindIs "map" $item) (hasKey $item "name") }}
+          {{- $name := (printf "%v" (get $item "name")) }}
+          {{- if hasKey $item "value" }}
+          {{- $_ := set $mergedEnv $name (printf "%v" (get $item "value")) }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
           {{- end }}
           image: {{ include "tokenplace.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -78,9 +99,6 @@ spec:
             {{- range $key := keys $mergedEnv | sortAlpha }}
             - name: {{ $key }}
               value: {{ get $mergedEnv $key | quote }}
-            {{- end }}
-            {{- with .Values.extraEnv }}
-            {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- with .Values.envFrom }}
           envFrom:

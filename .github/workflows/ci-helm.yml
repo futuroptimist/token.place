@@ -63,6 +63,11 @@ jobs:
           grep -n "name: XDG_STATE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/state"'
           ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
 
+      - name: Install Python dependency for duplicate-env check
+        run: pip3 install PyYAML
+
+      - name: Duplicate-env validation
+        run: |
           python3 - <<'PY'
           import collections
           import yaml
@@ -74,6 +79,9 @@ jobs:
           dupes = [name for name, count in collections.Counter(names).items() if count > 1]
           assert not dupes, dupes
           PY
+
+      - name: Template strategy-empty fallback smoke render
+        run: |
 
           helm template tokenplace charts/tokenplace \
             --namespace tokenplace \
@@ -97,6 +105,10 @@ jobs:
           docker run -d --rm --name tokenplace-relay-readonly --read-only --tmpfs /tmp \
             -p 127.0.0.1:5010:5010 \
             -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
+            -e XDG_CONFIG_HOME=/tmp/.config \
+            -e XDG_DATA_HOME=/tmp/.local/share \
+            -e XDG_CACHE_HOME=/tmp/.cache \
+            -e XDG_STATE_HOME=/tmp/.local/state \
             tokenplace-relay:chart-smoke
           trap 'docker logs tokenplace-relay-readonly || true; docker stop tokenplace-relay-readonly || true' EXIT
           for _ in $(seq 1 30); do

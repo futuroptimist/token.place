@@ -794,7 +794,7 @@ class RelayClient:
             return base_timeout
         if not math.isfinite(wait_seconds) or wait_seconds < 0:
             return base_timeout
-        return max(base_timeout, wait_seconds + 1.0)
+        return max(base_timeout, wait_seconds + 5.0, wait_seconds * 1.25)
 
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
@@ -848,9 +848,16 @@ class RelayClient:
                     self._api_v1_registered_relays.add(candidate_url)
                     log_info("server.registered relay={}", candidate_url)
 
+                poll_timeout_seconds = self._api_v1_poll_timeout_seconds(poll_wait)
+                log_info(
+                    "API v1 relay poll timing relay={} poll_wait_seconds={} timeout_seconds={}",
+                    candidate_url,
+                    poll_wait,
+                    poll_timeout_seconds,
+                )
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
-                    'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
+                    'timeout': poll_timeout_seconds,
                 }
                 headers = self._auth_headers()
                 if headers:
@@ -895,6 +902,18 @@ class RelayClient:
                     payload.get('request_id', 'none'),
                 )
                 return payload
+            except requests.exceptions.ReadTimeout as exc:
+                log_info(
+                    "API v1 relay poll timeout relay={} poll_wait_seconds={} timeout_seconds={}",
+                    candidate_url,
+                    poll_wait,
+                    self._api_v1_poll_timeout_seconds(poll_wait),
+                )
+                last_error = {
+                    'message': 'No requests available',
+                    'next_ping_in_x_seconds': 0,
+                    'poll_wait_seconds': poll_wait,
+                }
             except Exception as exc:
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
                 self._api_v1_registered_relays.discard(candidate_url)

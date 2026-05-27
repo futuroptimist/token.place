@@ -95,3 +95,19 @@ The migration roadmap follow-up phases own the implementation repair:
 4. add final guardrails proving active production paths no longer use legacy routes.
 
 This documentation baseline intentionally does **not** implement those code migrations.
+
+## Manual staging verification snippet (desktop compute-node long-poll)
+
+Use this check when validating API v1 relay long-poll behavior against staging:
+
+1. Start the desktop compute-node bridge and point it at `https://staging.token.place`.
+2. Let it run for at least 1-2 poll intervals so register + poll heartbeats settle.
+3. Verify relay health shows at least one known server:
+   - `curl -s https://staging.token.place/healthz | jq '.checks.knownServers'`
+   - expected: value is `>= 1`
+4. Verify relay diagnostics includes the desktop node:
+   - `curl -s https://staging.token.place/relay/diagnostics | jq '.known_servers'`
+   - expected: includes the desktop `server_public_key` and heartbeat metadata.
+
+If `knownServers` never increases or the node is absent from diagnostics, treat it as a relay
+registration/poll regression before release.

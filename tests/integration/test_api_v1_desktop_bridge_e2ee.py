@@ -267,6 +267,22 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     _assert_ciphertext_only(response_posts[0], forbidden_text="pong from desktop")
 
 
+def test_api_v1_desktop_bridge_register_and_poll_no_work_metadata():
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        payload = desktop_client.poll_api_v1_encrypted_work()
+
+    assert payload["message"] == "No requests available"
+    assert payload["next_ping_in_x_seconds"] == 0
+    assert payload["poll_wait_seconds"] >= 0
+
+
 def test_api_v1_stream_true_fails_before_relay_queue():
     relay.client_inference_requests.clear()
     with relay.app.test_client() as client:

@@ -434,29 +434,38 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
 
         assert started, "desktop bridge did not emit a started event"
         assert registered, "desktop bridge never reported relay registration"
-        relay_ready = False
-        consecutive_ready_observations = 0
-        relay_server_selection_body = ""
-        for _ in range(40):
-            next_server_response = page.request.get(
-                f"{base_url}/api/v1/relay/servers/next"
-            )
-            if next_server_response.ok:
-                relay_server_selection_body = next_server_response.text()
-                try:
-                    payload = next_server_response.json()
-                except Exception:  # pragma: no cover - defensive for non-json relay errors
-                    payload = {}
-                if isinstance(payload, dict) and payload.get("server_public_key"):
-                    consecutive_ready_observations += 1
-                    if consecutive_ready_observations >= 3:
-                        relay_ready = True
-                        break
+        def wait_for_relay_ready(required_consecutive: int, attempts: int, pause_seconds: float) -> tuple[bool, str]:
+            relay_ready_local = False
+            consecutive_ready_observations_local = 0
+            relay_server_selection_body_local = ""
+            for _ in range(attempts):
+                next_server_response = page.request.get(
+                    f"{base_url}/api/v1/relay/servers/next"
+                )
+                if next_server_response.ok:
+                    relay_server_selection_body_local = next_server_response.text()
+                    try:
+                        payload = next_server_response.json()
+                    except Exception:  # pragma: no cover - defensive for non-json relay errors
+                        payload = {}
+                    if isinstance(payload, dict) and payload.get("server_public_key"):
+                        consecutive_ready_observations_local += 1
+                        if consecutive_ready_observations_local >= required_consecutive:
+                            relay_ready_local = True
+                            break
+                    else:
+                        consecutive_ready_observations_local = 0
                 else:
-                    consecutive_ready_observations = 0
-            else:
-                consecutive_ready_observations = 0
-            time.sleep(0.25)
+                    consecutive_ready_observations_local = 0
+                time.sleep(pause_seconds)
+
+            return relay_ready_local, relay_server_selection_body_local
+
+        relay_ready, relay_server_selection_body = wait_for_relay_ready(
+            required_consecutive=3,
+            attempts=40,
+            pause_seconds=0.25,
+        )
         assert relay_ready, (
             "desktop bridge reported registered but relay /api/v1/relay/servers/next "
             "did not expose an active server_public_key in time. Last response body: "
@@ -519,8 +528,17 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "Sorry, the relay returned an invalid response. Please try again.",
             "Sorry, an error occurred while sending your message. Please try again.",
         }
-        max_attempts = 8
+        max_attempts = 10
         for attempt in range(max_attempts):
+            relay_ready, relay_server_selection_body = wait_for_relay_ready(
+                required_consecutive=2,
+                attempts=20,
+                pause_seconds=0.2,
+            )
+            assert relay_ready, (
+                "relay lost active server selection while waiting to retry chat request. "
+                f"Last response body: {relay_server_selection_body!r}"
+            )
             textarea.fill(prompt_text)
             page.locator("button", has_text="Send").click()
             user_message_count += 1

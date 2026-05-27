@@ -1,8 +1,8 @@
 mod backend;
 mod compute_node;
 mod config;
-mod forward;
-mod keygen;
+pub mod forward;
+pub mod keygen;
 mod logging;
 mod python_runtime;
 mod sidecar;

@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "desktop-macos-compute-node-cryptography-missing",
+  "summary": "Desktop macOS packaged compute-node startup could fail before first bridge event with No module named 'cryptography' because compute runtime imports ran before dependency preflight.",
+  "impact": "Desktop UI Start operator could immediately fail in clean packaged-like environments, preventing compute-node startup and surfacing only bridge-exited diagnostics.",
+  "fix": "Moved bridge path bootstrap earlier, removed early compute runtime import from main mode normalization path, and expanded packaged e2e/unit coverage for macOS .app/Contents/Resources dependency preflight and import ordering.",
+  "lessons": "Bridge startup ordering is critical: dependency preflight and packaged import-root resolution must happen before crypto-dependent runtime imports, and regression tests must mirror real macOS bundle layouts."
+}

@@ -22,6 +22,8 @@ if __package__ in (None, ""):
 
 from path_bootstrap import ensure_runtime_import_paths
 
+ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+
 try:
     from desktop_runtime_setup import (
         desktop_gpu_runtime_failure_message,
@@ -55,8 +57,6 @@ except ModuleNotFoundError:
         _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
     ) -> None:
         return
-
-ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
@@ -176,6 +176,13 @@ def _runtime_path_from_env() -> str:
     if value.strip().lower() == "sidecar":
         return "sidecar"
     return "bridge"
+
+
+def _normalize_compute_mode_local(mode: Any) -> str:
+    supported_modes = {"auto", "cpu", "gpu", "hybrid"}
+    selected = (mode or "auto").strip().lower()
+    normalized = {"cuda": "gpu", "metal": "gpu"}.get(selected, selected)
+    return normalized if normalized in supported_modes else "auto"
 
 
 def _start_stdin_reader() -> None:
@@ -599,9 +606,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        from utils.compute_node_runtime import normalize_compute_mode
-
-        args.mode = normalize_compute_mode(args.mode)
+        args.mode = _normalize_compute_mode_local(args.mode)
         return run(args)
     except Exception as exc:  # pragma: no cover - last resort failure handling
         emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})

@@ -65,7 +65,7 @@ def _simple_type_atom_info(node: ast.AST) -> tuple[bool, bool]:
             return True, True
         if bool(node.id) and node.id[0].isupper():
             # CapWords and acronym-style type names (UUID, IO, URL, etc.).
-            return True, not node.id.isupper()
+            return True, True
         return False, False
     if isinstance(node, ast.Attribute):
         # e.g. pathlib.Path, decimal.Decimal, module.TreeNode
@@ -113,7 +113,12 @@ def _contains_type_alias_annotation(annotation: ast.AST | None) -> bool:
 
 
 def _is_alias_like_target(target: ast.AST) -> bool:
-    return isinstance(target, ast.Name) and bool(target.id) and target.id[0].isupper()
+    return (
+        isinstance(target, ast.Name)
+        and bool(target.id)
+        and target.id[0].isupper()
+        and not target.id.isupper()
+    )
 
 
 def _iter_import_time_child_bodies(node: ast.AST) -> list[list[ast.stmt]]:
@@ -248,7 +253,12 @@ def test_runtime_typing_union_alias_detection_regressions() -> None:
     assert isinstance(acronym_alias_assign, ast.Assign)
     assert _is_runtime_typing_union_alias(acronym_alias_assign.value)
 
+    all_acronym_alias_assign = _first_assignment_from_source("MaybeURL = URL | UUID\n")
+    assert isinstance(all_acronym_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(all_acronym_alias_assign.value)
+
     bitwise_assign = _first_assignment_from_source("FLAGS = READ | WRITE\n")
     assert isinstance(bitwise_assign, ast.Assign)
     assert _is_runtime_union_alias(bitwise_assign.value)
-    assert not _is_runtime_typing_union_alias(bitwise_assign.value)
+    assert _is_runtime_typing_union_alias(bitwise_assign.value)
+    assert not all(_is_alias_like_target(target) for target in bitwise_assign.targets)

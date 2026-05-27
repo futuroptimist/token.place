@@ -180,7 +180,8 @@ def _runtime_path_from_env() -> str:
 
 def _normalize_compute_mode_local(mode: Any) -> str:
     supported_modes = {"auto", "cpu", "gpu", "hybrid"}
-    normalized = {"cuda": "gpu", "metal": "gpu"}.get(str(mode).lower(), str(mode).lower())
+    selected = (mode or "auto").strip().lower()
+    normalized = {"cuda": "gpu", "metal": "gpu"}.get(selected, selected)
     return normalized if normalized in supported_modes else "auto"
 
 

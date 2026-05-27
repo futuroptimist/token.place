@@ -58,24 +58,22 @@ spec:
       containers:
         - name: relay
           {{- $defaultEnv := dict
-                "RELAY_HOST" "0.0.0.0"
-                "RELAY_PORT" (printf "%v" .Values.containerPort)
-                "RELAY_WORKERS" "1"
-                "TOKENPLACE_FRONTEND_MODE" "production"
-                "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "0"
+                "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
+                "RELAY_PORT" (dict "name" "RELAY_PORT" "value" (printf "%v" .Values.containerPort))
+                "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
+                "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
+                "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
           }}
           {{- $mergedEnv := deepCopy $defaultEnv }}
           {{- if kindIs "map" .Values.env }}
           {{- range $key, $val := .Values.env }}
-          {{- $_ := set $mergedEnv (printf "%v" $key) (printf "%v" $val) }}
+          {{- $_ := set $mergedEnv (printf "%v" $key) (dict "name" (printf "%v" $key) "value" (printf "%v" $val)) }}
           {{- end }}
           {{- else if kindIs "slice" .Values.env }}
           {{- range $item := .Values.env }}
           {{- if and (kindIs "map" $item) (hasKey $item "name") }}
           {{- $name := (printf "%v" (get $item "name")) }}
-          {{- if hasKey $item "value" }}
-          {{- $_ := set $mergedEnv $name (printf "%v" (get $item "value")) }}
-          {{- end }}
+          {{- $_ := set $mergedEnv $name (deepCopy $item) }}
           {{- end }}
           {{- end }}
           {{- end }}
@@ -83,9 +81,7 @@ spec:
           {{- range $item := .Values.extraEnv }}
           {{- if and (kindIs "map" $item) (hasKey $item "name") }}
           {{- $name := (printf "%v" (get $item "name")) }}
-          {{- if hasKey $item "value" }}
-          {{- $_ := set $mergedEnv $name (printf "%v" (get $item "value")) }}
-          {{- end }}
+          {{- $_ := set $mergedEnv $name (deepCopy $item) }}
           {{- end }}
           {{- end }}
           {{- end }}
@@ -97,8 +93,16 @@ spec:
               protocol: TCP
           env:
             {{- range $key := keys $mergedEnv | sortAlpha }}
+            {{- $entry := get $mergedEnv $key }}
             - name: {{ $key }}
-              value: {{ get $mergedEnv $key | quote }}
+              {{- if and (kindIs "map" $entry) (hasKey $entry "valueFrom") }}
+              valueFrom:
+                {{- toYaml (get $entry "valueFrom") | nindent 16 }}
+              {{- else if and (kindIs "map" $entry) (hasKey $entry "value") }}
+              value: {{ get $entry "value" | quote }}
+              {{- else }}
+              value: ""
+              {{- end }}
             {{- end }}
           {{- with .Values.envFrom }}
           envFrom:

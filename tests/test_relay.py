@@ -354,13 +354,31 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
         },
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
-    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+    class _FakeLlmInstance:
+        @staticmethod
+        def create_chat_completion(messages, **options):
+            captured["messages"] = messages
+            captured["options"] = options
+            return {
+                "choices": [
+                    {"message": {"role": "assistant", "content": "bonjour"}},
+                ]
+            }
 
-    def fake_generate_response(model, messages, **options):
-        captured["model"] = model
-        captured["messages"] = messages
-        captured["options"] = options
-        return messages + [{"role": "assistant", "content": "bonjour"}]
+    class _RuntimeModelManager:
+        @staticmethod
+        def supports_api_v1_model(model):
+            captured["model"] = model
+            return model == "llama-3-8b-instruct:alignment"
+
+        @staticmethod
+        def get_llm_instance():
+            return _FakeLlmInstance()
+
+    relay_client = _build_relay_client_for_api_v1_tests(
+        crypto_stub,
+        model_manager=_RuntimeModelManager(),
+    )
 
     def fake_post(url, json, timeout, **_kwargs):
         assert url == "https://relay.example/api/v1/relay/responses"
@@ -379,7 +397,6 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -391,7 +408,8 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-1"
-    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
+    assert encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
+    assert captured["model"] == "llama-3-8b-instruct:alignment"
 
 
 def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):
@@ -517,8 +535,6 @@ def test_relay_client_api_v1_posts_encrypted_model_unsupported_error(monkeypatch
 
 
 def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unavailable(monkeypatch):
-    from api.v1.models import ModelError
-
     decrypted_payload = {
         "protocol": "tokenplace_api_v1_relay_e2ee",
         "version": 1,
@@ -532,18 +548,24 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
 
+    class _FakeLlmInstance:
+        @staticmethod
+        def create_chat_completion(messages, **_options):
+            return {"choices": [{"message": {"role": "assistant", "content": "Paris"}}]}
+
     class _RuntimeModelManager:
         @staticmethod
-        def llama_cpp_get_response(messages):
-            return messages + [{"role": "assistant", "content": "Paris"}]
+        def supports_api_v1_model(model):
+            return model == "llama-3-8b-instruct"
+
+        @staticmethod
+        def get_llm_instance():
+            return _FakeLlmInstance()
 
     relay_client = _build_relay_client_for_api_v1_tests(
         crypto_stub,
         model_manager=_RuntimeModelManager(),
     )
-
-    def fake_generate_response(*_args, **_kwargs):
-        raise ModelError("Model file missing", status_code=500, error_type="model_load_error")
 
     def fake_post(_url, json=None, timeout=None, **_kwargs):
         assert json is not None
@@ -554,7 +576,6 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -566,7 +587,7 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-runtime-fallback"
-    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
+    assert encrypted_payload["api_v1_response"]["message"]["content"] == "Paris"
 
 
 def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_exception(monkeypatch):
@@ -582,10 +603,19 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_excep
         },
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
-    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+    class _RuntimeModelManager:
+        @staticmethod
+        def supports_api_v1_model(_model):
+            return True
 
-    def fake_generate_response(*_args, **_kwargs):
-        raise RuntimeError("backend crashed")
+        @staticmethod
+        def get_llm_instance():
+            raise RuntimeError("backend crashed")
+
+    relay_client = _build_relay_client_for_api_v1_tests(
+        crypto_stub,
+        model_manager=_RuntimeModelManager(),
+    )
 
     def fake_post(_url, json=None, timeout=None, **_kwargs):
         assert json is not None
@@ -607,7 +637,7 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_excep
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-internal"
-    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
 
 
 def test_relay_client_api_v1_source_post_failure_returns_false(monkeypatch):
@@ -665,10 +695,24 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
         },
     }
     crypto_stub = _RelayClientApiV1CryptoStub(decrypted_payload)
-    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+    class _FakeLlmInstance:
+        @staticmethod
+        def create_chat_completion(*, messages, **_options):
+            return generated_response
 
-    def fake_generate_response(*_args, **_kwargs):
-        return generated_response
+    class _RuntimeModelManager:
+        @staticmethod
+        def supports_api_v1_model(_model):
+            return True
+
+        @staticmethod
+        def get_llm_instance():
+            return _FakeLlmInstance()
+
+    relay_client = _build_relay_client_for_api_v1_tests(
+        crypto_stub,
+        model_manager=_RuntimeModelManager(),
+    )
 
     def fake_post(_url, json=None, timeout=None, **_kwargs):
         assert json is not None
@@ -690,7 +734,7 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-invalid-inference-output"
-    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_invalid_model_output"
 
 # --- Test /faucet ---
 

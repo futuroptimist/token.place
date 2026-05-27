@@ -69,7 +69,8 @@ def test_landing_page_does_not_document_forbidden_or_optional_relay_e2ee_shapes(
         'plaintext or encrypted',
         '"prompt": "Write a poem about AI"',
         '"content": "Hello!"',
-        '"encrypted": true,\n  "client_public_key": "YOUR_PUBLIC_KEY_HERE",\n  "messages": {',
+        '"content": "Hello! How can I assist you today?"',
+        '"choices": [',
     ]
     for snippet in forbidden_snippets:
         assert snippet not in html

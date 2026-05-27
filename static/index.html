@@ -399,26 +399,13 @@
     "iv": "INITIALIZATION_VECTOR_HERE"
   }
 }</pre>
-            <p><strong>Example Response:</strong></p>
+            <p><strong>Example Encrypted Response:</strong></p>
             <pre>{
-  "id": "chatcmpl-123abc456def",
-  "object": "chat.completion",
-  "created": 1677858242,
-  "model": "llama-3-8b-instruct",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "Hello! How can I assist you today?"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
+  "encrypted": true,
+  "data": {
+    "ciphertext": "ENCRYPTED_RESPONSE_PAYLOAD_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
   }
 }</pre>
         </div>

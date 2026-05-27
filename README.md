@@ -29,7 +29,7 @@ Secure peer-to-peer generative AI platform
 
 **Prerequisites**
 
-- **Python 3.11 or 3.12** (matches CI and Docker images; see [macOS relay setup](#macos-relay-only-quick-start) below)
+- **Python 3.11 or 3.12 for full development; Python 3.12 recommended for relay-only on macOS** (see [macOS relay setup](#macos-relay-only-quick-start) below)
 - **Node.js 18+** (`nvm use` respects the included `.nvmrc`)
 
 Create and activate a virtual environment before installing Python packages (recommended on all platforms, especially macOS where `pip` may be missing but `pip3` is available):
@@ -39,12 +39,21 @@ git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 
 # Prefer Python 3.12 when available (brew install python@3.12)
-python3.12 -m venv .venv || python3 -m venv .venv
+python3.12 -m venv .venv || python3.11 -m venv .venv || python3 -m venv .venv
 # Windows PowerShell alternative: py -3.12 -m venv .venv
 source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
 python -m pip install -r config/requirements_relay.txt
+```
+
+If `python -m pip` reports a venv path like `.venv/lib/python3.9/...` after Homebrew install, your shell is still resolving an older Python first. Recreate the venv with an explicit interpreter:
+
+```bash
+rm -rf .venv
+/opt/homebrew/bin/python3.12 -m venv .venv  # Apple Silicon Homebrew path
+source .venv/bin/activate
+python -V  # expect 3.12.x (or 3.11.x)
 ```
 
 **Relay only (fast path):** after activating `.venv`, run `python relay.py` and open `http://127.0.0.1:5010/api/v1/health`. Or run `./scripts/setup-relay-venv.sh` to create the venv and install relay dependencies in one step.

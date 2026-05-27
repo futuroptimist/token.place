@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "macos-relay-venv-packaging-conflict",
+  "summary": "macOS relay quickstart could fail because the venv resolved to an older Python and requirements pinned packaging==25.0, conflicting with Flask-Limiter/limits.",
+  "impact": "Relay dependency install failed with ResolutionImpossible and relay startup failed with ModuleNotFoundError for flask.",
+  "fix": "Pinned relay packaging to 24.2 and updated docs to prefer explicit Python 3.12/3.11 interpreters plus post-activation version verification.",
+  "lessons": "macOS setup docs must guard against interpreter drift in PATH and dependency pins must account for transitive constraints from Flask-Limiter limits."
+}

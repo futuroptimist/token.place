@@ -420,8 +420,8 @@ def main() -> int:
                 ],
                 cwd=REPO_ROOT,
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 text=True,
             )
 

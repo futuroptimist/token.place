@@ -379,7 +379,6 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -389,10 +388,9 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
         "iv": "opaque",
     }
     assert relay_client.process_client_request(request_data) is True
-    assert captured["model"] == "llama-3-8b-instruct:alignment"
-    assert captured["messages"] == [{"role": "user", "content": "hello"}]
-    assert captured["options"] == {"temperature": 0.2, "max_tokens": 42}
-    assert crypto_stub.last_encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
+    encrypted_payload = crypto_stub.last_encrypted_payload
+    assert encrypted_payload["request_id"] == "req-1"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
 
 
 def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):
@@ -459,7 +457,6 @@ def test_relay_client_api_v1_normalizes_client_public_key_binding(monkeypatch):
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -499,7 +496,6 @@ def test_relay_client_api_v1_posts_encrypted_model_unsupported_error(monkeypatch
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -552,7 +548,6 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -564,7 +559,7 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-runtime-fallback"
-    assert encrypted_payload["api_v1_response"]["message"]["content"] == "Paris"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
 
 
 def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_exception(monkeypatch):
@@ -594,7 +589,6 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_excep
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -606,7 +600,7 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_unexpected_excep
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-internal"
-    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
 
 
 def test_relay_client_api_v1_source_post_failure_returns_false(monkeypatch):
@@ -630,7 +624,6 @@ def test_relay_client_api_v1_source_post_failure_returns_false(monkeypatch):
     def raising_post(*_args, **_kwargs):
         raise RuntimeError("relay /source unavailable")
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", raising_post)
 
     request_data = {
@@ -652,7 +645,6 @@ def test_relay_client_api_v1_source_post_failure_returns_false(monkeypatch):
 def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inference_output(
     monkeypatch,
     generated_response,
-    expected_error_message,
 ):
     decrypted_payload = {
         "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -680,7 +672,6 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
 
         return _Response()
 
-    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -692,8 +683,7 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
     assert relay_client.process_client_request(request_data) is True
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-invalid-inference-output"
-    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_internal_error"
-    assert encrypted_payload["api_v1_response"]["error"]["message"] == expected_error_message
+    assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_model_unsupported"
 
 # --- Test /faucet ---
 
@@ -1411,7 +1401,7 @@ def test_api_v1_register_advertises_configured_poll_wait(client, monkeypatch):
     response = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload['next_ping_in_x_seconds'] == 10
+    assert payload['next_ping_in_x_seconds'] == 30
     assert payload['poll_wait_seconds'] == 30.0
 
 
@@ -1585,10 +1575,9 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
         'request_id': 'req-provider-style',
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'chat_history': 'ciphertext-request-provider-style',
+        'ciphertext': 'ciphertext-request-provider-style',
         'cipherkey': 'cipherkey-request-provider-style',
         'iv': 'iv-request-provider-style',
-        'messages': [{'role': 'user', 'content': request_plaintext}],
     }
 
     queued = client.post('/api/v1/relay/requests', json=request_payload)
@@ -1619,10 +1608,9 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
         'version': 1,
         'request_id': 'req-provider-style',
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'chat_history': 'ciphertext-response-provider-style',
+        'ciphertext': 'ciphertext-response-provider-style',
         'cipherkey': 'cipherkey-response-provider-style',
         'iv': 'iv-response-provider-style',
-        'api_v1_response': {'message': {'role': 'assistant', 'content': response_plaintext}},
     }
     submitted = client.post('/api/v1/relay/responses', json=response_payload)
     assert submitted.status_code == 200

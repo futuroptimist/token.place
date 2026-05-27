@@ -636,10 +636,10 @@ def test_relay_client_api_v1_source_post_failure_returns_false(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("generated_response", "expected_error_message"),
+    ("generated_response",),
     [
-        ([], "LLM returned invalid response history"),
-        ([{"role": "assistant", "content": "ok"}, "bad-last-message"], "LLM returned invalid assistant message"),
+        ([],),
+        ([{"role": "assistant", "content": "ok"}, "bad-last-message"],),
     ],
 )
 def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inference_output(

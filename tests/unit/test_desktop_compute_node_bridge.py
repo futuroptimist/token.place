@@ -1004,6 +1004,23 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     )
 
 
+def test_main_emits_structured_error_when_dependency_missing(capsys, monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.compute_node_runtime':
+            raise ModuleNotFoundError("No module named 'cryptography'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--model', '/tmp/model.gguf'])
+    status = compute_node_bridge.main()
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get("type") == "error")
+    assert "No module named 'cryptography'" in payload['message']
+
+
 def test_main_normalizes_mode_before_run(monkeypatch):
     captured = {}
 

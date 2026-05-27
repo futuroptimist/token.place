@@ -1,0 +1,8 @@
+{
+  "date": "2026-05-27",
+  "slug": "desktop-macos-compute-node-cryptography-missing",
+  "summary": "macOS desktop compute-node startup could exit before first bridge event with 'No module named cryptography'.",
+  "impact": "Start operator failed before started/status bridge events; desktop UI surfaced early startup failure.",
+  "fix": "Bootstrap runtime import paths before runtime-helper imports, emit structured ModuleNotFoundError startup events, and add packaged e2e guards for cryptography/import error signatures.",
+  "lessons": "Packaged release-like compute-node startup tests must assert dependency-failure signatures and lifecycle-event emission guarantees on the actual compute bridge path."
+}

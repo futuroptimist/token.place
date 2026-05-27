@@ -22,6 +22,8 @@ if __package__ in (None, ""):
 
 from path_bootstrap import ensure_runtime_import_paths
 
+ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+
 try:
     from desktop_runtime_setup import (
         desktop_gpu_runtime_failure_message,
@@ -55,8 +57,6 @@ except ModuleNotFoundError:
         _runtime_setup: Dict[str, str], *, allow_reexec: bool = True
     ) -> None:
         return
-
-ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
@@ -603,6 +603,9 @@ def main() -> int:
 
         args.mode = normalize_compute_mode(args.mode)
         return run(args)
+    except ModuleNotFoundError as exc:
+        emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})
+        return 1
     except Exception as exc:  # pragma: no cover - last resort failure handling
         emit({"type": "error", "message": f"{EARLY_STARTUP_EXIT_ERROR}: {exc}"})
         return 1

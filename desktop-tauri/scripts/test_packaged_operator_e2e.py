@@ -213,7 +213,9 @@ def run_compute_bridge_import_probe(tmp_root: Path) -> None:
     assert result.returncode == 0, combined
 
     forbidden_any_output = [
+        "No module named 'cryptography'",
         "No module named 'requests'",
+        "compute-node bridge exited before emitting a startup event",
         "ModuleNotFoundError",
         "ImportError",
     ]

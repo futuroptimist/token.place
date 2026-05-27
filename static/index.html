@@ -441,13 +441,13 @@
 }</pre>
         </div>
 
-        <h3>Encrypted API Usage</h3>
-        <p>For enhanced privacy, you can use end-to-end encryption with the API:</p>
+        <h3>E2EE Relay Envelope (Always Required)</h3>
+        <p>token.place API and relay traffic is always end-to-end encrypted by design. Use this envelope format for every request.</p>
         <ol>
             <li>Get the server's public key from <code>/api/v1/public-key</code></li>
             <li>Generate your own RSA key pair on the client</li>
             <li>Encrypt your messages with the server's public key</li>
-            <li>Send the encrypted request with <code>"encrypted": true</code> flag</li>
+            <li>Send the encrypted request envelope (<code>"encrypted": true</code> is required when present in client payloads)</li>
             <li>The server will encrypt its response with your public key</li>
         </ol>
 
@@ -478,7 +478,7 @@
         <p>Learn more about our goals and how you can be a part of this initiative on our <a href="https://github.com/futuroptimist/token.place">GitHub repository</a>.</p>
 
         <h3>Privacy Notice</h3>
-        <p><strong>All communications are now end-to-end encrypted for enhanced privacy. For maximum security, consider self-hosting by following the README on the GitHub repository.</strong></p>
+        <p><strong>All communications are end-to-end encrypted by default and relay-mediated by design. Relay components must stay ciphertext-only (plus safe routing metadata). For maximum control, consider self-hosting via the README.</strong></p>
 
         <div class="mode-toggle-container">
             <button id="toggleMode"></button>

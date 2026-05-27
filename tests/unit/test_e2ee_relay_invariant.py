@@ -218,3 +218,50 @@ def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(monkeypatch, caplog
     diagnostics_text = _to_text(relay_client.get("/relay/diagnostics").get_json())
     assert E2EE_SENTINEL_LOGS not in diagnostics_text
     assert _to_text(sink_response.get_json()).find(E2EE_SENTINEL_LOGS) == -1
+
+
+def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(monkeypatch, relay_client):
+    relay.known_servers["server-key"] = {
+        "public_key": "server-key",
+        "last_ping": relay.datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    resp = relay_client.post(
+        "/api/v1/relay/requests",
+        json={
+            "server_public_key": "server-key",
+            "client_public_key": "client-key",
+            "ciphertext": "c",
+            "cipherkey": "k",
+            "iv": "i",
+            "messages": [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "Plaintext relay payload fields are forbidden" in resp.get_json()["error"]["message"]
+
+
+def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client):
+    monkeypatch.setenv("TOKENPLACE_RELAY_SERVER_BEARER_TOKEN", "token")
+    relay.known_servers["server-key"] = {
+        "public_key": "server-key",
+        "last_ping": relay.datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    resp = relay_client.post(
+        "/api/v1/relay/responses",
+        json={
+            "client_public_key": "client-key",
+            "ciphertext": "c",
+            "cipherkey": "k",
+            "iv": "i",
+            "content": E2EE_SENTINEL_RELAY_STATE,
+        },
+        headers={"Authorization": "Bearer token"},
+    )
+
+    assert resp.status_code == 400
+    assert "Plaintext relay payload fields are forbidden" in resp.get_json()["error"]["message"]

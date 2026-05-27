@@ -865,6 +865,15 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
     return envelope, None
 
 
+
+
+def _payload_has_plaintext_fields(payload):
+    if not isinstance(payload, dict):
+        return False
+    forbidden_plaintext_fields = {"messages", "prompt", "input", "content", "response", "text"}
+    return any(field in payload for field in forbidden_plaintext_fields)
+
+
 def _queue_client_response(client_public_key, envelope):
     """Queue an encrypted response while preserving per-request retrieval."""
     with client_responses_lock:
@@ -1066,6 +1075,8 @@ def api_v1_relay_requests():
     _evict_stale_servers()
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
+    if _payload_has_plaintext_fields(data):
+        return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if error:
         msg, code = error
         return jsonify({'error': {'message': msg, 'code': code}}), code
@@ -1107,6 +1118,8 @@ def api_v1_relay_responses():
 
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
+    if _payload_has_plaintext_fields(data):
+        return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if error:
         msg, code = error
         return jsonify({'error': {'message': msg, 'code': code}}), code
@@ -1172,8 +1185,8 @@ def faucet():
     diffing mechanisms to determine if conversations were altered, but this is intentionally built in a
     stateless manner to minimize complexity and maximize scalability. It's trivially easy to identify
     tampering from either party, so enforcing it on the relay is a non-goal, especially since communication
-    between the client and the server is intended to be end-to-end-encrypted. Servers and clients can choose
-    how to handle this as they see fit.
+    between the client and the server is mandatory end-to-end encrypted. This relay path must remain
+    ciphertext-only (+ safe routing metadata) and fail closed for plaintext payloads or bypass attempts.
 
     Example request:
 

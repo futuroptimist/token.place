@@ -32,9 +32,11 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Launch version alignment for v0.1.0: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
+- Before publishing the chart, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if it already exists with stale contents, stop and resolve manually (do not overwrite immutable OCI artifacts).
 
 ## Default hostnames
 

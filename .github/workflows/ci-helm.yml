@@ -150,7 +150,7 @@ jobs:
           chart_ref="${{ needs.validate-and-package.outputs.chart_ref }}"
           chart_registry="${chart_ref%/*}"
           if helm show chart "${chart_ref}" --version "${{ needs.validate-and-package.outputs.chart_version }}" >/dev/null 2>&1; then
-            echo "Chart ${chart_ref}:${{ needs.validate-and-package.outputs.chart_version }} already exists. Bump charts/tokenplace/Chart.yaml version before publishing." >&2
+            echo "Chart ${chart_ref}:${{ needs.validate-and-package.outputs.chart_version }} already exists. Do not overwrite published OCI artifacts; stop and perform a manual release decision." >&2
             exit 1
           fi
           helm push "${package_file}" "${chart_registry}"

@@ -382,7 +382,6 @@ def run_compute_bridge_startup_probe(
 
 
 def main() -> int:
-    relay_port = reserve_free_port()
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
 
@@ -402,42 +401,42 @@ def main() -> int:
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0
 
-        relay = subprocess.Popen(  # noqa: S603
-            [
-                sys.executable,
-                str(REPO_ROOT / "relay.py"),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(relay_port),
-                "--use_mock_llm",
-            ],
-            cwd=REPO_ROOT,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        probe_specs = (
+            (bridge_script, None, "standard resources"),
+            (mac_bridge_script, mac_resources_root, "macOS Contents/Resources"),
         )
 
-        try:
-            wait_for_livez(relay, relay_port)
-            run_compute_bridge_startup_probe(
-                tmp_path,
-                bridge_script,
-                relay_port=relay_port,
-                layout_label="standard resources",
-            )
-            run_compute_bridge_startup_probe(
-                tmp_path,
-                mac_bridge_script,
-                relay_port=relay_port,
-                resources_root=mac_resources_root,
-                layout_label="macOS Contents/Resources",
+        for probe_script, probe_resources_root, layout_label in probe_specs:
+            relay_port = reserve_free_port()
+            relay = subprocess.Popen(  # noqa: S603
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "relay.py"),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(relay_port),
+                    "--use_mock_llm",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
 
-        finally:
-            if relay.poll() is None:
-                relay.kill()
+            try:
+                wait_for_livez(relay, relay_port)
+                run_compute_bridge_startup_probe(
+                    tmp_path,
+                    probe_script,
+                    relay_port=relay_port,
+                    resources_root=probe_resources_root,
+                    layout_label=layout_label,
+                )
+            finally:
+                if relay.poll() is None:
+                    relay.kill()
 
     return 0
 

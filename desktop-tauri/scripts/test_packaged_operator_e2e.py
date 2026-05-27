@@ -323,6 +323,12 @@ def run_compute_bridge_startup_probe(
                 if saw_started and saw_registered:
                     bridge.stdin.write(b'{"type":"cancel"}\n')
                     bridge.stdin.flush()
+                    cancel_deadline = time.time() + 5
+                    while time.time() < cancel_deadline and bridge.poll() is None:
+                        try:
+                            bridge_output += output_queue.get(timeout=0.1).decode("utf-8", errors="replace")
+                        except queue.Empty:
+                            pass
                     break
             if saw_started and saw_registered:
                 break

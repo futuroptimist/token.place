@@ -45,6 +45,14 @@ source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
 python -m pip install -r config/requirements_relay.txt
+
+# macOS/Homebrew note: if `python3` still resolves to Apple Python (often 3.9),
+# recreate the venv with Homebrew Python explicitly:
+#   deactivate 2>/dev/null || true
+#   rm -rf .venv
+#   /opt/homebrew/bin/python3 -m venv .venv
+#   source .venv/bin/activate
+#   python -V   # should show 3.11+
 ```
 
 **Relay only (fast path):** after activating `.venv`, run `python relay.py` and open `http://127.0.0.1:5010/api/v1/health`. Or run `./scripts/setup-relay-venv.sh` to create the venv and install relay dependencies in one step.
@@ -63,6 +71,8 @@ pre-commit run --all-files
 ```
 
 On macOS, use `python3` / `pip3` (or the venv’s `python` / `pip` after activation) if the unversioned `python` / `pip` commands are not on your `PATH`.
+
+On macOS, always verify the interpreter used to create the venv (`python -V` after activation). If it reports Python 3.9, remove `.venv` and recreate it with `/opt/homebrew/bin/python3` so dependency resolution matches CI and pinned requirements.
 
 ### Developer workflow quick reference
 

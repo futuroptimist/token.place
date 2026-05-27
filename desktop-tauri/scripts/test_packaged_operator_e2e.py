@@ -290,14 +290,20 @@ def run_compute_bridge_startup_probe(
             daemon=True,
         ).start()
 
-        deadline = time.time() + 20
+        start_deadline = time.time() + 20
+        registration_deadline = time.time() + 45
         buffered = ""
-        while time.time() < deadline:
-            timeout = max(0.0, min(0.25, deadline - time.time()))
+        while time.time() < registration_deadline:
+            active_deadline = start_deadline if not saw_started else registration_deadline
+            timeout = max(0.0, min(0.25, active_deadline - time.time()))
+            if timeout <= 0 and not saw_started:
+                break
             try:
                 chunk = output_queue.get(timeout=timeout)
             except queue.Empty:
                 if bridge.poll() is not None:
+                    break
+                if saw_started and time.time() >= registration_deadline:
                     break
                 continue
 

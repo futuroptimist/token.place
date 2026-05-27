@@ -284,6 +284,24 @@ def test_api_v1_stream_true_fails_before_relay_queue():
     assert relay.client_inference_requests == {}
 
 
+def test_api_v1_desktop_bridge_register_and_poll_no_work_heartbeat():
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 2
+
+        payload = desktop_client.poll_api_v1_encrypted_work()
+
+    assert payload["message"] == "No requests available"
+    assert payload["next_ping_in_x_seconds"] >= 1
+    assert payload["poll_wait_seconds"] >= 0
+
+
 @pytest.mark.parametrize("encrypted", [False, True])
 def test_api_v1_image_content_fails_before_relay_queue(encrypted):
     messages = [

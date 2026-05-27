@@ -1041,7 +1041,11 @@ def api_v1_relay_servers_poll():
 
     if first_request is None:
         server_payload['last_ping'] = datetime.now()
-        return jsonify({'message': 'No requests available'}), 200
+        return jsonify({
+            'message': 'No requests available',
+            'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
+            'poll_wait_seconds': poll_wait_seconds,
+        }), 200
 
     queue_wait_ms = None
     queued_at = first_request.pop('_queued_at', None)

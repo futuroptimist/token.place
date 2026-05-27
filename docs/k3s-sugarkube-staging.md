@@ -94,6 +94,23 @@ curl -fsS https://staging.token.place/
 Optional note: true relay traffic validation requires a registered external compute node plus an
 E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
 
+Desktop compute-node long-poll verification (manual):
+
+```bash
+# Start the Windows 11 desktop compute node bridge and point it at staging.
+# Example env override:
+TOKENPLACE_DISTRIBUTED_COMPUTE_URL=https://staging.token.place python server.py
+
+# Confirm the relay sees at least one registered node.
+curl -fsS https://staging.token.place/healthz | jq '.knownServers'
+
+# Confirm diagnostics includes the registered node public key.
+curl -fsS https://staging.token.place/relay/diagnostics | jq '.registered_compute_nodes'
+```
+
+Expected result: `/healthz` reports `knownServers >= 1` and `/relay/diagnostics` lists the
+desktop node while idle polls return `message: "No requests available"` with timing metadata.
+
 If operators use a non-default staging hostname, apply the same checks with that host.
 
 ## Rollback

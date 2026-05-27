@@ -17,9 +17,9 @@ Pinned dependency conflict in relay requirements:
 - Transitive constraint: `limits` (via Flask-Limiter) requires `packaging<25`
 
 ## Remediation
-- Changed relay dependency pin to `packaging==24.2`.
-- Updated quickstart and onboarding docs to use `python3 -m venv .venv` rather than hardcoding `python3.12`, which is often absent on fresh Homebrew installs where `python3` points to current stable (for example Python 3.14).
+- Changed relay dependency pin to `packaging==24.2` so pip can resolve `Flask-Limiter`/`limits` constraints.
+- Updated quickstart and onboarding docs with a macOS/Homebrew guardrail: run `python -V` after activating `.venv`; if the venv reports Python 3.9 (or another too-old interpreter), recreate with `rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv`.
 
 ## Prevention
 - Keep relay requirement pins aligned with transitive upper bounds.
-- Prefer `python3`/`py -3` for docs-first bootstrap commands unless an exact version is strictly required.
+- Treat interpreter verification as a quickstart guardrail (confirm `python -V` shows 3.11+) rather than the primary root cause for this outage.

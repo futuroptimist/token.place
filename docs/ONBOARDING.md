@@ -62,8 +62,11 @@ Create a virtual environment first (recommended on macOS):
 
 ```bash
 python3 -m venv .venv
-# On macOS relay-only setups, prefer Python 3.12 if available: python3.12 -m venv .venv
 source .venv/bin/activate
+python -V
+# Relay quickstart expects Python 3.11+ in this venv.
+# If macOS/Homebrew still activates Python 3.9 (or another too-old version), recreate with:
+#   rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv
 python -m pip install --upgrade pip
 ```
 

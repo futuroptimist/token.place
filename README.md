@@ -39,9 +39,13 @@ git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 
 # Use a known-good interpreter for relay dependencies (3.11/3.12 recommended)
-python3.12 -m venv .venv
-# Windows PowerShell alternative: py -3.12 -m venv .venv
+python3 -m venv .venv
+# Windows PowerShell alternative: py -3 -m venv .venv
 source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
+python -V
+# Relay quickstart expects Python 3.11+ in this venv.
+# If macOS/Homebrew still activates Python 3.9 (or another too-old version), recreate with:
+#   rm -rf .venv && /opt/homebrew/bin/python3 -m venv .venv
 
 python -m pip install --upgrade pip
 python -m pip install -r config/requirements_relay.txt

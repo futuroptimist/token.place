@@ -63,7 +63,11 @@ ingress:
     enabled: false
     secretName: ""
 
-env: {}
+env:
+  XDG_CONFIG_HOME: /tmp/.config
+  XDG_DATA_HOME: /tmp/.local/share
+  XDG_CACHE_HOME: /tmp/.cache
+  XDG_STATE_HOME: /tmp/.local/state
 extraEnv: []
 envFrom: []
 

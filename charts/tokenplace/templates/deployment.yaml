@@ -68,15 +68,11 @@ spec:
               value: "0.0.0.0"
             - name: RELAY_PORT
               value: "{{ .Values.containerPort }}"
-            - name: RELAY_WORKERS
-              value: "1"
-            - name: TOKENPLACE_FRONTEND_MODE
-              value: "production"
-            - name: TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH
-              value: "0"
-            {{- range $key, $val := .Values.env }}
+            {{- $defaultEnv := dict "RELAY_WORKERS" "1" "TOKENPLACE_FRONTEND_MODE" "production" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "0" }}
+            {{- $mergedEnv := mergeOverwrite (deepCopy $defaultEnv) (.Values.env | default dict) }}
+            {{- range $key := keys $mergedEnv | sortAlpha }}
             - name: {{ $key }}
-              value: {{ $val | quote }}
+              value: {{ index $mergedEnv $key | quote }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

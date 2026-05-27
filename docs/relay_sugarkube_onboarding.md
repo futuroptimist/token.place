@@ -59,6 +59,30 @@ Assumption: cert-manager is installed and the configured ClusterIssuer (for exam
 - Staging: host `staging.token.place`, TLS secret `tokenplace-staging-tls`
 - Production: host `token.place`, TLS secret `tokenplace-prod-tls`
 
+
+## 0.1.0 release alignment
+
+All launch identifiers stay pinned to the same release line:
+
+- Sugarkube `docs/apps/tokenplace.version` chart version: `0.1.0`
+- OCI chart package version: `0.1.0`
+- Helm chart `appVersion`: `0.1.0`
+- token.place Git tag: `v0.1.0`
+- Production release image tag: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Staging candidate image tag before final promotion: `main-<shortsha>`
+
+This intentionally does not introduce `0.1.1`.
+
+## Pre-flight before Step 1 deploy commands
+
+Before install/upgrade, verify the `0.1.0` OCI chart is the currently published artifact:
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+If this succeeds before the final token.place chart publish window, confirm the chart is not a stale `0.1.0` artifact before deploying.
+
 ## Sugarkube deployment command patterns
 
 > Run the following from a **Sugarkube checkout**, not from token.place.
@@ -68,13 +92,13 @@ Use the values files and version file that live in Sugarkube for your environmen
 First install pattern:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-<shortsha>
 ```
 
 Existing release upgrade pattern:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-<shortsha>
 ```
 
 Production pattern uses `PATH/TO/tokenplace.values.prod.yaml` with the same approved
@@ -85,11 +109,14 @@ immutable tag.
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-<shortsha> > /tmp/tokenplace-staging-render.yaml
 grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
 grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
 grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-staging-render.yaml
+yq e 'select(.kind == "Ingress" and .metadata.name == "tokenplace") | .spec.tls' /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
@@ -105,6 +132,8 @@ helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version
 grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
 grep -n "token.place" /tmp/tokenplace-prod-render.yaml
 grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-prod-render.yaml
+yq e 'select(.kind == "Ingress" and .metadata.name == "tokenplace") | .spec.tls' /tmp/tokenplace-prod-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez

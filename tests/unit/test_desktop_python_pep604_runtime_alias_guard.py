@@ -25,80 +25,8 @@ def _iter_python_files() -> list[Path]:
     return files
 
 
-def _is_runtime_union_alias(value: ast.AST) -> bool:
-    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
-        return True
-    if isinstance(value, ast.Subscript):
-        return _is_runtime_union_alias(value.slice)
-    if isinstance(value, ast.Tuple):
-        return any(_is_runtime_union_alias(elt) for elt in value.elts)
-    if isinstance(value, ast.Dict):
-        return any(_is_runtime_union_alias(k) for k in value.keys if k is not None) or any(
-            _is_runtime_union_alias(v) for v in value.values
-        )
-    if isinstance(value, ast.List):
-        return any(_is_runtime_union_alias(elt) for elt in value.elts)
-    return False
-
-
-def _is_typing_like_name(node: ast.AST) -> bool:
-    typing_like_names = {
-        "Dict", "List", "Set", "FrozenSet", "Tuple",
-        "Mapping", "MutableMapping", "Sequence", "Iterable",
-        "Collection", "MutableSequence", "MutableSet",
-        "DefaultDict", "Deque", "Callable",
-        "Optional", "Union", "Literal", "Annotated",
-        "Type", "Final", "Generator",
-    }
-    builtins_generics = {"dict", "list", "set", "frozenset", "tuple"}
-    if isinstance(node, ast.Name):
-        return node.id in typing_like_names or node.id in builtins_generics
-    if isinstance(node, ast.Attribute):
-        return node.attr in typing_like_names or node.attr in builtins_generics
-    return False
-
-
-def _simple_type_atom_info(node: ast.AST) -> tuple[bool, bool]:
-    """Return (is_type_atom, is_explicit_type_marker)."""
-    if isinstance(node, ast.Name):
-        if node.id in {"str", "bytes", "int", "float", "bool", "object", "None"}:
-            return True, True
-        if bool(node.id) and node.id[0].isupper():
-            # CapWords and acronym-style type names (UUID, IO, URL, etc.).
-            return True, True
-        return False, False
-    if isinstance(node, ast.Attribute):
-        # e.g. pathlib.Path, decimal.Decimal, module.TreeNode
-        return True, True
-    if isinstance(node, ast.Constant):
-        if node.value is None or node.value is Ellipsis:
-            return True, True
-    return False, False
-
-
-def _typing_like_union_chain_info(node: ast.AST) -> tuple[bool, bool]:
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        left_ok, left_explicit = _typing_like_union_chain_info(node.left)
-        right_ok, right_explicit = _typing_like_union_chain_info(node.right)
-        return left_ok and right_ok, left_explicit or right_explicit
-    return _simple_type_atom_info(node)
-
-
-def _is_typing_like_union_chain(node: ast.AST) -> bool:
-    ok, has_explicit = _typing_like_union_chain_info(node)
-    return ok and has_explicit
-
-
-def _contains_typing_like_context(value: ast.AST) -> bool:
-    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
-        return _is_typing_like_union_chain(value)
-    if isinstance(value, ast.Subscript) and _is_typing_like_name(value.value):
-        return True
-    return any(isinstance(node, ast.Subscript) and _is_typing_like_name(node.value) for node in ast.walk(value))
-
-
-def _is_runtime_typing_union_alias(value: ast.AST) -> bool:
-    return _is_runtime_union_alias(value) and _contains_typing_like_context(value)
+def _contains_runtime_bitor(value: ast.AST) -> bool:
+    return any(isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr) for node in ast.walk(value))
 
 
 def _contains_type_alias_annotation(annotation: ast.AST | None) -> bool:
@@ -112,16 +40,23 @@ def _contains_type_alias_annotation(annotation: ast.AST | None) -> bool:
     return False
 
 
-def _is_alias_like_target(target: ast.AST) -> bool:
-    if not isinstance(target, ast.Name) or not target.id:
-        return False
-    if not target.id[0].isupper():
-        return False
-    if target.id.isupper():
-        # Permit likely type aliases (T, IO, URL, UUID) while excluding
-        # constant-like names (FLAGS, READ, WRITE) to avoid bitwise false positives.
-        return len(target.id) <= 4
-    return True
+def _known_safe_runtime_bitor_assignment(target: ast.AST, value: ast.AST) -> bool:
+    """Narrow escape hatch for legitimate runtime bitwise assignments.
+
+    Import-time `|` in assignment RHS is forbidden by default for Python 3.9 safety
+    in desktop-packaged Python. Add explicit cases here only when known-safe and
+    clearly non-typing.
+    """
+    return (
+        isinstance(target, ast.Name)
+        and target.id == "FLAGS"
+        and isinstance(value, ast.BinOp)
+        and isinstance(value.op, ast.BitOr)
+        and isinstance(value.left, ast.Name)
+        and value.left.id == "READ"
+        and isinstance(value.right, ast.Name)
+        and value.right.id == "WRITE"
+    )
 
 
 def _iter_import_time_child_bodies(node: ast.AST) -> list[list[ast.stmt]]:
@@ -161,21 +96,21 @@ def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignme
             if isinstance(node, ast.Assign):
                 value = node.value
                 targets = node.targets
-                alias_like = all(_is_alias_like_target(target) for target in targets)
             elif isinstance(node, ast.AnnAssign):
                 value = node.value
                 targets = [node.target]
-                alias_like = _contains_type_alias_annotation(node.annotation) or _is_alias_like_target(node.target)
             else:
                 continue
 
-            if value is None or not alias_like:
+            if value is None or not _contains_runtime_bitor(value):
                 continue
 
-            if _is_runtime_typing_union_alias(value):
-                target_names = [ast.unparse(target) for target in targets]
-                rel = path.relative_to(REPO_ROOT)
-                violations.append(f"{rel}:{node.lineno} assigns runtime union alias: {', '.join(target_names)}")
+            if all(_known_safe_runtime_bitor_assignment(target, value) for target in targets):
+                continue
+
+            target_names = [ast.unparse(target) for target in targets]
+            rel = path.relative_to(REPO_ROOT)
+            violations.append(f"{rel}:{node.lineno} assigns runtime union alias: {', '.join(target_names)}")
 
     assert not violations, "\n".join(violations)
 
@@ -218,60 +153,57 @@ def test_runtime_typing_union_alias_detection_regressions() -> None:
         "from typing import Dict, TypeAlias\nGpuMetrics: TypeAlias = Dict[str, float | int | bool]\n"
     )
     assert _contains_type_alias_annotation(ann_assign.annotation)
-    assert _is_runtime_typing_union_alias(ann_assign.value)
+    assert _contains_runtime_bitor(ann_assign.value)
 
     class_assign = _first_assignment_from_source(
         "from typing import Dict\nclass Metrics:\n    GpuMetrics = Dict[str, float | int | bool]\n"
     )
     assert isinstance(class_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(class_assign.value)
+    assert _contains_runtime_bitor(class_assign.value)
 
     conditional_assign = _first_assignment_from_source(
         "from typing import Dict\nif True:\n    GpuMetrics = Dict[str, float | int | bool]\n"
     )
     assert isinstance(conditional_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(conditional_assign.value)
+    assert _contains_runtime_bitor(conditional_assign.value)
 
     direct_alias_assign = _first_assignment_from_source("GpuMetricValue = float | int | bool\n")
     assert isinstance(direct_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(direct_alias_assign.value)
+    assert _contains_runtime_bitor(direct_alias_assign.value)
 
     callable_alias_assign = _first_assignment_from_source(
         "from typing import Callable\nBytesOrText = Callable[[str | bytes], None]\n"
     )
     assert isinstance(callable_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(callable_alias_assign.value)
+    assert _contains_runtime_bitor(callable_alias_assign.value)
 
     capitalized_alias_assign = _first_assignment_from_source("PathLike = str | Path\n")
     assert isinstance(capitalized_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(capitalized_alias_assign.value)
+    assert _contains_runtime_bitor(capitalized_alias_assign.value)
 
     wrapper_alias_assign = _first_assignment_from_source(
         "from typing import Type\nTypePath = Type[str | Path]\n"
     )
     assert isinstance(wrapper_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(wrapper_alias_assign.value)
+    assert _contains_runtime_bitor(wrapper_alias_assign.value)
 
     acronym_alias_assign = _first_assignment_from_source("MaybeUUID = UUID | str\n")
     assert isinstance(acronym_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(acronym_alias_assign.value)
+    assert _contains_runtime_bitor(acronym_alias_assign.value)
 
     all_acronym_alias_assign = _first_assignment_from_source("MaybeURL = URL | UUID\n")
     assert isinstance(all_acronym_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(all_acronym_alias_assign.value)
+    assert _contains_runtime_bitor(all_acronym_alias_assign.value)
 
     bitwise_assign = _first_assignment_from_source("FLAGS = READ | WRITE\n")
     assert isinstance(bitwise_assign, ast.Assign)
-    assert _is_runtime_union_alias(bitwise_assign.value)
-    assert _is_runtime_typing_union_alias(bitwise_assign.value)
-    assert not all(_is_alias_like_target(target) for target in bitwise_assign.targets)
+    assert _contains_runtime_bitor(bitwise_assign.value)
+    assert _known_safe_runtime_bitor_assignment(bitwise_assign.targets[0], bitwise_assign.value)
 
     uppercase_direct_alias_assign = _first_assignment_from_source("T = str | bytes\n")
     assert isinstance(uppercase_direct_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(uppercase_direct_alias_assign.value)
-    assert all(_is_alias_like_target(target) for target in uppercase_direct_alias_assign.targets)
+    assert _contains_runtime_bitor(uppercase_direct_alias_assign.value)
 
     uppercase_acronym_alias_assign = _first_assignment_from_source("URL = UUID | URL\n")
     assert isinstance(uppercase_acronym_alias_assign, ast.Assign)
-    assert _is_runtime_typing_union_alias(uppercase_acronym_alias_assign.value)
-    assert all(_is_alias_like_target(target) for target in uppercase_acronym_alias_assign.targets)
+    assert _contains_runtime_bitor(uppercase_acronym_alias_assign.value)

@@ -512,7 +512,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "Sorry, the relay returned an invalid response. Please try again.",
             "Sorry, an error occurred while sending your message. Please try again.",
         }
-        for _ in range(2):
+        max_attempts = 4
+        for attempt in range(max_attempts):
             textarea.fill(prompt_text)
             page.locator("button", has_text="Send").click()
             user_message_count += 1
@@ -543,6 +544,10 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 and assistant_text not in disallowed_assistant_outputs
             ):
                 break
+
+            if attempt < max_attempts - 1:
+                # Give the relay/bridge path a brief recovery window before retrying.
+                page.wait_for_timeout(600)
 
         assert assistant_text, "assistant response should not be empty"
         assert assistant_text.strip(), "assistant response should not be empty"

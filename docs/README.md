@@ -50,3 +50,7 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - [Implement](prompts/codex/implement.md)
 - [Automation](prompts/codex/automation.md)
 - [Polish](prompts/codex/polish.md)
+
+## Troubleshooting quick links
+
+- Relay dependency resolver conflict on macOS fresh setup (`Flask-Limiter`/`limits` vs `packaging`): see [README Quickstart](../README.md#quickstart) and outage record `outages/2026-05-27-macos-relay-requirements-packaging-conflict.md`.

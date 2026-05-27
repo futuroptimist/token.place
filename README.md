@@ -29,7 +29,7 @@ Secure peer-to-peer generative AI platform
 
 **Prerequisites**
 
-- **Python 3.11 or 3.12** (matches CI and Docker images; see [macOS relay setup](#macos-relay-only-quick-start) below)
+- **Python 3.11+** (3.11/3.12 are CI baseline; Homebrew currently installs 3.14 on macOS)
 - **Node.js 18+** (`nvm use` respects the included `.nvmrc`)
 
 Create and activate a virtual environment before installing Python packages (recommended on all platforms, especially macOS where `pip` may be missing but `pip3` is available):
@@ -43,9 +43,17 @@ python3.12 -m venv .venv || python3 -m venv .venv
 # Windows PowerShell alternative: py -3.12 -m venv .venv
 source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 
+# If .venv was created before you installed/updated Homebrew Python, recreate it:
+# deactivate 2>/dev/null || true
+# rm -rf .venv
+# /opt/homebrew/bin/python3 -m venv .venv
+# source .venv/bin/activate
+
 python -m pip install --upgrade pip
 python -m pip install -r config/requirements_relay.txt
 ```
+
+On macOS, if `python -m pip install -r config/requirements_relay.txt` fails with a solver error mentioning `Flask-Limiter`, `limits`, and `packaging==25.0`, update to latest main (or set `packaging==24.2` in `config/requirements_relay.txt`) and reinstall into a freshly recreated `.venv`.
 
 **Relay only (fast path):** after activating `.venv`, run `python relay.py` and open `http://127.0.0.1:5010/api/v1/health`. Or run `./scripts/setup-relay-venv.sh` to create the venv and install relay dependencies in one step.
 

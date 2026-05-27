@@ -858,6 +858,17 @@ def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeyp
     assert result['missing'] == 'psutil,requests,dotenv,cryptography'
 
 
+def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_path):
+    runtime_root = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources'
+    requirements = runtime_root / 'python' / 'requirements_desktop_runtime.txt'
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text('cryptography==46.0.1\n', encoding='utf-8')
+
+    resolved = desktop_runtime_setup._resolve_desktop_requirements_path(runtime_root)
+
+    assert resolved == requirements
+
+
 def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, tmp_path):
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')

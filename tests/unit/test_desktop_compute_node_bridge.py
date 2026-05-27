@@ -999,9 +999,7 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     payload = next(event for event in events if event.get("type") == "error")
     assert payload['type'] == 'error'
-    assert payload['message'].startswith(
-        'compute-node bridge exited before emitting a startup event:'
-    )
+    assert payload['message'] == "runtime unavailable: No module named 'utils.compute_node_runtime'"
 
 
 def test_main_normalizes_mode_before_run(monkeypatch):
@@ -1011,9 +1009,6 @@ def test_main_normalizes_mode_before_run(monkeypatch):
         captured['mode'] = args.mode
         return 0
 
-    module = ModuleType('utils.compute_node_runtime')
-    module.normalize_compute_mode = lambda mode: {'cuda': 'gpu'}.get(str(mode).lower(), 'auto')
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
     monkeypatch.setattr(
         sys,
@@ -1034,6 +1029,25 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     status = compute_node_bridge.main()
     assert status == 0
     assert captured['mode'] == 'auto'
+
+
+def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'run', lambda _args: 0)
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == 'utils.compute_node_runtime':
+            raise AssertionError('main() should not import compute runtime before run()')
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr('builtins.__import__', fake_import)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'CUDA'],
+    )
+
+    assert compute_node_bridge.main() == 0
 
 
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):

@@ -48,8 +48,8 @@ def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: flo
     raise RuntimeError(f"relay did not become live on port {port}: {last_error}")
 
 
-def create_packaged_layout(tmp_root: Path) -> Path:
-    resources_root = tmp_root / "resources"
+def create_packaged_layout(tmp_root: Path, *, resources_dir_name: str = "resources") -> Path:
+    resources_root = tmp_root / resources_dir_name
     python_dir = resources_root / "python"
     python_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,8 +75,13 @@ def create_packaged_layout(tmp_root: Path) -> Path:
     return python_dir / "compute_node_bridge.py"
 
 
-def _packaged_env(tmp_root: Path) -> dict[str, str]:
-    resources_root = tmp_root / "resources"
+def create_macos_bundle_layout(tmp_root: Path) -> Path:
+    resources_tmp_root = tmp_root / "TokenPlace.app" / "Contents"
+    return create_packaged_layout(resources_tmp_root, resources_dir_name="Resources")
+
+
+def _packaged_env(tmp_root: Path, resources_root: Path | None = None) -> dict[str, str]:
+    resources_root = resources_root or (tmp_root / "resources")
     home_dir = tmp_root / "home"
     home_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -87,9 +92,9 @@ def _packaged_env(tmp_root: Path) -> dict[str, str]:
     return env
 
 
-def run_desktop_dependency_preflight(tmp_root: Path) -> None:
-    resources_root = tmp_root / "resources"
-    env = _packaged_env(tmp_root)
+def run_desktop_dependency_preflight(tmp_root: Path, *, resources_root: Path | None = None) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    env = _packaged_env(tmp_root, resources_root)
 
     result = subprocess.run(  # noqa: S603
         [
@@ -114,10 +119,11 @@ def run_desktop_dependency_preflight(tmp_root: Path) -> None:
     assert payload.get("ok") == "true", combined
 
 
-def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
-    env = _packaged_env(tmp_root)
+def run_model_bridge_inspect_probe(tmp_root: Path, *, resources_root: Path | None = None) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    env = _packaged_env(tmp_root, resources_root)
 
-    model_bridge = tmp_root / "resources" / "python" / "model_bridge.py"
+    model_bridge = resources_root / "python" / "model_bridge.py"
     result = subprocess.run(  # noqa: S603
         [sys.executable, str(model_bridge), "inspect"],
         cwd=tmp_root,
@@ -188,10 +194,11 @@ def run_model_bridge_inspect_probe(tmp_root: Path) -> None:
 
 
 
-def run_compute_bridge_import_probe(tmp_root: Path) -> None:
-    env = _packaged_env(tmp_root)
+def run_compute_bridge_import_probe(tmp_root: Path, *, resources_root: Path | None = None) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    env = _packaged_env(tmp_root, resources_root)
 
-    compute_bridge = tmp_root / "resources" / "python" / "compute_node_bridge.py"
+    compute_bridge = resources_root / "python" / "compute_node_bridge.py"
     result = subprocess.run(  # noqa: S603
         [
             sys.executable,
@@ -238,10 +245,17 @@ def main() -> int:
     env["USE_MOCK_LLM"] = "1"
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
-        bridge_script = create_packaged_layout(Path(tmpdir))
-        run_desktop_dependency_preflight(Path(tmpdir))
-        run_model_bridge_inspect_probe(Path(tmpdir))
-        run_compute_bridge_import_probe(Path(tmpdir))
+        tmp_path = Path(tmpdir)
+        bridge_script = create_packaged_layout(tmp_path)
+        run_desktop_dependency_preflight(tmp_path)
+        run_model_bridge_inspect_probe(tmp_path)
+        run_compute_bridge_import_probe(tmp_path)
+
+        create_macos_bundle_layout(tmp_path)
+        mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
+        run_desktop_dependency_preflight(tmp_path, resources_root=mac_resources_root)
+        run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
+        run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
 
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0

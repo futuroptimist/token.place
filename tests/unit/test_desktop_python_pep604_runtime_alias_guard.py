@@ -41,6 +41,40 @@ def _is_runtime_union_alias(value: ast.AST) -> bool:
     return False
 
 
+def _is_typing_like_name(node: ast.AST) -> bool:
+    typing_like_names = {
+        "Dict",
+        "List",
+        "Set",
+        "FrozenSet",
+        "Tuple",
+        "Mapping",
+        "MutableMapping",
+        "Sequence",
+        "Iterable",
+        "Optional",
+        "Union",
+        "Literal",
+        "Annotated",
+    }
+    builtins_generics = {"dict", "list", "set", "frozenset", "tuple"}
+    if isinstance(node, ast.Name):
+        return node.id in typing_like_names or node.id in builtins_generics
+    if isinstance(node, ast.Attribute):
+        return node.attr in typing_like_names or node.attr in builtins_generics
+    return False
+
+
+def _contains_typing_like_context(value: ast.AST) -> bool:
+    if isinstance(value, ast.Subscript) and _is_typing_like_name(value.value):
+        return True
+    return any(isinstance(node, ast.Subscript) and _is_typing_like_name(node.value) for node in ast.walk(value))
+
+
+def _is_runtime_typing_union_alias(value: ast.AST) -> bool:
+    return _is_runtime_union_alias(value) and _contains_typing_like_context(value)
+
+
 def _contains_type_alias_annotation(annotation: ast.AST | None) -> bool:
     if annotation is None:
         return False
@@ -104,7 +138,7 @@ def test_desktop_packaged_import_graph_has_no_runtime_pep604_type_alias_assignme
             if value is None or not alias_like:
                 continue
 
-            if _is_runtime_union_alias(value):
+            if _is_runtime_typing_union_alias(value):
                 target_names = [ast.unparse(target) for target in targets]
                 rel = path.relative_to(REPO_ROOT)
                 violations.append(f"{rel}:{node.lineno} assigns runtime union alias: {', '.join(target_names)}")
@@ -134,3 +168,36 @@ def test_desktop_packaged_import_graph_has_no_unconditional_dataclass_slots_true
                         )
 
     assert not violations, "\n".join(violations)
+
+
+def _first_assignment_from_source(source: str) -> ast.Assign | ast.AnnAssign:
+    tree = ast.parse(source)
+    for node in _iter_import_time_assignment_nodes(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            return node
+    raise AssertionError("expected assignment in source")
+
+
+def test_runtime_typing_union_alias_detection_regressions() -> None:
+    ann_assign = _first_assignment_from_source(
+        "from typing import Dict, TypeAlias\nGpuMetrics: TypeAlias = Dict[str, float | int | bool]\n"
+    )
+    assert _contains_type_alias_annotation(ann_assign.annotation)
+    assert _is_runtime_typing_union_alias(ann_assign.value)
+
+    class_assign = _first_assignment_from_source(
+        "from typing import Dict\nclass Metrics:\n    GpuMetrics = Dict[str, float | int | bool]\n"
+    )
+    assert isinstance(class_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(class_assign.value)
+
+    conditional_assign = _first_assignment_from_source(
+        "from typing import Dict\nif True:\n    GpuMetrics = Dict[str, float | int | bool]\n"
+    )
+    assert isinstance(conditional_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(conditional_assign.value)
+
+    bitwise_assign = _first_assignment_from_source("FLAGS = READ | WRITE\n")
+    assert isinstance(bitwise_assign, ast.Assign)
+    assert _is_runtime_union_alias(bitwise_assign.value)
+    assert not _is_runtime_typing_union_alias(bitwise_assign.value)

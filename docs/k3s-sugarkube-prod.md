@@ -29,8 +29,19 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Required sign-off tag style: immutable semver release tag `vX.Y.Z` (published from a signed-off main artifact)
+- v0.1.0 launch alignment: keep chart package `version: 0.1.0`, chart `appVersion: "0.1.0"`, Git tag `v0.1.0`, and release image tag `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only and not production sign-off
+
+
+Before publishing the launch chart, run:
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+- If chart `0.1.0` already exists with stale contents, stop and decide manually; never overwrite published OCI artifacts.
+- If it does not exist, publish `0.1.0`.
 
 ## Deployment commands (run from Sugarkube repo)
 

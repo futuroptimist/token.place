@@ -33,6 +33,25 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Final release Git tags publish matching image tags (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only
 
+
+### Pre-launch `v0.1.0` alignment
+
+Launch alignment for this phase keeps all release identifiers at `0.1.0`:
+
+- Git tag: `v0.1.0`
+- Chart package version: `0.1.0`
+- chart `appVersion`: `0.1.0`
+- Final release image: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Staging candidate before final tag: `main-<shortsha>`
+
+Before publishing `0.1.0`, verify whether it already exists in OCI:
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+If it exists with stale contents, stop and resolve manually; do not overwrite an immutable OCI artifact.
+
 ## Deployment commands (run from Sugarkube repo)
 
 > These commands run from a **Sugarkube checkout**, not from token.place.

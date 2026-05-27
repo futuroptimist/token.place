@@ -36,6 +36,28 @@ operator workflow.
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
 
+
+## Pre-launch v0.1.0 alignment contract
+
+For the `v0.1.0` launch, all token.place release identifiers stay aligned at `0.1.0`:
+
+- Git tag: `v0.1.0`
+- OCI Helm chart package version (`charts/tokenplace/Chart.yaml` `version`): `0.1.0`
+- chart `appVersion`: `0.1.0`
+- Final release image tag: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Staging candidate image tag before final tagging: `main-<shortsha>`
+
+Do **not** bump the chart package version as part of this launch alignment work; keep launch alignment at 0.1.0.
+
+Before publishing the chart, verify whether `oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0` already exists:
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+- If `0.1.0` already exists with stale contents, do **not** overwrite it; stop and decide manually.
+- If `0.1.0` does not exist, proceed with publishing `0.1.0`.
+
 ## Default hostnames
 
 - Staging default: `https://staging.token.place`

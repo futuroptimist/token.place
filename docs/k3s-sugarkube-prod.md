@@ -32,6 +32,19 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only and not production sign-off
 
+## Pre-flight (before Step 1)
+
+- Verify the token.place OCI chart version `0.1.0` exists only after token.place publishes the current chart release.
+- If `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0` succeeds before final token.place chart publish, confirm the artifact is not stale before deploying.
+
+## 0.1.0 release alignment
+
+- Sugarkube chart version (`docs/apps/tokenplace.version`) = `0.1.0`
+- token.place chart `appVersion` = `0.1.0`
+- token.place Git tag = `v0.1.0`
+- release image tag = `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- staging candidate image tag = `main-<shortsha>`
+
 ## Deployment commands (run from Sugarkube repo)
 
 > Run from a **Sugarkube checkout**, not from token.place.
@@ -59,7 +72,7 @@ ingress:
     secretName: tokenplace-prod-tls
 ```
 
-> Tag selection: use `default_tag=main-REPLACE_SHORTSHA` while validating a staging candidate.
+> Tag selection: use `default_tag=main-<shortsha>` while validating a staging candidate.
 > After pushing the real Git release tag (for example `v0.1.0`), use `default_tag=v0.1.0` as the
 > canonical production release image tag.
 
@@ -79,12 +92,14 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
 helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.prod.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-prod-render.yaml
-grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
+grep -n "spec:\|tls:" -A8 /tmp/tokenplace-prod-render.yaml
 grep -n "token.place" /tmp/tokenplace-prod-render.yaml
 grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-prod-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez

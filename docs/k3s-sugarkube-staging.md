@@ -33,6 +33,19 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Final release Git tags publish matching image tags (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only
 
+## Pre-flight (before Step 1)
+
+- Verify the token.place OCI chart version `0.1.0` exists only after token.place publishes the current chart release.
+- If `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0` succeeds before final token.place chart publish, confirm the artifact is not stale before deploying.
+
+## 0.1.0 release alignment
+
+- Sugarkube chart version (`docs/apps/tokenplace.version`) = `0.1.0`
+- token.place chart `appVersion` = `0.1.0`
+- token.place Git tag = `v0.1.0`
+- release image tag = `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- staging candidate image tag = `main-<shortsha>`
+
 ## Deployment commands (run from Sugarkube repo)
 
 > These commands run from a **Sugarkube checkout**, not from token.place.
@@ -63,25 +76,27 @@ ingress:
 First install:
 
 ```bash
-just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-<shortsha>
 ```
 
 Upgrade existing release:
 
 ```bash
-just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA
+just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-<shortsha>
 ```
 
 ## Validation checklist
 
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-staging-render.yaml
-grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-<shortsha> > /tmp/tokenplace-staging-render.yaml
+grep -n "spec:\|tls:" -A8 /tmp/tokenplace-staging-render.yaml
 grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
 grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez

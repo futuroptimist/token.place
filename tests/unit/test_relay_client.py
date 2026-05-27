@@ -879,7 +879,7 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
+        assert result['next_ping_in_x_seconds'] == 12
         assert mock_post.call_args_list[1].kwargs['timeout'] == 37.5
 
     @patch('utils.networking.relay_client.requests.post')
@@ -892,7 +892,7 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
+        assert result['next_ping_in_x_seconds'] == 12
         assert mock_post.call_args_list[1].kwargs['timeout'] == 17.0
 
     @patch('utils.networking.relay_client.requests.post')
@@ -907,7 +907,7 @@ class TestRelayClient:
 
         assert result == {
             'message': 'No requests available',
-            'next_ping_in_x_seconds': 0,
+            'next_ping_in_x_seconds': 12,
             'poll_wait_seconds': 10,
         }
         assert 'http://localhost:5000' in relay_client._api_v1_registered_relays
@@ -939,8 +939,31 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
+        assert result['next_ping_in_x_seconds'] == 9
         assert relay_client._active_relay_index == 1
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://relay-a.example/api/v1/relay/servers/register',
+            'http://relay-b.example/api/v1/relay/servers/register',
+            'http://relay-b.example/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_register_timeout_does_not_return_no_work(self, mock_post, relay_client):
+        relay_client._relay_urls = ('http://relay-a.example', 'http://relay-b.example')
+        relay_client._active_relay_index = 0
+
+        register_timeout = requests.Timeout("Read timed out. (read timeout=15)")
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 9, 'poll_wait_seconds': 10}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_timeout, register_ok, poll_ok]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['message'] == 'No requests available'
+        assert result['next_ping_in_x_seconds'] == 9
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
             'http://relay-a.example/api/v1/relay/servers/register',

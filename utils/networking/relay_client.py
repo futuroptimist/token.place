@@ -862,11 +862,37 @@ class RelayClient:
                 if headers:
                     request_kwargs['headers'] = headers
 
-                response = requests.post(
-                    self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
-                    timeout=request_kwargs.pop('timeout'),
-                    **request_kwargs,
-                )
+                poll_timeout_seconds = float(request_kwargs.pop('timeout'))
+                try:
+                    response = requests.post(
+                        self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
+                        timeout=poll_timeout_seconds,
+                        **request_kwargs,
+                    )
+                except Exception as exc:
+                    numeric_poll_wait = self._api_v1_poll_timeout_seconds(poll_wait)
+                    near_long_poll_window = (
+                        isinstance(exc, requests.Timeout)
+                        or "Read timed out" in str(exc)
+                    ) and (
+                        math.isfinite(numeric_poll_wait)
+                        and math.isfinite(poll_timeout_seconds)
+                        and poll_timeout_seconds >= numeric_poll_wait
+                    )
+                    if near_long_poll_window and candidate_url in self._api_v1_registered_relays:
+                        log_info(
+                            "api_v1.poll_timeout_no_work relay={} poll_wait_seconds={} timeout_seconds={} error={}",
+                            candidate_url,
+                            poll_wait,
+                            poll_timeout_seconds,
+                            str(exc),
+                        )
+                        return {
+                            'message': 'No requests available',
+                            'next_ping_in_x_seconds': register_wait,
+                            'poll_wait_seconds': poll_wait,
+                        }
+                    raise
                 if response.status_code != 200:
                     if response.status_code == 404:
                         self._api_v1_registered_relays.discard(candidate_url)
@@ -884,14 +910,7 @@ class RelayClient:
                         'next_ping_in_x_seconds': register_wait,
                     }
                     continue
-                if (
-                    payload.get('message') == 'No requests available'
-                    and 'api_v1_request' not in payload
-                    and payload.get('protocol') != 'tokenplace_api_v1_relay_e2ee'
-                ):
-                    payload['next_ping_in_x_seconds'] = 0
-                else:
-                    payload.setdefault('next_ping_in_x_seconds', register_wait)
+                payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
                 log_info("server.heartbeat relay={}", candidate_url)
@@ -902,22 +921,6 @@ class RelayClient:
                 )
                 return payload
             except Exception as exc:
-                if isinstance(exc, requests.Timeout) or "Read timed out" in str(exc):
-                    effective_timeout = self._api_v1_poll_timeout_seconds(poll_wait)
-                    near_long_poll_window = math.isfinite(effective_timeout) and effective_timeout >= poll_wait
-                    if near_long_poll_window:
-                        log_info(
-                            "api_v1.poll_timeout_no_work relay={} poll_wait_seconds={} timeout_seconds={} error={}",
-                            candidate_url,
-                            poll_wait,
-                            effective_timeout,
-                            str(exc),
-                        )
-                        return {
-                            'message': 'No requests available',
-                            'next_ping_in_x_seconds': 0,
-                            'poll_wait_seconds': poll_wait,
-                        }
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
                 self._api_v1_registered_relays.discard(candidate_url)
                 relay_wait_hints.pop(candidate_url, None)

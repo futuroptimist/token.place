@@ -109,6 +109,8 @@ jobs:
           set -euo pipefail
 
           docker run -d --rm --name tokenplace-relay-smoke \
+            --read-only \
+            --tmpfs /tmp \
             -p 127.0.0.1:5010:5010 \
             -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
             tokenplace-relay:smoke

@@ -43,19 +43,11 @@ def _is_runtime_union_alias(value: ast.AST) -> bool:
 
 def _is_typing_like_name(node: ast.AST) -> bool:
     typing_like_names = {
-        "Dict",
-        "List",
-        "Set",
-        "FrozenSet",
-        "Tuple",
-        "Mapping",
-        "MutableMapping",
-        "Sequence",
-        "Iterable",
-        "Optional",
-        "Union",
-        "Literal",
-        "Annotated",
+        "Dict", "List", "Set", "FrozenSet", "Tuple",
+        "Mapping", "MutableMapping", "Sequence", "Iterable",
+        "Collection", "MutableSequence", "MutableSet",
+        "DefaultDict", "Deque", "Callable",
+        "Optional", "Union", "Literal", "Annotated",
     }
     builtins_generics = {"dict", "list", "set", "frozenset", "tuple"}
     if isinstance(node, ast.Name):
@@ -65,7 +57,25 @@ def _is_typing_like_name(node: ast.AST) -> bool:
     return False
 
 
+def _is_simple_type_atom(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id[0].islower()
+    if isinstance(node, ast.Attribute):
+        return True
+    if isinstance(node, ast.Constant):
+        return node.value is None or node.value is Ellipsis
+    return False
+
+
+def _is_typing_like_union_chain(node: ast.AST) -> bool:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _is_typing_like_union_chain(node.left) and _is_typing_like_union_chain(node.right)
+    return _is_simple_type_atom(node)
+
+
 def _contains_typing_like_context(value: ast.AST) -> bool:
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
+        return _is_typing_like_union_chain(value)
     if isinstance(value, ast.Subscript) and _is_typing_like_name(value.value):
         return True
     return any(isinstance(node, ast.Subscript) and _is_typing_like_name(node.value) for node in ast.walk(value))
@@ -163,6 +173,7 @@ def test_desktop_packaged_import_graph_has_no_unconditional_dataclass_slots_true
                     continue
                 for keyword in decorator.keywords:
                     if keyword.arg == "slots" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
+                        rel = path.relative_to(REPO_ROOT)
                         violations.append(
                             f"{rel}:{node.lineno} uses dataclass(slots=True) without Python-version gating"
                         )
@@ -196,6 +207,16 @@ def test_runtime_typing_union_alias_detection_regressions() -> None:
     )
     assert isinstance(conditional_assign, ast.Assign)
     assert _is_runtime_typing_union_alias(conditional_assign.value)
+
+    direct_alias_assign = _first_assignment_from_source("GpuMetricValue = float | int | bool\n")
+    assert isinstance(direct_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(direct_alias_assign.value)
+
+    callable_alias_assign = _first_assignment_from_source(
+        "from typing import Callable\nBytesOrText = Callable[[str | bytes], None]\n"
+    )
+    assert isinstance(callable_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(callable_alias_assign.value)
 
     bitwise_assign = _first_assignment_from_source("FLAGS = READ | WRITE\n")
     assert isinstance(bitwise_assign, ast.Assign)

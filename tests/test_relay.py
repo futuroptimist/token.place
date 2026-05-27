@@ -1731,7 +1731,10 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     elapsed = time.monotonic() - started
     assert poll.status_code == 200
-    assert poll.get_json()['message'] == 'No requests available'
+    payload = poll.get_json()
+    assert payload['message'] == 'No requests available'
+    assert payload['next_ping_in_x_seconds'] > 0
+    assert payload['poll_wait_seconds'] == 0.01
     assert elapsed >= 0.008
 
 

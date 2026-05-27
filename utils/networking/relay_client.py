@@ -794,7 +794,7 @@ class RelayClient:
             return base_timeout
         if not math.isfinite(wait_seconds) or wait_seconds < 0:
             return base_timeout
-        return max(base_timeout, wait_seconds + 1.0)
+        return max(base_timeout, wait_seconds + 5.0, wait_seconds * 1.25)
 
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
@@ -852,6 +852,12 @@ class RelayClient:
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
                     'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
+                log_info(
+                    "api_v1.poll_timeout relay={} poll_wait_seconds={} timeout_seconds={}",
+                    candidate_url,
+                    poll_wait,
+                    request_kwargs['timeout'],
+                )
                 headers = self._auth_headers()
                 if headers:
                     request_kwargs['headers'] = headers
@@ -896,6 +902,22 @@ class RelayClient:
                 )
                 return payload
             except Exception as exc:
+                if isinstance(exc, requests.Timeout) or "Read timed out" in str(exc):
+                    effective_timeout = self._api_v1_poll_timeout_seconds(poll_wait)
+                    near_long_poll_window = math.isfinite(effective_timeout) and effective_timeout >= poll_wait
+                    if near_long_poll_window:
+                        log_info(
+                            "api_v1.poll_timeout_no_work relay={} poll_wait_seconds={} timeout_seconds={} error={}",
+                            candidate_url,
+                            poll_wait,
+                            effective_timeout,
+                            str(exc),
+                        )
+                        return {
+                            'message': 'No requests available',
+                            'next_ping_in_x_seconds': 0,
+                            'poll_wait_seconds': poll_wait,
+                        }
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
                 self._api_v1_registered_relays.discard(candidate_url)
                 relay_wait_hints.pop(candidate_url, None)

@@ -1,4 +1,10 @@
-"""End-to-end API v1 desktop bridge E2EE relay regression tests."""
+"""End-to-end API v1 desktop bridge E2EE relay regression tests.
+
+Manual staging verification snippet:
+1. Run desktop compute node against ``https://staging.token.place``.
+2. Confirm ``GET /healthz`` reports ``knownServers >= 1``.
+3. Confirm ``GET /relay/diagnostics`` includes the registered node public key.
+"""
 
 from __future__ import annotations
 
@@ -282,6 +288,27 @@ def test_api_v1_stream_true_fails_before_relay_queue():
     assert 400 <= response.status_code < 500
     assert response.get_json()["error"]["param"] == "stream"
     assert relay.client_inference_requests == {}
+
+
+def test_api_v1_desktop_bridge_registration_poll_no_work_heartbeat():
+    """Desktop node register/poll should treat no queued work as healthy heartbeat."""
+
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        register = desktop_client.register_api_v1_compute_node(base_url)
+        assert register["next_ping_in_x_seconds"] > 0
+        assert register["poll_wait_seconds"] > 0
+
+        poll_payload = desktop_client.poll_api_v1_encrypted_work()
+        assert poll_payload["message"] == "No requests available"
+        assert poll_payload["next_ping_in_x_seconds"] == 0
+        assert poll_payload["poll_wait_seconds"] > 0
 
 
 @pytest.mark.parametrize("encrypted", [False, True])

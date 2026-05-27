@@ -36,7 +36,7 @@ operator workflow.
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
-- Before publishing the chart, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if it already exists with stale contents, stop and resolve manually (do not overwrite immutable OCI artifacts).
+- Before publishing, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
 
 ## Default hostnames
 

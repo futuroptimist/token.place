@@ -169,6 +169,26 @@ def _start_fake_desktop_loop(base_url, done_event):
     return thread, model_manager
 
 
+def test_api_v1_desktop_bridge_registration_and_no_work_poll_heartbeat():
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+
+        register_payload = desktop_client.register_api_v1_compute_node()
+        assert register_payload["next_ping_in_x_seconds"] > 0
+        assert register_payload["poll_wait_seconds"] >= 0
+
+        poll_payload = desktop_client.poll_api_v1_encrypted_work()
+        assert poll_payload["message"] == "No requests available"
+        assert poll_payload["next_ping_in_x_seconds"] > 0
+        assert poll_payload["poll_wait_seconds"] >= 0
+
+
 def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     """Browser-shaped encrypted API v1 chat completes via relay-blind desktop bridge."""
 

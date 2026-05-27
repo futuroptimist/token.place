@@ -852,22 +852,21 @@ class TestRelayClient:
         ) == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
 
     @pytest.mark.parametrize(
-        "expected_wait, expected_timeout_offset",
+        "expected_wait, expected_timeout",
         [
-            (9, 0.0),
-            (10, 0.0),
-            (15.5, 1.5),
-            ("11", 0.0),
-            ("bad", 0.0),
-            (True, 0.0),
-            (False, 0.0),
-            (-1, 0.0),
-            (float("nan"), 0.0),
-            (float("inf"), 0.0),
+            (9, 15.0),
+            (10, 15.0),
+            (15.5, 20.5),
+            ("11", 16.0),
+            ("bad", 15.0),
+            (True, 15.0),
+            (False, 15.0),
+            (-1, 15.0),
+            (float("nan"), 15.0),
+            (float("inf"), 15.0),
         ],
     )
-    def test_api_v1_poll_timeout_seconds_defensive(self, relay_client, expected_wait, expected_timeout_offset):
-        expected_timeout = float(relay_client._request_timeout) + expected_timeout_offset
+    def test_api_v1_poll_timeout_seconds_defensive(self, relay_client, expected_wait, expected_timeout):
         assert relay_client._api_v1_poll_timeout_seconds(expected_wait) == expected_timeout
 
     @patch('utils.networking.relay_client.requests.post')
@@ -880,8 +879,9 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
-        assert mock_post.call_args_list[1].kwargs['timeout'] == max(float(relay_client._request_timeout), 31.0)
+        assert result['next_ping_in_x_seconds'] == 12
+        assert result['poll_wait_seconds'] == 30
+        assert mock_post.call_args_list[1].kwargs['timeout'] == max(float(relay_client._request_timeout), 35.0, 37.5)
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_falls_back_to_register_wait_without_poll_wait(self, mock_post, relay_client):
@@ -893,8 +893,9 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
-        assert mock_post.call_args_list[1].kwargs['timeout'] == max(float(relay_client._request_timeout), 13.0)
+        assert result['next_ping_in_x_seconds'] == 12
+        assert result['poll_wait_seconds'] == 12
+        assert mock_post.call_args_list[1].kwargs['timeout'] == max(float(relay_client._request_timeout), 17.0, 15.0)
 
 
     @patch('utils.networking.relay_client.requests.post')
@@ -923,7 +924,7 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result['next_ping_in_x_seconds'] == 0
+        assert result['next_ping_in_x_seconds'] == 9
         assert relay_client._active_relay_index == 1
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
@@ -1034,6 +1035,20 @@ class TestRelayClient:
         result = relay_client.poll_api_v1_encrypted_work()
 
         assert result == {'error': 'HTTP 429', 'next_ping_in_x_seconds': 11}
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_handles_expected_long_poll_timeout_without_reregistering(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 10, 'poll_wait_seconds': 10}
+        mock_post.side_effect = [register_ok, requests.Timeout("Read timed out.")]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['message'] == 'No requests available'
+        assert result['next_ping_in_x_seconds'] == 10
+        assert result['poll_wait_seconds'] == 10
+        assert relay_client.relay_url == 'http://localhost:5000'
+        assert 'http://localhost:5000' in relay_client._api_v1_registered_relays
 
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""

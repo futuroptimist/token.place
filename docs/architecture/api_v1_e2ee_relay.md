@@ -95,3 +95,18 @@ The migration roadmap follow-up phases own the implementation repair:
 4. add final guardrails proving active production paths no longer use legacy routes.
 
 This documentation baseline intentionally does **not** implement those code migrations.
+
+## Manual staging verification: desktop compute-node registration + long-poll heartbeat
+
+Use this when validating a desktop compute node against `https://staging.token.place`:
+
+1. Launch the desktop compute node with API v1 relay mode pointed at staging.
+2. Confirm relay health is green:
+   - `GET https://staging.token.place/healthz`
+   - verify `knownServers >= 1`.
+3. Confirm relay diagnostics sees the registered node:
+   - `GET https://staging.token.place/relay/diagnostics`
+   - verify the compute node public key appears in registered node diagnostics.
+4. Let the node idle with no queued requests for several poll intervals.
+   - expected behavior: repeated API v1 `No requests available` heartbeat responses,
+     no sustained registration churn, and no repeated desktop read-timeout storms.

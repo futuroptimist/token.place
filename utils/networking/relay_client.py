@@ -794,7 +794,7 @@ class RelayClient:
             return base_timeout
         if not math.isfinite(wait_seconds) or wait_seconds < 0:
             return base_timeout
-        return max(base_timeout, wait_seconds + 1.0)
+        return max(base_timeout, wait_seconds + 5.0, wait_seconds * 1.25)
 
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
@@ -852,9 +852,16 @@ class RelayClient:
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
                     'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
+                poll_timeout_seconds = float(request_kwargs['timeout'])
                 headers = self._auth_headers()
                 if headers:
                     request_kwargs['headers'] = headers
+                log_info(
+                    "relay.poll_config relay={} poll_wait_seconds={} timeout_seconds={}",
+                    candidate_url,
+                    poll_wait,
+                    round(poll_timeout_seconds, 3),
+                )
 
                 response = requests.post(
                     self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
@@ -883,7 +890,8 @@ class RelayClient:
                     and 'api_v1_request' not in payload
                     and payload.get('protocol') != 'tokenplace_api_v1_relay_e2ee'
                 ):
-                    payload['next_ping_in_x_seconds'] = 0
+                    payload.setdefault('next_ping_in_x_seconds', register_wait)
+                    payload.setdefault('poll_wait_seconds', poll_wait)
                 else:
                     payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
@@ -896,6 +904,24 @@ class RelayClient:
                 )
                 return payload
             except Exception as exc:
+                if isinstance(exc, requests.Timeout) or "timed out" in str(exc).lower():
+                    poll_timeout = self._api_v1_poll_timeout_seconds(poll_wait)
+                    if poll_wait and poll_timeout > 0 and abs(float(poll_timeout) - float(poll_wait)) <= 6.0:
+                        log_info(
+                            "relay.poll_timeout_near_wait relay={} poll_wait_seconds={} timeout_seconds={}",
+                            candidate_url,
+                            poll_wait,
+                            round(float(poll_timeout), 3),
+                        )
+                        self._active_relay_index = index
+                        return {
+                            'message': 'No requests available',
+                            'next_ping_in_x_seconds': register_wait,
+                            'poll_wait_seconds': poll_wait,
+                        }
+                    log_error("API v1 relay poll timed out for {}: {}", candidate_url, str(exc))
+                    last_error = {'error': str(exc), 'next_ping_in_x_seconds': self._request_timeout}
+                    continue
                 log_error("API v1 relay poll failed for {}: {}", candidate_url, str(exc), exc_info=True)
                 self._api_v1_registered_relays.discard(candidate_url)
                 relay_wait_hints.pop(candidate_url, None)

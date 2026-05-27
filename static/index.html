@@ -390,11 +390,14 @@
             <p>Creates a completion for the chat message.</p>
             <p><strong>Request Body:</strong></p>
             <pre>{
-  "server_public_key": "SERVER_PUBLIC_KEY_HERE",
+  "model": "llama-3-8b-instruct",
+  "encrypted": true,
   "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
-  "ciphertext": "ENCRYPTED_REQUEST_PAYLOAD_HERE",
-  "cipherkey": "ENCRYPTED_AES_KEY_HERE",
-  "iv": "INITIALIZATION_VECTOR_HERE"
+  "messages": {
+    "ciphertext": "ENCRYPTED_MESSAGES_PAYLOAD_HERE",
+    "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+    "iv": "INITIALIZATION_VECTOR_HERE"
+  }
 }</pre>
             <p><strong>Example Response:</strong></p>
             <pre>{
@@ -422,16 +425,9 @@
 
         <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/completions</span></h3>
-            <p>Creates a completion for the prompt (traditional completion API).</p>
-            <p><strong>Request Body:</strong></p>
-            <pre>{
-  "server_public_key": "SERVER_PUBLIC_KEY_HERE",
-  "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
-  "ciphertext": "ENCRYPTED_REQUEST_PAYLOAD_HERE",
-  "cipherkey": "ENCRYPTED_AES_KEY_HERE",
-  "iv": "INITIALIZATION_VECTOR_HERE"
-}</pre>
-            <p><strong>Example Response:</strong> (Same format as chat/completions)</p>
+            <p>Creates a completion for a legacy plaintext prompt payload. For ciphertext-envelope-first API v1 usage, prefer <code>/api/v1/chat/completions</code> with encrypted request mode.</p>
+            <p><strong>Note:</strong> This endpoint is retained for compatibility with legacy clients that send a plaintext <code>prompt</code>. Relay-blind E2EE deployments should use <code>/api/v1/chat/completions</code> encrypted mode and relay ciphertext envelopes.</p>
+            <p><strong>Response format:</strong> Same schema family as chat/completions (text completion object).</p>
         </div>
 
         <div class="api-endpoint">

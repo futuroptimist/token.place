@@ -1023,6 +1023,26 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     monkeypatch.setattr(
         sys,
         'argv',
+        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', ' CUDA '],
+    )
+
+    status = compute_node_bridge.main()
+    assert status == 0
+    assert captured['mode'] == 'gpu'
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', ' cpu '],
+    )
+
+    status = compute_node_bridge.main()
+    assert status == 0
+    assert captured['mode'] == 'cpu'
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
         ['compute_node_bridge.py', '--model', '/tmp/model.gguf', '--mode', 'unsupported'],
     )
 

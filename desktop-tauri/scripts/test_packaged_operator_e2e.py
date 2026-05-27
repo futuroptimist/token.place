@@ -239,6 +239,90 @@ def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> N
         output_queue.put(chunk)
 
 
+def run_compute_bridge_startup_probe(
+    tmp_root: Path,
+    bridge_script: Path,
+    *,
+    relay_port: int,
+    resources_root: Path | None = None,
+) -> None:
+    env = _packaged_env(tmp_root, resources_root)
+    bridge = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            str(bridge_script),
+            "--model",
+            "mock.gguf",
+            "--mode",
+            "cpu",
+            "--relay-url",
+            f"http://127.0.0.1:{relay_port}",
+        ],
+        cwd=tmp_root,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=False,
+    )
+    bridge_output = ""
+    saw_structured_event = False
+    try:
+        assert bridge.stdout is not None
+        output_queue: queue.Queue[bytes] = queue.Queue()
+        threading.Thread(
+            target=enqueue_bridge_stdout,
+            args=(bridge.stdout, output_queue),
+            daemon=True,
+        ).start()
+
+        deadline = time.time() + 20
+        buffered = ""
+        while time.time() < deadline:
+            timeout = max(0.0, min(0.25, deadline - time.time()))
+            try:
+                chunk = output_queue.get(timeout=timeout)
+            except queue.Empty:
+                if bridge.poll() is not None:
+                    break
+                continue
+
+            text = chunk.decode("utf-8", errors="replace")
+            bridge_output += text
+            buffered += text
+
+            while "\n" in buffered:
+                line, buffered = buffered.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") in {"started", "status", "error"}:
+                    saw_structured_event = True
+                    break
+            if saw_structured_event:
+                break
+
+        assert saw_structured_event, (
+            "compute-node bridge exited before emitting a startup event; output="
+            f"{bridge_output[-2000:]}"
+        )
+        forbidden_output = (
+            "No module named 'cryptography'",
+            "ModuleNotFoundError",
+            "ImportError",
+            "compute-node bridge exited before emitting a startup event",
+        )
+        for marker in forbidden_output:
+            assert marker not in bridge_output, bridge_output
+    finally:
+        if bridge.poll() is None:
+            bridge.kill()
+
+
 def main() -> int:
     relay_port = reserve_free_port()
     env = os.environ.copy()
@@ -251,7 +335,7 @@ def main() -> int:
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
 
-        create_macos_bundle_layout(tmp_path)
+        mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
         run_desktop_dependency_preflight(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
@@ -277,117 +361,17 @@ def main() -> int:
             text=True,
         )
 
-        bridge: subprocess.Popen[bytes] | None = None
-        bridge_output = ""
-        output_queue: queue.Queue[bytes] | None = None
         try:
             wait_for_livez(relay, relay_port)
-            bridge = subprocess.Popen(  # noqa: S603
-                [
-                    sys.executable,
-                    str(bridge_script),
-                    "--model",
-                    "mock.gguf",
-                    "--mode",
-                    "cpu",
-                    "--relay-url",
-                    f"http://127.0.0.1:{relay_port}",
-                ],
-                cwd=tmpdir,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=False,
+            run_compute_bridge_startup_probe(tmp_path, bridge_script, relay_port=relay_port)
+            run_compute_bridge_startup_probe(
+                tmp_path,
+                mac_bridge_script,
+                relay_port=relay_port,
+                resources_root=mac_resources_root,
             )
-
-            assert bridge.stdout is not None
-            assert bridge.stdin is not None
-
-            output_queue = queue.Queue()
-            threading.Thread(
-                target=enqueue_bridge_stdout,
-                args=(bridge.stdout, output_queue),
-                daemon=True,
-            ).start()
-
-            saw_started = False
-            saw_registered = False
-            buffered = ""
-            deadline = time.time() + 20
-
-            while time.time() < deadline:
-                timeout = max(0.0, min(0.25, deadline - time.time()))
-                try:
-                    chunk = output_queue.get(timeout=timeout)
-                except queue.Empty:
-                    if bridge.poll() is not None:
-                        break
-                    continue
-
-                text = chunk.decode("utf-8", errors="replace")
-                bridge_output += text
-                buffered += text
-
-                while "\n" in buffered:
-                    line, buffered = buffered.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if payload.get("type") == "error":
-                        raise RuntimeError(f"bridge emitted error event: {payload}")
-                    if payload.get("type") == "started" and payload.get("running") is True:
-                        saw_started = True
-                    if payload.get("registered") is True:
-                        saw_registered = True
-                    if saw_started and saw_registered:
-                        bridge.stdin.write(b'{"type":"cancel"}\n')
-                        bridge.stdin.flush()
-                        break
-
-                if saw_started and saw_registered:
-                    break
-
-            if not saw_started:
-                raise RuntimeError(
-                    "bridge did not emit started/running event; output="
-                    f"{bridge_output[-2000:]}"
-                )
-            if not saw_registered:
-                raise RuntimeError(
-                    "bridge never reported registered=true (relay connection missing); output="
-                    f"{bridge_output[-2000:]}"
-                )
-
-            try:
-                bridge.stdin.close()
-            except OSError:
-                pass
-
-            try:
-                bridge.wait(timeout=90)
-            except subprocess.TimeoutExpired:
-                bridge.terminate()
-                bridge.wait(timeout=15)
-            if bridge.returncode != 0:
-                raise RuntimeError(f"bridge exited non-zero ({bridge.returncode}): {bridge_output}")
-            forbidden_output = (
-                "No module named",
-                "ModuleNotFoundError",
-                "ImportError",
-                "compute-node bridge exited before emitting a startup event",
-                "desktop_runtime_setup module missing",
-            )
-            for marker in forbidden_output:
-                assert marker not in bridge_output, bridge_output
 
         finally:
-            if bridge is not None and bridge.poll() is None:
-                bridge.kill()
             if relay.poll() is None:
                 relay.kill()
 

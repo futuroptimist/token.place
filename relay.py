@@ -1109,10 +1109,10 @@ def api_v1_relay_requests():
     _evict_stale_servers()
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
-    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=True):
-        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if _payload_has_plaintext_fields(data):
         return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
+    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=True):
+        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if error:
         msg, code = error
         return jsonify({'error': {'message': msg, 'code': code}}), code
@@ -1154,10 +1154,10 @@ def api_v1_relay_responses():
 
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
-    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=False):
-        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if _payload_has_plaintext_fields(data):
         return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
+    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=False):
+        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if error:
         msg, code = error
         return jsonify({'error': {'message': msg, 'code': code}}), code

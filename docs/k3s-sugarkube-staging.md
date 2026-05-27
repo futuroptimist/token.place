@@ -29,9 +29,14 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Launch chart package version: `0.1.0`
+- Launch chart `appVersion`: `"0.1.0"`
 - Preferred tag for validation/sign-off: immutable `main-<shortsha>`
-- Final release Git tags publish matching image tags (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
+- Final release image tag for Git tag `v0.1.0`: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only
+
+For launch alignment, keep staging candidate deploys on immutable `main-<shortsha>` until final
+release tagging. Do not switch staging sign-off to semver tags before release cut.
 
 ## Deployment commands (run from Sugarkube repo)
 

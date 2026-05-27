@@ -32,9 +32,27 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Launch chart package version: `0.1.0`
+- Launch chart `appVersion`: `"0.1.0"`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
-- Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Canonical release image tag after pushing Git tag `v0.1.0`: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
+
+### v0.1.0 publish guardrail (must check before chart publish)
+
+For the v0.1.0 launch, token.place release identifiers intentionally stay aligned at `0.1.0`:
+Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, and release
+image tag `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`.
+
+Before publishing chart `0.1.0`, verify whether that OCI chart version already exists:
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+- If it **does not exist**, publish `0.1.0`.
+- If it **already exists**, do **not** overwrite/re-push from code or CI. Stop and decide manually
+  whether the existing artifact already matches the approved launch contents.
 
 ## Default hostnames
 

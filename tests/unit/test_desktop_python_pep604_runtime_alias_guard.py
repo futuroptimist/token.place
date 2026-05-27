@@ -113,12 +113,15 @@ def _contains_type_alias_annotation(annotation: ast.AST | None) -> bool:
 
 
 def _is_alias_like_target(target: ast.AST) -> bool:
-    return (
-        isinstance(target, ast.Name)
-        and bool(target.id)
-        and target.id[0].isupper()
-        and not target.id.isupper()
-    )
+    if not isinstance(target, ast.Name) or not target.id:
+        return False
+    if not target.id[0].isupper():
+        return False
+    if target.id.isupper():
+        # Permit likely type aliases (T, IO, URL, UUID) while excluding
+        # constant-like names (FLAGS, READ, WRITE) to avoid bitwise false positives.
+        return len(target.id) <= 4
+    return True
 
 
 def _iter_import_time_child_bodies(node: ast.AST) -> list[list[ast.stmt]]:
@@ -262,3 +265,13 @@ def test_runtime_typing_union_alias_detection_regressions() -> None:
     assert _is_runtime_union_alias(bitwise_assign.value)
     assert _is_runtime_typing_union_alias(bitwise_assign.value)
     assert not all(_is_alias_like_target(target) for target in bitwise_assign.targets)
+
+    uppercase_direct_alias_assign = _first_assignment_from_source("T = str | bytes\n")
+    assert isinstance(uppercase_direct_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(uppercase_direct_alias_assign.value)
+    assert all(_is_alias_like_target(target) for target in uppercase_direct_alias_assign.targets)
+
+    uppercase_acronym_alias_assign = _first_assignment_from_source("URL = UUID | URL\n")
+    assert isinstance(uppercase_acronym_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(uppercase_acronym_alias_assign.value)
+    assert all(_is_alias_like_target(target) for target in uppercase_acronym_alias_assign.targets)

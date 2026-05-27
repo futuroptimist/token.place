@@ -65,6 +65,10 @@ def test_landing_page_does_not_document_forbidden_or_optional_relay_e2ee_shapes(
     forbidden_snippets = [
         'For enhanced privacy',
         'optional privacy',
+        'Main API requests can be plaintext',
+        'plaintext or encrypted',
+        '"prompt": "Write a poem about AI"',
+        '"content": "Hello!"',
         '"encrypted": true,\n  "client_public_key": "YOUR_PUBLIC_KEY_HERE",\n  "messages": {',
     ]
     for snippet in forbidden_snippets:

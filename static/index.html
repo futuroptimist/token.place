@@ -390,11 +390,11 @@
             <p>Creates a completion for the chat message.</p>
             <p><strong>Request Body:</strong></p>
             <pre>{
-  "model": "llama-3-8b-instruct",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-  ]
+  "server_public_key": "SERVER_PUBLIC_KEY_HERE",
+  "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
+  "ciphertext": "ENCRYPTED_REQUEST_PAYLOAD_HERE",
+  "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+  "iv": "INITIALIZATION_VECTOR_HERE"
 }</pre>
             <p><strong>Example Response:</strong></p>
             <pre>{
@@ -425,9 +425,11 @@
             <p>Creates a completion for the prompt (traditional completion API).</p>
             <p><strong>Request Body:</strong></p>
             <pre>{
-  "model": "llama-3-8b-instruct",
-  "prompt": "Write a poem about AI",
-  "max_tokens": 256
+  "server_public_key": "SERVER_PUBLIC_KEY_HERE",
+  "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
+  "ciphertext": "ENCRYPTED_REQUEST_PAYLOAD_HERE",
+  "cipherkey": "ENCRYPTED_AES_KEY_HERE",
+  "iv": "INITIALIZATION_VECTOR_HERE"
 }</pre>
             <p><strong>Example Response:</strong> (Same format as chat/completions)</p>
         </div>
@@ -442,13 +444,13 @@
         </div>
 
         <h3>E2EE Usage and Relay Envelope</h3>
-        <p>Main API requests can be plaintext or encrypted; set <code>"encrypted": true</code> when using encrypted handling for <code>/api/v1/chat/completions</code> and <code>/api/v1/completions</code>. Relay endpoints are always ciphertext-only and reject plaintext-like or unexpected top-level fields.</p>
+        <p>API v1 relay traffic is mandatory end-to-end encrypted: relay endpoints are ciphertext-only and reject plaintext-like or unexpected top-level fields. Use ciphertext envelope payloads in API-facing examples.</p>
         <ol>
             <li>Get the server's public key from <code>/api/v1/public-key</code></li>
             <li>Generate your own RSA key pair on the client</li>
             <li>Encrypt payload data with the server's public key</li>
-            <li>For main API chat/completions routes, include <code>"encrypted": true</code> when sending encrypted payloads</li>
-            <li>For relay routes, send only ciphertext envelope keys</li>
+            <li>For API v1 relay routes, send only ciphertext envelope keys</li>
+            <li>Do not send plaintext top-level keys such as <code>messages</code>, <code>prompt</code>, <code>input</code>, <code>content</code>, <code>response</code>, or <code>text</code></li>
         </ol>
 
         <p><strong>Example API v1 Relay Request Envelope:</strong></p>

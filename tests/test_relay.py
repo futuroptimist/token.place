@@ -416,6 +416,7 @@ def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):
             status_code = 200
         return _Response()
 
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -457,6 +458,7 @@ def test_relay_client_api_v1_normalizes_client_public_key_binding(monkeypatch):
 
         return _Response()
 
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -548,6 +550,7 @@ def test_relay_client_api_v1_falls_back_to_runtime_model_when_catalog_model_unav
 
         return _Response()
 
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {

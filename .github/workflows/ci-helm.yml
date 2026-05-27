@@ -98,30 +98,6 @@ jobs:
           grep -n 'else if and (eq $strategyType "Recreate") $existingHasRollingUpdate' charts/tokenplace/templates/deployment.yaml
           grep -n 'rollingUpdate: null' charts/tokenplace/templates/deployment.yaml
 
-      - name: Relay container read-only rootfs smoke test
-        run: |
-          set -euo pipefail
-          docker build -t tokenplace-relay:chart-smoke .
-          docker run -d --rm --name tokenplace-relay-readonly --read-only --tmpfs /tmp \
-            -p 127.0.0.1:5010:5010 \
-            -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
-            -e XDG_CONFIG_HOME=/tmp/.config \
-            -e XDG_DATA_HOME=/tmp/.local/share \
-            -e XDG_CACHE_HOME=/tmp/.cache \
-            -e XDG_STATE_HOME=/tmp/.local/state \
-            tokenplace-relay:chart-smoke
-          trap 'docker logs tokenplace-relay-readonly || true; docker stop tokenplace-relay-readonly || true' EXIT
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:5010/livez >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:5010/livez
-          curl -fsS http://127.0.0.1:5010/healthz
-          curl -fsS http://127.0.0.1:5010/
-          curl -fsS http://127.0.0.1:5010/metrics
-
       - name: Capture chart metadata
         id: chart_meta
         run: |

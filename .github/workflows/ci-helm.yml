@@ -80,6 +80,63 @@ jobs:
           assert not dupes, dupes
           PY
 
+
+      - name: Template list-style env render check
+        run: |
+          cat > /tmp/tokenplace-list-env-values.yaml <<'YAML'
+          env:
+            - name: FOO
+              value: bar
+          YAML
+
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            -f /tmp/tokenplace-list-env-values.yaml > /tmp/tokenplace-render-list-env.yaml
+
+          python3 - <<'PY'
+          import collections
+          import yaml
+
+          docs = list(yaml.safe_load_all(open("/tmp/tokenplace-render-list-env.yaml", encoding="utf-8")))
+          deploy = next(d for d in docs if d and d.get("kind") == "Deployment")
+          env = deploy["spec"]["template"]["spec"]["containers"][0]["env"]
+          names = [item["name"] for item in env]
+          dupes = [name for name, count in collections.Counter(names).items() if count > 1]
+          assert not dupes, dupes
+          values = {item["name"]: item.get("value") for item in env}
+          assert values["FOO"] == "bar"
+          assert values["XDG_CONFIG_HOME"] == "/tmp/.config"
+          assert values["XDG_DATA_HOME"] == "/tmp/.local/share"
+          assert values["XDG_CACHE_HOME"] == "/tmp/.cache"
+          assert values["XDG_STATE_HOME"] == "/tmp/.local/state"
+          PY
+
+      - name: Template extraEnv valueFrom render check
+        run: |
+          cat > /tmp/tokenplace-extra-env-values.yaml <<'YAML'
+          extraEnv:
+            - name: SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: relay-secret
+                  key: token
+          YAML
+
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            -f /tmp/tokenplace-extra-env-values.yaml > /tmp/tokenplace-render-extra-env.yaml
+
+          python3 - <<'PY'
+          import yaml
+
+          docs = list(yaml.safe_load_all(open("/tmp/tokenplace-render-extra-env.yaml", encoding="utf-8")))
+          deploy = next(d for d in docs if d and d.get("kind") == "Deployment")
+          env = deploy["spec"]["template"]["spec"]["containers"][0]["env"]
+          secret = next(item for item in env if item["name"] == "SECRET_TOKEN")
+          assert secret["valueFrom"]["secretKeyRef"]["name"] == "relay-secret"
+          assert secret["valueFrom"]["secretKeyRef"]["key"] == "token"
+          PY
+
       - name: Template strategy-empty fallback smoke render
         run: |
 

@@ -63,6 +63,10 @@ spec:
                 "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
                 "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
+                "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
+                "XDG_DATA_HOME" (dict "name" "XDG_DATA_HOME" "value" "/tmp/.local/share")
+                "XDG_CACHE_HOME" (dict "name" "XDG_CACHE_HOME" "value" "/tmp/.cache")
+                "XDG_STATE_HOME" (dict "name" "XDG_STATE_HOME" "value" "/tmp/.local/state")
           }}
           {{- $mergedEnv := deepCopy $defaultEnv }}
           {{- if kindIs "map" .Values.env }}

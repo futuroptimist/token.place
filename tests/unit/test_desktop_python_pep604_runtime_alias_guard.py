@@ -58,26 +58,35 @@ def _is_typing_like_name(node: ast.AST) -> bool:
     return False
 
 
-def _is_simple_type_atom(node: ast.AST) -> bool:
+def _simple_type_atom_info(node: ast.AST) -> tuple[bool, bool]:
+    """Return (is_type_atom, is_explicit_type_marker)."""
     if isinstance(node, ast.Name):
-        # Builtin/simple runtime types frequently used directly in aliases.
         if node.id in {"str", "bytes", "int", "float", "bool", "object", "None"}:
-            return True
-        # Imported/project type names are usually CapWords, while ALL_CAPS is
-        # typically a runtime constant used in bitwise expressions.
-        return bool(node.id) and node.id[0].isupper() and not node.id.isupper()
+            return True, True
+        if bool(node.id) and node.id[0].isupper():
+            # CapWords and acronym-style type names (UUID, IO, URL, etc.).
+            return True, not node.id.isupper()
+        return False, False
     if isinstance(node, ast.Attribute):
         # e.g. pathlib.Path, decimal.Decimal, module.TreeNode
-        return True
+        return True, True
     if isinstance(node, ast.Constant):
-        return node.value is None or node.value is Ellipsis
-    return False
+        if node.value is None or node.value is Ellipsis:
+            return True, True
+    return False, False
+
+
+def _typing_like_union_chain_info(node: ast.AST) -> tuple[bool, bool]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left_ok, left_explicit = _typing_like_union_chain_info(node.left)
+        right_ok, right_explicit = _typing_like_union_chain_info(node.right)
+        return left_ok and right_ok, left_explicit or right_explicit
+    return _simple_type_atom_info(node)
 
 
 def _is_typing_like_union_chain(node: ast.AST) -> bool:
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return _is_typing_like_union_chain(node.left) and _is_typing_like_union_chain(node.right)
-    return _is_simple_type_atom(node)
+    ok, has_explicit = _typing_like_union_chain_info(node)
+    return ok and has_explicit
 
 
 def _contains_typing_like_context(value: ast.AST) -> bool:
@@ -234,6 +243,10 @@ def test_runtime_typing_union_alias_detection_regressions() -> None:
     )
     assert isinstance(wrapper_alias_assign, ast.Assign)
     assert _is_runtime_typing_union_alias(wrapper_alias_assign.value)
+
+    acronym_alias_assign = _first_assignment_from_source("MaybeUUID = UUID | str\n")
+    assert isinstance(acronym_alias_assign, ast.Assign)
+    assert _is_runtime_typing_union_alias(acronym_alias_assign.value)
 
     bitwise_assign = _first_assignment_from_source("FLAGS = READ | WRITE\n")
     assert isinstance(bitwise_assign, ast.Assign)

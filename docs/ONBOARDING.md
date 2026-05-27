@@ -62,13 +62,12 @@ Create a virtual environment first (recommended on macOS):
 
 ```bash
 # Prefer a known-good relay interpreter when available
-python3.12 -m venv .venv || python3 -m venv .venv
+python3.12 -m venv .venv || python3.11 -m venv .venv
 source .venv/bin/activate
 python -V
 # Relay quickstart expects Python 3.11/3.12 in this venv.
-# If macOS/Homebrew selected Python 3.9 (too old) or a newer default that lacks wheels,
-# recreate with a known-good interpreter (or run ./scripts/setup-relay-venv.sh):
-#   rm -rf .venv && python3.12 -m venv .venv
+# If neither interpreter is available, install Python 3.12 (or run ./scripts/setup-relay-venv.sh)
+# after confirming it selected a supported interpreter.
 python -m pip install --upgrade pip
 ```
 

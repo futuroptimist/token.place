@@ -15,7 +15,17 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DESKTOP_APP = REPO_ROOT / "desktop-tauri" / "src-tauri" / "target" / "debug" / "token.place.app"
+DESKTOP_TARGET_DIR = REPO_ROOT / "desktop-tauri" / "src-tauri" / "target" / "debug"
+DESKTOP_APP_BUNDLE = DESKTOP_TARGET_DIR / "token.place desktop.app"
+DESKTOP_APP_BIN = DESKTOP_TARGET_DIR / "token-place-desktop-tauri"
+
+
+def _resolve_desktop_app_target() -> Path | None:
+    if DESKTOP_APP_BUNDLE.exists():
+        return DESKTOP_APP_BUNDLE
+    if DESKTOP_APP_BIN.exists():
+        return DESKTOP_APP_BIN
+    return None
 
 
 def _port_in_use(port: int) -> bool:
@@ -41,11 +51,21 @@ def _assert_no_relay_port_listener() -> None:
 
 
 def main() -> int:
+    require_no_relay_e2e = os.getenv("TOKENPLACE_REQUIRE_NO_RELAY_E2E") == "1"
+
     if platform.system() != "Darwin":
-        print("SKIP: desktop no-relay lifecycle e2e is macOS-only")
+        message = "desktop no-relay lifecycle e2e is macOS-only"
+        if require_no_relay_e2e:
+            raise AssertionError(message)
+        print(f"SKIP: {message}")
         return 0
-    if not DESKTOP_APP.exists():
-        print(f"SKIP: desktop app binary not found: {DESKTOP_APP}")
+
+    desktop_target = _resolve_desktop_app_target()
+    if desktop_target is None:
+        message = f"desktop app binary not found: {DESKTOP_APP_BUNDLE} or {DESKTOP_APP_BIN}"
+        if require_no_relay_e2e:
+            raise AssertionError(message)
+        print(f"SKIP: {message}")
         return 0
 
     env = os.environ.copy()
@@ -54,8 +74,13 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-no-relay-home-") as home:
         env["HOME"] = home
+        launched_app_bundle = desktop_target.suffix == ".app"
+        if launched_app_bundle:
+            launch_cmd = ["open", "-W", str(desktop_target)]
+        else:
+            launch_cmd = [str(desktop_target)]
         app = subprocess.Popen(
-            ["open", "-W", str(DESKTOP_APP)],
+            launch_cmd,
             cwd=REPO_ROOT,
             env=env,
             stdout=subprocess.PIPE,
@@ -63,7 +88,12 @@ def main() -> int:
             text=True,
         )
         time.sleep(2)
-        subprocess.run(["osascript", "-e", 'tell application "token.place" to quit'], check=False)
+        if launched_app_bundle:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "token.place desktop" to quit'], check=False
+            )
+        else:
+            app.terminate()
         app.wait(timeout=60)
 
     assert not _has_process_matching("relay.py"), "relay.py process exists after desktop shutdown"

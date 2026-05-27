@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Made with help from https://www.youtube.com/watch?v=pOx2TYwR590
 # Github: https://github.com/cgossi/fundamental_cryptography_with_python
 
@@ -6,6 +8,7 @@ import base64
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import sys
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
 
@@ -190,7 +193,7 @@ def _decrypt_session_key(encrypted_key: bytes, private_key_pem: bytes) -> bytes:
     return base64.b64decode(aes_key_b64)
 
 
-@dataclass(slots=True)
+@dataclass(**({"slots": True} if sys.version_info >= (3, 10) else {}))
 class StreamSession:
     """Hold symmetric context for encrypted streaming payloads."""
 

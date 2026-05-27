@@ -10,6 +10,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
+      - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -25,6 +26,7 @@ on:
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
+      - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -81,12 +83,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r config/requirements_codex_verification.txt
           pip install selenium
 
       - name: Run desktop operator UI e2e
@@ -115,14 +117,38 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r config/requirements_codex_verification.txt
 
       - name: Run packaged operator bridge e2e (Windows)
+        run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
+
+  desktop-operator-packaged-inspect-python39-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+          cache-dependency-path: config/requirements_codex_verification.txt
+
+      - name: Install Python dependencies (macOS, Python 3.9 inspect)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r config/requirements_codex_verification.txt
+
+      - name: Run dependency-isolated model bridge inspect smoke (macOS, Python 3.9)
+        env:
+          TOKEN_PLACE_INSPECT_ONLY: "1"
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
 
   desktop-operator-packaged-e2e-macos:
@@ -131,22 +157,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: Install desktop Node dependencies (macOS)
+        run: cd desktop-tauri && npm ci
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build desktop frontend assets (macOS)
+        run: cd desktop-tauri && npm run build
+
+      - name: Build desktop binary (debug, no bundle, macOS)
+        run: cd desktop-tauri && npm run tauri build -- --debug --no-bundle
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
-
-      - name: Run dependency-isolated model bridge inspect smoke (macOS)
-        env:
-          TOKEN_PLACE_INSPECT_ONLY: "1"
-        run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+          cache-dependency-path: config/requirements_codex_verification.txt
 
       - name: Install Python dependencies (macOS packaged e2e)
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
 
+      - name: Run dependency-isolated model bridge inspect smoke (macOS)
+        env:
+          TOKEN_PLACE_INSPECT_ONLY: "1"
+        run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
       - name: Run packaged operator bridge e2e (macOS)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
+
+      - name: Run desktop no-relay lifecycle e2e (macOS, required)
+        env:
+          TOKENPLACE_REQUIRE_NO_RELAY_E2E: "1"
+        run: python desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py

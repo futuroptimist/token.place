@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import sys
 from typing import Iterable, MutableMapping, Sequence
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **({"slots": True} if sys.version_info >= (3, 10) else {}))
 class PlatformMatrixEntry:
     """A single target entry for the CI test matrix."""
 

@@ -807,8 +807,8 @@ def relay_api_v1_chat_completions():
                 'type': 'service_unavailable_error',
                 'code': 'distributed_api_v1_relay_disabled',
                 'message': (
-                    'Distributed relay API v1 chat completions are disabled pending '
-                    'an end-to-end encrypted relay design.'
+                    'Distributed relay API v1 chat completions must use encrypted API v1 relay envelopes; '
+                    'plaintext relay dispatch is forbidden by design.'
                 ),
             }
         }
@@ -825,8 +825,8 @@ def relay_api_v1_source():
                 'type': 'service_unavailable_error',
                 'code': 'distributed_api_v1_relay_disabled',
                 'message': (
-                    'Distributed relay API v1 source dispatch is disabled pending '
-                    'an end-to-end encrypted relay design.'
+                    'Distributed relay API v1 source dispatch must use encrypted API v1 relay envelopes; '
+                    'plaintext relay dispatch is forbidden by design.'
                 ),
             }
         }
@@ -843,6 +843,12 @@ def _extract_ciphertext_envelope(payload, *, require_server_key=False):
         return None, ('Invalid request data', 400)
     if require_server_key:
         required.insert(0, 'server_public_key')
+
+    forbidden_plaintext_fields = {'messages', 'prompt', 'input', 'content'}
+    present_plaintext_fields = sorted(forbidden_plaintext_fields.intersection(payload))
+    if present_plaintext_fields:
+        return None, ('Plaintext fields are not allowed on encrypted relay routes', 400)
+
     missing = [field for field in required if field not in payload]
     if missing:
         return None, ('Invalid request data', 400)

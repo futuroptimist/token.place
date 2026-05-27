@@ -442,13 +442,13 @@
         </div>
 
         <h3>Encrypted API Usage</h3>
-        <p>For enhanced privacy, you can use end-to-end encryption with the API:</p>
+        <p>End-to-end encryption is required across token.place. The relay only accepts encrypted envelopes and never plaintext payloads:</p>
         <ol>
             <li>Get the server's public key from <code>/api/v1/public-key</code></li>
             <li>Generate your own RSA key pair on the client</li>
             <li>Encrypt your messages with the server's public key</li>
-            <li>Send the encrypted request with <code>"encrypted": true</code> flag</li>
-            <li>The server will encrypt its response with your public key</li>
+            <li>Send the encrypted request envelope (<code>ciphertext</code> + encrypted symmetric key + IV)</li>
+            <li>The server returns an encrypted envelope for client-side decryption</li>
         </ol>
 
         <p><strong>Example Encrypted Request:</strong></p>

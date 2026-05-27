@@ -1135,7 +1135,7 @@ Example response:
 
 ### End-to-End Encryption
 
-For enhanced privacy, you can use end-to-end encryption with the API:
+End-to-end encryption is mandatory across token.place. Relay paths only accept encrypted envelopes and reject plaintext payload fields:
 
 1. Get the server's public key:
 ```

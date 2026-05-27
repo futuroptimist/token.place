@@ -29,9 +29,11 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Launch version alignment for v0.1.0: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - Preferred tag for validation/sign-off: immutable `main-<shortsha>`
 - Final release Git tags publish matching image tags (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only
+- Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
 
 ## Deployment commands (run from Sugarkube repo)
 

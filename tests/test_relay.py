@@ -379,6 +379,7 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
 
         return _Response()
 
+    monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
 
     request_data = {
@@ -415,6 +416,9 @@ def test_relay_client_rejects_invalid_client_public_key_encoding(monkeypatch):
         class _Response:
             status_code = 200
         return _Response()
+
+    def fake_generate_response(_model, messages, **_options):
+        return messages + [{"role": "assistant", "content": "bonjour"}]
 
     monkeypatch.setattr("api.v1.models.generate_response", fake_generate_response)
     monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)

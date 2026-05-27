@@ -62,6 +62,7 @@ Create a virtual environment first (recommended on macOS):
 
 ```bash
 python3 -m venv .venv
+# On macOS relay-only setups, prefer Python 3.12 if available: python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 ```

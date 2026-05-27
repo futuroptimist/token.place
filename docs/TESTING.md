@@ -9,7 +9,8 @@ Before running the tests, install the required Python and Node.js dependencies a
 ```bash
 pip install -r config/requirements_server.txt
 pip install -r config/requirements_relay.txt
-# Note: relay requirements pin packaging 24.2 to satisfy Flask-Limiter/limits constraints.
+# Note: relay requirements pin packaging 24.2 for relay-only environments.
+# Installing requirements.txt afterward may upgrade packaging (for dev tooling), which is expected.
 pip install -r requirements.txt
 npm ci
 playwright install --with-deps chromium

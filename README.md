@@ -29,7 +29,7 @@ Secure peer-to-peer generative AI platform
 
 **Prerequisites**
 
-- **Python 3.11+** (3.11/3.12/3.13/3.14 are supported for relay quickstart; see [macOS relay setup](#macos-relay-only-quick-start) below)
+- **Python 3.11+** (3.11/3.12 are recommended for relay quickstart; see [macOS relay setup](#macos-relay-only-quick-start) below)
 - **Node.js 18+** (`nvm use` respects the included `.nvmrc`)
 
 Create and activate a virtual environment before installing Python packages (recommended on all platforms, especially macOS where `pip` may be missing but `pip3` is available):
@@ -38,9 +38,9 @@ Create and activate a virtual environment before installing Python packages (rec
 git clone https://github.com/futuroptimist/token.place.git
 cd token.place
 
-# Use whichever Python 3 is available on your system
-python3 -m venv .venv
-# Windows PowerShell alternative: py -3 -m venv .venv
+# Use a known-good interpreter for relay dependencies (3.11/3.12 recommended)
+python3.12 -m venv .venv
+# Windows PowerShell alternative: py -3.12 -m venv .venv
 source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
@@ -531,7 +531,7 @@ Use this path when you only need `relay.py` (no local `llama-cpp-python` build):
    cd token.place
    ./scripts/setup-relay-venv.sh
    # or manually:
-   python3 -m venv .venv
+   python3.12 -m venv .venv
    source .venv/bin/activate
    python -m pip install -r config/requirements_relay.txt
    ```
@@ -543,7 +543,7 @@ Use this path when you only need `relay.py` (no local `llama-cpp-python` build):
    curl http://127.0.0.1:5010/api/v1/health
    ```
 
-If `pip install` fails building Pillow, install JPEG support (`brew install jpeg`) or use Python 3.12 as above so pip can install a prebuilt wheel.
+If `pip install` fails building Pillow, install JPEG support (`brew install jpeg`) or use Python 3.12 as above so pip can install a prebuilt wheel. If you used `python3 -m venv`, recreate the venv with `python3.12 -m venv .venv` to avoid unsupported Homebrew default interpreters.
 
 On other Linux distributions, use your package manager to install the equivalents of `build-essential` and `cmake`. For example on Fedora:
 

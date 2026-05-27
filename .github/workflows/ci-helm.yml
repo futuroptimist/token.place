@@ -57,7 +57,23 @@ jobs:
           grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
           grep -n "type: Recreate" /tmp/tokenplace-render.yaml
           grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "1"'
+          grep -n "name: XDG_CONFIG_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.config"'
+          grep -n "name: XDG_DATA_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/share"'
+          grep -n "name: XDG_CACHE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.cache"'
+          grep -n "name: XDG_STATE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/state"'
           ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
+
+          python3 - <<'PY'
+          import collections
+          import yaml
+
+          docs = list(yaml.safe_load_all(open("/tmp/tokenplace-render.yaml", encoding="utf-8")))
+          deploy = next(d for d in docs if d and d.get("kind") == "Deployment")
+          env = deploy["spec"]["template"]["spec"]["containers"][0]["env"]
+          names = [item["name"] for item in env]
+          dupes = [name for name, count in collections.Counter(names).items() if count > 1]
+          assert not dupes, dupes
+          PY
 
           helm template tokenplace charts/tokenplace \
             --namespace tokenplace \
@@ -73,6 +89,26 @@ jobs:
           # when switching live defaulted RollingUpdate Deployments to Recreate.
           grep -n 'else if and (eq $strategyType "Recreate") $existingHasRollingUpdate' charts/tokenplace/templates/deployment.yaml
           grep -n 'rollingUpdate: null' charts/tokenplace/templates/deployment.yaml
+
+      - name: Relay container read-only rootfs smoke test
+        run: |
+          set -euo pipefail
+          docker build -t tokenplace-relay:chart-smoke .
+          docker run -d --rm --name tokenplace-relay-readonly --read-only --tmpfs /tmp \
+            -p 127.0.0.1:5010:5010 \
+            -e TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0 \
+            tokenplace-relay:chart-smoke
+          trap 'docker logs tokenplace-relay-readonly || true; docker stop tokenplace-relay-readonly || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5010/livez >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:5010/livez
+          curl -fsS http://127.0.0.1:5010/healthz
+          curl -fsS http://127.0.0.1:5010/
+          curl -fsS http://127.0.0.1:5010/metrics
 
       - name: Capture chart metadata
         id: chart_meta

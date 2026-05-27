@@ -1345,7 +1345,7 @@ def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(clie
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
 
-def test_api_v1_relay_plaintext_messages_not_stored(client):
+def test_api_v1_relay_plaintext_messages_are_rejected(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
     plaintext = 'PLAINTEXT_SENTINEL_DO_NOT_STORE'
@@ -1360,12 +1360,9 @@ def test_api_v1_relay_plaintext_messages_not_stored(client):
         'prompt': plaintext,
     }
     response = client.post('/api/v1/relay/requests', json=payload)
-    assert response.status_code == 200
-
-    queued_payload = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
-    assert 'messages' not in queued_payload
-    assert 'prompt' not in queued_payload
-    assert plaintext not in json.dumps(queued_payload)
+    assert response.status_code == 400
+    assert "forbidden; send ciphertext envelope only" in response.get_json()["error"]["message"]
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
 
 
 def test_api_v1_relay_requests_requires_client_public_key(client):
@@ -1450,7 +1447,7 @@ def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
 
 
-def test_api_v1_relay_response_plaintext_not_stored(client):
+def test_api_v1_relay_response_plaintext_is_rejected(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
 
     plaintext = 'PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE'
@@ -1467,19 +1464,9 @@ def test_api_v1_relay_response_plaintext_not_stored(client):
         'model_output_text': plaintext,
     }
     source = client.post('/api/v1/relay/responses', json=response_payload)
-    assert source.status_code == 200
-
-    queued_payload = client_responses[DUMMY_CLIENT_PUB_KEY]
-    assert 'messages' not in queued_payload
-    assert 'prompt' not in queued_payload
-    assert 'assistant_output' not in queued_payload
-    assert 'tool_arguments' not in queued_payload
-    assert 'model_output_text' not in queued_payload
-    assert plaintext not in json.dumps(queued_payload)
-
-    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
-    assert retrieved.status_code == 200
-    assert plaintext not in json.dumps(retrieved.get_json())
+    assert source.status_code == 400
+    assert "forbidden; send ciphertext envelope only" in source.get_json()["error"]["message"]
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
 
 def test_api_v1_relay_chat_completions_fail_closed_and_queue_unchanged(client):

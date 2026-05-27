@@ -874,6 +874,25 @@ def _payload_has_plaintext_fields(payload):
     return any(field in payload for field in forbidden_plaintext_fields)
 
 
+def _payload_has_unexpected_relay_fields(payload, *, allow_server_public_key):
+    """Reject unknown top-level keys so relay envelopes stay ciphertext-only by schema."""
+    if not isinstance(payload, dict):
+        return False
+    allowed_fields = {
+        "client_public_key",
+        "ciphertext",
+        "chat_history",
+        "cipherkey",
+        "iv",
+        "request_id",
+        "protocol",
+        "version",
+    }
+    if allow_server_public_key:
+        allowed_fields.add("server_public_key")
+    return any(field not in allowed_fields for field in payload)
+
+
 def _queue_client_response(client_public_key, envelope):
     """Queue an encrypted response while preserving per-request retrieval."""
     with client_responses_lock:
@@ -1075,6 +1094,8 @@ def api_v1_relay_requests():
     _evict_stale_servers()
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
+    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=True):
+        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if _payload_has_plaintext_fields(data):
         return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if error:
@@ -1118,6 +1139,8 @@ def api_v1_relay_responses():
 
     data = request.get_json()
     envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
+    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=False):
+        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if _payload_has_plaintext_fields(data):
         return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
     if error:
@@ -1185,7 +1208,7 @@ def faucet():
     diffing mechanisms to determine if conversations were altered, but this is intentionally built in a
     stateless manner to minimize complexity and maximize scalability. It's trivially easy to identify
     tampering from either party, so enforcing it on the relay is a non-goal, especially since communication
-    between the client and the server is mandatory end-to-end encrypted. This relay path must remain
+    between the client and the server uses mandatory end-to-end encryption. This relay path must remain
     ciphertext-only (+ safe routing metadata) and fail closed for plaintext payloads or bypass attempts.
 
     Example request:
@@ -1204,6 +1227,13 @@ def faucet():
     _evict_stale_servers()
     # Parse the request data
     data = request.get_json()
+    if _payload_has_plaintext_fields(data):
+        return jsonify({
+            'error': {
+                'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only',
+                'code': 400
+            }
+        }), 400
 
     if not data or 'server_public_key' not in data or 'chat_history' not in data or 'cipherkey' not in data or 'iv' not in data:
         return jsonify({

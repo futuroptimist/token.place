@@ -61,8 +61,13 @@ The `.gitignore` file keeps OS artifacts like `.DS_Store` and `Thumbs.db` out of
 Create a virtual environment first (recommended on macOS):
 
 ```bash
-python3.12 -m venv .venv || python3 -m venv .venv
+# Prefer a known-good relay interpreter when available
+python3.12 -m venv .venv || python3.11 -m venv .venv
 source .venv/bin/activate
+python -V
+# Relay quickstart expects Python 3.11/3.12 in this venv.
+# If neither interpreter is available, install Python 3.12 (or run ./scripts/setup-relay-venv.sh)
+# after confirming it selected a supported interpreter.
 python -m pip install --upgrade pip
 ```
 

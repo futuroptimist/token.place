@@ -363,6 +363,15 @@ def _handle_chat_completion_request(data):
         requested_model_id = data["model"]
         response_model_id = requested_model_id
         model_id = resolve_model_alias(requested_model_id) or requested_model_id
+        supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
+        if model_id not in supported_model_ids:
+            return format_error_response(
+                f"Model '{requested_model_id}' is not supported by API v1.",
+                error_type="invalid_request_error",
+                param="model",
+                code="model_not_supported",
+                status_code=400,
+            )
         if model_id != requested_model_id:
             log_info(
                 f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"

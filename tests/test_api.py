@@ -232,7 +232,7 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
 
     payload = {
-        'model': 'remote-only-model',
+        'model': 'llama-3-8b-instruct',
         'messages': [{'role': 'user', 'content': 'Ping distributed runtime'}],
         'temperature': 0.2,
         'stop': ['END'],
@@ -682,8 +682,8 @@ def test_v1_completions_reject_stream_flag(client, mock_llama):
     assert "Streaming is not supported for API v1" in error["error"]["message"]
 
 
-def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch):
-    """Alias identifiers should execute against the canonical model entry."""
+def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
+    """API v1 chat completions should execute using the canonical token.place model."""
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
@@ -700,7 +700,7 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
             captured["options"] = options
             return {
                 "role": "assistant",
-                "content": "Alias resolved response",
+                "content": "Llama response",
             }
 
     monkeypatch.setattr(
@@ -717,7 +717,7 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
     )
 
     payload = {
-        "model": "gpt-3.5-turbo",
+        "model": "llama-3-8b-instruct",
         "messages": [{"role": "user", "content": "Hello"}],
     }
 
@@ -727,10 +727,40 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
     assert response.is_json
 
     body = response.get_json()
-    assert body["model"] == "gpt-3.5-turbo"
+    assert body["model"] == "llama-3-8b-instruct"
     assert captured["model_id"] == "llama-3-8b-instruct"
     assert captured["messages"] == payload["messages"]
-    assert body["choices"][0]["message"]["content"] == "Alias resolved response"
+    assert body["choices"][0]["message"]["content"] == "Llama response"
+
+
+def test_v1_chat_completion_rejects_gpt_model_ids(client, monkeypatch):
+    """API v1 should reject GPT-branded model IDs."""
+
+    monkeypatch.setattr(
+        "api.v1.routes.get_models_info",
+        lambda: [{"id": "llama-3-8b-instruct"}],
+    )
+
+    class ProviderShouldNotBeCalled:
+        def complete_chat(self, **kwargs):
+            raise AssertionError("provider should not be called for unsupported GPT model IDs")
+
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_compute_provider",
+        lambda: ProviderShouldNotBeCalled(),
+    )
+
+    response = client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"].get("param") == "model"
 
 
 def test_streaming_chat_completion(client, mock_llama):

@@ -3,40 +3,104 @@
 from __future__ import annotations
 
 import os
+import secrets
 from flask import jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from prometheus_flask_exporter import PrometheusMetrics
 
+from config import get_config
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
-
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 
-# Paths that support operations, health checking, metrics scraping, and relay
-# compute-node control-plane heartbeats must not consume the public user API
-# quota. Kubernetes readiness probes can call /healthz every few seconds, and
-# API v1 compute providers poll/register independently of end-user chat traffic.
-RATE_LIMIT_EXEMPT_PATHS = frozenset({
-    "/livez",
-    "/healthz",
-    "/metrics",
-    "/relay/diagnostics",
-    "/api/v1/relay/servers/register",
-    "/api/v1/relay/servers/poll",
-    "/api/v1/relay/servers/next",
-    "/api/v1/relay/responses",
-    "/api/v1/relay/responses/retrieve",
-})
+# Paths that support operations, health checking, metrics scraping, and
+# diagnostics must not consume the public user API quota. Kubernetes readiness
+# probes can call /healthz every few seconds.
+RATE_LIMIT_EXEMPT_PATHS = frozenset(
+    {
+        "/livez",
+        "/healthz",
+        "/metrics",
+        "/relay/diagnostics",
+    }
+)
+
+# API v1 compute-node control-plane routes should bypass the public user quota
+# only for authenticated compute-node traffic. When relay server tokens are not
+# configured, these mutation/long-poll routes remain rate-limited to prevent
+# anonymous callers from growing relay-owned state or occupying workers.
+AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS = frozenset(
+    {
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/poll",
+        "/api/v1/relay/servers/next",
+        "/api/v1/relay/responses",
+    }
+)
+
+
+def _normalized_path(path: str) -> str:
+    return path.rstrip("/") or "/"
+
+
+def _load_relay_server_registration_tokens() -> list[str]:
+    """Return configured relay compute-node tokens from config and env."""
+
+    tokens: list[str] = []
+    try:
+        configured = get_config().get("relay.server_registration_token")
+    except (AttributeError, KeyError, TypeError):
+        configured = None
+    if isinstance(configured, str):
+        tokens.extend(configured.split(","))
+
+    plural_tokens = os.environ.get("TOKEN_PLACE_RELAY_SERVER_TOKENS", "")
+    if plural_tokens:
+        tokens.extend(plural_tokens.replace("\n", ",").split(","))
+
+    singular_token = os.environ.get("TOKEN_PLACE_RELAY_SERVER_TOKEN", "")
+    if singular_token:
+        tokens.append(singular_token)
+
+    normalized = [
+        candidate.strip() for candidate in tokens if isinstance(candidate, str)
+    ]
+    return [token for token in normalized if token]
+
+
+def _is_authenticated_relay_control_plane_request(path: str) -> bool:
+    """Return True for compute-node control-plane requests with a valid token."""
+
+    if (
+        _normalized_path(path)
+        not in AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS
+    ):
+        return False
+
+    relay_server_tokens = _load_relay_server_registration_tokens()
+    if not relay_server_tokens:
+        return False
+
+    provided = request.headers.get("X-Relay-Server-Token", "").strip()
+    if not provided:
+        return False
+
+    return any(
+        secrets.compare_digest(provided, token) for token in relay_server_tokens
+    )
 
 
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     """Return True when a route should not consume the public API quota."""
 
-    normalized_path = path.rstrip("/") or "/"
-    return normalized_path in RATE_LIMIT_EXEMPT_PATHS
+    normalized_path = _normalized_path(path)
+    return (
+        normalized_path in RATE_LIMIT_EXEMPT_PATHS
+        or _is_authenticated_relay_control_plane_request(normalized_path)
+    )
 
 
 def _resolve_rate_limit_storage_uri() -> str | None:
@@ -127,7 +191,9 @@ def init_app(app):
             "openai_v2.create_chat_completion_openai",
         ):
             view_func = app.view_functions.get(endpoint)
-            if view_func and not getattr(view_func, "_stream_rate_limit_attached", False):
+            if view_func and not getattr(
+                view_func, "_stream_rate_limit_attached", False
+            ):
                 decorated = shared_stream_limit(view_func)
                 setattr(decorated, "_stream_rate_limit_attached", True)
                 app.view_functions[endpoint] = decorated

@@ -203,11 +203,15 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
 
 @patch.dict(
     os.environ,
-    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "1000/day"},
+    {
+        "API_RATE_LIMIT": "60/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
+    },
     clear=True,
 )
-def test_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota():
-    """Compute-node control-plane heartbeats must be independent from user API limits."""
+def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota():
+    """Authenticated compute-node heartbeats must not consume user API quota."""
     app = Flask(__name__)
     init_app(app)
 
@@ -222,10 +226,51 @@ def test_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota():
     with app.test_client() as client:
         for path in ("/api/v1/relay/servers/register", "/api/v1/relay/servers/poll"):
             responses = [
-                client.post(path, json={"server_public_key": "server"})
+                client.post(
+                    path,
+                    json={"server_public_key": "server"},
+                    headers={"X-Relay-Server-Token": "relay-token"},
+                )
                 for _ in range(65)
             ]
             assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_unauthenticated_api_v1_relay_mutations_keep_public_rate_limit():
+    """Anonymous relay mutations should retain quota protection when no token exists."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/register")
+    def relay_servers_register():
+        return {"status": "registered"}
+
+    with app.test_client() as client:
+        assert (
+            client.post(
+                "/api/v1/relay/servers/register", json={"server_public_key": "server-1"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/v1/relay/servers/register", json={"server_public_key": "server-2"}
+            ).status_code
+            == 200
+        )
+        response = client.post(
+            "/api/v1/relay/servers/register", json={"server_public_key": "server-3"}
+        )
+
+    assert response.status_code == 429
+    body = response.get_json()
+    assert body is not None
+    assert body["error"]["code"] == "rate_limit_exceeded"
 
 
 @patch.dict(

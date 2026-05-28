@@ -145,8 +145,8 @@ helm show chart ./charts/tokenplace
 helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
 
 # Render local and OCI manifests, then diff strategy/env sections.
-helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-local.yaml
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-oci.yaml
+helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-local.yaml
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-oci.yaml
 diff -u /tmp/tokenplace-local.yaml /tmp/tokenplace-oci.yaml | less
 ```
 

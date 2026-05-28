@@ -794,8 +794,8 @@ def test_faucet_unknown_server(client):
     assert data['error'] == {'message': 'Server with the specified public key not found', 'code': 404}
 
 
-def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
-    """Diagnostics should expose configured URLs and live compute registrations."""
+def test_relay_diagnostics_distinguishes_legacy_upstreams_and_live_nodes(client, monkeypatch):
+    """Diagnostics should expose relay-only posture separately from live compute registrations."""
     app.config["relay_configured_servers"] = [
         "https://configured-one.example.com:8000",
         "https://configured-two.example.com:8000",
@@ -809,18 +809,23 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
         {"chat_history": "pending", "client_public_key": "c", "cipherkey": "k", "iv": "i"}
     ]
 
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+
     response = client.get("/relay/diagnostics")
     assert response.status_code == 200
     payload = response.get_json()
 
-    assert payload["configured_upstream_servers"] == app.config["relay_configured_servers"]
+    assert payload["relay_only"] is True
+    assert payload["upstream_health_required"] is False
+    assert payload["legacy_configured_upstream_servers"] == app.config["relay_configured_servers"]
+    assert "configured_upstream_servers" not in payload
     assert payload["total_registered_compute_nodes"] == 1
     assert payload["registered_compute_nodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
 
 
-def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monkeypatch):
-    """Healthz should separate configured upstream URLs from live registered nodes."""
+def test_healthz_reports_legacy_upstreams_and_live_queue_depth_in_relay_only_mode(client, monkeypatch):
+    """Healthz should expose relay-only posture while separating legacy upstream URLs from live nodes."""
     monkeypatch.setitem(app.config, "gpu_host", None)
     configured_servers = [
         "https://configured-one.example.com:8000",
@@ -842,11 +847,16 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monke
         }
     ]
 
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+
     response = client.get("/healthz")
     assert response.status_code == 200
     payload = response.get_json()
 
-    assert payload["configuredUpstreamServers"] == configured_servers
+    assert payload["relayOnly"] is True
+    assert payload["upstreamHealthRequired"] is False
+    assert payload["legacyConfiguredUpstreamServers"] == configured_servers
+    assert "configuredUpstreamServers" not in payload
     assert payload["registeredServers"][0]["server_public_key"] == live_server_key
     assert payload["registeredServers"][0]["age_seconds"] >= 0
     assert payload["registeredServers"][0]["queue_depth"] == 1
@@ -854,6 +864,30 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monke
         node["server_public_key"] for node in payload["registeredServers"]
     }
 
+
+
+
+def test_healthz_staging_relay_only_no_registered_servers_is_healthy(client, monkeypatch):
+    """Staging relay-only health should not imply required in-cluster upstream dependencies."""
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+    monkeypatch.setitem(app.config, "public_base_url", "https://staging.token.place")
+    monkeypatch.setitem(app.config, "upstream_url", "http://gpu-server:3000")
+    monkeypatch.setitem(app.config, "gpu_host", "gpu-server")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["publicBaseUrl"] == "https://staging.token.place"
+    assert payload["knownServers"] == 0
+    assert payload["details"]["knownServers"] == "empty"
+    assert payload["relayOnly"] is True
+    assert payload["upstreamHealthRequired"] is False
+    assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
+    assert "configuredUpstreamServers" not in payload
 
 def test_healthz_returns_draining_when_shutdown_flag_set(client):
     """healthz should switch to draining status and 503 during shutdown."""

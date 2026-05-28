@@ -619,14 +619,23 @@ def healthz():
     _evict_stale_servers()
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    relay_only = not require_upstream_health
+
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
-        "configuredUpstreamServers": configured_servers,
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
         "registeredServers": _live_server_diagnostics(),
+        "upstreamHealthRequired": require_upstream_health,
+        "relayOnly": relay_only,
     }
+
+    if relay_only:
+        status["legacyConfiguredUpstreamServers"] = configured_servers
+    else:
+        status["configuredUpstreamServers"] = configured_servers
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -639,7 +648,6 @@ def healthz():
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
@@ -790,11 +798,21 @@ def relay_diagnostics():
     """Live diagnostics for legacy relay registered compute nodes."""
     _evict_stale_servers()
     live_nodes = _live_server_diagnostics()
-    return jsonify({
-        "configured_upstream_servers": app.config.get("relay_configured_servers", []),
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    relay_only = not require_upstream_health
+
+    diagnostics = {
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
-    })
+        "upstream_health_required": require_upstream_health,
+        "relay_only": relay_only,
+    }
+    if relay_only:
+        diagnostics["legacy_configured_upstream_servers"] = app.config.get("relay_configured_servers", [])
+    else:
+        diagnostics["configured_upstream_servers"] = app.config.get("relay_configured_servers", [])
+
+    return jsonify(diagnostics)
 
 
 @app.route('/relay/api/v1/chat/completions', methods=['POST'])

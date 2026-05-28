@@ -114,6 +114,19 @@ curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
 ```
 
+
+
+Health interpretation for relay-only staging:
+
+- `TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0` means the relay reports process readiness even
+  when no compute nodes are registered yet.
+- `knownServers: 0` means no external compute nodes have registered; it does **not** mean relay
+  process health is degraded.
+- Relay-only Sugarkube does not require `TOKENPLACE_RELAY_UPSTREAM_URL` or an in-cluster GPU
+  service for `/healthz` to return `200`.
+- `/healthz` and `/relay/diagnostics` report `relayOnly: true` / `relay_only: true` and
+  `upstreamHealthRequired: false` / `upstream_health_required: false` in this mode.
+
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).
 

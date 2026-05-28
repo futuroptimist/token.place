@@ -1,6 +1,7 @@
 """Unit tests for API rate limiting."""
 
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -210,8 +211,13 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
     },
     clear=True,
 )
-def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota():
+def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota(monkeypatch):
     """Authenticated compute-node heartbeats must not consume user API quota."""
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["relay-token"]),
+    )
     app = Flask(__name__)
     init_app(app)
 
@@ -234,6 +240,83 @@ def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota
                 for _ in range(65)
             ]
             assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_api_v1_relay_client_read_routes_do_not_inherit_public_quota():
+    """Client discovery/retrieval polling should not consume user API quota."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.get("/api/v1/relay/servers/next")
+    def relay_servers_next():
+        return {"server_public_key": "server"}
+
+    @app.post("/api/v1/relay/responses/retrieve")
+    def relay_responses_retrieve():
+        return {"status": "pending"}, 202
+
+    with app.test_client() as client:
+        next_responses = [client.get("/api/v1/relay/servers/next") for _ in range(65)]
+        retrieve_responses = [
+            client.post(
+                "/api/v1/relay/responses/retrieve",
+                json={"client_public_key": "client", "request_id": "request"},
+            )
+            for _ in range(65)
+        ]
+
+    assert {response.status_code for response in next_responses} == {200}
+    assert {response.status_code for response in retrieve_responses} == {202}
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "rotated-token",
+    },
+    clear=True,
+)
+def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypatch):
+    """Limiter auth should not drift from relay.py's active token snapshot."""
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["active-token"]),
+    )
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/register")
+    def relay_servers_register():
+        return {"status": "registered"}
+
+    with app.test_client() as client:
+        rotated_responses = [
+            client.post(
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": f"server-{index}"},
+                headers={"X-Relay-Server-Token": "rotated-token"},
+            )
+            for index in range(3)
+        ]
+        active_responses = [
+            client.post(
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": f"active-server-{index}"},
+                headers={"X-Relay-Server-Token": "active-token"},
+            )
+            for index in range(3)
+        ]
+
+    assert [response.status_code for response in rotated_responses] == [200, 200, 429]
+    assert {response.status_code for response in active_responses} == {200}
 
 
 @patch.dict(

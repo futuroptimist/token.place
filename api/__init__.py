@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from flask import jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
@@ -28,6 +29,16 @@ RATE_LIMIT_EXEMPT_PATHS = frozenset(
     }
 )
 
+# API v1 relay client read/poll routes should not consume the public user quota.
+# They do not mutate relay-owned state and are used by clients while waiting for
+# an encrypted response envelope or discovering a compute node.
+CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
+    {
+        "/api/v1/relay/servers/next",
+        "/api/v1/relay/responses/retrieve",
+    }
+)
+
 # API v1 compute-node control-plane routes should bypass the public user quota
 # only for authenticated compute-node traffic. When relay server tokens are not
 # configured, these mutation/long-poll routes remain rate-limited to prevent
@@ -36,7 +47,6 @@ AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS = frozenset(
     {
         "/api/v1/relay/servers/register",
         "/api/v1/relay/servers/poll",
-        "/api/v1/relay/servers/next",
         "/api/v1/relay/responses",
     }
 )
@@ -46,8 +56,25 @@ def _normalized_path(path: str) -> str:
     return path.rstrip("/") or "/"
 
 
+def _loaded_relay_server_registration_tokens() -> list[str] | None:
+    """Return relay.py's active token snapshot when the relay module is loaded."""
+
+    for module_name in ("relay", "__main__"):
+        module = sys.modules.get(module_name)
+        if module is None or not hasattr(module, "SERVER_REGISTRATION_TOKENS"):
+            continue
+        tokens = getattr(module, "SERVER_REGISTRATION_TOKENS")
+        if isinstance(tokens, (list, tuple, set, frozenset)):
+            return [token for token in tokens if isinstance(token, str) and token]
+    return None
+
+
 def _load_relay_server_registration_tokens() -> list[str]:
     """Return configured relay compute-node tokens from config and env."""
+
+    loaded_tokens = _loaded_relay_server_registration_tokens()
+    if loaded_tokens is not None:
+        return loaded_tokens
 
     tokens: list[str] = []
     try:
@@ -99,6 +126,7 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     normalized_path = _normalized_path(path)
     return (
         normalized_path in RATE_LIMIT_EXEMPT_PATHS
+        or normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS
         or _is_authenticated_relay_control_plane_request(normalized_path)
     )
 

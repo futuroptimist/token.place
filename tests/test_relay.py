@@ -1757,7 +1757,10 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     elapsed = time.monotonic() - started
     assert poll.status_code == 200
-    assert poll.get_json()['message'] == 'No requests available'
+    payload = poll.get_json()
+    assert payload['message'] == 'No requests available'
+    assert payload['next_ping_in_x_seconds'] == 0
+    assert payload['poll_wait_seconds'] == 0.01
     assert elapsed >= 0.008
 
 
@@ -1877,3 +1880,110 @@ def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(clien
     assert not poll_thread.is_alive()
     assert result['status'] == 200
     assert result['json']['chat_history'] == 'legacy-ciphertext-request'
+
+
+def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '3')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-inflight-1',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == 'req-inflight-1'
+
+    time.sleep(1.2)
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 200
+    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+
+    time.sleep(2.1)
+    expired = client.get('/api/v1/relay/servers/next')
+    assert expired.status_code == 503
+
+
+
+
+def test_api_v1_next_does_not_keep_stale_server_alive_after_in_flight_response_removed(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '10')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-race-finished',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == 'req-race-finished'
+
+    # Complete/remove the only in-flight request, then force stale lease.
+    response = client.post('/api/v1/relay/responses', json={
+        'request_id': 'req-race-finished',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    })
+    assert response.status_code == 200
+
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=5)
+
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 503
+def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '3')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    for request_id in ('req-inflight-a', 'req-inflight-b'):
+        queued = client.post('/api/v1/relay/requests', json={
+            'request_id': request_id,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': f'ciphertext-{request_id}',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+        })
+        assert queued.status_code == 200
+
+    first_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    second_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert first_poll.status_code == 200
+    assert second_poll.status_code == 200
+
+    first_request_id = first_poll.get_json()['request_id']
+    second_request_id = second_poll.get_json()['request_id']
+    assert {first_request_id, second_request_id} == {'req-inflight-a', 'req-inflight-b'}
+
+    response = client.post('/api/v1/relay/responses', json={
+        'request_id': second_request_id,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    })
+    assert response.status_code == 200
+
+    time.sleep(1.2)
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 200
+    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY

@@ -232,7 +232,7 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
 
     payload = {
-        'model': 'remote-only-model',
+        'model': 'llama-3-8b-instruct',
         'messages': [{'role': 'user', 'content': 'Ping distributed runtime'}],
         'temperature': 0.2,
         'stop': ['END'],
@@ -299,6 +299,105 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
         'compute_node_unreachable',
     }
     local_generate.assert_not_called()
+
+
+
+
+def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+
+    class ProviderShouldNotRun:
+        def complete_chat(self, **kwargs):
+            raise AssertionError('provider should not be called for unsupported local models')
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ProviderShouldNotRun())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
+
+    response = client.post('/api/v1/chat/completions', json={
+        'model': 'remote-only-model',
+        'messages': [{'role': 'user', 'content': 'hello'}],
+    })
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['param'] == 'model'
+    assert body['error']['code'] == 'model_not_supported'
+
+
+def test_api_v1_chat_completion_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.validate_chat_messages', lambda msgs: None)
+
+    captured = {}
+
+    class FakeDistributedProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured['model_id'] = model_id
+            captured['messages'] = messages
+            return {'role': 'assistant', 'content': 'distributed ok'}
+
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: FakeDistributedProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed_with_local_fallback')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_last_backend_path', lambda: 'distributed_relay_e2ee')
+
+    response = client.post('/api/v1/chat/completions', json={
+        'model': 'remote-only-model',
+        'messages': [{'role': 'user', 'content': 'route remotely'}],
+    })
+
+    assert response.status_code == 200
+    assert captured['model_id'] == 'remote-only-model'
+    assert response.get_json()['choices'][0]['message']['content'] == 'distributed ok'
+
+
+
+
+def test_api_v1_completions_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+
+    captured = {}
+
+    class FakeDistributedProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured['model_id'] = model_id
+            captured['messages'] = messages
+            return {'role': 'assistant', 'content': 'distributed completion ok'}
+
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: FakeDistributedProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed_with_local_fallback')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_last_backend_path', lambda: 'distributed_relay_e2ee')
+
+    response = client.post('/api/v1/completions', json={
+        'model': 'remote-only-model',
+        'prompt': 'route remotely',
+    })
+
+    assert response.status_code == 200
+    assert captured['model_id'] == 'remote-only-model'
+    assert response.get_json()['choices'][0]['text'] == 'distributed completion ok'
+
+
+def test_api_v1_completions_local_provider_rejects_unsupported_model(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+
+    class ProviderShouldNotRun:
+        def complete_chat(self, **kwargs):
+            raise AssertionError('provider should not be called for unsupported local completion models')
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ProviderShouldNotRun())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
+
+    response = client.post('/api/v1/completions', json={
+        'model': 'unsupported-model',
+        'prompt': 'hello',
+    })
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['param'] == 'model'
+    assert body['error']['code'] == 'model_not_supported'
 
 
 def test_chat_completion_rejects_empty_messages(client):
@@ -682,8 +781,8 @@ def test_v1_completions_reject_stream_flag(client, mock_llama):
     assert "Streaming is not supported for API v1" in error["error"]["message"]
 
 
-def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch):
-    """Alias identifiers should execute against the canonical model entry."""
+def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
+    """API v1 chat completions should execute using the canonical token.place model."""
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
@@ -693,16 +792,31 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
 
     captured = {}
 
-    def fake_generate_response(model_id, messages, **model_options):
-        captured["model_id"] = model_id
-        return messages + [
-            {"role": "assistant", "content": "Alias resolved response"}
-        ]
+    class FakeProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured["model_id"] = model_id
+            captured["messages"] = messages
+            captured["options"] = options
+            return {
+                "role": "assistant",
+                "content": "Llama response",
+            }
 
-    monkeypatch.setattr("api.v1.compute_provider.generate_response", fake_generate_response)
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_compute_provider",
+        lambda: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_resolved_provider_path",
+        lambda _provider: "local",
+    )
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_last_backend_path",
+        lambda: "local",
+    )
 
     payload = {
-        "model": "gpt-3.5-turbo",
+        "model": "llama-3-8b-instruct",
         "messages": [{"role": "user", "content": "Hello"}],
     }
 
@@ -712,9 +826,41 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
     assert response.is_json
 
     body = response.get_json()
-    assert body["model"] == "gpt-3.5-turbo"
+    assert body["model"] == "llama-3-8b-instruct"
     assert captured["model_id"] == "llama-3-8b-instruct"
-    assert body["choices"][0]["message"]["content"] == "Alias resolved response"
+    assert captured["messages"] == payload["messages"]
+    assert body["choices"][0]["message"]["content"] == "Llama response"
+
+
+def test_v1_chat_completion_rejects_unsupported_gpt_model_ids(client, monkeypatch):
+    """API v1 should reject unsupported GPT-branded model IDs."""
+
+    monkeypatch.setattr(
+        "api.v1.routes.get_models_info",
+        lambda: [{"id": "llama-3-8b-instruct"}],
+    )
+
+    class ProviderShouldNotBeCalled:
+        def complete_chat(self, **kwargs):
+            raise AssertionError("provider should not be called for unsupported GPT model IDs")
+
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_compute_provider",
+        lambda: ProviderShouldNotBeCalled(),
+    )
+
+    for gpt_model in ("gpt-4",):
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": gpt_model,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 400
+        body = response.get_json()
+        assert body["error"].get("param") == "model"
 
 
 def test_streaming_chat_completion(client, mock_llama):
@@ -1117,10 +1263,14 @@ def test_completions_missing_model(client):
 
 def test_completions_model_error(client, monkeypatch):
     from api.v1.models import ModelError
-    monkeypatch.setattr(
-        'api.v1.compute_provider.generate_response',
-        lambda *a, **k: (_ for _ in ()).throw(ModelError('no', status_code=404, error_type='model_not_found')),
-    )
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'foo'}])
+
+    class ErrorProvider:
+        def complete_chat(self, **kwargs):
+            raise ModelError('no', status_code=404, error_type='model_not_found')
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ErrorProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
     resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
     assert resp.status_code == 404
     assert 'model_not_found' in resp.get_json()['error']['type']
@@ -1128,10 +1278,14 @@ def test_completions_model_error(client, monkeypatch):
 
 def test_completions_generate_model_error(client, monkeypatch):
     from api.v1.models import ModelError
-    monkeypatch.setattr(
-        'api.v1.compute_provider.generate_response',
-        lambda *a, **k: (_ for _ in ()).throw(ModelError('bad', status_code=402)),
-    )
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'foo'}])
+
+    class ErrorProvider:
+        def complete_chat(self, **kwargs):
+            raise ModelError('bad', status_code=402)
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ErrorProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
     resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
     assert resp.status_code == 402
     assert 'bad' in resp.get_json()['error']['message']

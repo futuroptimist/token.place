@@ -308,6 +308,10 @@ def _estimate_token_length(text: str) -> int:
     return max(1, math.ceil(len(stripped) / 4))
 
 
+def _is_relay_capable_provider_path(resolved_provider_path: str) -> bool:
+    return resolved_provider_path in {"distributed", "distributed_with_local_fallback"}
+
+
 def _extract_chat_completion_options(data: dict) -> dict:
     """Pass through compatible OpenAI-style chat options to compute providers."""
 
@@ -479,6 +483,16 @@ def _handle_chat_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
+        if not _is_relay_capable_provider_path(resolved_provider_path):
+            supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
+            if model_id not in supported_model_ids:
+                return format_error_response(
+                    f"Model '{model_id}' is not supported by API v1.",
+                    error_type="invalid_request_error",
+                    param="model",
+                    code="model_not_supported",
+                    status_code=400,
+                )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -652,6 +666,16 @@ def _handle_text_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
+        if not _is_relay_capable_provider_path(resolved_provider_path):
+            supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
+            if model_id not in supported_model_ids:
+                return format_error_response(
+                    f"Model '{model_id}' is not supported by API v1.",
+                    error_type="invalid_request_error",
+                    param="model",
+                    code="model_not_supported",
+                    status_code=400,
+                )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,

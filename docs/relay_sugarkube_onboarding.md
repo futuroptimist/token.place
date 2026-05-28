@@ -141,12 +141,12 @@ Verification commands:
 
 ```bash
 # Compare local chart metadata with OCI package metadata.
-helm show chart ./deploy/charts/tokenplace-relay
+helm show chart ./charts/tokenplace
 helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
 
 # Render local and OCI manifests, then diff strategy/env sections.
-helm template tokenplace ./deploy/charts/tokenplace-relay --namespace tokenplace > /tmp/tokenplace-local.yaml
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace > /tmp/tokenplace-oci.yaml
+helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-local.yaml
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=main-REPLACE_SHORTSHA > /tmp/tokenplace-oci.yaml
 diff -u /tmp/tokenplace-local.yaml /tmp/tokenplace-oci.yaml | less
 ```
 
@@ -180,12 +180,12 @@ Required fix:
 Verification commands:
 
 ```bash
-kubectl -n tokenplace get deploy tokenplace -o yaml | grep -n "XDG_CONFIG_HOME\\|XDG_CACHE_HOME\\|XDG_DATA_HOME" -A1 -B1
+kubectl -n tokenplace get deploy tokenplace -o yaml | grep -n "XDG_CONFIG_HOME\\|XDG_CACHE_HOME\\|XDG_DATA_HOME\\|XDG_STATE_HOME" -A1 -B1
 kubectl -n tokenplace logs deploy/tokenplace --tail=200
 ```
 
 Expected:
-- `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `XDG_DATA_HOME` are set under container env.
+- `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME` are set under container env.
 - No read-only filesystem write failure appears in logs after rollout.
 
 ### 4) Duplicate environment variable rendering warnings
@@ -198,7 +198,22 @@ Verification commands:
 
 ```bash
 grep -n "name: TOKENPLACE_" -A1 /tmp/tokenplace-oci.yaml
-awk '/env:/{flag=1;next}/imagePullPolicy:/{flag=0}flag' /tmp/tokenplace-oci.yaml | grep "name:" | sort | uniq -d
+python - <<'PY'
+import sys, yaml
+from collections import Counter
+
+with open('/tmp/tokenplace-oci.yaml', 'r', encoding='utf-8') as f:
+    docs=[d for d in yaml.safe_load_all(f) if isinstance(d, dict)]
+
+for d in docs:
+    if d.get('kind') != 'Deployment':
+        continue
+    for c in d.get('spec', {}).get('template', {}).get('spec', {}).get('containers', []):
+        names=[e.get('name') for e in c.get('env', []) if isinstance(e, dict) and e.get('name')]
+        dupes=[k for k,v in Counter(names).items() if v>1]
+        if dupes:
+            print(f"{d.get('metadata', {}).get('name','<unknown>')}:{c.get('name','<unknown>')} duplicates: {', '.join(dupes)}")
+PY
 helm upgrade --install tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace --dry-run=client
 ```
 

@@ -234,7 +234,32 @@ Verification focus:
 - Validate end-to-end register/poll/request/reply path with an actual external node, not relay
   pod health alone.
 
-### 6) Health checks green before true relay flow validation
+### 6) Readiness probe exhausted public API rate limit
+
+Symptom:
+- Kubernetes readiness probes receive `429` from `/healthz`, causing the pod to become unready
+  and public health checks to return `503`.
+
+Cause:
+- A 10-second kube-probe cadence sends 360 `/healthz` requests per hour. The staging default
+  public API quota (`API_RATE_LIMIT=60/hour`) previously counted `/healthz`, so probes could
+  consume the public API quota even while the relay process was healthy.
+
+Expected behavior:
+- Operational endpoints (`/livez`, `/healthz`, `/metrics`, and `/relay/diagnostics`) and API v1
+  relay compute-node heartbeat/control-plane routes are exempt from the public user API quota.
+- Public chat/completions routes remain rate-limited and continue returning OpenAI-style rate-limit
+  errors for user traffic.
+
+Verification commands:
+
+```bash
+curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/livez
+curl -fsS https://staging.token.place/metrics | head -n 20
+```
+
+### 7) Health checks green before true relay flow validation
 
 Warning:
 - `/livez`, `/healthz`, `/`, and `/metrics` are necessary checks but **not sufficient** for

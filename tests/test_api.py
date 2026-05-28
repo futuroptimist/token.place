@@ -113,6 +113,28 @@ def _encrypt_messages_for_server(messages, server_public_key):
         'iv': base64.b64encode(iv).decode('utf-8'),
     }
 
+
+def test_api_public_chat_completion_rate_limit_regression(monkeypatch):
+    """Public chat completions should remain covered by the global API quota."""
+    from flask import Flask
+
+    from api import init_app
+
+    monkeypatch.setenv("API_RATE_LIMIT", "1/minute")
+    monkeypatch.delenv("API_DAILY_QUOTA", raising=False)
+    test_app = Flask(__name__)
+    init_app(test_app)
+
+    with test_app.test_client() as isolated_client:
+        first_response = isolated_client.post("/api/v1/chat/completions", json={})
+        limited_response = isolated_client.post("/api/v1/chat/completions", json={})
+
+    assert first_response.status_code != 429
+    assert limited_response.status_code == 429
+    payload = limited_response.get_json()
+    assert payload["error"]["code"] == "rate_limit_exceeded"
+
+
 def test_api_health(client):
     """Test the API health endpoint"""
     response = client.get("/api/v1/health")

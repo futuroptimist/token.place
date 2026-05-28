@@ -127,3 +127,104 @@ def test_production_with_rate_limit_storage_uri_uses_explicit_backend():
 
     assert limiter is limiter_instance
     assert limiter_cls.call_args.kwargs["storage_uri"] == "memcached://127.0.0.1:11211"
+
+
+def _make_rate_limited_app_with_operational_routes():
+    app = Flask(__name__)
+    init_app(app)
+
+    app.add_url_rule("/healthz", "healthz", lambda: {"status": "ok"})
+    app.add_url_rule("/livez", "livez", lambda: {"status": "alive"})
+    app.add_url_rule(
+        "/relay/diagnostics",
+        "relay_diagnostics",
+        lambda: {"status": "ok"},
+    )
+    app.add_url_rule(
+        "/api/v1/relay/servers/register",
+        "api_v1_relay_servers_register",
+        lambda: {"registered": True},
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/v1/relay/servers/poll",
+        "api_v1_relay_servers_poll",
+        lambda: {"message": "No requests available"},
+        methods=["POST"],
+    )
+    return app
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "60/hour"}, clear=True)
+def test_healthz_exempt_from_staging_default_rate_limit_after_many_calls():
+    """Staging default 60/hour must not exhaust Kubernetes readiness checks."""
+    app = _make_rate_limited_app_with_operational_routes()
+
+    with app.test_client() as client:
+        responses = [client.get("/healthz") for _ in range(120)]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert not any(response.status_code == 429 for response in responses)
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "60/hour"}, clear=True)
+def test_kubernetes_probe_cadence_cannot_exhaust_healthz_quota():
+    """A 10s kube-probe cadence produces 360 hits/hour and should remain ready."""
+    app = _make_rate_limited_app_with_operational_routes()
+
+    with app.test_client() as client:
+        for _ in range(360):
+            response = client.get(
+                "/healthz",
+                headers={"User-Agent": "kube-probe/1.29", "Accept": "*/*"},
+            )
+            assert response.status_code == 200
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "60/hour"}, clear=True)
+def test_operational_routes_are_exempt_from_public_api_quota():
+    """Liveness, metrics, and relay diagnostics should not consume public API quota."""
+    app = _make_rate_limited_app_with_operational_routes()
+
+    with app.test_client() as client:
+        for path in ("/livez", "/metrics", "/relay/diagnostics"):
+            responses = [client.get(path) for _ in range(75)]
+            assert all(response.status_code != 429 for response in responses), path
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"}, clear=True)
+def test_public_chat_completion_route_still_uses_default_rate_limit():
+    """Public chat completions should keep OpenAI-style rate limiting."""
+    app = _make_rate_limited_app_with_operational_routes()
+
+    with app.test_client() as client:
+        first_response = client.post("/api/v1/chat/completions", json={})
+        limited_response = client.post("/api/v1/chat/completions", json={})
+
+    assert first_response.status_code != 429
+    assert limited_response.status_code == 429
+    payload = limited_response.get_json()
+    assert payload["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "60/hour"}, clear=True)
+def test_api_v1_compute_node_register_and_poll_exempt_from_public_quota():
+    """Compute-node heartbeat control-plane routes must not inherit 60/hour."""
+    app = _make_rate_limited_app_with_operational_routes()
+
+    with app.test_client() as client:
+        register_responses = [
+            client.post(
+                "/api/v1/relay/servers/register", json={"server_public_key": "node"}
+            )
+            for _ in range(75)
+        ]
+        poll_responses = [
+            client.post(
+                "/api/v1/relay/servers/poll", json={"server_public_key": "node"}
+            )
+            for _ in range(75)
+        ]
+
+    assert all(response.status_code == 200 for response in register_responses)
+    assert all(response.status_code == 200 for response in poll_responses)

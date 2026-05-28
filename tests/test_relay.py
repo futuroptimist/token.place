@@ -794,6 +794,42 @@ def test_faucet_unknown_server(client):
     assert data['error'] == {'message': 'Server with the specified public key not found', 'code': 404}
 
 
+def test_healthz_ignores_public_api_rate_limit_under_probe_burst(client):
+    """Readiness probes should not be blocked by the global public API quota."""
+    responses = [
+        client.get("/healthz", headers={"User-Agent": "kube-probe/1.29"})
+        for _ in range(120)
+    ]
+
+    assert all(response.status_code != 429 for response in responses)
+    assert responses[-1].status_code in {200, 503}
+
+
+def test_relay_operational_diagnostics_ignore_public_api_rate_limit(client):
+    """Relay diagnostics should stay available during public API quota pressure."""
+    responses = [client.get("/relay/diagnostics") for _ in range(75)]
+
+    assert all(response.status_code == 200 for response in responses)
+
+
+def test_api_v1_register_and_poll_ignore_public_api_rate_limit(client, monkeypatch):
+    """Compute-node heartbeat routes should not inherit the public 60/hour quota."""
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    server_payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
+
+    register_responses = [
+        client.post("/api/v1/relay/servers/register", json=server_payload)
+        for _ in range(75)
+    ]
+    poll_responses = [
+        client.post("/api/v1/relay/servers/poll", json=server_payload)
+        for _ in range(75)
+    ]
+
+    assert all(response.status_code == 200 for response in register_responses)
+    assert all(response.status_code == 200 for response in poll_responses)
+
+
 def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monkeypatch):
     """Diagnostics should expose configured URLs and live compute registrations."""
     monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)

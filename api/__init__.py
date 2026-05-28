@@ -15,6 +15,20 @@ from api.v2 import routes as v2_routes
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 
+RATE_LIMIT_EXEMPT_PATHS = frozenset(
+    {
+        "/livez",
+        "/healthz",
+        "/metrics",
+        "/relay/diagnostics",
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/poll",
+        "/api/v1/relay/servers/next",
+        "/api/v1/relay/responses",
+        "/api/v1/relay/responses/retrieve",
+    }
+)
+
 
 def _resolve_rate_limit_storage_uri() -> str | None:
     raw_value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
@@ -66,6 +80,10 @@ def init_app(app):
         app=app,
         **limiter_kwargs,
     )
+
+    @limiter.request_filter
+    def _exempt_operational_and_relay_control_plane_routes() -> bool:
+        return request.path.rstrip("/") in RATE_LIMIT_EXEMPT_PATHS
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):

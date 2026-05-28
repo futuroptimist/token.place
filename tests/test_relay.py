@@ -794,12 +794,16 @@ def test_faucet_unknown_server(client):
     assert data['error'] == {'message': 'Server with the specified public key not found', 'code': 404}
 
 
-def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
+def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monkeypatch):
     """Diagnostics should expose configured URLs and live compute registrations."""
-    app.config["relay_configured_servers"] = [
+    monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setitem(app.config, "relay_configured_servers", [
         "https://configured-one.example.com:8000",
         "https://configured-two.example.com:8000",
-    ]
+    ])
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         "public_key": DUMMY_SERVER_PUB_KEY,
         "last_ping": datetime.now(),
@@ -814,9 +818,28 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client):
     payload = response.get_json()
 
     assert payload["configured_upstream_servers"] == app.config["relay_configured_servers"]
+    assert payload["legacy_configured_upstream_servers"] == []
+    assert payload["upstream_health_required"] is False
+    assert payload["relay_only"] is False
     assert payload["total_registered_compute_nodes"] == 1
     assert payload["registered_compute_nodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
+
+
+def test_relay_diagnostics_reports_explicit_upstream_env(client, monkeypatch):
+    """Diagnostics should retain configured_upstream_servers for explicit upstream env config."""
+    configured_servers = ["https://configured-one.example.com:8000"]
+    monkeypatch.setitem(app.config, "relay_configured_servers", configured_servers)
+    monkeypatch.setenv("TOKENPLACE_RELAY_UPSTREAM_URL", "https://gpu.example.com:5015")
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["configured_upstream_servers"] == configured_servers
+    assert payload["legacy_configured_upstream_servers"] == []
+    assert payload["relay_only"] is False
+    assert payload["upstream_health_required"] is False
 
 
 def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monkeypatch):
@@ -842,11 +865,15 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monke
         }
     ]
 
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_UPSTREAMS", ",".join(configured_servers))
     response = client.get("/healthz")
     assert response.status_code == 200
     payload = response.get_json()
 
     assert payload["configuredUpstreamServers"] == configured_servers
+    assert payload["upstreamHealthRequired"] is False
+    assert payload["relayOnly"] is False
+    assert payload["legacyConfiguredUpstreamServers"] == []
     assert payload["registeredServers"][0]["server_public_key"] == live_server_key
     assert payload["registeredServers"][0]["age_seconds"] >= 0
     assert payload["registeredServers"][0]["queue_depth"] == 1
@@ -887,8 +914,12 @@ def test_livez_remains_alive_when_draining(client):
 def test_healthz_default_allows_unresolvable_upstream_host(client, monkeypatch):
     """healthz should stay ready by default for relay-only deployments."""
     monkeypatch.setitem(app.config, "gpu_host", "definitely-not-resolvable.invalid")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
     monkeypatch.setattr(relay_module, "_can_resolve_gpu_host", lambda _host: False)
     monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
 
     response = client.get("/healthz")
     payload = response.get_json()
@@ -896,6 +927,10 @@ def test_healthz_default_allows_unresolvable_upstream_host(client, monkeypatch):
     assert response.status_code == 200
     assert payload["status"] == "ok"
     assert payload["gpuHost"] == "definitely-not-resolvable.invalid"
+    assert payload["upstreamHealthRequired"] is False
+    assert payload["relayOnly"] is True
+    assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
+    assert payload["configuredUpstreamServers"] == ["https://token.place"]
     assert payload.get("details", {}).get("gpuHostResolution") != "failed"
 
 
@@ -910,7 +945,67 @@ def test_healthz_requires_upstream_health_when_env_enabled(client, monkeypatch):
 
     assert response.status_code == 503
     assert payload["status"] == "degraded"
+    assert payload["upstreamHealthRequired"] is True
+    assert payload["relayOnly"] is False
     assert payload["details"]["gpuHostResolution"] == "failed"
+
+
+def test_healthz_staging_relay_only_does_not_imply_prod_upstream(client, monkeypatch):
+    """Staging relay-only health should be OK with zero registered external nodes."""
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setitem(app.config, "public_base_url", "https://staging.token.place")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["publicBaseUrl"] == "https://staging.token.place"
+    assert payload["knownServers"] == 0
+    assert payload["relayOnly"] is True
+    assert payload["upstreamHealthRequired"] is False
+    assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
+    assert payload["configuredUpstreamServers"] == ["https://token.place"]
+    assert payload.get("details", {}).get("knownServers") == "empty"
+
+
+def test_healthz_malformed_upstreams_env_keeps_default_as_legacy(client, monkeypatch):
+    """Malformed upstream list env should not mark fallback default as explicit config."""
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_UPSTREAMS", '{"url":"https://ignored"}')
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["relayOnly"] is True
+    assert payload["configuredUpstreamServers"] == ["https://token.place"]
+    assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
+
+
+def test_healthz_custom_configured_servers_are_not_reported_as_legacy(client, monkeypatch):
+    """Custom configured server pools should be treated as explicit/non-legacy."""
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://custom.upstream.example"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["relayOnly"] is False
+    assert payload["configuredUpstreamServers"] == ["https://custom.upstream.example"]
+    assert payload["legacyConfiguredUpstreamServers"] == []
 
 
 def test_relay_entrypoint_defaults_to_one_worker():

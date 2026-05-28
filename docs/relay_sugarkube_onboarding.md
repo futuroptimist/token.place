@@ -117,6 +117,46 @@ curl -fsS https://token.place/
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).
 
+### Relay-only health output expectations (staging and production)
+
+For Sugarkube relay-only deployments, healthy relay readiness does **not** require
+`TOKENPLACE_RELAY_UPSTREAM_URL` or an in-cluster GPU service. External compute nodes can register
+later.
+
+Before (misleading in relay-only mode):
+
+```json
+{
+  "status": "ok",
+  "publicBaseUrl": "https://staging.token.place",
+  "knownServers": 0,
+  "configuredUpstreamServers": ["https://token.place"],
+  "upstream": "http://gpu-server:3000"
+}
+```
+
+After (explicit relay-only semantics):
+
+```json
+{
+  "status": "ok",
+  "publicBaseUrl": "https://staging.token.place",
+  "relayOnly": true,
+  "upstreamHealthRequired": false,
+  "knownServers": 0,
+  "configuredUpstreamServers": ["https://token.place"],
+  "legacyConfiguredUpstreamServers": ["https://token.place"],
+  "upstream": "http://gpu-server:3000",
+  "details": {"knownServers": "empty"}
+}
+```
+
+Interpretation:
+- `status: ok` reflects relay process readiness.
+- `knownServers: 0` means no registered external compute nodes yet (expected before node registration).
+- `configuredUpstreamServers` is retained as a stable compatibility key.
+- `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
+
 ## Guardrails
 
 - Keep API v1 relay-blind E2EE invariants intact (ciphertext only + safe routing metadata).

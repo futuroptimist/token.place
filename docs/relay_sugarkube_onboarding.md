@@ -117,6 +117,16 @@ curl -fsS https://token.place/
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).
 
+Expected relay-only staging `/healthz` behavior:
+
+- `status: "ok"` and HTTP 200 when relay process is healthy.
+- `knownServers: 0` before external compute nodes register (this is not degraded relay health).
+- `relayOnly: true` and `upstreamHealthRequired: false` when
+  `TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0`.
+- `configuredUpstreamServers` may be empty in relay-only mode; any inherited
+  legacy default appears under `legacyConfiguredUpstreamServers` and does **not**
+  mean staging depends on production upstreams.
+
 ## Guardrails
 
 - Keep API v1 relay-blind E2EE invariants intact (ciphertext only + safe routing metadata).

@@ -246,6 +246,7 @@ PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_COMPAT_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
 REQUIRE_UPSTREAM_HEALTH_ENV = "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"
+DEFAULT_LEGACY_UPSTREAM_URL = "https://token.place"
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -306,6 +307,18 @@ def _load_public_base_url() -> str | None:
             return trimmed
 
     return None
+
+
+def _configured_upstream_metadata(configured_servers: list[str]) -> dict[str, Any]:
+    """Classify configured upstreams to avoid implying production coupling in relay-only mode."""
+
+    normalized = [str(server).strip().rstrip("/") for server in configured_servers if str(server).strip()]
+    unique = list(dict.fromkeys(normalized))
+    has_only_legacy_default = unique == [DEFAULT_LEGACY_UPSTREAM_URL]
+    return {
+        "explicit_servers": [] if has_only_legacy_default else unique,
+        "legacy_servers": unique if has_only_legacy_default else [],
+    }
 
 
 def create_app() -> Flask:
@@ -619,10 +632,16 @@ def healthz():
     _evict_stale_servers()
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
+    configured_upstreams = _configured_upstream_metadata(configured_servers)
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    relay_only_mode = not require_upstream_health
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
-        "configuredUpstreamServers": configured_servers,
+        "configuredUpstreamServers": configured_upstreams["explicit_servers"],
+        "legacyConfiguredUpstreamServers": configured_upstreams["legacy_servers"],
+        "upstreamHealthRequired": require_upstream_health,
+        "relayOnly": relay_only_mode,
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
         "registeredServers": _live_server_diagnostics(),
@@ -639,7 +658,6 @@ def healthz():
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
@@ -790,8 +808,14 @@ def relay_diagnostics():
     """Live diagnostics for legacy relay registered compute nodes."""
     _evict_stale_servers()
     live_nodes = _live_server_diagnostics()
+    configured_servers = app.config.get("relay_configured_servers", [])
+    configured_upstreams = _configured_upstream_metadata(configured_servers)
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     return jsonify({
-        "configured_upstream_servers": app.config.get("relay_configured_servers", []),
+        "configured_upstream_servers": configured_upstreams["explicit_servers"],
+        "legacy_configured_upstream_servers": configured_upstreams["legacy_servers"],
+        "upstream_health_required": require_upstream_health,
+        "relay_only": not require_upstream_health,
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
     })

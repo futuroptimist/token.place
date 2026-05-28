@@ -324,7 +324,7 @@ def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client,
     assert body['error']['code'] == 'model_not_supported'
 
 
-def test_api_v1_chat_completion_distributed_allows_model_absent_from_local_catalogue(client, monkeypatch):
+def test_api_v1_chat_completion_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
     monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
     monkeypatch.setattr('api.v1.routes.validate_chat_messages', lambda msgs: None)
 
@@ -338,7 +338,7 @@ def test_api_v1_chat_completion_distributed_allows_model_absent_from_local_catal
 
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: FakeDistributedProvider())
-    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed_with_local_fallback')
     monkeypatch.setattr('api.v1.routes.get_api_v1_last_backend_path', lambda: 'distributed_relay_e2ee')
 
     response = client.post('/api/v1/chat/completions', json={
@@ -349,6 +349,34 @@ def test_api_v1_chat_completion_distributed_allows_model_absent_from_local_catal
     assert response.status_code == 200
     assert captured['model_id'] == 'remote-only-model'
     assert response.get_json()['choices'][0]['message']['content'] == 'distributed ok'
+
+
+
+
+def test_api_v1_completions_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+
+    captured = {}
+
+    class FakeDistributedProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured['model_id'] = model_id
+            captured['messages'] = messages
+            return {'role': 'assistant', 'content': 'distributed completion ok'}
+
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: FakeDistributedProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed_with_local_fallback')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_last_backend_path', lambda: 'distributed_relay_e2ee')
+
+    response = client.post('/api/v1/completions', json={
+        'model': 'remote-only-model',
+        'prompt': 'route remotely',
+    })
+
+    assert response.status_code == 200
+    assert captured['model_id'] == 'remote-only-model'
+    assert response.get_json()['choices'][0]['text'] == 'distributed completion ok'
 
 
 def test_api_v1_completions_local_provider_rejects_unsupported_model(client, monkeypatch):

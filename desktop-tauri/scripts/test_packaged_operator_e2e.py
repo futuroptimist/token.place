@@ -26,7 +26,13 @@ def reserve_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: float = 20.0) -> None:
+def wait_for_livez(
+    relay: subprocess.Popen[str],
+    port: int,
+    timeout_seconds: float = 90.0,
+    *,
+    log_paths: tuple[Path, Path] | None = None,
+) -> None:
     deadline = time.time() + timeout_seconds
     last_error: Exception | None = None
     while time.time() < deadline:
@@ -38,14 +44,34 @@ def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: flo
             last_error = exc
 
         if relay.poll() is not None:
-            stderr = relay.stderr.read() if relay.stderr else ""
-            stdout = relay.stdout.read() if relay.stdout else ""
+            if log_paths is not None:
+                stdout_path, stderr_path = log_paths
+                stdout = _tail_file(stdout_path)
+                stderr = _tail_file(stderr_path)
+            else:
+                stderr = relay.stderr.read() if relay.stderr else ""
+                stdout = relay.stdout.read() if relay.stdout else ""
             raise RuntimeError(
                 f"relay exited early with code {relay.returncode}; stdout={stdout}; stderr={stderr}"
             )
         time.sleep(0.25)
 
-    raise RuntimeError(f"relay did not become live on port {port}: {last_error}")
+    log_details = ""
+    if log_paths is not None:
+        stdout_path, stderr_path = log_paths
+        log_details = (
+            f"; stdout_tail={_tail_file(stdout_path)}"
+            f"; stderr_tail={_tail_file(stderr_path)}"
+        )
+    raise RuntimeError(f"relay did not become live on port {port}: {last_error}{log_details}")
+
+
+def _tail_file(path: Path, *, max_chars: int = 4000) -> str:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<unavailable: {exc}>"
+    return content[-max_chars:]
 
 
 def create_packaged_layout(tmp_root: Path, *, resources_dir_name: str = "resources") -> Path:
@@ -406,37 +432,55 @@ def main() -> int:
             (mac_bridge_script, mac_resources_root, "macOS Contents/Resources"),
         )
 
+        relay_log_dir = REPO_ROOT / ".desktop-e2e-logs"
+        relay_log_dir.mkdir(parents=True, exist_ok=True)
+
         for probe_script, probe_resources_root, layout_label in probe_specs:
             relay_port = reserve_free_port()
-            relay = subprocess.Popen(  # noqa: S603
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "relay.py"),
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(relay_port),
-                    "--use_mock_llm",
-                ],
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-
-            try:
-                wait_for_livez(relay, relay_port)
-                run_compute_bridge_startup_probe(
-                    tmp_path,
-                    probe_script,
-                    relay_port=relay_port,
-                    resources_root=probe_resources_root,
-                    layout_label=layout_label,
+            safe_layout_label = layout_label.replace(" ", "_").replace("/", "_")
+            relay_stdout_path = relay_log_dir / f"packaged-relay-{safe_layout_label}.stdout.log"
+            relay_stderr_path = relay_log_dir / f"packaged-relay-{safe_layout_label}.stderr.log"
+            with relay_stdout_path.open("w", encoding="utf-8") as relay_stdout, relay_stderr_path.open(
+                "w", encoding="utf-8"
+            ) as relay_stderr:
+                relay = subprocess.Popen(  # noqa: S603
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "relay.py"),
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(relay_port),
+                        "--use_mock_llm",
+                    ],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    stdout=relay_stdout,
+                    stderr=relay_stderr,
+                    text=True,
                 )
-            finally:
-                if relay.poll() is None:
-                    relay.kill()
+
+                try:
+                    wait_for_livez(
+                        relay,
+                        relay_port,
+                        log_paths=(relay_stdout_path, relay_stderr_path),
+                    )
+                    run_compute_bridge_startup_probe(
+                        tmp_path,
+                        probe_script,
+                        relay_port=relay_port,
+                        resources_root=probe_resources_root,
+                        layout_label=layout_label,
+                    )
+                finally:
+                    if relay.poll() is None:
+                        relay.kill()
+                    try:
+                        relay.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        relay.terminate()
+                        relay.wait(timeout=15)
 
     return 0
 

@@ -127,3 +127,123 @@ def test_production_with_rate_limit_storage_uri_uses_explicit_backend():
 
     assert limiter is limiter_instance
     assert limiter_cls.call_args.kwargs["storage_uri"] == "memcached://127.0.0.1:11211"
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_staging_healthz_is_exempt_from_default_public_rate_limit():
+    """Staging's default 60/hour quota must not block readiness probes."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    with app.test_client() as client:
+        responses = [client.get("/healthz") for _ in range(125)]
+
+    assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_kubernetes_probe_cadence_cannot_exhaust_healthz_quota():
+    """A kube-probe every 10 seconds exceeds 60/hour but /healthz stays ready."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    with app.test_client() as client:
+        # Simulate a little over one hour of 10-second readiness probes.
+        responses = [
+            client.get("/healthz", headers={"User-Agent": "kube-probe/1.29"})
+            for _ in range(361)
+        ]
+
+    assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_operational_routes_are_exempt_from_public_rate_limit():
+    """Operational endpoints should not consume or inherit the user API quota."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.get("/livez")
+    def livez():
+        return {"status": "alive"}
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    @app.get("/relay/diagnostics")
+    def relay_diagnostics():
+        return {"status": "ok"}
+
+    with app.test_client() as client:
+        for path in ("/livez", "/healthz", "/metrics", "/relay/diagnostics"):
+            statuses = [client.get(path).status_code for _ in range(3)]
+            assert statuses == [200, 200, 200]
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota():
+    """Compute-node control-plane heartbeats must be independent from user API limits."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/register")
+    def relay_servers_register():
+        return {"status": "registered"}
+
+    @app.post("/api/v1/relay/servers/poll")
+    def relay_servers_poll():
+        return {"status": "polling"}
+
+    with app.test_client() as client:
+        for path in ("/api/v1/relay/servers/register", "/api/v1/relay/servers/poll"):
+            responses = [
+                client.post(path, json={"server_public_key": "server"})
+                for _ in range(65)
+            ]
+            assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_public_chat_completion_route_still_uses_public_rate_limit():
+    """Public chat traffic should still receive OpenAI-style 429 responses."""
+    app = Flask(__name__)
+    init_app(app)
+
+    with app.test_client() as client:
+        assert client.post("/api/v1/chat/completions", json={}).status_code != 429
+        assert client.post("/api/v1/chat/completions", json={}).status_code != 429
+        response = client.post("/api/v1/chat/completions", json={})
+
+    assert response.status_code == 429
+    body = response.get_json()
+    assert body is not None
+    assert body["error"]["code"] == "rate_limit_exceeded"

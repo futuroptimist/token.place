@@ -62,6 +62,35 @@ def client():
     streaming_sessions_by_client.clear()
 
 
+def test_operational_endpoints_are_not_rate_limited_by_public_quota(client):
+    """Health, liveness, metrics, and diagnostics stay outside user API quotas."""
+
+    paths = ("/healthz", "/livez", "/metrics", "/relay/diagnostics")
+
+    for path in paths:
+        responses = [client.get(path) for _ in range(105)]
+        assert 429 not in {response.status_code for response in responses}
+
+
+def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, monkeypatch):
+    """Compute-provider register/poll heartbeats stay outside the public API quota."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
+
+    register_responses = [
+        client.post("/api/v1/relay/servers/register", json=payload)
+        for _ in range(65)
+    ]
+    assert {response.status_code for response in register_responses} == {200}
+
+    poll_responses = [
+        client.post("/api/v1/relay/servers/poll", json=payload)
+        for _ in range(65)
+    ]
+    assert {response.status_code for response in poll_responses} == {200}
+
+
 def test_inference_endpoint_removed(client):
     """Ensure deprecated /inference endpoint is unavailable."""
     response = client.post("/inference", json={})

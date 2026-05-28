@@ -15,6 +15,29 @@ from api.v2 import routes as v2_routes
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 
+# Paths that support operations, health checking, metrics scraping, and relay
+# compute-node control-plane heartbeats must not consume the public user API
+# quota. Kubernetes readiness probes can call /healthz every few seconds, and
+# API v1 compute providers poll/register independently of end-user chat traffic.
+RATE_LIMIT_EXEMPT_PATHS = frozenset({
+    "/livez",
+    "/healthz",
+    "/metrics",
+    "/relay/diagnostics",
+    "/api/v1/relay/servers/register",
+    "/api/v1/relay/servers/poll",
+    "/api/v1/relay/servers/next",
+    "/api/v1/relay/responses",
+    "/api/v1/relay/responses/retrieve",
+})
+
+
+def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
+    """Return True when a route should not consume the public API quota."""
+
+    normalized_path = path.rstrip("/") or "/"
+    return normalized_path in RATE_LIMIT_EXEMPT_PATHS
+
 
 def _resolve_rate_limit_storage_uri() -> str | None:
     raw_value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
@@ -66,6 +89,10 @@ def init_app(app):
         app=app,
         **limiter_kwargs,
     )
+
+    @limiter.request_filter
+    def _exempt_operational_and_relay_control_plane_paths() -> bool:
+        return _is_public_api_rate_limit_exempt_path(request.path)
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):

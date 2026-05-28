@@ -840,9 +840,16 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
-def _select_next_server_payload():
+def _select_next_server_payload(*, api_v1: bool = False):
     _evict_stale_servers()
     if not known_servers:
+        if api_v1:
+            return jsonify({
+                'error': {
+                    'message': 'No registered compute nodes are available on this relay.',
+                    'code': 'no_registered_compute_nodes',
+                }
+            }), 503
         return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
     server_public_key = secrets.choice(list(known_servers.keys()))
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
@@ -865,7 +872,7 @@ def next_server():
 @app.route('/api/v1/relay/servers/next', methods=['GET'])
 def api_v1_relay_servers_next():
     """Get a registered compute node public key for API v1 encrypted relay requests."""
-    return _select_next_server_payload()
+    return _select_next_server_payload(api_v1=True)
 
 
 @app.route('/relay/diagnostics', methods=['GET'])

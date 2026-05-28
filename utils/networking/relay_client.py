@@ -141,7 +141,7 @@ _API_V1_SENSITIVE_BODY_KEYS = {
 
 
 def _redact_sensitive_text(text: Any, *, secrets: Tuple[str, ...] = ()) -> str:
-    """Return a compact text representation with known sensitive values removed."""
+    """Return a compact single-line text representation with sensitive values removed."""
 
     rendered = text if isinstance(text, str) else str(text)
     for secret in secrets:
@@ -163,12 +163,14 @@ def _redact_sensitive_text(text: Any, *, secrets: Tuple[str, ...] = ()) -> str:
     for pattern, replacement in replacements:
         rendered = re.sub(pattern, replacement, rendered)
 
+    rendered = re.sub(r"[\r\n\x00]+", " ", rendered)
+
     if len(rendered) > _API_V1_BODY_SNIPPET_LIMIT:
         return rendered[:_API_V1_BODY_SNIPPET_LIMIT] + "..."
     return rendered
 
 
-def _sanitize_api_v1_json_body(value: Any) -> Any:
+def _sanitize_api_v1_json_body(value: Any, *, secrets: Tuple[str, ...] = ()) -> Any:
     """Sanitize a relay error JSON body before it is logged or returned."""
 
     if isinstance(value, dict):
@@ -178,12 +180,12 @@ def _sanitize_api_v1_json_body(value: Any) -> Any:
             if key_text.lower() in _API_V1_SENSITIVE_BODY_KEYS:
                 sanitized[key_text] = _API_V1_REDACTED
             else:
-                sanitized[key_text] = _sanitize_api_v1_json_body(item)
+                sanitized[key_text] = _sanitize_api_v1_json_body(item, secrets=secrets)
         return sanitized
     if isinstance(value, list):
-        return [_sanitize_api_v1_json_body(item) for item in value[:10]]
+        return [_sanitize_api_v1_json_body(item, secrets=secrets) for item in value[:10]]
     if isinstance(value, str):
-        return _redact_sensitive_text(value)
+        return _redact_sensitive_text(value, secrets=secrets)
     return value
 
 
@@ -199,7 +201,7 @@ def _safe_api_v1_response_body_snippet(
         parsed_json = None
 
     if parsed_json is not None:
-        sanitized = _sanitize_api_v1_json_body(parsed_json)
+        sanitized = _sanitize_api_v1_json_body(parsed_json, secrets=secrets)
         try:
             rendered = json.dumps(sanitized, sort_keys=True, separators=(",", ":"))
         except (TypeError, ValueError):
@@ -897,20 +899,24 @@ class RelayClient:
         parsed_url = urlparse(url)
         path = parsed_url.path or "/"
         headers = _api_v1_response_headers(response)
+        secrets = (
+            self._registration_token or "",
+            getattr(self.crypto_manager, "public_key_b64", ""),
+        )
         body_snippet, parsed_json = _safe_api_v1_response_body_snippet(
             response,
-            secrets=(
-                self._registration_token or "",
-                getattr(self.crypto_manager, "public_key_b64", ""),
-            ),
+            secrets=secrets,
         )
         relay_error = None
         if isinstance(parsed_json, dict):
             raw_error = parsed_json.get("error")
             if isinstance(raw_error, str):
-                relay_error = _redact_sensitive_text(raw_error)
+                relay_error = _redact_sensitive_text(raw_error, secrets=secrets)
             elif isinstance(raw_error, dict):
-                relay_error = json.dumps(raw_error, sort_keys=True, separators=(",", ":"))
+                relay_error = _redact_sensitive_text(
+                    json.dumps(raw_error, sort_keys=True, separators=(",", ":")),
+                    secrets=secrets,
+                )
 
         server_header = headers.get("server", "")
         cf_ray = headers.get("cf-ray")

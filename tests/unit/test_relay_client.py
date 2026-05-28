@@ -38,6 +38,25 @@ TEST_NO_REQUEST_RESPONSE = {
 }
 
 
+def _load_compute_node_bridge_module():
+    import importlib.util
+
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "desktop-tauri"
+        / "src-tauri"
+        / "python"
+        / "compute_node_bridge.py"
+    )
+    module_dir = str(module_path.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+    spec = importlib.util.spec_from_file_location("compute_node_bridge_for_unit_test", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_load_jsonschema_returns_none_on_import_error(monkeypatch):
@@ -865,7 +884,7 @@ class TestRelayClient:
             'content-type': 'text/html; charset=UTF-8',
         }
         response.text = (
-            '<html>403 forbidden X-Relay-Server-Token: super-secret-token '
+            '<html>\n403 forbidden\r\nX-Relay-Server-Token: super-secret-token\x00 '
             'server_public_key=server-public-key-secret private_key=do-not-log</html>'
         )
         response.json.side_effect = ValueError('not json')
@@ -889,6 +908,18 @@ class TestRelayClient:
         assert diagnostic['token_sent'] is True
         assert diagnostic['probable_pre_app_rejection'] is True
         assert '403 forbidden' in diagnostic['body_snippet']
+        assert len(diagnostic['body_snippet']) <= relay_client_module._API_V1_BODY_SNIPPET_LIMIT + 3
+        assert '\n' not in diagnostic['body_snippet']
+        assert '\r' not in diagnostic['body_snippet']
+        assert '\x00' not in diagnostic['body_snippet']
+        http_log = next(
+            record.getMessage()
+            for record in caplog.records
+            if 'api_v1.relay_http_error' in record.getMessage()
+        )
+        assert '\n' not in http_log
+        assert '\r' not in http_log
+        assert '\x00' not in http_log
         logs = caplog.text
         assert 'api_v1.relay_http_error' in logs
         assert 'api_v1.relay_pre_app_rejection' in logs
@@ -972,6 +1003,43 @@ class TestRelayClient:
         for forbidden in ('super-secret-token', 'server-public-key-secret'):
             assert forbidden not in logs
             assert forbidden not in json.dumps(result, sort_keys=True)
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=401)
+        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.text = (
+            '{"error":"bad super-secret-token server-public-key-secret",'
+            '"detail":{"message":"bad super-secret-token server-public-key-secret"}}'
+        )
+        response.json.return_value = {
+            'error': 'bad super-secret-token server-public-key-secret',
+            'detail': {
+                'message': 'bad super-secret-token server-public-key-secret',
+            },
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        bridge = _load_compute_node_bridge_module()
+        summary = bridge._relay_response_summary(result)
+
+        assert result['relay_error_kind'] == 'relay_json_error'
+        assert result['relay_error'] == 'bad [redacted] [redacted]'
+        assert (
+            result['relay_http_diagnostic']['body_snippet']
+            == '{"detail":{"message":"bad [redacted] [redacted]"},"error":"bad [redacted] [redacted]"}'
+        )
+        for rendered in (caplog.text, json.dumps(result, sort_keys=True), summary):
+            assert 'super-secret-token' not in rendered
+            assert 'server-public-key-secret' not in rendered
 
     def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
         assert RelayClient._build_api_v1_url(

@@ -2082,3 +2082,34 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
     next_response = client.get('/api/v1/relay/servers/next')
     assert next_response.status_code == 200
     assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+
+
+def test_healthz_not_limited_by_staging_default_public_quota(client):
+    """Repeated readiness probes should not exhaust the public API limit."""
+
+    for _ in range(105):
+        response = client.get("/healthz", headers={"User-Agent": "kube-probe/1.30"})
+        assert response.status_code == 200
+
+
+def test_api_v1_relay_register_and_poll_not_limited_by_public_quota(client, monkeypatch):
+    """Compute-node heartbeat routes should not inherit the public 60/hour limit."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "-1")
+    server_payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
+
+    for _ in range(65):
+        register = client.post("/api/v1/relay/servers/register", json=server_payload)
+        assert register.status_code == 200
+
+    for _ in range(65):
+        poll = client.post("/api/v1/relay/servers/poll", json=server_payload)
+        assert poll.status_code == 200
+
+
+def test_relay_operational_diagnostics_not_limited_by_public_quota(client):
+    """Relay diagnostics must remain available under public API quota pressure."""
+
+    for _ in range(105):
+        response = client.get("/relay/diagnostics")
+        assert response.status_code == 200

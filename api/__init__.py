@@ -15,11 +15,31 @@ from api.v2 import routes as v2_routes
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 
+PUBLIC_API_RATE_LIMIT_EXEMPT_PATHS = frozenset(
+    {
+        "/livez",
+        "/healthz",
+        "/metrics",
+        "/relay/diagnostics",
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/poll",
+        "/api/v1/relay/servers/next",
+        "/api/v1/relay/responses",
+        "/api/v1/relay/responses/retrieve",
+    }
+)
+
 
 def _resolve_rate_limit_storage_uri() -> str | None:
     raw_value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
     storage_uri = raw_value.strip()
     return storage_uri or None
+
+
+def _is_public_api_rate_limit_exempt() -> bool:
+    """Return True when a route should not consume public API quota."""
+
+    return request.path.rstrip("/") in PUBLIC_API_RATE_LIMIT_EXEMPT_PATHS
 
 
 def _build_rate_limit_response(exc: RateLimitExceeded):
@@ -56,7 +76,8 @@ def init_app(app):
         "default_limits": [
             os.environ.get("API_RATE_LIMIT", "60/hour"),
             os.environ.get("API_DAILY_QUOTA", "1000/day"),
-        ]
+        ],
+        "default_limits_exempt_when": _is_public_api_rate_limit_exempt,
     }
     if limiter_storage_uri:
         limiter_kwargs["storage_uri"] = limiter_storage_uri

@@ -260,6 +260,11 @@ curl -fsS https://staging.token.place/relay/diagnostics
 curl -fsS https://staging.token.place/metrics | head -n 40
 ```
 
+Operational note: `/healthz`, `/livez`, `/metrics`, `/relay/diagnostics`, and API v1 relay
+compute-node heartbeat endpoints are exempt from the public API quota. Kubernetes readiness probes
+may hit `/healthz` every 10 seconds; those probes must not exhaust the default `60/hour` user API
+limit or make an otherwise-running pod unready.
+
 ### Image tag, chart version, and Git tag must be validated independently
 
 For final v0.1.0 release readiness, verify all four identifiers explicitly (separate from staging candidate validation):

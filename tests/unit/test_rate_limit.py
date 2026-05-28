@@ -127,3 +127,65 @@ def test_production_with_rate_limit_storage_uri_uses_explicit_backend():
 
     assert limiter is limiter_instance
     assert limiter_cls.call_args.kwargs["storage_uri"] == "memcached://127.0.0.1:11211"
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "60/hour"}, clear=True)
+def test_staging_default_rate_limit_exempts_operational_routes():
+    """Operational routes should not consume the public API quota."""
+
+    app = Flask(__name__)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    @app.get("/livez")
+    def livez():
+        return {"status": "alive"}
+
+    @app.get("/relay/diagnostics")
+    def relay_diagnostics():
+        return {"registered_compute_nodes": []}
+
+    init_app(app)
+
+    with app.test_client() as client:
+        for path in ("/healthz", "/livez", "/metrics", "/relay/diagnostics"):
+            responses = [client.get(path) for _ in range(105)]
+            assert all(response.status_code != 429 for response in responses), path
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "60/hour"}, clear=True)
+def test_kubernetes_probe_cadence_cannot_exhaust_healthz_quota():
+    """A kube-probe hitting /healthz every 10s should not exhaust 60/hour."""
+
+    app = Flask(__name__)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    init_app(app)
+
+    with app.test_client() as client:
+        for _ in range(72):
+            response = client.get("/healthz", headers={"User-Agent": "kube-probe/1.30"})
+            assert response.status_code == 200
+
+
+@patch.dict(os.environ, {"API_RATE_LIMIT": "1/hour"}, clear=True)
+def test_public_chat_completion_route_still_uses_public_rate_limit():
+    """Public chat completions must keep OpenAI-style public API rate limits."""
+
+    app = Flask(__name__)
+    init_app(app)
+
+    with app.test_client() as client:
+        first_response = client.post("/api/v1/chat/completions", json={})
+        limited_response = client.post("/api/v1/chat/completions", json={})
+
+    assert first_response.status_code != 429
+    assert limited_response.status_code == 429
+    body = limited_response.get_json()
+    assert body is not None
+    assert body["error"]["code"] == "rate_limit_exceeded"

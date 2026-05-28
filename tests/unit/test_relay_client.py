@@ -841,7 +841,114 @@ class TestRelayClient:
 
         result = relay_client.register_api_v1_compute_node('http://relay-a.example')
 
-        assert result == {'error': 'HTTP 503', 'next_ping_in_x_seconds': relay_client._request_timeout}
+        assert result['error'] == 'HTTP 503'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert result['error_kind'] == 'http_status_without_json_body'
+
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_403_html_logs_safe_cloudflare_diagnostic(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-registration-token'
+        response = MagicMock(status_code=403)
+        response.headers = {
+            'server': 'cloudflare',
+            'cf-ray': 'abc123-IAD',
+            'cf-cache-status': 'DYNAMIC',
+            'content-type': 'text/html; charset=UTF-8',
+            'x-request-id': 'req-123',
+            'authorization': 'should-not-log',
+        }
+        response.text = (
+            '<html><body>blocked token=super-secret-registration-token '
+            'private_key=desktop-private-key ciphertext=encrypted-payload body></html>'
+        )
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node(
+                'https://staging.token.place?token=do-not-log'
+            )
+
+        log_output = caplog.text
+        assert result['error'] == 'HTTP 403'
+        assert result['error_kind'] == 'cloudflare_pre_app_rejection'
+        assert result['pre_app_rejection'] is True
+        assert result['cf_ray'] == 'abc123-IAD'
+        assert 'api_v1.relay_http_non_200' in log_output
+        assert 'api_v1.relay_pre_app_rejection' in log_output
+        assert 'path=/api/v1/relay/servers/register' in log_output
+        assert 'status=403' in log_output
+        assert "'server': 'cloudflare'" in log_output
+        assert "'cf-ray': 'abc123-IAD'" in log_output
+        assert 'token_sent=True' in log_output
+        assert 'do-not-log' not in log_output
+        assert 'super-secret-registration-token' not in log_output
+        assert 'desktop-private-key' not in log_output
+        assert 'encrypted-payload' not in log_output
+        assert 'should-not-log' not in log_output
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-registration-token'
+        response = MagicMock(status_code=401)
+        response.headers = {
+            'server': 'gunicorn',
+            'content-type': 'application/json',
+            'x-request-id': 'relay-req-456',
+        }
+        response.text = '{"error":"invalid relay registration token"}'
+        response.json.return_value = {'error': 'invalid relay registration token'}
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        log_output = caplog.text
+        assert result['error'] == 'HTTP 401: invalid relay registration token'
+        assert result['error_kind'] == 'relay_json_error'
+        assert result['relay_json_error'] is True
+        assert result['pre_app_rejection'] is False
+        assert 'relay_json_error=invalid relay registration token' in log_output
+        assert 'api_v1.relay_pre_app_rejection' not in log_output
+        assert 'super-secret-registration-token' not in log_output
+        assert 'token_sent=True' in log_output
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_403_html_logs_safe_cloudflare_diagnostic(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-registration-token'
+        relay_client._api_v1_registered_relays.add('http://localhost:5000')
+        relay_client._api_v1_relay_wait_hints = {
+            'http://localhost:5000': {
+                'next_ping_in_x_seconds': 7,
+                'poll_wait_seconds': 0,
+                'server_public_key': relay_client.crypto_manager.public_key_b64,
+            }
+        }
+        response = MagicMock(status_code=403)
+        response.headers = {'server': 'cloudflare', 'cf-ray': 'poll-ray-789'}
+        response.text = '<html>WAF blocked prompt=secret-user-prompt</html>'
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.poll_api_v1_encrypted_work()
+
+        log_output = caplog.text
+        assert result['error'] == 'HTTP 403'
+        assert result['error_kind'] == 'cloudflare_pre_app_rejection'
+        assert result['pre_app_rejection'] is True
+        assert result['cf_ray'] == 'poll-ray-789'
+        assert 'path=/api/v1/relay/servers/poll' in log_output
+        assert 'secret-user-prompt' not in log_output
+        assert 'super-secret-registration-token' not in log_output
 
     def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
         assert RelayClient._build_api_v1_url(
@@ -1015,7 +1122,9 @@ class TestRelayClient:
         first = relay_client.poll_api_v1_encrypted_work()
         second = relay_client.poll_api_v1_encrypted_work()
 
-        assert first == {'error': 'HTTP 404', 'next_ping_in_x_seconds': 9}
+        assert first['error'] == 'HTTP 404'
+        assert first['next_ping_in_x_seconds'] == 9
+        assert first['error_kind'] == 'http_status_without_json_body'
         assert second['message'] == 'No requests available'
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
@@ -1086,7 +1195,9 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result == {'error': 'HTTP 429', 'next_ping_in_x_seconds': 11}
+        assert result['error'] == 'HTTP 429'
+        assert result['next_ping_in_x_seconds'] == 11
+        assert result['error_kind'] == 'http_status_without_json_body'
 
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""

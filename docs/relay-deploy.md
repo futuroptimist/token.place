@@ -192,3 +192,54 @@ Kubernetes continuously verifies the relay’s health:
 With the Windows host advertising `server.py` on the expected port and the Helm release pointing to
 that DNS record, pods inside the cluster can reach the GPU-backed server transparently through the
 `gpu-server` service.
+
+## Troubleshooting desktop API v1 compute-node HTTP 403 registration failures
+
+Desktop/Tauri compute nodes log API v1 register and poll failures with metadata only. If a desktop
+build reports `desktop.compute_node_bridge.api_v1_e2ee.register error=HTTP 403` while synthetic
+register/poll checks succeed and the relay app logs do not show matching `POST
+/api/v1/relay/servers/register` or `/api/v1/relay/servers/poll` requests, suspect a pre-app
+infrastructure rejection such as Cloudflare WAF.
+
+1. Compare desktop stderr with relay logs. A probable Cloudflare/pre-app rejection includes
+   `outcome=cloudflare_pre_app_rejection`, `http_status=403`, and often `cf_ray=<id>` in the desktop
+   `desktop.compute_node_bridge.relay_poll` summary. The shared relay client also emits a redacted
+   diagnostic like:
+   ```text
+   api_v1.relay_http_non_200 method=POST path=/api/v1/relay/servers/register status=403 token_sent=True headers={'server': 'cloudflare', 'cf-ray': 'abc123-IAD', 'content-type': 'text/html'} body_snippet=<html>... relay_json_error=none
+   api_v1.relay_pre_app_rejection probable=cloudflare_or_waf method=POST path=/api/v1/relay/servers/register status=403 cf_ray=abc123-IAD server=cloudflare token_sent=True
+   ```
+   The logs intentionally report only whether `X-Relay-Server-Token` was sent, never the token value,
+   keys, ciphertext, prompts, or model payload content.
+2. Use the `cf-ray` value from the desktop log to inspect Cloudflare **Security Events** for the
+   relevant zone and timeframe. Filter by Ray ID when available, then check the rule, action, source
+   IP, bot/WAF signal, and any managed challenge or block reason.
+3. Reproduce from the same desktop network with a metadata-only register call. Replace the token with
+   a real registration token only in your shell; do not paste it into tickets or logs:
+   ```bash
+   TOKEN_PLACE_RELAY_SERVER_TOKEN='<redacted>'
+   curl -i -X POST 'https://staging.token.place/api/v1/relay/servers/register' \
+     -H "X-Relay-Server-Token: ${TOKEN_PLACE_RELAY_SERVER_TOKEN}" \
+     -H 'Content-Type: application/json' \
+     --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+   ```
+   Or use Python requests:
+   ```bash
+   python - <<'PY'
+   import os, requests
+   url = 'https://staging.token.place/api/v1/relay/servers/register'
+   response = requests.post(
+       url,
+       headers={'X-Relay-Server-Token': os.environ['TOKEN_PLACE_RELAY_SERVER_TOKEN']},
+       json={'server_public_key': 'diagnostic-public-key-placeholder'},
+       timeout=15,
+   )
+   print(response.status_code)
+   print({k: response.headers.get(k) for k in ['server', 'cf-ray', 'cf-cache-status', 'content-type', 'x-request-id']})
+   print(response.text[:240])
+   PY
+   ```
+4. Compare timestamps across systems. If desktop logs show `cf-ray`/Cloudflare HTML for a 403 and
+   relay application logs have no matching POST for the same time window, debug Cloudflare or another
+   pre-app layer before changing relay application code. If relay logs do show the request and return a
+   JSON error (for example a 401 registration-token guard), inspect the relay app response instead.

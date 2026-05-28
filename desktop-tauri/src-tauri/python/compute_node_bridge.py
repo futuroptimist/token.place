@@ -142,11 +142,30 @@ def _relay_response_summary(
     relay_error = _relay_error_message(relay_response)
     request_id = relay_response.get("request_id")
     safe_request_id = request_id if isinstance(request_id, str) and request_id else "none"
+    error_kind = relay_response.get("error_kind")
+    http_status = relay_response.get("http_status")
+    if isinstance(error_kind, str) and error_kind:
+        outcome = error_kind
+    elif relay_error and isinstance(http_status, int):
+        outcome = "http_status"
+    elif relay_error:
+        outcome = "relay_error"
+    elif api_v1_payload:
+        outcome = "api_v1_work"
+    elif has_heartbeat:
+        outcome = "heartbeat"
+    else:
+        outcome = "metadata_only"
+
+    cf_ray = relay_response.get("cf_ray")
+    safe_cf_ray = cf_ray if isinstance(cf_ray, str) and cf_ray else "none"
+    safe_http_status = http_status if isinstance(http_status, int) else "none"
 
     return (
-        f"keys={keys} api_v1_payload={api_v1_payload} "
+        f"outcome={outcome} keys={keys} api_v1_payload={api_v1_payload} "
         f"heartbeat={has_heartbeat} request_id={safe_request_id} "
-        f"wait={wait_seconds} error={relay_error or 'none'}"
+        f"wait={wait_seconds} http_status={safe_http_status} cf_ray={safe_cf_ray} "
+        f"error={relay_error or 'none'}"
     )
 
 

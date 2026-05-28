@@ -346,3 +346,66 @@ def test_api_v1_image_content_fails_before_relay_queue(encrypted):
     assert 400 <= response.status_code < 500
     assert "image" in response.get_json()["error"]["message"].lower()
     assert relay.client_inference_requests == {}
+
+
+def test_desktop_bridge_relay_summary_classifies_http_error_kinds():
+    """Desktop summary logs distinguish relay JSON, HTTP, timeout, and pre-app failures."""
+
+    import importlib.util
+    from pathlib import Path
+
+    bridge_path = (
+        Path(__file__).resolve().parents[2]
+        / "desktop-tauri"
+        / "src-tauri"
+        / "python"
+        / "compute_node_bridge.py"
+    )
+    spec = importlib.util.spec_from_file_location("compute_node_bridge_summary_probe", bridge_path)
+    assert spec is not None and spec.loader is not None
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+
+    cloudflare_summary = bridge._relay_response_summary(
+        {
+            "error": "HTTP 403",
+            "error_kind": "cloudflare_pre_app_rejection",
+            "http_status": 403,
+            "cf_ray": "abc123-IAD",
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+    relay_json_summary = bridge._relay_response_summary(
+        {
+            "error": "HTTP 401: invalid relay registration token",
+            "error_kind": "relay_json_error",
+            "http_status": 401,
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+    timeout_summary = bridge._relay_response_summary(
+        {
+            "error": "Read timed out",
+            "error_kind": "request_timeout",
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+    http_summary = bridge._relay_response_summary(
+        {
+            "error": "HTTP 503",
+            "error_kind": "http_status_without_json_body",
+            "http_status": 503,
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+
+    assert "outcome=cloudflare_pre_app_rejection" in cloudflare_summary
+    assert "http_status=403" in cloudflare_summary
+    assert "cf_ray=abc123-IAD" in cloudflare_summary
+    assert "outcome=relay_json_error" in relay_json_summary
+    assert "outcome=request_timeout" in timeout_summary
+    assert "outcome=http_status_without_json_body" in http_summary

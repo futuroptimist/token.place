@@ -483,7 +483,7 @@ def _handle_chat_completion_request(data):
             supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
             if model_id not in supported_model_ids:
                 return format_error_response(
-                    f"Model '{requested_model_id}' is not supported by API v1.",
+                    f"Model '{model_id}' is not supported by API v1.",
                     error_type="invalid_request_error",
                     param="model",
                     code="model_not_supported",
@@ -666,7 +666,7 @@ def _handle_text_completion_request(data):
             supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
             if model_id not in supported_model_ids:
                 return format_error_response(
-                    f"Model '{requested_model_id}' is not supported by API v1.",
+                    f"Model '{model_id}' is not supported by API v1.",
                     error_type="invalid_request_error",
                     param="model",
                     code="model_not_supported",

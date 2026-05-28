@@ -349,6 +349,29 @@ def test_api_v1_chat_completion_distributed_allows_model_absent_from_local_catal
     assert response.status_code == 200
     assert captured['model_id'] == 'remote-only-model'
     assert response.get_json()['choices'][0]['message']['content'] == 'distributed ok'
+
+
+def test_api_v1_completions_local_provider_rejects_unsupported_model(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+
+    class ProviderShouldNotRun:
+        def complete_chat(self, **kwargs):
+            raise AssertionError('provider should not be called for unsupported local completion models')
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ProviderShouldNotRun())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
+
+    response = client.post('/api/v1/completions', json={
+        'model': 'unsupported-model',
+        'prompt': 'hello',
+    })
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['param'] == 'model'
+    assert body['error']['code'] == 'model_not_supported'
+
+
 def test_chat_completion_rejects_empty_messages(client):
     """Empty chat message arrays should be rejected as invalid input."""
 
@@ -1212,10 +1235,14 @@ def test_completions_missing_model(client):
 
 def test_completions_model_error(client, monkeypatch):
     from api.v1.models import ModelError
-    monkeypatch.setattr(
-        'api.v1.compute_provider.generate_response',
-        lambda *a, **k: (_ for _ in ()).throw(ModelError('no', status_code=404, error_type='model_not_found')),
-    )
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'foo'}])
+
+    class ErrorProvider:
+        def complete_chat(self, **kwargs):
+            raise ModelError('no', status_code=404, error_type='model_not_found')
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ErrorProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
     resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
     assert resp.status_code == 404
     assert 'model_not_found' in resp.get_json()['error']['type']
@@ -1223,10 +1250,14 @@ def test_completions_model_error(client, monkeypatch):
 
 def test_completions_generate_model_error(client, monkeypatch):
     from api.v1.models import ModelError
-    monkeypatch.setattr(
-        'api.v1.compute_provider.generate_response',
-        lambda *a, **k: (_ for _ in ()).throw(ModelError('bad', status_code=402)),
-    )
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'foo'}])
+
+    class ErrorProvider:
+        def complete_chat(self, **kwargs):
+            raise ModelError('bad', status_code=402)
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ErrorProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
     resp = client.post('/api/v1/completions', json={'model': 'foo', 'prompt': 'hi'})
     assert resp.status_code == 402
     assert 'bad' in resp.get_json()['error']['message']

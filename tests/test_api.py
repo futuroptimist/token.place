@@ -324,6 +324,35 @@ def test_api_v1_distributed_provider_staging_fails_without_target(monkeypatch):
     assert "outside production" in str(exc_info.value)
 
 
+def test_api_v1_distributed_provider_staging_rejects_malformed_relay_public_url(
+    monkeypatch,
+):
+    import api.v1.compute_provider as compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "staging.token.place")
+
+    def fail_if_constructed(*args, **kwargs):
+        raise AssertionError("Distributed provider should not be constructed")
+
+    monkeypatch.setattr(
+        compute_provider,
+        "DistributedApiV1ComputeProvider",
+        fail_if_constructed,
+    )
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with pytest.raises(compute_provider.ComputeProviderError) as exc_info:
+        compute_provider.get_api_v1_compute_provider()
+
+    message = str(exc_info.value)
+    assert "env:TOKENPLACE_RELAY_PUBLIC_URL" in message
+    assert "absolute HTTP(S) URL" in message
+
+
 def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monkeypatch):
     import api.v1.compute_provider as compute_provider
 

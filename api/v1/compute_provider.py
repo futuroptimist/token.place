@@ -11,9 +11,10 @@ import logging
 import os
 import time
 import uuid
-from functools import lru_cache
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Optional, Protocol
+from urllib.parse import urlparse
 
 import requests
 
@@ -444,6 +445,22 @@ def _normalise_target_url(value: str | None) -> str:
     return (value or "").strip().rstrip("/")
 
 
+def _validated_target_url(value: str | None, *, source: str) -> str:
+    """Return a normalized absolute HTTP(S) target or fail clearly."""
+
+    target = _normalise_target_url(value)
+    if not target:
+        return ""
+
+    parsed = urlparse(target)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ComputeProviderError(
+            f"Invalid distributed relay target from {source}: target must be an "
+            "absolute HTTP(S) URL."
+        )
+    return target
+
+
 def _current_token_place_env() -> str:
     """Return the active token.place deployment environment label."""
 
@@ -477,7 +494,10 @@ def _select_distributed_target() -> DistributedTargetSelection:
     """
 
     for env_name in _EXPLICIT_DISTRIBUTED_TARGET_ENVS:
-        target = _normalise_target_url(os.environ.get(env_name))
+        target = _validated_target_url(
+            os.environ.get(env_name),
+            source=f"env:{env_name}",
+        )
         if target:
             return DistributedTargetSelection(
                 url=target,
@@ -486,7 +506,10 @@ def _select_distributed_target() -> DistributedTargetSelection:
             )
 
     for env_name in _RELAY_PUBLIC_URL_ENVS:
-        target = _normalise_target_url(os.environ.get(env_name))
+        target = _validated_target_url(
+            os.environ.get(env_name),
+            source=f"env:{env_name}",
+        )
         if target:
             return DistributedTargetSelection(
                 url=target,
@@ -496,7 +519,10 @@ def _select_distributed_target() -> DistributedTargetSelection:
 
     env_name = _current_token_place_env()
     for config_key in ("api.relay_url", "relay.server_url"):
-        target = _normalise_target_url(_config_value(config_key))
+        target = _validated_target_url(
+            _config_value(config_key),
+            source=f"config:{config_key}",
+        )
         if not target or target == _DEFAULT_PRODUCTION_RELAY_URL:
             continue
         return DistributedTargetSelection(

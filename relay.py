@@ -523,16 +523,18 @@ def _evict_stale_servers() -> list[str]:
             continue
         in_flight_requests = payload.get("api_v1_in_flight_requests")
         if isinstance(in_flight_requests, dict):
-            active_in_flight_requests = {
-                request_id: expires_at
-                for request_id, expires_at in list(in_flight_requests.items())
-                if isinstance(request_id, str)
-                and request_id
-                and isinstance(expires_at, (int, float))
-                and expires_at > now_monotonic
-            }
-            if active_in_flight_requests:
-                payload["api_v1_in_flight_requests"] = active_in_flight_requests
+            has_active_in_flight_requests = False
+            for request_id, expires_at in list(in_flight_requests.items()):
+                if not isinstance(request_id, str) or not request_id:
+                    continue
+                if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
+                    current_expires_at = in_flight_requests.get(request_id)
+                    if isinstance(current_expires_at, (int, float)) and current_expires_at > now_monotonic:
+                        has_active_in_flight_requests = True
+                    continue
+                if in_flight_requests.get(request_id) == expires_at:
+                    in_flight_requests.pop(request_id, None)
+            if has_active_in_flight_requests:
                 continue
             payload.pop("api_v1_in_flight_requests", None)
 

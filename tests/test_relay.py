@@ -2082,3 +2082,59 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
     next_response = client.get('/api/v1/relay/servers/next')
     assert next_response.status_code == 200
     assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+
+
+def test_healthz_rate_limit_exempt_for_kubernetes_probe_cadence(client):
+    """Kubernetes readiness probes should not exhaust the public API quota."""
+
+    responses = [
+        client.get(
+            "/healthz",
+            headers={"User-Agent": "kube-probe/1.30"},
+            environ_base={"REMOTE_ADDR": "10.42.2.1"},
+        )
+        for _ in range(65)
+    ]
+
+    assert all(response.status_code != 429 for response in responses)
+    assert responses[-1].status_code == 200
+
+
+def test_livez_metrics_and_diagnostics_rate_limit_exempt(client):
+    """Operational health, metrics, and diagnostics routes should bypass API quotas."""
+
+    for path in ("/livez", "/metrics", "/relay/diagnostics"):
+        responses = [
+            client.get(path, environ_base={"REMOTE_ADDR": "10.42.2.1"})
+            for _ in range(65)
+        ]
+        assert all(response.status_code != 429 for response in responses), path
+
+
+def test_api_v1_server_register_and_poll_rate_limit_exempt(client, monkeypatch):
+    """Compute-node heartbeat routes should not inherit the public 60/hour quota."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
+
+    register_responses = [
+        client.post(
+            "/api/v1/relay/servers/register",
+            json=payload,
+            environ_base={"REMOTE_ADDR": "10.42.2.1"},
+        )
+        for _ in range(65)
+    ]
+    poll_responses = [
+        client.post(
+            "/api/v1/relay/servers/poll",
+            json=payload,
+            environ_base={"REMOTE_ADDR": "10.42.2.1"},
+        )
+        for _ in range(65)
+    ]
+
+    assert all(response.status_code != 429 for response in register_responses)
+    assert all(response.status_code != 429 for response in poll_responses)
+    assert register_responses[-1].status_code == 200
+    assert poll_responses[-1].status_code == 200

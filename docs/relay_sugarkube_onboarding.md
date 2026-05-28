@@ -237,8 +237,13 @@ Verification focus:
 ### 6) Health checks green before true relay flow validation
 
 Warning:
-- `/livez`, `/healthz`, `/`, and `/metrics` are necessary checks but **not sufficient** for
-  production sign-off.
+- `/livez`, `/healthz`, `/`, `/metrics`, and `/relay/diagnostics` are necessary checks but
+  **not sufficient** for production sign-off. These operational routes are exempt from the
+  public API quota so Kubernetes probes, such as `/healthz` every 10 seconds, do not exhaust
+  the default `60/hour` API rate limit and make an otherwise running pod unready.
+- API v1 relay compute-node heartbeat routes (`/api/v1/relay/servers/register` and
+  `/api/v1/relay/servers/poll`) are also exempt from the public user API quota; public
+  chat/completion endpoints remain rate limited.
 - Sign-off requires successful encrypted relay flow with a real external compute node.
 
 ### Required external compute node validation checklist (sign-off gate)

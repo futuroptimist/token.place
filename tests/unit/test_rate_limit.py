@@ -127,3 +127,103 @@ def test_production_with_rate_limit_storage_uri_uses_explicit_backend():
 
     assert limiter is limiter_instance
     assert limiter_cls.call_args.kwargs["storage_uri"] == "memcached://127.0.0.1:11211"
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "10000/day"},
+    clear=True,
+)
+def test_operational_endpoints_are_exempt_from_staging_default_rate_limit():
+    """Staging health, metrics, and diagnostics routes must not consume API quota."""
+
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    @app.get("/livez")
+    def livez():
+        return {"status": "alive"}
+
+    @app.get("/relay/diagnostics")
+    def relay_diagnostics():
+        return {"registered_compute_nodes": []}
+
+    with app.test_client() as client:
+        for path in ("/healthz", "/livez", "/metrics", "/relay/diagnostics"):
+            responses = [client.get(path) for _ in range(65)]
+            assert all(response.status_code != 429 for response in responses), path
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "10000/day"},
+    clear=True,
+)
+def test_public_chat_completion_route_still_uses_staging_default_rate_limit():
+    """Public API traffic should still receive OpenAI-style 429s after quota exhaustion."""
+
+    app = Flask(__name__)
+    init_app(app)
+    payload = {}
+
+    with app.test_client() as client:
+        for _ in range(60):
+            response = client.post("/api/v1/chat/completions", json=payload)
+            assert response.status_code != 429
+        limited_response = client.post("/api/v1/chat/completions", json=payload)
+
+    assert limited_response.status_code == 429
+    body = limited_response.get_json()
+    assert body is not None
+    assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "10000/day"},
+    clear=True,
+)
+def test_api_v1_relay_control_plane_routes_are_exempt_from_public_api_quota():
+    """Compute-node heartbeat/control-plane routes should not inherit public user limits."""
+
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/register")
+    def register():
+        return {"next_ping_in_x_seconds": 10}
+
+    @app.post("/api/v1/relay/servers/poll")
+    def poll():
+        return {"message": "No requests available"}
+
+    @app.get("/api/v1/relay/servers/next")
+    def next_server():
+        return {"server_public_key": "test"}
+
+    @app.post("/api/v1/relay/responses")
+    def responses():
+        return {"message": "Response received and queued for client"}
+
+    @app.post("/api/v1/relay/responses/retrieve")
+    def responses_retrieve():
+        return {"status": "pending"}, 202
+
+    with app.test_client() as client:
+        route_calls = (
+            ("post", "/api/v1/relay/servers/register"),
+            ("post", "/api/v1/relay/servers/poll"),
+            ("get", "/api/v1/relay/servers/next"),
+            ("post", "/api/v1/relay/responses"),
+            ("post", "/api/v1/relay/responses/retrieve"),
+        )
+        for method, path in route_calls:
+            responses = [
+                getattr(client, method)(path, json={})
+                for _ in range(65)
+            ]
+            assert all(response.status_code != 429 for response in responses), path

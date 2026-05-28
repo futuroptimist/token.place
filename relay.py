@@ -428,6 +428,7 @@ API_V1_POLL_WAIT_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
 DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
 API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
 DEFAULT_API_V1_LEASE_SECONDS = 30
+API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -467,6 +468,18 @@ def _api_v1_lease_seconds() -> int:
         return DEFAULT_API_V1_LEASE_SECONDS
     return max(value, 1)
 
+
+
+
+def _api_v1_in_flight_ttl_seconds() -> float:
+    raw = os.environ.get(API_V1_IN_FLIGHT_TTL_SECONDS_ENV)
+    if raw is None:
+        return max(float(_api_v1_lease_seconds()), 1.0)
+    try:
+        value = float(raw)
+    except ValueError:
+        return max(float(_api_v1_lease_seconds()), 1.0)
+    return max(value, 1.0)
 
 def _pop_next_api_v1_request(public_key: str):
     queued_requests = client_inference_requests.get(public_key, [])
@@ -508,6 +521,11 @@ def _evict_stale_servers() -> list[str]:
         polling_until = payload.get("polling_until_monotonic")
         if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
             continue
+        in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+        if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+            continue
+        payload.pop("api_v1_in_flight_until_monotonic", None)
+        payload.pop("api_v1_in_flight_request_id", None)
         stale_after = payload.get("last_ping_duration", default_stale_after)
         if not isinstance(stale_after, (int, float)):
             stale_after = default_stale_after
@@ -1043,7 +1061,7 @@ def api_v1_relay_servers_poll():
         server_payload['last_ping'] = datetime.now()
         return jsonify({
             'message': 'No requests available',
-            'next_ping_in_x_seconds': server_payload['last_ping_duration'],
+            'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else max(server_payload['last_ping_duration'], 1),
             'poll_wait_seconds': poll_wait_seconds,
         }), 200
 
@@ -1051,6 +1069,9 @@ def api_v1_relay_servers_poll():
     queued_at = first_request.pop('_queued_at', None)
     if isinstance(queued_at, (int, float)):
         queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
+    server_payload['api_v1_in_flight_request_id'] = first_request.get('request_id')
+    server_payload['api_v1_in_flight_until_monotonic'] = time.monotonic() + _api_v1_in_flight_ttl_seconds()
+
     LOGGER.info(
         "relay.api_v1.request_dispatched",
         extra={
@@ -1118,6 +1139,14 @@ def api_v1_relay_responses():
     client_public_key = envelope.get('client_public_key')
     if not client_public_key:
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    request_id = envelope.get('request_id')
+    if isinstance(request_id, str) and request_id:
+        for server_payload in known_servers.values():
+            if server_payload.get('api_v1_in_flight_request_id') == request_id:
+                server_payload.pop('api_v1_in_flight_request_id', None)
+                server_payload.pop('api_v1_in_flight_until_monotonic', None)
+                break
 
     _queue_client_response(client_public_key, envelope)
     return jsonify({'message': 'Response received and queued for client'}), 200

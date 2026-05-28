@@ -907,11 +907,25 @@ class TestRelayClient:
 
         assert result == {
             'message': 'No requests available',
-            'next_ping_in_x_seconds': 12,
+            'next_ping_in_x_seconds': 0,
             'poll_wait_seconds': 10,
         }
         assert 'http://localhost:5000' in relay_client._api_v1_registered_relays
 
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_no_work_hint_is_preserved(self, mock_post, relay_client):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 10}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 10}
+        mock_post.side_effect = [register_ok, poll_ok]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['next_ping_in_x_seconds'] == 0
+        assert result['poll_wait_seconds'] == 10
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_error_path_uses_register_backoff(self, mock_post, relay_client):
@@ -2699,3 +2713,23 @@ class TestRelayClient:
         assert mock_sleep.call_count == 1
         mock_sleep.assert_called_with(relay_client._request_timeout)
         assert relay_client.stop_polling is True
+
+
+def test_poll_api_v1_encrypted_work_continuously_sleeps_no_work_hint(monkeypatch):
+    client = RelayClient('http://localhost', 5000, MagicMock(public_key_b64='k'), MagicMock())
+    client.stop_polling = False
+    calls = {'n': 0}
+
+    def fake_poll():
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return {'message': 'No requests available', 'next_ping_in_x_seconds': 0.25, 'poll_wait_seconds': 10}
+        client.stop_polling = True
+        return {'error': 'stop', 'next_ping_in_x_seconds': 0}
+
+    sleeps = []
+    monkeypatch.setattr(client, 'poll_api_v1_encrypted_work', fake_poll)
+    monkeypatch.setattr(relay_client_module.time, 'sleep', lambda secs: sleeps.append(secs))
+
+    client.poll_api_v1_encrypted_work_continuously()
+    assert 0.25 in sleeps

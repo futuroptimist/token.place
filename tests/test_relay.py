@@ -1414,7 +1414,7 @@ def test_api_v1_register_advertises_configured_poll_wait(client, monkeypatch):
     response = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload['next_ping_in_x_seconds'] == 10
+    assert payload['next_ping_in_x_seconds'] == 30
     assert payload['poll_wait_seconds'] == 30.0
 
 
@@ -1733,7 +1733,7 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     assert poll.status_code == 200
     payload = poll.get_json()
     assert payload['message'] == 'No requests available'
-    assert payload['next_ping_in_x_seconds'] > 0
+    assert payload['next_ping_in_x_seconds'] == 0
     assert payload['poll_wait_seconds'] == 0.01
     assert elapsed >= 0.008
 
@@ -1854,3 +1854,33 @@ def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(clien
     assert not poll_thread.is_alive()
     assert result['status'] == 200
     assert result['json']['chat_history'] == 'legacy-ciphertext-request'
+
+
+def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '3')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-inflight-1',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == 'req-inflight-1'
+
+    time.sleep(1.2)
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 200
+    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+
+    time.sleep(2.1)
+    expired = client.get('/api/v1/relay/servers/next')
+    assert expired.status_code == 503

@@ -834,6 +834,7 @@ class RelayClient:
                         self._request_timeout,
                     )
                     poll_wait = register_response.get('poll_wait_seconds', register_wait)
+                    poll_wait = self._normalise_poll_wait_seconds(poll_wait)
                     if register_response.get('error'):
                         last_error = {
                             'error': register_response.get('error'),
@@ -889,7 +890,7 @@ class RelayClient:
                         )
                         return {
                             'message': 'No requests available',
-                            'next_ping_in_x_seconds': register_wait,
+                            'next_ping_in_x_seconds': 0 if poll_wait > 0 else register_wait,
                             'poll_wait_seconds': poll_wait,
                         }
                     raise
@@ -910,7 +911,11 @@ class RelayClient:
                         'next_ping_in_x_seconds': register_wait,
                     }
                     continue
-                payload.setdefault('next_ping_in_x_seconds', register_wait)
+                payload_wait = payload.get('next_ping_in_x_seconds')
+                if isinstance(payload_wait, bool):
+                    payload_wait = None
+                if payload_wait is None:
+                    payload.setdefault('next_ping_in_x_seconds', register_wait)
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
                 log_info("server.heartbeat relay={}", candidate_url)

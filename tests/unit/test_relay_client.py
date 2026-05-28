@@ -1010,20 +1010,20 @@ class TestRelayClient:
         self, mock_post, relay_client, caplog
     ):
         relay_client._registration_token = 'super-secret-token'
-        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        relay_client.crypto_manager.public_key_b64 = 'configured-public-key-secret'
         response = MagicMock(status_code=401)
         response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
         response.text = 'ignored because response.json returns a JSON object'
         response.json.return_value = {
             'error': {
-                'message': 'bad super-secret-token server-public-key-secret',
-                'X-Relay-Server-Token': 'super-secret-token',
+                'message': 'bad super-secret-token configured-public-key-secret',
+                'X-Relay-Server-Token': 'echoed-other-token',
                 'private-key': 'private-key-secret',
                 'server-public-key': 'server-public-key-secret',
             },
             'detail': {
                 'token': 'super-secret-token',
-                'message': 'bad super-secret-token server-public-key-secret',
+                'message': 'bad super-secret-token configured-public-key-secret',
             },
         }
         mock_post.return_value = response
@@ -1044,10 +1044,19 @@ class TestRelayClient:
         assert '"private-key":"[redacted]"' in body_snippet
         assert '"server-public-key":"[redacted]"' in body_snippet
         assert '"token":"[redacted]"' in body_snippet
-        for rendered in (caplog.text, json.dumps(result, sort_keys=True), summary):
-            assert 'super-secret-token' not in rendered
-            assert 'server-public-key-secret' not in rendered
-            assert 'private-key-secret' not in rendered
+        rendered_result = json.dumps(result, sort_keys=True)
+        for forbidden in (
+            'super-secret-token',
+            'configured-public-key-secret',
+            'echoed-other-token',
+            'server-public-key-secret',
+            'private-key-secret',
+        ):
+            assert forbidden not in caplog.text
+            assert forbidden not in rendered_result
+            assert forbidden not in body_snippet
+            assert forbidden not in result['relay_error']
+            assert forbidden not in summary
 
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(

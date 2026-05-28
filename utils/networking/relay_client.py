@@ -117,6 +117,7 @@ _API_V1_BODY_SNIPPET_LIMIT = 512
 _API_V1_REDACTED = "[redacted]"
 _API_V1_SENSITIVE_BODY_KEYS = {
     "x-relay-server-token",
+    "x_relay_server_token",
     "relay_server_token",
     "server_registration_token",
     "registration_token",

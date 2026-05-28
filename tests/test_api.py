@@ -301,6 +301,54 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     local_generate.assert_not_called()
 
 
+
+
+def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+
+    class ProviderShouldNotRun:
+        def complete_chat(self, **kwargs):
+            raise AssertionError('provider should not be called for unsupported local models')
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: ProviderShouldNotRun())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'local')
+
+    response = client.post('/api/v1/chat/completions', json={
+        'model': 'remote-only-model',
+        'messages': [{'role': 'user', 'content': 'hello'}],
+    })
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body['error']['param'] == 'model'
+    assert body['error']['code'] == 'model_not_supported'
+
+
+def test_api_v1_chat_completion_distributed_allows_model_absent_from_local_catalogue(client, monkeypatch):
+    monkeypatch.setattr('api.v1.routes.get_models_info', lambda: [{'id': 'llama-3-8b-instruct'}])
+    monkeypatch.setattr('api.v1.routes.validate_chat_messages', lambda msgs: None)
+
+    captured = {}
+
+    class FakeDistributedProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured['model_id'] = model_id
+            captured['messages'] = messages
+            return {'role': 'assistant', 'content': 'distributed ok'}
+
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: FakeDistributedProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed')
+    monkeypatch.setattr('api.v1.routes.get_api_v1_last_backend_path', lambda: 'distributed_relay_e2ee')
+
+    response = client.post('/api/v1/chat/completions', json={
+        'model': 'remote-only-model',
+        'messages': [{'role': 'user', 'content': 'route remotely'}],
+    })
+
+    assert response.status_code == 200
+    assert captured['model_id'] == 'remote-only-model'
+    assert response.get_json()['choices'][0]['message']['content'] == 'distributed ok'
 def test_chat_completion_rejects_empty_messages(client):
     """Empty chat message arrays should be rejected as invalid input."""
 

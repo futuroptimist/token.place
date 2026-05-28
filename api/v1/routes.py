@@ -363,15 +363,6 @@ def _handle_chat_completion_request(data):
         requested_model_id = data["model"]
         response_model_id = requested_model_id
         model_id = resolve_model_alias(requested_model_id) or requested_model_id
-        supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
-        if model_id not in supported_model_ids:
-            return format_error_response(
-                f"Model '{requested_model_id}' is not supported by API v1.",
-                error_type="invalid_request_error",
-                param="model",
-                code="model_not_supported",
-                status_code=400,
-            )
         if model_id != requested_model_id:
             log_info(
                 f"Routing alias model '{requested_model_id}' to canonical model '{model_id}' for compatibility"
@@ -488,6 +479,16 @@ def _handle_chat_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
+        if resolved_provider_path != "distributed":
+            supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
+            if model_id not in supported_model_ids:
+                return format_error_response(
+                    f"Model '{requested_model_id}' is not supported by API v1.",
+                    error_type="invalid_request_error",
+                    param="model",
+                    code="model_not_supported",
+                    status_code=400,
+                )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,
@@ -661,6 +662,16 @@ def _handle_text_completion_request(data):
             "api_v1_provider_selection provider_class=%s resolved_provider_path=%s stream_mode=non-streaming"
             % (resolved_provider_name, resolved_provider_path)
         )
+        if resolved_provider_path != "distributed":
+            supported_model_ids = {entry.get("id") for entry in get_models_info() if isinstance(entry, dict)}
+            if model_id not in supported_model_ids:
+                return format_error_response(
+                    f"Model '{requested_model_id}' is not supported by API v1.",
+                    error_type="invalid_request_error",
+                    param="model",
+                    code="model_not_supported",
+                    status_code=400,
+                )
         assistant_message = provider.complete_chat(
             model_id=model_id,
             messages=messages,

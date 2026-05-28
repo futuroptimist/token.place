@@ -1886,6 +1886,42 @@ def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypat
     assert expired.status_code == 503
 
 
+
+
+def test_api_v1_next_does_not_keep_stale_server_alive_after_in_flight_response_removed(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '10')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-race-finished',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == 'req-race-finished'
+
+    # Complete/remove the only in-flight request, then force stale lease.
+    response = client.post('/api/v1/relay/responses', json={
+        'request_id': 'req-race-finished',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    })
+    assert response.status_code == 200
+
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=5)
+
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 503
 def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')

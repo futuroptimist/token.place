@@ -62,6 +62,62 @@ def client():
     streaming_sessions_by_client.clear()
 
 
+def test_operational_endpoints_are_not_rate_limited_by_public_quota(client):
+    """Health, liveness, metrics, and diagnostics stay outside user API quotas."""
+
+    paths = ("/healthz", "/livez", "/metrics", "/relay/diagnostics")
+
+    for path in paths:
+        responses = [client.get(path) for _ in range(105)]
+        assert [response.status_code for response in responses] == [200] * 105
+        assert 429 not in {response.status_code for response in responses}
+
+
+def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, monkeypatch):
+    """Authenticated compute-provider heartbeats stay outside the public API quota."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", "relay-token")
+    monkeypatch.setattr(relay_module, "SERVER_REGISTRATION_TOKENS", ["relay-token"])
+    payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
+    headers = {"X-Relay-Server-Token": "relay-token"}
+
+    register_responses = [
+        client.post("/api/v1/relay/servers/register", json=payload, headers=headers)
+        for _ in range(65)
+    ]
+    assert {response.status_code for response in register_responses} == {200}
+
+    poll_responses = [
+        client.post("/api/v1/relay/servers/poll", json=payload, headers=headers)
+        for _ in range(65)
+    ]
+    assert {response.status_code for response in poll_responses} == {200}
+
+
+def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(client):
+    """Client discovery and response polling stay outside the public API quota."""
+
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        "public_key": DUMMY_SERVER_PUB_KEY,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 60,
+    }
+    client_pending_request_ids[DUMMY_CLIENT_PUB_KEY] = {"request-1": time.time()}
+
+    next_responses = [client.get("/api/v1/relay/servers/next") for _ in range(65)]
+    assert {response.status_code for response in next_responses} == {200}
+
+    retrieve_responses = [
+        client.post(
+            "/api/v1/relay/responses/retrieve",
+            json={"client_public_key": DUMMY_CLIENT_PUB_KEY, "request_id": "request-1"},
+        )
+        for _ in range(65)
+    ]
+    assert {response.status_code for response in retrieve_responses} == {202}
+
+
 def test_inference_endpoint_removed(client):
     """Ensure deprecated /inference endpoint is unavailable."""
     response = client.post("/inference", json={})

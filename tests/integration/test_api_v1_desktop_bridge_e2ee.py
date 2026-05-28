@@ -9,10 +9,12 @@ Manual staging verification snippet:
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -36,6 +38,50 @@ LEGACY_ROUTE_FRAGMENTS = (
     "/stream/",
     "/api/v2",
 )
+
+
+def _load_desktop_compute_node_bridge_module():
+    bridge_path = (
+        Path(__file__).resolve().parents[2]
+        / "desktop-tauri"
+        / "src-tauri"
+        / "python"
+        / "compute_node_bridge.py"
+    )
+    spec = importlib.util.spec_from_file_location("compute_node_bridge_test", bridge_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_desktop_bridge_summary_distinguishes_relay_error_kinds():
+    bridge = _load_desktop_compute_node_bridge_module()
+
+    relay_json = {
+        "error": "HTTP 401",
+        "http_status_code": 401,
+        "error_kind": "relay_json_error",
+        "relay_error_body": {"code": "invalid_registration_token"},
+        "next_ping_in_x_seconds": 5,
+    }
+    plain_http = {
+        "error": "HTTP 503",
+        "http_status_code": 503,
+        "next_ping_in_x_seconds": 5,
+    }
+    timeout = {"error": "Read timed out. (read timeout=15)", "next_ping_in_x_seconds": 5}
+    cloudflare = {
+        "error": "HTTP 403",
+        "http_status_code": 403,
+        "probable_pre_app_rejection": True,
+        "next_ping_in_x_seconds": 5,
+    }
+
+    assert "error_kind=relay_json_error" in bridge._relay_response_summary(relay_json)
+    assert "error_kind=http_status_without_json_body" in bridge._relay_response_summary(plain_http)
+    assert "error_kind=request_timeout" in bridge._relay_response_summary(timeout)
+    assert "error_kind=cloudflare_pre_app_rejection" in bridge._relay_response_summary(cloudflare)
 
 
 class FakeDesktopRuntime:

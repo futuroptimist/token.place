@@ -735,6 +735,55 @@ Clients remain zero-auth: they never see or transmit the relay token. This
 keeps the network open for end users while letting operators quarantine
 suspicious server nodes using cryptography instead of static passwords.
 
+#### Desktop API v1 relay 403 diagnostics
+
+When a desktop/Tauri compute node reports `desktop.compute_node_bridge.api_v1_e2ee.register`
+or `desktop.compute_node_bridge.api_v1_e2ee.poll` followed by `HTTP 403`, first determine
+whether the request reached `relay.py` or was rejected by an infrastructure layer. Desktop
+API v1 diagnostics intentionally log only safe routing metadata: method, API path, status,
+a capped/redacted body snippet, selected infrastructure headers (`server`, `cf-ray`,
+`cf-cache-status`, `content-type`, `x-request-id`), and whether the
+`X-Relay-Server-Token` header was sent. They never log the token value, private keys,
+ciphertext payloads, or prompts.
+
+Use the diagnostics this way:
+
+1. If the desktop log includes `error_kind=cloudflare_pre_app_rejection` or a
+   `cf-ray` value, open Cloudflare **Security Events** for the staging/production zone,
+   filter by that `cf-ray`, and inspect the matched WAF/rate-limit rule. A `403` with
+   `server=cloudflare` or `cf-ray` and no JSON relay error usually means `relay.py` did
+   not handle the request.
+2. Reproduce from the same network with a metadata-only request, replacing the token value
+   locally and never pasting it into issue comments:
+
+   ```sh
+   curl -i -X POST 'https://staging.token.place/api/v1/relay/servers/register' \
+     -H 'content-type: application/json' \
+     -H "X-Relay-Server-Token: $TOKEN_PLACE_RELAY_SERVER_TOKEN" \
+     --data '{"server_public_key":"diagnostic-public-key"}'
+   ```
+
+   Or with Python:
+
+   ```sh
+   python - <<'PY'
+   import os, requests
+   response = requests.post(
+       'https://staging.token.place/api/v1/relay/servers/register',
+       headers={'X-Relay-Server-Token': os.environ['TOKEN_PLACE_RELAY_SERVER_TOKEN']},
+       json={'server_public_key': 'diagnostic-public-key'},
+       timeout=15,
+   )
+   print(response.status_code, response.headers.get('cf-ray'), response.text[:200])
+   PY
+   ```
+
+3. Compare timestamps and request paths in relay logs. If desktop shows `403` with a
+   Cloudflare `cf-ray` but relay logs do not show matching `POST /api/v1/relay/servers/register`
+   or `/poll`, investigate Cloudflare/WAF, bot, cache, and rate-limit events before changing
+   relay application code. If relay logs show the request and the body is JSON with a relay
+   `error`, debug the application-side registration-token or request validation failure.
+
 Once that upstream list is stable, export `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1`
 before launching `server.py`. The background `RelayClient` will refuse to talk
 to `localhost` and instead require at least one upstream derived from

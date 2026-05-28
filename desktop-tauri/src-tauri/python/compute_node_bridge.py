@@ -129,6 +129,28 @@ def _safe_poll_wait_seconds(relay_response: Dict[str, Any], default: float = 1) 
     return wait_seconds
 
 
+def _relay_response_error_kind(relay_response: Dict[str, Any]) -> str:
+    """Classify relay errors for desktop stderr summaries without logging payload data."""
+
+    if not isinstance(relay_response, dict):
+        return "invalid_response"
+    explicit_kind = relay_response.get("error_kind")
+    if isinstance(explicit_kind, str) and explicit_kind:
+        return explicit_kind
+    if relay_response.get("probable_pre_app_rejection") is True:
+        return "cloudflare_pre_app_rejection"
+    if isinstance(relay_response.get("relay_error_body"), dict):
+        return "relay_json_error"
+    relay_error = _relay_error_message(relay_response)
+    if relay_error is None:
+        return "none"
+    if relay_error.startswith("HTTP "):
+        return "http_status_without_json_body"
+    if "timed out" in relay_error.lower() or "timeout" in relay_error.lower():
+        return "request_timeout"
+    return "relay_error"
+
+
 def _relay_response_summary(
     relay_response: Dict[str, Any], *, api_v1_payload: bool = False, wait_seconds: float = 1
 ) -> str:
@@ -142,11 +164,15 @@ def _relay_response_summary(
     relay_error = _relay_error_message(relay_response)
     request_id = relay_response.get("request_id")
     safe_request_id = request_id if isinstance(request_id, str) and request_id else "none"
+    error_kind = _relay_response_error_kind(relay_response)
+    http_status = relay_response.get("http_status_code")
+    safe_http_status = http_status if isinstance(http_status, int) else "none"
 
     return (
         f"keys={keys} api_v1_payload={api_v1_payload} "
         f"heartbeat={has_heartbeat} request_id={safe_request_id} "
-        f"wait={wait_seconds} error={relay_error or 'none'}"
+        f"wait={wait_seconds} error_kind={error_kind} "
+        f"http_status={safe_http_status} error={relay_error or 'none'}"
     )
 
 
@@ -468,6 +494,7 @@ def run(args: argparse.Namespace) -> int:
                 and isinstance(relay_response.get("request_id"), str)
                 else "none"
             )
+            error_kind = _relay_response_error_kind(relay_response)
             summary = _relay_response_summary(
                 relay_response, api_v1_payload=api_v1_payload, wait_seconds=wait_seconds
             )
@@ -476,7 +503,8 @@ def run(args: argparse.Namespace) -> int:
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                f"request_id={request_id} wait={wait_seconds} error_kind={error_kind} "
+                f"summary={summary}",
                 file=sys.stderr,
             )
 
@@ -484,7 +512,8 @@ def run(args: argparse.Namespace) -> int:
                 "desktop.compute_node_bridge.api_v1_e2ee.poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                f"request_id={request_id} wait={wait_seconds} error_kind={error_kind} "
+                f"summary={summary}",
                 file=sys.stderr,
             )
 

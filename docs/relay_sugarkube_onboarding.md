@@ -117,6 +117,67 @@ curl -fsS https://token.place/
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).
 
+### Desktop compute-node HTTP 403 / pre-app rejection diagnostics
+
+Symptom:
+- A desktop/Tauri compute node logs `desktop.compute_node_bridge.api_v1_e2ee.register`
+  followed by `error=HTTP 403`, while a synthetic register/poll probe succeeds and relay pod logs
+  do not show corresponding `POST /api/v1/relay/servers/register` or
+  `POST /api/v1/relay/servers/poll` requests.
+
+Why this matters:
+- The relay registration-token guard returns JSON `401` responses for invalid tokens. A non-JSON
+  `403` with `server: cloudflare` or a `cf-ray` header usually means Cloudflare/WAF or another
+  pre-app layer rejected the request before it reached `relay.py`.
+- Desktop diagnostics intentionally log only safe routing/infrastructure metadata: method, URL
+  path, status, selected response headers, a capped redacted body snippet, and whether a relay
+  token was sent. They must not include the token value, private keys, public keys, ciphertext, or
+  model prompts.
+
+Operator steps:
+
+```bash
+# 1. Capture the cf-ray from the desktop log event, if present.
+# Example event fields: status=403 server=cloudflare cf_ray=REPLACE_CF_RAY
+CF_RAY=REPLACE_CF_RAY
+
+# 2. In Cloudflare, open Security > Events for the staging zone and filter by Ray ID.
+# Check which WAF, bot, firewall, or access rule produced the 403.
+
+# 3. Reproduce the compute-node registration shape without exposing the real desktop token.
+# Use a staging-safe throwaway token value or omit the header when validating routing only.
+curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
+  -H 'content-type: application/json' \
+  -H 'X-Relay-Server-Token: REPLACE_WITH_STAGING_TEST_TOKEN' \
+  --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+
+# 4. Reproduce with Python requests to compare headers/body with desktop behavior.
+python - <<'PY'
+import requests
+url = 'https://staging.token.place/api/v1/relay/servers/register'
+headers = {
+    'content-type': 'application/json',
+    'X-Relay-Server-Token': 'REPLACE_WITH_STAGING_TEST_TOKEN',
+}
+response = requests.post(url, headers=headers, json={'server_public_key': 'diagnostic-public-key-placeholder'}, timeout=15)
+print('status', response.status_code)
+print('headers', {k: response.headers.get(k) for k in ['server', 'cf-ray', 'cf-cache-status', 'content-type', 'x-request-id']})
+print('body', response.text[:512])
+PY
+
+# 5. Compare relay app logs with desktop diagnostics for the same UTC window.
+kubectl -n tokenplace logs deploy/tokenplace --since=30m | \
+  grep -E 'POST /api/v1/relay/servers/(register|poll)|api_v1|relay/servers'
+```
+
+Decision points:
+- If desktop logs show `kind=cloudflare_pre_app_rejection`, `status=403`, and a `cf-ray`, but
+  relay app logs have no matching POST, investigate Cloudflare Security Events for that Ray ID.
+- If desktop logs show `kind=relay_json_error` with `status=401`, the request reached the relay;
+  check registration-token configuration on the desktop and relay.
+- If desktop logs show `kind=http_status_no_json_body` without Cloudflare headers, inspect ingress,
+  tunnel, and upstream proxy logs before changing relay application code.
+
 ## v0.1.0 staging failure modes and operator runbook
 
 The following failure modes were observed during v0.1.0 staging and should be treated as a

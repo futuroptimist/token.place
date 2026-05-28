@@ -346,3 +346,86 @@ def test_api_v1_image_content_fails_before_relay_queue(encrypted):
     assert 400 <= response.status_code < 500
     assert "image" in response.get_json()["error"]["message"].lower()
     assert relay.client_inference_requests == {}
+
+
+def _load_compute_node_bridge_module():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "desktop-tauri"
+        / "src-tauri"
+        / "python"
+        / "compute_node_bridge.py"
+    )
+    module_dir = str(module_path.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+    spec = importlib.util.spec_from_file_location("compute_node_bridge_for_test", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_desktop_bridge_summary_distinguishes_cloudflare_pre_app_rejection():
+    bridge = _load_compute_node_bridge_module()
+
+    summary = bridge._relay_response_summary(
+        {
+            "error": "HTTP 403",
+            "http_status": 403,
+            "relay_error_kind": "cloudflare_pre_app_rejection",
+            "relay_http_diagnostic": {
+                "headers": {
+                    "server": "cloudflare",
+                    "cf-ray": "84abcd-SJC",
+                }
+            },
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+
+    assert "kind=cloudflare_pre_app_rejection" in summary
+    assert "status=403" in summary
+    assert "cf_ray=84abcd-SJC" in summary
+    assert "server=cloudflare" in summary
+
+
+def test_desktop_bridge_summary_distinguishes_relay_json_http_and_timeout_errors():
+    bridge = _load_compute_node_bridge_module()
+
+    relay_json_summary = bridge._relay_response_summary(
+        {
+            "error": "HTTP 401",
+            "http_status": 401,
+            "relay_error_kind": "relay_json_error",
+            "relay_error": "invalid relay registration token",
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+    http_summary = bridge._relay_response_summary(
+        {
+            "error": "HTTP 403",
+            "http_status": 403,
+            "relay_error_kind": "http_status_no_json_body",
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+    timeout_summary = bridge._relay_response_summary(
+        {"error": "Read timed out", "next_ping_in_x_seconds": 15},
+        wait_seconds=15,
+    )
+
+    assert "kind=relay_json_error" in relay_json_summary
+    assert "status=401" in relay_json_summary
+    assert "invalid relay registration token" in relay_json_summary
+    assert "kind=http_status_no_json_body" in http_summary
+    assert "status=403" in http_summary
+    assert "kind=request_timeout" in timeout_summary

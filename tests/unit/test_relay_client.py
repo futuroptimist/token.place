@@ -38,6 +38,25 @@ TEST_NO_REQUEST_RESPONSE = {
 }
 
 
+def _load_compute_node_bridge_module():
+    import importlib.util
+
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "desktop-tauri"
+        / "src-tauri"
+        / "python"
+        / "compute_node_bridge.py"
+    )
+    module_dir = str(module_path.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+    spec = importlib.util.spec_from_file_location("compute_node_bridge_for_unit_test", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_load_jsonschema_returns_none_on_import_error(monkeypatch):
@@ -837,11 +856,243 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_non_200_returns_error(self, mock_post, relay_client):
-        mock_post.return_value = MagicMock(status_code=503)
+        response = MagicMock(status_code=503)
+        response.headers = {'content-type': 'text/plain'}
+        response.text = 'Service unavailable'
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
 
         result = relay_client.register_api_v1_compute_node('http://relay-a.example')
 
-        assert result == {'error': 'HTTP 503', 'next_ping_in_x_seconds': relay_client._request_timeout}
+        assert result['error'] == 'HTTP 503'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert result['http_status'] == 503
+        assert result['relay_error_kind'] == 'http_status_no_json_body'
+        assert result['relay_http_diagnostic']['path'] == '/api/v1/relay/servers/register'
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=403)
+        response.headers = {
+            'server': 'cloudflare',
+            'cf-ray': '84abcd-SJC',
+            'cf-cache-status': 'DYNAMIC',
+            'content-type': 'text/html; charset=UTF-8',
+        }
+        response.text = (
+            '<html>\n403 forbidden\r\nX-Relay-Server-Token: super-secret-token\x00 '
+            'server_public_key=server-public-key-secret private_key=do-not-log</html>'
+        )
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        diagnostic = result['relay_http_diagnostic']
+        assert result['error'] == 'HTTP 403'
+        assert result['relay_error_kind'] == 'cloudflare_pre_app_rejection'
+        assert diagnostic['method'] == 'POST'
+        assert diagnostic['path'] == '/api/v1/relay/servers/register'
+        assert diagnostic['status_code'] == 403
+        assert diagnostic['headers'] == {
+            'server': 'cloudflare',
+            'cf-ray': '84abcd-SJC',
+            'cf-cache-status': 'DYNAMIC',
+            'content-type': 'text/html; charset=UTF-8',
+        }
+        assert diagnostic['token_sent'] is True
+        assert diagnostic['probable_pre_app_rejection'] is True
+        assert '403 forbidden' in diagnostic['body_snippet']
+        assert len(diagnostic['body_snippet']) <= relay_client_module._API_V1_BODY_SNIPPET_LIMIT + 3
+        assert '\n' not in diagnostic['body_snippet']
+        assert '\r' not in diagnostic['body_snippet']
+        assert '\x00' not in diagnostic['body_snippet']
+        http_log = next(
+            record.getMessage()
+            for record in caplog.records
+            if 'api_v1.relay_http_error' in record.getMessage()
+        )
+        assert '\n' not in http_log
+        assert '\r' not in http_log
+        assert '\x00' not in http_log
+        logs = caplog.text
+        assert 'api_v1.relay_http_error' in logs
+        assert 'api_v1.relay_pre_app_rejection' in logs
+        assert 'cf-ray' in logs
+        assert '84abcd-SJC' in logs
+        for forbidden in (
+            'super-secret-token',
+            'server-public-key-secret',
+            'do-not-log',
+        ):
+            assert forbidden not in logs
+            assert forbidden not in json.dumps(result, sort_keys=True)
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_propagates_register_http_diagnostic(
+        self, mock_post, relay_client
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=403)
+        response.headers = {
+            'server': 'cloudflare',
+            'cf-ray': '84abcd-SJC',
+            'content-type': 'text/html; charset=UTF-8',
+        }
+        response.text = (
+            '<html>403 forbidden X-Relay-Server-Token: super-secret-token '
+            'server_public_key=server-public-key-secret</html>'
+        )
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['error'] == 'HTTP 403'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert result['http_status'] == 403
+        assert result['relay_error_kind'] == 'cloudflare_pre_app_rejection'
+        diagnostic = result['relay_http_diagnostic']
+        assert diagnostic['path'] == '/api/v1/relay/servers/register'
+        assert diagnostic['headers']['cf-ray'] == '84abcd-SJC'
+        assert diagnostic['token_sent'] is True
+        for forbidden in ('super-secret-token', 'server-public-key-secret'):
+            assert forbidden not in json.dumps(result, sort_keys=True)
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=401)
+        response.headers = {
+            'server': 'gunicorn',
+            'content-type': 'application/json',
+            'x-request-id': 'relay-request-123',
+        }
+        response.text = '{"error":"invalid relay registration token"}'
+        response.json.return_value = {
+            'error': 'invalid relay registration token',
+            'token': 'super-secret-token',
+            'server_public_key': 'server-public-key-secret',
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        assert result['error'] == 'HTTP 401'
+        assert result['relay_error_kind'] == 'relay_json_error'
+        assert result['relay_error'] == 'invalid relay registration token'
+        diagnostic = result['relay_http_diagnostic']
+        assert diagnostic['headers']['x-request-id'] == 'relay-request-123'
+        assert diagnostic['token_sent'] is True
+        assert diagnostic['probable_pre_app_rejection'] is False
+        assert 'invalid relay registration token' in diagnostic['body_snippet']
+        assert '"token":"[redacted]"' in diagnostic['body_snippet']
+        logs = caplog.text
+        assert 'api_v1.relay_http_error' in logs
+        assert 'api_v1.relay_pre_app_rejection' not in logs
+        for forbidden in ('super-secret-token', 'server-public-key-secret'):
+            assert forbidden not in logs
+            assert forbidden not in json.dumps(result, sort_keys=True)
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_redacts_nested_json_error_and_hyphen_keys(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'configured-public-key-secret'
+        response = MagicMock(status_code=401)
+        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.text = 'ignored because response.json returns a JSON object'
+        response.json.return_value = {
+            'error': {
+                'message': 'bad super-secret-token configured-public-key-secret',
+                'X-Relay-Server-Token': 'echoed-other-token',
+                'private-key': 'private-key-secret',
+                'server-public-key': 'server-public-key-secret',
+            },
+            'detail': {
+                'token': 'super-secret-token',
+                'message': 'bad super-secret-token configured-public-key-secret',
+            },
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        bridge = _load_compute_node_bridge_module()
+        summary = bridge._relay_response_summary(result)
+
+        assert result['relay_error_kind'] == 'relay_json_error'
+        assert result['relay_error'] == (
+            '{"X-Relay-Server-Token":"[redacted]","message":"bad [redacted] [redacted]",'
+            '"private-key":"[redacted]","server-public-key":"[redacted]"}'
+        )
+        body_snippet = result['relay_http_diagnostic']['body_snippet']
+        assert '"X-Relay-Server-Token":"[redacted]"' in body_snippet
+        assert '"private-key":"[redacted]"' in body_snippet
+        assert '"server-public-key":"[redacted]"' in body_snippet
+        assert '"token":"[redacted]"' in body_snippet
+        rendered_result = json.dumps(result, sort_keys=True)
+        for forbidden in (
+            'super-secret-token',
+            'configured-public-key-secret',
+            'echoed-other-token',
+            'server-public-key-secret',
+            'private-key-secret',
+        ):
+            assert forbidden not in caplog.text
+            assert forbidden not in rendered_result
+            assert forbidden not in body_snippet
+            assert forbidden not in result['relay_error']
+            assert forbidden not in summary
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=401)
+        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.text = (
+            '{"error":"bad super-secret-token server-public-key-secret",'
+            '"detail":{"message":"bad super-secret-token server-public-key-secret"}}'
+        )
+        response.json.return_value = {
+            'error': 'bad super-secret-token server-public-key-secret',
+            'detail': {
+                'message': 'bad super-secret-token server-public-key-secret',
+            },
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        bridge = _load_compute_node_bridge_module()
+        summary = bridge._relay_response_summary(result)
+
+        assert result['relay_error_kind'] == 'relay_json_error'
+        assert result['relay_error'] == 'bad [redacted] [redacted]'
+        assert (
+            result['relay_http_diagnostic']['body_snippet']
+            == '{"detail":{"message":"bad [redacted] [redacted]"},"error":"bad [redacted] [redacted]"}'
+        )
+        for rendered in (caplog.text, json.dumps(result, sort_keys=True), summary):
+            assert 'super-secret-token' not in rendered
+            assert 'server-public-key-secret' not in rendered
 
     def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
         assert RelayClient._build_api_v1_url(
@@ -1015,7 +1266,9 @@ class TestRelayClient:
         first = relay_client.poll_api_v1_encrypted_work()
         second = relay_client.poll_api_v1_encrypted_work()
 
-        assert first == {'error': 'HTTP 404', 'next_ping_in_x_seconds': 9}
+        assert first['error'] == 'HTTP 404'
+        assert first['next_ping_in_x_seconds'] == 9
+        assert first['relay_error_kind'] == 'http_status_no_json_body'
         assert second['message'] == 'No requests available'
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [
@@ -1086,7 +1339,9 @@ class TestRelayClient:
 
         result = relay_client.poll_api_v1_encrypted_work()
 
-        assert result == {'error': 'HTTP 429', 'next_ping_in_x_seconds': 11}
+        assert result['error'] == 'HTTP 429'
+        assert result['next_ping_in_x_seconds'] == 11
+        assert result['relay_error_kind'] == 'http_status_no_json_body'
 
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""

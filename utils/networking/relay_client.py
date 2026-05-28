@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
@@ -103,6 +104,134 @@ RELAY_RESPONSE_SCHEMA = {
         "error": {"type": "string"}
     }
 }
+
+
+_API_V1_DIAGNOSTIC_HEADER_NAMES = (
+    "server",
+    "cf-ray",
+    "cf-cache-status",
+    "content-type",
+    "x-request-id",
+)
+_API_V1_BODY_SNIPPET_LIMIT = 512
+_API_V1_REDACTED = "[redacted]"
+_API_V1_SENSITIVE_BODY_KEYS = {
+    "x_relay_server_token",
+    "relay_server_token",
+    "server_registration_token",
+    "registration_token",
+    "token",
+    "authorization",
+    "private_key",
+    "privatekey",
+    "public_key",
+    "publickey",
+    "client_public_key",
+    "server_public_key",
+    "ciphertext",
+    "cipherkey",
+    "chat_history",
+    "iv",
+    "messages",
+    "prompt",
+    "content",
+    "api_v1_request",
+    "api_v1_response",
+}
+
+
+def _redact_sensitive_text(text: Any, *, secrets: Tuple[str, ...] = ()) -> str:
+    """Return a compact single-line text representation with sensitive values removed."""
+
+    rendered = text if isinstance(text, str) else str(text)
+    for secret in secrets:
+        if isinstance(secret, str) and secret:
+            rendered = rendered.replace(secret, _API_V1_REDACTED)
+
+    replacements = [
+        (
+            r"(?i)(x-relay-server-token\s*[:=]\s*)([^\s<>'\"]+)",
+            r"\1[redacted]",
+        ),
+        (
+            r"(?i)((?:private[_-]?key|public[_-]?key|server[_-]?public[_-]?key|"
+            r"client[_-]?public[_-]?key|ciphertext|cipherkey|chat_history|iv|"
+            r"prompt|content)\s*[=:]\s*)([^\s,;}<]+)",
+            r"\1[redacted]",
+        ),
+    ]
+    for pattern, replacement in replacements:
+        rendered = re.sub(pattern, replacement, rendered)
+
+    rendered = re.sub(r"[\r\n\x00]+", " ", rendered)
+
+    if len(rendered) > _API_V1_BODY_SNIPPET_LIMIT:
+        return rendered[:_API_V1_BODY_SNIPPET_LIMIT] + "..."
+    return rendered
+
+
+def _sanitize_api_v1_json_body(value: Any, *, secrets: Tuple[str, ...] = ()) -> Any:
+    """Sanitize a relay error JSON body before it is logged or returned."""
+
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            normalized_key = key_text.lower().replace("-", "_")
+            if normalized_key in _API_V1_SENSITIVE_BODY_KEYS:
+                sanitized[key_text] = _API_V1_REDACTED
+            else:
+                sanitized[key_text] = _sanitize_api_v1_json_body(item, secrets=secrets)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_api_v1_json_body(item, secrets=secrets) for item in value[:10]]
+    if isinstance(value, str):
+        return _redact_sensitive_text(value, secrets=secrets)
+    return value
+
+
+def _safe_api_v1_response_body_snippet(
+    response: Any, *, secrets: Tuple[str, ...] = ()
+) -> Tuple[str, Optional[Any]]:
+    """Return a redacted, capped non-200 response-body snippet and parsed JSON when available."""
+
+    parsed_json: Optional[Any] = None
+    try:
+        parsed_json = response.json()
+    except Exception:
+        parsed_json = None
+
+    if parsed_json is not None:
+        sanitized = _sanitize_api_v1_json_body(parsed_json, secrets=secrets)
+        try:
+            rendered = json.dumps(sanitized, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            rendered = str(sanitized)
+        return _redact_sensitive_text(rendered, secrets=secrets), sanitized
+
+    body_text = getattr(response, "text", "")
+    return _redact_sensitive_text(body_text or "", secrets=secrets), None
+
+
+def _api_v1_response_headers(response: Any) -> Dict[str, str]:
+    """Extract infrastructure-oriented response headers safe for diagnostics."""
+
+    headers = getattr(response, "headers", {}) or {}
+    diagnostic_headers: Dict[str, str] = {}
+    for header_name in _API_V1_DIAGNOSTIC_HEADER_NAMES:
+        value: Optional[Any] = None
+        try:
+            value = headers.get(header_name)
+        except AttributeError:
+            value = None
+        if value is None:
+            try:
+                value = headers.get(header_name.title())
+            except AttributeError:
+                value = None
+        if value is not None:
+            diagnostic_headers[header_name] = _redact_sensitive_text(str(value))
+    return diagnostic_headers
 
 
 def _normalise_registration_token(value: Optional[str]) -> Optional[str]:
@@ -758,6 +887,111 @@ class RelayClient:
             'next_ping_in_x_seconds': self._request_timeout,
         }
 
+    def _api_v1_non_200_diagnostic(
+        self,
+        response: Any,
+        *,
+        method: str,
+        url: str,
+        token_sent: bool,
+    ) -> Dict[str, Any]:
+        """Build and emit safe diagnostics for API v1 register/poll non-200 responses."""
+
+        parsed_url = urlparse(url)
+        path = parsed_url.path or "/"
+        headers = _api_v1_response_headers(response)
+        secrets = (
+            self._registration_token or "",
+            getattr(self.crypto_manager, "public_key_b64", ""),
+        )
+        body_snippet, parsed_json = _safe_api_v1_response_body_snippet(
+            response,
+            secrets=secrets,
+        )
+        relay_error = None
+        if isinstance(parsed_json, dict):
+            raw_error = parsed_json.get("error")
+            if isinstance(raw_error, str):
+                relay_error = _redact_sensitive_text(raw_error, secrets=secrets)
+            elif isinstance(raw_error, dict):
+                sanitized_error = _sanitize_api_v1_json_body(raw_error, secrets=secrets)
+                relay_error = _redact_sensitive_text(
+                    json.dumps(sanitized_error, sort_keys=True, separators=(",", ":")),
+                    secrets=secrets,
+                )
+
+        server_header = headers.get("server", "")
+        cf_ray = headers.get("cf-ray")
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        probable_pre_app_rejection = (
+            status_code == 403
+            and (server_header.lower() == "cloudflare" or bool(cf_ray))
+            and relay_error is None
+        )
+        if relay_error is not None:
+            error_kind = "relay_json_error"
+        elif probable_pre_app_rejection:
+            error_kind = "cloudflare_pre_app_rejection"
+        else:
+            error_kind = "http_status_no_json_body"
+
+        diagnostic = {
+            "method": method.upper(),
+            "path": path,
+            "status_code": status_code,
+            "headers": headers,
+            "body_snippet": body_snippet,
+            "token_sent": token_sent,
+            "relay_error": relay_error,
+            "error_kind": error_kind,
+            "probable_pre_app_rejection": probable_pre_app_rejection,
+        }
+
+        log_error(
+            "api_v1.relay_http_error method={} path={} status={} token_sent={} headers={} body_snippet={}",
+            diagnostic["method"],
+            diagnostic["path"],
+            diagnostic["status_code"],
+            diagnostic["token_sent"],
+            diagnostic["headers"],
+            diagnostic["body_snippet"],
+        )
+        if probable_pre_app_rejection:
+            log_error(
+                "api_v1.relay_pre_app_rejection method={} path={} status={} cf_ray={} server={} token_sent={}",
+                diagnostic["method"],
+                diagnostic["path"],
+                diagnostic["status_code"],
+                headers.get("cf-ray", "none"),
+                headers.get("server", "none"),
+                diagnostic["token_sent"],
+            )
+        return diagnostic
+
+    def _api_v1_http_error_result(
+        self,
+        response: Any,
+        *,
+        method: str,
+        url: str,
+        token_sent: bool,
+        next_ping_in_x_seconds: Any,
+    ) -> Dict[str, Any]:
+        diagnostic = self._api_v1_non_200_diagnostic(
+            response,
+            method=method,
+            url=url,
+            token_sent=token_sent,
+        )
+        return {
+            'error': f'HTTP {diagnostic["status_code"]}',
+            'next_ping_in_x_seconds': next_ping_in_x_seconds,
+            'http_status': diagnostic["status_code"],
+            'relay_error_kind': diagnostic["error_kind"],
+            'relay_error': diagnostic["relay_error"],
+            'relay_http_diagnostic': diagnostic,
+        }
+
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
         payload = {'server_public_key': self.crypto_manager.public_key_b64}
@@ -765,13 +999,21 @@ class RelayClient:
         headers = self._auth_headers()
         if headers:
             request_kwargs['headers'] = headers
+        register_url = self._build_api_v1_url(target_url, "/relay/servers/register")
+        token_sent = bool(headers)
         response = requests.post(
-            self._build_api_v1_url(target_url, "/relay/servers/register"),
+            register_url,
             timeout=request_kwargs.pop('timeout'),
             **request_kwargs,
         )
         if response.status_code != 200:
-            return {'error': f'HTTP {response.status_code}', 'next_ping_in_x_seconds': self._request_timeout}
+            return self._api_v1_http_error_result(
+                response,
+                method="POST",
+                url=register_url,
+                token_sent=token_sent,
+                next_ping_in_x_seconds=self._request_timeout,
+            )
         return response.json()
 
     @staticmethod
@@ -836,10 +1078,8 @@ class RelayClient:
                     poll_wait = register_response.get('poll_wait_seconds', register_wait)
                     poll_wait = self._normalise_poll_wait_seconds(poll_wait)
                     if register_response.get('error'):
-                        last_error = {
-                            'error': register_response.get('error'),
-                            'next_ping_in_x_seconds': register_wait,
-                        }
+                        last_error = dict(register_response)
+                        last_error.setdefault('next_ping_in_x_seconds', register_wait)
                         continue
                     relay_wait_hints[candidate_url] = {
                         'next_ping_in_x_seconds': register_wait,
@@ -864,9 +1104,11 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 poll_timeout_seconds = float(request_kwargs.pop('timeout'))
+                poll_url = self._build_api_v1_url(candidate_url, "/relay/servers/poll")
+                token_sent = bool(headers)
                 try:
                     response = requests.post(
-                        self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
+                        poll_url,
                         timeout=poll_timeout_seconds,
                         **request_kwargs,
                     )
@@ -899,10 +1141,13 @@ class RelayClient:
                         self._api_v1_registered_relays.discard(candidate_url)
                         relay_wait_hints.pop(candidate_url, None)
                         log_info("server.reregister reason=unknown_node relay={}", candidate_url)
-                    last_error = {
-                        'error': f'HTTP {response.status_code}',
-                        'next_ping_in_x_seconds': register_wait,
-                    }
+                    last_error = self._api_v1_http_error_result(
+                        response,
+                        method="POST",
+                        url=poll_url,
+                        token_sent=token_sent,
+                        next_ping_in_x_seconds=register_wait,
+                    )
                     continue
                 payload = response.json()
                 if not isinstance(payload, dict):

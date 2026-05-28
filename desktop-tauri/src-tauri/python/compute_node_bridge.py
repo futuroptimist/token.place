@@ -142,6 +142,34 @@ def _relay_response_summary(
     relay_error = _relay_error_message(relay_response)
     request_id = relay_response.get("request_id")
     safe_request_id = request_id if isinstance(request_id, str) and request_id else "none"
+    error_kind = relay_response.get("relay_error_kind")
+    http_status = relay_response.get("http_status")
+
+    if error_kind == "cloudflare_pre_app_rejection":
+        diagnostic = relay_response.get("relay_http_diagnostic")
+        headers = diagnostic.get("headers", {}) if isinstance(diagnostic, dict) else {}
+        return (
+            "kind=cloudflare_pre_app_rejection "
+            f"status={http_status or 'unknown'} cf_ray={headers.get('cf-ray', 'none')} "
+            f"server={headers.get('server', 'none')} wait={wait_seconds} error={relay_error or 'none'}"
+        )
+    if error_kind == "relay_json_error":
+        return (
+            "kind=relay_json_error "
+            f"status={http_status or 'unknown'} request_id={safe_request_id} "
+            f"wait={wait_seconds} error={relay_response.get('relay_error') or relay_error or 'none'}"
+        )
+    if error_kind == "http_status_no_json_body":
+        return (
+            "kind=http_status_no_json_body "
+            f"status={http_status or 'unknown'} request_id={safe_request_id} "
+            f"wait={wait_seconds} error={relay_error or 'none'}"
+        )
+    if isinstance(relay_error, str) and "timed out" in relay_error.lower():
+        return (
+            "kind=request_timeout "
+            f"request_id={safe_request_id} wait={wait_seconds} error={relay_error}"
+        )
 
     return (
         f"keys={keys} api_v1_payload={api_v1_payload} "

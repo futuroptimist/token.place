@@ -693,13 +693,28 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
 
     captured = {}
 
-    def fake_generate_response(model_id, messages, **model_options):
-        captured["model_id"] = model_id
-        return messages + [
-            {"role": "assistant", "content": "Alias resolved response"}
-        ]
+    class FakeProvider:
+        def complete_chat(self, *, model_id, messages, options=None):
+            captured["model_id"] = model_id
+            captured["messages"] = messages
+            captured["options"] = options
+            return {
+                "role": "assistant",
+                "content": "Alias resolved response",
+            }
 
-    monkeypatch.setattr("api.v1.compute_provider.generate_response", fake_generate_response)
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_compute_provider",
+        lambda: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_resolved_provider_path",
+        lambda _provider: "local",
+    )
+    monkeypatch.setattr(
+        "api.v1.routes.get_api_v1_last_backend_path",
+        lambda: "local",
+    )
 
     payload = {
         "model": "gpt-3.5-turbo",
@@ -714,6 +729,7 @@ def test_v1_chat_completion_alias_routes_to_canonical_model(client, monkeypatch)
     body = response.get_json()
     assert body["model"] == "gpt-3.5-turbo"
     assert captured["model_id"] == "llama-3-8b-instruct"
+    assert captured["messages"] == payload["messages"]
     assert body["choices"][0]["message"]["content"] == "Alias resolved response"
 
 

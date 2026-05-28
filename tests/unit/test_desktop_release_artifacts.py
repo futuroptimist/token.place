@@ -45,6 +45,15 @@ def test_workflow_sets_explicit_dmg_volume_name() -> None:
     assert 'hdiutil create -volname "token.place desktop"' in text
 
 
+def test_workflow_retries_hdiutil_dmg_creation_after_cleanup() -> None:
+    text = WORKFLOW.read_text(encoding='utf-8')
+    assert 'dmg_tmp_path="$RUNNER_TEMP/${dmg_name}.tmp.dmg"' in text
+    assert 'for dmg_attempt in 1 2 3; do' in text
+    assert 'hdiutil create failed, retrying after cleanup' in text
+    assert 'hdiutil detach "/Volumes/token.place desktop" -force' in text
+    assert 'mv "${dmg_tmp_path}" "${dmg_path}"' in text
+
+
 def test_workflow_stages_dmg_directory_with_app_readme_and_applications_symlink() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'dmg_stage_dir="$RUNNER_TEMP/token-place-dmg-stage"' in text

@@ -21,9 +21,9 @@ def _reload_models(env=None):
     return models
 
 
-def test_resolve_model_alias_rejects_removed_gpt_aliases():
+def test_resolve_model_alias_returns_canonical_id():
     models = _reload_models()
-    assert models.resolve_model_alias("gpt-5-chat-latest") is None
+    assert models.resolve_model_alias("gpt-5-chat-latest") == "llama-3-8b-instruct"
 
 
 def test_resolve_model_alias_missing_target_logs_and_returns_none():

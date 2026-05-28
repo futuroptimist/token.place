@@ -246,6 +246,8 @@ PUBLIC_BASE_URL_ENV = "TOKENPLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_COMPAT_ENV = "TOKEN_PLACE_RELAY_PUBLIC_URL"
 PUBLIC_BASE_URL_FALLBACK_ENV = "RELAY_PUBLIC_URL"
 REQUIRE_UPSTREAM_HEALTH_ENV = "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH"
+RELAY_UPSTREAMS_ENV = "TOKEN_PLACE_RELAY_UPSTREAMS"
+RELAY_UPSTREAM_COMPAT_ENV = "PERSONAL_GAMING_PC_URL"
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -253,6 +255,16 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     if raw_value is None:
         return default
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _has_explicit_relay_upstream_config() -> bool:
+    """Return whether relay upstream URLs were explicitly configured by env."""
+
+    for env_name in (RELAY_UPSTREAMS_ENV, RELAY_UPSTREAM_COMPAT_ENV):
+        raw_value = os.environ.get(env_name, "")
+        if raw_value.strip():
+            return True
+    return False
 
 
 def _load_upstream_config() -> Dict[str, Any]:
@@ -619,14 +631,22 @@ def healthz():
     _evict_stale_servers()
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    relay_only_mode = not require_upstream_health
+    explicit_upstream_config = _has_explicit_relay_upstream_config()
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
-        "configuredUpstreamServers": configured_servers,
+        "upstreamHealthRequired": require_upstream_health,
+        "relayOnly": relay_only_mode,
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
         "registeredServers": _live_server_diagnostics(),
     }
+    if explicit_upstream_config:
+        status["configuredUpstreamServers"] = configured_servers
+    elif configured_servers:
+        status["legacyConfiguredUpstreamServers"] = configured_servers
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -639,7 +659,6 @@ def healthz():
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
@@ -790,11 +809,19 @@ def relay_diagnostics():
     """Live diagnostics for legacy relay registered compute nodes."""
     _evict_stale_servers()
     live_nodes = _live_server_diagnostics()
-    return jsonify({
-        "configured_upstream_servers": app.config.get("relay_configured_servers", []),
+    configured_servers = app.config.get("relay_configured_servers", [])
+    require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    diagnostics = {
+        "relay_only": not require_upstream_health,
+        "upstream_health_required": require_upstream_health,
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
-    })
+    }
+    if _has_explicit_relay_upstream_config():
+        diagnostics["configured_upstream_servers"] = configured_servers
+    elif configured_servers:
+        diagnostics["legacy_configured_upstream_servers"] = configured_servers
+    return jsonify(diagnostics)
 
 
 @app.route('/relay/api/v1/chat/completions', methods=['POST'])

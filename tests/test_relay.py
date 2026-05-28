@@ -134,6 +134,20 @@ def test_next_server_no_servers(client):
     assert data['error']['message'] == 'No servers available'
     assert data['error']['code'] == 503
 
+
+def test_api_v1_next_server_no_registered_compute_nodes_message(client):
+    """API v1 relay reports no registered compute nodes with a stable error code."""
+
+    response = client.get("/api/v1/relay/servers/next")
+    assert response.status_code == 503
+    data = response.get_json()
+    assert data["error"]["code"] == "no_registered_compute_nodes"
+    assert (
+        data["error"]["message"]
+        == "No registered compute nodes are available on this relay."
+    )
+
+
 def test_next_server_one_server(client):
     """Test /next_server when one server is registered."""
     # Simulate server registration (directly modifying state for setup)

@@ -497,7 +497,7 @@ new Vue({
             const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
 
             const codeToMessage = {
-                no_registered_compute_nodes: 'No LLM servers are available right now.',
+                no_registered_compute_nodes: 'No registered compute nodes are available on this relay.',
                 compute_node_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',

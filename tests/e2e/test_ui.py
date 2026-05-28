@@ -302,7 +302,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     assistant_message = page.locator(".assistant-message").last
     assistant_message.wait_for(state="visible")
-    assert "No LLM servers are available right now." in assistant_message.inner_text()
+    assert "No registered compute nodes are available on this relay." in assistant_message.inner_text()
 
 
 @pytest.mark.e2e

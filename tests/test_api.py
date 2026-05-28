@@ -226,6 +226,101 @@ def test_unencrypted_chat_completion(client, client_keys, mock_llama):
     assert 'Mock response' in data['choices'][0]['message']['content']
 
 
+
+def _clear_distributed_target_env(monkeypatch):
+    for env_var in (
+        "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "TOKENPLACE_RELAY_PUBLIC_URL",
+        "TOKEN_PLACE_RELAY_PUBLIC_URL",
+        "RELAY_PUBLIC_URL",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+
+def test_api_v1_distributed_provider_staging_uses_public_relay_url(monkeypatch, caplog):
+    from api.v1 import compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    caplog.set_level(logging.INFO, logger="api.v1.compute_provider")
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "https://staging.token.place"
+    assert provider.base_url != "https://token.place"
+    assert (
+        "api_v1.compute_provider.selected provider=distributed mode=distributed "
+        "fallback_enabled=false target=https://staging.token.place "
+        "target_source=TOKENPLACE_RELAY_PUBLIC_URL relay_only=True"
+    ) in caplog.text
+
+
+def test_api_v1_distributed_provider_production_uses_production_default(monkeypatch):
+    from api.v1 import compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "https://token.place"
+
+
+def test_api_v1_staging_distributed_no_compute_nodes_reports_relay_error(client, monkeypatch):
+    from api.v1 import compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+
+    next_server_response = MagicMock()
+    next_server_response.status_code = 503
+    next_server_response.json.return_value = {
+        "error": {"message": "No servers available", "code": 503}
+    }
+
+    def fake_get(url, timeout):
+        assert url == "https://staging.token.place/api/v1/relay/servers/next"
+        assert timeout > 0
+        return next_server_response
+
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "hello staging"}],
+            },
+        )
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    assert response.status_code == 503
+    error = response.get_json()["error"]
+    assert error["type"] == "service_unavailable_error"
+    assert error["code"] == "no_registered_compute_nodes"
+    assert "No registered compute nodes are available on this relay" in error["message"]
+
 def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_nodes(client, monkeypatch):
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
     monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')

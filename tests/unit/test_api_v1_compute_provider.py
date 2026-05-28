@@ -572,7 +572,7 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
             compute_provider.get_api_v1_compute_provider()
             raise AssertionError("expected ComputeProviderError")
         except ComputeProviderError as exc:
-            assert "requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL" in str(exc)
+            assert "requires a configured distributed relay target" in str(exc)
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
@@ -760,7 +760,7 @@ def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(mon
         get_api_v1_compute_provider_for_mode(mode="distributed", distributed_fallback_enabled=False)
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
-        assert "requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL" in str(exc)
+        assert "requires a configured distributed relay target" in str(exc)
 
 
 def test_get_api_v1_compute_provider_for_mode_reads_fallback_from_env(monkeypatch):

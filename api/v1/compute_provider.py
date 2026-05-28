@@ -14,6 +14,7 @@ import uuid
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
+from urllib.parse import urlparse
 
 import requests
 
@@ -49,7 +50,7 @@ class ComputeProviderError(Exception):
 _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
     "no_registered_compute_nodes": {
         "error_type": "service_unavailable_error",
-        "public_message": "No LLM servers are available right now.",
+        "public_message": "No registered compute nodes are available on this relay.",
         "status_code": 503,
     },
     "compute_node_timeout": {
@@ -88,6 +89,103 @@ def _error_from_code(code: str, *, message: str) -> ComputeProviderError:
         error_type=mapped.get("error_type", "server_error"),
         public_message=mapped.get("public_message", "Unable to generate a response right now."),
         status_code=int(mapped.get("status_code", 502)),
+    )
+
+
+@dataclass(frozen=True)
+class ResolvedDistributedRelayTarget:
+    """Normalized distributed relay target plus diagnostics metadata."""
+
+    url: str
+    source: str
+    relay_only: bool = False
+
+
+def _normalise_relay_target_url(value: str) -> str:
+    """Normalize a configured HTTP(S) relay target URL."""
+
+    candidate = (value or "").strip().rstrip("/")
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return candidate
+
+
+def _configured_public_relay_url() -> ResolvedDistributedRelayTarget | None:
+    """Return the relay public URL when this process is configured as a relay."""
+
+    for env_var in (
+        "TOKENPLACE_RELAY_PUBLIC_URL",
+        "TOKEN_PLACE_RELAY_PUBLIC_URL",
+        "RELAY_PUBLIC_URL",
+    ):
+        target = _normalise_relay_target_url(os.environ.get(env_var, ""))
+        if target:
+            return ResolvedDistributedRelayTarget(
+                url=target,
+                source=env_var,
+                relay_only=True,
+            )
+    return None
+
+
+def _explicit_distributed_relay_target_from_env() -> ResolvedDistributedRelayTarget | None:
+    """Return explicit API v1 distributed relay target env overrides."""
+
+    for env_var in (
+        "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
+        "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+    ):
+        target = _normalise_relay_target_url(os.environ.get(env_var, ""))
+        if target:
+            return ResolvedDistributedRelayTarget(url=target, source=env_var)
+    return None
+
+
+def _explicit_distributed_relay_target_from_config() -> ResolvedDistributedRelayTarget | None:
+    """Return an explicit distributed relay target from config."""
+
+    try:
+        from config import get_config
+
+        config = get_config()
+        raw_value = config.get("api.distributed_relay_url", "")
+        target = _normalise_relay_target_url(raw_value if isinstance(raw_value, str) else "")
+        if target:
+            return ResolvedDistributedRelayTarget(url=target, source="config:api.distributed_relay_url")
+    except Exception as exc:  # pragma: no cover - defensive config fallback
+        logger.debug("unable to inspect distributed relay target config: %s", exc)
+    return None
+
+
+def _production_default_distributed_relay_target() -> ResolvedDistributedRelayTarget | None:
+    """Return the production default only for explicit production environments."""
+
+    env_name = (
+        os.environ.get("TOKEN_PLACE_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or ""
+    ).strip().lower()
+    if env_name in {"prod", "production"}:
+        return ResolvedDistributedRelayTarget(
+            url="https://token.place",
+            source="production_default",
+        )
+    return None
+
+
+def _resolve_distributed_relay_target() -> ResolvedDistributedRelayTarget:
+    """Resolve distributed relay target with staging-safe precedence rules."""
+
+    return (
+        _explicit_distributed_relay_target_from_env()
+        or _explicit_distributed_relay_target_from_config()
+        or _configured_public_relay_url()
+        or _production_default_distributed_relay_target()
+        or ResolvedDistributedRelayTarget(url="", source="unset")
     )
 
 
@@ -177,6 +275,31 @@ class DistributedApiV1ComputeProvider:
                 message=f"unable to reach relay next_server endpoint: {exc}",
             ) from exc
 
+        try:
+            next_server_payload = next_server_response.json()
+        except ValueError as exc:
+            if next_server_response.status_code >= 500:
+                raise _error_from_code(
+                    "compute_node_unreachable",
+                    message=(
+                        "relay next_server endpoint returned "
+                        f"unexpected status {next_server_response.status_code}"
+                    ),
+                ) from exc
+            raise _error_from_code(
+                "compute_node_invalid_payload",
+                message="relay next_server response was not valid JSON",
+            ) from exc
+
+        if next_server_response.status_code == 503:
+            relay_error = next_server_payload.get("error") if isinstance(next_server_payload, dict) else None
+            relay_error_code = relay_error.get("code") if isinstance(relay_error, dict) else None
+            if relay_error_code in {503, "503", "no_registered_compute_nodes"}:
+                raise _error_from_code(
+                    "no_registered_compute_nodes",
+                    message="relay reported no registered compute nodes are available",
+                )
+
         if next_server_response.status_code >= 500:
             raise _error_from_code(
                 "compute_node_unreachable",
@@ -185,14 +308,6 @@ class DistributedApiV1ComputeProvider:
                     f"unexpected status {next_server_response.status_code}"
                 ),
             )
-
-        try:
-            next_server_payload = next_server_response.json()
-        except ValueError as exc:
-            raise _error_from_code(
-                "compute_node_invalid_payload",
-                message="relay next_server response was not valid JSON",
-            ) from exc
 
         if not isinstance(next_server_payload, dict):
             raise _error_from_code(
@@ -396,9 +511,13 @@ class FallbackApiV1ComputeProvider:
             return message
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def _build_api_v1_compute_provider(
-    mode: str, distributed_url: str, distributed_fallback_enabled: bool
+    mode: str,
+    distributed_url: str,
+    distributed_fallback_enabled: bool,
+    distributed_url_source: str = "unset",
+    relay_only_mode: bool = False,
 ) -> ApiV1ComputeProvider:
     """Create a compute provider for the normalized environment inputs."""
 
@@ -412,7 +531,7 @@ def _build_api_v1_compute_provider(
         if not distributed_fallback_enabled:
             message = (
                 "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed requires "
-                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL when "
+                "a configured distributed relay target when "
                 "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK is disabled"
             )
             logger.error(
@@ -423,9 +542,11 @@ def _build_api_v1_compute_provider(
             raise ComputeProviderError(message)
         logger.warning(
             "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed set without "
-            "TOKENPLACE_DISTRIBUTED_COMPUTE_URL; using local fallback "
-            "(fallback_enabled=%s)",
+            "a configured distributed relay target; using local fallback "
+            "(fallback_enabled=%s target_source=%s relay_only=%s)",
             distributed_fallback_enabled,
+            distributed_url_source,
+            relay_only_mode,
         )
         return local_provider
 
@@ -433,17 +554,21 @@ def _build_api_v1_compute_provider(
     if not distributed_fallback_enabled:
         logger.info(
             "api_v1.compute_provider.selected provider=distributed mode=%s "
-            "fallback_enabled=false target=%s",
+            "fallback_enabled=false target=%s target_source=%s relay_only=%s",
             mode,
             distributed_url.rstrip("/"),
+            distributed_url_source,
+            relay_only_mode,
         )
         return distributed_provider
 
     logger.info(
         "api_v1.compute_provider.selected provider=distributed_with_local_fallback "
-        "mode=%s fallback_enabled=true target=%s",
+        "mode=%s fallback_enabled=true target=%s target_source=%s relay_only=%s",
         mode,
         distributed_url.rstrip("/"),
+        distributed_url_source,
+        relay_only_mode,
     )
     return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
 
@@ -451,20 +576,26 @@ def _build_api_v1_compute_provider(
 def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
     """Resolve the active provider based on environment configuration."""
 
-    mode, distributed_url, distributed_fallback_enabled = _read_api_v1_provider_env()
-    return _build_api_v1_compute_provider(mode, distributed_url, distributed_fallback_enabled)
+    mode, target, distributed_fallback_enabled = _read_api_v1_provider_env()
+    return _build_api_v1_compute_provider(
+        mode,
+        target.url,
+        distributed_fallback_enabled,
+        target.source,
+        target.relay_only,
+    )
 
 
-def _read_api_v1_provider_env() -> tuple[str, str, bool]:
+def _read_api_v1_provider_env() -> tuple[str, ResolvedDistributedRelayTarget, bool]:
     """Read and normalize API v1 provider environment configuration."""
 
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
-    distributed_url = os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "").strip()
+    distributed_target = _resolve_distributed_relay_target()
     distributed_fallback_enabled = (
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
-    return mode, distributed_url, distributed_fallback_enabled
+    return mode, distributed_target, distributed_fallback_enabled
 
 
 def get_api_v1_compute_provider_for_mode(
@@ -476,14 +607,22 @@ def get_api_v1_compute_provider_for_mode(
     """Resolve provider with an explicit mode override for request-scoped routing."""
 
     normalized_mode = (mode or "local").strip().lower()
-    _, env_distributed_url, fallback_enabled_from_env = _read_api_v1_provider_env()
+    _, env_distributed_target, fallback_enabled_from_env = _read_api_v1_provider_env()
     if distributed_fallback_enabled is None:
         distributed_fallback_enabled = fallback_enabled_from_env
-    selected_distributed_url = distributed_url if distributed_url is not None else env_distributed_url
+    if distributed_url is not None:
+        selected_target = ResolvedDistributedRelayTarget(
+            url=_normalise_relay_target_url(distributed_url),
+            source="request_override",
+        )
+    else:
+        selected_target = env_distributed_target
     return _build_api_v1_compute_provider(
         normalized_mode,
-        selected_distributed_url.strip(),
+        selected_target.url,
         bool(distributed_fallback_enabled),
+        selected_target.source,
+        selected_target.relay_only,
     )
 
 

@@ -38,6 +38,7 @@ class APISettings(TypedDict, total=False):
     host: str
     port: int
     relay_url: str
+    distributed_relay_url: str
     cors_origins: List[str]
 
 
@@ -122,6 +123,7 @@ DEFAULT_CONFIG: AppConfig = {
         "host": "127.0.0.1",
         "port": 3000,
         "relay_url": "https://token.place",
+        "distributed_relay_url": "",
         "cors_origins": ["*"],
     },
     "security": {

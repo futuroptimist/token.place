@@ -177,7 +177,8 @@ def _sanitize_api_v1_json_body(value: Any, *, secrets: Tuple[str, ...] = ()) -> 
         sanitized: Dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if key_text.lower() in _API_V1_SENSITIVE_BODY_KEYS:
+            normalized_key = key_text.lower().replace("-", "_")
+            if normalized_key in _API_V1_SENSITIVE_BODY_KEYS:
                 sanitized[key_text] = _API_V1_REDACTED
             else:
                 sanitized[key_text] = _sanitize_api_v1_json_body(item, secrets=secrets)
@@ -913,8 +914,9 @@ class RelayClient:
             if isinstance(raw_error, str):
                 relay_error = _redact_sensitive_text(raw_error, secrets=secrets)
             elif isinstance(raw_error, dict):
+                sanitized_error = _sanitize_api_v1_json_body(raw_error, secrets=secrets)
                 relay_error = _redact_sensitive_text(
-                    json.dumps(raw_error, sort_keys=True, separators=(",", ":")),
+                    json.dumps(sanitized_error, sort_keys=True, separators=(",", ":")),
                     secrets=secrets,
                 )
 

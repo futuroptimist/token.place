@@ -1006,6 +1006,50 @@ class TestRelayClient:
 
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_redacts_nested_json_error_and_hyphen_keys(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=401)
+        response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
+        response.text = 'ignored because response.json returns a JSON object'
+        response.json.return_value = {
+            'error': {
+                'message': 'bad super-secret-token server-public-key-secret',
+                'X-Relay-Server-Token': 'super-secret-token',
+                'private-key': 'private-key-secret',
+                'server-public-key': 'server-public-key-secret',
+            },
+            'detail': {
+                'token': 'super-secret-token',
+                'message': 'bad super-secret-token server-public-key-secret',
+            },
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        bridge = _load_compute_node_bridge_module()
+        summary = bridge._relay_response_summary(result)
+
+        assert result['relay_error_kind'] == 'relay_json_error'
+        assert result['relay_error'] == (
+            '{"X-Relay-Server-Token":"[redacted]","message":"bad [redacted] [redacted]",'
+            '"private-key":"[redacted]","server-public-key":"[redacted]"}'
+        )
+        body_snippet = result['relay_http_diagnostic']['body_snippet']
+        assert '"X-Relay-Server-Token":"[redacted]"' in body_snippet
+        assert '"private-key":"[redacted]"' in body_snippet
+        assert '"server-public-key":"[redacted]"' in body_snippet
+        assert '"token":"[redacted]"' in body_snippet
+        for rendered in (caplog.text, json.dumps(result, sort_keys=True), summary):
+            assert 'super-secret-token' not in rendered
+            assert 'server-public-key-secret' not in rendered
+            assert 'private-key-secret' not in rendered
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
         self, mock_post, relay_client, caplog
     ):

@@ -143,7 +143,10 @@ def init_app(app):
         "default_limits": [
             os.environ.get("API_RATE_LIMIT", "60/hour"),
             os.environ.get("API_DAILY_QUOTA", "1000/day"),
-        ]
+        ],
+        "default_limits_exempt_when": (
+            lambda: _is_public_api_rate_limit_exempt_path(request.path)
+        ),
     }
     if limiter_storage_uri:
         limiter_kwargs["storage_uri"] = limiter_storage_uri
@@ -153,10 +156,6 @@ def init_app(app):
         app=app,
         **limiter_kwargs,
     )
-
-    @limiter.request_filter
-    def _exempt_operational_and_relay_control_plane_paths() -> bool:
-        return _is_public_api_rate_limit_exempt_path(request.path)
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):

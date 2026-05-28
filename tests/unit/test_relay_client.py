@@ -5,6 +5,7 @@ import base64
 import builtins
 import json
 import math
+import logging
 import pytest
 import sys
 import requests
@@ -843,6 +844,76 @@ class TestRelayClient:
 
         assert result == {'error': 'HTTP 503', 'next_ping_in_x_seconds': relay_client._request_timeout}
 
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_403_html_logs_safe_cloudflare_diagnostics(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-registration-token'
+        response = MagicMock(status_code=403)
+        response.headers = {
+            'Server': 'cloudflare',
+            'CF-Ray': 'abc123-IAD',
+            'CF-Cache-Status': 'DYNAMIC',
+            'Content-Type': 'text/html; charset=UTF-8',
+        }
+        response.text = (
+            '<html><title>Forbidden</title>'
+            'token=super-secret-registration-token '
+            'server_public_key=mock_public_key_b64 '
+            '-----BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY-----'
+            '</html>'
+        )
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        caplog.set_level(logging.ERROR, logger='relay_client')
+        result = relay_client.register_api_v1_compute_node('https://staging.token.place?debug=1')
+
+        assert result['error'] == 'HTTP 403: probable_pre_app_rejection'
+        assert result['pre_app_rejection'] is True
+        assert result['http_path'] == '/api/v1/relay/servers/register'
+        assert result['http_response_headers']['cf-ray'] == 'abc123-IAD'
+        assert 'api_v1.relay_http_non_200' in caplog.text
+        assert 'api_v1.relay_pre_app_rejection' in caplog.text
+        assert 'path=/api/v1/relay/servers/register' in caplog.text
+        assert 'cf-ray' in caplog.text
+        assert 'Forbidden' in caplog.text
+        assert 'super-secret-registration-token' not in caplog.text
+        assert 'mock_public_key_b64' not in caplog.text
+        assert 'PRIVATE KEY' not in caplog.text
+        assert 'debug=1' not in caplog.text
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-registration-token'
+        response = MagicMock(status_code=401)
+        response.headers = {
+            'server': 'gunicorn',
+            'content-type': 'application/json',
+            'x-request-id': 'req-123',
+        }
+        response.text = ''
+        response.json.return_value = {
+            'error': 'invalid registration token',
+            'server_public_key': 'mock_public_key_b64',
+        }
+        mock_post.return_value = response
+
+        caplog.set_level(logging.ERROR, logger='relay_client')
+        result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        assert result['error'] == 'HTTP 401: relay_json_error'
+        assert result['relay_json_error'] == 'invalid registration token'
+        assert result['pre_app_rejection'] is False
+        assert result['http_response_headers']['x-request-id'] == 'req-123'
+        assert 'invalid registration token' in caplog.text
+        assert 'x-request-id' in caplog.text
+        assert 'super-secret-registration-token' not in caplog.text
+        assert 'mock_public_key_b64' not in caplog.text
+        assert 'server_public_key' not in caplog.text
+
     def test_build_api_v1_url_avoids_double_api_v1_suffix(self):
         assert RelayClient._build_api_v1_url(
             "http://localhost:5000", "/relay/servers/register"
@@ -868,6 +939,36 @@ class TestRelayClient:
     )
     def test_api_v1_poll_timeout_seconds_defensive(self, relay_client, expected_wait, expected_timeout):
         assert relay_client._api_v1_poll_timeout_seconds(expected_wait) == expected_timeout
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_403_html_logs_safe_cloudflare_diagnostics(
+        self, mock_post, relay_client, caplog
+    ):
+        relay_client._registration_token = 'super-secret-registration-token'
+        relay_client._api_v1_registered_relays.add('http://localhost:5000')
+        relay_client._api_v1_relay_wait_hints = {
+            'http://localhost:5000': {
+                'next_ping_in_x_seconds': 9,
+                'poll_wait_seconds': 10,
+                'server_public_key': 'mock_public_key_b64',
+            }
+        }
+        response = MagicMock(status_code=403)
+        response.headers = {'server': 'cloudflare', 'cf-ray': 'poll-ray'}
+        response.text = '<html>WAF blocked token=super-secret-registration-token</html>'
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        caplog.set_level(logging.ERROR, logger='relay_client')
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['error'] == 'HTTP 403: probable_pre_app_rejection'
+        assert result['pre_app_rejection'] is True
+        assert result['http_path'] == '/api/v1/relay/servers/poll'
+        assert result['next_ping_in_x_seconds'] == 9
+        assert 'path=/api/v1/relay/servers/poll' in caplog.text
+        assert 'poll-ray' in caplog.text
+        assert 'super-secret-registration-token' not in caplog.text
 
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_uses_derived_poll_timeout(self, mock_post, relay_client):

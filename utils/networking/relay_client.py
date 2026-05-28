@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urlunparse
@@ -17,6 +18,104 @@ from utils.networking.http_requests_compat import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')
+
+
+_INFRA_DEBUG_HEADERS = (
+    "server",
+    "cf-ray",
+    "cf-cache-status",
+    "content-type",
+    "x-request-id",
+)
+_BODY_SNIPPET_LIMIT = 512
+_REDACTED = "[redacted]"
+
+
+def _safe_response_header_map(headers: Any) -> Dict[str, str]:
+    """Return selected response headers useful for pre-app infrastructure debugging."""
+
+    safe_headers: Dict[str, str] = {}
+    if not headers:
+        return safe_headers
+
+    for wanted in _INFRA_DEBUG_HEADERS:
+        value = None
+        try:
+            value = headers.get(wanted)
+        except AttributeError:
+            value = None
+        if value is None:
+            try:
+                value = headers.get(wanted.title())
+            except AttributeError:
+                value = None
+        if value is None and isinstance(headers, dict):
+            for key, candidate in headers.items():
+                if str(key).lower() == wanted:
+                    value = candidate
+                    break
+        if value is not None:
+            safe_headers[wanted] = str(value)[:200]
+    return safe_headers
+
+
+def _redact_diagnostic_text(text: Any, *, secrets: Optional[List[Optional[str]]] = None) -> str:
+    """Redact tokens, keys, ciphertext-shaped fields, and prompts from diagnostic text."""
+
+    if text is None:
+        return ""
+    redacted = str(text).replace("\r", "\\r").replace("\n", "\\n")
+
+    for secret in secrets or []:
+        if isinstance(secret, str) and secret:
+            redacted = redacted.replace(secret, _REDACTED)
+
+    sensitive_names = (
+        "x-relay-server-token",
+        "relay_server_token",
+        "server_token",
+        "registration_token",
+        "token",
+        "private_key",
+        "public_key",
+        "server_public_key",
+        "client_public_key",
+        "chat_history",
+        "cipherkey",
+        "iv",
+        "ciphertext",
+        "prompt",
+        "messages",
+        "content",
+        "api_v1_request",
+        "api_v1_response",
+    )
+    for name in sensitive_names:
+        redacted = re.sub(
+            rf'(?i)(["\']?{name}["\']?\s*[:=]\s*)(["\'][^"\']*["\']|[^,}}\s<>]+)',
+            rf'\1{_REDACTED}',
+            redacted,
+        )
+
+    redacted = re.sub(
+        r"-----BEGIN [^-]+ KEY-----.*?-----END [^-]+ KEY-----",
+        _REDACTED,
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    if len(redacted) > _BODY_SNIPPET_LIMIT:
+        return f"{redacted[:_BODY_SNIPPET_LIMIT]}…[truncated]"
+    return redacted
+
+
+def _response_text_for_diagnostics(response: Any) -> str:
+    text = getattr(response, "text", "")
+    if isinstance(text, str) and text:
+        return text
+    content = getattr(response, "content", b"")
+    if isinstance(content, bytes) and content:
+        return content.decode("utf-8", errors="replace")
+    return ""
 
 
 def _load_jsonschema():
@@ -583,6 +682,86 @@ class RelayClient:
             return {}
         return {"X-Relay-Server-Token": self._registration_token}
 
+    def _api_v1_non_200_diagnostics(
+        self,
+        *,
+        method: str,
+        url: str,
+        response: Any,
+        token_sent: bool,
+    ) -> Dict[str, Any]:
+        """Log safe diagnostics for non-200 API v1 register/poll responses."""
+
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        headers = _safe_response_header_map(getattr(response, "headers", {}))
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        raw_body = _response_text_for_diagnostics(response)
+        relay_json_error: Optional[str] = None
+        has_json_relay_error = False
+
+        try:
+            json_body = response.json()
+        except Exception:
+            json_body = None
+        if isinstance(json_body, dict) and isinstance(json_body.get("error"), str):
+            relay_json_error = json_body["error"]
+            has_json_relay_error = True
+            if not raw_body:
+                raw_body = json.dumps({"error": relay_json_error}, sort_keys=True)
+
+        secrets = [
+            self._registration_token,
+            getattr(self.crypto_manager, "public_key_b64", None),
+        ]
+        body_snippet = _redact_diagnostic_text(raw_body, secrets=secrets)
+        safe_relay_error = (
+            _redact_diagnostic_text(relay_json_error, secrets=secrets)
+            if relay_json_error is not None
+            else None
+        )
+        server_header = headers.get("server", "")
+        probable_pre_app_rejection = (
+            status_code == 403
+            and (server_header.lower() == "cloudflare" or bool(headers.get("cf-ray")))
+            and not has_json_relay_error
+        )
+
+        log_error(
+            "api_v1.relay_http_non_200 method={} path={} status={} token_sent={} "
+            "headers={} body_snippet={}",
+            method.upper(),
+            path,
+            status_code,
+            token_sent,
+            headers,
+            body_snippet,
+        )
+        if probable_pre_app_rejection:
+            log_error(
+                "api_v1.relay_pre_app_rejection probable=cloudflare_or_waf "
+                "method={} path={} status={} cf_ray={} server={} token_sent={}",
+                method.upper(),
+                path,
+                status_code,
+                headers.get("cf-ray", "none"),
+                server_header or "none",
+                token_sent,
+            )
+
+        diagnostics: Dict[str, Any] = {
+            "http_status": status_code,
+            "http_path": path,
+            "http_method": method.upper(),
+            "http_response_headers": headers,
+            "http_body_snippet": body_snippet,
+            "relay_token_sent": token_sent,
+            "pre_app_rejection": probable_pre_app_rejection,
+        }
+        if safe_relay_error is not None:
+            diagnostics["relay_json_error"] = safe_relay_error
+        return diagnostics
+
     def start(self):
         """Start the polling loop by setting stop_polling to False"""
         self.stop_polling = False
@@ -765,19 +944,40 @@ class RelayClient:
         headers = self._auth_headers()
         if headers:
             request_kwargs['headers'] = headers
+        request_url = self._build_api_v1_url(target_url, "/relay/servers/register")
         response = requests.post(
-            self._build_api_v1_url(target_url, "/relay/servers/register"),
+            request_url,
             timeout=request_kwargs.pop('timeout'),
             **request_kwargs,
         )
         if response.status_code != 200:
-            return {'error': f'HTTP {response.status_code}', 'next_ping_in_x_seconds': self._request_timeout}
+            diagnostics = self._api_v1_non_200_diagnostics(
+                method="POST",
+                url=request_url,
+                response=response,
+                token_sent=bool(headers),
+            )
+            error_payload = {
+                'error': f'HTTP {response.status_code}',
+                'next_ping_in_x_seconds': self._request_timeout,
+            }
+            if response.status_code in {401, 403}:
+                error_payload.update(diagnostics)
+                if diagnostics.get("relay_json_error"):
+                    error_payload['error'] = f"HTTP {response.status_code}: relay_json_error"
+                elif diagnostics.get("pre_app_rejection"):
+                    error_payload['error'] = f"HTTP {response.status_code}: probable_pre_app_rejection"
+            return error_payload
         return response.json()
 
     @staticmethod
     def _build_api_v1_url(relay_url: str, route: str) -> str:
         """Build API v1 URLs without duplicating a pre-existing /api/v1 suffix."""
-        base = relay_url.rstrip("/")
+        parsed = urlparse(relay_url)
+        if parsed.scheme and parsed.netloc:
+            base = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', '')).rstrip("/")
+        else:
+            base = relay_url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
         normalized_route = route if route.startswith("/") else f"/{route}"
         if base.endswith("/api/v1"):
             return f"{base}{normalized_route}"
@@ -837,9 +1037,11 @@ class RelayClient:
                     poll_wait = self._normalise_poll_wait_seconds(poll_wait)
                     if register_response.get('error'):
                         last_error = {
-                            'error': register_response.get('error'),
-                            'next_ping_in_x_seconds': register_wait,
+                            key: value
+                            for key, value in register_response.items()
+                            if key != 'poll_wait_seconds'
                         }
+                        last_error['next_ping_in_x_seconds'] = register_wait
                         continue
                     relay_wait_hints[candidate_url] = {
                         'next_ping_in_x_seconds': register_wait,
@@ -865,8 +1067,9 @@ class RelayClient:
 
                 poll_timeout_seconds = float(request_kwargs.pop('timeout'))
                 try:
+                    poll_url = self._build_api_v1_url(candidate_url, "/relay/servers/poll")
                     response = requests.post(
-                        self._build_api_v1_url(candidate_url, "/relay/servers/poll"),
+                        poll_url,
                         timeout=poll_timeout_seconds,
                         **request_kwargs,
                     )
@@ -895,6 +1098,12 @@ class RelayClient:
                         }
                     raise
                 if response.status_code != 200:
+                    diagnostics = self._api_v1_non_200_diagnostics(
+                        method="POST",
+                        url=poll_url,
+                        response=response,
+                        token_sent=bool(headers),
+                    )
                     if response.status_code == 404:
                         self._api_v1_registered_relays.discard(candidate_url)
                         relay_wait_hints.pop(candidate_url, None)
@@ -903,6 +1112,12 @@ class RelayClient:
                         'error': f'HTTP {response.status_code}',
                         'next_ping_in_x_seconds': register_wait,
                     }
+                    if response.status_code in {401, 403}:
+                        last_error.update(diagnostics)
+                        if diagnostics.get("relay_json_error"):
+                            last_error['error'] = f"HTTP {response.status_code}: relay_json_error"
+                        elif diagnostics.get("pre_app_rejection"):
+                            last_error['error'] = f"HTTP {response.status_code}: probable_pre_app_rejection"
                     continue
                 payload = response.json()
                 if not isinstance(payload, dict):

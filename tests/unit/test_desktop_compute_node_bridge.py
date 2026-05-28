@@ -1282,6 +1282,43 @@ def test_relay_error_message_normalizes_non_string_truthy_values():
     assert compute_node_bridge._relay_error_message({"error": 503}) == "503"
 
 
+def test_relay_response_summary_classifies_cloudflare_pre_app_rejection():
+    summary = compute_node_bridge._relay_response_summary(
+        {
+            "error": "HTTP 403: probable_pre_app_rejection",
+            "http_status": 403,
+            "http_path": "/api/v1/relay/servers/register",
+            "pre_app_rejection": True,
+            "next_ping_in_x_seconds": 15,
+        },
+        wait_seconds=15,
+    )
+
+    assert "error_kind=cloudflare_or_pre_app_rejection" in summary
+    assert "http_status=403" in summary
+    assert "http_path=/api/v1/relay/servers/register" in summary
+
+
+def test_relay_response_summary_distinguishes_relay_json_http_and_timeout_errors():
+    relay_json = compute_node_bridge._relay_response_summary(
+        {
+            "error": "HTTP 401: relay_json_error",
+            "relay_json_error": "invalid registration token",
+            "http_status": 401,
+        }
+    )
+    http_only = compute_node_bridge._relay_response_summary(
+        {"error": "HTTP 503", "http_status": 503}
+    )
+    timeout = compute_node_bridge._relay_response_summary(
+        {"error": "Read timed out. (read timeout=15)"}
+    )
+
+    assert "error_kind=relay_json_error" in relay_json
+    assert "error_kind=http_status_without_json_body" in http_only
+    assert "error_kind=request_timeout" in timeout
+
+
 def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []

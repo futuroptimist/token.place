@@ -129,6 +129,25 @@ def _safe_poll_wait_seconds(relay_response: Dict[str, Any], default: float = 1) 
     return wait_seconds
 
 
+def _relay_response_error_kind(relay_response: Dict[str, Any]) -> str:
+    """Classify relay poll failures without exposing payload content."""
+
+    if not isinstance(relay_response, dict):
+        return "invalid_response"
+    relay_error = _relay_error_message(relay_response)
+    if relay_response.get("pre_app_rejection") is True:
+        return "cloudflare_or_pre_app_rejection"
+    if relay_response.get("relay_json_error"):
+        return "relay_json_error"
+    if relay_response.get("http_status") is not None:
+        return "http_status_without_json_body"
+    if relay_error and "timed out" in relay_error.lower():
+        return "request_timeout"
+    if relay_error:
+        return "relay_error"
+    return "none"
+
+
 def _relay_response_summary(
     relay_response: Dict[str, Any], *, api_v1_payload: bool = False, wait_seconds: float = 1
 ) -> str:
@@ -142,11 +161,15 @@ def _relay_response_summary(
     relay_error = _relay_error_message(relay_response)
     request_id = relay_response.get("request_id")
     safe_request_id = request_id if isinstance(request_id, str) and request_id else "none"
+    error_kind = _relay_response_error_kind(relay_response)
+    http_status = relay_response.get("http_status", "none")
+    http_path = relay_response.get("http_path", "none")
 
     return (
         f"keys={keys} api_v1_payload={api_v1_payload} "
         f"heartbeat={has_heartbeat} request_id={safe_request_id} "
-        f"wait={wait_seconds} error={relay_error or 'none'}"
+        f"wait={wait_seconds} error_kind={error_kind} http_status={http_status} "
+        f"http_path={http_path} error={relay_error or 'none'}"
     )
 
 

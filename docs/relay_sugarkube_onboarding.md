@@ -234,6 +234,50 @@ Verification focus:
 - Validate end-to-end register/poll/request/reply path with an actual external node, not relay
   pod health alone.
 
+Troubleshooting HTTP 403 or pre-app rejection:
+
+- Compare desktop bridge stderr with relay app logs. A desktop log that includes
+  `api_v1.relay_pre_app_rejection probable=cloudflare_or_waf`, `http_status=403`,
+  a `server=cloudflare` header, or a `cf-ray` value while relay logs show no matching
+  `POST /api/v1/relay/servers/register` or `/poll` strongly suggests the request was rejected
+  before the relay app handled it.
+- In the Cloudflare dashboard, open **Security** → **Events**, filter by the `cf-ray` value from
+  the desktop log, and inspect the matched rule/action. Use the event timestamp, source IP, host,
+  path, and user agent to confirm it is the same desktop request.
+- Reproduce from the same machine/network with a minimal request. Replace the placeholder key and
+  token, and do not paste real tokens into shared logs:
+
+```bash
+curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
+  -H 'content-type: application/json' \
+  -H 'X-Relay-Server-Token: REPLACE_WITH_TOKEN' \
+  --data '{"server_public_key":"REPLACE_WITH_TEST_PUBLIC_KEY"}'
+
+python - <<'PY'
+import os
+import requests
+
+response = requests.post(
+    "https://staging.token.place/api/v1/relay/servers/register",
+    headers={"X-Relay-Server-Token": os.environ["TOKEN_PLACE_RELAY_SERVER_TOKEN"]},
+    json={"server_public_key": "REPLACE_WITH_TEST_PUBLIC_KEY"},
+    timeout=15,
+)
+print(response.status_code)
+print({
+    k: response.headers.get(k)
+    for k in ["server", "cf-ray", "cf-cache-status", "content-type", "x-request-id"]
+})
+print(response.text[:512])
+PY
+```
+
+- Compare the reproduced `cf-ray`, status, and path against relay pod/app logs. If the synthetic
+  request succeeds and appears in relay logs but the desktop request gets 403 with Cloudflare
+  headers and no relay log entry, investigate Cloudflare/WAF/security rules rather than the relay
+  registration-token guard. The relay guard returns a JSON `401` for invalid registration tokens;
+  it should not appear as a Cloudflare HTML `403`.
+
 ### 6) Health checks green before true relay flow validation
 
 Warning:

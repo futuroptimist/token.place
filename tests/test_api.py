@@ -290,7 +290,7 @@ def test_api_v1_distributed_provider_production_prefers_non_default_relay_config
 
     config_values = {
         "api.relay_url": "https://token.place",
-        "relay.server_url": "https://configured-relay.example",
+        "relay.server_url": "https://prod-relay.example",
     }
     monkeypatch.setattr(
         compute_provider,
@@ -303,8 +303,8 @@ def test_api_v1_distributed_provider_production_prefers_non_default_relay_config
         provider = compute_provider.get_api_v1_compute_provider()
 
     assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-    assert provider.base_url == "https://configured-relay.example"
-    assert "target=https://configured-relay.example" in caplog.text
+    assert provider.base_url == "https://prod-relay.example"
+    assert "target=https://prod-relay.example" in caplog.text
     assert "target_source=config:relay.server_url" in caplog.text
     assert "target_source=production_default" not in caplog.text
 

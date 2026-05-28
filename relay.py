@@ -260,9 +260,19 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 def _has_explicit_relay_upstream_config() -> bool:
     """Return whether relay upstream URLs were explicitly configured by env."""
 
-    for env_name in (RELAY_UPSTREAMS_ENV, RELAY_UPSTREAM_COMPAT_ENV):
+    for env_name in (RELAY_UPSTREAMS_ENV, RELAY_UPSTREAM_COMPAT_ENV, UPSTREAM_URL_ENV):
         raw_value = os.environ.get(env_name, "")
-        if raw_value.strip():
+        if not raw_value.strip():
+            continue
+        if env_name == UPSTREAM_URL_ENV:
+            return True
+        try:
+            from config import Config
+
+            parsed_upstreams = Config()._parse_relay_upstreams(raw_value)
+        except Exception:
+            parsed_upstreams = []
+        if parsed_upstreams:
             return True
     return False
 
@@ -817,10 +827,10 @@ def relay_diagnostics():
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
     }
-    if _has_explicit_relay_upstream_config():
+    if configured_servers:
         diagnostics["configured_upstream_servers"] = configured_servers
-    elif configured_servers:
-        diagnostics["legacy_configured_upstream_servers"] = configured_servers
+        if not _has_explicit_relay_upstream_config():
+            diagnostics["legacy_configured_upstream_servers"] = configured_servers
     return jsonify(diagnostics)
 
 

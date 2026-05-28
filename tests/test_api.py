@@ -278,6 +278,37 @@ def test_api_v1_distributed_provider_production_uses_default_target(monkeypatch,
     assert "relay_only=False" in caplog.text
 
 
+def test_api_v1_distributed_provider_production_prefers_non_default_relay_config(
+    monkeypatch, caplog
+):
+    import api.v1.compute_provider as compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    config_values = {
+        "api.relay_url": "https://token.place",
+        "relay.server_url": "https://configured-relay.example",
+    }
+    monkeypatch.setattr(
+        compute_provider,
+        "_config_value",
+        lambda key: config_values.get(key, ""),
+    )
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+        provider = compute_provider.get_api_v1_compute_provider()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "https://configured-relay.example"
+    assert "target=https://configured-relay.example" in caplog.text
+    assert "target_source=config:relay.server_url" in caplog.text
+    assert "target_source=production_default" not in caplog.text
+
+
 def test_api_v1_distributed_provider_staging_fails_without_target(monkeypatch):
     import api.v1.compute_provider as compute_provider
 

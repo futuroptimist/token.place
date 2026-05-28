@@ -497,16 +497,18 @@ def _select_distributed_target() -> DistributedTargetSelection:
     env_name = _current_token_place_env()
     for config_key in ("api.relay_url", "relay.server_url"):
         target = _normalise_target_url(_config_value(config_key))
-        if not target:
+        if not target or target == _DEFAULT_PRODUCTION_RELAY_URL:
             continue
-        if target == _DEFAULT_PRODUCTION_RELAY_URL and env_name != "production":
-            continue
-        source = f"config:{config_key}"
-        if target == _DEFAULT_PRODUCTION_RELAY_URL:
-            source = "production_default"
         return DistributedTargetSelection(
             url=target,
-            source=source,
+            source=f"config:{config_key}",
+            relay_only=False,
+        )
+
+    if env_name == "production":
+        return DistributedTargetSelection(
+            url=_DEFAULT_PRODUCTION_RELAY_URL,
+            source="production_default",
             relay_only=False,
         )
 

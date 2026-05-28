@@ -104,6 +104,7 @@ if ENVIRONMENT != 'prod':
 
 # Available model metadata
 MODEL_ALIASES: Dict[str, str] = {
+    "gpt-3.5-turbo": "llama-3-8b-instruct",
     "gpt-5-chat-latest": "llama-3-8b-instruct",
 }
 

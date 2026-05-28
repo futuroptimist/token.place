@@ -733,8 +733,8 @@ def test_v1_chat_completion_uses_fixed_llama_3_1_8b_model(client, monkeypatch):
     assert body["choices"][0]["message"]["content"] == "Llama response"
 
 
-def test_v1_chat_completion_rejects_gpt_model_ids(client, monkeypatch):
-    """API v1 should reject GPT-branded model IDs."""
+def test_v1_chat_completion_rejects_unsupported_gpt_model_ids(client, monkeypatch):
+    """API v1 should reject unsupported GPT-branded model IDs."""
 
     monkeypatch.setattr(
         "api.v1.routes.get_models_info",
@@ -753,7 +753,7 @@ def test_v1_chat_completion_rejects_gpt_model_ids(client, monkeypatch):
     response = client.post(
         "/api/v1/chat/completions",
         json={
-            "model": "gpt-3.5-turbo",
+            "model": "gpt-4",
             "messages": [{"role": "user", "content": "Hello"}],
         },
     )

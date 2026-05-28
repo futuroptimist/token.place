@@ -103,7 +103,13 @@ if ENVIRONMENT != 'prod':
     logger.info(f"API v1 Models module loaded with USE_MOCK_LLM={USE_MOCK_LLM}, raw env value: '{os.environ.get('USE_MOCK_LLM', 'NOT_SET')}'")
 
 # Available model metadata
-MODEL_ALIASES: Dict[str, str] = {}
+MODEL_ALIASES: Dict[str, str] = {
+    # Temporary OpenAI-client compatibility aliases that route to the fixed
+    # Meta Llama 3.1 8B backend; these are not first-class GPT model support.
+    # Any removal should happen in a dedicated compatibility/deprecation PR.
+    "gpt-3.5-turbo": "llama-3-8b-instruct",
+    "gpt-5-chat-latest": "llama-3-8b-instruct",
+}
 
 
 AVAILABLE_MODELS = [

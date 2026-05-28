@@ -750,7 +750,7 @@ def test_v1_chat_completion_rejects_unsupported_gpt_model_ids(client, monkeypatc
         lambda: ProviderShouldNotBeCalled(),
     )
 
-    for gpt_model in ("gpt-3.5-turbo", "gpt-4", "gpt-5-chat-latest"):
+    for gpt_model in ("gpt-4",):
         response = client.post(
             "/api/v1/chat/completions",
             json={

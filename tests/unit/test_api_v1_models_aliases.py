@@ -21,10 +21,15 @@ def _reload_models(env=None):
     return models
 
 
-def test_resolve_model_alias_rejects_gpt_branded_ids():
+def test_resolve_model_alias_returns_canonical_id_for_compat_aliases():
     models = _reload_models()
-    assert models.resolve_model_alias("gpt-5-chat-latest") is None
-    assert models.resolve_model_alias("gpt-3.5-turbo") is None
+    assert models.resolve_model_alias("gpt-5-chat-latest") == "llama-3-8b-instruct"
+    assert models.resolve_model_alias("gpt-3.5-turbo") == "llama-3-8b-instruct"
+
+
+def test_resolve_model_alias_rejects_unsupported_gpt_id():
+    models = _reload_models()
+    assert models.resolve_model_alias("gpt-4") is None
 
 
 def test_resolve_model_alias_missing_target_logs_and_returns_none():

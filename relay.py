@@ -642,8 +642,8 @@ def healthz():
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
-    relay_only_mode = not require_upstream_health
     explicit_upstream_config = _has_explicit_relay_upstream_config()
+    relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
     status = {
         "status": "ok",
         "upstream": app.config.get("upstream_url"),
@@ -653,10 +653,8 @@ def healthz():
         "knownServers": len(known_servers),
         "registeredServers": _live_server_diagnostics(),
     }
-    if explicit_upstream_config:
-        status["configuredUpstreamServers"] = configured_servers
-    elif configured_servers:
-        status["legacyConfiguredUpstreamServers"] = configured_servers
+    status["configuredUpstreamServers"] = configured_servers
+    status["legacyConfiguredUpstreamServers"] = [] if explicit_upstream_config else configured_servers
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
 
@@ -821,16 +819,15 @@ def relay_diagnostics():
     live_nodes = _live_server_diagnostics()
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
+    explicit_upstream_config = _has_explicit_relay_upstream_config()
     diagnostics = {
-        "relay_only": not require_upstream_health,
+        "relay_only": (not require_upstream_health) and (not explicit_upstream_config),
         "upstream_health_required": require_upstream_health,
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
+        "configured_upstream_servers": configured_servers,
+        "legacy_configured_upstream_servers": [] if explicit_upstream_config else configured_servers,
     }
-    if configured_servers:
-        diagnostics["configured_upstream_servers"] = configured_servers
-        if not _has_explicit_relay_upstream_config():
-            diagnostics["legacy_configured_upstream_servers"] = configured_servers
     return jsonify(diagnostics)
 
 

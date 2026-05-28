@@ -840,7 +840,9 @@ def test_relay_diagnostics_reports_explicit_upstream_env(client, monkeypatch):
 
     assert response.status_code == 200
     assert payload["configured_upstream_servers"] == configured_servers
-    assert "legacy_configured_upstream_servers" not in payload
+    assert payload["legacy_configured_upstream_servers"] == []
+    assert payload["relay_only"] is False
+    assert payload["upstream_health_required"] is False
 
 
 def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monkeypatch):
@@ -873,7 +875,8 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monke
 
     assert payload["configuredUpstreamServers"] == configured_servers
     assert payload["upstreamHealthRequired"] is False
-    assert payload["relayOnly"] is True
+    assert payload["relayOnly"] is False
+    assert payload["legacyConfiguredUpstreamServers"] == []
     assert payload["registeredServers"][0]["server_public_key"] == live_server_key
     assert payload["registeredServers"][0]["age_seconds"] >= 0
     assert payload["registeredServers"][0]["queue_depth"] == 1
@@ -930,7 +933,7 @@ def test_healthz_default_allows_unresolvable_upstream_host(client, monkeypatch):
     assert payload["upstreamHealthRequired"] is False
     assert payload["relayOnly"] is True
     assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
-    assert "configuredUpstreamServers" not in payload
+    assert payload["configuredUpstreamServers"] == ["https://token.place"]
     assert payload.get("details", {}).get("gpuHostResolution") != "failed"
 
 
@@ -969,8 +972,25 @@ def test_healthz_staging_relay_only_does_not_imply_prod_upstream(client, monkeyp
     assert payload["relayOnly"] is True
     assert payload["upstreamHealthRequired"] is False
     assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
-    assert "configuredUpstreamServers" not in payload
+    assert payload["configuredUpstreamServers"] == ["https://token.place"]
     assert payload.get("details", {}).get("knownServers") == "empty"
+
+
+def test_healthz_malformed_upstreams_env_keeps_default_as_legacy(client, monkeypatch):
+    """Malformed upstream list env should not mark fallback default as explicit config."""
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_UPSTREAMS", '{"url":"https://ignored"}')
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["relayOnly"] is True
+    assert payload["configuredUpstreamServers"] == ["https://token.place"]
+    assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
 
 
 def test_relay_entrypoint_defaults_to_one_worker():

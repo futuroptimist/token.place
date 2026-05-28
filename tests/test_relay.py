@@ -1884,3 +1884,44 @@ def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypat
     time.sleep(2.1)
     expired = client.get('/api/v1/relay/servers/next')
     assert expired.status_code == 503
+
+
+def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS', '3')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    for request_id in ('req-inflight-a', 'req-inflight-b'):
+        queued = client.post('/api/v1/relay/requests', json={
+            'request_id': request_id,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': f'ciphertext-{request_id}',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+        })
+        assert queued.status_code == 200
+
+    first_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    second_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert first_poll.status_code == 200
+    assert second_poll.status_code == 200
+
+    first_request_id = first_poll.get_json()['request_id']
+    second_request_id = second_poll.get_json()['request_id']
+    assert {first_request_id, second_request_id} == {'req-inflight-a', 'req-inflight-b'}
+
+    response = client.post('/api/v1/relay/responses', json={
+        'request_id': second_request_id,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    })
+    assert response.status_code == 200
+
+    time.sleep(1.2)
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 200
+    assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY

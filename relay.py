@@ -521,6 +521,21 @@ def _evict_stale_servers() -> list[str]:
         polling_until = payload.get("polling_until_monotonic")
         if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
             continue
+        in_flight_requests = payload.get("api_v1_in_flight_requests")
+        if isinstance(in_flight_requests, dict):
+            active_in_flight_requests = {
+                request_id: expires_at
+                for request_id, expires_at in in_flight_requests.items()
+                if isinstance(request_id, str)
+                and request_id
+                and isinstance(expires_at, (int, float))
+                and expires_at > now_monotonic
+            }
+            if active_in_flight_requests:
+                payload["api_v1_in_flight_requests"] = active_in_flight_requests
+                continue
+            payload.pop("api_v1_in_flight_requests", None)
+
         in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
         if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
             continue
@@ -1069,8 +1084,11 @@ def api_v1_relay_servers_poll():
     queued_at = first_request.pop('_queued_at', None)
     if isinstance(queued_at, (int, float)):
         queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
-    server_payload['api_v1_in_flight_request_id'] = first_request.get('request_id')
-    server_payload['api_v1_in_flight_until_monotonic'] = time.monotonic() + _api_v1_in_flight_ttl_seconds()
+    request_id = first_request.get('request_id')
+    if isinstance(request_id, str) and request_id:
+        in_flight_requests = server_payload.setdefault('api_v1_in_flight_requests', {})
+        if isinstance(in_flight_requests, dict):
+            in_flight_requests[request_id] = time.monotonic() + _api_v1_in_flight_ttl_seconds()
 
     LOGGER.info(
         "relay.api_v1.request_dispatched",
@@ -1143,9 +1161,11 @@ def api_v1_relay_responses():
     request_id = envelope.get('request_id')
     if isinstance(request_id, str) and request_id:
         for server_payload in known_servers.values():
-            if server_payload.get('api_v1_in_flight_request_id') == request_id:
-                server_payload.pop('api_v1_in_flight_request_id', None)
-                server_payload.pop('api_v1_in_flight_until_monotonic', None)
+            in_flight_requests = server_payload.get('api_v1_in_flight_requests')
+            if isinstance(in_flight_requests, dict) and request_id in in_flight_requests:
+                in_flight_requests.pop(request_id, None)
+                if not in_flight_requests:
+                    server_payload.pop('api_v1_in_flight_requests', None)
                 break
 
     _queue_client_response(client_public_key, envelope)

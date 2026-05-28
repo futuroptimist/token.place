@@ -345,22 +345,8 @@ jobs:
             cp -R "${app_path}" "${dmg_stage_dir}/"
             cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"
             ln -s /Applications "${dmg_stage_dir}/Applications"
-            dmg_tmp_path="$RUNNER_TEMP/${dmg_name}.tmp.dmg"
-            rm -f "${dmg_path}" "${dmg_tmp_path}"
-            for dmg_attempt in 1 2 3; do
-              if hdiutil create -volname "token.place desktop" -srcfolder "${dmg_stage_dir}" -ov -format UDZO "${dmg_tmp_path}"; then
-                mv "${dmg_tmp_path}" "${dmg_path}"
-                break
-              fi
-              rm -f "${dmg_tmp_path}"
-              if [ "${dmg_attempt}" -eq 3 ]; then
-                echo "hdiutil create failed after ${dmg_attempt} attempts." >&2
-                exit 1
-              fi
-              echo "::warning::hdiutil create failed, retrying after cleanup (attempt ${dmg_attempt}/3)."
-              hdiutil detach "/Volumes/token.place desktop" -force >/dev/null 2>&1 || true
-              sleep "$((dmg_attempt * 5))"
-            done
+            rm -f "${dmg_path}"
+            hdiutil create -volname "token.place desktop" -srcfolder "${dmg_stage_dir}" -ov -format UDZO "${dmg_path}"
             if [[ "${dmg_path}" == *"tokenplace Desktop"* ]] || [[ "${dmg_path}" == *"tokenplace Desktop Setup"* ]] || [[ "${dmg_path}" == *"desktop/electron-builder"* ]]; then
               echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
               exit 1

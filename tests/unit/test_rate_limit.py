@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from flask import Flask
 
-from api import init_app
+from api import _load_relay_server_registration_tokens, init_app
 
 
 @patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"})
@@ -93,6 +93,67 @@ def test_streaming_chat_completion_requests_are_rate_limited(monkeypatch):
     body = limited_response.get_json()
     assert body is not None
     assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "100/minute", "API_STREAM_RATE_LIMIT": "1/minute"},
+    clear=True,
+)
+def test_non_json_chat_completion_posts_do_not_consume_stream_limit():
+    """The streaming-only limiter should ignore non-JSON chat requests."""
+
+    app = Flask(__name__)
+    init_app(app)
+
+    with app.test_client() as client:
+        responses = [
+            client.post("/api/v2/chat/completions", data="not-json") for _ in range(2)
+        ]
+
+    assert 429 not in {response.status_code for response in responses}
+
+
+@patch.dict(os.environ, {}, clear=True)
+def test_relay_token_loader_handles_missing_config(monkeypatch):
+    """Missing config/env tokens should leave relay mutations quota-protected."""
+
+    monkeypatch.delitem(sys.modules, "relay", raising=False)
+    monkeypatch.delattr(
+        sys.modules["__main__"], "SERVER_REGISTRATION_TOKENS", raising=False
+    )
+
+    with patch("api.get_config", side_effect=AttributeError):
+        assert _load_relay_server_registration_tokens() == []
+
+
+@patch.dict(
+    os.environ,
+    {
+        "TOKEN_PLACE_RELAY_SERVER_TOKENS": "plural-one\nplural-two, ",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "single-token",
+    },
+    clear=True,
+)
+def test_relay_token_loader_combines_config_and_env_tokens(monkeypatch):
+    """Fallback token loading should normalize configured and env tokens."""
+
+    monkeypatch.delitem(sys.modules, "relay", raising=False)
+    monkeypatch.delattr(
+        sys.modules["__main__"], "SERVER_REGISTRATION_TOKENS", raising=False
+    )
+
+    with patch(
+        "api.get_config",
+        return_value={"relay.server_registration_token": " config-one,config-two "},
+    ):
+        assert _load_relay_server_registration_tokens() == [
+            "config-one",
+            "config-two",
+            "plural-one",
+            "plural-two",
+            "single-token",
+        ]
 
 
 @patch.dict(os.environ, {"TOKEN_PLACE_ENV": "production"}, clear=True)
@@ -211,7 +272,9 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
     },
     clear=True,
 )
-def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota(monkeypatch):
+def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota(
+    monkeypatch,
+):
     """Authenticated compute-node heartbeats must not consume user API quota."""
     monkeypatch.setitem(
         sys.modules,
@@ -317,6 +380,42 @@ def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypa
 
     assert [response.status_code for response in rotated_responses] == [200, 200, 429]
     assert {response.status_code for response in active_responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
+    },
+    clear=True,
+)
+def test_relay_mutations_with_missing_token_header_keep_public_rate_limit(monkeypatch):
+    """Configured relay tokens should not exempt requests that omit the header."""
+
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["relay-token"]),
+    )
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/register")
+    def relay_servers_register_missing_header():
+        return {"status": "registered"}
+
+    with app.test_client() as client:
+        responses = [
+            client.post(
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": f"server-{index}"},
+            )
+            for index in range(3)
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200, 429]
 
 
 @patch.dict(

@@ -244,6 +244,45 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     assert data['error']['code'] in {'no_registered_compute_nodes', 'compute_node_unreachable'}
 
 
+def test_api_v1_chat_completion_staging_relay_public_url_no_nodes_clear_503(client, monkeypatch):
+    compute_provider_module = importlib.import_module('api.v1.compute_provider')
+    monkeypatch.setenv('TOKEN_PLACE_ENV', 'staging')
+    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
+    monkeypatch.delenv('TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL', raising=False)
+    monkeypatch.delenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', raising=False)
+    monkeypatch.setenv('TOKENPLACE_RELAY_PUBLIC_URL', 'https://staging.token.place')
+    monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
+
+    requested_urls = []
+
+    class FakeNoNodeResponse:
+        status_code = 200
+
+        def json(self):
+            return {'error': {'code': 'no_registered_compute_nodes'}}
+
+    monkeypatch.setattr(
+        compute_provider_module.requests,
+        'get',
+        lambda url, timeout: requested_urls.append(url) or FakeNoNodeResponse(),
+    )
+    compute_provider_module._build_api_v1_compute_provider.cache_clear()
+    try:
+        response = client.post('/api/v1/chat/completions', json={
+            'model': 'llama-3-8b-instruct',
+            'messages': [{'role': 'user', 'content': 'Ping staging distributed runtime'}],
+        })
+    finally:
+        compute_provider_module._build_api_v1_compute_provider.cache_clear()
+
+    assert requested_urls == ['https://staging.token.place/api/v1/relay/servers/next']
+    assert response.status_code == 503
+    data = response.get_json()
+    assert data['error']['type'] == 'service_unavailable_error'
+    assert data['error']['code'] == 'no_registered_compute_nodes'
+    assert data['error']['message'] == 'No registered compute nodes are available on this relay.'
+
+
 def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
     fallback_message = {
         'role': 'assistant',

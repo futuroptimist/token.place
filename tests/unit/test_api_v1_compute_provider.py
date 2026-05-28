@@ -371,7 +371,7 @@ def test_distributed_compute_provider_maps_next_server_json_error(monkeypatch):
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_invalid_payload"
-        assert "next_server response was not valid JSON" in str(exc)
+        assert "compute-node selection response was not valid JSON" in str(exc)
 
 
 def test_distributed_compute_provider_maps_next_server_5xx(monkeypatch):
@@ -561,6 +561,47 @@ def test_get_provider_disables_local_fallback_when_configured(monkeypatch):
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
 
+def test_get_provider_uses_staging_relay_public_url_without_prod_fallback(monkeypatch, caplog):
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.delenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        with caplog.at_level("INFO", logger="api.v1.compute_provider"):
+            provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.base_url == "https://staging.token.place"
+        assert "target=https://staging.token.place" in caplog.text
+        assert "target_source=TOKENPLACE_RELAY_PUBLIC_URL" in caplog.text
+        assert "relay_only=True" in caplog.text
+        assert "target=https://token.place" not in caplog.text
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_get_provider_uses_production_relay_default(monkeypatch):
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.delenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("RELAY_PUBLIC_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.base_url == "https://token.place"
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
 def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
     monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "")
@@ -572,7 +613,7 @@ def test_get_provider_raises_when_distributed_fallback_disabled_without_url(monk
             compute_provider.get_api_v1_compute_provider()
             raise AssertionError("expected ComputeProviderError")
         except ComputeProviderError as exc:
-            assert "requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL" in str(exc)
+            assert "requires an explicit distributed relay target" in str(exc)
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
@@ -673,7 +714,7 @@ def test_distributed_compute_provider_maps_next_server_request_exception(monkeyp
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
         assert exc.code == "compute_node_unreachable"
-        assert "unable to reach relay next_server endpoint" in str(exc)
+        assert "unable to reach API v1 relay compute-node selection endpoint" in str(exc)
 
 
 def test_distributed_compute_provider_maps_faucet_request_exception(monkeypatch):
@@ -760,7 +801,7 @@ def test_get_api_v1_compute_provider_for_mode_distributed_without_url_raises(mon
         get_api_v1_compute_provider_for_mode(mode="distributed", distributed_fallback_enabled=False)
         raise AssertionError("expected ComputeProviderError")
     except ComputeProviderError as exc:
-        assert "requires TOKENPLACE_DISTRIBUTED_COMPUTE_URL" in str(exc)
+        assert "requires an explicit distributed relay target" in str(exc)
 
 
 def test_get_api_v1_compute_provider_for_mode_reads_fallback_from_env(monkeypatch):

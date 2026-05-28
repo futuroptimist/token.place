@@ -956,6 +956,7 @@ def test_healthz_staging_relay_only_does_not_imply_prod_upstream(client, monkeyp
     monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
     monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
     monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
     monkeypatch.setitem(app.config, "public_base_url", "https://staging.token.place")
     monkeypatch.setitem(app.config, "relay_configured_servers", ["https://token.place"])
 

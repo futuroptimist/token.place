@@ -144,6 +144,7 @@ After (explicit relay-only semantics):
   "relayOnly": true,
   "upstreamHealthRequired": false,
   "knownServers": 0,
+  "configuredUpstreamServers": ["https://token.place"],
   "legacyConfiguredUpstreamServers": ["https://token.place"],
   "upstream": "http://gpu-server:3000",
   "details": {"knownServers": "empty"}
@@ -153,6 +154,7 @@ After (explicit relay-only semantics):
 Interpretation:
 - `status: ok` reflects relay process readiness.
 - `knownServers: 0` means no registered external compute nodes yet (expected before node registration).
+- `configuredUpstreamServers` is retained as a stable compatibility key.
 - `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
 
 ## Guardrails

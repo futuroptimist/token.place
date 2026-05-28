@@ -257,8 +257,21 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _has_explicit_relay_upstream_config() -> bool:
-    """Return whether relay upstream URLs were explicitly configured by env."""
+def _normalise_upstream_server_pool(servers: List[str]) -> List[str]:
+    """Return a normalised upstream server pool for source comparisons."""
+
+    normalised: List[str] = []
+    for raw_server in servers:
+        if not isinstance(raw_server, str):
+            continue
+        value = raw_server.strip().rstrip("/")
+        if value:
+            normalised.append(value.lower())
+    return normalised
+
+
+def _has_explicit_relay_upstream_config(configured_servers: List[str] | None = None) -> bool:
+    """Return whether relay upstream URLs were explicitly configured by env or config."""
 
     for env_name in (RELAY_UPSTREAMS_ENV, RELAY_UPSTREAM_COMPAT_ENV, UPSTREAM_URL_ENV):
         raw_value = os.environ.get(env_name, "")
@@ -273,6 +286,11 @@ def _has_explicit_relay_upstream_config() -> bool:
         except Exception:
             parsed_upstreams = []
         if parsed_upstreams:
+            return True
+    if configured_servers is not None:
+        default_legacy_pool = _normalise_upstream_server_pool(["https://token.place"])
+        current_pool = _normalise_upstream_server_pool(configured_servers)
+        if current_pool and current_pool != default_legacy_pool:
             return True
     return False
 
@@ -642,7 +660,7 @@ def healthz():
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
-    explicit_upstream_config = _has_explicit_relay_upstream_config()
+    explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
     relay_only_mode = (not require_upstream_health) and (not explicit_upstream_config)
     status = {
         "status": "ok",
@@ -819,7 +837,7 @@ def relay_diagnostics():
     live_nodes = _live_server_diagnostics()
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
-    explicit_upstream_config = _has_explicit_relay_upstream_config()
+    explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
     diagnostics = {
         "relay_only": (not require_upstream_health) and (not explicit_upstream_config),
         "upstream_health_required": require_upstream_health,

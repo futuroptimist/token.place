@@ -800,9 +800,6 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monke
     monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
     monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
     monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
-    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
-    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
-    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
     monkeypatch.setitem(app.config, "relay_configured_servers", [
         "https://configured-one.example.com:8000",
         "https://configured-two.example.com:8000",
@@ -821,9 +818,9 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monke
     payload = response.get_json()
 
     assert payload["configured_upstream_servers"] == app.config["relay_configured_servers"]
-    assert payload["legacy_configured_upstream_servers"] == app.config["relay_configured_servers"]
+    assert payload["legacy_configured_upstream_servers"] == []
     assert payload["upstream_health_required"] is False
-    assert payload["relay_only"] is True
+    assert payload["relay_only"] is False
     assert payload["total_registered_compute_nodes"] == 1
     assert payload["registered_compute_nodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
@@ -991,6 +988,23 @@ def test_healthz_malformed_upstreams_env_keeps_default_as_legacy(client, monkeyp
     assert payload["relayOnly"] is True
     assert payload["configuredUpstreamServers"] == ["https://token.place"]
     assert payload["legacyConfiguredUpstreamServers"] == ["https://token.place"]
+
+
+def test_healthz_custom_configured_servers_are_not_reported_as_legacy(client, monkeypatch):
+    """Custom configured server pools should be treated as explicit/non-legacy."""
+    monkeypatch.delenv("TOKEN_PLACE_RELAY_UPSTREAMS", raising=False)
+    monkeypatch.delenv("PERSONAL_GAMING_PC_URL", raising=False)
+    monkeypatch.delenv("TOKENPLACE_RELAY_UPSTREAM_URL", raising=False)
+    monkeypatch.setenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", "0")
+    monkeypatch.setitem(app.config, "relay_configured_servers", ["https://custom.upstream.example"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["relayOnly"] is False
+    assert payload["configuredUpstreamServers"] == ["https://custom.upstream.example"]
+    assert payload["legacyConfiguredUpstreamServers"] == []
 
 
 def test_relay_entrypoint_defaults_to_one_worker():

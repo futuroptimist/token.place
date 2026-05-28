@@ -145,8 +145,12 @@ helm show chart ./charts/tokenplace
 helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
 
 # Render local and OCI manifests, then diff strategy/env sections.
-helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-local.yaml
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-oci.yaml
+# For staging candidate validation, set this to the immutable image tag deployed by Sugarkube.
+IMAGE_TAG=main-REPLACE_SHORTSHA
+
+
+helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-local.yaml
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-oci.yaml
 diff -u /tmp/tokenplace-local.yaml /tmp/tokenplace-oci.yaml | less
 ```
 
@@ -258,15 +262,21 @@ curl -fsS https://staging.token.place/metrics | head -n 40
 
 ### Image tag, chart version, and Git tag must be validated independently
 
-For v0.1.0 launch readiness, verify all three identifiers explicitly:
+For final v0.1.0 release readiness, verify all four identifiers explicitly (separate from staging candidate validation):
 
 - Git release tag: `v0.1.0`
 - Chart package version: `0.1.0` (with chart `appVersion: "0.1.0"`)
+- Chart appVersion: `"0.1.0"`
 - Relay image tag: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 
-Example image-tag existence check:
+Example image-tag existence checks:
 
 ```bash
+# Staging candidate validation (use the same candidate tag as IMAGE_TAG above).
+IMAGE_TAG=main-REPLACE_SHORTSHA
+docker manifest inspect "ghcr.io/futuroptimist/tokenplace-relay:${IMAGE_TAG}" >/dev/null
+
+# Final release-tag validation.
 docker manifest inspect ghcr.io/futuroptimist/tokenplace-relay:v0.1.0 >/dev/null
 ```
 

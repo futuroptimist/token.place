@@ -93,6 +93,10 @@ curl -fsS https://staging.token.place/
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
 E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
+See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" for
+required checks covering stale OCI chart detection, Recreate strategy verification, XDG
+read-only-root safeguards, duplicate env detection, and external compute-node long-poll flow
+validation.
 
 If operators use a non-default staging hostname, apply the same checks with that host.
 

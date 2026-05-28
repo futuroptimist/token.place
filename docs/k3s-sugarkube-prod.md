@@ -96,6 +96,8 @@ curl -fsS https://token.place/
 
 Optional note: true relay traffic validation requires a registered external compute node plus an
 E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
+See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" and run
+the same external compute-node validation pattern against production hostnames before sign-off.
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 

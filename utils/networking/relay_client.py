@@ -1070,10 +1070,8 @@ class RelayClient:
                     poll_wait = register_response.get('poll_wait_seconds', register_wait)
                     poll_wait = self._normalise_poll_wait_seconds(poll_wait)
                     if register_response.get('error'):
-                        last_error = {
-                            'error': register_response.get('error'),
-                            'next_ping_in_x_seconds': register_wait,
-                        }
+                        last_error = dict(register_response)
+                        last_error.setdefault('next_ping_in_x_seconds', register_wait)
                         continue
                     relay_wait_hints[candidate_url] = {
                         'next_ping_in_x_seconds': register_wait,

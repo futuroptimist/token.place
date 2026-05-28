@@ -903,6 +903,38 @@ class TestRelayClient:
             assert forbidden not in json.dumps(result, sort_keys=True)
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_propagates_register_http_diagnostic(
+        self, mock_post, relay_client
+    ):
+        relay_client._registration_token = 'super-secret-token'
+        relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
+        response = MagicMock(status_code=403)
+        response.headers = {
+            'server': 'cloudflare',
+            'cf-ray': '84abcd-SJC',
+            'content-type': 'text/html; charset=UTF-8',
+        }
+        response.text = (
+            '<html>403 forbidden X-Relay-Server-Token: super-secret-token '
+            'server_public_key=server-public-key-secret</html>'
+        )
+        response.json.side_effect = ValueError('not json')
+        mock_post.return_value = response
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['error'] == 'HTTP 403'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert result['http_status'] == 403
+        assert result['relay_error_kind'] == 'cloudflare_pre_app_rejection'
+        diagnostic = result['relay_http_diagnostic']
+        assert diagnostic['path'] == '/api/v1/relay/servers/register'
+        assert diagnostic['headers']['cf-ray'] == '84abcd-SJC'
+        assert diagnostic['token_sent'] is True
+        for forbidden in ('super-secret-token', 'server-public-key-secret'):
+            assert forbidden not in json.dumps(result, sort_keys=True)
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
         self, mock_post, relay_client, caplog
     ):

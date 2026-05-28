@@ -536,9 +536,11 @@ def _evict_stale_servers() -> list[str]:
                     in_flight_requests.pop(request_id, None)
 
             has_active_in_flight_requests = any(
-                isinstance(in_flight_requests.get(request_id), (int, float))
-                and in_flight_requests[request_id] > now_monotonic
-                for request_id in active_request_ids
+                isinstance(current_expires_at, (int, float))
+                and current_expires_at > now_monotonic
+                for current_expires_at in (
+                    in_flight_requests.get(request_id) for request_id in active_request_ids
+                )
             )
             if has_active_in_flight_requests:
                 continue

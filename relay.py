@@ -525,7 +525,7 @@ def _evict_stale_servers() -> list[str]:
         if isinstance(in_flight_requests, dict):
             active_in_flight_requests = {
                 request_id: expires_at
-                for request_id, expires_at in in_flight_requests.items()
+                for request_id, expires_at in list(in_flight_requests.items())
                 if isinstance(request_id, str)
                 and request_id
                 and isinstance(expires_at, (int, float))

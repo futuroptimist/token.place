@@ -178,6 +178,13 @@ Decision points:
 - If desktop logs show `kind=http_status_no_json_body` without Cloudflare headers, inspect ingress,
   tunnel, and upstream proxy logs before changing relay application code.
 
+Operational note: `/healthz`, `/livez`, `/metrics`, `/relay/diagnostics`, and API v1 compute-node
+heartbeat/control-plane routes are intentionally exempt from the public API rate-limit quota. A
+Kubernetes readiness probe that calls `/healthz` every 10 seconds must not exhaust the default
+`API_RATE_LIMIT=60/hour`; before this exemption, staging could return 429 to kube-probe and become
+externally unhealthy even while the relay process was running. User-facing chat/completion routes
+remain rate-limited.
+
 ## v0.1.0 staging failure modes and operator runbook
 
 The following failure modes were observed during v0.1.0 staging and should be treated as a

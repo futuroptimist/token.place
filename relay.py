@@ -843,7 +843,12 @@ def _legacy_route_deprecated_response(route_name: str):
 def _select_next_server_payload():
     _evict_stale_servers()
     if not known_servers:
-        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
+        return jsonify({
+            'error': {
+                'message': 'No registered compute nodes are available on this relay.',
+                'code': 'no_registered_compute_nodes',
+            }
+        }), 503
     server_public_key = secrets.choice(list(known_servers.keys()))
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
 

@@ -75,8 +75,8 @@ def test_next_server_no_servers(client):
     assert response.status_code == 503
     data = response.get_json()
     assert 'error' in data
-    assert data['error']['message'] == 'No servers available'
-    assert data['error']['code'] == 503
+    assert data['error']['message'] == 'No registered compute nodes are available on this relay.'
+    assert data['error']['code'] == 'no_registered_compute_nodes'
 
 def test_next_server_one_server(client):
     """Test /next_server when one server is registered."""
@@ -108,7 +108,7 @@ def test_next_server_evicts_stale_nodes(client):
     payload = response.get_json()
 
     assert response.status_code == 503
-    assert payload["error"]["message"] == "No servers available"
+    assert payload["error"]["message"] == "No registered compute nodes are available on this relay."
     assert DUMMY_SERVER_PUB_KEY not in known_servers
 
 # --- Test /sink ---

@@ -96,6 +96,21 @@ E2EE client-flow probe; health/root checks alone do not prove register/poll/requ
 
 If operators use a non-default staging hostname, apply the same checks with that host.
 
+## Required v0.1.0 failure-mode runbook checks
+
+Before declaring staging ready, run the v0.1.0 troubleshooting checks in
+[`relay_sugarkube_onboarding.md`](./relay_sugarkube_onboarding.md#v010-staging-failure-modes-and-fast-triage-runbook),
+including:
+
+- stale OCI `0.1.0` chart detection vs local render,
+- `strategy.type: Recreate` verification,
+- XDG `/tmp` env verification for read-only root operation,
+- duplicate env detection in rendered manifests,
+- staging image tag existence check,
+- external compute-node long-poll + queue/retrieve flow validation.
+
+Warning: `/livez`, `/healthz`, `/`, and `/metrics` are necessary but not sufficient for sign-off.
+
 ## Rollback
 
 - Record baseline revision: `helm history tokenplace -n tokenplace`

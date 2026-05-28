@@ -99,6 +99,21 @@ E2EE client-flow probe; health/root checks alone do not prove register/poll/requ
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 
+## Required v0.1.0 failure-mode runbook checks
+
+Before production promotion/sign-off, execute the v0.1.0 troubleshooting runbook in
+[`relay_sugarkube_onboarding.md`](./relay_sugarkube_onboarding.md#v010-staging-failure-modes-and-fast-triage-runbook),
+especially:
+
+- OCI chart `0.1.0` drift detection (local vs GHCR render),
+- explicit `strategy.type: Recreate` confirmation,
+- read-only root XDG env checks (`XDG_*` redirected to `/tmp`),
+- duplicate env warning prevention,
+- release image tag availability validation,
+- external compute-node register/poll/queue/retrieve encrypted-response validation.
+
+Warning: `/livez`, `/healthz`, `/`, and `/metrics` alone do not prove end-to-end relay readiness.
+
 ## Rollback
 
 - Record baseline revision: `helm history tokenplace -n tokenplace`

@@ -117,6 +117,104 @@ curl -fsS https://token.place/
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).
 
+## v0.1.0 staging failure modes and fast triage runbook
+
+The v0.1.0 staging incident exposed six recurring operator failure modes. Treat this section as
+required pre-release triage for both staging and production promotion.
+
+### 1) Stale OCI chart `0.1.0` (missing `strategy.type: Recreate`)
+
+Symptom: rendered manifests from GHCR chart `0.1.0` do not include `strategy.type: Recreate`
+even though local chart files do.
+
+```bash
+# Local chart render (token.place repo)
+helm template tokenplace ./deploy/charts/tokenplace-relay -f docs/examples/tokenplace.values.dev.yaml > /tmp/tokenplace-local-render.yaml
+grep -n "strategy:" -A4 /tmp/tokenplace-local-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-local-render.yaml
+
+# OCI chart render (published package)
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 -f docs/examples/tokenplace.values.dev.yaml > /tmp/tokenplace-oci-render.yaml
+grep -n "strategy:" -A4 /tmp/tokenplace-oci-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-oci-render.yaml
+```
+
+If local and OCI renders diverge, stop rollout.
+
+### 2) GHCR package delete/re-publish decision for pre-launch `0.1.0`
+
+Before public launch, if `0.1.0` in GHCR is stale and operators must keep all launch identifiers
+at `0.1.0`, the fix is to delete the bad `0.1.0` chart package and re-publish corrected `0.1.0`.
+Do **not** imply `0.1.1` is required for this pre-launch correction.
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+Keep identifiers aligned: Git tag `v0.1.0`, chart package version `0.1.0`, chart
+`appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`.
+
+### 3) Relay crash with read-only root filesystem (XDG paths)
+
+Symptom: relay container exits on startup when runtime/user cache/config paths point to
+unwritable root locations.
+
+Required mitigation: redirect XDG/runtime temp paths to `/tmp`.
+
+```bash
+# Render-time verification
+grep -n "XDG_CONFIG_HOME\\|XDG_CACHE_HOME\\|XDG_DATA_HOME\\|XDG_STATE_HOME\\|XDG_RUNTIME_DIR" /tmp/tokenplace-oci-render.yaml
+
+# Runtime verification (cluster)
+kubectl -n tokenplace exec deploy/tokenplace -- env | grep -E '^XDG_(CONFIG_HOME|CACHE_HOME|DATA_HOME|STATE_HOME|RUNTIME_DIR)='
+```
+
+### 4) Duplicate env warnings (chart + values overlap)
+
+Symptom: deployment warnings about duplicate environment variable keys due to values overlays
+redeclaring env vars already emitted by chart defaults.
+
+```bash
+# Render and inspect env block
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml > /tmp/tokenplace-staging-render.yaml
+awk '/env:/,/imagePullPolicy:/' /tmp/tokenplace-staging-render.yaml
+```
+
+Expected: one declaration per env key. Remove duplicates from values overlays instead of patching
+around warnings.
+
+### 5) Desktop compute node long-poll timeout against staging
+
+Symptom: external desktop compute node can register, then poll times out or loops without
+delivering queued relay work.
+
+Verify staging image/tag and relay poll behavior before release sign-off:
+
+```bash
+# Verify intended image tag exists before deploy/promotion
+docker manifest inspect ghcr.io/futuroptimist/tokenplace-relay:v0.1.0 >/dev/null
+
+# Verify active cluster image
+kubectl -n tokenplace get deploy tokenplace -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+If long-poll still times out, block release until external compute-node poll/queue/retrieve flow
+passes end-to-end.
+
+### 6) Green health endpoints before real relay path validation
+
+`/livez`, `/healthz`, `/`, and `/metrics` are necessary baseline checks but are **not sufficient**
+for production sign-off. They validate relay process health, not full distributed relay inference.
+
+Required external compute-node validation checklist:
+
+- [ ] Compute node registers with relay.
+- [ ] `/healthz` `knownServers` increments from `0` to `>=1`.
+- [ ] `/relay/diagnostics` shows the registered node.
+- [ ] Client request is accepted and queued at relay.
+- [ ] External compute node receives that request via poll.
+- [ ] Client retrieves encrypted response successfully.
+
 ### Relay-only health output expectations (staging and production)
 
 For Sugarkube relay-only deployments, healthy relay readiness does **not** require

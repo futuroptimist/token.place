@@ -77,6 +77,17 @@ Upgrade existing release:
 just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.prod.yaml version_file=PATH/TO/tokenplace.version default_tag=v0.1.0
 ```
 
+## v0.1.0 staging incident runbook reference
+
+Before sign-off, review and execute the troubleshooting runbook in
+[`relay_sugarkube_onboarding.md` (v0.1.0 staging failure modes)](./relay_sugarkube_onboarding.md#v010-staging-failure-modes-and-troubleshooting-runbook), including:
+
+- stale OCI chart vs local chart render diff checks
+- `strategy.type: Recreate` verification
+- XDG `/tmp` path verification for read-only root runtime
+- duplicate env var detection in rendered manifests
+- external compute-node long-poll and relay-flow validation
+
 ## Validation checklist
 
 ```bash

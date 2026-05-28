@@ -157,6 +157,144 @@ Interpretation:
 - `configuredUpstreamServers` is retained as a stable compatibility key.
 - `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
 
+
+## v0.1.0 staging failure modes and troubleshooting runbook
+
+This section captures failure modes seen during the **v0.1.0** staging push so operators can quickly triage chart/image/tag mismatches and relay runtime issues.
+
+### Fast distinction: Git tag vs chart version vs image tag
+
+Keep these identifiers distinct during release work:
+
+- Git release tag: `v0.1.0`
+- OCI chart package version: `0.1.0`
+- Chart `appVersion`: `"0.1.0"`
+- Relay image tag (release): `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+
+For pre-release validation, use immutable `main-<shortsha>` image tags without changing the chart version away from `0.1.0`.
+
+### Failure mode 1: stale OCI chart `0.1.0` (missing `strategy.type: Recreate`)
+
+Symptoms:
+- Cluster render does not include `strategy.type: Recreate` for the relay deployment.
+- Local chart render and OCI chart render disagree.
+
+Verify local vs OCI chart output:
+
+```bash
+# Local chart render (token.place repo)
+helm template tokenplace ./deploy/charts/tokenplace-relay \
+  --namespace tokenplace \
+  > /tmp/tokenplace-local-render.yaml
+
+# OCI chart render (published artifact)
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace \
+  --version 0.1.0 \
+  --namespace tokenplace \
+  > /tmp/tokenplace-oci-render.yaml
+
+# Confirm rollout strategy in both renders
+grep -n "strategy:" -A4 /tmp/tokenplace-local-render.yaml
+grep -n "strategy:" -A4 /tmp/tokenplace-oci-render.yaml
+grep -n "type: Recreate" /tmp/tokenplace-local-render.yaml /tmp/tokenplace-oci-render.yaml
+```
+
+### Failure mode 2: chart package delete/re-publish decision for pre-launch `0.1.0`
+
+If stale chart `0.1.0` was already pushed before launch, operators may need to delete and re-publish the `0.1.0` package so all launch artifacts remain aligned on `0.1.0`.
+
+Decision rule for pre-launch only:
+- If `helm show chart ... --version 0.1.0` shows stale content, pause rollout and coordinate package delete/re-publish of `0.1.0`.
+- Do **not** imply a forced bump to `0.1.1` for this staging issue alone.
+
+```bash
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+```
+
+### Failure mode 3: relay crash on read-only root filesystem (XDG paths)
+
+Symptoms:
+- Relay pod starts and then exits or CrashLoopBackOff on read-only root.
+- Runtime attempts to write under non-writable default XDG paths.
+
+Verify XDG redirection to `/tmp` in rendered manifest:
+
+```bash
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace \
+  --version 0.1.0 \
+  --namespace tokenplace \
+  -f PATH/TO/tokenplace.values.dev.yaml \
+  -f PATH/TO/tokenplace.values.staging.yaml \
+  --set image.tag=main-REPLACE_SHORTSHA \
+  > /tmp/tokenplace-staging-render.yaml
+
+grep -n "XDG_CONFIG_HOME" -A1 /tmp/tokenplace-staging-render.yaml
+grep -n "XDG_CACHE_HOME" -A1 /tmp/tokenplace-staging-render.yaml
+grep -n "XDG_DATA_HOME" -A1 /tmp/tokenplace-staging-render.yaml
+```
+
+Expected values should point to `/tmp`-backed writable paths for read-only root operation.
+
+### Failure mode 4: duplicate env var warnings from chart + values
+
+Symptoms:
+- Helm/Kubernetes warnings for duplicated environment variable names during render/apply.
+
+Verify no duplicate env names in final rendered deployment:
+
+```bash
+# quick signal for repeated env names
+awk '/name: /{print $2}' /tmp/tokenplace-staging-render.yaml | sort | uniq -d
+
+# explicit check for known duplicated keys from staging incident
+grep -n "TOKENPLACE_PUBLIC_BASE_URL" /tmp/tokenplace-staging-render.yaml
+grep -n "TOKENPLACE_RELAY_*" /tmp/tokenplace-staging-render.yaml
+```
+
+If duplicates appear, remove overlap between chart defaults and environment-specific values so each env key is emitted once.
+
+### Failure mode 5: external desktop compute node long-poll timeout
+
+Symptoms:
+- External compute node appears healthy locally but times out while polling staging relay for work.
+
+Minimum triage checks:
+
+```bash
+# verify staging relay image tag is present in registry before rollout
+docker manifest inspect ghcr.io/futuroptimist/tokenplace-relay:main-REPLACE_SHORTSHA > /dev/null
+
+# relay readiness endpoints (necessary but not sufficient)
+curl -fsS https://staging.token.place/livez
+curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/metrics >/dev/null
+curl -fsS https://staging.token.place/
+```
+
+Then run the external compute-node validation checklist below to confirm end-to-end relay registration/poll/request/reply flow.
+
+### Health endpoint warning (sign-off gate)
+
+`/livez`, `/healthz`, `/`, and `/metrics` are required baseline checks, but they are **not sufficient** for production sign-off. They validate relay process/HTTP exposure, not end-to-end external compute-node inference flow.
+
+### Required external compute-node validation checklist
+
+Treat sign-off as incomplete until all items pass:
+
+1. Compute node registers successfully with staging relay.
+2. `/healthz` reflects registration (`knownServers` increments from 0).
+3. `/relay/diagnostics` lists the registered node in relay diagnostics metadata.
+4. Client E2EE request is accepted and queued by relay.
+5. External compute node receives/dequeues request through the long-poll path.
+6. Client retrieves encrypted response successfully from relay queue.
+
+Suggested operator commands:
+
+```bash
+curl -fsS https://staging.token.place/healthz | jq '.knownServers'
+curl -fsS https://staging.token.place/relay/diagnostics
+```
+
 ## Guardrails
 
 - Keep API v1 relay-blind E2EE invariants intact (ciphertext only + safe routing metadata).

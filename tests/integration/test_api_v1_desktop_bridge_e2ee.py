@@ -307,8 +307,8 @@ def test_api_v1_desktop_bridge_registration_poll_no_work_heartbeat():
 
         poll_payload = desktop_client.poll_api_v1_encrypted_work()
         assert poll_payload["message"] == "No requests available"
-        assert poll_payload["next_ping_in_x_seconds"] > 0
         assert poll_payload["poll_wait_seconds"] > 0
+        assert poll_payload["next_ping_in_x_seconds"] == 0
 
 
 @pytest.mark.parametrize("encrypted", [False, True])

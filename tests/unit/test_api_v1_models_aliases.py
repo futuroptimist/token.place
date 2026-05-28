@@ -21,15 +21,16 @@ def _reload_models(env=None):
     return models
 
 
-def test_resolve_model_alias_returns_canonical_id():
+def test_resolve_model_alias_rejects_removed_gpt_aliases():
     models = _reload_models()
-    assert models.resolve_model_alias("gpt-5-chat-latest") == "llama-3-8b-instruct"
+    assert models.resolve_model_alias("gpt-5-chat-latest") is None
 
 
 def test_resolve_model_alias_missing_target_logs_and_returns_none():
     models = _reload_models()
-    with patch.object(models, "_get_model_metadata", return_value=None):
-        with patch.object(models, "log_warning") as mock_log_warning:
-            result = models.resolve_model_alias("gpt-5-chat-latest")
+    with patch.dict(models.MODEL_ALIASES, {"local-alias": "missing-model"}, clear=True):
+        with patch.object(models, "_get_model_metadata", return_value=None):
+            with patch.object(models, "log_warning") as mock_log_warning:
+                result = models.resolve_model_alias("local-alias")
     assert result is None
     mock_log_warning.assert_called_once()

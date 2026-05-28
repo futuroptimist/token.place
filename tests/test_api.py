@@ -750,17 +750,18 @@ def test_v1_chat_completion_rejects_unsupported_gpt_model_ids(client, monkeypatc
         lambda: ProviderShouldNotBeCalled(),
     )
 
-    response = client.post(
-        "/api/v1/chat/completions",
-        json={
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello"}],
-        },
-    )
+    for gpt_model in ("gpt-3.5-turbo", "gpt-4", "gpt-5-chat-latest"):
+        response = client.post(
+            "/api/v1/chat/completions",
+            json={
+                "model": gpt_model,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
 
-    assert response.status_code == 400
-    body = response.get_json()
-    assert body["error"].get("param") == "model"
+        assert response.status_code == 400
+        body = response.get_json()
+        assert body["error"].get("param") == "model"
 
 
 def test_streaming_chat_completion(client, mock_llama):

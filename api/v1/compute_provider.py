@@ -480,18 +480,8 @@ def _config_value(key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _select_distributed_target() -> DistributedTargetSelection:
-    """Resolve the distributed API v1 relay target with explicit staging-safe precedence.
-
-    Precedence:
-    1. Explicit API v1/distributed relay target environment variables.
-    2. Relay public URL environment variables when this process is the public relay.
-    3. Explicit non-default config relay URLs.
-    4. Production default only when TOKEN_PLACE_ENV=production.
-
-    Non-production environments intentionally do not silently fall back to
-    https://token.place because that makes staging appear to call production.
-    """
+def _select_explicit_distributed_target() -> DistributedTargetSelection | None:
+    """Return the highest-precedence explicit distributed target, if configured."""
 
     for env_name in _EXPLICIT_DISTRIBUTED_TARGET_ENVS:
         target = _validated_target_url(
@@ -501,9 +491,43 @@ def _select_distributed_target() -> DistributedTargetSelection:
         if target:
             return DistributedTargetSelection(
                 url=target,
-                source=f"env:{env_name}",
+                source=f"explicit_env:{env_name}",
                 relay_only=False,
             )
+    return None
+
+
+def _select_distributed_target(
+    *,
+    request_loopback_url: str | None = None,
+) -> DistributedTargetSelection:
+    """Resolve the distributed API v1 relay target with staging-safe precedence.
+
+    Precedence:
+    1. Explicit API v1/distributed relay target environment variables.
+    2. Verified request-local loopback origins for local desktop bridge traffic.
+    3. Relay public URL environment variables when this process is the public relay.
+    4. Explicit non-default config relay URLs.
+    5. Production default only when TOKEN_PLACE_ENV=production.
+
+    Non-production environments intentionally do not silently fall back to
+    https://token.place because that makes staging appear to call production.
+    """
+
+    explicit_target = _select_explicit_distributed_target()
+    if explicit_target is not None:
+        return explicit_target
+
+    loopback_target = _validated_target_url(
+        request_loopback_url,
+        source="request_loopback_origin",
+    )
+    if loopback_target:
+        return DistributedTargetSelection(
+            url=loopback_target,
+            source="request_loopback_origin",
+            relay_only=True,
+        )
 
     for env_name in _RELAY_PUBLIC_URL_ENVS:
         target = _validated_target_url(
@@ -513,7 +537,7 @@ def _select_distributed_target() -> DistributedTargetSelection:
         if target:
             return DistributedTargetSelection(
                 url=target,
-                source=f"env:{env_name}",
+                source=f"relay_public_env:{env_name}",
                 relay_only=True,
             )
 
@@ -539,6 +563,15 @@ def _select_distributed_target() -> DistributedTargetSelection:
         )
 
     return DistributedTargetSelection(url="", source="unset", relay_only=False)
+
+
+def select_api_v1_distributed_target(
+    *,
+    request_loopback_url: str | None = None,
+) -> DistributedTargetSelection:
+    """Public resolver for request-scoped API v1 relay target selection."""
+
+    return _select_distributed_target(request_loopback_url=request_loopback_url)
 
 
 @lru_cache(maxsize=16)
@@ -636,6 +669,7 @@ def get_api_v1_compute_provider_for_mode(
     *,
     mode: str,
     distributed_url: str | None = None,
+    distributed_target_selection: DistributedTargetSelection | None = None,
     distributed_fallback_enabled: bool | None = None,
 ) -> ApiV1ComputeProvider:
     """Resolve provider with an explicit mode override for request-scoped routing."""
@@ -644,7 +678,9 @@ def get_api_v1_compute_provider_for_mode(
     _, env_target_selection, fallback_enabled_from_env = _read_api_v1_provider_env()
     if distributed_fallback_enabled is None:
         distributed_fallback_enabled = fallback_enabled_from_env
-    if distributed_url is not None:
+    if distributed_target_selection is not None:
+        target_selection = distributed_target_selection
+    elif distributed_url is not None:
         target_selection = DistributedTargetSelection(
             url=_normalise_target_url(distributed_url),
             source="request_override",

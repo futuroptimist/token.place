@@ -388,6 +388,48 @@ Interpretation:
 - `configuredUpstreamServers` is retained as a stable compatibility key.
 - `legacyConfiguredUpstreamServers` represents compatibility/default config, not a required staging dependency.
 
+### Public URL versus internal distributed relay target
+
+Sugarkube relay-only deployments intentionally carry two different relay URLs:
+
+- `TOKENPLACE_RELAY_PUBLIC_URL` is the browser/API-facing origin advertised to users, such as
+  `https://staging.token.place` for staging or `https://token.place` for production.
+- `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL` and `TOKENPLACE_DISTRIBUTED_COMPUTE_URL` are the
+  same-pod distributed dispatch targets used by the forced desktop-bridge API v1 E2EE route. In the
+  relay-only chart these default to `http://127.0.0.1:5010`, so a browser chat request accepted by
+  the relay calls the relay API inside the pod instead of accidentally dispatching to a production
+  public hostname.
+
+This split is required because `https://staging.token.place` is the public ingress, while
+`http://127.0.0.1:5010` is the safest target for the relay process to call itself when it queues
+relay-blind E2EE work for registered desktop compute nodes. Staging must not fall back to
+`https://token.place`; outside production, an unset distributed target should fail closed rather
+than silently using the production default.
+
+The relay chart also keeps `RELAY_WORKERS=1` and sets `RELAY_THREADS=4` for relay-only deployments.
+One Gunicorn worker process keeps the in-memory relay queues and registered-node state unified.
+Multiple threads are still necessary so the outer `/api/v1/chat/completions` request, internal
+relay API calls, readiness probes, and compute-node long-poll requests can coexist without the
+single worker deadlocking on its own loopback dispatch.
+
+Verification commands after rendering a staging candidate:
+
+```bash
+grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A1 /tmp/tokenplace-oci.yaml
+grep -n "name: TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" -A1 /tmp/tokenplace-oci.yaml
+grep -n "name: TOKENPLACE_DISTRIBUTED_COMPUTE_URL" -A1 /tmp/tokenplace-oci.yaml
+grep -n "name: RELAY_WORKERS" -A1 /tmp/tokenplace-oci.yaml
+grep -n "name: RELAY_THREADS" -A1 /tmp/tokenplace-oci.yaml
+```
+
+Expected:
+- The public URL matches the ingress host (`https://staging.token.place` when staging TLS is
+  enabled).
+- The distributed relay targets point at loopback (`http://127.0.0.1:5010` unless the container
+  port is intentionally changed).
+- `RELAY_WORKERS` remains `1`.
+- `RELAY_THREADS` is greater than `1`.
+
 ## Guardrails
 
 - Keep API v1 relay-blind E2EE invariants intact (ciphertext only + safe routing metadata).

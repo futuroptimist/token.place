@@ -700,6 +700,8 @@ def run(args: argparse.Namespace) -> int:
         )
 
     def warm_runtime_before_registration() -> bool:
+        nonlocal warm_load_duration_ms, warm_load_failed, warm_load_state
+        nonlocal last_error
         if not warm_load_enabled:
             print(
                 "desktop.compute_node_bridge.model_init.skipped "
@@ -707,10 +709,12 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return True
+        warm_load_deadline_seconds = _api_v1_warm_load_wait_seconds()
         print(
             "desktop.compute_node_bridge.registration.gate_wait_start "
             f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
-            f"runtime_path={runtime_path} relay_runtime_path={relay_runtime_path}",
+            f"runtime_path={runtime_path} relay_runtime_path={relay_runtime_path} "
+            f"timeout_seconds={warm_load_deadline_seconds}",
             file=sys.stderr,
         )
         ensure_runtime_ready(
@@ -718,13 +722,35 @@ def run(args: argparse.Namespace) -> int:
             active_relay_url=runtime.relay_client.relay_url,
             block=False,
         )
-        last_progress_log_at = time.monotonic()
+        wait_started_at = time.monotonic()
+        last_progress_log_at = wait_started_at
         while warm_load_state == "warming":
+            elapsed_seconds = time.monotonic() - wait_started_at
+            remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
+            if remaining_seconds <= 0:
+                warm_load_state = "failed"
+                warm_load_failed = "timed out initializing API v1 model runtime before relay registration"
+                warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
+                last_error = warm_load_failed
+                print(
+                    "desktop.compute_node_bridge.registration.gate_wait_timeout "
+                    f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+                    f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
+                    f"timeout_seconds={warm_load_deadline_seconds}",
+                    file=sys.stderr,
+                )
+                emit_status_event(
+                    registered=False,
+                    active_relay_url=runtime.relay_client.relay_url,
+                    current_last_error=last_error,
+                )
+                fail_on_warm_load_error(active_relay_url=runtime.relay_client.relay_url)
+                return False
             if ensure_runtime_ready(
                 "pre_registration",
                 active_relay_url=runtime.relay_client.relay_url,
                 block=True,
-                block_timeout_seconds=0.1,
+                block_timeout_seconds=min(0.1, remaining_seconds),
             ):
                 break
             now = time.monotonic()
@@ -734,7 +760,8 @@ def run(args: argparse.Namespace) -> int:
                 print(
                     "desktop.compute_node_bridge.model_init.still_warming "
                     f"reason=pre_registration relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
-                    f"state={warm_load_state} duration_ms={duration_ms}",
+                    f"state={warm_load_state} duration_ms={duration_ms} "
+                    f"timeout_seconds={warm_load_deadline_seconds}",
                     file=sys.stderr,
                 )
             emit_status_event(

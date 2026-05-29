@@ -37,6 +37,9 @@ pub struct ComputeNodeStatus {
     pub fallback_reason: Option<String>,
     pub model_path: String,
     pub last_error: Option<String>,
+    pub warm_load_state: Option<String>,
+    pub runtime_path: Option<String>,
+    pub relay_runtime_path: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -194,6 +197,9 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         fallback_reason: None,
         model_path: request.model_path.clone(),
         last_error: Some(last_error),
+        warm_load_state: Some("failed".into()),
+        runtime_path: Some("bridge".into()),
+        relay_runtime_path: Some("bridge".into()),
     }
 }
 
@@ -234,6 +240,24 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
     if payload.get("last_error").is_some() {
         status.last_error = payload
             .get("last_error")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("warm_load_state").is_some() {
+        status.warm_load_state = payload
+            .get("warm_load_state")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("runtime_path").is_some() {
+        status.runtime_path = payload
+            .get("runtime_path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("relay_runtime_path").is_some() {
+        status.relay_runtime_path = payload
+            .get("relay_runtime_path")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
@@ -449,6 +473,9 @@ pub async fn start_compute_node(
                 fallback_reason: None,
                 model_path: request.model_path.clone(),
                 last_error: None,
+                warm_load_state: Some("not_started".into()),
+                runtime_path: Some("bridge".into()),
+                relay_runtime_path: Some("bridge".into()),
             };
             true
         }
@@ -708,12 +735,45 @@ mod tests {
         let observed_cancel = std::fs::read_to_string(&observed_cancel_path)
             .expect("cancel message should be recorded");
         assert_eq!(observed_cancel, "{\"type\":\"cancel\"}");
-        assert!(state.child.lock().await.is_none(), "child handle should be cleared");
-        assert!(state.stdin.lock().await.is_none(), "stdin handle should be cleared");
+        assert!(
+            state.child.lock().await.is_none(),
+            "child handle should be cleared"
+        );
+        assert!(
+            state.stdin.lock().await.is_none(),
+            "stdin handle should be cleared"
+        );
 
         let final_status = state.status.lock().await.clone();
         assert!(!final_status.running);
         assert!(!final_status.registered);
+    }
+
+    #[test]
+    fn update_status_from_event_preserves_relay_runtime_readiness_fields() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            warm_load_state: Some("ready".into()),
+            runtime_path: Some("bridge".into()),
+            relay_runtime_path: Some("bridge".into()),
+            ..ComputeNodeStatus::default()
+        };
+
+        let payload = serde_json::json!({
+            "type": "status",
+            "registered": true,
+            "warm_load_state": "warming",
+            "runtime_path": "sidecar",
+            "relay_runtime_path": "bridge"
+        });
+
+        update_status_from_event(&mut status, &payload);
+
+        assert!(status.registered);
+        assert_eq!(status.warm_load_state.as_deref(), Some("warming"));
+        assert_eq!(status.runtime_path.as_deref(), Some("sidecar"));
+        assert_eq!(status.relay_runtime_path.as_deref(), Some("bridge"));
     }
 
     #[test]

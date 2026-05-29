@@ -812,7 +812,7 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
 ):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
-    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.01')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
 
     stop_counter = {'count': 0}
 
@@ -1531,6 +1531,55 @@ def test_run_does_not_wait_for_active_warmup_before_runtime_stop(capsys, monkeyp
     finally:
         release_warmup.set()
     _ = capsys.readouterr()
+
+
+def test_run_pre_registration_warmup_times_out_without_registering(capsys, monkeypatch):
+    _reset_cancel_queue()
+    events = []
+    warm_started = threading.Event()
+    release_warmup = threading.Event()
+
+    class StuckWarmupRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            events.append("warm-start")
+            warm_started.set()
+            release_warmup.wait(timeout=1.0)
+            events.append("warm-done")
+            return True
+
+        def register_and_poll_once(self):
+            events.append("poll")
+            return {"next_ping_in_x_seconds": 0}
+
+        def stop(self):
+            events.append("stop")
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=StuckWarmupRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "0.05")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    started_at = time.perf_counter()
+    status = compute_node_bridge.run(args)
+    elapsed = time.perf_counter() - started_at
+
+    try:
+        assert status == 1
+        assert elapsed < 0.5
+        assert warm_started.is_set()
+        assert "poll" not in events
+        assert "stop" in events
+        captured = capsys.readouterr()
+        output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+        error_event = next(event for event in output_events if event.get("type") == "error")
+        assert error_event["warm_load_state"] == "failed"
+        assert "timed out" in error_event["message"]
+        assert "registration.gate_wait_timeout" in captured.err
+    finally:
+        release_warmup.set()
 
 
 def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatch):

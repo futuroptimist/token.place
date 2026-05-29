@@ -780,10 +780,16 @@ def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
     stop_counter = {'count': 0}
 
     def fake_stop_requested():
+        runtime = WarmingThenApiV1Runtime.last_instance
+        if runtime is not None and runtime._processed:
+            return True
         stop_counter['count'] += 1
-        return stop_counter['count'] > 2
+        return stop_counter['count'] > 50
 
     monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, 'submit', releasing_submit)
+    monkeypatch.setattr(
+        compute_node_bridge, '_sleep_with_cancel', lambda _seconds: (time.sleep(0.01) or False)
+    )
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
@@ -801,18 +807,16 @@ def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
     assert runtime.relay_client.endpoint_calls[0][0] == '/api/v1/relay/responses'
 
     output = capsys.readouterr()
-    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start' in output.err
-    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.ready' in output.err
+    assert 'desktop.compute_node_bridge.model_init.start' in output.err
+    assert 'desktop.compute_node_bridge.model_init.ready' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.registration.begin_after_ready' in output.err
     assert 'desktop.compute_node_bridge.process_request relay=https://token.place request_id=req-1' in output.err
     assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
 
 
-def test_run_api_v1_payload_timeout_posts_encrypted_error_without_losing_payload(
-    capsys, monkeypatch
-):
+def test_run_slow_warm_load_does_not_poll_or_submit_runtime_not_ready(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
-    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.01')
 
     stop_counter = {'count': 0}
 
@@ -835,24 +839,16 @@ def test_run_api_v1_payload_timeout_posts_encrypted_error_without_losing_payload
     assert runtime is not None
     assert runtime.ready_started.is_set()
     assert runtime._processed == []
-    assert runtime.relay_client.endpoint_calls == [
-        (
-            '/api/v1/relay/responses',
-            {
-                'request_id': 'req-1',
-                'error': {
-                    'code': 'compute_node_runtime_not_ready',
-                    'message': 'API v1 model runtime is not ready',
-                },
-            },
-        )
-    ]
+    assert runtime.relay_client.endpoint_calls == []
 
     output = capsys.readouterr()
-    assert 'api_v1_payload=True' in output.err
-    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.timeout' in output.err
-    assert 'desktop.compute_node_bridge.process_request.skipped_runtime_not_ready' in output.err
-    assert 'desktop.compute_node_bridge.api_v1_e2ee.error_response.submitted' in output.err
+    assert 'desktop.compute_node_bridge.model_init.start' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.register' not in output.err
+    assert 'compute_node_runtime_not_ready' not in output.err
+    events = [json.loads(line) for line in output.out.splitlines()]
+    warming_status = [event for event in events if event.get('warm_load_state') == 'warming']
+    assert warming_status
+    assert all(event.get('registered') is False for event in warming_status)
 
 
 def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):
@@ -900,7 +896,7 @@ def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
 
     def fake_stop_requested():
         call_count['n'] += 1
-        return call_count['n'] > 1
+        return call_count['n'] > 3
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
@@ -917,8 +913,10 @@ def test_run_treats_null_error_heartbeat_as_registered(capsys, monkeypatch):
     events = [json.loads(line) for line in output.out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
-    assert status_events[0]['registered'] is True
-    assert status_events[0]['last_error'] is None
+    assert any(event['registered'] is False for event in status_events if event.get('warm_load_state') == 'warming')
+    registered_events = [event for event in status_events if event['registered'] is True]
+    assert registered_events
+    assert registered_events[-1]['last_error'] is None
     stderr = output.err
     assert 'desktop.compute_node_bridge.start' in stderr
     assert 'desktop.compute_node_bridge.relay_target.resolved' in stderr
@@ -936,7 +934,7 @@ def test_run_treats_false_error_heartbeat_as_registered(capsys, monkeypatch):
 
     def fake_stop_requested():
         call_count['n'] += 1
-        return call_count['n'] > 1
+        return call_count['n'] > 3
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
@@ -952,8 +950,10 @@ def test_run_treats_false_error_heartbeat_as_registered(capsys, monkeypatch):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
-    assert status_events[0]['registered'] is True
-    assert status_events[0]['last_error'] is None
+    assert any(event['registered'] is False for event in status_events if event.get('warm_load_state') == 'warming')
+    registered_events = [event for event in status_events if event['registered'] is True]
+    assert registered_events
+    assert registered_events[-1]['last_error'] is None
 
 
 def test_run_reports_actionable_error_for_incompatible_relay(capsys, monkeypatch):
@@ -997,7 +997,7 @@ def test_run_ignores_legacy_shaped_processing_failure(capsys, monkeypatch):
 
     def fake_stop_requested():
         call_count['n'] += 1
-        return call_count['n'] > 1
+        return call_count['n'] > 3
 
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
@@ -1013,8 +1013,10 @@ def test_run_ignores_legacy_shaped_processing_failure(capsys, monkeypatch):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     status_events = [event for event in events if event['type'] == 'status']
     assert status_events
-    assert status_events[0]['registered'] is True
-    assert status_events[0]['last_error'] is None
+    assert any(event['registered'] is False for event in status_events if event.get('warm_load_state') == 'warming')
+    registered_events = [event for event in status_events if event['registered'] is True]
+    assert registered_events
+    assert registered_events[-1]['last_error'] is None
 
 
 def test_apply_compute_mode_supports_gpu_and_cpu_modes(monkeypatch):
@@ -1471,7 +1473,7 @@ def test_run_reports_stale_registration_status_after_missed_heartbeat(capsys, mo
     )
 
 
-def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypatch):
+def test_run_warms_runtime_before_first_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []
 
@@ -1490,7 +1492,7 @@ def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypat
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
     assert status == 0
-    assert call_order[:3] == ["poll", "warm", "poll"]
+    assert call_order[:3] == ["warm", "poll", "poll"]
     _ = capsys.readouterr()
 
 
@@ -1603,7 +1605,7 @@ def test_run_stops_when_post_registration_runtime_warmup_fails(capsys, monkeypat
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     status = compute_node_bridge.run(args)
     assert status == 1
-    assert calls == ["poll", "warm"]
+    assert calls == ["warm"]
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
@@ -1652,10 +1654,10 @@ def test_run_sidecar_runtime_path_skips_bridge_warm_load_without_dual_opt_in(cap
     monkeypatch.delenv("TOKENPLACE_DESKTOP_DUAL_RUNTIME", raising=False)
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
-    assert status == 0
-    assert call_order == ["poll", "poll"]
+    assert status == 1
+    assert call_order == []
     output = capsys.readouterr()
-    assert "model_init.skipped" in output.err
+    assert "API v1 relay work requires the bridge runtime" in output.out
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     started = next(event for event in events if event.get("type") == "started")
     assert started["runtime_path"] == "sidecar"
@@ -1682,7 +1684,7 @@ def test_run_sidecar_runtime_path_with_dual_mode_warms_and_logs_opt_in(capsys, m
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
     assert status == 0
-    assert call_order[:3] == ["poll", "warm", "poll"]
+    assert call_order[:3] == ["warm", "poll", "poll"]
     output = capsys.readouterr()
     assert "dual_mode_enabled" in output.err
 
@@ -1798,25 +1800,13 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_raises(capsys, mon
     output = capsys.readouterr()
     assert status == 1
     assert calls == ["warm"]
-    assert "request_id=req-1" in output.err
-    assert "runtime_wait.exception" in output.err or "model_init.exception" in output.err
-    assert "error_response.submitted" in output.err
-    assert "code=compute_node_runtime_unavailable" in output.err
+    assert "request_id=none" in output.err
+    assert "model_init.exception" in output.err
+    assert "error_response.submitted" not in output.err
     assert "exc_type=RuntimeError" in output.err
     assert "sensitive model init failure details" not in output.err
     assert ApiPayloadWarmRaiseRuntime.last_instance is not None
-    assert ApiPayloadWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == [
-        (
-            '/api/v1/relay/responses',
-            {
-                'request_id': 'req-1',
-                'error': {
-                    'code': 'compute_node_runtime_unavailable',
-                    'message': 'failed to initialize API v1 model runtime',
-                },
-            },
-        )
-    ]
+    assert ApiPayloadWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == []
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     error_event = next(event for event in events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
@@ -1854,24 +1844,13 @@ def test_run_first_api_v1_payload_fails_closed_when_blocking_warm_load_raises(ca
     output = capsys.readouterr()
     assert status == 1
     assert calls == ["warm"]
-    assert "request_id=req-1" in output.err
-    assert "runtime_wait.exception" in output.err
-    assert "error_response.submitted" in output.err
+    assert "request_id=none" in output.err
+    assert "model_init.exception" in output.err
+    assert "error_response.submitted" not in output.err
     assert "exc_type=RuntimeError" in output.err
     assert "sensitive delayed model init details" not in output.err
     assert BlockingWarmRaiseRuntime.last_instance is not None
-    assert BlockingWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == [
-        (
-            '/api/v1/relay/responses',
-            {
-                'request_id': 'req-1',
-                'error': {
-                    'code': 'compute_node_runtime_unavailable',
-                    'message': 'failed to initialize API v1 model runtime',
-                },
-            },
-        )
-    ]
+    assert BlockingWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == []
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
     error_event = next(event for event in events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
@@ -1978,10 +1957,10 @@ def test_run_sidecar_api_v1_payload_skips_bridge_warm_load_without_dual_opt_in(c
 
     status = compute_node_bridge.run(args)
 
-    assert status == 0
-    assert calls == ["process"]
+    assert status == 1
+    assert calls == []
     output = capsys.readouterr()
-    assert "model_init.skipped reason=api_v1_request" in output.err
+    assert "API v1 relay work requires the bridge runtime" in output.out
 
 
 def test_run_reports_api_v1_processing_failure(capsys, monkeypatch):

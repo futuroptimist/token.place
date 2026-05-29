@@ -429,6 +429,35 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
   });
 
+  it('shows warming instead of registered yes while relay runtime is warming', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        warm_load_state: 'warming',
+        warm_load_enabled: true,
+        runtime_path: 'bridge',
+        effective_mode: 'pending',
+        backend_available: 'unknown',
+        backend_selected: 'unknown',
+        backend_used: 'unknown',
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('warming');
+    expect(screen.getByText(/Registered:/).textContent).not.toContain('yes');
+    expect(screen.getByText(/Relay runtime readiness:/).textContent).toContain('warming');
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

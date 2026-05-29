@@ -1224,7 +1224,9 @@ class TestRelayClient:
         result = relay_client.poll_api_v1_encrypted_work()
 
         assert 'Read timed out' in result['error']
+        assert result.get('message') != 'No requests available'
         assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert relay_client._api_v1_last_heartbeat_at == {}
         assert relay_client.api_v1_registration_fresh() is False
 
 

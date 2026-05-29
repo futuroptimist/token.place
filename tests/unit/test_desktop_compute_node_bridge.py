@@ -1388,10 +1388,13 @@ def test_run_does_not_wait_for_active_warmup_before_runtime_stop(capsys, monkeyp
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
 
+    started_at = time.perf_counter()
     status = compute_node_bridge.run(args)
+    elapsed = time.perf_counter() - started_at
 
     try:
         assert status == 0
+        assert elapsed < 0.5
         assert "stop" in events
         assert "warm-done" not in events[: events.index("stop") + 1]
     finally:

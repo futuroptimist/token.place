@@ -107,6 +107,57 @@ class FakeRuntime:
         return None
 
 
+
+
+class BlockingPollRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        BlockingPollRuntime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClient()
+        self.poll_started = threading.Event()
+        self.release_poll = threading.Event()
+        self.poll_calls = 0
+        self.stop_calls = 0
+
+    def register_and_poll_once(self):
+        self.poll_calls += 1
+        self.poll_started.set()
+        self.release_poll.wait(timeout=2)
+        return {'next_ping_in_x_seconds': 0}
+
+    def stop(self):
+        self.stop_calls += 1
+        self.release_poll.set()
+
+
+class StopDuringWarmLoadRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        StopDuringWarmLoadRuntime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClient()
+        self.ready_started = threading.Event()
+        self.release_ready = threading.Event()
+        self.poll_calls = 0
+        self.stop_calls = 0
+
+    def ensure_api_v1_runtime_ready(self):
+        self.ready_started.set()
+        self.release_ready.wait(timeout=2)
+        return True
+
+    def register_and_poll_once(self):
+        self.poll_calls += 1
+        return {'next_ping_in_x_seconds': 0}
+
+    def stop(self):
+        self.stop_calls += 1
+        self.release_ready.set()
+
+
 class StreamingRuntime(FakeRuntime):
     last_instance = None
 
@@ -376,6 +427,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
 def _reset_cancel_queue():
     compute_node_bridge._stdin_lines = queue.Queue()
     compute_node_bridge._stdin_reader_started = True
+    compute_node_bridge._stop_event.clear()
 
 
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
@@ -2104,3 +2156,91 @@ def test_run_handles_keyboard_interrupt_from_poll_worker(capsys, monkeypatch):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert events[-1]["type"] == "stopped"
+
+
+def test_poll_worker_returns_cancelled_without_starting_new_poll_after_shutdown():
+    worker = compute_node_bridge._CancelablePollWorker()
+    called = []
+    worker.shutdown()
+
+    result = worker.call(lambda: called.append(True), lambda: False, poll_interval=0.01)
+
+    assert result is compute_node_bridge._POLL_CANCELLED
+    assert called == []
+
+
+def test_run_stop_during_long_poll_cancels_promptly_and_stops_runtime(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingPollRuntime)
+
+    def fake_stop_requested():
+        runtime = BlockingPollRuntime.last_instance
+        if runtime is not None and runtime.poll_started.is_set():
+            return True
+        return False
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    started = time.monotonic()
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert time.monotonic() - started < 1.0
+    runtime = BlockingPollRuntime.last_instance
+    assert runtime is not None
+    assert runtime.poll_calls == 1
+    assert runtime.stop_calls == 1
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.poll.cancelled' in output.err
+    assert 'desktop.compute_node_bridge.poll_worker.stopped' in output.err
+
+
+def test_run_stop_during_sleep_does_not_poll_again(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    runtime_holder = {}
+
+    class SleepStopRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self._responses = [{'next_ping_in_x_seconds': 5}]
+            self.poll_calls = 0
+            runtime_holder['runtime'] = self
+
+        def register_and_poll_once(self):
+            self.poll_calls += 1
+            return super().register_and_poll_once()
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SleepStopRuntime)
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', lambda _seconds: True)
+
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert runtime_holder['runtime'].poll_calls == 1
+    assert 'desktop.compute_node_bridge.stop_requested' in capsys.readouterr().err
+
+
+def test_run_stop_during_warm_load_does_not_register_afterward(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=StopDuringWarmLoadRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '1')
+
+    def fake_stop_requested():
+        runtime = StopDuringWarmLoadRuntime.last_instance
+        return runtime is not None and runtime.ready_started.is_set()
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    runtime = StopDuringWarmLoadRuntime.last_instance
+    assert runtime is not None
+    assert runtime.poll_calls == 0
+    assert runtime.stop_calls == 1
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.register' not in output.err

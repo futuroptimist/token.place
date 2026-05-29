@@ -374,7 +374,7 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_success(self, mock_post, relay_client):
-        """Unregister should post to /unregister and return True on success."""
+        """Unregister should post to the API v1 unregister route and return True on success."""
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -384,9 +384,9 @@ class TestRelayClient:
 
         assert result is True
         mock_post.assert_called_once_with(
-            'http://localhost:5000/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
             json={'server_public_key': 'mock_public_key_b64'},
-            timeout=relay_client._request_timeout,
+            timeout=min(float(relay_client._request_timeout), 2.0),
         )
 
     def test_unregister_from_relay_attempts_all_configured_relays(
@@ -426,8 +426,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/unregister',
-            'http://backup-relay:6000/unregister',
+            'http://primary-relay:5000/api/v1/relay/servers/unregister',
+            'http://backup-relay:6000/api/v1/relay/servers/unregister',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -465,6 +465,16 @@ class TestRelayClient:
         mock_post.assert_called_once()
         call = mock_post.call_args
         assert call.kwargs['headers'] == {'X-Relay-Server-Token': 'alpha-token'}
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_skips_register_after_stop(self, mock_post, relay_client):
+        relay_client.stop()
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['message'] == 'Relay polling stopped'
+        assert mock_post.call_count == 0
 
     @patch('utils.networking.relay_client.requests.post')
     def test_ping_relay_success(self, mock_post, relay_client, mock_crypto_manager):

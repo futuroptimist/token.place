@@ -2100,6 +2100,40 @@ def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(clien
     assert result['json']['chat_history'] == 'legacy-ciphertext-request'
 
 
+def test_api_v1_unregister_removes_server_and_is_idempotent(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    assert client.get('/api/v1/relay/servers/next').status_code == 200
+
+    first = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+    assert first.status_code == 200
+    assert first.get_json()['removed'] is True
+    assert client.get('/api/v1/relay/servers/next').status_code == 503
+
+    second = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+    assert second.status_code == 200
+    assert second.get_json()['removed'] is False
+
+
+def test_api_v1_unregister_prevents_dispatch_to_stopped_node(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    assert client.post('/api/v1/relay/servers/unregister', json=server_payload).status_code == 200
+
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-after-unregister',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 404
+
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 404
+
+
 def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')

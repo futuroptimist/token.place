@@ -70,6 +70,7 @@ def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+_stop_event = threading.Event()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
@@ -153,10 +154,12 @@ class _CancelablePollWorker:
 
     def shutdown(self) -> None:
         self._closed = True
+        print("desktop.compute_node_bridge.poll_worker.stop_requested", file=sys.stderr)
         try:
             self._tasks.put_nowait(None)
         except queue.Full:  # pragma: no cover - unbounded queue is not expected to fill
             pass
+        print("desktop.compute_node_bridge.poll_worker.stopped", file=sys.stderr)
 
 
 def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
@@ -367,6 +370,8 @@ def _start_stdin_reader() -> None:
 
 
 def stop_requested() -> bool:
+    if _stop_event.is_set():
+        return True
     _start_stdin_reader()
     while True:
         try:
@@ -380,6 +385,11 @@ def stop_requested() -> bool:
         except json.JSONDecodeError:
             continue
         if payload.get("type") == "cancel":
+            _stop_event.set()
+            print(
+                "desktop.compute_node_bridge.stop_requested signal=stdin_cancel",
+                file=sys.stderr,
+            )
             return True
 
 
@@ -398,6 +408,7 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    _stop_event.clear()
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -939,11 +950,36 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        print("desktop.compute_node_bridge.stop", file=sys.stderr)
+        _stop_event.set()
+        relay_url_for_stop = _sanitize_relay_target(
+            getattr(runtime.relay_client, 'relay_url', 'unknown')
+        )
+        key_fingerprint_fn = getattr(
+            runtime.relay_client, '_api_v1_public_key_fingerprint', None
+        )
+        public_key = getattr(getattr(runtime, 'relay_client', None), 'crypto_manager', None)
+        public_key_value = getattr(public_key, 'public_key_b64', None)
+        key_fingerprint = (
+            key_fingerprint_fn(public_key_value)
+            if callable(key_fingerprint_fn)
+            else 'unknown'
+        )
+        print(
+            "desktop.compute_node_bridge.stop relay={} key_fingerprint={}".format(
+                relay_url_for_stop, key_fingerprint
+            ),
+            file=sys.stderr,
+        )
         poll_worker.shutdown()
         if warm_load_future is not None and not warm_load_future.done():
             warm_load_future.cancel()
         runtime.stop()
+        print(
+            "desktop.compute_node_bridge.stopped_idle relay={} key_fingerprint={}".format(
+                relay_url_for_stop, key_fingerprint
+            ),
+            file=sys.stderr,
+        )
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(

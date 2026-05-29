@@ -297,6 +297,60 @@ def test_compute_node_runtime_request_flow_delegates_to_relay_client():
     relay_client.process_client_request.assert_called_once_with(payload)
 
 
+def test_compute_node_runtime_submit_api_v1_error_response_delegates_to_relay_client():
+    relay_client = MagicMock()
+    relay_client.submit_api_v1_error_response.return_value = True
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+    payload = {"request_id": "req-runtime-error", "chat_history": "ciphertext"}
+
+    assert (
+        runtime.submit_api_v1_error_response(
+            payload,
+            code="compute_node_runtime_unavailable",
+            message="failed to initialize API v1 model runtime",
+        )
+        is True
+    )
+    relay_client.submit_api_v1_error_response.assert_called_once_with(
+        payload,
+        code="compute_node_runtime_unavailable",
+        message="failed to initialize API v1 model runtime",
+    )
+
+
+def test_compute_node_runtime_submit_api_v1_error_response_fails_closed_without_helper():
+    relay_client = MagicMock()
+    relay_client.submit_api_v1_error_response = None
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    assert (
+        runtime.submit_api_v1_error_response(
+            {"request_id": "req-runtime-error"},
+            code="compute_node_runtime_unavailable",
+            message="failed to initialize API v1 model runtime",
+        )
+        is False
+    )
+
+
 def test_compute_node_runtime_process_relay_request_returns_false_for_unknown_payload():
     relay_client = MagicMock()
     model_manager = MagicMock()

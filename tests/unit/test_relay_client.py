@@ -59,6 +59,21 @@ def _load_compute_node_bridge_module():
     return module
 
 
+def test_sanitize_relay_target_handles_malformed_ports_and_ipv6():
+    assert relay_client_module._sanitize_relay_target('https://relay.example:bad') == 'unknown'
+    assert relay_client_module._sanitize_relay_target('http://[::1') == 'unknown'
+    assert (
+        relay_client_module._sanitize_relay_target('http://[::1]:8000/path?token=abc#debug')
+        == 'http://[::1]:8000'
+    )
+    assert (
+        relay_client_module._sanitize_relay_target(
+            'https://user:pass@[2001:db8::1]:9443/source?token=abc'
+        )
+        == 'https://[2001:db8::1]:9443'
+    )
+
+
 def test_load_jsonschema_returns_none_on_import_error(monkeypatch):
     import importlib
 

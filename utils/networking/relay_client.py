@@ -236,6 +236,25 @@ def _api_v1_response_headers(response: Any) -> Dict[str, str]:
     return diagnostic_headers
 
 
+def _sanitize_relay_target(relay_url: Any) -> str:
+    """Return a relay target safe for diagnostics without userinfo, query, or fragment."""
+
+    if not isinstance(relay_url, str):
+        return "unknown"
+    try:
+        parsed = urlparse(relay_url.strip() if relay_url.strip() else "")
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
+        return "unknown"
+
+    if not parsed.scheme or not hostname:
+        return "unknown"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return urlunparse((parsed.scheme, f"{host}{port}", "", "", "", ""))
+
+
 def _normalise_registration_token(value: Optional[str]) -> Optional[str]:
     """Normalise optional registration tokens from config or environment."""
 
@@ -1385,10 +1404,12 @@ class RelayClient:
             if headers:
                 request_kwargs["headers"] = headers
 
+            response_relay_url = self._api_v1_response_relay_url()
             response_url = self._build_api_v1_url(
-                self._api_v1_response_relay_url(),
+                response_relay_url,
                 "/relay/responses",
             )
+            relay_target = _sanitize_relay_target(response_relay_url)
             source_response = requests.post(
                 response_url,
                 timeout=self._request_timeout,
@@ -1399,18 +1420,20 @@ class RelayClient:
             protocol = "tokenplace_api_v1_relay_e2ee"
             if submitted:
                 log_info(
-                    "API v1 E2EE response submission request_id={} protocol={} route={} submitted={}",
+                    "API v1 E2EE response submission request_id={} protocol={} route={} relay={} submitted={}",
                     response_envelope["request_id"],
                     protocol,
                     route,
+                    relay_target,
                     submitted,
                 )
             else:
                 log_error(
-                    "API v1 E2EE response submission failed request_id={} protocol={} route={} http_status={}",
+                    "API v1 E2EE response submission failed request_id={} protocol={} route={} relay={} http_status={}",
                     response_envelope["request_id"],
                     protocol,
                     route,
+                    relay_target,
                     source_response.status_code,
                 )
             return submitted
@@ -1423,6 +1446,47 @@ class RelayClient:
                 exc_info=True,
             )
             return False
+
+
+    def submit_api_v1_error_response(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """Submit a structured encrypted API v1 error response for an unprocessed work item."""
+
+        required_string_fields = ("request_id", "client_public_key", "chat_history", "cipherkey", "iv")
+        if (
+            not isinstance(request_data, dict)
+            or request_data.get("protocol") != "tokenplace_api_v1_relay_e2ee"
+            or request_data.get("version") != 1
+            or not all(isinstance(request_data.get(field), str) for field in required_string_fields)
+        ):
+            log_error("Cannot submit API v1 error response for invalid relay payload")
+            return False
+
+        client_pub_key_b64 = _normalize_client_public_key_b64(request_data.get("client_public_key"))
+        if client_pub_key_b64 is None:
+            log_error("Cannot submit API v1 error response: invalid client_public_key metadata")
+            return False
+
+        try:
+            client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
+        except (AttributeError, binascii.Error, ValueError):
+            log_error("Cannot submit API v1 error response: invalid client_public_key encoding")
+            return False
+
+        response_envelope = self._api_v1_response_envelope(
+            request_data["request_id"],
+            error={"code": code, "message": message},
+        )
+        return self._post_api_v1_response(
+            response_envelope,
+            client_pub_key_b64=client_pub_key_b64,
+            client_pub_key=client_pub_key,
+        )
 
     @staticmethod
     def _valid_api_v1_assistant_message(message: Any) -> Optional[Dict[str, Any]]:

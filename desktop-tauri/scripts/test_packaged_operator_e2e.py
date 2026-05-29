@@ -17,6 +17,10 @@ from pathlib import Path
 from urllib.request import urlopen
 
 
+RELAY_STARTUP_TIMEOUT_SECONDS = 60.0
+RELAY_LIVEZ_REQUEST_TIMEOUT_SECONDS = 2.0
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -26,26 +30,49 @@ def reserve_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_for_livez(relay: subprocess.Popen[str], port: int, timeout_seconds: float = 20.0) -> None:
+def _tail_text(path: Path, *, max_chars: int = 4000) -> str:
+    try:
+        return path.read_text(errors="replace")[-max_chars:]
+    except OSError as exc:
+        return f"<unable to read {path}: {exc}>"
+
+
+def wait_for_livez(
+    relay: subprocess.Popen[str],
+    port: int,
+    *,
+    timeout_seconds: float = RELAY_STARTUP_TIMEOUT_SECONDS,
+    request_timeout_seconds: float = RELAY_LIVEZ_REQUEST_TIMEOUT_SECONDS,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+) -> None:
     deadline = time.time() + timeout_seconds
     last_error: Exception | None = None
     while time.time() < deadline:
         try:
-            with urlopen(f"http://127.0.0.1:{port}/livez", timeout=1) as resp:  # noqa: S310
+            with urlopen(
+                f"http://127.0.0.1:{port}/livez",
+                timeout=request_timeout_seconds,
+            ) as resp:  # noqa: S310
                 if resp.status == 200:
                     return
         except Exception as exc:  # pragma: no cover - retry loop
             last_error = exc
 
         if relay.poll() is not None:
-            stderr = relay.stderr.read() if relay.stderr else ""
-            stdout = relay.stdout.read() if relay.stdout else ""
+            stderr = _tail_text(stderr_path) if stderr_path is not None else ""
+            stdout = _tail_text(stdout_path) if stdout_path is not None else ""
             raise RuntimeError(
                 f"relay exited early with code {relay.returncode}; stdout={stdout}; stderr={stderr}"
             )
         time.sleep(0.25)
 
-    raise RuntimeError(f"relay did not become live on port {port}: {last_error}")
+    stdout = _tail_text(stdout_path) if stdout_path is not None else ""
+    stderr = _tail_text(stderr_path) if stderr_path is not None else ""
+    raise RuntimeError(
+        f"relay did not become live on port {port} after {timeout_seconds:.1f}s: "
+        f"{last_error}; stdout={stdout}; stderr={stderr}"
+    )
 
 
 def create_packaged_layout(tmp_root: Path, *, resources_dir_name: str = "resources") -> Path:
@@ -408,6 +435,11 @@ def main() -> int:
 
         for probe_script, probe_resources_root, layout_label in probe_specs:
             relay_port = reserve_free_port()
+            relay_log_label = layout_label.replace(" ", "-").replace("/", "-")
+            relay_stdout = tmp_path / f"relay-{relay_log_label}-{relay_port}.stdout.log"
+            relay_stderr = tmp_path / f"relay-{relay_log_label}-{relay_port}.stderr.log"
+            relay_stdout_handle = relay_stdout.open("w", encoding="utf-8")
+            relay_stderr_handle = relay_stderr.open("w", encoding="utf-8")
             relay = subprocess.Popen(  # noqa: S603
                 [
                     sys.executable,
@@ -420,13 +452,18 @@ def main() -> int:
                 ],
                 cwd=REPO_ROOT,
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=relay_stdout_handle,
+                stderr=relay_stderr_handle,
                 text=True,
             )
 
             try:
-                wait_for_livez(relay, relay_port)
+                wait_for_livez(
+                    relay,
+                    relay_port,
+                    stdout_path=relay_stdout,
+                    stderr_path=relay_stderr,
+                )
                 run_compute_bridge_startup_probe(
                     tmp_path,
                     probe_script,
@@ -436,7 +473,14 @@ def main() -> int:
                 )
             finally:
                 if relay.poll() is None:
-                    relay.kill()
+                    relay.terminate()
+                    try:
+                        relay.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        relay.kill()
+                        relay.wait(timeout=5)
+                relay_stdout_handle.close()
+                relay_stderr_handle.close()
 
     return 0
 

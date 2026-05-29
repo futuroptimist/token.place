@@ -369,6 +369,21 @@ class ComputeNodeRuntime:
 
         return self.relay_client.poll_api_v1_encrypted_work()
 
+    def submit_api_v1_error_response(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """Submit a structured encrypted API v1 error response for relay work."""
+
+        submit_error = getattr(self.relay_client, "submit_api_v1_error_response", None)
+        if not callable(submit_error):
+            _log_error("Relay client cannot submit API v1 structured error responses")
+            return False
+        return bool(submit_error(request_data, code=code, message=message))
+
     def stop(self) -> None:
         """Stop relay polling and network activity."""
         try:

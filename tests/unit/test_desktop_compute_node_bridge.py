@@ -150,6 +150,48 @@ class ApiV1Runtime(FakeRuntime):
         return self.relay_client.process_api_v1_chat_request(payload)
 
 
+
+
+class SlowWarmApiV1Runtime(ApiV1Runtime):
+    last_instance = None
+
+    def __init__(self, _config):
+        SlowWarmApiV1Runtime.last_instance = self
+        super().__init__(_config)
+        SlowWarmApiV1Runtime.last_instance = self
+        self.warm_calls = 0
+
+    def ensure_api_v1_runtime_ready(self):
+        self.warm_calls += 1
+        time.sleep(0.05)
+        return True
+
+
+class FailingApiV1Runtime(ApiV1Runtime):
+    last_instance = None
+
+    def __init__(self, _config):
+        FailingApiV1Runtime.last_instance = self
+        super().__init__(_config)
+        FailingApiV1Runtime.last_instance = self
+        self.error_responses = []
+
+    def ensure_api_v1_runtime_ready(self):
+        return False
+
+    def process_relay_request(self, payload):
+        self._processed.append(payload)
+        return False
+
+    def submit_api_v1_error_response(self, payload, *, code, message):
+        self.error_responses.append((payload, code, message))
+        self.relay_client.endpoint_calls.append(('/api/v1/relay/responses', {
+            'request_id': payload['request_id'],
+            'error': {'code': code, 'message': message},
+        }))
+        return True
+
+
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
     last_instance = None
 
@@ -717,10 +759,85 @@ def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypa
     status_events = [event for event in events if event['type'] == 'status']
     assert any(event.get('registered') is True for event in status_events)
     assert 'api_v1_payload=True' in output.err
+    assert 'desktop.compute_node_bridge.process_request' in output.err
     assert 'desktop.compute_node_bridge.api_v1_e2ee.work_received' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.process_request.call' in output.err
     assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
     assert "ModuleNotFoundError: No module named 'api'" not in output.err
 
+
+
+def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SlowWarmApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.001')
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    runtime = SlowWarmApiV1Runtime.last_instance
+    assert runtime is not None
+    assert runtime.warm_calls == 1
+    assert [payload['request_id'] for payload in runtime._processed] == ['req-1']
+    assert runtime.relay_client.endpoint_calls[0][0] == '/api/v1/relay/responses'
+
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.timeout' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.process_request.call' in output.err
+    assert 'runtime_ready=False' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
+
+
+def test_run_api_v1_payload_posts_structured_error_when_processing_fails(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=FailingApiV1Runtime)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    runtime = FailingApiV1Runtime.last_instance
+    assert runtime is not None
+    assert [payload['request_id'] for payload in runtime._processed] == ['req-1']
+    assert len(runtime.error_responses) == 1
+    payload, code, message = runtime.error_responses[0]
+    assert payload['request_id'] == 'req-1'
+    assert code == 'compute_node_runtime_unavailable'
+    assert 'not ready' in message
+    assert runtime.relay_client.endpoint_calls[0][0] == '/api/v1/relay/responses'
+
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_ready' in output.err
+    assert 'ready=False' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
 
 def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):
     _reset_cancel_queue()
@@ -1617,14 +1734,22 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
             return True
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=ApiPayloadWarmFailRuntime)
+    stop_counter = {"n": 0}
+
+    def fake_stop_requested():
+        stop_counter["n"] += 1
+        return stop_counter["n"] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
-    assert status == 1
-    assert calls == ["warm"]
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
-    error_event = next(event for event in events if event.get("type") == "error")
-    assert error_event["warm_load_state"] == "failed"
+    assert status == 0
+    assert calls == ["warm", "process"]
+    output = capsys.readouterr()
+    assert "desktop.compute_node_bridge.api_v1_e2ee.runtime_ready" in output.err
+    assert "ready=False" in output.err
+    assert "desktop.compute_node_bridge.api_v1_e2ee.response_submitted" in output.err
 
 
 def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):

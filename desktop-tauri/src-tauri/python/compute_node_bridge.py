@@ -73,6 +73,8 @@ _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
+API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 10.0
+
 
 
 _POLL_CANCELLED = object()
@@ -281,6 +283,19 @@ def _env_enabled(name: str, default: str = "0") -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    if not math.isfinite(parsed) or parsed < minimum:
+        return default
+    return parsed
+
+
 def _runtime_path_from_env() -> str:
     value = os.getenv("TOKENPLACE_DESKTOP_RUNTIME_PATH", RUNTIME_PATH_DEFAULT)
     if value.strip().lower() == "sidecar":
@@ -426,6 +441,10 @@ def run(args: argparse.Namespace) -> int:
     apply_compute_mode(runtime.model_manager, args.mode)
 
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
+    api_v1_warm_load_wait_seconds = _env_float(
+        "TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS",
+        API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS,
+    )
     runtime_path = _runtime_path_from_env()
     dual_runtime_enabled = _env_enabled("TOKENPLACE_DESKTOP_DUAL_RUNTIME", "0")
     bridge_runtime_allowed = runtime_path == "bridge" or dual_runtime_enabled
@@ -468,12 +487,33 @@ def run(args: argparse.Namespace) -> int:
             }
         )
 
-    def ensure_runtime_ready(reason: str, *, active_relay_url: str, block: bool = False) -> bool:
+    def ensure_runtime_ready(
+        reason: str,
+        *,
+        active_relay_url: str,
+        block: bool = False,
+        timeout_seconds: Optional[float] = None,
+        request_id: str = "none",
+    ) -> bool:
         nonlocal warm_load_state, warm_load_started_at, warm_load_duration_ms, warm_load_failed
         nonlocal warm_load_executor, warm_load_future
         if warm_load_state == "ready":
+            if reason == "api_v1_request":
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_ready "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"ready=True state={warm_load_state}",
+                    file=sys.stderr,
+                )
             return True
         if warm_load_state == "failed":
+            if reason == "api_v1_request":
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_ready "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"ready=False state={warm_load_state}",
+                    file=sys.stderr,
+                )
             return False
         if warm_load_state == "not_started":
             warm_load_state = "warming"
@@ -498,7 +538,25 @@ def run(args: argparse.Namespace) -> int:
         if warm_load_future is None:
             return False
         if block and not warm_load_future.done():
-            ready = bool(warm_load_future.result())
+            if reason == "api_v1_request":
+                wait_label = timeout_seconds if timeout_seconds is not None else "unbounded"
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"state={warm_load_state} timeout_seconds={wait_label}",
+                    file=sys.stderr,
+                )
+            try:
+                ready = bool(warm_load_future.result(timeout=timeout_seconds))
+            except concurrent.futures.TimeoutError:
+                if reason == "api_v1_request":
+                    print(
+                        "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.timeout "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"state={warm_load_state} timeout_seconds={timeout_seconds}",
+                        file=sys.stderr,
+                    )
+                return False
         elif warm_load_future.done():
             ready = bool(warm_load_future.result())
         else:
@@ -512,6 +570,13 @@ def run(args: argparse.Namespace) -> int:
                 f"reason={reason} state={warm_load_state} duration_ms={warm_load_duration_ms}",
                 file=sys.stderr,
             )
+            if reason == "api_v1_request":
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_ready "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"ready=False state={warm_load_state} duration_ms={warm_load_duration_ms}",
+                    file=sys.stderr,
+                )
             return False
         warm_load_state = "ready"
         print(
@@ -519,6 +584,13 @@ def run(args: argparse.Namespace) -> int:
             f"reason={reason} state={warm_load_state} duration_ms={warm_load_duration_ms}",
             file=sys.stderr,
         )
+        if reason == "api_v1_request":
+            print(
+                "desktop.compute_node_bridge.api_v1_e2ee.runtime_ready "
+                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                f"ready=True state={warm_load_state} duration_ms={warm_load_duration_ms}",
+                file=sys.stderr,
+            )
         print(_runtime_diagnostics_summary(compute_mode_diagnostics(runtime.model_manager)), file=sys.stderr)
         return True
 
@@ -582,6 +654,11 @@ def run(args: argparse.Namespace) -> int:
             active_relay_url = runtime.relay_client.relay_url
             relay_response = poll_worker.call(runtime.register_and_poll_once, stop_requested)
             if relay_response is _POLL_CANCELLED:
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.poll.cancelled "
+                    f"relay={_sanitize_relay_target(active_relay_url)}",
+                    file=sys.stderr,
+                )
                 break
             relay_response = relay_response if isinstance(relay_response, dict) else {}
             active_relay_url = runtime.relay_client.relay_url
@@ -624,6 +701,7 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+            api_v1_runtime_ready = True
             if registered and api_v1_payload and warm_load_enabled and warm_load_state != "ready":
                 if not bridge_runtime_allowed:
                     warm_load_state = "not_started"
@@ -633,11 +711,26 @@ def run(args: argparse.Namespace) -> int:
                         f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
                         file=sys.stderr,
                     )
-                elif not ensure_runtime_ready(
-                    "api_v1_request", active_relay_url=active_relay_url, block=True
-                ):
-                    fail_on_warm_load_error(active_relay_url=active_relay_url)
-                    break
+                else:
+                    api_v1_runtime_ready = ensure_runtime_ready(
+                        "api_v1_request",
+                        active_relay_url=active_relay_url,
+                        block=True,
+                        timeout_seconds=api_v1_warm_load_wait_seconds,
+                        request_id=request_id,
+                    )
+                    if not api_v1_runtime_ready:
+                        last_error = (
+                            warm_load_failed
+                            or "API v1 model runtime was not ready before bounded wait elapsed"
+                        )
+                        print(
+                            "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.failed "
+                            f"relay={_sanitize_relay_target(active_relay_url)} "
+                            f"request_id={request_id} state={warm_load_state} "
+                            f"timeout_seconds={api_v1_warm_load_wait_seconds}",
+                            file=sys.stderr,
+                        )
 
             if not registered:
                 if relay_error is not None:
@@ -653,24 +746,53 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 print(
-                    "desktop.compute_node_bridge.process_request",
+                    "desktop.compute_node_bridge.process_request "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
                     file=sys.stderr,
                 )
                 print(
-                    "desktop.compute_node_bridge.api_v1_e2ee.work_received",
+                    "desktop.compute_node_bridge.api_v1_e2ee.work_received "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                    file=sys.stderr,
+                )
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.process_request.call "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"runtime_ready={api_v1_runtime_ready}",
                     file=sys.stderr,
                 )
                 processed = runtime.process_relay_request(relay_response)
                 if not processed:
+                    submit_error = getattr(runtime, "submit_api_v1_error_response", None)
+                    if callable(submit_error):
+                        processed = bool(
+                            submit_error(
+                                relay_response,
+                                code="compute_node_runtime_unavailable",
+                                message=(
+                                    "Desktop runtime was not ready to process the API v1 relay request"
+                                    if not api_v1_runtime_ready
+                                    else "Desktop runtime failed to process the API v1 relay request"
+                                ),
+                            )
+                        )
+                if not processed:
                     last_error = "failed to process relay request"
                     print(
-                        "desktop.compute_node_bridge.process_request.failed",
+                        "desktop.compute_node_bridge.process_request.failed "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "desktop.compute_node_bridge.api_v1_e2ee.response_submission.failed "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
                         file=sys.stderr,
                     )
                 else:
                     last_error = None
                     print(
-                        "desktop.compute_node_bridge.api_v1_e2ee.response_submitted",
+                        "desktop.compute_node_bridge.api_v1_e2ee.response_submitted "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
                         file=sys.stderr,
                     )
             else:
@@ -707,6 +829,11 @@ def run(args: argparse.Namespace) -> int:
             )
 
             if _sleep_with_cancel(wait_seconds):
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.sleep.cancelled "
+                    f"relay={_sanitize_relay_target(active_relay_url)}",
+                    file=sys.stderr,
+                )
                 break
     except KeyboardInterrupt:
         pass

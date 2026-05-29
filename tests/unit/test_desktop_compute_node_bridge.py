@@ -1798,7 +1798,10 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_raises(capsys, mon
     output = capsys.readouterr()
     assert status == 1
     assert calls == ["warm"]
+    assert "request_id=req-1" in output.err
     assert "runtime_wait.exception" in output.err or "model_init.exception" in output.err
+    assert "error_response.submitted" in output.err
+    assert "code=compute_node_runtime_unavailable" in output.err
     assert "exc_type=RuntimeError" in output.err
     assert "sensitive model init failure details" not in output.err
     assert ApiPayloadWarmRaiseRuntime.last_instance is not None

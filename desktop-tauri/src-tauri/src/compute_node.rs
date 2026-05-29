@@ -580,8 +580,11 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
+        eprintln!("desktop.compute_node.stop_requested sending_cancel=true");
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
+    } else {
+        eprintln!("desktop.compute_node.stop_requested sending_cancel=false");
     }
 
     let mut owned_child = None;
@@ -604,8 +607,12 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
+            eprintln!("desktop.compute_node.bridge_process.kill_after_cancel_timeout");
             let _ = child.kill().await;
             let _ = child.wait().await;
+            eprintln!("desktop.compute_node.bridge_process.exited_after_kill");
+        } else {
+            eprintln!("desktop.compute_node.bridge_process.exited_after_cancel");
         }
     }
 

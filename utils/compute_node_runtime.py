@@ -280,6 +280,8 @@ class ComputeNodeRuntime:
             ]
         else:
             self.request_adapters = list(request_adapters)
+        self._stopped = False
+        self._stop_lock = threading.Lock()
 
     def ensure_model_ready(self) -> bool:
         """Initialize model runtime and report readiness."""
@@ -381,13 +383,22 @@ class ComputeNodeRuntime:
         return bool(submit_error(request_data, code=code, message=message))
 
     def stop(self) -> None:
-        """Stop relay polling and network activity."""
+        """Stop relay polling and best-effort unregister exactly once."""
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
         try:
+            _log_info("Compute node runtime stop requested; cancelling relay polling")
             self.relay_client.stop()
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn):
+                _log_info("Attempting compute node relay unregister during shutdown")
                 if not unregister_fn():
                     _log_warning("Relay unregister request failed during shutdown")
+            else:
+                _log_warning("Relay client does not expose unregister_from_relay during shutdown")
         except Exception:
             _log_warning(
                 "Relay unregister request raised during shutdown; continuing stop",

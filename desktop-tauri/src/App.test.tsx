@@ -314,6 +314,42 @@ describe('desktop app start failure handling', () => {
     resolveStart?.();
   });
 
+
+  it('clicking Stop operator invokes backend stop and reflects stopped event', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        warm_load_state: 'ready',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    fireEvent.click((await screen.findByText('Stop operator')) as HTMLButtonElement);
+
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'stop_compute_node')).toBe(true)
+    );
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
   it('keeps model path blank on first launch when config has no persisted model path', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'detect_backend') {

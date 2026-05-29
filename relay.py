@@ -1134,6 +1134,26 @@ def api_v1_relay_servers_register():
     }), 200
 
 
+@app.route('/api/v1/relay/servers/unregister', methods=['POST'])
+def api_v1_relay_servers_unregister():
+    """Explicitly unregister an API v1 compute node and clear relay state."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not isinstance(public_key, str) or not public_key.strip():
+        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
+
+    removed = _unregister_server(public_key)
+    LOGGER.info("server.unregistered", extra={"server_public_key": public_key, "removed": removed})
+    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
+
+
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
 def api_v1_relay_servers_poll():
     """Claim the next queued encrypted workload for a registered compute node."""

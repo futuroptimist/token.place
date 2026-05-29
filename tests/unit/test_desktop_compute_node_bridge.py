@@ -1416,6 +1416,14 @@ def test_sanitize_relay_target_redacts_credentials_query_and_fragment():
 def test_sanitize_relay_target_returns_unknown_for_invalid_values():
     assert compute_node_bridge._sanitize_relay_target(None) == 'unknown'
     assert compute_node_bridge._sanitize_relay_target('not-a-valid-url') == 'unknown'
+    assert compute_node_bridge._sanitize_relay_target('https://token.place:bad') == 'unknown'
+    assert compute_node_bridge._sanitize_relay_target('http://[::1') == 'unknown'
+
+
+def test_sanitize_relay_target_preserves_ipv6_brackets():
+    sanitized = compute_node_bridge._sanitize_relay_target('http://[::1]:8000/path?token=abc')
+
+    assert sanitized == 'http://[::1]:8000'
 
 
 def test_relay_response_summary_handles_non_dict_payloads():
@@ -1760,6 +1768,57 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
     assert error_event["warm_load_state"] == "failed"
 
 
+def test_run_first_api_v1_payload_fails_closed_when_warm_load_raises(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class ApiPayloadWarmRaiseRuntime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            ApiPayloadWarmRaiseRuntime.last_instance = self
+
+        def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
+            raise RuntimeError("sensitive model init failure details")
+
+        def process_relay_request(self, _payload):
+            calls.append("process")
+            return True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiPayloadWarmRaiseRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    status = compute_node_bridge.run(args)
+
+    output = capsys.readouterr()
+    assert status == 1
+    assert calls == ["warm"]
+    assert "runtime_wait.exception" in output.err or "model_init.exception" in output.err
+    assert "exc_type=RuntimeError" in output.err
+    assert "sensitive model init failure details" not in output.err
+    assert ApiPayloadWarmRaiseRuntime.last_instance is not None
+    assert ApiPayloadWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == [
+        (
+            '/api/v1/relay/responses',
+            {
+                'request_id': 'req-1',
+                'error': {
+                    'code': 'compute_node_runtime_unavailable',
+                    'message': 'failed to initialize API v1 model runtime',
+                },
+            },
+        )
+    ]
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get("type") == "error")
+    assert error_event["warm_load_state"] == "failed"
+
+
 def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)
@@ -1886,6 +1945,34 @@ def test_run_reports_api_v1_processing_failure(capsys, monkeypatch):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     status_events = [event for event in events if event.get("type") == "status"]
     assert status_events[-1]["last_error"] == "failed to process relay request"
+
+
+def test_run_logs_api_v1_processing_exception_type(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class ApiV1ProcessingExceptionRuntime(ApiV1Runtime):
+        def process_relay_request(self, payload):
+            self._processed.append(payload)
+            raise ValueError("sensitive payload details")
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiV1ProcessingExceptionRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: bool(ApiV1ProcessingExceptionRuntime.last_instance._processed),
+    )
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    status = compute_node_bridge.run(args)
+
+    output = capsys.readouterr()
+    assert status == 0
+    assert "process_request.exception" in output.err
+    assert "exc_type=ValueError" in output.err
+    assert "sensitive payload details" not in output.err
 
 
 def test_run_reports_unreachable_for_non_heartbeat_response(capsys, monkeypatch):

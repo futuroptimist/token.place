@@ -241,11 +241,18 @@ def _sanitize_relay_target(relay_url: Any) -> str:
 
     if not isinstance(relay_url, str):
         return "unknown"
-    parsed = urlparse(relay_url.strip() if relay_url.strip() else "")
-    if not parsed.scheme or not parsed.hostname:
+    try:
+        parsed = urlparse(relay_url.strip() if relay_url.strip() else "")
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
         return "unknown"
-    port = f":{parsed.port}" if parsed.port is not None else ""
-    return urlunparse((parsed.scheme, f"{parsed.hostname}{port}", "", "", "", ""))
+
+    if not parsed.scheme or not hostname:
+        return "unknown"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return urlunparse((parsed.scheme, f"{host}{port}", "", "", "", ""))
 
 
 def _normalise_registration_token(value: Optional[str]) -> Optional[str]:

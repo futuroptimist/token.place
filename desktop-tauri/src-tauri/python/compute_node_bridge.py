@@ -192,12 +192,18 @@ def _sanitize_relay_target(relay_url: Any) -> str:
     if not isinstance(relay_url, str):
         return "unknown"
 
-    parsed = urlsplit(relay_url.strip())
-    if not parsed.scheme or not parsed.hostname:
+    try:
+        parsed = urlsplit(relay_url.strip())
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
         return "unknown"
 
-    port = f":{parsed.port}" if parsed.port is not None else ""
-    return urlunsplit((parsed.scheme, f"{parsed.hostname}{port}", "", "", ""))
+    if not parsed.scheme or not hostname:
+        return "unknown"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return urlunsplit((parsed.scheme, f"{host}{port}", "", "", ""))
 
 
 def _safe_poll_wait_seconds(relay_response: Dict[str, Any], default: float = 1) -> float:
@@ -569,8 +575,33 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return False
+            except Exception as exc:
+                ready = False
+                warm_load_state = "failed"
+                warm_load_failed = "failed to initialize API v1 model runtime"
+                warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.exception "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
         elif warm_load_future.done():
-            ready = bool(warm_load_future.result())
+            try:
+                ready = bool(warm_load_future.result())
+            except Exception as exc:
+                ready = False
+                warm_load_state = "failed"
+                warm_load_failed = "failed to initialize API v1 model runtime"
+                warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
+                print(
+                    "desktop.compute_node_bridge.model_init.exception "
+                    f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
+                    f"request_id={request_id} state={warm_load_state} "
+                    f"duration_ms={warm_load_duration_ms} exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
         else:
             return False
         warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
@@ -791,12 +822,13 @@ def run(args: argparse.Namespace) -> int:
                     )
                     try:
                         processed = runtime.process_relay_request(relay_response)
-                    except Exception:
+                    except Exception as exc:
                         processed = False
                         last_error = "failed to process relay request"
                         print(
                             "desktop.compute_node_bridge.process_request.exception "
-                            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                            f"exc_type={type(exc).__name__}",
                             file=sys.stderr,
                         )
                     if not processed:

@@ -1424,6 +1424,60 @@ class RelayClient:
             )
             return False
 
+
+    def submit_api_v1_error_response(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """Encrypt and submit a structured API v1 error response for queued work."""
+
+        request_id = request_data.get("request_id") if isinstance(request_data, dict) else None
+        if not isinstance(request_id, str) or not request_id.strip():
+            log_error("Cannot submit API v1 error response without request_id")
+            return False
+
+        client_pub_key_b64 = _normalize_client_public_key_b64(
+            request_data.get("client_public_key") if isinstance(request_data, dict) else None
+        )
+        if client_pub_key_b64 is None:
+            log_error("Cannot submit API v1 error response with invalid client_public_key metadata")
+            return False
+
+        try:
+            client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
+        except (AttributeError, binascii.Error, ValueError):
+            log_error("Cannot submit API v1 error response with invalid client_public_key encoding")
+            return False
+
+        response_envelope = self._api_v1_response_envelope(
+            request_id,
+            error={
+                "code": code,
+                "message": message,
+            },
+        )
+        submitted = self._post_api_v1_response(
+            response_envelope,
+            client_pub_key_b64=client_pub_key_b64,
+            client_pub_key=client_pub_key,
+        )
+        if submitted:
+            log_info(
+                "API v1 E2EE structured error response submitted request_id={} code={}",
+                request_id,
+                code,
+            )
+        else:
+            log_error(
+                "API v1 E2EE structured error response submission failed request_id={} code={}",
+                request_id,
+                code,
+            )
+        return submitted
+
     @staticmethod
     def _valid_api_v1_assistant_message(message: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(message, dict):

@@ -102,6 +102,9 @@ def reset_relay_state(monkeypatch):
     relay.client_responses.clear()
     relay.streaming_sessions.clear()
     relay.streaming_sessions_by_client.clear()
+    relay.app.config["RATELIMIT_ENABLED"] = False
+    for limiter in relay.app.extensions.get("limiter", set()):
+        limiter.enabled = False
     compute_provider._build_api_v1_compute_provider.cache_clear()
     monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
@@ -175,6 +178,35 @@ def _start_fake_desktop_loop(base_url, done_event):
     thread.start()
     return thread, model_manager
 
+
+
+def _start_erroring_desktop_loop(base_url, done_event):
+    desktop_client = RelayClient(
+        base_url=base_url,
+        port=None,
+        crypto_manager=CryptoManager(),
+        model_manager=FakeDesktopModelManager(),
+        include_configured_servers=False,
+    )
+    desktop_client._request_timeout = 2
+
+    def worker():
+        deadline = time.time() + 5
+        while time.time() < deadline and not done_event.is_set():
+            payload = desktop_client.poll_api_v1_encrypted_work()
+            if payload.get("protocol") == "tokenplace_api_v1_relay_e2ee":
+                assert desktop_client.submit_api_v1_error_response(
+                    payload,
+                    code="compute_node_runtime_unavailable",
+                    message="Desktop runtime was not ready",
+                ) is True
+                done_event.set()
+                return
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
 
 def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     """Browser-shaped encrypted API v1 chat completes via relay-blind desktop bridge."""
@@ -272,6 +304,151 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     _assert_ciphertext_only(request_posts[0], forbidden_text="pong from desktop")
     _assert_ciphertext_only(response_posts[0], forbidden_text=user_text)
     _assert_ciphertext_only(response_posts[0], forbidden_text="pong from desktop")
+
+
+
+def test_api_v1_desktop_bridge_structured_error_returns_non_timeout(monkeypatch):
+    """Desktop structured encrypted errors are returned instead of repeated 202 timeout."""
+
+    observed_retrieve_statuses = []
+    observed_posts = []
+    real_request = requests.sessions.Session.request
+    real_relay_post = relay_client_module.requests.post
+
+    def observe_requests(self, method, url, **kwargs):
+        response = real_request(self, method, url, **kwargs)
+        path = urlparse(url).path
+        if method.upper() == "POST" and path == "/api/v1/relay/responses/retrieve":
+            observed_retrieve_statuses.append(response.status_code)
+        if method.upper() == "POST" and path in {
+            "/api/v1/relay/requests",
+            "/api/v1/relay/responses",
+        }:
+            observed_posts.append((path, kwargs.get("json")))
+        return response
+
+    def observe_relay_client_post(url, *args, **kwargs):
+        response = real_relay_post(url, *args, **kwargs)
+        path = urlparse(url).path
+        if path == "/api/v1/relay/responses":
+            observed_posts.append((path, kwargs.get("json")))
+        return response
+
+    monkeypatch.setattr(requests.sessions.Session, "request", observe_requests)
+    monkeypatch.setattr(relay_client_module.requests, "post", observe_relay_client_post)
+
+    with live_relay_server() as base_url:
+        monkeypatch.setattr(
+            routes,
+            "get_api_v1_compute_provider_for_mode",
+            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
+                base_url=base_url,
+                timeout_seconds=5,
+            ),
+        )
+
+        desktop_done = threading.Event()
+        desktop_thread = _start_erroring_desktop_loop(base_url, desktop_done)
+
+        browser_crypto = EncryptionManager()
+        payload = {
+            "model": "llama-3-8b-instruct",
+            "encrypted": True,
+            "client_public_key": browser_crypto.public_key_b64,
+            "messages": _encrypt_browser_messages(
+                [{"role": "user", "content": "trigger structured desktop error"}]
+            ),
+            "metadata": {
+                "inference_target": "desktop_bridge_api_v1_e2ee",
+                "relay_path": "api_v1_e2ee",
+            },
+        }
+
+        response = requests.post(
+            f"{base_url}/api/v1/chat/completions",
+            json=payload,
+            timeout=10,
+        )
+        desktop_thread.join(timeout=5)
+
+    assert desktop_done.is_set()
+    assert response.status_code != 504, response.text
+    assert 400 <= response.status_code < 500 or response.status_code == 502
+    error_body = response.json()["error"]
+    assert error_body["code"] == "compute_node_bridge_error"
+    assert "Unable to contact the LLM server" in error_body["message"]
+    assert any(status == 200 for status in observed_retrieve_statuses)
+    assert [path for path, _payload in observed_posts].count("/api/v1/relay/responses") == 1
+
+
+def test_api_v1_desktop_bridge_without_response_post_leaves_retrieve_pending(monkeypatch):
+    """Negative guard: dispatched API v1 work without a desktop post remains 202."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.01")
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 1
+        assert desktop_client.poll_api_v1_encrypted_work()["message"] == "No requests available"
+
+        request_id = "api-v1-negative-no-response"
+        plaintext_envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": request_id,
+            "client_public_key": encryption_manager.public_key_b64,
+            "api_v1_request": {
+                "model": "llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": "no desktop post"}],
+                "options": {},
+            },
+        }
+        encrypted_envelope = encryption_manager.encrypt_message(
+            plaintext_envelope, desktop_client.crypto_manager.public_key_b64
+        )
+        encrypted_envelope.pop("encrypted", None)
+        queued = requests.post(
+            f"{base_url}/api/v1/relay/requests",
+            json={
+                "client_public_key": encryption_manager.public_key_b64,
+                "server_public_key": desktop_client.crypto_manager.public_key_b64,
+                "request_id": request_id,
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                **encrypted_envelope,
+            },
+            timeout=2,
+        )
+        assert queued.status_code == 200, queued.text
+
+        polled_payload = desktop_client.poll_api_v1_encrypted_work()
+        assert polled_payload.get("protocol") == "tokenplace_api_v1_relay_e2ee"
+        assert polled_payload["request_id"] == request_id
+
+        first_retrieve = requests.post(
+            f"{base_url}/api/v1/relay/responses/retrieve",
+            json={
+                "client_public_key": encryption_manager.public_key_b64,
+                "request_id": request_id,
+            },
+            timeout=2,
+        )
+        second_retrieve = requests.post(
+            f"{base_url}/api/v1/relay/responses/retrieve",
+            json={
+                "client_public_key": encryption_manager.public_key_b64,
+                "request_id": request_id,
+            },
+            timeout=2,
+        )
+
+    assert first_retrieve.status_code == 202
+    assert second_retrieve.status_code == 202
 
 
 def test_api_v1_stream_true_fails_before_relay_queue():

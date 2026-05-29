@@ -575,11 +575,13 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
+    eprintln!("desktop.compute_node.stop_requested");
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
+        eprintln!("desktop.compute_node.cancel_requested");
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
     }
@@ -604,8 +606,12 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
+            eprintln!("desktop.compute_node.bridge_terminate_requested");
             let _ = child.kill().await;
             let _ = child.wait().await;
+            eprintln!("desktop.compute_node.bridge_process_exited termination=kill");
+        } else {
+            eprintln!("desktop.compute_node.bridge_process_exited termination=graceful");
         }
     }
 

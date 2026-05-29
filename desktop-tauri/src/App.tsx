@@ -385,6 +385,11 @@ export function App() {
   const stopComputeNode = async () => {
     try {
       await invoke('stop_compute_node');
+      setComputeStatus((prev) => ({
+        ...prev,
+        running: false,
+        registered: false,
+      }));
     } catch (e) {
       setError(formatErrorMessage(e));
     }

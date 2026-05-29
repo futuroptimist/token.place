@@ -1542,6 +1542,31 @@ def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(
     assert pending.get_json() == {'status': 'pending'}
 
 
+
+
+def test_api_v1_unregister_removes_server_from_known_servers_and_next(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    assert DUMMY_SERVER_PUB_KEY in known_servers
+
+    unregistered = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+    assert DUMMY_SERVER_PUB_KEY not in known_servers
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 503
+
+
+def test_api_v1_unregister_is_idempotent_for_missing_server(client):
+    response = client.post(
+        '/api/v1/relay/servers/unregister',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()['removed'] is False
+
 def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_queue(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     queued = client.post(

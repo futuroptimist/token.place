@@ -1515,6 +1515,7 @@ def sink():
     return jsonify(response_data)
 
 
+@app.route('/api/v1/relay/servers/unregister', methods=['POST'])
 @app.route('/unregister', methods=['POST'])
 def unregister():
     """Explicitly unregister a compute node and clear relay queue/session state."""
@@ -1532,6 +1533,10 @@ def unregister():
         return jsonify({'error': 'Invalid public key'}), 400
 
     removed = _unregister_server(public_key)
+    LOGGER.info(
+        "server.unregistered",
+        extra={"server_public_key": public_key, "removed": removed},
+    )
     return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
 
 @app.route('/source', methods=['POST'])

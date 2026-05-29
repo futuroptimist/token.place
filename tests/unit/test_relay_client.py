@@ -1293,6 +1293,64 @@ class TestRelayClient:
         assert second_poll_call.args[0] == 'http://localhost:5000/api/v1/relay/servers/poll'
         assert second_poll_call.kwargs['timeout'] == relay_client._api_v1_poll_timeout_seconds(60)
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_reregisters_before_local_lease_expires(
+        self, mock_post, relay_client, monkeypatch
+    ):
+        clock = {'now': 100.0}
+        monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: clock['now'])
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {
+            'message': 'No requests available',
+            'next_ping_in_x_seconds': 0,
+            'poll_wait_seconds': 10,
+        }
+        mock_post.side_effect = [register_ok, poll_ok, register_ok, poll_ok]
+
+        relay_client.poll_api_v1_encrypted_work()
+        clock['now'] = 125.0
+        relay_client.poll_api_v1_encrypted_work()
+
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_keeps_registration_fresh_after_no_work_poll(
+        self, mock_post, relay_client, monkeypatch
+    ):
+        clock = {'now': 200.0}
+        monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: clock['now'])
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {
+            'message': 'No requests available',
+            'next_ping_in_x_seconds': 0,
+            'poll_wait_seconds': 10,
+        }
+        mock_post.side_effect = [register_ok, poll_ok, poll_ok]
+
+        first = relay_client.poll_api_v1_encrypted_work()
+        clock['now'] = 205.0
+        second = relay_client.poll_api_v1_encrypted_work()
+
+        assert first['registration_fresh_for_seconds'] == 30.0
+        assert second['registration_fresh_for_seconds'] == 30.0
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_reregisters_when_public_key_changes(self, mock_post, relay_client):
         register_first = MagicMock(status_code=200)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 import importlib
+import hashlib
 import ipaddress
 import json
 import logging
@@ -591,6 +592,7 @@ class RelayClient:
         self._sink_start_index = 0
         self._last_api_v1_work_relay_url: Optional[str] = None
         self._api_v1_registered_relays: Set[str] = set()
+        self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
@@ -992,6 +994,79 @@ class RelayClient:
             'relay_http_diagnostic': diagnostic,
         }
 
+    @staticmethod
+    def _api_v1_key_fingerprint(public_key: Any) -> str:
+        """Return a short stable fingerprint for registration diagnostics."""
+
+        if not isinstance(public_key, str) or not public_key:
+            return "unknown"
+        return hashlib.sha256(public_key.encode("utf-8")).hexdigest()[:12]
+
+    def _api_v1_registration_reregister_reason(
+        self,
+        relay_url: str,
+        cached_hints: Dict[str, Any],
+        current_public_key: str,
+        *,
+        now_monotonic: float,
+    ) -> Optional[str]:
+        """Return why the relay should be re-registered before the next poll."""
+
+        if relay_url not in self._api_v1_registered_relays:
+            return "not_registered"
+
+        registered_public_key = cached_hints.get('server_public_key')
+        if isinstance(registered_public_key, str) and registered_public_key != current_public_key:
+            return "public_key_changed"
+
+        last_heartbeat = cached_hints.get('last_heartbeat_monotonic')
+        lease_seconds = cached_hints.get('lease_seconds')
+        if not isinstance(last_heartbeat, (int, float)) or not math.isfinite(float(last_heartbeat)):
+            return "missing_heartbeat_timestamp"
+        if not isinstance(lease_seconds, (int, float)) or not math.isfinite(float(lease_seconds)):
+            return "missing_lease_seconds"
+
+        lease_seconds = max(float(lease_seconds), 1.0)
+        elapsed = max(now_monotonic - float(last_heartbeat), 0.0)
+        # Refresh comfortably before the relay lease boundary. This protects the
+        # desktop bridge when local work, like model warmup, delayed the next
+        # poll after an otherwise successful no-work long poll.
+        if elapsed >= max(lease_seconds * 0.80, lease_seconds - 5.0):
+            return "lease_expiry_risk"
+
+        return None
+
+    def _api_v1_record_registration_heartbeat(
+        self,
+        relay_url: str,
+        *,
+        register_wait: Any,
+        poll_wait: Any,
+        server_public_key: str,
+        now_monotonic: float,
+    ) -> Dict[str, Any]:
+        """Store local lease timing for API v1 relay registration freshness."""
+
+        lease_seconds = self._normalise_poll_wait_seconds(register_wait)
+        if lease_seconds <= 0:
+            lease_seconds = float(self._request_timeout)
+        poll_wait_seconds = self._normalise_poll_wait_seconds(poll_wait)
+        next_heartbeat_in = min(
+            poll_wait_seconds,
+            max(lease_seconds * 0.50, 1.0),
+        )
+        hints = {
+            'next_ping_in_x_seconds': register_wait,
+            'poll_wait_seconds': poll_wait_seconds,
+            'server_public_key': server_public_key,
+            'server_public_key_fingerprint': self._api_v1_key_fingerprint(server_public_key),
+            'lease_seconds': lease_seconds,
+            'last_heartbeat_monotonic': now_monotonic,
+            'next_heartbeat_due_monotonic': now_monotonic + max(next_heartbeat_in, 0.0),
+        }
+        self._api_v1_relay_wait_hints[relay_url] = hints
+        return hints
+
     def register_api_v1_compute_node(self, relay_url: Optional[str] = None) -> Dict[str, Any]:
         target_url = relay_url or self.relay_url
         payload = {'server_public_key': self.crypto_manager.public_key_b64}
@@ -1054,16 +1129,23 @@ class RelayClient:
                 register_wait = cached_hints.get('next_ping_in_x_seconds', self._request_timeout)
                 poll_wait = cached_hints.get('poll_wait_seconds', register_wait)
                 current_public_key = self.crypto_manager.public_key_b64
-                registered_public_key = cached_hints.get('server_public_key')
-                requires_register = candidate_url not in self._api_v1_registered_relays
-                if (
-                    not requires_register
-                    and isinstance(registered_public_key, str)
-                    and registered_public_key != current_public_key
-                ):
-                    requires_register = True
+                now_monotonic = time.monotonic()
+                reregister_reason = self._api_v1_registration_reregister_reason(
+                    candidate_url,
+                    cached_hints,
+                    current_public_key,
+                    now_monotonic=now_monotonic,
+                )
+                requires_register = reregister_reason is not None
 
                 if requires_register:
+                    if reregister_reason != "not_registered":
+                        log_info(
+                            "server.reregister reason={} relay={} key_fingerprint={}",
+                            reregister_reason,
+                            candidate_url,
+                            self._api_v1_key_fingerprint(current_public_key),
+                        )
                     register_response = self.register_api_v1_compute_node(candidate_url)
                     if not isinstance(register_response, dict):
                         last_error = {
@@ -1081,13 +1163,22 @@ class RelayClient:
                         last_error = dict(register_response)
                         last_error.setdefault('next_ping_in_x_seconds', register_wait)
                         continue
-                    relay_wait_hints[candidate_url] = {
-                        'next_ping_in_x_seconds': register_wait,
-                        'poll_wait_seconds': poll_wait,
-                        'server_public_key': current_public_key,
-                    }
+                    hints = self._api_v1_record_registration_heartbeat(
+                        candidate_url,
+                        register_wait=register_wait,
+                        poll_wait=poll_wait,
+                        server_public_key=current_public_key,
+                        now_monotonic=time.monotonic(),
+                    )
+                    poll_wait = hints['poll_wait_seconds']
                     self._api_v1_registered_relays.add(candidate_url)
-                    log_info("server.registered relay={}", candidate_url)
+                    log_info(
+                        "server.registered relay={} lease_seconds={} next_heartbeat_due_seconds={} key_fingerprint={}",
+                        candidate_url,
+                        hints['lease_seconds'],
+                        max(hints['next_heartbeat_due_monotonic'] - time.monotonic(), 0.0),
+                        hints['server_public_key_fingerprint'],
+                    )
 
                 request_kwargs: Dict[str, Any] = {
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
@@ -1161,9 +1252,31 @@ class RelayClient:
                     payload_wait = None
                 if payload_wait is None:
                     payload.setdefault('next_ping_in_x_seconds', register_wait)
+                heartbeat_hints = self._api_v1_record_registration_heartbeat(
+                    candidate_url,
+                    register_wait=register_wait,
+                    poll_wait=payload.get('poll_wait_seconds', poll_wait),
+                    server_public_key=current_public_key,
+                    now_monotonic=time.monotonic(),
+                )
                 self._active_relay_index = index
                 self._last_api_v1_work_relay_url = candidate_url
-                log_info("server.heartbeat relay={}", candidate_url)
+                payload.setdefault('lease_seconds', heartbeat_hints['lease_seconds'])
+                payload.setdefault(
+                    'registration_fresh_for_seconds',
+                    max(
+                        heartbeat_hints['lease_seconds']
+                        - (time.monotonic() - heartbeat_hints['last_heartbeat_monotonic']),
+                        0.0,
+                    ),
+                )
+                log_info(
+                    "server.heartbeat relay={} lease_seconds={} next_heartbeat_due_seconds={} key_fingerprint={}",
+                    candidate_url,
+                    heartbeat_hints['lease_seconds'],
+                    max(heartbeat_hints['next_heartbeat_due_monotonic'] - time.monotonic(), 0.0),
+                    heartbeat_hints['server_public_key_fingerprint'],
+                )
                 log_info(
                     "API v1 relay poll route=/api/v1/relay/servers/poll api_v1_payload={} request_id={}",
                     payload.get('protocol') == 'tokenplace_api_v1_relay_e2ee',

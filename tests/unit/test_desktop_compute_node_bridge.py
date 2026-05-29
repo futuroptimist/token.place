@@ -327,6 +327,24 @@ def _reset_cancel_queue():
     compute_node_bridge._stdin_reader_started = True
 
 
+
+def test_registration_freshness_helpers_mark_stale_status(monkeypatch):
+    assert compute_node_bridge._relay_registration_fresh({"registration_fresh_for_seconds": 0}) is False
+    assert compute_node_bridge._relay_registration_fresh({"registration_fresh_for_seconds": 5}) is True
+    assert compute_node_bridge._safe_registration_lease_seconds({"lease_seconds": 30}, 1) == 30.0
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(compute_node_bridge.time, "monotonic", lambda: clock["now"])
+    assert compute_node_bridge._registration_still_confirmed(90.0, 30.0) is True
+    clock["now"] = 121.0
+    assert compute_node_bridge._registration_still_confirmed(90.0, 30.0) is False
+
+
+def test_sleep_cadence_is_clamped_below_registration_lease():
+    assert compute_node_bridge._clamp_sleep_to_heartbeat_window(30.0, 30.0) == 15.0
+    assert compute_node_bridge._clamp_sleep_to_heartbeat_window(0.0, 30.0) == 0.0
+
+
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)
@@ -368,6 +386,13 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
             return False
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingRuntime)
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 4
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -377,11 +402,9 @@ def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     )
     status = compute_node_bridge.run(args)
 
-    assert status == 1
+    assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
-    payload = next(event for event in events if event.get("type") == "error")
-    assert payload['type'] == 'error'
-    assert 'failed to initialize API v1 model runtime' in payload['message']
+    assert any(event.get('warm_load_state') == 'failed' for event in events)
 
 
 def test_run_allows_runtime_reexec_when_cuda_runtime_is_repaired(capsys, monkeypatch):
@@ -741,10 +764,10 @@ def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, mo
     runtime = MalformedWaitThenApiV1Runtime.last_instance
     assert runtime is not None
     assert [payload['request_id'] for payload in runtime._processed] == ['req-after-bad-wait']
-    assert sleep_values[:2] == [2.0, 0.0]
+    assert sleep_values[:2] == [1.0, 0.0]
 
     output = capsys.readouterr()
-    assert 'wait=2.0' in output.err
+    assert 'wait=1.0' in output.err
     assert 'request_id=req-after-bad-wait' in output.err
 
 
@@ -1305,7 +1328,7 @@ def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypat
     _ = capsys.readouterr()
 
 
-def test_run_stops_when_post_registration_runtime_warmup_fails(capsys, monkeypatch):
+def test_run_keeps_polling_when_post_registration_runtime_warmup_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     calls = []
 
@@ -1319,14 +1342,15 @@ def test_run_stops_when_post_registration_runtime_warmup_fails(capsys, monkeypat
             return {"next_ping_in_x_seconds": 0}
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=FailingWarmupRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: calls.count("poll") > 2)
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     status = compute_node_bridge.run(args)
-    assert status == 1
-    assert calls == ["poll", "warm"]
+    assert status == 0
+    assert calls.count("poll") >= 2
+    assert "warm" in calls
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
-    payload = next(event for event in events if event.get("type") == "error")
-    assert payload["type"] == "error"
+    assert any(event.get("warm_load_state") == "failed" for event in events)
 
 
 def test_run_does_not_warm_when_disabled(capsys, monkeypatch):

@@ -57,6 +57,11 @@ jobs:
           grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
           grep -n "type: Recreate" /tmp/tokenplace-render.yaml
           grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "1"'
+          grep -n "name: RELAY_THREADS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "4"'
+          grep -n "name: TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "http://127.0.0.1:5010"'
+          grep -n "name: TOKENPLACE_DISTRIBUTED_COMPUTE_URL" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "http://127.0.0.1:5010"'
+          grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "https://staging.token.place"'
+          ! grep -n 'value: "https://token.place"' /tmp/tokenplace-render.yaml
           grep -n "name: XDG_CONFIG_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.config"'
           grep -n "name: XDG_DATA_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/share"'
           grep -n "name: XDG_CACHE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.cache"'
@@ -105,6 +110,10 @@ jobs:
           assert not dupes, dupes
           values = {item["name"]: item.get("value") for item in env}
           assert values["FOO"] == "bar"
+          assert values["RELAY_WORKERS"] == "1"
+          assert int(values["RELAY_THREADS"]) > 1
+          assert values["TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL"] == "http://127.0.0.1:5010"
+          assert values["TOKENPLACE_DISTRIBUTED_COMPUTE_URL"] == "http://127.0.0.1:5010"
           assert values["XDG_CONFIG_HOME"] == "/tmp/.config"
           assert values["XDG_DATA_HOME"] == "/tmp/.local/share"
           assert values["XDG_CACHE_HOME"] == "/tmp/.cache"

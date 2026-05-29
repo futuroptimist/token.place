@@ -501,7 +501,7 @@ def _select_distributed_target() -> DistributedTargetSelection:
         if target:
             return DistributedTargetSelection(
                 url=target,
-                source=f"env:{env_name}",
+                source=f"explicit_env:{env_name}",
                 relay_only=False,
             )
 
@@ -513,7 +513,7 @@ def _select_distributed_target() -> DistributedTargetSelection:
         if target:
             return DistributedTargetSelection(
                 url=target,
-                source=f"env:{env_name}",
+                source=f"relay_public_env:{env_name}",
                 relay_only=True,
             )
 
@@ -632,11 +632,18 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
     return mode, _select_distributed_target(), distributed_fallback_enabled
 
 
+def get_api_v1_distributed_target_selection() -> DistributedTargetSelection:
+    """Resolve the distributed API v1 relay target for route-level overrides."""
+
+    return _select_distributed_target()
+
+
 def get_api_v1_compute_provider_for_mode(
     *,
     mode: str,
     distributed_url: str | None = None,
     distributed_fallback_enabled: bool | None = None,
+    distributed_target_selection: DistributedTargetSelection | None = None,
 ) -> ApiV1ComputeProvider:
     """Resolve provider with an explicit mode override for request-scoped routing."""
 
@@ -644,7 +651,9 @@ def get_api_v1_compute_provider_for_mode(
     _, env_target_selection, fallback_enabled_from_env = _read_api_v1_provider_env()
     if distributed_fallback_enabled is None:
         distributed_fallback_enabled = fallback_enabled_from_env
-    if distributed_url is not None:
+    if distributed_target_selection is not None:
+        target_selection = distributed_target_selection
+    elif distributed_url is not None:
         target_selection = DistributedTargetSelection(
             url=_normalise_target_url(distributed_url),
             source="request_override",

@@ -57,10 +57,15 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: relay
+          {{- $relayPort := printf "%v" .Values.containerPort }}
+          {{- $selfDispatchURL := printf "http://127.0.0.1:%s" $relayPort }}
           {{- $defaultEnv := dict
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
-                "RELAY_PORT" (dict "name" "RELAY_PORT" "value" (printf "%v" .Values.containerPort))
+                "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
                 "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
+                "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
+                "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" (dict "name" "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" "value" $selfDispatchURL)
+                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL" (dict "name" "TOKENPLACE_DISTRIBUTED_COMPUTE_URL" "value" $selfDispatchURL)
                 "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
                 "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
@@ -69,6 +74,9 @@ spec:
                 "XDG_STATE_HOME" (dict "name" "XDG_STATE_HOME" "value" "/tmp/.local/state")
           }}
           {{- $mergedEnv := deepCopy $defaultEnv }}
+          {{- if and .Values.ingress.enabled .Values.ingress.host }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_PUBLIC_URL" (dict "name" "TOKENPLACE_RELAY_PUBLIC_URL" "value" (printf "https://%s" .Values.ingress.host)) }}
+          {{- end }}
           {{- if kindIs "map" .Values.env }}
           {{- range $key, $val := .Values.env }}
           {{- $name := (printf "%v" $key) }}

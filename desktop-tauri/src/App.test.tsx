@@ -413,6 +413,7 @@ describe('desktop app start failure handling', () => {
         running: true,
         registered: false,
         last_error: null,
+        warm_load_state: 'warming',
       },
     });
     computeHandler?.({
@@ -421,12 +422,39 @@ describe('desktop app start failure handling', () => {
         running: true,
         registered: true,
         last_error: null,
+        warm_load_state: 'ready',
       },
     });
 
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Warm load state:/).textContent).toContain('ready');
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+  it('does not display Registered yes while relay runtime is still warming', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        warm_load_state: 'warming',
+        runtime_path: 'bridge',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Warm load state:/).textContent).toContain('warming');
+    expect(screen.getByText(/Runtime path:/).textContent).toContain('bridge');
   });
 
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {

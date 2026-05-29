@@ -38,11 +38,13 @@ from api.v1.models import (
     get_model_instance as _get_model_instance,
 )
 from api.v1.compute_provider import (
+    ComputeProviderError,
+    DistributedTargetSelection,
     get_api_v1_compute_provider,
     get_api_v1_compute_provider_for_mode,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
-    ComputeProviderError,
+    select_api_v1_distributed_target,
 )
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
@@ -151,23 +153,26 @@ def _request_remote_addr_is_loopback() -> bool:
         return False
 
 
-def _trusted_configured_relay_origins() -> list[str]:
+def _trusted_configured_relay_origins() -> list[tuple[str, str]]:
     """Return relay origins trusted for request-scoped same-origin routing."""
 
     config = get_config()
-    candidates = [
-        config.get("relay.server_url", ""),
-        config.get("api.relay_url", ""),
+    candidates: list[tuple[str, str]] = [
+        ("config:relay.server_url", config.get("relay.server_url", "")),
+        ("config:api.relay_url", config.get("api.relay_url", "")),
     ]
-    candidates.extend(config.get("relay.server_pool", []) or [])
+    for item in config.get("relay.server_pool", []) or []:
+        candidates.append(("config:relay.server_pool", item))
 
-    trusted: list[str] = []
-    for candidate in candidates:
+    trusted: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for source, candidate in candidates:
         if not isinstance(candidate, str):
             continue
         origin = _normalise_relay_origin(candidate)
-        if origin and origin not in trusted:
-            trusted.append(origin)
+        if origin and origin not in seen:
+            trusted.append((origin, source))
+            seen.add(origin)
     return trusted
 
 
@@ -184,22 +189,30 @@ def _request_loopback_relay_origin() -> str:
     return ""
 
 
-def _request_relay_base_url() -> str:
-    """Return a trusted API v1 relay base URL for desktop bridge work."""
+def _request_relay_target_selection() -> DistributedTargetSelection:
+    """Return a trusted API v1 relay target selection for desktop bridge work."""
 
-    configured = _normalise_relay_origin(
-        os.environ.get("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "")
-    )
-    if configured:
-        return configured
+    env_selection = select_api_v1_distributed_target()
+    if env_selection.url:
+        return env_selection
 
     loopback_origin = _request_loopback_relay_origin()
     if loopback_origin:
-        return loopback_origin
+        return DistributedTargetSelection(
+            url=loopback_origin,
+            source="request_loopback_origin",
+            relay_only=True,
+        )
 
-    trusted_origins = _trusted_configured_relay_origins()
-    if trusted_origins:
-        return trusted_origins[0]
+    token_place_env = os.environ.get("TOKEN_PLACE_ENV", "development").strip().lower()
+    for trusted_origin, source in _trusted_configured_relay_origins():
+        if trusted_origin == "https://token.place" and token_place_env != "production":
+            continue
+        return DistributedTargetSelection(
+            url=trusted_origin,
+            source=source if trusted_origin != "https://token.place" else "production_default",
+            relay_only=False,
+        )
 
     raise ComputeProviderError(
         "desktop bridge distributed routing requires a trusted relay origin",
@@ -208,6 +221,12 @@ def _request_relay_base_url() -> str:
         public_message="No trusted relay origin is configured for this request.",
         status_code=400,
     )
+
+
+def _request_relay_base_url() -> str:
+    """Return a trusted API v1 relay base URL for desktop bridge work."""
+
+    return _request_relay_target_selection().url
 
 
 def _get_service_name() -> str:
@@ -468,15 +487,17 @@ def _handle_chat_completion_request(data):
         )
 
         log_info(f"Generating response using model {model_id}")
-        provider = (
-            get_api_v1_compute_provider_for_mode(
+        if force_desktop_bridge_distributed:
+            relay_target_selection = _request_relay_target_selection()
+            provider = get_api_v1_compute_provider_for_mode(
                 mode="distributed",
-                distributed_url=_request_relay_base_url(),
+                distributed_url=relay_target_selection.url,
                 distributed_fallback_enabled=False,
+                distributed_target_source=relay_target_selection.source,
+                distributed_relay_only=relay_target_selection.relay_only,
             )
-            if force_desktop_bridge_distributed
-            else get_api_v1_compute_provider()
-        )
+        else:
+            provider = get_api_v1_compute_provider()
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
         log_info(

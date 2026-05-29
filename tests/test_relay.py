@@ -1078,12 +1078,13 @@ def test_healthz_custom_configured_servers_are_not_reported_as_legacy(client, mo
     assert payload["legacyConfiguredUpstreamServers"] == []
 
 
-def test_relay_entrypoint_defaults_to_one_worker():
-    """Container entrypoint should default to one worker process."""
+def test_relay_entrypoint_defaults_to_one_worker_with_multiple_threads():
+    """Container entrypoint should keep one worker process with safe thread concurrency."""
     entrypoint_path = Path(__file__).resolve().parents[1] / "docker" / "relay" / "entrypoint.sh"
     with entrypoint_path.open(encoding="utf-8") as file:
         content = file.read()
     assert 'WORKERS="${RELAY_WORKERS:-1}"' in content
+    assert 'THREADS="${RELAY_THREADS:-4}"' in content
 
 # --- Test /source ---
 

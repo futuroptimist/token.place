@@ -25,6 +25,33 @@ this phase.
 Note on upgrades: the canonical token.place Helm chart now defaults to strict single-pod rollout
 behavior for relay state safety by rendering `strategy.type: Recreate` with `replicaCount: 1`.
 
+### Public URL vs. internal distributed relay target
+
+Sugarkube relay-only deployments intentionally have two different relay URLs:
+
+- **Public relay URL**: the browser, desktop compute nodes, and operators use the ingress URL,
+  for example `https://staging.token.place` or `https://token.place`. The chart exposes this to
+  the app as `TOKENPLACE_RELAY_PUBLIC_URL` when an ingress host is rendered.
+- **Internal distributed relay target**: same-pod API v1 self-dispatch uses loopback, for example
+  `http://127.0.0.1:5010`. The chart defaults `TOKENPLACE_DISTRIBUTED_COMPUTE_URL`,
+  `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL`, and `TOKENPLACE_RELAY_INTERNAL_URL` to that loopback
+  target so forced desktop-bridge browser/API requests do not accidentally route staging traffic to
+  production-like `https://token.place` defaults.
+
+The API v1 target resolver logs the chosen distributed target and source. Expected Sugarkube
+relay-only logs should show the internal loopback target for same-pod dispatch while public client
+and compute-node registration URLs remain the ingress hostname. If a staging browser chat request
+logs `target=https://token.place`, treat it as a configuration bug.
+
+### Single worker, multiple threads
+
+The relay remains one process/one Gunicorn worker because registrations, queues, and responses live
+in process memory. Running multiple workers would split that state. The chart and relay entrypoint
+therefore keep `RELAY_WORKERS=1`, but default `RELAY_THREADS=4`. Multiple threads are intentional:
+they let the outer `/api/v1/chat/completions` request, internal loopback relay API calls, readiness
+probes, and compute-node long-polling coexist without requiring Redis, shared state, or multiple
+replicas.
+
 ## Artifact ownership and source of truth
 
 token.place publishes deployable artifacts; Sugarkube owns environment values, wrappers, and

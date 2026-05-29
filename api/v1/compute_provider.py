@@ -34,6 +34,11 @@ _EXPLICIT_DISTRIBUTED_TARGET_ENVS = (
     "TOKENPLACE_DISTRIBUTED_RELAY_URL",
     "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
 )
+_RELAY_INTERNAL_URL_ENVS = (
+    "TOKENPLACE_RELAY_INTERNAL_URL",
+    "TOKEN_PLACE_RELAY_INTERNAL_URL",
+    "RELAY_INTERNAL_URL",
+)
 _RELAY_PUBLIC_URL_ENVS = (
     "TOKENPLACE_RELAY_PUBLIC_URL",
     "TOKEN_PLACE_RELAY_PUBLIC_URL",
@@ -480,14 +485,15 @@ def _config_value(key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _select_distributed_target() -> DistributedTargetSelection:
+def select_api_v1_distributed_target() -> DistributedTargetSelection:
     """Resolve the distributed API v1 relay target with explicit staging-safe precedence.
 
     Precedence:
     1. Explicit API v1/distributed relay target environment variables.
-    2. Relay public URL environment variables when this process is the public relay.
-    3. Explicit non-default config relay URLs.
-    4. Production default only when TOKEN_PLACE_ENV=production.
+    2. Internal relay URL environment variables for relay-only self-dispatch.
+    3. Relay public URL environment variables when this process is the public relay.
+    4. Explicit non-default config relay URLs.
+    5. Production default only when TOKEN_PLACE_ENV=production.
 
     Non-production environments intentionally do not silently fall back to
     https://token.place because that makes staging appear to call production.
@@ -505,15 +511,27 @@ def _select_distributed_target() -> DistributedTargetSelection:
                 relay_only=False,
             )
 
-    for env_name in _RELAY_PUBLIC_URL_ENVS:
+    for env_name in _RELAY_INTERNAL_URL_ENVS:
         target = _validated_target_url(
             os.environ.get(env_name),
-            source=f"env:{env_name}",
+            source=f"relay_internal_env:{env_name}",
         )
         if target:
             return DistributedTargetSelection(
                 url=target,
-                source=f"env:{env_name}",
+                source=f"relay_internal_env:{env_name}",
+                relay_only=True,
+            )
+
+    for env_name in _RELAY_PUBLIC_URL_ENVS:
+        target = _validated_target_url(
+            os.environ.get(env_name),
+            source=f"relay_public_env:{env_name}",
+        )
+        if target:
+            return DistributedTargetSelection(
+                url=target,
+                source=f"relay_public_env:{env_name}",
                 relay_only=True,
             )
 
@@ -563,7 +581,8 @@ def _build_api_v1_compute_provider(
                 "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed requires "
                 "TOKENPLACE_DISTRIBUTED_COMPUTE_URL or another explicit distributed "
                 "relay target outside production. Set one of "
-                f"{', '.join(_EXPLICIT_DISTRIBUTED_TARGET_ENVS)} or TOKENPLACE_RELAY_PUBLIC_URL."
+                f"{', '.join(_EXPLICIT_DISTRIBUTED_TARGET_ENVS)}, "
+                "TOKENPLACE_RELAY_INTERNAL_URL, or TOKENPLACE_RELAY_PUBLIC_URL."
             )
             logger.error(
                 "api_v1.compute_provider.target_unset mode=%s fallback_enabled=%s "
@@ -629,7 +648,7 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
         os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
-    return mode, _select_distributed_target(), distributed_fallback_enabled
+    return mode, select_api_v1_distributed_target(), distributed_fallback_enabled
 
 
 def get_api_v1_compute_provider_for_mode(
@@ -637,6 +656,8 @@ def get_api_v1_compute_provider_for_mode(
     mode: str,
     distributed_url: str | None = None,
     distributed_fallback_enabled: bool | None = None,
+    distributed_target_source: str = "request_override",
+    distributed_relay_only: bool = False,
 ) -> ApiV1ComputeProvider:
     """Resolve provider with an explicit mode override for request-scoped routing."""
 
@@ -647,8 +668,8 @@ def get_api_v1_compute_provider_for_mode(
     if distributed_url is not None:
         target_selection = DistributedTargetSelection(
             url=_normalise_target_url(distributed_url),
-            source="request_override",
-            relay_only=False,
+            source=distributed_target_source,
+            relay_only=distributed_relay_only,
         )
     else:
         target_selection = env_target_selection

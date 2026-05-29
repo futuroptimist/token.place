@@ -1224,6 +1224,7 @@ class RelayClient:
                         timeout_exception
                         and not can_try_another_relay
                         and math.isfinite(float(poll_wait))
+                        and float(poll_wait) > 0
                         and elapsed_seconds >= max(0.0, float(poll_wait) - 0.5)
                     )
                     if reached_server_long_poll and candidate_url in self._api_v1_registered_relays:

@@ -75,6 +75,57 @@ WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
 
 
+_POLL_CANCELLED = object()
+
+
+class _CancelablePollWorker:
+    """Run one relay poll at a time while the bridge keeps checking for cancel."""
+
+    def __init__(self) -> None:
+        self._tasks: "queue.Queue[Any]" = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="tokenplace-relay-poll",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            fn, result_queue = task
+            try:
+                result_queue.put((True, fn()))
+            except BaseException as exc:  # pragma: no cover - exercised via call() re-raise
+                result_queue.put((False, exc))
+
+    def call(self, fn: Any, should_cancel: Any, *, poll_interval: float = 0.1) -> Any:
+        if self._closed:
+            return _POLL_CANCELLED
+        result_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
+        self._tasks.put((fn, result_queue))
+        while True:
+            try:
+                ok, value = result_queue.get(timeout=poll_interval)
+            except queue.Empty:
+                if should_cancel():
+                    return _POLL_CANCELLED
+                continue
+            if ok:
+                return value
+            raise value
+
+    def shutdown(self) -> None:
+        self._closed = True
+        try:
+            self._tasks.put_nowait(None)
+        except queue.Full:  # pragma: no cover - unbounded queue is not expected to fill
+            pass
+
+
 def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
     """Return whether bridge UI should report the relay registration as current."""
 
@@ -385,6 +436,7 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
     warm_load_future: Optional[concurrent.futures.Future] = None
+    poll_worker = _CancelablePollWorker()
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
         fresh_registered = registered and _registration_fresh(runtime.relay_client, active_relay_url)
@@ -528,7 +580,10 @@ def run(args: argparse.Namespace) -> int:
         while not stop_requested():
             print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
             active_relay_url = runtime.relay_client.relay_url
-            relay_response: Dict[str, Any] = runtime.register_and_poll_once()
+            relay_response = poll_worker.call(runtime.register_and_poll_once, stop_requested)
+            if relay_response is _POLL_CANCELLED:
+                break
+            relay_response = relay_response if isinstance(relay_response, dict) else {}
             active_relay_url = runtime.relay_client.relay_url
             api_v1_payload = is_api_v1_relay_payload(relay_response)
             relay_error = _relay_error_message(relay_response)
@@ -657,8 +712,9 @@ def run(args: argparse.Namespace) -> int:
         pass
     finally:
         print("desktop.compute_node_bridge.stop", file=sys.stderr)
+        poll_worker.shutdown()
         if warm_load_executor is not None:
-            warm_load_executor.shutdown(wait=True, cancel_futures=True)
+            warm_load_executor.shutdown(wait=False, cancel_futures=True)
         runtime.stop()
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)

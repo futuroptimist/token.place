@@ -1351,16 +1351,17 @@ def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypat
     _ = capsys.readouterr()
 
 
-def test_run_waits_for_active_warmup_before_runtime_stop(capsys, monkeypatch):
+def test_run_does_not_wait_for_active_warmup_before_runtime_stop(capsys, monkeypatch):
     _reset_cancel_queue()
     events = []
     warm_started = threading.Event()
+    release_warmup = threading.Event()
 
     class SlowWarmupRuntime(FakeRuntime):
         def ensure_api_v1_runtime_ready(self):
             events.append("warm-start")
             warm_started.set()
-            time.sleep(0.05)
+            release_warmup.wait(timeout=1.0)
             events.append("warm-done")
             return True
 
@@ -1387,8 +1388,54 @@ def test_run_waits_for_active_warmup_before_runtime_stop(capsys, monkeypatch):
 
     status = compute_node_bridge.run(args)
 
-    assert status == 0
-    assert events.index("warm-done") < events.index("stop")
+    try:
+        assert status == 0
+        assert "stop" in events
+        assert "warm-done" not in events[: events.index("stop") + 1]
+    finally:
+        release_warmup.set()
+    _ = capsys.readouterr()
+
+
+def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatch):
+    _reset_cancel_queue()
+    events = []
+    poll_started = threading.Event()
+    release_poll = threading.Event()
+
+    class BlockingPollRuntime(FakeRuntime):
+        def register_and_poll_once(self):
+            events.append("poll-start")
+            poll_started.set()
+            release_poll.wait(timeout=1.0)
+            events.append("poll-done")
+            return {"next_ping_in_x_seconds": 0}
+
+        def stop(self):
+            events.append("stop")
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingPollRuntime)
+    stop_calls = {"count": 0}
+
+    def fake_stop_requested():
+        stop_calls["count"] += 1
+        if stop_calls["count"] == 1:
+            return False
+        assert poll_started.wait(timeout=1.0)
+        return True
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    try:
+        assert status == 0
+        assert "stop" in events
+        assert "poll-done" not in events[: events.index("stop") + 1]
+    finally:
+        release_poll.set()
     _ = capsys.readouterr()
 
 

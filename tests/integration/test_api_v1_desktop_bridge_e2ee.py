@@ -311,6 +311,51 @@ def test_api_v1_desktop_bridge_registration_poll_no_work_heartbeat():
         assert poll_payload["next_ping_in_x_seconds"] == 0
 
 
+def test_api_v1_desktop_bridge_idle_no_work_poll_keeps_node_available(monkeypatch):
+    """A no-work desktop poll must be followed by a lease-safe heartbeat before API work arrives."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS", "2")
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.01")
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 1
+
+        first_poll = desktop_client.poll_api_v1_encrypted_work()
+        assert first_poll["message"] == "No requests available"
+        assert desktop_client.is_api_v1_registration_fresh(base_url) is True
+
+        time.sleep(1.7)
+        second_poll = desktop_client.poll_api_v1_encrypted_work()
+        assert second_poll["message"] == "No requests available"
+        assert desktop_client.is_api_v1_registration_fresh(base_url) is True
+
+        time.sleep(0.6)
+        request_id = "req-after-idle-heartbeat"
+        queued = requests.post(
+            f"{base_url}/api/v1/relay/requests",
+            json={
+                "request_id": request_id,
+                "client_public_key": "client-public-key",
+                "server_public_key": desktop_client.crypto_manager.public_key_b64,
+                "ciphertext": "ciphertext-request",
+                "cipherkey": "cipherkey-request",
+                "iv": "iv-request",
+            },
+            timeout=2,
+        )
+        assert queued.status_code == 200
+
+        work = desktop_client.poll_api_v1_encrypted_work()
+        assert work["request_id"] == request_id
+        assert work.get("e2ee_v1") is True
+
+
 @pytest.mark.parametrize("encrypted", [False, True])
 def test_api_v1_image_content_fails_before_relay_queue(encrypted):
     messages = [

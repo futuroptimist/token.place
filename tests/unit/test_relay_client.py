@@ -1178,6 +1178,80 @@ class TestRelayClient:
         assert result['next_ping_in_x_seconds'] == 0
         assert result['poll_wait_seconds'] == 10
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_reregisters_before_lease_expiry_risk(
+        self, mock_post, monkeypatch, relay_client
+    ):
+        now = {'value': 1000.0}
+        monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: now['value'])
+        register_first = MagicMock(status_code=200)
+        register_first.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        poll_first = MagicMock(status_code=200)
+        poll_first.json.return_value = {
+            'message': 'No requests available',
+            'next_ping_in_x_seconds': 0,
+            'poll_wait_seconds': 10,
+        }
+        register_second = MagicMock(status_code=200)
+        register_second.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        poll_second = MagicMock(status_code=200)
+        poll_second.json.return_value = {
+            'message': 'No requests available',
+            'next_ping_in_x_seconds': 0,
+            'poll_wait_seconds': 10,
+        }
+        mock_post.side_effect = [register_first, poll_first, register_second, poll_second]
+
+        relay_client.poll_api_v1_encrypted_work()
+        assert relay_client.is_api_v1_registration_fresh('http://localhost:5000') is True
+
+        now['value'] += 23.0
+        relay_client.poll_api_v1_encrypted_work()
+
+        called_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert called_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_api_v1_registration_freshness_expires_after_lease(
+        self, mock_post, monkeypatch, relay_client
+    ):
+        now = {'value': 2000.0}
+        monkeypatch.setattr(relay_client_module.time, 'monotonic', lambda: now['value'])
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 5, 'poll_wait_seconds': 1}
+        mock_post.return_value = register_ok
+
+        relay_client.register_api_v1_compute_node('http://localhost:5000')
+        assert relay_client.is_api_v1_registration_fresh('http://localhost:5000') is True
+
+        now['value'] += 5.5
+        assert relay_client.is_api_v1_registration_fresh('http://localhost:5000') is False
+
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_poll_api_v1_encrypted_work_unknown_node_retries_without_sleeping_lease(
+        self, mock_post, relay_client
+    ):
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 10}
+        poll_missing = MagicMock(status_code=404)
+        poll_missing.json.return_value = {
+            'error': {'message': 'Server with the specified public key not found', 'code': 404}
+        }
+        mock_post.side_effect = [register_ok, poll_missing]
+
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['http_status'] == 404
+        assert result['next_ping_in_x_seconds'] == 0
+        assert relay_client.is_api_v1_registration_fresh('http://localhost:5000') is False
+
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_error_path_uses_register_backoff(self, mock_post, relay_client):
         register_ok = MagicMock(status_code=200)
@@ -1267,7 +1341,7 @@ class TestRelayClient:
         second = relay_client.poll_api_v1_encrypted_work()
 
         assert first['error'] == 'HTTP 404'
-        assert first['next_ping_in_x_seconds'] == 9
+        assert first['next_ping_in_x_seconds'] == 0
         assert first['relay_error_kind'] == 'http_status_no_json_body'
         assert second['message'] == 'No requests available'
         called_urls = [call.args[0] for call in mock_post.call_args_list]

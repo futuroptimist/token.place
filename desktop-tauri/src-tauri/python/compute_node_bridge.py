@@ -486,7 +486,11 @@ def run(args: argparse.Namespace) -> int:
             has_heartbeat = (
                 isinstance(relay_response, dict) and "next_ping_in_x_seconds" in relay_response
             )
-            registered = relay_error is None and (has_heartbeat or api_v1_payload)
+            locally_fresh = False
+            if relay_error is None and (has_heartbeat or api_v1_payload):
+                freshness_check = getattr(runtime.relay_client, "is_api_v1_registration_fresh", None)
+                locally_fresh = bool(freshness_check(active_relay_url)) if callable(freshness_check) else True
+            registered = relay_error is None and (has_heartbeat or api_v1_payload) and locally_fresh
             wait_seconds = _safe_poll_wait_seconds(
                 relay_response, getattr(runtime.relay_client, "_request_timeout", 1)
             )
@@ -572,19 +576,12 @@ def run(args: argparse.Namespace) -> int:
                         "operator; update relay.py to repo HEAD"
                     )
 
-            if registered and warm_load_enabled and warm_load_state == "not_started":
-                if not bridge_runtime_allowed:
-                    warm_load_state = "not_started"
-                    print(
-                        "desktop.compute_node_bridge.model_init.skipped "
-                        f"reason=post_registration runtime_path={runtime_path} "
-                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
-                        file=sys.stderr,
-                    )
-                else:
-                    if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
-                        fail_on_warm_load_error(active_relay_url=active_relay_url)
-                        break
+            if registered and warm_load_enabled and warm_load_state == "not_started" and not api_v1_payload:
+                print(
+                    "desktop.compute_node_bridge.model_init.deferred "
+                    "reason=heartbeat_only state=not_started next_poll_required=True",
+                    file=sys.stderr,
+                )
             emit_status_event(
                 registered=registered,
                 active_relay_url=active_relay_url,

@@ -2205,3 +2205,29 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
     next_response = client.get('/api/v1/relay/servers/next')
     assert next_response.status_code == 200
     assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
+
+
+def test_api_v1_unregister_removes_server_from_known_servers_and_next(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    assert client.get('/api/v1/relay/servers/next').status_code == 200
+
+    response = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+
+    assert response.status_code == 200
+    assert response.get_json()['removed'] is True
+    next_response = client.get('/api/v1/relay/servers/next')
+    assert next_response.status_code == 503
+    assert next_response.get_json()['error']['code'] == 'no_registered_compute_nodes'
+
+
+def test_api_v1_unregister_is_idempotent_for_missing_server(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+
+    first = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+    second = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.get_json()['removed'] is False
+    assert second.get_json()['removed'] is False

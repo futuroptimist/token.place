@@ -70,6 +70,7 @@ def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+_stop_event = threading.Event()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
@@ -152,11 +153,14 @@ class _CancelablePollWorker:
             raise value
 
     def shutdown(self) -> None:
+        if not self._closed:
+            print("desktop.compute_node_bridge.poll_worker.stop_requested", file=sys.stderr)
         self._closed = True
         try:
             self._tasks.put_nowait(None)
         except queue.Full:  # pragma: no cover - unbounded queue is not expected to fill
             pass
+        print("desktop.compute_node_bridge.poll_worker.stopped", file=sys.stderr)
 
 
 def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
@@ -367,12 +371,14 @@ def _start_stdin_reader() -> None:
 
 
 def stop_requested() -> bool:
+    if _stop_event.is_set():
+        return True
     _start_stdin_reader()
     while True:
         try:
             line = _stdin_lines.get_nowait().strip()
         except queue.Empty:
-            return False
+            return _stop_event.is_set()
         if not line:
             continue
         try:
@@ -380,6 +386,8 @@ def stop_requested() -> bool:
         except json.JSONDecodeError:
             continue
         if payload.get("type") == "cancel":
+            _stop_event.set()
+            print("desktop.compute_node_bridge.stop_requested signal=stdin_cancel", file=sys.stderr)
             return True
 
 
@@ -398,6 +406,7 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    _stop_event.clear()
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -478,6 +487,9 @@ def run(args: argparse.Namespace) -> int:
 
     runtime.model_manager.model_path = args.model
     apply_compute_mode(runtime.model_manager, args.mode)
+    start_relay_client = getattr(runtime.relay_client, "start", None)
+    if callable(start_relay_client):
+        start_relay_client()
 
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
     runtime_path = _runtime_path_from_env()
@@ -939,11 +951,21 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        print("desktop.compute_node_bridge.stop", file=sys.stderr)
+        _stop_event.set()
+        print(
+            "desktop.compute_node_bridge.stop "
+            f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)}",
+            file=sys.stderr,
+        )
         poll_worker.shutdown()
         if warm_load_future is not None and not warm_load_future.done():
             warm_load_future.cancel()
         runtime.stop()
+        print(
+            "desktop.compute_node_bridge.stopped_idle "
+            f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)}",
+            file=sys.stderr,
+        )
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(

@@ -80,6 +80,37 @@ PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
 _POLL_CANCELLED = object()
 
 
+class _DaemonWarmLoadFuture:
+    """Run warm-load work on a daemon thread so wedged init cannot keep the process alive."""
+
+    def __init__(self, fn: Any) -> None:
+        self._future: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(fn,),
+            name="tokenplace-warm-load",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self, fn: Any) -> None:
+        if not self._future.set_running_or_notify_cancel():
+            return
+        try:
+            self._future.set_result(fn())
+        except BaseException as exc:
+            self._future.set_exception(exc)
+
+    def done(self) -> bool:
+        return self._future.done()
+
+    def result(self, timeout: Optional[float] = None) -> Any:
+        return self._future.result(timeout=timeout)
+
+    def cancel(self) -> bool:
+        return self._future.cancel()
+
+
 class _CancelablePollWorker:
     """Run one relay poll at a time while the bridge keeps checking for cancel."""
 
@@ -457,8 +488,7 @@ def run(args: argparse.Namespace) -> int:
     warm_load_duration_ms: Optional[int] = None
     warm_load_failed: Optional[str] = None
     warm_load_fatal = False
-    warm_load_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-    warm_load_future: Optional[concurrent.futures.Future] = None
+    warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     poll_worker = _CancelablePollWorker()
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
@@ -530,7 +560,7 @@ def run(args: argparse.Namespace) -> int:
         block_timeout_seconds: Optional[float] = None,
     ) -> bool:
         nonlocal warm_load_state, warm_load_started_at, warm_load_duration_ms, warm_load_failed
-        nonlocal warm_load_executor, warm_load_future
+        nonlocal warm_load_future
         if warm_load_state == "ready":
             return True
         if warm_load_state == "failed":
@@ -540,11 +570,7 @@ def run(args: argparse.Namespace) -> int:
             warm_load_failed = None
             warm_load_duration_ms = None
             warm_load_started_at = time.perf_counter()
-            if warm_load_executor is None:
-                warm_load_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="tokenplace-warm-load"
-                )
-            warm_load_future = warm_load_executor.submit(runtime.ensure_api_v1_runtime_ready)
+            warm_load_future = _DaemonWarmLoadFuture(runtime.ensure_api_v1_runtime_ready)
             emit_status_event(
                 registered=False,
                 active_relay_url=active_relay_url,
@@ -915,8 +941,8 @@ def run(args: argparse.Namespace) -> int:
     finally:
         print("desktop.compute_node_bridge.stop", file=sys.stderr)
         poll_worker.shutdown()
-        if warm_load_executor is not None:
-            warm_load_executor.shutdown(wait=False, cancel_futures=True)
+        if warm_load_future is not None and not warm_load_future.done():
+            warm_load_future.cancel()
         runtime.stop()
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)

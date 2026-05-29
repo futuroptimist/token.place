@@ -1,6 +1,5 @@
 """Unit tests for the desktop compute-node bridge."""
 
-import concurrent.futures
 import importlib.util
 import json
 import os
@@ -767,23 +766,16 @@ def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
 
-    real_submit = concurrent.futures.ThreadPoolExecutor.submit
-
-    def releasing_submit(self, fn, *args, **kwargs):
-        future = real_submit(self, fn, *args, **kwargs)
-        runtime = WarmingThenApiV1Runtime.last_instance
-        assert runtime is not None
-        assert runtime.ready_started.wait(timeout=0.5)
-        runtime.ready_release.set()
-        return future
-
     stop_counter = {'count': 0}
 
     def fake_stop_requested():
         stop_counter['count'] += 1
+        runtime = WarmingThenApiV1Runtime.last_instance
+        assert runtime is not None
+        assert runtime.ready_started.wait(timeout=0.5)
+        runtime.ready_release.set()
         return stop_counter['count'] > 2
 
-    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, 'submit', releasing_submit)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
 
     args = SimpleNamespace(
@@ -1548,13 +1540,13 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     _reset_cancel_queue()
     events = []
     warm_started = threading.Event()
-    release_warmup = threading.Event()
+    never_release_warmup = threading.Event()
 
     class StuckWarmupRuntime(FakeRuntime):
         def ensure_api_v1_runtime_ready(self):
             events.append("warm-start")
             warm_started.set()
-            release_warmup.wait(timeout=1.0)
+            never_release_warmup.wait()
             events.append("warm-done")
             return True
 
@@ -1577,28 +1569,31 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     status = compute_node_bridge.run(args)
     elapsed = time.perf_counter() - started_at
 
-    try:
-        assert status == 1
-        assert elapsed < 0.5
-        assert warm_started.is_set()
-        assert "poll" not in events
-        assert "stop" in events
-        captured = capsys.readouterr()
-        output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
-        error_event = next(event for event in output_events if event.get("type") == "error")
-        assert error_event["warm_load_state"] == "failed"
-        assert "timed out" in error_event["message"]
-        warming_status_events = [
-            event
-            for event in output_events
-            if event.get("type") == "status" and event.get("warm_load_state") == "warming"
-        ]
-        assert len(warming_status_events) == 1
-        assert "registration.gate_wait_timeout" in captured.err
-        assert "api_v1_e2ee.runtime_wait.start" not in captured.err
-        assert "api_v1_e2ee.runtime_wait.timeout" not in captured.err
-    finally:
-        release_warmup.set()
+    assert status == 1
+    assert elapsed < 0.5
+    assert warm_started.is_set()
+    assert any(
+        thread.daemon
+        for thread in threading.enumerate()
+        if thread.name == "tokenplace-warm-load" and thread.is_alive()
+    )
+    assert "poll" not in events
+    assert "warm-done" not in events
+    assert "stop" in events
+    captured = capsys.readouterr()
+    output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    error_event = next(event for event in output_events if event.get("type") == "error")
+    assert error_event["warm_load_state"] == "failed"
+    assert "timed out" in error_event["message"]
+    warming_status_events = [
+        event
+        for event in output_events
+        if event.get("type") == "status" and event.get("warm_load_state") == "warming"
+    ]
+    assert len(warming_status_events) == 1
+    assert "registration.gate_wait_timeout" in captured.err
+    assert "api_v1_e2ee.runtime_wait.start" not in captured.err
+    assert "api_v1_e2ee.runtime_wait.timeout" not in captured.err
 
 
 def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatch):

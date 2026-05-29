@@ -364,6 +364,21 @@ class ComputeNodeRuntime:
         )
         return False
 
+    def submit_api_v1_error_response(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """Submit an encrypted API v1 error envelope for unprocessed relay work."""
+
+        submit_error = getattr(self.relay_client, "submit_api_v1_error_response", None)
+        if not callable(submit_error):
+            _log_error("Relay client cannot submit API v1 error responses")
+            return False
+        return bool(submit_error(request_data, code=code, message=message))
+
     def register_and_poll_once(self) -> Dict[str, Any]:
         """Poll relay for one encrypted API v1 work item."""
 

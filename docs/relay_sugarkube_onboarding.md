@@ -25,6 +25,31 @@ this phase.
 Note on upgrades: the canonical token.place Helm chart now defaults to strict single-pod rollout
 behavior for relay state safety by rendering `strategy.type: Recreate` with `replicaCount: 1`.
 
+
+## Public URL vs. internal relay dispatch target
+
+Relay-only staging and production deployments have two distinct URLs:
+
+- **Public relay URL:** the browser/operator-facing origin, such as
+  `https://staging.token.place` or `https://token.place`, routed through Cloudflare and
+  Kubernetes ingress. This is the URL humans and external desktop compute nodes use.
+- **Internal distributed relay target:** the same-pod loopback target used when the relay
+  receives an API v1 desktop-bridge chat request and self-dispatches to its own relay API,
+  for example `http://127.0.0.1:5010`. This target must stay internal for relay-only
+  Sugarkube installs so staging never silently routes forced desktop-bridge work to the
+  production-like `https://token.place` default.
+
+The Helm chart encodes this relay-only default by setting
+`TOKENPLACE_DISTRIBUTED_COMPUTE_URL`, `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL`, and
+`TOKENPLACE_RELAY_INTERNAL_URL` to the loopback relay target. Public URLs can still be
+configured independently for ingress and external clients.
+
+Gunicorn intentionally runs with `RELAY_WORKERS=1` and `RELAY_THREADS=4` by default for
+relay-only deployments. One worker process keeps in-memory relay registrations, queued
+requests, and responses unified. Multiple threads allow the outer `/api/v1/chat/completions`
+request, loopback relay API calls, readiness probes, and compute-node long polls to coexist
+without requiring Redis, shared state, or multiple replicas.
+
 ## Artifact ownership and source of truth
 
 token.place publishes deployable artifacts; Sugarkube owns environment values, wrappers, and

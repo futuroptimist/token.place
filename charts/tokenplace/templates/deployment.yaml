@@ -57,11 +57,16 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: relay
+          {{- $internalRelayTarget := printf "http://127.0.0.1:%v" .Values.containerPort }}
           {{- $defaultEnv := dict
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" (printf "%v" .Values.containerPort))
                 "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
+                "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
+                "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" (dict "name" "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" "value" $internalRelayTarget)
+                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL" (dict "name" "TOKENPLACE_DISTRIBUTED_COMPUTE_URL" "value" $internalRelayTarget)
                 "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
+                "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $internalRelayTarget)
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
                 "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
                 "XDG_DATA_HOME" (dict "name" "XDG_DATA_HOME" "value" "/tmp/.local/share")

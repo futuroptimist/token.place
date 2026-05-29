@@ -1078,12 +1078,38 @@ def test_healthz_custom_configured_servers_are_not_reported_as_legacy(client, mo
     assert payload["legacyConfiguredUpstreamServers"] == []
 
 
-def test_relay_entrypoint_defaults_to_one_worker():
-    """Container entrypoint should default to one worker process."""
+def test_relay_entrypoint_defaults_to_one_worker_and_multiple_threads():
+    """Container entrypoint should keep one stateful worker with thread concurrency."""
     entrypoint_path = Path(__file__).resolve().parents[1] / "docker" / "relay" / "entrypoint.sh"
     with entrypoint_path.open(encoding="utf-8") as file:
         content = file.read()
     assert 'WORKERS="${RELAY_WORKERS:-1}"' in content
+    assert 'THREADS="${RELAY_THREADS:-4}"' in content
+
+
+
+def test_tokenplace_chart_relay_only_defaults_encode_loopback_dispatch():
+    """Helm defaults should encode relay-only self-dispatch without manual overrides."""
+
+    chart_template_path = (
+        Path(__file__).resolve().parents[1]
+        / "charts"
+        / "tokenplace"
+        / "templates"
+        / "deployment.yaml"
+    )
+    values_path = Path(__file__).resolve().parents[1] / "charts" / "tokenplace" / "values.yaml"
+    template = chart_template_path.read_text(encoding="utf-8")
+    values = values_path.read_text(encoding="utf-8")
+
+    assert "replicaCount: 1" in values
+    assert "type: Recreate" in values
+    assert '"RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")' in template
+    assert '"RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")' in template
+    assert 'printf "http://127.0.0.1:%v" .Values.containerPort' in template
+    assert '"TOKENPLACE_DISTRIBUTED_COMPUTE_URL"' in template
+    assert '"TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL"' in template
+    assert '"TOKENPLACE_RELAY_INTERNAL_URL"' in template
 
 # --- Test /source ---
 

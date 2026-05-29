@@ -32,6 +32,8 @@ interface ComputeNodeStatus {
   model_path: string;
   last_error: string | null;
   warm_load_state: string | null;
+  warm_load_enabled: boolean | null;
+  warm_load_duration_ms: number | null;
   runtime_path: string | null;
   relay_runtime_path: string | null;
 }
@@ -67,6 +69,8 @@ const defaultComputeStatus: ComputeNodeStatus = {
   model_path: '',
   last_error: null,
   warm_load_state: null,
+  warm_load_enabled: null,
+  warm_load_duration_ms: null,
   runtime_path: null,
   relay_runtime_path: null,
 };
@@ -103,7 +107,7 @@ export function App() {
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const relayRuntimeReady = computeStatus.warm_load_state === null || computeStatus.warm_load_state === 'ready';
-  const computeNodeRegistered = computeStatus.registered && relayRuntimeReady;
+  const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
@@ -196,6 +200,14 @@ export function App() {
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
         warm_load_state:
           typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+        warm_load_enabled:
+          typeof payload.warm_load_enabled === 'boolean'
+            ? payload.warm_load_enabled
+            : prev.warm_load_enabled,
+        warm_load_duration_ms:
+          typeof payload.warm_load_duration_ms === 'number'
+            ? payload.warm_load_duration_ms
+            : prev.warm_load_duration_ms,
         runtime_path: typeof payload.runtime_path === 'string' ? payload.runtime_path : prev.runtime_path,
         relay_runtime_path:
           typeof payload.relay_runtime_path === 'string'

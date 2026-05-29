@@ -78,6 +78,55 @@ describe('desktop app start failure handling', () => {
     });
   });
 
+
+  const mockInitialComputeStatus = (statusOverrides: Record<string, unknown>) => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'detect_backend') {
+        return Promise.resolve({
+          platform_label: 'macos',
+          preferred_mode: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
+        });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          active_relay_url: '',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '',
+          last_error: null,
+          ...statusOverrides,
+        });
+      }
+      if (command === 'inspect_model_artifact') {
+        return Promise.resolve({
+          canonical_family_url: 'https://example.test/models',
+          filename: 'model.gguf',
+          url: 'https://example.test/model.gguf',
+          models_dir: '/tmp',
+          resolved_model_path: '/tmp/model.gguf',
+          exists: true,
+          size_bytes: 1,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+  };
+
   it('moves local inference from starting to failed when invoke rejects', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_inference') {
@@ -454,6 +503,67 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming');
+  });
+
+
+  it('replays cached warming readiness and relay runtime path without showing registered yes', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      warm_load_state: 'warming',
+      warm_load_enabled: true,
+      warm_load_duration_ms: 25,
+      runtime_path: 'sidecar',
+      relay_runtime_path: 'bridge',
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming');
+    expect(screen.getByText(/Relay runtime path:/).textContent).toContain('bridge');
+  });
+
+  it('allows cached ready relay runtime status to display registered yes', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      warm_load_state: 'ready',
+      warm_load_enabled: true,
+      warm_load_duration_ms: 25,
+      runtime_path: 'bridge',
+      relay_runtime_path: 'bridge',
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready');
+  });
+
+  it('does not display registered yes for stopped cached compute node status', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      warm_load_state: 'ready',
+      warm_load_enabled: true,
+      warm_load_duration_ms: 25,
+      runtime_path: 'bridge',
+      relay_runtime_path: 'bridge',
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {

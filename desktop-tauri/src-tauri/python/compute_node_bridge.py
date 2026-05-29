@@ -70,6 +70,7 @@ def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+_stop_event = threading.Event()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
@@ -135,8 +136,15 @@ class _CancelablePollWorker:
             except BaseException as exc:  # pragma: no cover - exercised via call() re-raise
                 result_queue.put((False, exc))
 
-    def call(self, fn: Any, should_cancel: Any, *, poll_interval: float = 0.1) -> Any:
-        if self._closed:
+    def call(
+        self,
+        fn: Any,
+        should_cancel: Any,
+        *,
+        poll_interval: float = 0.1,
+        check_before_submit: bool = False,
+    ) -> Any:
+        if self._closed or (check_before_submit and should_cancel()):
             return _POLL_CANCELLED
         result_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
         self._tasks.put((fn, result_queue))
@@ -151,12 +159,13 @@ class _CancelablePollWorker:
                 return value
             raise value
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, join_timeout: float = 1.0) -> None:
         self._closed = True
         try:
             self._tasks.put_nowait(None)
         except queue.Full:  # pragma: no cover - unbounded queue is not expected to fill
             pass
+        self._thread.join(timeout=max(join_timeout, 0.0))
 
 
 def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
@@ -359,6 +368,7 @@ def _start_stdin_reader() -> None:
             while True:
                 line = sys.stdin.readline()
                 if line == "":
+                    _stop_event.set()
                     break
                 _stdin_lines.put(line)
 
@@ -368,11 +378,13 @@ def _start_stdin_reader() -> None:
 
 def stop_requested() -> bool:
     _start_stdin_reader()
+    if _stop_event.is_set():
+        return True
     while True:
         try:
             line = _stdin_lines.get_nowait().strip()
         except queue.Empty:
-            return False
+            return _stop_event.is_set()
         if not line:
             continue
         try:
@@ -380,6 +392,8 @@ def stop_requested() -> bool:
         except json.JSONDecodeError:
             continue
         if payload.get("type") == "cancel":
+            _stop_event.set()
+            print("desktop.compute_node_bridge.stop_requested signal=stdin_cancel", file=sys.stderr)
             return True
 
 
@@ -398,6 +412,7 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    _stop_event.clear()
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -805,6 +820,9 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         if warm_runtime_before_registration():
+            relay_start = getattr(runtime.relay_client, "start", None)
+            if callable(relay_start):
+                relay_start()
             while not stop_requested():
                 print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
                 active_relay_url = runtime.relay_client.relay_url
@@ -939,11 +957,14 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        print("desktop.compute_node_bridge.stop", file=sys.stderr)
-        poll_worker.shutdown()
+        print("desktop.compute_node_bridge.stop_requested phase=shutdown", file=sys.stderr)
         if warm_load_future is not None and not warm_load_future.done():
             warm_load_future.cancel()
+        print("desktop.compute_node_bridge.poll.cancel_requested", file=sys.stderr)
         runtime.stop()
+        poll_worker.shutdown()
+        print("desktop.compute_node_bridge.poll_worker.stopped", file=sys.stderr)
+        print("desktop.compute_node_bridge.stopped_idle", file=sys.stderr)
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(

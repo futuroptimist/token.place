@@ -274,6 +274,8 @@ class ComputeNodeRuntime:
             model_manager=self.model_manager,
             include_configured_servers=runtime_config.use_configured_relay_fallbacks,
         )
+        self._stop_lock = threading.Lock()
+        self._stopped = False
         if request_adapters is None:
             self.request_adapters = [
                 ApiV1RelayRequestAdapter(self.relay_client),
@@ -382,11 +384,21 @@ class ComputeNodeRuntime:
 
     def stop(self) -> None:
         """Stop relay polling and network activity."""
+        with self._stop_lock:
+            if self._stopped:
+                _log_info("Compute-node runtime stop already completed; skipping duplicate unregister")
+                return
+            self._stopped = True
+
         try:
+            _log_info("Compute-node runtime stop requested")
             self.relay_client.stop()
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
             if callable(unregister_fn):
-                if not unregister_fn():
+                _log_info("Compute-node runtime unregister attempted")
+                if unregister_fn():
+                    _log_info("Compute-node runtime unregister succeeded")
+                else:
                     _log_warning("Relay unregister request failed during shutdown")
         except Exception:
             _log_warning(

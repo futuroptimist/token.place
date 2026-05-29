@@ -37,6 +37,12 @@ class FakeModelManager:
 class FakeRelayClient:
     relay_url = 'https://token.place'
 
+    def __init__(self):
+        self.started = False
+
+    def start(self):
+        self.started = True
+
     def api_v1_registration_fresh(self, _relay_url=None):
         return True
 
@@ -410,6 +416,121 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
 
+
+
+
+def test_run_cancel_during_long_poll_stops_runtime_without_second_poll(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class LongPollRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, _config):
+            LongPollRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClient()
+            self.poll_started = threading.Event()
+            self.poll_calls = 0
+            self.stop_calls = 0
+
+        def register_and_poll_once(self):
+            self.poll_calls += 1
+            self.poll_started.set()
+            time.sleep(0.2)
+            return {'next_ping_in_x_seconds': 0}
+
+        def stop(self):
+            self.stop_calls += 1
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=LongPollRuntime)
+
+    def fake_stop_requested():
+        instance = LongPollRuntime.last_instance
+        return bool(instance and instance.poll_started.is_set())
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    status = compute_node_bridge.run(SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    ))
+
+    assert status == 0
+    runtime = LongPollRuntime.last_instance
+    assert runtime is not None
+    assert runtime.poll_calls == 1
+    assert runtime.stop_calls == 1
+    captured = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.poll.cancelled' in captured.err
+    assert 'desktop.compute_node_bridge.poll_worker.stopped' in captured.err
+
+
+def test_run_cancel_during_warm_load_does_not_register_afterward(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class SlowWarmRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, _config):
+            SlowWarmRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClient()
+            self.warm_started = threading.Event()
+            self.poll_calls = 0
+            self.stop_calls = 0
+
+        def ensure_api_v1_runtime_ready(self):
+            self.warm_started.set()
+            time.sleep(0.2)
+            return True
+
+        def register_and_poll_once(self):
+            self.poll_calls += 1
+            return {'next_ping_in_x_seconds': 0}
+
+        def stop(self):
+            self.stop_calls += 1
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SlowWarmRuntime)
+
+    def fake_stop_requested():
+        instance = SlowWarmRuntime.last_instance
+        return bool(instance and instance.warm_started.is_set())
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    status = compute_node_bridge.run(SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    ))
+
+    assert status == 0
+    runtime = SlowWarmRuntime.last_instance
+    assert runtime is not None
+    assert runtime.poll_calls == 0
+    assert runtime.stop_calls == 1
+    capsys.readouterr()
+
+
+def test_cancelable_poll_worker_does_not_submit_after_cancel():
+    worker = compute_node_bridge._CancelablePollWorker()
+    try:
+        called = {'value': False}
+
+        def work():
+            called['value'] = True
+            return {'next_ping_in_x_seconds': 0}
+
+        result = worker.call(work, lambda: True, check_before_submit=True)
+
+        assert result is compute_node_bridge._POLL_CANCELLED
+        assert called['value'] is False
+    finally:
+        worker.shutdown(join_timeout=0.1)
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):
     _reset_cancel_queue()

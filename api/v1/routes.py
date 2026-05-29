@@ -153,26 +153,6 @@ def _request_remote_addr_is_loopback() -> bool:
         return False
 
 
-def _trusted_configured_relay_origins() -> list[str]:
-    """Return relay origins trusted for request-scoped same-origin routing."""
-
-    config = get_config()
-    candidates = [
-        config.get("relay.server_url", ""),
-        config.get("api.relay_url", ""),
-    ]
-    candidates.extend(config.get("relay.server_pool", []) or [])
-
-    trusted: list[str] = []
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        origin = _normalise_relay_origin(candidate)
-        if origin and origin not in trusted:
-            trusted.append(origin)
-    return trusted
-
-
 def _request_loopback_relay_origin() -> str:
     """Return the request origin only when it is verified loopback-local."""
 
@@ -189,9 +169,9 @@ def _request_loopback_relay_origin() -> str:
 def _request_relay_target_selection() -> DistributedTargetSelection:
     """Return a trusted API v1 relay target selection for desktop bridge work."""
 
-    env_selection = get_api_v1_distributed_target_selection()
-    if env_selection.url:
-        return env_selection
+    target_selection = get_api_v1_distributed_target_selection()
+    if target_selection.url and target_selection.source.startswith("explicit_env:"):
+        return target_selection
 
     loopback_origin = _request_loopback_relay_origin()
     if loopback_origin:
@@ -200,6 +180,9 @@ def _request_relay_target_selection() -> DistributedTargetSelection:
             source="request_override:loopback_same_origin",
             relay_only=True,
         )
+
+    if target_selection.url:
+        return target_selection
 
     raise ComputeProviderError(
         "desktop bridge distributed routing requires a trusted relay origin",

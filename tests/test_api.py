@@ -1760,6 +1760,81 @@ def test_desktop_bridge_relay_base_url_prefers_loopback_host_over_default_config
         assert routes_module._request_relay_base_url() == "http://127.0.0.1:5010"
 
 
+def test_desktop_bridge_production_loopback_preempts_production_default(
+    monkeypatch,
+):
+    """Verified loopback desktop requests must not dispatch to production default."""
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+
+    assert selection.url == "http://127.0.0.1:5010"
+    assert selection.source == "request_override:loopback_same_origin"
+    assert selection.relay_only is True
+
+
+def test_desktop_bridge_loopback_preempts_public_relay_url(
+    monkeypatch,
+):
+    """Public relay URLs are fallbacks for verified local desktop self-dispatch."""
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+
+    assert selection.url == "http://127.0.0.1:5010"
+    assert selection.source == "request_override:loopback_same_origin"
+    assert selection.relay_only is True
+
+
+def test_desktop_bridge_loopback_preempts_configured_relay_url(
+    monkeypatch,
+):
+    """Configured relay URLs remain fallbacks after verified loopback self-dispatch."""
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    import api.v1.compute_provider as compute_provider
+    import api.v1.routes as routes_module
+
+    config_values = {
+        "api.relay_url": "https://relay.example/api/v1/",
+        "relay.server_url": "",
+    }
+    monkeypatch.setattr(
+        compute_provider,
+        "_config_value",
+        lambda key: config_values.get(key, ""),
+    )
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+
+    assert selection.url == "http://127.0.0.1:5010"
+    assert selection.source == "request_override:loopback_same_origin"
+    assert selection.relay_only is True
+
+
 def test_desktop_bridge_relay_base_url_prefers_env_over_loopback_host(
     monkeypatch,
 ):

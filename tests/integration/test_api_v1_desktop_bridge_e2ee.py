@@ -12,6 +12,7 @@ import base64
 import json
 import threading
 import time
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 from urllib.parse import urlparse
 
@@ -309,6 +310,86 @@ def test_api_v1_desktop_bridge_registration_poll_no_work_heartbeat():
         assert poll_payload["message"] == "No requests available"
         assert poll_payload["poll_wait_seconds"] > 0
         assert poll_payload["next_ping_in_x_seconds"] == 0
+
+
+
+def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_request(monkeypatch):
+    """A desktop node that idled after no-work polling should renew before browser work."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.01")
+
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 1
+        server_key = desktop_client.crypto_manager.public_key_b64
+
+        first_no_work = desktop_client.poll_api_v1_encrypted_work()
+        assert first_no_work["message"] == "No requests available"
+        assert server_key in relay.known_servers
+
+        relay.known_servers[server_key]["last_ping"] = datetime.now() - timedelta(seconds=60)
+        desktop_client._api_v1_last_heartbeat_at[base_url] -= 25.0
+
+        renewed_no_work = desktop_client.poll_api_v1_encrypted_work()
+        assert renewed_no_work["message"] == "No requests available"
+        assert server_key in relay.known_servers
+        assert requests.get(f"{base_url}/api/v1/relay/servers/next", timeout=2).status_code == 200
+
+        monkeypatch.setattr(
+            routes,
+            "get_api_v1_compute_provider_for_mode",
+            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
+                base_url=base_url,
+                timeout_seconds=5,
+            ),
+        )
+        browser_crypto = EncryptionManager()
+        user_text = "ping after idle no-work"
+        payload = {
+            "model": "llama-3-8b-instruct",
+            "encrypted": True,
+            "client_public_key": browser_crypto.public_key_b64,
+            "messages": _encrypt_browser_messages(
+                [{"role": "user", "content": user_text}]
+            ),
+            "metadata": {
+                "inference_target": "desktop_bridge_api_v1_e2ee",
+                "relay_path": "api_v1_e2ee",
+            },
+        }
+        response_holder = {}
+
+        def _browser_request():
+            response_holder["response"] = requests.post(
+                f"{base_url}/api/v1/chat/completions", json=payload, timeout=10
+            )
+
+        browser_thread = threading.Thread(target=_browser_request, daemon=True)
+        browser_thread.start()
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            relay_payload = desktop_client.poll_api_v1_encrypted_work()
+            if relay_payload.get("protocol") == "tokenplace_api_v1_relay_e2ee":
+                assert desktop_client.process_client_request(relay_payload) is True
+                break
+            time.sleep(0.02)
+        else:  # pragma: no cover - diagnostic failure path
+            pytest.fail("desktop did not receive queued API v1 E2EE request after idle renewal")
+
+        browser_thread.join(timeout=5)
+
+    response = response_holder.get("response")
+    assert response is not None
+    assert response.status_code == 200, response.text
+    completion = _decrypt_browser_response(browser_crypto, response.json())
+    assert completion["choices"][0]["message"]["content"] == "pong from desktop"
 
 
 @pytest.mark.parametrize("encrypted", [False, True])

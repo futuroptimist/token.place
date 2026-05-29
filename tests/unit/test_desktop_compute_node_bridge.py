@@ -2104,3 +2104,53 @@ def test_run_handles_keyboard_interrupt_from_poll_worker(capsys, monkeypatch):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert events[-1]["type"] == "stopped"
+
+
+def test_stop_requested_persists_after_cancel_message(monkeypatch):
+    _reset_cancel_queue()
+    compute_node_bridge._stop_event.clear()
+    compute_node_bridge._stdin_lines.put(json.dumps({'type': 'cancel'}))
+
+    assert compute_node_bridge.stop_requested() is True
+    assert compute_node_bridge.stop_requested() is True
+
+
+def test_cancelable_poll_worker_does_not_start_new_poll_after_shutdown():
+    worker = compute_node_bridge._CancelablePollWorker()
+    calls = []
+    worker.shutdown()
+
+    result = worker.call(lambda: calls.append('poll'), lambda: False)
+
+    assert result is compute_node_bridge._POLL_CANCELLED
+    assert calls == []
+
+
+def test_run_cancel_during_pre_registration_warm_load_does_not_register(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class CancelDuringWarmRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            calls.append('warm')
+            time.sleep(0.05)
+            return True
+
+        def register_and_poll_once(self):
+            calls.append('register')
+            return {'next_ping_in_x_seconds': 0}
+
+        def stop(self):
+            calls.append('stop')
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=CancelDuringWarmRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '1')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: bool(calls))
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+    assert 'warm' in calls
+    assert 'stop' in calls
+    assert 'register' not in calls
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert events[-1]['type'] == 'stopped'

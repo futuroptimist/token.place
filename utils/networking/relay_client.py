@@ -518,7 +518,8 @@ class RelayClient:
         self.port = port
         self.crypto_manager = crypto_manager
         self.model_manager = model_manager
-        self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
+        self.stop_polling = True  # Flag to control continuous polling loops.
+        self._shutdown_requested = False
         self._registration_token: Optional[str] = None
         configured_servers: List[Any] = []
         self._cluster_only = False
@@ -778,19 +779,30 @@ class RelayClient:
         return {"X-Relay-Server-Token": self._registration_token}
 
     def start(self):
-        """Start the polling loop by setting stop_polling to False"""
+        """Start the polling loop by setting stop_polling to False."""
         self.stop_polling = False
+        self._shutdown_requested = False
 
     def stop(self):
-        """Stop the polling loop by setting stop_polling to True"""
+        """Stop the polling loop and prevent new API v1 register/poll requests."""
         log_info("Stopping relay polling")
         self.stop_polling = True
+        self._shutdown_requested = True
+
+    def _api_v1_stop_result(self) -> Dict[str, Any]:
+        return {
+            'error': 'Relay polling stopped',
+            'stopped': True,
+            'next_ping_in_x_seconds': 0,
+        }
 
     def unregister_from_relay(self) -> bool:
         """Best-effort unregister call for graceful compute-node shutdown."""
 
         last_error: Optional[str] = None
         had_success = False
+        public_key = self.crypto_manager.public_key_b64
+        key_fingerprint = self._api_v1_public_key_fingerprint(public_key)
 
         relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
         self._api_v1_relay_wait_hints = relay_wait_hints
@@ -800,42 +812,58 @@ class RelayClient:
             candidate_url = self._relay_urls[index]
             try:
                 request_kwargs = {
-                    'json': {'server_public_key': self.crypto_manager.public_key_b64},
+                    'json': {'server_public_key': public_key},
                 }
                 headers = self._auth_headers()
                 if headers:
                     request_kwargs['headers'] = headers
 
+                unregister_url = self._build_api_v1_url(candidate_url, '/relay/servers/unregister')
+                log_info(
+                    'server.unregister.attempt relay={} key_fingerprint={}',
+                    _sanitize_relay_target(candidate_url),
+                    key_fingerprint,
+                )
                 response = requests.post(
-                    f'{candidate_url}/unregister',
-                    timeout=self._request_timeout,
+                    unregister_url,
+                    timeout=min(float(self._request_timeout), 5.0),
                     **request_kwargs,
                 )
                 if response.status_code == 200:
                     self._active_relay_index = index
-                    log_info("Unregistered compute node from relay {}", candidate_url)
+                    log_info(
+                        'server.unregister.succeeded relay={} key_fingerprint={}',
+                        _sanitize_relay_target(candidate_url),
+                        key_fingerprint,
+                    )
                     had_success = True
+                    self._api_v1_registered_relays.discard(candidate_url)
+                    self._api_v1_last_heartbeat_at.pop(candidate_url, None)
+                    relay_wait_hints.pop(candidate_url, None)
                     continue
 
                 last_error = f"HTTP {response.status_code}"
                 log_error(
-                    "Failed to unregister compute node from {}: {}",
-                    candidate_url,
+                    "server.unregister.failed relay={} key_fingerprint={} error={}",
+                    _sanitize_relay_target(candidate_url),
+                    key_fingerprint,
                     last_error,
                 )
             except requests.RequestException as exc:
                 last_error = str(exc)
                 log_error(
-                    "Error unregistering compute node from {}: {}",
-                    candidate_url,
+                    "server.unregister.failed relay={} key_fingerprint={} error={}",
+                    _sanitize_relay_target(candidate_url),
+                    key_fingerprint,
                     last_error,
                     exc_info=True,
                 )
             except Exception as exc:  # pragma: no cover - unexpected edge cases
                 last_error = str(exc)
                 log_error(
-                    "Unexpected error unregistering compute node from {}: {}",
-                    candidate_url,
+                    "server.unregister.failed relay={} key_fingerprint={} error={}",
+                    _sanitize_relay_target(candidate_url),
+                    key_fingerprint,
                     last_error,
                     exc_info=True,
                 )
@@ -1127,6 +1155,9 @@ class RelayClient:
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
 
+        if getattr(self, '_shutdown_requested', False):
+            return self._api_v1_stop_result()
+
         last_error: Optional[Dict[str, Any]] = None
         relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
         self._api_v1_relay_wait_hints = relay_wait_hints
@@ -1136,6 +1167,8 @@ class RelayClient:
             candidate_url = self._relay_urls[index]
 
             try:
+                if getattr(self, '_shutdown_requested', False):
+                    return self._api_v1_stop_result()
                 cached_hints = relay_wait_hints.get(candidate_url, {})
                 register_wait = self._normalise_positive_seconds(
                     cached_hints.get('next_ping_in_x_seconds'),
@@ -1168,6 +1201,8 @@ class RelayClient:
                         reregister_reason = "lease_expiry_risk"
 
                 if requires_register:
+                    if getattr(self, '_shutdown_requested', False):
+                        return self._api_v1_stop_result()
                     if reregister_reason and reregister_reason != "not_registered":
                         log_info(
                             "server.reregister reason={} relay={} key_fingerprint={}",
@@ -1222,6 +1257,8 @@ class RelayClient:
                 if headers:
                     request_kwargs['headers'] = headers
 
+                if getattr(self, '_shutdown_requested', False):
+                    return self._api_v1_stop_result()
                 poll_timeout_seconds = float(request_kwargs.pop('timeout'))
                 poll_url = self._build_api_v1_url(candidate_url, "/relay/servers/poll")
                 token_sent = bool(headers)

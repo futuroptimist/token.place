@@ -480,6 +480,46 @@ describe('desktop app start failure handling', () => {
   });
 
 
+  it('invokes backend stop and reflects stopped operator event', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    const stopOperatorButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        warm_load_state: 'ready',
+        last_error: null,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+
+    fireEvent.click(stopOperatorButton);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'stop_compute_node')).toBe(true)
+    );
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        warm_load_state: 'ready',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
+
   it('does not display registered yes while relay runtime is warming', async () => {
     render(<App />);
     await screen.findByText('Start operator');

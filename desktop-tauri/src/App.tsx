@@ -31,6 +31,9 @@ interface ComputeNodeStatus {
   fallback_reason: string | null;
   model_path: string;
   last_error: string | null;
+  warm_load_state: string | null;
+  warm_load_enabled: boolean | null;
+  runtime_path: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -63,6 +66,9 @@ const defaultComputeStatus: ComputeNodeStatus = {
   fallback_reason: null,
   model_path: '',
   last_error: null,
+  warm_load_state: null,
+  warm_load_enabled: null,
+  runtime_path: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -194,6 +200,13 @@ export function App() {
               : typeof payload.message === 'string'
                 ? payload.message
                 : prev.last_error,
+        warm_load_state:
+          typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+        warm_load_enabled:
+          typeof payload.warm_load_enabled === 'boolean'
+            ? payload.warm_load_enabled
+            : prev.warm_load_enabled,
+        runtime_path: typeof payload.runtime_path === 'string' ? payload.runtime_path : prev.runtime_path,
       }));
       if (payload.type === 'started' || payload.type === 'error') {
         setIsStartingComputeNode(false);
@@ -331,6 +344,9 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
+        warm_load_state: 'not_started',
+        warm_load_enabled: true,
+        runtime_path: 'bridge',
       }));
       await invoke('start_compute_node', {
         request: {
@@ -450,7 +466,7 @@ export function App() {
           </button>
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : computeStatus.warm_load_state === 'warming' ? 'warming' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
         <p style={{ marginBottom: 0 }}>Requested mode: <code>{computeStatus.requested_mode || config.preferred_mode}</code></p>
         <p style={{ marginBottom: 0 }}>Effective mode: <code>{computeStatus.effective_mode ?? 'pending'}</code></p>
@@ -458,6 +474,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend selected: <code>{computeStatus.backend_selected ?? 'pending'}</code></p>
         <p style={{ marginBottom: 0 }}>Backend used: <code>{computeStatus.backend_used ?? 'pending'}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime readiness: <code>{computeStatus.warm_load_state ?? 'pending'}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{computeStatus.runtime_path ?? 'bridge'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
       </section>

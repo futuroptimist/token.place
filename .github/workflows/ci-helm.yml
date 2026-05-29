@@ -57,11 +57,30 @@ jobs:
           grep -n "strategy:" -A4 /tmp/tokenplace-render.yaml
           grep -n "type: Recreate" /tmp/tokenplace-render.yaml
           grep -n "name: RELAY_WORKERS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "1"'
+          grep -n "name: RELAY_THREADS" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "4"'
+          grep -n "name: TOKENPLACE_RELAY_INTERNAL_URL" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "http://127.0.0.1:$(RELAY_PORT)"'
+          ! grep -n "name: TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" /tmp/tokenplace-render.yaml
+          ! grep -n "name: TOKENPLACE_DISTRIBUTED_COMPUTE_URL" /tmp/tokenplace-render.yaml
+          grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "https://staging.token.place"'
+          ! grep -n 'value: "https://token.place"' /tmp/tokenplace-render.yaml
           grep -n "name: XDG_CONFIG_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.config"'
           grep -n "name: XDG_DATA_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/share"'
           grep -n "name: XDG_CACHE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.cache"'
           grep -n "name: XDG_STATE_HOME" -A2 /tmp/tokenplace-render.yaml | grep -n 'value: "/tmp/.local/state"'
           ! grep -n "rollingUpdate:" /tmp/tokenplace-render.yaml
+
+      - name: Template relay port override smoke render
+        run: |
+          helm template tokenplace charts/tokenplace \
+            --namespace tokenplace \
+            --set env.RELAY_PORT=6000 \
+            --set ingress.enabled=true \
+            --set ingress.host=staging.token.place \
+            --set ingress.tls.enabled=true \
+            --set ingress.tls.secretName=tokenplace-staging-tls \
+            --set image.tag=main-deadbee > /tmp/tokenplace-render-port.yaml
+
+          grep -n -E '127\.0\.0\.1:(6000|\$\(RELAY_PORT\))' /tmp/tokenplace-render-port.yaml
 
       - name: Install Python dependency for duplicate-env check
         run: pip3 install PyYAML
@@ -105,6 +124,11 @@ jobs:
           assert not dupes, dupes
           values = {item["name"]: item.get("value") for item in env}
           assert values["FOO"] == "bar"
+          assert values["RELAY_WORKERS"] == "1"
+          assert int(values["RELAY_THREADS"]) > 1
+          assert values["TOKENPLACE_RELAY_INTERNAL_URL"] == "http://127.0.0.1:$(RELAY_PORT)"
+          assert "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" not in values
+          assert "TOKENPLACE_DISTRIBUTED_COMPUTE_URL" not in values
           assert values["XDG_CONFIG_HOME"] == "/tmp/.config"
           assert values["XDG_DATA_HOME"] == "/tmp/.local/share"
           assert values["XDG_CACHE_HOME"] == "/tmp/.cache"

@@ -15,9 +15,16 @@ The relay is **operationally stateful today** because registrations, queued clie
 replies are held in process memory. Current operating model:
 
 - one pod
-- one Gunicorn worker
+- one Gunicorn worker process (`RELAY_WORKERS=1`)
+- multiple Gunicorn threads (`RELAY_THREADS=4` by default)
 - one replica
 - accepted state loss if the pod restarts or is replaced
+
+The single worker process is intentional: relay registrations and queues are in memory, so multiple
+worker processes would split state. The thread count is also intentional: browser/API chat can
+self-dispatch to the relay over loopback while compute-node long polls and Kubernetes probes are
+active, so the one process needs enough threads for the outer chat request plus internal relay API
+calls and health/readiness traffic.
 
 Multi-replica + shared state (Redis or similar) is explicitly future work and out of scope for
 this phase.
@@ -44,6 +51,45 @@ operator workflow.
 - Production default: `https://token.place`
 
 Operators can override hostnames in Sugarkube values and Cloudflare route configuration.
+
+## Public URL vs. internal distributed relay target
+
+Relay-only Kubernetes deployments use two different relay URLs:
+
+- **Public relay URL**: the browser/desktop-facing HTTPS origin, for example
+  `https://staging.token.place` or `https://token.place`. The chart derives
+  `TOKENPLACE_RELAY_PUBLIC_URL=https://<ingress.host>` when ingress is enabled.
+- **Internal distributed relay target**: the same-pod self-dispatch URL used when API v1 browser
+  chat forces the desktop-bridge E2EE route. The chart defaults
+  `TOKENPLACE_RELAY_INTERNAL_URL` to `http://127.0.0.1:$(RELAY_PORT)` so the target follows the
+  effective relay port while staging/prod avoid accidentally routing forced desktop-bridge
+  requests through a production-like public default.
+
+Target precedence is deliberately split between operator overrides, same-pod dispatch, and
+public/config fallbacks:
+
+1. `explicit_env:*` from `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL`,
+   `TOKENPLACE_DISTRIBUTED_RELAY_URL`, or `TOKENPLACE_DISTRIBUTED_COMPUTE_URL`. Use these only
+   when an operator deliberately wants to dispatch API v1 distributed work to a specific external
+   relay/compute target; forced desktop-bridge routing also lets these explicit overrides beat
+   verified loopback same-origin routing.
+2. `relay_internal_env:*` from `TOKENPLACE_RELAY_INTERNAL_URL`,
+   `TOKEN_PLACE_RELAY_INTERNAL_URL`, or `RELAY_INTERNAL_URL`. Helm uses this class for safe
+   relay-only self-dispatch diagnostics (`relay_only=True`).
+3. `relay_public_env:*` from `TOKENPLACE_RELAY_PUBLIC_URL`, `TOKEN_PLACE_RELAY_PUBLIC_URL`, or
+   `RELAY_PUBLIC_URL`. This is a public HTTPS relay fallback for non-loopback requests.
+4. `config:*` from non-default `api.relay_url` or `relay.server_url` values.
+5. `production_default` (`https://token.place`) only when `TOKEN_PLACE_ENV=production`.
+6. `unset` in non-production when no trusted relay target is configured.
+
+For forced desktop-bridge request routing, `request_override:loopback_same_origin` is inserted
+after `explicit_env:*` and before `relay_internal_env:*`, `relay_public_env:*`, `config:*`, and
+`production_default`. That keeps verified local desktop/browser sessions on their same-origin
+local relay unless an operator deliberately set an explicit distributed target override.
+
+Otherwise leave the chart defaults in place; staging should not require a manual Helm override for
+`TOKENPLACE_RELAY_INTERNAL_URL`, `TOKENPLACE_DISTRIBUTED_COMPUTE_URL`,
+`TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL`, or `RELAY_THREADS`.
 
 
 ## Ingress TLS expectations for staging/prod
@@ -92,6 +138,9 @@ helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version
 grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
 grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
 grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
+grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A1 /tmp/tokenplace-staging-render.yaml
+grep -n "name: TOKENPLACE_RELAY_INTERNAL_URL" -A1 /tmp/tokenplace-staging-render.yaml
+grep -n "name: RELAY_THREADS" -A1 /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
@@ -107,6 +156,9 @@ helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version
 grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
 grep -n "token.place" /tmp/tokenplace-prod-render.yaml
 grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
+grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A1 /tmp/tokenplace-prod-render.yaml
+grep -n "name: TOKENPLACE_RELAY_INTERNAL_URL" -A1 /tmp/tokenplace-prod-render.yaml
+grep -n "name: RELAY_THREADS" -A1 /tmp/tokenplace-prod-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez

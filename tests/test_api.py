@@ -231,11 +231,65 @@ def _clear_distributed_target_env(monkeypatch):
         "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
         "TOKENPLACE_DISTRIBUTED_RELAY_URL",
         "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
         "TOKENPLACE_RELAY_PUBLIC_URL",
         "TOKEN_PLACE_RELAY_PUBLIC_URL",
         "RELAY_PUBLIC_URL",
     ):
         monkeypatch.delenv(env_name, raising=False)
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    (
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
+    ),
+)
+def test_api_v1_distributed_provider_uses_internal_relay_url(env_name, monkeypatch, caplog):
+    import api.v1.compute_provider as compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv(env_name, "http://127.0.0.1:5010")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+        provider = compute_provider.get_api_v1_compute_provider()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "http://127.0.0.1:5010"
+    assert "target=http://127.0.0.1:5010" in caplog.text
+    assert f"target_source=relay_internal_env:{env_name}" in caplog.text
+    assert "relay_only=True" in caplog.text
+
+
+def test_api_v1_distributed_provider_prefers_explicit_target_over_internal_url(
+    monkeypatch, caplog
+):
+    import api.v1.compute_provider as compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", "https://relay.example")
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+        provider = compute_provider.get_api_v1_compute_provider()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "https://relay.example"
+    assert "target_source=explicit_env:TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" in caplog.text
+    assert "relay_only=False" in caplog.text
 
 
 def test_api_v1_distributed_provider_uses_staging_relay_public_url(monkeypatch, caplog):
@@ -255,8 +309,75 @@ def test_api_v1_distributed_provider_uses_staging_relay_public_url(monkeypatch, 
     assert provider.base_url == "https://staging.token.place"
     assert provider.base_url != "https://token.place"
     assert "target=https://staging.token.place" in caplog.text
-    assert "target_source=env:TOKENPLACE_RELAY_PUBLIC_URL" in caplog.text
+    assert "target_source=relay_public_env:TOKENPLACE_RELAY_PUBLIC_URL" in caplog.text
     assert "relay_only=True" in caplog.text
+
+
+def test_desktop_bridge_staging_forced_route_uses_unified_relay_public_selection(
+    monkeypatch, caplog
+):
+    import api.v1.compute_provider as compute_provider
+    import api.v1.routes as routes_module
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://staging.token.place",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+        assert selection.url == "https://staging.token.place"
+        assert selection.url != "https://token.place"
+        assert selection.source == "relay_public_env:TOKENPLACE_RELAY_PUBLIC_URL"
+        with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+            provider = compute_provider.get_api_v1_compute_provider_for_mode(
+                mode="distributed",
+                distributed_target_selection=selection,
+                distributed_fallback_enabled=False,
+            )
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "https://staging.token.place"
+    assert "target=https://staging.token.place" in caplog.text
+    assert "target_source=relay_public_env:TOKENPLACE_RELAY_PUBLIC_URL" in caplog.text
+    assert "target_source=request_override" not in caplog.text
+
+
+def test_desktop_bridge_production_prefers_internal_self_dispatch_over_public(
+    monkeypatch, caplog
+):
+    import api.v1.compute_provider as compute_provider
+    import api.v1.routes as routes_module
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://token.place")
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="https://token.place",
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+        assert selection.url == "http://127.0.0.1:5010"
+        assert selection.source == "relay_internal_env:TOKENPLACE_RELAY_INTERNAL_URL"
+        with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+            provider = compute_provider.get_api_v1_compute_provider_for_mode(
+                mode="distributed",
+                distributed_target_selection=selection,
+                distributed_fallback_enabled=False,
+            )
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "http://127.0.0.1:5010"
+    assert "target=http://127.0.0.1:5010" in caplog.text
+    assert "target_source=relay_internal_env:TOKENPLACE_RELAY_INTERNAL_URL" in caplog.text
 
 
 def test_api_v1_distributed_provider_production_uses_default_target(monkeypatch, caplog):
@@ -1485,14 +1606,9 @@ def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_uns
 ):
     """Explicit desktop API v1 E2EE metadata may use loopback same-origin locally."""
 
-    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
     import api.v1.routes as routes_module
-
-    class EmptyConfig:
-        def get(self, _key, default=None):
-            return default
-
-    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
 
     captured = {}
 
@@ -1545,11 +1661,12 @@ def test_desktop_bridge_metadata_routes_to_same_origin_api_v1_relay_when_env_uns
     )
 
     assert response.status_code == 200
-    assert captured["provider_kwargs"] == {
-        "mode": "distributed",
-        "distributed_url": "http://127.0.0.1:5010",
-        "distributed_fallback_enabled": False,
-    }
+    assert captured["provider_kwargs"]["mode"] == "distributed"
+    assert captured["provider_kwargs"]["distributed_fallback_enabled"] is False
+    target_selection = captured["provider_kwargs"]["distributed_target_selection"]
+    assert target_selection.url == "http://127.0.0.1:5010"
+    assert target_selection.source == "request_override:loopback_same_origin"
+    assert target_selection.relay_only is True
     assert captured["messages"] == [{"role": "user", "content": "hello desktop"}]
     assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
     assert response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"] == "distributed_relay_e2ee"
@@ -1606,19 +1723,19 @@ def test_desktop_bridge_relay_base_url_preserves_config_api_v1_base_for_untruste
 ):
     """Path-scoped trusted config relay URLs must not be ignored for forged hosts."""
 
-    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    import api.v1.compute_provider as compute_provider
     import api.v1.routes as routes_module
 
-    class FakeConfig:
-        def get(self, key, default=None):
-            values = {
-                "relay.server_url": "https://relay.example/api/v1/",
-                "api.relay_url": "",
-                "relay.server_pool": [],
-            }
-            return values.get(key, default)
-
-    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+    config_values = {
+        "relay.server_url": "https://relay.example/api/v1/",
+        "api.relay_url": "",
+    }
+    monkeypatch.setattr(
+        compute_provider,
+        "_config_value",
+        lambda key: config_values.get(key, ""),
+    )
 
     with app.test_request_context(
         "/api/v1/chat/completions",
@@ -1633,15 +1750,10 @@ def test_desktop_bridge_relay_base_url_allows_ipv6_loopback_same_origin_only_fro
 ):
     """Bracketed IPv6 localhost fallback is limited to loopback clients."""
 
-    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
     import api.v1.routes as routes_module
     from api.v1.compute_provider import ComputeProviderError
-
-    class EmptyConfig:
-        def get(self, _key, default=None):
-            return default
-
-    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
 
     with app.test_request_context(
         "/api/v1/chat/completions",
@@ -1666,26 +1778,20 @@ def test_desktop_bridge_relay_base_url_uses_configured_origin_for_untrusted_host
 ):
     """Forged Host headers must not control outbound desktop relay routing."""
 
-    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
     import api.v1.routes as routes_module
-
-    class FakeConfig:
-        def get(self, key, default=None):
-            values = {
-                "relay.server_url": "https://token.place/",
-                "api.relay_url": "",
-                "relay.server_pool": ["https://token.place/"],
-            }
-            return values.get(key, default)
-
-    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
+    from api.v1.compute_provider import ComputeProviderError
 
     with app.test_request_context(
         "/api/v1/chat/completions",
         base_url="https://attacker.example",
         environ_base={"REMOTE_ADDR": "203.0.113.10"},
     ):
-        assert routes_module._request_relay_base_url() == "https://token.place"
+        with pytest.raises(ComputeProviderError) as exc_info:
+            routes_module._request_relay_base_url()
+
+    assert exc_info.value.code == "untrusted_relay_origin"
 
 
 def test_desktop_bridge_relay_base_url_prefers_loopback_host_over_default_config(
@@ -1693,19 +1799,9 @@ def test_desktop_bridge_relay_base_url_prefers_loopback_host_over_default_config
 ):
     """Verified loopback desktop requests stay on their same-origin local relay."""
 
-    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
     import api.v1.routes as routes_module
-
-    class FakeConfig:
-        def get(self, key, default=None):
-            values = {
-                "relay.server_url": "https://token.place/",
-                "api.relay_url": "",
-                "relay.server_pool": [],
-            }
-            return values.get(key, default)
-
-    monkeypatch.setattr(routes_module, "get_config", lambda: FakeConfig())
 
     with app.test_request_context(
         "/api/v1/chat/completions",
@@ -1713,6 +1809,81 @@ def test_desktop_bridge_relay_base_url_prefers_loopback_host_over_default_config
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     ):
         assert routes_module._request_relay_base_url() == "http://127.0.0.1:5010"
+
+
+def test_desktop_bridge_production_loopback_preempts_production_default(
+    monkeypatch,
+):
+    """Verified loopback desktop requests must not dispatch to production default."""
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+
+    assert selection.url == "http://127.0.0.1:5010"
+    assert selection.source == "request_override:loopback_same_origin"
+    assert selection.relay_only is True
+
+
+def test_desktop_bridge_loopback_preempts_public_relay_url(
+    monkeypatch,
+):
+    """Public relay URLs are fallbacks for verified local desktop self-dispatch."""
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    import api.v1.routes as routes_module
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+
+    assert selection.url == "http://127.0.0.1:5010"
+    assert selection.source == "request_override:loopback_same_origin"
+    assert selection.relay_only is True
+
+
+def test_desktop_bridge_loopback_preempts_configured_relay_url(
+    monkeypatch,
+):
+    """Configured relay URLs remain fallbacks after verified loopback self-dispatch."""
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    import api.v1.compute_provider as compute_provider
+    import api.v1.routes as routes_module
+
+    config_values = {
+        "api.relay_url": "https://relay.example/api/v1/",
+        "relay.server_url": "",
+    }
+    monkeypatch.setattr(
+        compute_provider,
+        "_config_value",
+        lambda key: config_values.get(key, ""),
+    )
+
+    with app.test_request_context(
+        "/api/v1/chat/completions",
+        base_url="http://127.0.0.1:5010",
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        selection = routes_module._request_relay_target_selection()
+
+    assert selection.url == "http://127.0.0.1:5010"
+    assert selection.source == "request_override:loopback_same_origin"
+    assert selection.relay_only is True
 
 
 def test_desktop_bridge_relay_base_url_prefers_env_over_loopback_host(
@@ -1736,15 +1907,10 @@ def test_desktop_bridge_relay_base_url_fails_closed_without_trusted_origin(
 ):
     """Desktop distributed override must fail closed when no trusted relay exists."""
 
-    monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
     import api.v1.routes as routes_module
     from api.v1.compute_provider import ComputeProviderError
-
-    class EmptyConfig:
-        def get(self, _key, default=None):
-            return default
-
-    monkeypatch.setattr(routes_module, "get_config", lambda: EmptyConfig())
 
     with app.test_request_context(
         "/api/v1/chat/completions",

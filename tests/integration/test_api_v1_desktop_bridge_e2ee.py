@@ -180,6 +180,7 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     """Browser-shaped encrypted API v1 chat completes via relay-blind desktop bridge."""
 
     observed_posts = []
+    observed_retrieve_statuses = []
     real_request = requests.sessions.Session.request
     real_relay_post = relay_client_module.requests.post
 
@@ -187,12 +188,15 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
         path = urlparse(url).path
         if any(fragment in path for fragment in LEGACY_ROUTE_FRAGMENTS):
             raise AssertionError(f"legacy/API v2 route used in API v1 bridge: {path}")
+        response = real_request(self, method, url, **kwargs)
         if method.upper() == "POST" and path in {
             "/api/v1/relay/requests",
             "/api/v1/relay/responses",
         }:
             observed_posts.append((path, kwargs.get("json")))
-        return real_request(self, method, url, **kwargs)
+        if method.upper() == "POST" and path == "/api/v1/relay/responses/retrieve":
+            observed_retrieve_statuses.append(response.status_code)
+        return response
 
     def guard_relay_client_post(url, *args, **kwargs):
         path = urlparse(url).path
@@ -268,10 +272,64 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     ]
     assert len(request_posts) == 1
     assert len(response_posts) == 1
+    assert 200 in observed_retrieve_statuses
+    assert response.status_code != 504
     _assert_ciphertext_only(request_posts[0], forbidden_text=user_text)
     _assert_ciphertext_only(request_posts[0], forbidden_text="pong from desktop")
     _assert_ciphertext_only(response_posts[0], forbidden_text=user_text)
     _assert_ciphertext_only(response_posts[0], forbidden_text="pong from desktop")
+
+
+def test_api_v1_chat_times_out_without_desktop_response_post(monkeypatch):
+    """Repeated relay response 202s without a desktop post must not look successful."""
+
+    with live_relay_server() as base_url:
+        monkeypatch.setattr(
+            routes,
+            "get_api_v1_compute_provider_for_mode",
+            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
+                base_url=base_url,
+                timeout_seconds=0.25,
+            ),
+        )
+
+        idle_desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        register = idle_desktop_client.register_api_v1_compute_node(base_url)
+        assert register["next_ping_in_x_seconds"] > 0
+
+        browser_crypto = EncryptionManager()
+        payload = {
+            "model": "llama-3-8b-instruct",
+            "encrypted": True,
+            "client_public_key": browser_crypto.public_key_b64,
+            "messages": _encrypt_browser_messages(
+                [{"role": "user", "content": "ping that no desktop answers"}]
+            ),
+            "metadata": {
+                "inference_target": "desktop_bridge_api_v1_e2ee",
+                "relay_path": "api_v1_e2ee",
+            },
+        }
+
+        response = requests.post(
+            f"{base_url}/api/v1/chat/completions",
+            json=payload,
+            timeout=5,
+        )
+
+    assert response.status_code == 504
+    body = response.json()
+    assert body["error"]["code"] in {
+        "distributed_compute_timeout",
+        "compute_timeout",
+        "compute_node_timeout",
+    }
 
 
 def test_api_v1_stream_true_fails_before_relay_queue():

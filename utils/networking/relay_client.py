@@ -1353,6 +1353,53 @@ class RelayClient:
             "api_v1_response": api_v1_response,
         }
 
+    def submit_api_v1_error_response(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """Encrypt and submit an API v1 error for work that cannot be processed."""
+
+        if not isinstance(request_data, dict):
+            log_error("Cannot submit API v1 error response: request payload is not an object")
+            return False
+        request_id = request_data.get("request_id")
+        if not isinstance(request_id, str) or not request_id.strip():
+            log_error("Cannot submit API v1 error response: missing request_id")
+            return False
+        client_pub_key_b64 = _normalize_client_public_key_b64(
+            request_data.get("client_public_key")
+        )
+        if client_pub_key_b64 is None:
+            log_error(
+                "Cannot submit API v1 error response request_id={}: invalid client_public_key",
+                request_id,
+            )
+            return False
+        try:
+            client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
+        except (AttributeError, binascii.Error, ValueError):
+            log_error(
+                "Cannot submit API v1 error response request_id={}: invalid client_public_key encoding",
+                request_id,
+            )
+            return False
+
+        response_envelope = self._api_v1_response_envelope(
+            request_id,
+            error={
+                "code": code,
+                "message": message,
+            },
+        )
+        return self._post_api_v1_response(
+            response_envelope,
+            client_pub_key_b64=client_pub_key_b64,
+            client_pub_key=client_pub_key,
+        )
+
     def _post_api_v1_response(
         self,
         response_envelope: Dict[str, Any],

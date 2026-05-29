@@ -37,7 +37,14 @@ class FakeModelManager:
 class FakeRelayClient:
     relay_url = 'https://token.place'
 
+    def __init__(self):
+        self.error_responses = []
+
     def api_v1_registration_fresh(self, _relay_url=None):
+        return True
+
+    def submit_api_v1_error_response(self, payload, *, code, message):
+        self.error_responses.append((payload, code, message))
         return True
 
 
@@ -48,6 +55,7 @@ class StaleRelayClient(FakeRelayClient):
 
 class FakeRelayClientRouting(FakeRelayClient):
     def __init__(self):
+        super().__init__()
         self.endpoint_calls = []
 
     def process_client_request(self, payload):
@@ -92,6 +100,11 @@ class FakeRuntime:
     def process_relay_request(self, payload):
         self._processed.append(payload)
         return True
+
+    def submit_api_v1_error_response(self, payload, *, code, message):
+        return self.relay_client.submit_api_v1_error_response(
+            payload, code=code, message=message
+        )
 
     def stop(self):
         return None
@@ -1591,11 +1604,17 @@ def test_run_api_v1_payload_not_dropped_when_warm_not_started(capsys, monkeypatc
     assert "runtime_path=bridge" in output.err
 
 
-def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monkeypatch):
+def test_run_first_api_v1_payload_posts_error_when_warm_load_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     calls = []
 
     class ApiPayloadWarmFailRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            ApiPayloadWarmFailRuntime.last_instance = self
+
         def ensure_api_v1_runtime_ready(self):
             calls.append("warm")
             return False
@@ -1618,14 +1637,92 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=ApiPayloadWarmFailRuntime)
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: bool(
+            ApiPayloadWarmFailRuntime.last_instance
+            and ApiPayloadWarmFailRuntime.last_instance.relay_client.error_responses
+        ),
+    )
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
-    assert status == 1
+    assert status == 0
     assert calls == ["warm"]
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
-    error_event = next(event for event in events if event.get("type") == "error")
-    assert error_event["warm_load_state"] == "failed"
+    runtime = ApiPayloadWarmFailRuntime.last_instance
+    assert runtime is not None
+    assert len(runtime.relay_client.error_responses) == 1
+    payload, code, message = runtime.relay_client.error_responses[0]
+    assert payload["request_id"] == "req-bridge-fail-1"
+    assert code == "compute_node_runtime_not_ready"
+    assert "not ready" in message
+    output = capsys.readouterr()
+    assert "desktop.compute_node_bridge.model_init.wait_result" in output.err
+    assert "runtime_not_ready_response request_id=req-bridge-fail-1" in output.err
+    assert "submitted=True" in output.err
 
+
+
+def test_run_api_v1_payload_posts_error_when_warm_load_times_out(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class ApiPayloadWarmTimeoutRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            ApiPayloadWarmTimeoutRuntime.last_instance = self
+
+        def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
+            time.sleep(0.25)
+            return True
+
+        def register_and_poll_once(self):
+            return {
+                "protocol": "tokenplace_api_v1_relay_e2ee",
+                "version": 1,
+                "request_id": "req-bridge-timeout-1",
+                "client_public_key": "abc",
+                "chat_history": "ciphertext",
+                "cipherkey": "key",
+                "iv": "iv",
+                "next_ping_in_x_seconds": 0,
+            }
+
+        def process_relay_request(self, _payload):
+            calls.append("process")
+            return True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiPayloadWarmTimeoutRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_READY_WAIT_SECONDS", "0.01")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: bool(
+            ApiPayloadWarmTimeoutRuntime.last_instance
+            and ApiPayloadWarmTimeoutRuntime.last_instance.relay_client.error_responses
+        ),
+    )
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert calls == ["warm"]
+    runtime = ApiPayloadWarmTimeoutRuntime.last_instance
+    assert runtime is not None
+    assert len(runtime.relay_client.error_responses) == 1
+    payload, code, _message = runtime.relay_client.error_responses[0]
+    assert payload["request_id"] == "req-bridge-timeout-1"
+    assert code == "compute_node_runtime_not_ready"
+    output = capsys.readouterr()
+    assert "request_id=req-bridge-timeout-1" in output.err
+    assert "timed_out=True" in output.err
+    assert "runtime_not_ready_response request_id=req-bridge-timeout-1" in output.err
+    assert "desktop.compute_node_bridge.process_request request_id=req-bridge-timeout-1" not in output.err
 
 def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     _reset_cancel_queue()

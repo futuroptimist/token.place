@@ -1957,6 +1957,48 @@ class TestRelayClient:
             'https://relay-that-polled.example/api/v1/relay/responses'
         )
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_submit_api_v1_error_response_posts_encrypted_error_without_decrypting_payload(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        """Bridge warm-load failures can be answered as encrypted API v1 errors."""
+
+        request_data = TEST_VALID_RESPONSE.copy()
+        request_data.update({
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-runtime-not-ready",
+        })
+        relay_client._last_api_v1_work_relay_url = "https://relay-that-polled.example"
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        assert relay_client.submit_api_v1_error_response(
+            request_data,
+            code="compute_node_runtime_not_ready",
+            message="Desktop runtime was not ready",
+        ) is True
+
+        mock_crypto_manager.decrypt_message.assert_not_called()
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["request_id"] == "req-runtime-not-ready"
+        assert encrypted_envelope["api_v1_response"]["error"] == {
+            "code": "compute_node_runtime_not_ready",
+            "message": "Desktop runtime was not ready",
+        }
+        assert mock_post.call_args.args[0] == (
+            "https://relay-that-polled.example/api/v1/relay/responses"
+        )
+        relay_visible_payload = mock_post.call_args.kwargs["json"]
+        assert relay_visible_payload["request_id"] == "req-runtime-not-ready"
+        assert relay_visible_payload["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert relay_visible_payload["version"] == 1
+
     @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_e2ee_rejects_mismatched_bound_key(
         self,

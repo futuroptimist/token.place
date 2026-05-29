@@ -231,11 +231,65 @@ def _clear_distributed_target_env(monkeypatch):
         "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
         "TOKENPLACE_DISTRIBUTED_RELAY_URL",
         "TOKENPLACE_DISTRIBUTED_COMPUTE_URL",
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
         "TOKENPLACE_RELAY_PUBLIC_URL",
         "TOKEN_PLACE_RELAY_PUBLIC_URL",
         "RELAY_PUBLIC_URL",
     ):
         monkeypatch.delenv(env_name, raising=False)
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    (
+        "TOKENPLACE_RELAY_INTERNAL_URL",
+        "TOKEN_PLACE_RELAY_INTERNAL_URL",
+        "RELAY_INTERNAL_URL",
+    ),
+)
+def test_api_v1_distributed_provider_uses_internal_relay_url(env_name, monkeypatch, caplog):
+    import api.v1.compute_provider as compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv(env_name, "http://127.0.0.1:5010")
+    monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+        provider = compute_provider.get_api_v1_compute_provider()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "http://127.0.0.1:5010"
+    assert "target=http://127.0.0.1:5010" in caplog.text
+    assert f"target_source=relay_internal_env:{env_name}" in caplog.text
+    assert "relay_only=True" in caplog.text
+
+
+def test_api_v1_distributed_provider_prefers_explicit_target_over_internal_url(
+    monkeypatch, caplog
+):
+    import api.v1.compute_provider as compute_provider
+
+    _clear_distributed_target_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "staging")
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", "https://relay.example")
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+
+    with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
+        provider = compute_provider.get_api_v1_compute_provider()
+
+    assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    assert provider.base_url == "https://relay.example"
+    assert "target_source=explicit_env:TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" in caplog.text
+    assert "relay_only=False" in caplog.text
 
 
 def test_api_v1_distributed_provider_uses_staging_relay_public_url(monkeypatch, caplog):
@@ -293,7 +347,7 @@ def test_desktop_bridge_staging_forced_route_uses_unified_relay_public_selection
     assert "target_source=request_override" not in caplog.text
 
 
-def test_desktop_bridge_production_prefers_explicit_internal_self_dispatch_over_public(
+def test_desktop_bridge_production_prefers_internal_self_dispatch_over_public(
     monkeypatch, caplog
 ):
     import api.v1.compute_provider as compute_provider
@@ -302,10 +356,7 @@ def test_desktop_bridge_production_prefers_explicit_internal_self_dispatch_over_
     _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://token.place")
-    monkeypatch.setenv(
-        "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL",
-        "http://127.0.0.1:5010",
-    )
+    monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
     compute_provider._build_api_v1_compute_provider.cache_clear()
 
     with app.test_request_context(
@@ -315,7 +366,7 @@ def test_desktop_bridge_production_prefers_explicit_internal_self_dispatch_over_
     ):
         selection = routes_module._request_relay_target_selection()
         assert selection.url == "http://127.0.0.1:5010"
-        assert selection.source == "explicit_env:TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL"
+        assert selection.source == "relay_internal_env:TOKENPLACE_RELAY_INTERNAL_URL"
         with caplog.at_level(logging.INFO, logger="api.v1.compute_provider"):
             provider = compute_provider.get_api_v1_compute_provider_for_mode(
                 mode="distributed",
@@ -326,7 +377,7 @@ def test_desktop_bridge_production_prefers_explicit_internal_self_dispatch_over_
     assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
     assert provider.base_url == "http://127.0.0.1:5010"
     assert "target=http://127.0.0.1:5010" in caplog.text
-    assert "target_source=explicit_env:TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" in caplog.text
+    assert "target_source=relay_internal_env:TOKENPLACE_RELAY_INTERNAL_URL" in caplog.text
 
 
 def test_api_v1_distributed_provider_production_uses_default_target(monkeypatch, caplog):

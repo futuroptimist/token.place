@@ -60,14 +60,35 @@ Relay-only Kubernetes deployments use two different relay URLs:
   `https://staging.token.place` or `https://token.place`. The chart derives
   `TOKENPLACE_RELAY_PUBLIC_URL=https://<ingress.host>` when ingress is enabled.
 - **Internal distributed relay target**: the same-pod self-dispatch URL used when API v1 browser
-  chat forces the desktop-bridge E2EE route. The chart defaults both
-  `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL` and `TOKENPLACE_DISTRIBUTED_COMPUTE_URL` to
-  `http://127.0.0.1:5010` (using the configured relay port) so staging/prod do not accidentally
-  route forced desktop-bridge requests through a production-like public default.
+  chat forces the desktop-bridge E2EE route. The chart defaults
+  `TOKENPLACE_RELAY_INTERNAL_URL` to `http://127.0.0.1:$(RELAY_PORT)` so the target follows the
+  effective relay port while staging/prod avoid accidentally routing forced desktop-bridge
+  requests through a production-like public default.
 
-If an operator deliberately wants to dispatch to an external relay, override the explicit
-distributed target env vars. Otherwise leave the defaults in place; staging should not require a
-manual Helm override for `TOKENPLACE_DISTRIBUTED_COMPUTE_URL`,
+Target precedence is deliberately split between operator overrides, same-pod dispatch, and
+public/config fallbacks:
+
+1. `explicit_env:*` from `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL`,
+   `TOKENPLACE_DISTRIBUTED_RELAY_URL`, or `TOKENPLACE_DISTRIBUTED_COMPUTE_URL`. Use these only
+   when an operator deliberately wants to dispatch API v1 distributed work to a specific external
+   relay/compute target; forced desktop-bridge routing also lets these explicit overrides beat
+   verified loopback same-origin routing.
+2. `relay_internal_env:*` from `TOKENPLACE_RELAY_INTERNAL_URL`,
+   `TOKEN_PLACE_RELAY_INTERNAL_URL`, or `RELAY_INTERNAL_URL`. Helm uses this class for safe
+   relay-only self-dispatch diagnostics (`relay_only=True`).
+3. `relay_public_env:*` from `TOKENPLACE_RELAY_PUBLIC_URL`, `TOKEN_PLACE_RELAY_PUBLIC_URL`, or
+   `RELAY_PUBLIC_URL`. This is a public HTTPS relay fallback for non-loopback requests.
+4. `config:*` from non-default `api.relay_url` or `relay.server_url` values.
+5. `production_default` (`https://token.place`) only when `TOKEN_PLACE_ENV=production`.
+6. `unset` in non-production when no trusted relay target is configured.
+
+For forced desktop-bridge request routing, `request_override:loopback_same_origin` is inserted
+after `explicit_env:*` and before `relay_internal_env:*`, `relay_public_env:*`, `config:*`, and
+`production_default`. That keeps verified local desktop/browser sessions on their same-origin
+local relay unless an operator deliberately set an explicit distributed target override.
+
+Otherwise leave the chart defaults in place; staging should not require a manual Helm override for
+`TOKENPLACE_RELAY_INTERNAL_URL`, `TOKENPLACE_DISTRIBUTED_COMPUTE_URL`,
 `TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL`, or `RELAY_THREADS`.
 
 
@@ -118,8 +139,7 @@ grep -n "tls:" -A6 /tmp/tokenplace-staging-render.yaml
 grep -n "staging.token.place" /tmp/tokenplace-staging-render.yaml
 grep -n "tokenplace-staging-tls" /tmp/tokenplace-staging-render.yaml
 grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A1 /tmp/tokenplace-staging-render.yaml
-grep -n "name: TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" -A1 /tmp/tokenplace-staging-render.yaml
-grep -n "name: TOKENPLACE_DISTRIBUTED_COMPUTE_URL" -A1 /tmp/tokenplace-staging-render.yaml
+grep -n "name: TOKENPLACE_RELAY_INTERNAL_URL" -A1 /tmp/tokenplace-staging-render.yaml
 grep -n "name: RELAY_THREADS" -A1 /tmp/tokenplace-staging-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://staging.token.place/
@@ -137,8 +157,7 @@ grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
 grep -n "token.place" /tmp/tokenplace-prod-render.yaml
 grep -n "tokenplace-prod-tls" /tmp/tokenplace-prod-render.yaml
 grep -n "name: TOKENPLACE_RELAY_PUBLIC_URL" -A1 /tmp/tokenplace-prod-render.yaml
-grep -n "name: TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL" -A1 /tmp/tokenplace-prod-render.yaml
-grep -n "name: TOKENPLACE_DISTRIBUTED_COMPUTE_URL" -A1 /tmp/tokenplace-prod-render.yaml
+grep -n "name: TOKENPLACE_RELAY_INTERNAL_URL" -A1 /tmp/tokenplace-prod-render.yaml
 grep -n "name: RELAY_THREADS" -A1 /tmp/tokenplace-prod-render.yaml
 kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/

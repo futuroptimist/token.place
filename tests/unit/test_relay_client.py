@@ -1338,11 +1338,17 @@ class TestRelayClient:
         mock_post.side_effect = [register_ok, poll_404, register_ok, poll_ok]
 
         first = relay_client.poll_api_v1_encrypted_work()
-        second = relay_client.poll_api_v1_encrypted_work()
 
         assert first['error'] == 'HTTP 404'
-        assert first['next_ping_in_x_seconds'] == 9
+        assert first['next_ping_in_x_seconds'] == 0
         assert first['relay_error_kind'] == 'http_status_no_json_body'
+        assert relay_client.api_v1_registration_fresh('http://localhost:5000') is False
+        assert 'http://localhost:5000' not in relay_client._api_v1_registered_relays
+        assert 'http://localhost:5000' not in relay_client._api_v1_last_heartbeat_at
+        assert 'http://localhost:5000' not in relay_client._api_v1_relay_wait_hints
+
+        second = relay_client.poll_api_v1_encrypted_work()
+
         assert second['message'] == 'No requests available'
         called_urls = [call.args[0] for call in mock_post.call_args_list]
         assert called_urls == [

@@ -19,6 +19,7 @@ from utils.networking.http_requests_compat import requests
 
 # Configure logging
 logger = logging.getLogger('relay_client')
+DEFAULT_API_V1_LEASE_SECONDS = 30.0
 
 
 def _load_jsonschema():
@@ -628,13 +629,13 @@ class RelayClient:
         last_heartbeat_at = self._api_v1_last_heartbeat_at.get(candidate_url)
         if not isinstance(last_heartbeat_at, (int, float)):
             return False
-        lease_seconds = hints.get("next_ping_in_x_seconds", self._request_timeout)
+        lease_seconds = hints.get("next_ping_in_x_seconds", DEFAULT_API_V1_LEASE_SECONDS)
         try:
             lease = float(lease_seconds)
         except (TypeError, ValueError):
-            lease = float(self._request_timeout)
+            lease = DEFAULT_API_V1_LEASE_SECONDS
         if not math.isfinite(lease) or lease <= 0:
-            lease = float(self._request_timeout)
+            lease = DEFAULT_API_V1_LEASE_SECONDS
         return (time.monotonic() - float(last_heartbeat_at)) < lease
 
     @staticmethod
@@ -1265,7 +1266,7 @@ class RelayClient:
                         method="POST",
                         url=poll_url,
                         token_sent=token_sent,
-                        next_ping_in_x_seconds=register_wait,
+                        next_ping_in_x_seconds=0 if response.status_code == 404 else register_wait,
                     )
                     continue
                 payload = response.json()

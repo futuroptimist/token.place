@@ -6,6 +6,8 @@ import os
 import queue
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -32,6 +34,14 @@ class FakeModelManager:
 
 class FakeRelayClient:
     relay_url = 'https://token.place'
+
+    def api_v1_registration_fresh(self, _relay_url=None):
+        return True
+
+
+class StaleRelayClient(FakeRelayClient):
+    def api_v1_registration_fresh(self, _relay_url=None):
+        return False
 
 
 class FakeRelayClientRouting(FakeRelayClient):
@@ -1282,6 +1292,42 @@ def test_relay_error_message_normalizes_non_string_truthy_values():
     assert compute_node_bridge._relay_error_message({"error": 503}) == "503"
 
 
+def test_run_reports_stale_registration_status_after_missed_heartbeat(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class StaleHeartbeatRuntime(FakeRuntime):
+        def __init__(self, _config):
+            self.model_manager = FakeModelManager()
+            self.relay_client = StaleRelayClient()
+            self._processed = []
+
+        def register_and_poll_once(self):
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=StaleHeartbeatRuntime)
+    stop_calls = {"count": 0}
+
+    def fake_stop_requested():
+        stop_calls["count"] += 1
+        return stop_calls["count"] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    status_events = [event for event in events if event.get("type") == "status"]
+    assert status_events
+    assert all(event["registered"] is False for event in status_events)
+    assert any(
+        "relay appears unreachable" in (event.get("last_error") or "")
+        for event in status_events
+    )
+
+
 def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []
@@ -1302,6 +1348,47 @@ def test_run_warms_runtime_after_first_successful_registration(capsys, monkeypat
     status = compute_node_bridge.run(args)
     assert status == 0
     assert call_order[:3] == ["poll", "warm", "poll"]
+    _ = capsys.readouterr()
+
+
+def test_run_waits_for_active_warmup_before_runtime_stop(capsys, monkeypatch):
+    _reset_cancel_queue()
+    events = []
+    warm_started = threading.Event()
+
+    class SlowWarmupRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            events.append("warm-start")
+            warm_started.set()
+            time.sleep(0.05)
+            events.append("warm-done")
+            return True
+
+        def register_and_poll_once(self):
+            events.append("poll")
+            return {"next_ping_in_x_seconds": 0}
+
+        def stop(self):
+            events.append("stop")
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SlowWarmupRuntime)
+    stop_calls = {"count": 0}
+
+    def fake_stop_requested():
+        stop_calls["count"] += 1
+        if stop_calls["count"] == 1:
+            return False
+        assert warm_started.wait(timeout=1.0)
+        return True
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert events.index("warm-done") < events.index("stop")
     _ = capsys.readouterr()
 
 

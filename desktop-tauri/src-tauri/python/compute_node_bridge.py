@@ -87,19 +87,6 @@ def _registration_fresh(relay_client: Any, relay_url: str) -> bool:
     return False
 
 
-def _poll_deadline_seconds(relay_client: Any, wait_seconds: float) -> float:
-    timeout_for_wait = getattr(relay_client, "_api_v1_poll_timeout_seconds", None)
-    if callable(timeout_for_wait):
-        try:
-            return float(timeout_for_wait(wait_seconds)) + 5.0
-        except (TypeError, ValueError):
-            pass
-    try:
-        request_timeout = float(getattr(relay_client, "_request_timeout", 1))
-    except (TypeError, ValueError):
-        request_timeout = 1.0
-    return max(request_timeout, wait_seconds) + 5.0
-
 
 def _cached_poll_wait_seconds(relay_client: Any, relay_url: str, default: float) -> float:
     """Return the relay-advertised long-poll wait used by the active client."""
@@ -541,42 +528,7 @@ def run(args: argparse.Namespace) -> int:
         while not stop_requested():
             print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
             active_relay_url = runtime.relay_client.relay_url
-            poll_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="tokenplace-relay-poll"
-            )
-            poll_started = time.monotonic()
-            poll_future = poll_executor.submit(runtime.register_and_poll_once)
-            poll_wait_seconds = _cached_poll_wait_seconds(
-                runtime.relay_client,
-                active_relay_url,
-                getattr(runtime.relay_client, "_request_timeout", 1),
-            )
-            poll_deadline = _poll_deadline_seconds(runtime.relay_client, poll_wait_seconds)
-            relay_response: Dict[str, Any]
-            while True:
-                try:
-                    relay_response = poll_future.result(timeout=0.25)
-                    break
-                except concurrent.futures.TimeoutError:
-                    active_relay_url = runtime.relay_client.relay_url
-                    if not _registration_fresh(runtime.relay_client, active_relay_url):
-                        emit_status_event(
-                            registered=False,
-                            active_relay_url=active_relay_url,
-                            current_last_error="relay registration heartbeat is stale; reconnecting",
-                        )
-                    if poll_future.running() and (
-                        time.monotonic() - poll_started
-                    ) > poll_deadline:
-                        print(
-                            "desktop.compute_node_bridge.api_v1_e2ee.poll_timeout "
-                            f"relay={_sanitize_relay_target(active_relay_url)} deadline={poll_deadline}",
-                            file=sys.stderr,
-                        )
-                    if stop_requested():
-                        poll_executor.shutdown(wait=False, cancel_futures=True)
-                        raise KeyboardInterrupt
-            poll_executor.shutdown(wait=False)
+            relay_response: Dict[str, Any] = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
             api_v1_payload = is_api_v1_relay_payload(relay_response)
             relay_error = _relay_error_message(relay_response)
@@ -706,7 +658,7 @@ def run(args: argparse.Namespace) -> int:
     finally:
         print("desktop.compute_node_bridge.stop", file=sys.stderr)
         if warm_load_executor is not None:
-            warm_load_executor.shutdown(wait=False, cancel_futures=True)
+            warm_load_executor.shutdown(wait=True, cancel_futures=True)
         runtime.stop()
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)

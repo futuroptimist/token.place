@@ -70,6 +70,7 @@ def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
+_stop_requested_latched = threading.Event()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
@@ -135,16 +136,27 @@ class _CancelablePollWorker:
             except BaseException as exc:  # pragma: no cover - exercised via call() re-raise
                 result_queue.put((False, exc))
 
-    def call(self, fn: Any, should_cancel: Any, *, poll_interval: float = 0.1) -> Any:
+    def call(
+        self,
+        fn: Any,
+        should_cancel: Any,
+        *,
+        poll_interval: float = 0.1,
+        on_cancel: Optional[Any] = None,
+    ) -> Any:
         if self._closed:
             return _POLL_CANCELLED
         result_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
         self._tasks.put((fn, result_queue))
+        cancel_notified = False
         while True:
             try:
                 ok, value = result_queue.get(timeout=poll_interval)
             except queue.Empty:
                 if should_cancel():
+                    if not cancel_notified and callable(on_cancel):
+                        cancel_notified = True
+                        on_cancel()
                     return _POLL_CANCELLED
                 continue
             if ok:
@@ -236,6 +248,22 @@ def _sanitize_relay_target(relay_url: Any) -> str:
     host = f"[{hostname}]" if ":" in hostname else hostname
     port = f":{parsed_port}" if parsed_port is not None else ""
     return urlunsplit((parsed.scheme, f"{host}{port}", "", "", ""))
+
+
+def _relay_key_fingerprint(relay_client: Any) -> str:
+    """Return a safe short fingerprint for the compute-node relay key."""
+
+    crypto_manager = getattr(relay_client, "crypto_manager", None)
+    public_key = getattr(crypto_manager, "public_key_b64", None)
+    if not isinstance(public_key, str) or not public_key:
+        return "unknown"
+    fingerprint = getattr(relay_client, "_api_v1_public_key_fingerprint", None)
+    if callable(fingerprint):
+        try:
+            return str(fingerprint(public_key))
+        except Exception:
+            return "unknown"
+    return f"{public_key[:8]}...{public_key[-4:]}" if len(public_key) > 12 else "unknown"
 
 
 def _safe_poll_wait_seconds(relay_response: Dict[str, Any], default: float = 1) -> float:
@@ -367,6 +395,9 @@ def _start_stdin_reader() -> None:
 
 
 def stop_requested() -> bool:
+    if _stop_requested_latched.is_set():
+        return True
+
     _start_stdin_reader()
     while True:
         try:
@@ -380,6 +411,7 @@ def stop_requested() -> bool:
         except json.JSONDecodeError:
             continue
         if payload.get("type") == "cancel":
+            _stop_requested_latched.set()
             return True
 
 
@@ -398,6 +430,7 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    _stop_requested_latched.clear()
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -803,12 +836,69 @@ def run(args: argparse.Namespace) -> int:
         )
         return ready
 
+    poll_cancel_requested = False
+
+    def request_poll_cancel(active_relay_url: str) -> None:
+        nonlocal poll_cancel_requested
+        if poll_cancel_requested:
+            return
+        poll_cancel_requested = True
+        relay_client = getattr(runtime, "relay_client", None)
+        print(
+            "desktop.compute_node_bridge.poll.cancel_requested "
+            f"relay={_sanitize_relay_target(active_relay_url)} "
+            f"key_fingerprint={_relay_key_fingerprint(relay_client)}",
+            file=sys.stderr,
+        )
+        relay_stop = getattr(relay_client, "stop", None)
+        if callable(relay_stop):
+            relay_stop()
+        unregister = getattr(relay_client, "unregister_from_relay", None)
+        if callable(unregister):
+            print(
+                "desktop.compute_node_bridge.unregister.attempted "
+                f"relay={_sanitize_relay_target(active_relay_url)} "
+                f"key_fingerprint={_relay_key_fingerprint(relay_client)}",
+                file=sys.stderr,
+            )
+            try:
+                unregistered = bool(unregister())
+            except Exception as exc:
+                print(
+                    "desktop.compute_node_bridge.unregister.failed "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+            else:
+                unregister_event = (
+                    "desktop.compute_node_bridge.unregister.succeeded"
+                    if unregistered
+                    else "desktop.compute_node_bridge.unregister.failed"
+                )
+                print(
+                    f"{unregister_event} "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    f"success={unregistered}",
+                    file=sys.stderr,
+                )
+
     try:
         if warm_runtime_before_registration():
             while not stop_requested():
-                print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
                 active_relay_url = runtime.relay_client.relay_url
-                relay_response = poll_worker.call(runtime.register_and_poll_once, stop_requested)
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.register "
+                    f"relay={_sanitize_relay_target(active_relay_url)}",
+                    file=sys.stderr,
+                )
+                relay_response = poll_worker.call(
+                    runtime.register_and_poll_once,
+                    stop_requested,
+                    on_cancel=lambda relay=active_relay_url: request_poll_cancel(relay),
+                )
                 if relay_response is _POLL_CANCELLED:
                     print(
                         "desktop.compute_node_bridge.poll.cancelled "
@@ -939,11 +1029,27 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        print("desktop.compute_node_bridge.stop", file=sys.stderr)
+        active_relay_url = getattr(getattr(runtime, "relay_client", None), "relay_url", relay_url)
+        print(
+            "desktop.compute_node_bridge.stop "
+            f"relay={_sanitize_relay_target(active_relay_url)}",
+            file=sys.stderr,
+        )
+        request_poll_cancel(active_relay_url)
         poll_worker.shutdown()
+        print(
+            "desktop.compute_node_bridge.poll.worker_stopped "
+            f"relay={_sanitize_relay_target(active_relay_url)}",
+            file=sys.stderr,
+        )
         if warm_load_future is not None and not warm_load_future.done():
             warm_load_future.cancel()
         runtime.stop()
+        print(
+            "desktop.compute_node_bridge.stopped_idle "
+            f"relay={_sanitize_relay_target(active_relay_url)}",
+            file=sys.stderr,
+        )
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     emit(

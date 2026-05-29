@@ -3176,3 +3176,67 @@ def test_poll_api_v1_encrypted_work_continuously_sleeps_no_work_hint(monkeypatch
 
     client.poll_api_v1_encrypted_work_continuously()
     assert 0.25 in sleeps
+
+
+def _standalone_relay_client():
+    crypto = MagicMock()
+    crypto.public_key_b64 = 'mock_public_key_b64'
+    model = MagicMock()
+    config = MagicMock()
+    config.is_production = False
+    config.get.side_effect = lambda key, default=None: {'relay.request_timeout': 15}.get(key, default)
+    with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
+        return RelayClient('http://localhost', 5000, crypto, model)
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock_post):
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_relay_wait_hints = {'http://localhost:5000': {'next_ping_in_x_seconds': 30}}
+    mock_post.return_value = MagicMock(status_code=200)
+
+    assert client.unregister_from_relay() is True
+    assert client.unregister_from_relay() is True
+
+    mock_post.assert_called_once_with(
+        'http://localhost:5000/unregister',
+        json={'server_public_key': 'mock_public_key_b64'},
+        timeout=15,
+    )
+    assert client._api_v1_registered_relays == set()
+    assert client._api_v1_last_heartbeat_at == {}
+    assert client._api_v1_relay_wait_hints == {}
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_poll_api_v1_encrypted_work_stop_prevents_register_and_poll(mock_post):
+    client = _standalone_relay_client()
+    client.stop()
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result == {
+        'error': 'Relay polling stopped',
+        'next_ping_in_x_seconds': 0,
+        'poll_wait_seconds': 0,
+    }
+    mock_post.assert_not_called()
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_start_after_stop_allows_api_v1_registration_again(mock_post):
+    client = _standalone_relay_client()
+    client.stop()
+    client.start()
+    register_ok = MagicMock(status_code=200)
+    register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    poll_ok = MagicMock(status_code=200)
+    poll_ok.json.return_value = {'message': 'No requests available'}
+    mock_post.side_effect = [register_ok, poll_ok]
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result['next_ping_in_x_seconds'] == 12
+    assert mock_post.call_count == 2

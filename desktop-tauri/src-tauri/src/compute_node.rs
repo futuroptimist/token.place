@@ -575,11 +575,13 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
+    eprintln!("desktop.compute_node.stop_requested");
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
+        eprintln!("desktop.compute_node.cancel_requested");
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
     }
@@ -604,8 +606,12 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
+            eprintln!("desktop.compute_node.bridge_kill_requested");
             let _ = child.kill().await;
             let _ = child.wait().await;
+            eprintln!("desktop.compute_node.bridge_process_exited killed=true");
+        } else {
+            eprintln!("desktop.compute_node.bridge_process_exited killed=false");
         }
     }
 
@@ -759,6 +765,44 @@ mod tests {
         let final_status = state.status.lock().await.clone();
         assert!(!final_status.running);
         assert!(!final_status.registered);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn repeated_start_stop_start_does_not_leave_stale_child_handle() {
+        let state = ComputeNodeState::default();
+        let mut first_child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn first bridge");
+        let first_stdin = first_child.stdin.take().expect("first stdin");
+        let first_pid = first_child.id().expect("first child pid");
+        *state.child.lock().await = Some(first_child);
+        *state.stdin.lock().await = Some(first_stdin);
+
+        stop_compute_node(state.clone()).await.expect("first stop");
+        assert!(state.child.lock().await.is_none());
+        assert!(state.stdin.lock().await.is_none());
+
+        let mut second_child = Command::new("sh")
+            .args(["-c", "IFS= read -r _line; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn second bridge");
+        let second_stdin = second_child.stdin.take().expect("second stdin");
+        let second_pid = second_child.id().expect("second child pid");
+        *state.child.lock().await = Some(second_child);
+        *state.stdin.lock().await = Some(second_stdin);
+
+        assert_ne!(first_pid, second_pid);
+        stop_compute_node(state.clone()).await.expect("second stop");
+        assert!(state.child.lock().await.is_none());
+        assert!(state.stdin.lock().await.is_none());
     }
 
     #[test]

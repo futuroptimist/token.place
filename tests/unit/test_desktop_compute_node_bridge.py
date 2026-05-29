@@ -815,6 +815,7 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
     monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
 
     stop_counter = {'count': 0}
 
@@ -843,6 +844,14 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     output = capsys.readouterr()
     assert 'api_v1_payload=True' in output.err
     assert 'desktop.compute_node_bridge.registration.gate_wait_start' in output.err
+    assert 'desktop.compute_node_bridge.model_init.still_warming' in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    warming_status_events = [
+        event
+        for event in events
+        if event.get('type') == 'status' and event.get('warm_load_state') == 'warming'
+    ]
+    assert len(warming_status_events) >= 2
     assert 'desktop.compute_node_bridge.api_v1_e2ee.error_response.submitted' not in output.err
     assert 'compute_node_runtime_not_ready' not in output.err
 
@@ -1634,7 +1643,7 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
     _ = capsys.readouterr()
 
 
-def test_run_stops_when_post_registration_runtime_warmup_fails(capsys, monkeypatch):
+def test_run_stops_when_pre_registration_runtime_warmup_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     calls = []
 

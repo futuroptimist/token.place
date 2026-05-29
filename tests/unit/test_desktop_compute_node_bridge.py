@@ -6,6 +6,7 @@ import os
 import queue
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -1273,6 +1274,12 @@ def test_sanitize_relay_target_returns_unknown_for_invalid_values():
     assert compute_node_bridge._sanitize_relay_target('not-a-valid-url') == 'unknown'
 
 
+def test_registration_recent_expires_after_lease_window():
+    assert compute_node_bridge._registration_recent(10.0, 30.0, now_monotonic=39.0) is True
+    assert compute_node_bridge._registration_recent(10.0, 30.0, now_monotonic=40.0) is False
+    assert compute_node_bridge._registration_recent(None, 30.0, now_monotonic=11.0) is False
+
+
 def test_relay_response_summary_handles_non_dict_payloads():
     summary = compute_node_bridge._relay_response_summary(["unexpected"])
     assert summary == "non-dict response type=list"
@@ -1405,6 +1412,42 @@ def test_run_sidecar_runtime_path_with_dual_mode_warms_and_logs_opt_in(capsys, m
     assert call_order[:3] == ["poll", "warm", "poll"]
     output = capsys.readouterr()
     assert "dual_mode_enabled" in output.err
+
+
+def test_run_keeps_polling_while_post_registration_warm_load_runs(capsys, monkeypatch):
+    _reset_cancel_queue()
+    call_order = []
+    warm_can_finish = threading.Event()
+    warm_finished = threading.Event()
+
+    class SlowWarmRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            call_order.append("warm-start")
+            warm_can_finish.wait(timeout=2)
+            call_order.append("warm-finish")
+            warm_finished.set()
+            return True
+
+        def register_and_poll_once(self):
+            call_order.append("poll")
+            if call_order.count("poll") >= 2:
+                warm_can_finish.set()
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SlowWarmRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: call_order.count("poll") > 2)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+    warm_finished.wait(timeout=1)
+
+    assert status == 0
+    assert call_order.index("poll") < call_order.index("warm-start")
+    assert call_order.count("poll") >= 2
+    assert call_order.index("poll", call_order.index("warm-start")) < call_order.index("warm-finish")
+    output = capsys.readouterr()
+    assert "model_init.background_started" in output.err
 
 
 def test_run_api_v1_payload_not_dropped_when_warm_not_started(capsys, monkeypatch):

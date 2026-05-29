@@ -1929,6 +1929,36 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
     assert elapsed >= 0.008
 
 
+def test_api_v1_long_poll_keeps_compute_node_visible_past_lease(client, monkeypatch):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.5')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    result = {}
+
+    def _poll():
+        with app.test_client() as polling_client:
+            response = polling_client.post('/api/v1/relay/servers/poll', json=server_payload)
+            result['status'] = response.status_code
+            result['json'] = response.get_json()
+
+    poll_thread = threading.Thread(target=_poll)
+    poll_thread.start()
+    time.sleep(0.05)
+    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=2)
+
+    next_response = client.get('/api/v1/relay/servers/next')
+
+    poll_thread.join(timeout=1.0)
+    assert not poll_thread.is_alive()
+    assert next_response.status_code == 200
+    assert next_response.get_json()['server_public_key'] == DUMMY_SERVER_PUB_KEY
+    assert result['status'] == 200
+    assert result['json']['message'] == 'No requests available'
+
+
 def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200

@@ -72,6 +72,7 @@ _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
+DEFAULT_REGISTRATION_LEASE_SECONDS = 30.0
 
 
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
@@ -127,6 +128,38 @@ def _safe_poll_wait_seconds(relay_response: Dict[str, Any], default: float = 1) 
     if not math.isfinite(wait_seconds) or wait_seconds < 0:
         return fallback
     return wait_seconds
+
+
+def _safe_registration_lease_seconds(
+    relay_response: Dict[str, Any], default: float = DEFAULT_REGISTRATION_LEASE_SECONDS
+) -> float:
+    """Return a finite positive relay registration lease duration."""
+
+    if not isinstance(relay_response, dict):
+        return default
+    lease_seconds = relay_response.get("next_ping_in_x_seconds")
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float)):
+        return default
+    lease_seconds = float(lease_seconds)
+    if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+        return default
+    return lease_seconds
+
+
+def _registration_recent(
+    confirmed_at_monotonic: Optional[float],
+    lease_seconds: float,
+    *,
+    now_monotonic: Optional[float] = None,
+) -> bool:
+    """Return whether bridge status should still report relay registration as fresh."""
+
+    if confirmed_at_monotonic is None:
+        return False
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+        lease_seconds = DEFAULT_REGISTRATION_LEASE_SECONDS
+    return max(now - confirmed_at_monotonic, 0.0) < lease_seconds
 
 
 def _relay_response_summary(
@@ -352,6 +385,12 @@ def run(args: argparse.Namespace) -> int:
     warm_load_duration_ms: Optional[int] = None
     warm_load_failed: Optional[str] = None
     warm_load_fatal = False
+    warm_load_thread: Optional[threading.Thread] = None
+    registration_confirmed_at: Optional[float] = None
+    registration_lease_seconds = DEFAULT_REGISTRATION_LEASE_SECONDS
+
+    def current_registered() -> bool:
+        return _registration_recent(registration_confirmed_at, registration_lease_seconds)
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
         diagnostics = compute_mode_diagnostics(runtime.model_manager)
@@ -393,7 +432,7 @@ def run(args: argparse.Namespace) -> int:
         warm_load_duration_ms = None
         warm_load_started_at = time.perf_counter()
         emit_status_event(
-            registered=True,
+            registered=current_registered(),
             active_relay_url=active_relay_url,
             current_last_error=last_error,
         )
@@ -426,7 +465,7 @@ def run(args: argparse.Namespace) -> int:
         nonlocal last_error, warm_load_fatal
         last_error = warm_load_failed or "failed to initialize API v1 model runtime"
         emit_status_event(
-            registered=True,
+            registered=current_registered(),
             active_relay_url=active_relay_url,
             current_last_error=last_error,
         )
@@ -441,6 +480,25 @@ def run(args: argparse.Namespace) -> int:
             }
         )
         warm_load_fatal = True
+
+    def start_runtime_warmup(reason: str, *, active_relay_url: str) -> None:
+        """Start model warmup without blocking relay heartbeat polling."""
+
+        nonlocal warm_load_thread
+        if warm_load_state in {"ready", "warming"}:
+            return
+
+        def _warm() -> None:
+            if not ensure_runtime_ready(reason, active_relay_url=active_relay_url):
+                fail_on_warm_load_error(active_relay_url=active_relay_url)
+
+        warm_load_thread = threading.Thread(target=_warm, daemon=True)
+        warm_load_thread.start()
+        print(
+            "desktop.compute_node_bridge.model_init.background_started "
+            f"reason={reason} state={warm_load_state}",
+            file=sys.stderr,
+        )
 
     diagnostics = compute_mode_diagnostics(runtime.model_manager)
     last_error: Optional[str] = None
@@ -478,6 +536,8 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         while not stop_requested():
+            if warm_load_fatal:
+                break
             print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
             relay_response = runtime.register_and_poll_once()
             active_relay_url = runtime.relay_client.relay_url
@@ -486,7 +546,13 @@ def run(args: argparse.Namespace) -> int:
             has_heartbeat = (
                 isinstance(relay_response, dict) and "next_ping_in_x_seconds" in relay_response
             )
-            registered = relay_error is None and (has_heartbeat or api_v1_payload)
+            if relay_error is None and (has_heartbeat or api_v1_payload):
+                registration_confirmed_at = time.monotonic()
+                registration_lease_seconds = _safe_registration_lease_seconds(
+                    relay_response,
+                    registration_lease_seconds,
+                )
+            registered = relay_error is None and current_registered()
             wait_seconds = _safe_poll_wait_seconds(
                 relay_response, getattr(runtime.relay_client, "_request_timeout", 1)
             )
@@ -504,7 +570,8 @@ def run(args: argparse.Namespace) -> int:
                 "desktop.compute_node_bridge.relay_poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                f"request_id={request_id} wait={wait_seconds} "
+                f"lease={registration_lease_seconds} summary={summary}",
                 file=sys.stderr,
             )
 
@@ -512,7 +579,8 @@ def run(args: argparse.Namespace) -> int:
                 "desktop.compute_node_bridge.api_v1_e2ee.poll "
                 f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                 f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                f"request_id={request_id} wait={wait_seconds} "
+                f"lease={registration_lease_seconds} summary={summary}",
                 file=sys.stderr,
             )
 
@@ -525,6 +593,10 @@ def run(args: argparse.Namespace) -> int:
                         f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
                         file=sys.stderr,
                     )
+                elif warm_load_state == "warming" and warm_load_thread is not None:
+                    warm_load_thread.join()
+                    if warm_load_fatal:
+                        break
                 elif not ensure_runtime_ready("api_v1_request", active_relay_url=active_relay_url):
                     fail_on_warm_load_error(active_relay_url=active_relay_url)
                     break
@@ -582,9 +654,7 @@ def run(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                 else:
-                    if not ensure_runtime_ready("post_registration", active_relay_url=active_relay_url):
-                        fail_on_warm_load_error(active_relay_url=active_relay_url)
-                        break
+                    start_runtime_warmup("post_registration", active_relay_url=active_relay_url)
             emit_status_event(
                 registered=registered,
                 active_relay_url=active_relay_url,

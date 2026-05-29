@@ -101,6 +101,23 @@ def _poll_deadline_seconds(relay_client: Any, wait_seconds: float) -> float:
     return max(request_timeout, wait_seconds) + 5.0
 
 
+def _cached_poll_wait_seconds(relay_client: Any, relay_url: str, default: float) -> float:
+    """Return the relay-advertised long-poll wait used by the active client."""
+
+    hints_by_relay = getattr(relay_client, "_api_v1_relay_wait_hints", {})
+    hints = hints_by_relay.get(relay_url, {}) if isinstance(hints_by_relay, dict) else {}
+    wait_seconds = hints.get("poll_wait_seconds", default) if isinstance(hints, dict) else default
+    if isinstance(wait_seconds, bool):
+        return default
+    try:
+        normalised_wait = float(wait_seconds)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(normalised_wait) or normalised_wait < 0:
+        return default
+    return normalised_wait
+
+
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
     """Return a normalized relay error message if the response includes one."""
 
@@ -529,9 +546,12 @@ def run(args: argparse.Namespace) -> int:
             )
             poll_started = time.monotonic()
             poll_future = poll_executor.submit(runtime.register_and_poll_once)
-            poll_deadline = _poll_deadline_seconds(
-                runtime.relay_client, getattr(runtime.relay_client, "_request_timeout", 1)
+            poll_wait_seconds = _cached_poll_wait_seconds(
+                runtime.relay_client,
+                active_relay_url,
+                getattr(runtime.relay_client, "_request_timeout", 1),
             )
+            poll_deadline = _poll_deadline_seconds(runtime.relay_client, poll_wait_seconds)
             relay_response: Dict[str, Any]
             while True:
                 try:

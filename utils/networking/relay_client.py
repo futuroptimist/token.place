@@ -1083,6 +1083,27 @@ class RelayClient:
             return base_timeout
         return max(base_timeout, wait_seconds + 5.0, wait_seconds * 1.25)
 
+    def _normalise_positive_seconds(self, seconds: Any, fallback: Any) -> float:
+        """Return a finite positive numeric hint, accepting numeric strings."""
+
+        if isinstance(seconds, bool):
+            seconds = None
+        try:
+            normalised = float(seconds)
+        except (TypeError, ValueError):
+            try:
+                normalised = float(fallback)
+            except (TypeError, ValueError):
+                normalised = float(self._request_timeout)
+        if not math.isfinite(normalised) or normalised <= 0:
+            try:
+                normalised = float(fallback)
+            except (TypeError, ValueError):
+                normalised = float(self._request_timeout)
+        if not math.isfinite(normalised) or normalised <= 0:
+            normalised = float(self._request_timeout)
+        return normalised
+
     def poll_api_v1_encrypted_work(self) -> Dict[str, Any]:
         """Poll API v1 relay routes for encrypted work with lease-aware registration."""
 
@@ -1096,8 +1117,12 @@ class RelayClient:
 
             try:
                 cached_hints = relay_wait_hints.get(candidate_url, {})
-                register_wait = cached_hints.get('next_ping_in_x_seconds', self._request_timeout)
+                register_wait = self._normalise_positive_seconds(
+                    cached_hints.get('next_ping_in_x_seconds'),
+                    self._request_timeout,
+                )
                 poll_wait = cached_hints.get('poll_wait_seconds', register_wait)
+                poll_wait = self._normalise_poll_wait_seconds(poll_wait)
                 current_public_key = self.crypto_manager.public_key_b64
                 registered_public_key = cached_hints.get('server_public_key')
                 requires_register = candidate_url not in self._api_v1_registered_relays
@@ -1137,8 +1162,8 @@ class RelayClient:
                             'next_ping_in_x_seconds': self._request_timeout,
                         }
                         continue
-                    register_wait = register_response.get(
-                        'next_ping_in_x_seconds',
+                    register_wait = self._normalise_positive_seconds(
+                        register_response.get('next_ping_in_x_seconds'),
                         self._request_timeout,
                     )
                     poll_wait = register_response.get('poll_wait_seconds', register_wait)
@@ -1180,6 +1205,7 @@ class RelayClient:
                 poll_timeout_seconds = float(request_kwargs.pop('timeout'))
                 poll_url = self._build_api_v1_url(candidate_url, "/relay/servers/poll")
                 token_sent = bool(headers)
+                poll_started = time.monotonic()
                 try:
                     response = requests.post(
                         poll_url,
@@ -1187,16 +1213,19 @@ class RelayClient:
                         **request_kwargs,
                     )
                 except Exception as exc:
-                    numeric_poll_wait = self._api_v1_poll_timeout_seconds(poll_wait)
-                    near_long_poll_window = (
+                    elapsed_seconds = time.monotonic() - poll_started
+                    timeout_exception = (
                         isinstance(exc, requests.Timeout)
                         or "Read timed out" in str(exc)
-                    ) and (
-                        math.isfinite(numeric_poll_wait)
-                        and math.isfinite(poll_timeout_seconds)
-                        and poll_timeout_seconds >= numeric_poll_wait
                     )
-                    if near_long_poll_window and candidate_url in self._api_v1_registered_relays:
+                    can_try_another_relay = len(self._relay_urls) > 1
+                    reached_server_long_poll = (
+                        timeout_exception
+                        and not can_try_another_relay
+                        and math.isfinite(float(poll_wait))
+                        and elapsed_seconds >= max(0.0, float(poll_wait) - 0.5)
+                    )
+                    if reached_server_long_poll and candidate_url in self._api_v1_registered_relays:
                         self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
                         relay_wait_hints[candidate_url] = {
                             'next_ping_in_x_seconds': register_wait,
@@ -1247,12 +1276,19 @@ class RelayClient:
                     }
                     continue
                 payload_wait = payload.get('next_ping_in_x_seconds')
-                if isinstance(payload_wait, bool):
-                    payload_wait = None
-                if payload_wait is None:
+                normalised_payload_wait: Optional[float] = None
+                if not isinstance(payload_wait, bool):
+                    try:
+                        candidate_payload_wait = float(payload_wait)
+                    except (TypeError, ValueError):
+                        candidate_payload_wait = math.nan
+                    if math.isfinite(candidate_payload_wait) and candidate_payload_wait > 0:
+                        normalised_payload_wait = candidate_payload_wait
+                if normalised_payload_wait is None:
                     payload.setdefault('next_ping_in_x_seconds', register_wait)
-                elif isinstance(payload_wait, (int, float)) and payload_wait > 0:
-                    register_wait = payload_wait
+                else:
+                    register_wait = normalised_payload_wait
+                    payload['next_ping_in_x_seconds'] = normalised_payload_wait
                 payload_poll_wait = payload.get('poll_wait_seconds', poll_wait)
                 poll_wait = self._normalise_poll_wait_seconds(payload_poll_wait)
                 relay_wait_hints[candidate_url] = {
@@ -2027,10 +2063,12 @@ class RelayClient:
     def _normalise_poll_wait_seconds(self, wait_seconds: Any) -> float:
         """Return a safe non-negative polling delay for relay-provided wait values."""
 
-        if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)):
+        if isinstance(wait_seconds, bool):
             return float(self._request_timeout)
-
-        normalised_wait = float(wait_seconds)
+        try:
+            normalised_wait = float(wait_seconds)
+        except (TypeError, ValueError):
+            return float(self._request_timeout)
         if not math.isfinite(normalised_wait) or normalised_wait < 0:
             return float(self._request_timeout)
         return normalised_wait

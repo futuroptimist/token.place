@@ -106,7 +106,10 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
-  const relayRuntimeReady = computeStatus.warm_load_state === null || computeStatus.warm_load_state === 'ready';
+  const relayRuntimeReady =
+    computeStatus.warm_load_enabled === false ||
+    computeStatus.warm_load_state === null ||
+    computeStatus.warm_load_state === 'ready';
   const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');

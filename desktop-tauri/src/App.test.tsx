@@ -547,6 +547,26 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready');
   });
 
+  it('allows cached registered status when warm-load is disabled', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      warm_load_state: 'not_started',
+      warm_load_enabled: false,
+      warm_load_duration_ms: null,
+      runtime_path: 'bridge',
+      relay_runtime_path: 'bridge',
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('not_started');
+  });
+
   it('does not display registered yes for stopped cached compute node status', async () => {
     mockInitialComputeStatus({
       running: false,

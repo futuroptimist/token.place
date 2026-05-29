@@ -31,6 +31,11 @@ interface ComputeNodeStatus {
   fallback_reason: string | null;
   model_path: string;
   last_error: string | null;
+  warm_load_state: string | null;
+  warm_load_enabled: boolean | null;
+  warm_load_duration_ms: number | null;
+  runtime_path: string | null;
+  relay_runtime_path: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -63,6 +68,11 @@ const defaultComputeStatus: ComputeNodeStatus = {
   fallback_reason: null,
   model_path: '',
   last_error: null,
+  warm_load_state: null,
+  warm_load_enabled: null,
+  warm_load_duration_ms: null,
+  runtime_path: null,
+  relay_runtime_path: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -96,6 +106,11 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const relayRuntimeReady =
+    computeStatus.warm_load_enabled === false ||
+    computeStatus.warm_load_state === null ||
+    computeStatus.warm_load_state === 'ready';
+  const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
 
@@ -186,6 +201,21 @@ export function App() {
               ? payload.fallback_reason
               : prev.fallback_reason,
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
+        warm_load_state:
+          typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+        warm_load_enabled:
+          typeof payload.warm_load_enabled === 'boolean'
+            ? payload.warm_load_enabled
+            : prev.warm_load_enabled,
+        warm_load_duration_ms:
+          typeof payload.warm_load_duration_ms === 'number'
+            ? payload.warm_load_duration_ms
+            : prev.warm_load_duration_ms,
+        runtime_path: typeof payload.runtime_path === 'string' ? payload.runtime_path : prev.runtime_path,
+        relay_runtime_path:
+          typeof payload.relay_runtime_path === 'string'
+            ? payload.relay_runtime_path
+            : prev.relay_runtime_path,
         last_error:
           payload.last_error === null
             ? null
@@ -450,7 +480,10 @@ export function App() {
           </button>
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeStatus.registered ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeNodeRegistered ? 'yes' : 'no'}</strong></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{computeStatus.warm_load_state || 'idle'}</code></p>
+        <p style={{ marginBottom: 0 }}>Runtime path: <code>{computeStatus.runtime_path || 'bridge'}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{computeStatus.relay_runtime_path || 'bridge'}</code></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
         <p style={{ marginBottom: 0 }}>Requested mode: <code>{computeStatus.requested_mode || config.preferred_mode}</code></p>
         <p style={{ marginBottom: 0 }}>Effective mode: <code>{computeStatus.effective_mode ?? 'pending'}</code></p>

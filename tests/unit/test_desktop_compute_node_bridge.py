@@ -801,8 +801,10 @@ def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
     assert runtime.relay_client.endpoint_calls[0][0] == '/api/v1/relay/responses'
 
     output = capsys.readouterr()
-    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start' in output.err
-    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.ready' in output.err
+    assert 'desktop.compute_node_bridge.registration.gate_wait_start' in output.err
+    assert 'desktop.compute_node_bridge.registration.gate_wait_done' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start' not in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.timeout' not in output.err
     assert 'desktop.compute_node_bridge.process_request relay=https://token.place request_id=req-1' in output.err
     assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
 
@@ -1577,7 +1579,15 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
         error_event = next(event for event in output_events if event.get("type") == "error")
         assert error_event["warm_load_state"] == "failed"
         assert "timed out" in error_event["message"]
+        warming_status_events = [
+            event
+            for event in output_events
+            if event.get("type") == "status" and event.get("warm_load_state") == "warming"
+        ]
+        assert len(warming_status_events) == 1
         assert "registration.gate_wait_timeout" in captured.err
+        assert "api_v1_e2ee.runtime_wait.start" not in captured.err
+        assert "api_v1_e2ee.runtime_wait.timeout" not in captured.err
     finally:
         release_warmup.set()
 

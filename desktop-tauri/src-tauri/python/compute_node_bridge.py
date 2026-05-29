@@ -527,6 +527,7 @@ def run(args: argparse.Namespace) -> int:
         block: bool = False,
         request_id: str = "none",
         block_timeout_seconds: Optional[float] = None,
+        log_runtime_wait_progress: bool = True,
     ) -> bool:
         nonlocal warm_load_state, warm_load_started_at, warm_load_duration_ms, warm_load_failed
         nonlocal warm_load_executor, warm_load_future
@@ -559,22 +560,24 @@ def run(args: argparse.Namespace) -> int:
             return False
         if block and not warm_load_future.done():
             timeout = block_timeout_seconds
-            print(
-                "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start "
-                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
-                f"state={warm_load_state} timeout_seconds={timeout}",
-                file=sys.stderr,
-            )
+            if log_runtime_wait_progress:
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.start "
+                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                    f"state={warm_load_state} timeout_seconds={timeout}",
+                    file=sys.stderr,
+                )
             try:
                 ready = bool(warm_load_future.result(timeout=timeout))
             except concurrent.futures.TimeoutError:
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
-                print(
-                    "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.timeout "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
-                    f"state={warm_load_state} duration_ms={warm_load_duration_ms}",
-                    file=sys.stderr,
-                )
+                if log_runtime_wait_progress:
+                    print(
+                        "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.timeout "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"state={warm_load_state} duration_ms={warm_load_duration_ms}",
+                        file=sys.stderr,
+                    )
                 return False
             except Exception as exc:
                 ready = False
@@ -724,6 +727,8 @@ def run(args: argparse.Namespace) -> int:
         )
         wait_started_at = time.monotonic()
         last_progress_log_at = wait_started_at
+        last_status_emit_at = wait_started_at
+        progress_emit_interval_seconds = 30.0
         while warm_load_state == "warming":
             elapsed_seconds = time.monotonic() - wait_started_at
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
@@ -751,10 +756,11 @@ def run(args: argparse.Namespace) -> int:
                 active_relay_url=runtime.relay_client.relay_url,
                 block=True,
                 block_timeout_seconds=min(0.1, remaining_seconds),
+                log_runtime_wait_progress=False,
             ):
                 break
             now = time.monotonic()
-            if now - last_progress_log_at >= 30:
+            if now - last_progress_log_at >= progress_emit_interval_seconds:
                 last_progress_log_at = now
                 duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
@@ -764,11 +770,13 @@ def run(args: argparse.Namespace) -> int:
                     f"timeout_seconds={warm_load_deadline_seconds}",
                     file=sys.stderr,
                 )
-            emit_status_event(
-                registered=False,
-                active_relay_url=runtime.relay_client.relay_url,
-                current_last_error=last_error,
-            )
+            if now - last_status_emit_at >= progress_emit_interval_seconds:
+                last_status_emit_at = now
+                emit_status_event(
+                    registered=False,
+                    active_relay_url=runtime.relay_client.relay_url,
+                    current_last_error=last_error,
+                )
             if stop_requested():
                 return False
             time.sleep(0.01)

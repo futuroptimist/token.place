@@ -1822,6 +1822,61 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_raises(capsys, mon
     assert error_event["warm_load_state"] == "failed"
 
 
+def test_run_first_api_v1_payload_fails_closed_when_blocking_warm_load_raises(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class BlockingWarmRaiseRuntime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            BlockingWarmRaiseRuntime.last_instance = self
+
+        def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
+            time.sleep(0.05)
+            raise RuntimeError("sensitive delayed model init details")
+
+        def process_relay_request(self, _payload):
+            calls.append("process")
+            return True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=BlockingWarmRaiseRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "1")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    status = compute_node_bridge.run(args)
+
+    output = capsys.readouterr()
+    assert status == 1
+    assert calls == ["warm"]
+    assert "request_id=req-1" in output.err
+    assert "runtime_wait.exception" in output.err
+    assert "error_response.submitted" in output.err
+    assert "exc_type=RuntimeError" in output.err
+    assert "sensitive delayed model init details" not in output.err
+    assert BlockingWarmRaiseRuntime.last_instance is not None
+    assert BlockingWarmRaiseRuntime.last_instance.relay_client.endpoint_calls == [
+        (
+            '/api/v1/relay/responses',
+            {
+                'request_id': 'req-1',
+                'error': {
+                    'code': 'compute_node_runtime_unavailable',
+                    'message': 'failed to initialize API v1 model runtime',
+                },
+            },
+        )
+    ]
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get("type") == "error")
+    assert error_event["warm_load_state"] == "failed"
+
+
 def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

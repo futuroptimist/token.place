@@ -1958,6 +1958,44 @@ class TestRelayClient:
         )
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_post_api_v1_error_response_encrypts_structured_error(
+        self,
+        mock_post,
+        relay_client,
+        mock_crypto_manager,
+    ):
+        request_data = {
+            **TEST_VALID_RESPONSE,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-runtime-not-ready",
+        }
+        source_response = MagicMock()
+        source_response.status_code = 200
+        mock_post.return_value = source_response
+
+        result = relay_client.post_api_v1_error_response(
+            request_data,
+            code="compute_node_runtime_not_ready",
+            message="Desktop runtime was not ready",
+        )
+
+        assert result is True
+        encrypted_envelope = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_envelope["request_id"] == "req-runtime-not-ready"
+        assert encrypted_envelope["client_public_key"] == request_data["client_public_key"]
+        assert encrypted_envelope["api_v1_response"]["error"] == {
+            "code": "compute_node_runtime_not_ready",
+            "message": "Desktop runtime was not ready",
+        }
+        relay_visible_payload = mock_post.call_args.kwargs["json"]
+        assert relay_visible_payload["request_id"] == "req-runtime-not-ready"
+        assert relay_visible_payload["protocol"] == "tokenplace_api_v1_relay_e2ee"
+        assert relay_visible_payload["version"] == 1
+        assert "compute_node_runtime_not_ready" not in json.dumps(relay_visible_payload)
+
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_process_client_request_api_v1_e2ee_rejects_mismatched_bound_key(
         self,
         mock_post,

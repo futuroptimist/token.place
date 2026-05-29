@@ -22,6 +22,7 @@ from werkzeug.serving import make_server
 
 import relay
 from api.v1 import compute_provider, routes
+from api.v1.compute_provider import ComputeProviderError
 from api.v1.encryption import EncryptionManager, encryption_manager
 from utils.crypto.crypto_manager import CryptoManager
 from utils.networking import relay_client as relay_client_module
@@ -272,6 +273,122 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     _assert_ciphertext_only(request_posts[0], forbidden_text="pong from desktop")
     _assert_ciphertext_only(response_posts[0], forbidden_text=user_text)
     _assert_ciphertext_only(response_posts[0], forbidden_text="pong from desktop")
+
+
+def test_api_v1_desktop_bridge_posts_structured_error_instead_of_timeout(monkeypatch):
+    """Desktop can answer dispatched work with encrypted non-timeout compute-node error."""
+
+    with live_relay_server() as base_url:
+        monkeypatch.setattr(
+            routes,
+            "get_api_v1_compute_provider_for_mode",
+            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
+                base_url=base_url,
+                timeout_seconds=5,
+            ),
+        )
+
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 1
+        browser_crypto = EncryptionManager()
+        payload = {
+            "model": "llama-3-8b-instruct",
+            "encrypted": True,
+            "client_public_key": browser_crypto.public_key_b64,
+            "messages": _encrypt_browser_messages([{"role": "user", "content": "ping"}]),
+            "metadata": {
+                "inference_target": "desktop_bridge_api_v1_e2ee",
+                "relay_path": "api_v1_e2ee",
+            },
+        }
+        response_holder = {}
+
+        def _browser_request():
+            response_holder["response"] = requests.post(
+                f"{base_url}/api/v1/chat/completions", json=payload, timeout=10
+            )
+
+        browser_thread = threading.Thread(target=_browser_request, daemon=True)
+        browser_thread.start()
+
+        deadline = time.time() + 5
+        relay_payload = None
+        while time.time() < deadline:
+            candidate = desktop_client.poll_api_v1_encrypted_work()
+            if candidate.get("protocol") == "tokenplace_api_v1_relay_e2ee":
+                relay_payload = candidate
+                break
+            time.sleep(0.02)
+        assert relay_payload is not None
+        assert desktop_client.post_api_v1_error_response(
+            relay_payload,
+            code="compute_node_runtime_not_ready",
+            message="Desktop runtime was not ready to process API v1 relay work",
+        ) is True
+
+        browser_thread.join(timeout=5)
+
+    response = response_holder.get("response")
+    assert response is not None
+    assert response.status_code != 504
+    assert response.status_code >= 500
+    body = response.json()
+    assert body["error"]["code"] == "compute_node_bridge_error"
+    assert "timed out" not in body["error"]["message"].lower()
+
+
+def test_api_v1_desktop_bridge_fails_if_dispatched_work_is_not_posted(monkeypatch):
+    """Repeated retrieve 202 without a desktop /responses post must surface as timeout."""
+
+    with live_relay_server() as base_url:
+        provider = compute_provider.DistributedApiV1ComputeProvider(
+            base_url=base_url,
+            timeout_seconds=1,
+        )
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        response_retrieve_calls = {"count": 0}
+        real_post = compute_provider.requests.post
+
+        def counted_post(url, *args, **kwargs):
+            if url.endswith("/api/v1/relay/responses/retrieve"):
+                response_retrieve_calls["count"] += 1
+            return real_post(url, *args, **kwargs)
+
+        monkeypatch.setattr(compute_provider.requests, "post", counted_post)
+        register_payload = desktop_client.register_api_v1_compute_node(base_url)
+        assert register_payload["next_ping_in_x_seconds"] > 0
+        error_holder = {}
+
+        def _browser_provider_request():
+            try:
+                provider.complete_chat(
+                    model_id="llama-3-8b-instruct",
+                    messages=[{"role": "user", "content": "ping without post"}],
+                )
+            except ComputeProviderError as exc:
+                error_holder["error"] = exc
+
+        browser_thread = threading.Thread(target=_browser_provider_request, daemon=True)
+        browser_thread.start()
+
+        # Intentionally do not poll/process work or call /api/v1/relay/responses.
+        browser_thread.join(timeout=3)
+
+    assert "error" in error_holder
+    assert error_holder["error"].code == "compute_node_timeout"
+    assert response_retrieve_calls["count"] > 1
 
 
 def test_api_v1_stream_true_fails_before_relay_queue():

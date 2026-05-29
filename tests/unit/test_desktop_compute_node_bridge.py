@@ -50,6 +50,16 @@ class FakeRelayClientRouting(FakeRelayClient):
     def __init__(self):
         self.endpoint_calls = []
 
+    def post_api_v1_error_response(self, payload, *, code, message):
+        self.endpoint_calls.append((
+            '/api/v1/relay/responses',
+            {
+                'request_id': payload.get('request_id'),
+                'api_v1_response': {'error': {'code': code, 'message': message}},
+            },
+        ))
+        return True
+
     def process_client_request(self, payload):
         endpoint = '/source'
         if payload.get('stream') is True and payload.get('stream_session_id'):
@@ -148,6 +158,25 @@ class ApiV1Runtime(FakeRuntime):
     def process_relay_request(self, payload):
         self._processed.append(payload)
         return self.relay_client.process_api_v1_chat_request(payload)
+
+
+
+
+class HangingWarmLoadApiV1Runtime(ApiV1Runtime):
+    last_instance = None
+
+    def __init__(self, _config):
+        super().__init__(_config)
+        HangingWarmLoadApiV1Runtime.last_instance = self
+        self.ready_started = threading.Event()
+
+    def ensure_api_v1_runtime_ready(self):
+        self.ready_started.set()
+        time.sleep(10)
+        return True
+
+    def process_relay_request(self, payload):
+        raise AssertionError('timed-out warm-load work should get encrypted error response')
 
 
 class MalformedWaitThenApiV1Runtime(ApiV1Runtime):
@@ -720,6 +749,45 @@ def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypa
     assert 'desktop.compute_node_bridge.api_v1_e2ee.work_received' in output.err
     assert 'desktop.compute_node_bridge.api_v1_e2ee.response_submitted' in output.err
     assert "ModuleNotFoundError: No module named 'api'" not in output.err
+
+
+def test_run_api_v1_payload_posts_error_when_warm_load_times_out(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=HangingWarmLoadApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_READY_TIMEOUT_SECONDS', '0.01')
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+    assert status == 0
+
+    runtime = HangingWarmLoadApiV1Runtime.last_instance
+    assert runtime is not None
+    assert runtime.ready_started.is_set()
+    assert runtime._processed == []
+    assert len(runtime.relay_client.endpoint_calls) == 1
+    endpoint, payload = runtime.relay_client.endpoint_calls[0]
+    assert endpoint == '/api/v1/relay/responses'
+    assert payload['request_id'] == 'req-1'
+    assert payload['api_v1_response']['error']['code'] == 'compute_node_runtime_not_ready'
+
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.model_init.wait.start' in output.err
+    assert 'desktop.compute_node_bridge.model_init.wait.timeout' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.error_response_submit.done' in output.err
+    assert 'submitted=True response_kind=error' in output.err
 
 
 def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):
@@ -1596,11 +1664,22 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
     calls = []
 
     class ApiPayloadWarmFailRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, _config):
+            ApiPayloadWarmFailRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClientRouting()
+            self._processed = []
+
         def ensure_api_v1_runtime_ready(self):
             calls.append("warm")
             return False
 
         def register_and_poll_once(self):
+            if getattr(self, "_sent", False):
+                return {"next_ping_in_x_seconds": 0}
+            self._sent = True
             return {
                 "protocol": "tokenplace_api_v1_relay_e2ee",
                 "version": 1,
@@ -1617,14 +1696,29 @@ def test_run_first_api_v1_payload_fails_closed_when_warm_load_fails(capsys, monk
             return True
 
     _install_fake_runtime_module(monkeypatch, runtime_cls=ApiPayloadWarmFailRuntime)
+    stop_counter = {"n": 0}
+
+    def fake_stop_requested():
+        stop_counter["n"] += 1
+        return stop_counter["n"] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
     monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
     args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
     status = compute_node_bridge.run(args)
-    assert status == 1
+    assert status == 0
     assert calls == ["warm"]
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
-    error_event = next(event for event in events if event.get("type") == "error")
-    assert error_event["warm_load_state"] == "failed"
+    runtime = ApiPayloadWarmFailRuntime.last_instance
+    assert runtime is not None
+    assert runtime._processed == []
+    assert runtime.relay_client.endpoint_calls[0][0] == '/api/v1/relay/responses'
+    assert runtime.relay_client.endpoint_calls[0][1]['request_id'] == 'req-bridge-fail-1'
+    assert runtime.relay_client.endpoint_calls[0][1]['api_v1_response']['error']['code'] == (
+        'compute_node_runtime_not_ready'
+    )
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.model_init.failed' in output.err
+    assert 'submitted=True response_kind=error' in output.err
 
 
 def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):

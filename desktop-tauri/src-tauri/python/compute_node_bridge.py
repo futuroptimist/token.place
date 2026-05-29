@@ -73,7 +73,7 @@ _stdin_reader_lock = threading.Lock()
 EARLY_STARTUP_EXIT_ERROR = "compute-node bridge exited before emitting a startup event"
 WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
-API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 10.0
+API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 
 
 _POLL_CANCELLED = object()
@@ -450,7 +450,7 @@ def run(args: argparse.Namespace) -> int:
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
     runtime_path = _runtime_path_from_env()
     dual_runtime_enabled = _env_enabled("TOKENPLACE_DESKTOP_DUAL_RUNTIME", "0")
-    bridge_runtime_allowed = runtime_path == "bridge" or dual_runtime_enabled
+    relay_runtime_path = "bridge"
     warm_load_state = "not_started"
     warm_load_started_at = 0.0
     warm_load_duration_ms: Optional[int] = None
@@ -487,6 +487,7 @@ def run(args: argparse.Namespace) -> int:
                 "warm_load_enabled": warm_load_enabled,
                 "warm_load_duration_ms": warm_load_duration_ms,
                 "runtime_path": runtime_path,
+                "relay_runtime_path": relay_runtime_path,
             }
         )
 
@@ -544,7 +545,7 @@ def run(args: argparse.Namespace) -> int:
                 )
             warm_load_future = warm_load_executor.submit(runtime.ensure_api_v1_runtime_ready)
             emit_status_event(
-                registered=True,
+                registered=False,
                 active_relay_url=active_relay_url,
                 current_last_error=last_error,
             )
@@ -645,7 +646,7 @@ def run(args: argparse.Namespace) -> int:
         nonlocal last_error, warm_load_fatal
         last_error = warm_load_failed or "failed to initialize API v1 model runtime"
         emit_status_event(
-            registered=True,
+            registered=False,
             active_relay_url=active_relay_url,
             current_last_error=last_error,
         )
@@ -657,6 +658,7 @@ def run(args: argparse.Namespace) -> int:
                 "warm_load_state": warm_load_state,
                 "warm_load_duration_ms": warm_load_duration_ms,
                 "runtime_path": runtime_path,
+                "relay_runtime_path": relay_runtime_path,
             }
         )
         warm_load_fatal = True
@@ -686,81 +688,132 @@ def run(args: argparse.Namespace) -> int:
             "warm_load_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
             "runtime_path": runtime_path,
+            "relay_runtime_path": relay_runtime_path,
         }
     )
-    if runtime_path == "sidecar" and dual_runtime_enabled:
+    if runtime_path == "sidecar":
         print(
-            "desktop.compute_node_bridge.runtime_path.dual_mode_enabled "
-            "runtime_path=sidecar dual_runtime_enabled=True",
+            "desktop.compute_node_bridge.runtime_path.relay_uses_bridge "
+            f"runtime_path={runtime_path} relay_runtime_path={relay_runtime_path} "
+            f"dual_runtime_enabled={dual_runtime_enabled}",
             file=sys.stderr,
         )
 
-    try:
-        while not stop_requested():
-            print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
-            active_relay_url = runtime.relay_client.relay_url
-            relay_response = poll_worker.call(runtime.register_and_poll_once, stop_requested)
-            if relay_response is _POLL_CANCELLED:
+    def warm_runtime_before_registration() -> bool:
+        if not warm_load_enabled:
+            print(
+                "desktop.compute_node_bridge.model_init.skipped "
+                "reason=warm_load_disabled relay_runtime_path=bridge",
+                file=sys.stderr,
+            )
+            return True
+        print(
+            "desktop.compute_node_bridge.registration.gate_wait_start "
+            f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+            f"runtime_path={runtime_path} relay_runtime_path={relay_runtime_path}",
+            file=sys.stderr,
+        )
+        ensure_runtime_ready(
+            "pre_registration",
+            active_relay_url=runtime.relay_client.relay_url,
+            block=False,
+        )
+        last_progress_log_at = time.monotonic()
+        while warm_load_state == "warming":
+            if ensure_runtime_ready(
+                "pre_registration",
+                active_relay_url=runtime.relay_client.relay_url,
+                block=True,
+                block_timeout_seconds=0.1,
+            ):
+                break
+            now = time.monotonic()
+            if now - last_progress_log_at >= 30:
+                last_progress_log_at = now
+                duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
-                    "desktop.compute_node_bridge.poll.cancelled "
-                    f"relay={_sanitize_relay_target(active_relay_url)}",
+                    "desktop.compute_node_bridge.model_init.still_warming "
+                    f"reason=pre_registration relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+                    f"state={warm_load_state} duration_ms={duration_ms}",
                     file=sys.stderr,
                 )
-                break
-            relay_response = relay_response if isinstance(relay_response, dict) else {}
-            active_relay_url = runtime.relay_client.relay_url
-            api_v1_payload = is_api_v1_relay_payload(relay_response)
-            relay_error = _relay_error_message(relay_response)
-            has_heartbeat = (
-                isinstance(relay_response, dict) and "next_ping_in_x_seconds" in relay_response
+            emit_status_event(
+                registered=False,
+                active_relay_url=runtime.relay_client.relay_url,
+                current_last_error=last_error,
             )
-            registered = (
-                relay_error is None
-                and (has_heartbeat or api_v1_payload)
-                and _registration_fresh(runtime.relay_client, active_relay_url)
-            )
-            wait_seconds = _safe_poll_wait_seconds(
-                relay_response, getattr(runtime.relay_client, "_request_timeout", 1)
-            )
-            request_id = (
-                relay_response.get("request_id")
-                if isinstance(relay_response, dict)
-                and isinstance(relay_response.get("request_id"), str)
-                else "none"
-            )
-            summary = _relay_response_summary(
-                relay_response, api_v1_payload=api_v1_payload, wait_seconds=wait_seconds
-            )
+            if stop_requested():
+                return False
+            time.sleep(0.01)
+        if warm_load_state == "failed":
+            fail_on_warm_load_error(active_relay_url=runtime.relay_client.relay_url)
+            return False
+        ready = warm_load_state == "ready"
+        print(
+            "desktop.compute_node_bridge.registration.gate_wait_done "
+            f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+            f"state={warm_load_state} ready={ready}",
+            file=sys.stderr,
+        )
+        return ready
 
-            print(
-                "desktop.compute_node_bridge.relay_poll "
-                f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
-                file=sys.stderr,
-            )
-
-            print(
-                "desktop.compute_node_bridge.api_v1_e2ee.poll "
-                f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
-                f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
-                f"request_id={request_id} wait={wait_seconds} summary={summary}",
-                file=sys.stderr,
-            )
-
-            api_v1_runtime_ready_for_request = True
-            terminate_after_api_v1_error = False
-            if registered and api_v1_payload and warm_load_enabled and warm_load_state != "ready":
-                if not bridge_runtime_allowed:
-                    warm_load_state = "not_started"
+    try:
+        if warm_runtime_before_registration():
+            while not stop_requested():
+                print("desktop.compute_node_bridge.api_v1_e2ee.register", file=sys.stderr)
+                active_relay_url = runtime.relay_client.relay_url
+                relay_response = poll_worker.call(runtime.register_and_poll_once, stop_requested)
+                if relay_response is _POLL_CANCELLED:
                     print(
-                        "desktop.compute_node_bridge.model_init.skipped "
-                        f"reason=api_v1_request runtime_path={runtime_path} "
-                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state} "
-                        f"request_id={request_id}",
+                        "desktop.compute_node_bridge.poll.cancelled "
+                        f"relay={_sanitize_relay_target(active_relay_url)}",
                         file=sys.stderr,
                     )
-                else:
+                    break
+                relay_response = relay_response if isinstance(relay_response, dict) else {}
+                active_relay_url = runtime.relay_client.relay_url
+                api_v1_payload = is_api_v1_relay_payload(relay_response)
+                relay_error = _relay_error_message(relay_response)
+                has_heartbeat = (
+                    isinstance(relay_response, dict) and "next_ping_in_x_seconds" in relay_response
+                )
+                registered = (
+                    relay_error is None
+                    and (has_heartbeat or api_v1_payload)
+                    and _registration_fresh(runtime.relay_client, active_relay_url)
+                )
+                wait_seconds = _safe_poll_wait_seconds(
+                    relay_response, getattr(runtime.relay_client, "_request_timeout", 1)
+                )
+                request_id = (
+                    relay_response.get("request_id")
+                    if isinstance(relay_response, dict)
+                    and isinstance(relay_response.get("request_id"), str)
+                    else "none"
+                )
+                summary = _relay_response_summary(
+                    relay_response, api_v1_payload=api_v1_payload, wait_seconds=wait_seconds
+                )
+
+                print(
+                    "desktop.compute_node_bridge.relay_poll "
+                    f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
+                    f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
+                    f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                    file=sys.stderr,
+                )
+
+                print(
+                    "desktop.compute_node_bridge.api_v1_e2ee.poll "
+                    f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
+                    f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
+                    f"request_id={request_id} wait={wait_seconds} summary={summary}",
+                    file=sys.stderr,
+                )
+
+                api_v1_runtime_ready_for_request = True
+                terminate_after_api_v1_error = False
+                if registered and api_v1_payload and warm_load_enabled and warm_load_state != "ready":
                     api_v1_runtime_ready_for_request = ensure_runtime_ready(
                         "api_v1_request",
                         active_relay_url=active_relay_url,
@@ -769,109 +822,103 @@ def run(args: argparse.Namespace) -> int:
                         block_timeout_seconds=_api_v1_warm_load_wait_seconds(),
                     )
                     if not api_v1_runtime_ready_for_request:
-                        code = (
-                            "compute_node_runtime_not_ready"
-                            if warm_load_state == "warming"
-                            else "compute_node_runtime_unavailable"
-                        )
                         last_error = warm_load_failed or "API v1 model runtime is not ready"
-                        submit_api_v1_error_response(
-                            relay_response,
-                            code=code,
-                            message=last_error,
-                            active_relay_url=active_relay_url,
-                            request_id=request_id,
+                        if warm_load_state == "failed":
+                            submit_api_v1_error_response(
+                                relay_response,
+                                code="compute_node_runtime_unavailable",
+                                message=last_error,
+                                active_relay_url=active_relay_url,
+                                request_id=request_id,
+                            )
+                            terminate_after_api_v1_error = True
+                        else:
+                            print(
+                                "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.deferred "
+                                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                                f"state={warm_load_state}",
+                                file=sys.stderr,
+                            )
+
+                if terminate_after_api_v1_error:
+                    fail_on_warm_load_error(active_relay_url=active_relay_url)
+                    break
+
+                if not registered:
+                    if relay_error is not None:
+                        last_error = relay_error
+                    else:
+                        last_error = (
+                            "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
+                            "operator; update relay.py to repo HEAD"
                         )
-                        terminate_after_api_v1_error = warm_load_state == "failed"
-
-            if terminate_after_api_v1_error:
-                fail_on_warm_load_error(active_relay_url=active_relay_url)
-                break
-
-            if not registered:
-                if relay_error is not None:
-                    last_error = relay_error
-                else:
-                    last_error = (
-                        "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
-                        "operator; update relay.py to repo HEAD"
-                    )
-            elif api_v1_payload:
-                if not api_v1_runtime_ready_for_request:
-                    print(
-                        "desktop.compute_node_bridge.process_request.skipped_runtime_not_ready "
-                        f"relay={_sanitize_relay_target(active_relay_url)} "
-                        f"request_id={request_id} state={warm_load_state}",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"desktop.compute_node_bridge.request_route runtime_path={runtime_path} "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
-                        file=sys.stderr,
-                    )
-                    print(
-                        "desktop.compute_node_bridge.process_request "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
-                        file=sys.stderr,
-                    )
-                    print(
-                        "desktop.compute_node_bridge.api_v1_e2ee.work_received "
-                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
-                        file=sys.stderr,
-                    )
-                    try:
-                        processed = runtime.process_relay_request(relay_response)
-                    except Exception as exc:
-                        processed = False
-                        last_error = "failed to process relay request"
+                elif api_v1_payload:
+                    if not api_v1_runtime_ready_for_request:
                         print(
-                            "desktop.compute_node_bridge.process_request.exception "
-                            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
-                            f"exc_type={type(exc).__name__}",
+                            "desktop.compute_node_bridge.process_request.skipped_runtime_not_ready "
+                            f"relay={_sanitize_relay_target(active_relay_url)} "
+                            f"request_id={request_id} state={warm_load_state}",
                             file=sys.stderr,
                         )
-                    if not processed:
-                        last_error = "failed to process relay request"
+                    else:
                         print(
-                            "desktop.compute_node_bridge.process_request.failed "
+                            f"desktop.compute_node_bridge.request_route runtime_path={runtime_path} "
                             f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
                             file=sys.stderr,
                         )
-                        submit_api_v1_error_response(
-                            relay_response,
-                            code="compute_node_process_failed",
-                            message=last_error,
-                            active_relay_url=active_relay_url,
-                            request_id=request_id,
-                        )
-                    else:
-                        last_error = None
                         print(
-                            "desktop.compute_node_bridge.api_v1_e2ee.response_submitted "
-                            f"relay={_sanitize_relay_target(active_relay_url)} "
-                            f"request_id={request_id}",
+                            "desktop.compute_node_bridge.process_request "
+                            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
                             file=sys.stderr,
                         )
-            else:
-                if has_heartbeat:
-                    last_error = None
+                        print(
+                            "desktop.compute_node_bridge.api_v1_e2ee.work_received "
+                            f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                            file=sys.stderr,
+                        )
+                        try:
+                            processed = runtime.process_relay_request(relay_response)
+                        except Exception as exc:
+                            processed = False
+                            last_error = "failed to process relay request"
+                            print(
+                                "desktop.compute_node_bridge.process_request.exception "
+                                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                                f"exc_type={type(exc).__name__}",
+                                file=sys.stderr,
+                            )
+                        if not processed:
+                            last_error = "failed to process relay request"
+                            print(
+                                "desktop.compute_node_bridge.process_request.failed "
+                                f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                                file=sys.stderr,
+                            )
+                            submit_api_v1_error_response(
+                                relay_response,
+                                code="compute_node_process_failed",
+                                message=last_error,
+                                active_relay_url=active_relay_url,
+                                request_id=request_id,
+                            )
+                        else:
+                            last_error = None
+                            print(
+                                "desktop.compute_node_bridge.api_v1_e2ee.response_submitted "
+                                f"relay={_sanitize_relay_target(active_relay_url)} "
+                                f"request_id={request_id}",
+                                file=sys.stderr,
+                            )
                 else:
-                    last_error = (
-                        "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
-                        "operator; update relay.py to repo HEAD"
-                    )
+                    if has_heartbeat:
+                        last_error = None
+                    else:
+                        last_error = (
+                            "relay appears unreachable, old, or incompatible with desktop-v0.1.0 "
+                            "operator; update relay.py to repo HEAD"
+                        )
 
-            if registered and warm_load_enabled and warm_load_state == "not_started":
-                if not bridge_runtime_allowed:
-                    warm_load_state = "not_started"
-                    print(
-                        "desktop.compute_node_bridge.model_init.skipped "
-                        f"reason=post_registration runtime_path={runtime_path} "
-                        f"dual_runtime_enabled={dual_runtime_enabled} state={warm_load_state}",
-                        file=sys.stderr,
-                    )
-                else:
+                if registered and warm_load_enabled and warm_load_state == "not_started":
                     if (
                         not ensure_runtime_ready(
                             "post_registration", active_relay_url=active_relay_url, block=False
@@ -880,19 +927,19 @@ def run(args: argparse.Namespace) -> int:
                     ):
                         fail_on_warm_load_error(active_relay_url=active_relay_url)
                         break
-            emit_status_event(
-                registered=registered,
-                active_relay_url=active_relay_url,
-                current_last_error=last_error,
-            )
-
-            if _sleep_with_cancel(wait_seconds):
-                print(
-                    "desktop.compute_node_bridge.stop_requested "
-                    f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
-                    file=sys.stderr,
+                emit_status_event(
+                    registered=registered,
+                    active_relay_url=active_relay_url,
+                    current_last_error=last_error,
                 )
-                break
+
+                if _sleep_with_cancel(wait_seconds):
+                    print(
+                        "desktop.compute_node_bridge.stop_requested "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id}",
+                        file=sys.stderr,
+                    )
+                    break
     except KeyboardInterrupt:
         pass
     finally:
@@ -925,6 +972,7 @@ def run(args: argparse.Namespace) -> int:
             "warm_load_enabled": warm_load_enabled,
             "warm_load_duration_ms": warm_load_duration_ms,
             "runtime_path": runtime_path,
+            "relay_runtime_path": relay_runtime_path,
         }
     )
     return 1 if warm_load_fatal else 0

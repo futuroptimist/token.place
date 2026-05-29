@@ -420,6 +420,7 @@ describe('desktop app start failure handling', () => {
         type: 'status',
         running: true,
         registered: true,
+        warm_load_state: 'ready',
         last_error: null,
       },
     });
@@ -427,6 +428,32 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+
+  it('does not display registered yes while relay runtime is warming', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        warm_load_state: 'warming',
+        effective_mode: 'pending',
+        backend_available: 'unknown',
+        backend_selected: 'unknown',
+        backend_used: 'unknown',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming');
   });
 
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {

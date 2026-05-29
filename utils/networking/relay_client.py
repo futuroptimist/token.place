@@ -22,6 +22,18 @@ logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
 
 
+def _sanitize_relay_url_for_log(relay_url: Any) -> str:
+    """Return scheme/host/port only for relay diagnostics."""
+
+    if not isinstance(relay_url, str):
+        return "unknown"
+    parsed = urlparse(relay_url.strip())
+    if not parsed.scheme or not parsed.hostname:
+        return "unknown"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunparse((parsed.scheme, f"{parsed.hostname}{port}", "", "", "", ""))
+
+
 def _load_jsonschema():
     """Lazy-load jsonschema; return ``None`` when unavailable in packaged runtimes."""
     try:
@@ -1397,32 +1409,78 @@ class RelayClient:
             submitted = source_response.status_code == 200
             route = "/api/v1/relay/responses"
             protocol = "tokenplace_api_v1_relay_e2ee"
+            relay_target = _sanitize_relay_url_for_log(self._api_v1_response_relay_url())
             if submitted:
                 log_info(
-                    "API v1 E2EE response submission request_id={} protocol={} route={} submitted={}",
+                    "API v1 E2EE response submission request_id={} protocol={} route={} relay={} submitted={}",
                     response_envelope["request_id"],
                     protocol,
                     route,
+                    relay_target,
                     submitted,
                 )
             else:
                 log_error(
-                    "API v1 E2EE response submission failed request_id={} protocol={} route={} http_status={}",
+                    "API v1 E2EE response submission failed request_id={} protocol={} route={} relay={} http_status={} submitted={}",
                     response_envelope["request_id"],
                     protocol,
                     route,
+                    relay_target,
                     source_response.status_code,
+                    submitted,
                 )
             return submitted
         except Exception:
             log_error(
-                "Failed to encrypt or post API v1 response request_id={} protocol={} route={}",
+                "Failed to encrypt or post API v1 response request_id={} protocol={} route={} relay={}",
                 response_envelope.get("request_id"),
                 response_envelope.get("protocol", "tokenplace_api_v1_relay_e2ee"),
                 "/api/v1/relay/responses",
+                _sanitize_relay_url_for_log(self._api_v1_response_relay_url()),
                 exc_info=True,
             )
             return False
+
+
+    def post_api_v1_error_response(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> bool:
+        """Encrypt and submit a structured API v1 error response for queued work."""
+
+        request_id = request_data.get("request_id") if isinstance(request_data, dict) else None
+        if not isinstance(request_id, str) or not request_id.strip():
+            log_error("API v1 error response missing request_id; cannot submit structured error")
+            return False
+
+        try:
+            client_pub_key_b64 = _normalize_client_public_key_b64(request_data["client_public_key"])
+            if client_pub_key_b64 is None:
+                log_error(
+                    "API v1 error response invalid client key metadata request_id={}",
+                    request_id,
+                )
+                return False
+            client_pub_key = base64.b64decode(client_pub_key_b64, validate=True)
+        except (KeyError, AttributeError, binascii.Error, ValueError):
+            log_error(
+                "API v1 error response could not decode client key metadata request_id={}",
+                request_id,
+            )
+            return False
+
+        response_envelope = self._api_v1_response_envelope(
+            request_id,
+            error={"code": code, "message": message},
+        )
+        return self._post_api_v1_response(
+            response_envelope,
+            client_pub_key_b64=client_pub_key_b64,
+            client_pub_key=client_pub_key,
+        )
 
     @staticmethod
     def _valid_api_v1_assistant_message(message: Any) -> Optional[Dict[str, Any]]:

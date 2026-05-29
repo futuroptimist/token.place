@@ -806,6 +806,58 @@ def test_relay_client_api_v1_posts_encrypted_internal_error_for_invalid_inferenc
     assert encrypted_payload["request_id"] == "req-invalid-inference-output"
     assert encrypted_payload["api_v1_response"]["error"]["code"] == "compute_node_invalid_model_output"
 
+
+def test_relay_client_submit_api_v1_error_response_posts_ciphertext_only(monkeypatch):
+    crypto_stub = _RelayClientApiV1CryptoStub({})
+    relay_client = _build_relay_client_for_api_v1_tests(crypto_stub)
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, **_kwargs):
+        captured["url"] = url
+        captured["payload"] = json
+        captured["timeout"] = timeout
+
+        class _Response:
+            status_code = 200
+
+        return _Response()
+
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", fake_post)
+
+    request_data = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-runtime-not-ready",
+        "client_public_key": DUMMY_CLIENT_PUB_KEY,
+        "chat_history": "opaque",
+        "cipherkey": "opaque",
+        "iv": "opaque",
+    }
+
+    assert relay_client.submit_api_v1_error_response(
+        request_data,
+        code="compute_node_runtime_not_ready",
+        message="API v1 model runtime is not ready",
+    ) is True
+
+    assert captured["url"] == "https://relay.example/api/v1/relay/responses"
+    assert captured["timeout"] == relay_client._request_timeout
+    posted = captured["payload"]
+    assert posted["request_id"] == "req-runtime-not-ready"
+    assert posted["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert posted["version"] == 1
+    assert "chat_history" in posted and "cipherkey" in posted and "iv" in posted
+    assert "api_v1_response" not in posted
+    assert "API v1 model runtime is not ready" not in json.dumps(posted)
+
+    encrypted_payload = crypto_stub.last_encrypted_payload
+    assert encrypted_payload["request_id"] == "req-runtime-not-ready"
+    assert encrypted_payload["api_v1_response"]["error"] == {
+        "code": "compute_node_runtime_not_ready",
+        "message": "API v1 model runtime is not ready",
+    }
+
+
 # --- Test /faucet ---
 
 def test_faucet_submit_request(client):

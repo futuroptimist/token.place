@@ -1117,6 +1117,13 @@ def run(args: argparse.Namespace) -> int:
                             f"request_id={request_id}",
                             file=sys.stderr,
                         )
+                    wait_seconds = 0.0
+                    print(
+                        "desktop.compute_node_bridge.api_v1_e2ee.work_processed_next_poll_immediate "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        "wait=0.0",
+                        file=sys.stderr,
+                    )
                 else:
                     if has_heartbeat:
                         last_error = None

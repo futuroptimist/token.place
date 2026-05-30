@@ -454,7 +454,10 @@ client_responses = {}
 client_responses_lock = threading.Lock()
 client_pending_request_ids = {}
 client_pending_request_ids_lock = threading.Lock()
+client_abandoned_request_ids = {}
+client_abandoned_request_ids_lock = threading.Lock()
 PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
+ABANDONED_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_ABANDONED_REQUEST_TTL_SECONDS", "300"))
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 api_v1_in_flight_requests_lock = threading.Lock()
@@ -521,6 +524,134 @@ def _api_v1_in_flight_ttl_seconds() -> float:
     except ValueError:
         return max(float(_api_v1_lease_seconds()), 1.0)
     return max(value, 1.0)
+
+
+
+def _safe_public_key_fingerprint(public_key):
+    """Return a short, non-sensitive fingerprint for relay logs."""
+    if not isinstance(public_key, str) or not public_key:
+        return "unknown"
+    if len(public_key) <= 12:
+        return "short-key"
+    return f"{public_key[:8]}...{public_key[-4:]}"
+
+
+def _mark_request_abandoned(client_public_key, request_id, *, status="cancelled"):
+    """Remember terminal requester-side state so retrieve returns deterministic semantics."""
+    if not client_public_key or not request_id:
+        return
+    with client_abandoned_request_ids_lock:
+        abandoned_ids = client_abandoned_request_ids.setdefault(client_public_key, {})
+        abandoned_ids[request_id] = {"status": status, "marked_at": time.time()}
+
+
+def _pop_abandoned_request_status(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return None
+    with client_abandoned_request_ids_lock:
+        abandoned_ids = client_abandoned_request_ids.get(client_public_key)
+        if not abandoned_ids:
+            return None
+        record = abandoned_ids.get(request_id)
+        if not isinstance(record, dict):
+            abandoned_ids.pop(request_id, None)
+            return None
+        marked_at = record.get("marked_at")
+        if isinstance(marked_at, (int, float)) and ABANDONED_REQUEST_TTL_SECONDS > 0:
+            if (time.time() - float(marked_at)) > ABANDONED_REQUEST_TTL_SECONDS:
+                abandoned_ids.pop(request_id, None)
+                if not abandoned_ids:
+                    client_abandoned_request_ids.pop(client_public_key, None)
+                return None
+        return record.get("status") or "cancelled"
+
+
+def _remove_queued_api_v1_request(client_public_key, request_id, *, status="cancelled"):
+    """Remove an API v1 request from server queues before it can be dispatched."""
+    if not client_public_key or not request_id:
+        return False
+    removed = False
+    with client_inference_requests_changed:
+        for server_public_key, queued_requests in list(client_inference_requests.items()):
+            if not isinstance(queued_requests, list):
+                continue
+            kept = []
+            for item in queued_requests:
+                if (
+                    isinstance(item, dict)
+                    and bool(item.get("e2ee_v1"))
+                    and item.get("client_public_key") == client_public_key
+                    and item.get("request_id") == request_id
+                ):
+                    removed = True
+                    LOGGER.info(
+                        "relay.api_v1.request_removed_from_queue",
+                        extra={
+                            "server_key_fingerprint": _safe_public_key_fingerprint(
+                                server_public_key
+                            ),
+                            "request_id": request_id,
+                            "status": status,
+                        },
+                    )
+                    continue
+                kept.append(item)
+            if kept:
+                client_inference_requests[server_public_key] = kept
+            else:
+                client_inference_requests.pop(server_public_key, None)
+        if removed:
+            client_inference_requests_changed.notify_all()
+    return removed
+
+
+def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled"):
+    """Cancel/expire a requester-abandoned API v1 request and clean queue state."""
+    if not client_public_key or not request_id:
+        return False
+    removed = _remove_queued_api_v1_request(client_public_key, request_id, status=status)
+    _clear_pending_request(client_public_key, request_id)
+    _mark_request_abandoned(client_public_key, request_id, status=status)
+    log_event = (
+        "relay.api_v1.request_cancelled"
+        if status == "cancelled"
+        else "relay.api_v1.request_expired"
+    )
+    LOGGER.info(
+        log_event,
+        extra={
+            "client_key_fingerprint": _safe_public_key_fingerprint(client_public_key),
+            "request_id": request_id,
+            "removed_from_queue": removed,
+        },
+    )
+    return removed
+
+
+
+def _expire_pending_api_v1_requests():
+    """Expire pending request markers and remove matching queued work."""
+    if PENDING_REQUEST_TTL_SECONDS <= 0:
+        return
+    now = time.time()
+    expired: list[tuple[str, str]] = []
+    with client_pending_request_ids_lock:
+        for client_public_key, pending_ids in list(client_pending_request_ids.items()):
+            if not isinstance(pending_ids, dict):
+                client_pending_request_ids.pop(client_public_key, None)
+                continue
+            for request_id, queued_at in list(pending_ids.items()):
+                try:
+                    age = now - float(queued_at)
+                except (TypeError, ValueError):
+                    age = PENDING_REQUEST_TTL_SECONDS + 1
+                if age > PENDING_REQUEST_TTL_SECONDS:
+                    pending_ids.pop(request_id, None)
+                    expired.append((client_public_key, request_id))
+            if not pending_ids:
+                client_pending_request_ids.pop(client_public_key, None)
+    for client_public_key, request_id in expired:
+        _cancel_api_v1_request(client_public_key, request_id, status="expired")
 
 def _pop_next_api_v1_request(public_key: str):
     queued_requests = client_inference_requests.get(public_key, [])
@@ -598,6 +729,7 @@ def _evict_stale_servers() -> list[str]:
 
 
 def _live_server_diagnostics() -> list[dict[str, Any]]:
+    _expire_pending_api_v1_requests()
     diagnostics: list[dict[str, Any]] = []
     for server_public_key, payload in list(known_servers.items()):
         diagnostics.append({
@@ -1045,12 +1177,23 @@ def _clear_pending_requests_for_queued_items(queued_items):
             continue
         if not bool(item.get("e2ee_v1")):
             continue
-        _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
+        client_public_key = item.get("client_public_key")
+        request_id = item.get("request_id")
+        _clear_pending_request(client_public_key, request_id)
+        _mark_request_abandoned(client_public_key, request_id, status="cancelled")
+        LOGGER.info(
+            "relay.api_v1.request_removed_from_queue",
+            extra={
+                "request_id": request_id,
+                "status": "cancelled",
+            },
+        )
 
 
 def _is_request_pending(client_public_key, request_id):
     if not client_public_key or not request_id:
         return False
+    expired = False
     with client_pending_request_ids_lock:
         pending_ids = client_pending_request_ids.get(client_public_key)
         if not pending_ids:
@@ -1058,12 +1201,19 @@ def _is_request_pending(client_public_key, request_id):
         queued_at = pending_ids.get(request_id)
         if queued_at is None:
             return False
-        if PENDING_REQUEST_TTL_SECONDS > 0 and (time.time() - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS:
+        if (
+            PENDING_REQUEST_TTL_SECONDS > 0
+            and (time.time() - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS
+        ):
             pending_ids.pop(request_id, None)
             if not pending_ids:
                 client_pending_request_ids.pop(client_public_key, None)
-            return False
-        return True
+            expired = True
+        else:
+            return True
+    if expired:
+        _cancel_api_v1_request(client_public_key, request_id, status="expired")
+    return False
 
 
 def _pop_client_response(client_public_key, request_id=None):
@@ -1155,6 +1305,7 @@ def api_v1_relay_servers_poll():
     known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
     LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
+    _expire_pending_api_v1_requests()
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     known_servers[public_key]['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
     with client_inference_requests_changed:
@@ -1201,7 +1352,7 @@ def api_v1_relay_servers_poll():
     LOGGER.info(
         "relay.api_v1.request_dispatched",
         extra={
-            "server_public_key": public_key,
+            "server_key_fingerprint": _safe_public_key_fingerprint(public_key),
             "request_id": first_request.get("request_id"),
             "queued_at_unix": queued_at,
             "dispatched_at_unix": time.time(),
@@ -1244,7 +1395,7 @@ def api_v1_relay_requests():
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
-            "server_public_key": server_public_key,
+            "server_key_fingerprint": _safe_public_key_fingerprint(server_public_key),
             "request_id": envelope.get("request_id"),
             "queued_at_unix": queued_at,
             "queue_depth": queue_depth,
@@ -1285,8 +1436,45 @@ def api_v1_relay_responses():
                         server_payload.pop('api_v1_in_flight_requests', None)
                     break
 
+    abandoned_status = _pop_abandoned_request_status(client_public_key, request_id)
+    if abandoned_status in {"cancelled", "expired"}:
+        LOGGER.info(
+            "relay.api_v1.late_response_discarded",
+            extra={
+                "client_key_fingerprint": _safe_public_key_fingerprint(client_public_key),
+                "request_id": request_id,
+                "status": abandoned_status,
+            },
+        )
+        return jsonify(
+            {'message': 'Response ignored for abandoned request', 'status': abandoned_status}
+        ), 202
+
     _queue_client_response(client_public_key, envelope)
+    LOGGER.info(
+        "relay.api_v1.response_received",
+        extra={
+            "client_key_fingerprint": _safe_public_key_fingerprint(client_public_key),
+            "request_id": request_id,
+        },
+    )
     return jsonify({'message': 'Response received and queued for client'}), 200
+
+
+@app.route('/api/v1/relay/requests/cancel', methods=['POST'])
+def api_v1_relay_requests_cancel():
+    """Cancel an abandoned API v1 relay request before future dispatch."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+    client_public_key = data.get('client_public_key')
+    request_id = data.get('request_id')
+    if not client_public_key or not request_id:
+        return jsonify(
+            {'error': {'message': 'Missing client_public_key or request_id', 'code': 400}}
+        ), 400
+    removed = _cancel_api_v1_request(client_public_key, request_id, status='cancelled')
+    return jsonify({'status': 'cancelled', 'removed_from_queue': removed}), 200
 
 
 @app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
@@ -1303,13 +1491,32 @@ def api_v1_relay_responses_retrieve():
         if _is_request_pending(client_public_key, request_id):
             LOGGER.debug(
                 "relay.api_v1.response_pending",
-                extra={"client_public_key": client_public_key, "request_id": request_id},
+                extra={
+                    "client_key_fingerprint": _safe_public_key_fingerprint(client_public_key),
+                    "request_id": request_id,
+                },
             )
             return jsonify({"status": "pending"}), 202
+        abandoned_status = _pop_abandoned_request_status(client_public_key, request_id)
+        if abandoned_status in {"cancelled", "expired"}:
+            return jsonify({
+                'error': {
+                    'message': f'API v1 relay request {abandoned_status}',
+                    'code': f'request_{abandoned_status}',
+                    'status': abandoned_status,
+                }
+            }), 410
         if request_id:
             return jsonify({'error': {'message': f'Unknown request_id: {request_id}', 'code': 404}}), 404
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
+    LOGGER.info(
+        "relay.api_v1.response_retrieved",
+        extra={
+            "client_key_fingerprint": _safe_public_key_fingerprint(client_public_key),
+            "request_id": response.get('request_id') if isinstance(response, dict) else request_id,
+        },
+    )
     return jsonify(response), 200
 
 @app.route('/faucet', methods=['POST'])

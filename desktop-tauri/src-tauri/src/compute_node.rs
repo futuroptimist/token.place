@@ -1014,6 +1014,42 @@ mod tests {
     }
 
     #[test]
+    fn update_status_from_event_marks_warm_load_timeout_failed_and_unregistered() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            relay_runtime_state: Some("warming".into()),
+            warm_load_state: Some("warming".into()),
+            operator_session_id: Some("session-timeout".into()),
+            sequence: Some(2),
+            ..ComputeNodeStatus::default()
+        };
+
+        let payload = serde_json::json!({
+            "type": "error",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "failed",
+            "warm_load_state": "failed",
+            "warm_load_duration_ms": 120000,
+            "last_error": "API v1 relay runtime warm-load timed out after 120s",
+            "operator_session_id": "session-timeout",
+            "sequence": 3
+        });
+
+        assert!(update_status_from_event(&mut status, &payload));
+        assert!(!status.running);
+        assert!(!status.registered);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("failed"));
+        assert_eq!(status.warm_load_state.as_deref(), Some("failed"));
+        assert_eq!(status.warm_load_duration_ms, Some(120000));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("API v1 relay runtime warm-load timed out after 120s")
+        );
+    }
+
+    #[test]
     fn update_status_from_event_ignores_stale_prior_session_events() {
         let mut status = ComputeNodeStatus {
             running: true,

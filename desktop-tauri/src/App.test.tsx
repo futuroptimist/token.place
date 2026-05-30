@@ -1118,6 +1118,47 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+  it('shows warm-load timeout as stopped and unregistered with retry enabled', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      relay_runtime_state: 'warming',
+      warm_load_state: 'warming',
+      warm_load_enabled: true,
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      operator_session_id: 'session-timeout',
+      sequence: 2,
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        warm_load_state: 'failed',
+        warm_load_duration_ms: 120000,
+        last_error: 'API v1 relay runtime warm-load timed out after 120s',
+        operator_session_id: 'session-timeout',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
+    expect(screen.getByText(/Last error:/).textContent).toContain(
+      'API v1 relay runtime warm-load timed out after 120s'
+    );
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+  });
+
   it('surfaces fresh restart errors from a new operator session', async () => {
     mockInitialComputeStatus({
       running: false,

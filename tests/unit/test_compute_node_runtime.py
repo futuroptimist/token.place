@@ -156,6 +156,33 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_without_diagnostics_di
     assert model_manager.last_compute_diagnostics == "not-a-dict"
 
 
+def test_compute_node_runtime_api_v1_warmup_logs_file_and_runtime_readiness(caplog):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.model_path = "/tmp/model.gguf"
+    model_manager.download_model_if_needed.return_value = True
+    model_manager.last_compute_diagnostics = {}
+    llm_runtime = MagicMock()
+    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_runtime
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    with caplog.at_level("INFO", logger="utils.compute_node_runtime"):
+        assert runtime.ensure_api_v1_runtime_ready() is True
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Model file ready for runtime initialization path=/tmp/model.gguf" in messages
+    assert "API v1 runtime warmup loading Llama runtime" in messages
+    assert "API v1 runtime warmup completed; runtime ready for inference" in messages
+    assert "Model ready for inference" not in messages
+
+
 def test_compute_node_runtime_polling_thread_delegates_to_relay():
     relay_client = MagicMock()
     relay_client.poll_relay_continuously = MagicMock()

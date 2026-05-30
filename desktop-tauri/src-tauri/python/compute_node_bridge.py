@@ -556,6 +556,17 @@ def run(args: argparse.Namespace) -> int:
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
+        "desktop.compute_node_bridge.model_init.stage.runtime_setup_selected "
+        f"mode={args.mode} "
+        f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
+        f"device={runtime_setup.get('detected_device', 'cpu')} "
+        f"action={runtime_setup.get('runtime_action', 'none')} "
+        f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
+        f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        file=sys.stderr,
+    )
+    print(
         "desktop.runtime_setup "
         f"mode={args.mode} "
         f"selected_backend={runtime_setup.get('selected_backend', 'cpu')} "
@@ -924,14 +935,25 @@ def run(args: argparse.Namespace) -> int:
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
             if remaining_seconds <= 0:
                 warm_load_state = "failed"
-                warm_load_failed = "timed out initializing API v1 model runtime before relay registration"
+                timeout_display = (
+                    str(int(warm_load_deadline_seconds))
+                    if float(warm_load_deadline_seconds).is_integer()
+                    else str(warm_load_deadline_seconds)
+                )
+                warm_load_failed = (
+                    "API v1 relay runtime warm-load timed out after "
+                    f"{timeout_display}s"
+                )
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 last_error = warm_load_failed
+                if warm_load_future is not None and not warm_load_future.done():
+                    warm_load_future.cancel()
                 print(
                     "desktop.compute_node_bridge.registration.gate_wait_timeout "
                     f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
                     f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
-                    f"timeout_seconds={warm_load_deadline_seconds}",
+                    f"timeout_seconds={warm_load_deadline_seconds} "
+                    f"message={warm_load_failed}",
                     file=sys.stderr,
                 )
                 emit_status_event(
@@ -1234,6 +1256,12 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         if warm_load_future is not None and not warm_load_future.done():
+            print(
+                "desktop.compute_node_bridge.model_init.cancel_requested "
+                f"operator_session_id={bridge_session_id} "
+                f"state={warm_load_state} relay={_sanitize_relay_target(active_relay_url)}",
+                file=sys.stderr,
+            )
             warm_load_future.cancel()
         runtime.stop()
         print(

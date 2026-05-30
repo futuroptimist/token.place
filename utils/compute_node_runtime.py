@@ -281,25 +281,38 @@ class ComputeNodeRuntime:
         else:
             self.request_adapters = list(request_adapters)
 
-    def ensure_model_ready(self) -> bool:
-        """Initialize model runtime and report readiness."""
+    def ensure_model_file_ready(self) -> bool:
+        """Ensure the configured model file exists before runtime initialization."""
 
-        _log_info("Initializing LLM...")
+        _log_info("Checking model file before LLM runtime initialization...")
         if self.model_manager.use_mock_llm:
             _log_info("Using mock LLM based on configuration")
             return True
 
+        model_path = getattr(self.model_manager, "model_path", "unknown")
+        _log_info(f"Model file lookup started path={model_path}")
         if self.model_manager.download_model_if_needed():
-            _log_info("Model ready for inference")
+            _log_info(f"Model file ready for runtime initialization path={model_path}")
             return True
 
         _log_error("Failed to download or verify model")
         return False
 
+    def ensure_model_ready(self) -> bool:
+        """Backward-compatible model-file readiness check.
+
+        Runtime readiness for API v1 is only reported by
+        :meth:`ensure_api_v1_runtime_ready` after the Llama runtime is loaded and
+        exposes ``create_chat_completion``.
+        """
+
+        return self.ensure_model_file_ready()
+
     def ensure_api_v1_runtime_ready(self) -> bool:
         """Warm and validate API v1 non-streaming runtime before polling."""
 
-        if not self.ensure_model_ready():
+        _log_info("API v1 runtime warmup started")
+        if not self.ensure_model_file_ready():
             return False
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
@@ -308,6 +321,7 @@ class ComputeNodeRuntime:
             return False
 
         try:
+            _log_info("API v1 runtime warmup loading Llama runtime")
             llm_runtime = get_llm_instance()
         except Exception:
             _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
@@ -329,6 +343,7 @@ class ComputeNodeRuntime:
             diagnostics["api_v1_runtime_ready"] = True
             self.model_manager.last_compute_diagnostics = diagnostics
 
+        _log_info("API v1 runtime warmup completed; runtime ready for inference")
         return True
 
     def start_relay_polling(self) -> threading.Thread:

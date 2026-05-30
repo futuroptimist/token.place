@@ -1869,7 +1869,13 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
         if event.get("type") == "status" and event.get("warm_load_state") == "warming"
     ]
     assert len(warming_status_events) == 1
+    assert error_event["message"] == "API v1 relay runtime warm-load timed out after 0.05s"
+    assert error_event["running"] is False
+    assert error_event["registered"] is False
     assert "registration.gate_wait_timeout" in captured.err
+    assert "API v1 relay runtime warm-load timed out after 0.05s" in captured.err
+    assert "model_init.cancel_requested" in captured.err
+    assert "desktop.compute_node_bridge.api_v1_e2ee.register" not in captured.err
     assert "api_v1_e2ee.runtime_wait.start" not in captured.err
     assert "api_v1_e2ee.runtime_wait.timeout" not in captured.err
 
@@ -1914,6 +1920,59 @@ def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatc
     finally:
         release_poll.set()
     _ = capsys.readouterr()
+
+
+def test_run_start_after_pre_registration_timeout_uses_fresh_session_and_can_register(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+    run_number = {"value": 0}
+    never_release_warmup = threading.Event()
+
+    class RetryRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            run_number["value"] += 1
+            self.run_number = run_number["value"]
+
+        def ensure_api_v1_runtime_ready(self):
+            calls.append((self.run_number, "warm"))
+            if self.run_number == 1:
+                never_release_warmup.wait()
+                return True
+            return True
+
+        def register_and_poll_once(self):
+            calls.append((self.run_number, "poll"))
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RetryRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "0.02")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    first = capsys.readouterr()
+    assert "desktop.compute_node_bridge.api_v1_e2ee.register" not in first.err
+
+    stop_calls = {"count": 0}
+
+    def stop_after_registration():
+        stop_calls["count"] += 1
+        return stop_calls["count"] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_registration)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "1")
+
+    assert compute_node_bridge.run(args) == 0
+    second = capsys.readouterr()
+    second_events = [json.loads(line) for line in second.out.splitlines() if line.strip()]
+    assert any(event.get("registered") is True for event in second_events)
+    assert (2, "warm") in calls
+    assert (2, "poll") in calls
+    assert "desktop.compute_node_bridge.registration.succeeded" in second.err
 
 
 def test_run_stops_when_pre_registration_runtime_warmup_fails(capsys, monkeypatch):

@@ -780,12 +780,37 @@ class RelayClient:
             return {}
         return {"X-Relay-Server-Token": self._registration_token}
 
-    def start(self):
-        """Start the polling loop by setting stop_polling to False"""
+    def reset_api_v1_polling_session(self, *, clear_registration: bool = False) -> None:
+        """Reset stop/unregister state before a fresh API v1 polling session.
+
+        ``clear_registration`` forces the next poll to re-register with the relay, which is
+        required after an explicit Stop because the relay-side lease may have been removed.
+        """
+
         self.stop_polling = False
         self._polling_stopped_by_request = False
         self._unregister_attempted = False
         self._unregister_complete = False
+        if clear_registration:
+            self._api_v1_registered_relays.clear()
+            self._api_v1_last_heartbeat_at.clear()
+            getattr(self, "_api_v1_relay_wait_hints", {}).clear()
+
+    def start(self):
+        """Start the polling loop by setting stop_polling to False."""
+
+        clear_registration = bool(
+            getattr(self, "stop_polling", True)
+            or getattr(self, "_polling_stopped_by_request", False)
+            or getattr(self, "_unregister_complete", False)
+        )
+        self.reset_api_v1_polling_session(clear_registration=clear_registration)
+        log_info(
+            "Starting relay polling relay={} key_fingerprint={} registration_reset={}",
+            _sanitize_relay_target(self.relay_url),
+            self._api_v1_public_key_fingerprint(getattr(self.crypto_manager, "public_key_b64", None)),
+            clear_registration,
+        )
 
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""

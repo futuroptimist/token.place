@@ -416,6 +416,7 @@ export function App() {
         running: false,
         registered: false,
         relay_runtime_state: 'starting',
+        sequence: computeStatusRef.current.operator_session_id ? Number.MAX_SAFE_INTEGER : null,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
         effective_mode: null,

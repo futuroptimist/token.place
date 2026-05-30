@@ -622,6 +622,122 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+
+  it('handles Start Stop Start with fresh registration and cleared errors', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'idle',
+      last_error: 'previous failure',
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    fireEvent.click(startButton);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(true)
+    );
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.queryByText(/Previous failure/i)).toBeNull();
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'old stale stop',
+        operator_session_id: 'old-session',
+        sequence: 9,
+      },
+    });
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
+
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'warming',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+
+    fireEvent.click((await screen.findByText('Stop operator')) as HTMLButtonElement);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'stop_compute_node')).toBe(true)
+    );
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'warming',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+  });
+
   it('renders the full initial idle compute-node status contract', async () => {
     mockInitialComputeStatus({
       running: false,

@@ -364,6 +364,13 @@ class ComputeNodeRuntime:
         )
         return False
 
+    def start_relay_session(self) -> None:
+        """Reset relay-client stop state before a fresh operator session polls."""
+
+        start = getattr(self.relay_client, "start", None)
+        if callable(start):
+            start()
+
     def register_and_poll_once(self) -> Dict[str, Any]:
         """Poll relay for one encrypted API v1 work item."""
 

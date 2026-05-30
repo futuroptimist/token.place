@@ -1260,6 +1260,7 @@ class RelayClient:
                     }
                     self._api_v1_registered_relays.add(candidate_url)
                     self._api_v1_last_heartbeat_at[candidate_url] = time.monotonic()
+                    self._unregister_complete = False
                     if getattr(self, "_polling_stopped_by_request", False):
                         self.unregister_from_relay()
                         return {

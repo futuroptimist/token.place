@@ -3303,6 +3303,44 @@ def test_poll_api_v1_encrypted_work_stop_prevents_register_and_poll(mock_post):
     mock_post.assert_not_called()
 
 
+@patch('utils.networking.relay_client.requests.post')
+def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_post):
+    client = _standalone_relay_client()
+    client.start()
+    client._unregister_attempted = True
+    client._unregister_complete = True
+
+    register_response = MagicMock(status_code=200)
+    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    unregister_response = MagicMock(status_code=200)
+
+    def fake_post(url, *args, **kwargs):
+        if url.endswith('/relay/servers/register'):
+            client.stop()
+            return register_response
+        if url.endswith('/unregister'):
+            return unregister_response
+        raise AssertionError(f'Unexpected relay request: {url}')
+
+    mock_post.side_effect = fake_post
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result == {
+        'error': 'Relay polling stopped',
+        'next_ping_in_x_seconds': 0,
+        'poll_wait_seconds': 0,
+    }
+    requested_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert requested_urls == [
+        'http://localhost:5000/api/v1/relay/servers/register',
+        'http://localhost:5000/unregister',
+    ]
+    assert client._api_v1_registered_relays == set()
+    assert client._api_v1_last_heartbeat_at == {}
+    assert client._unregister_complete is True
+
+
 def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(monkeypatch):
     client = _standalone_relay_client()
     client.stop()

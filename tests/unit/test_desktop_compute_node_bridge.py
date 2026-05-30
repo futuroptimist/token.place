@@ -803,6 +803,73 @@ def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypa
     assert "ModuleNotFoundError: No module named 'api'" not in output.err
 
 
+def test_run_api_v1_payload_polls_immediately_after_work(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class TwoTurnRuntime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, _config):
+            TwoTurnRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = FakeRelayClientRouting()
+            self._responses = [
+                {
+                    'protocol': 'tokenplace_api_v1_relay_e2ee',
+                    'version': 1,
+                    'request_id': 'req-1',
+                    'client_public_key': 'client-key',
+                    'chat_history': 'ciphertext-1',
+                    'cipherkey': 'key-1',
+                    'iv': 'iv-1',
+                    'next_ping_in_x_seconds': 30,
+                },
+                {
+                    'protocol': 'tokenplace_api_v1_relay_e2ee',
+                    'version': 1,
+                    'request_id': 'req-2',
+                    'client_public_key': 'client-key',
+                    'chat_history': 'ciphertext-2',
+                    'cipherkey': 'key-2',
+                    'iv': 'iv-2',
+                    'next_ping_in_x_seconds': 30,
+                },
+            ]
+            self._processed = []
+
+        def process_relay_request(self, payload):
+            self._processed.append(payload)
+            return self.relay_client.process_api_v1_chat_request(payload)
+
+    sleep_values = []
+
+    def fake_sleep_with_cancel(seconds):
+        sleep_values.append(seconds)
+        return False
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 5
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=TwoTurnRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', fake_sleep_with_cancel)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    status = compute_node_bridge.run(
+        SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+    )
+
+    assert status == 0
+    runtime = TwoTurnRuntime.last_instance
+    assert [payload['request_id'] for payload in runtime._processed] == ['req-1', 'req-2']
+    assert sleep_values[:2] == [0.0, 0.0]
+    output = capsys.readouterr()
+    assert 'api_v1_e2ee.work_processed_next_poll_immediate relay=https://token.place request_id=req-1' in output.err
+    assert 'api_v1_e2ee.work_processed_next_poll_immediate relay=https://token.place request_id=req-2' in output.err
+
 def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
@@ -1373,7 +1440,6 @@ def resolve_relay_url(relay_url, **_kwargs):
 
 def resolve_relay_port(relay_port, _relay_url):
     return relay_port
-
 
 
 def is_api_v1_relay_payload(_payload):

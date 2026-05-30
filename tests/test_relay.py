@@ -21,6 +21,7 @@ from relay import (
     known_servers,
     client_inference_requests,
     client_pending_request_ids,
+    client_cancelled_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -42,6 +43,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_cancelled_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -57,6 +59,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_cancelled_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -1573,7 +1576,8 @@ def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_qu
         '/api/v1/relay/responses/retrieve',
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
     )
-    assert unknown.status_code == 404
+    assert unknown.status_code == 410
+    assert unknown.get_json()['error']['code'] == 'cancelled'
 
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
@@ -2232,3 +2236,66 @@ def test_api_v1_unregister_is_idempotent_when_server_already_gone(client):
     assert second.status_code == 200
     assert first.get_json()['removed'] is False
     assert second.get_json()['removed'] is False
+
+
+def _api_v1_ciphertext_request(request_id):
+    return {
+        'request_id': request_id,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': f'ciphertext-request-{request_id}',
+        'cipherkey': f'cipherkey-request-{request_id}',
+        'iv': f'iv-request-{request_id}',
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+    }
+
+
+def test_api_v1_cancel_removes_queued_request_and_reports_terminal_retrieve(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post('/api/v1/relay/requests', json=_api_v1_ciphertext_request('req-cancel'))
+    assert queued.status_code == 200
+    assert client.get('/relay/diagnostics').get_json()['registered_compute_nodes'][0]['queue_depth'] == 1
+
+    cancelled = client.post(
+        '/api/v1/relay/requests/cancel',
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-cancel',
+            'status': 'timeout',
+            'reason': 'api_requester_timeout',
+        },
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()['removed'] is True
+    assert client.get('/relay/diagnostics').get_json()['registered_compute_nodes'][0]['queue_depth'] == 0
+
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    assert poll.get_json()['message'] == 'No requests available'
+
+    retrieved = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-cancel'},
+    )
+    assert retrieved.status_code == 410
+    assert retrieved.get_json()['error']['code'] == 'timeout'
+
+
+def test_api_v1_pending_ttl_expiry_removes_queued_request(client, monkeypatch):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post('/api/v1/relay/requests', json=_api_v1_ciphertext_request('req-expire'))
+    assert queued.status_code == 200
+
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-expire']
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 2.0)
+
+    expired = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-expire'},
+    )
+    assert expired.status_code == 410
+    assert expired.get_json()['error']['code'] == 'expired'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+    assert client.get('/relay/diagnostics').get_json()['registered_compute_nodes'][0]['queue_depth'] == 0

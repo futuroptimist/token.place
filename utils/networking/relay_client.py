@@ -614,6 +614,7 @@ class RelayClient:
         self._last_api_v1_work_relay_url: Optional[str] = None
         self._api_v1_registered_relays: Set[str] = set()
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
+        self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
         self._unregister_attempted = False
         self._unregister_complete = False
 
@@ -781,11 +782,20 @@ class RelayClient:
         return {"X-Relay-Server-Token": self._registration_token}
 
     def start(self):
-        """Start the polling loop by setting stop_polling to False"""
+        """Start a fresh polling/registration lifecycle."""
+
+        was_stopped = self.stop_polling or getattr(self, "_polling_stopped_by_request", False)
         self.stop_polling = False
         self._polling_stopped_by_request = False
         self._unregister_attempted = False
         self._unregister_complete = False
+        if was_stopped:
+            self._api_v1_registered_relays.clear()
+            self._api_v1_last_heartbeat_at.clear()
+            self._api_v1_relay_wait_hints.clear()
+            log_info(
+                "Relay client lifecycle reset; API v1 registration state cleared for fresh start"
+            )
 
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""

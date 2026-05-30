@@ -395,6 +395,19 @@ def _start_stdin_reader() -> None:
         _stdin_reader_started = True
 
 
+def _reset_stop_state_for_new_session() -> int:
+    """Clear latched/queued cancel signals before a fresh bridge lifecycle starts."""
+
+    _stop_requested_latched.clear()
+    drained = 0
+    while True:
+        try:
+            _stdin_lines.get_nowait()
+        except queue.Empty:
+            return drained
+        drained += 1
+
+
 def stop_requested() -> bool:
     if _stop_requested_latched.is_set():
         return True
@@ -501,9 +514,15 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
-    _stop_requested_latched.clear()
+    drained_cancel_lines = _reset_stop_state_for_new_session()
     bridge_session_id = _bridge_session_id_from_env()
     status_sequence = 0
+    print(
+        "desktop.compute_node_bridge.session.start "
+        f"session={bridge_session_id} cancel_state_reset=true "
+        f"drained_stale_stdin_lines={drained_cancel_lines}",
+        file=sys.stderr,
+    )
 
     def emit_operator_event(payload: Dict[str, Any]) -> None:
         nonlocal status_sequence
@@ -591,6 +610,15 @@ def run(args: argparse.Namespace) -> int:
             use_configured_relay_fallbacks=False,
         )
     )
+    relay_start = getattr(runtime.relay_client, "start", None)
+    if callable(relay_start):
+        relay_start()
+    print(
+        "desktop.compute_node_bridge.relay_client.started "
+        f"session={bridge_session_id} relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+        f"key_fingerprint={_relay_key_fingerprint(runtime.relay_client)}",
+        file=sys.stderr,
+    )
 
     runtime.model_manager.model_path = args.model
     apply_compute_mode(runtime.model_manager, args.mode)
@@ -606,6 +634,11 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     poll_worker = _CancelablePollWorker()
+    print(
+        "desktop.compute_node_bridge.poll.worker_created "
+        f"session={bridge_session_id} relay={_sanitize_relay_target(runtime.relay_client.relay_url)}",
+        file=sys.stderr,
+    )
     def build_status_payload(
         *,
         event_type: str,
@@ -994,7 +1027,9 @@ def run(args: argparse.Namespace) -> int:
                 active_relay_url = runtime.relay_client.relay_url
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.register "
-                    f"relay={_sanitize_relay_target(active_relay_url)}",
+                    f"session={bridge_session_id} "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(runtime.relay_client)}",
                     file=sys.stderr,
                 )
                 relay_response = poll_worker.call(
@@ -1145,14 +1180,14 @@ def run(args: argparse.Namespace) -> int:
         active_relay_url = getattr(getattr(runtime, "relay_client", None), "relay_url", relay_url)
         print(
             "desktop.compute_node_bridge.stop "
-            f"relay={_sanitize_relay_target(active_relay_url)}",
+            f"session={bridge_session_id} relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
         request_poll_cancel(active_relay_url)
         poll_worker.shutdown()
         print(
             "desktop.compute_node_bridge.poll.worker_stopped "
-            f"relay={_sanitize_relay_target(active_relay_url)}",
+            f"session={bridge_session_id} relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
         if warm_load_future is not None and not warm_load_future.done():
@@ -1160,7 +1195,7 @@ def run(args: argparse.Namespace) -> int:
         runtime.stop()
         print(
             "desktop.compute_node_bridge.stopped_idle "
-            f"relay={_sanitize_relay_target(active_relay_url)}",
+            f"session={bridge_session_id} relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
 

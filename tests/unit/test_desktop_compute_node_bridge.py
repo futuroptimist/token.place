@@ -107,6 +107,40 @@ class FakeRuntime:
         return None
 
 
+class RestartRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.unregister_calls = 0
+        self.relay_url = 'https://token.place'
+
+    def start(self):
+        self.start_calls += 1
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        return True
+
+
+class RestartLifecycleRuntime(FakeRuntime):
+    instances = []
+
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = RestartRelayClient()
+        self._responses = [{'next_ping_in_x_seconds': 0, 'error': None}]
+        self._processed = []
+        self.stop_calls = 0
+        RestartLifecycleRuntime.instances.append(self)
+
+    def stop(self):
+        self.stop_calls += 1
+        return None
+
+
 class StreamingRuntime(FakeRuntime):
     last_instance = None
 
@@ -2491,3 +2525,57 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+
+def test_run_restart_lifecycle_resets_cancel_queue_and_registers_second_session(capsys, monkeypatch):
+    _reset_cancel_queue()
+    RestartLifecycleRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RestartLifecycleRuntime)
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-one')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', lambda _seconds: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    first_status = compute_node_bridge.run(args)
+    assert first_status == 0
+
+    compute_node_bridge._stdin_lines.put('{"type":"cancel"}\n')
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-two')
+    second_status = compute_node_bridge.run(args)
+    assert second_status == 0
+
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    started_events = [event for event in events if event['type'] == 'started']
+    registered_status_events = [
+        event for event in events if event['type'] == 'status' and event.get('registered') is True
+    ]
+
+    assert [event['operator_session_id'] for event in started_events] == ['session-one', 'session-two']
+    assert {event['operator_session_id'] for event in registered_status_events} == {
+        'session-one',
+        'session-two',
+    }
+    assert len(RestartLifecycleRuntime.instances) == 2
+    assert all(instance.relay_client.start_calls == 1 for instance in RestartLifecycleRuntime.instances)
+    assert all(instance.stop_calls == 1 for instance in RestartLifecycleRuntime.instances)
+    assert 'cancel_state_reset=true drained_stale_stdin_lines=1' in output.err
+    assert output.err.count('desktop.compute_node_bridge.poll.worker_created') == 2
+    assert output.err.count('desktop.compute_node_bridge.poll.worker_stopped') == 2
+    assert output.err.count('desktop.compute_node_bridge.api_v1_e2ee.register session=') == 2
+
+
+def test_reset_stop_state_for_new_session_clears_latched_and_queued_cancel():
+    _reset_cancel_queue()
+    compute_node_bridge._stop_requested_latched.set()
+    compute_node_bridge._stdin_lines.put('{"type":"cancel"}\n')
+
+    drained = compute_node_bridge._reset_stop_state_for_new_session()
+
+    assert drained == 1
+    assert compute_node_bridge.stop_requested() is False

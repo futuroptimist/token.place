@@ -408,7 +408,13 @@ fn finalize_bridge_exit(
 
     status.running = false;
     status.registered = false;
-    status.relay_runtime_state = Some("stopped".into());
+    let preserve_failed_state = status.relay_runtime_state.as_deref() == Some("failed")
+        || status.warm_load_state.as_deref() == Some("failed");
+    if preserve_failed_state {
+        status.relay_runtime_state = Some("failed".into());
+    } else {
+        status.relay_runtime_state = Some("stopped".into());
+    }
 
     let exit_error = bridge_exit_error(exit_status, saw_startup_event);
     if status.last_error.is_none() {
@@ -428,7 +434,7 @@ fn finalize_bridge_exit(
             "type": "error",
             "running": false,
             "registered": false,
-            "relay_runtime_state": "stopped",
+            "relay_runtime_state": status.relay_runtime_state.as_deref().unwrap_or("stopped"),
             "last_error": last_error,
             "message": last_error,
             "operator_session_id": expected_session_id,
@@ -847,6 +853,38 @@ mod tests {
         }
 
         assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
+    }
+
+    #[test]
+    fn finalize_bridge_exit_preserves_warm_load_failure_state() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            relay_runtime_state: Some("failed".into()),
+            warm_load_state: Some("failed".into()),
+            last_error: Some("API v1 relay runtime warm-load timed out after 120s".into()),
+            operator_session_id: Some("session-1".into()),
+            sequence: Some(3),
+            ..ComputeNodeStatus::default()
+        };
+
+        let payload = finalize_bridge_exit(
+            &mut status,
+            success_exit_status(),
+            true,
+            true,
+            "session-1",
+        );
+
+        assert!(payload.is_none());
+        assert!(!status.running);
+        assert!(!status.registered);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("failed"));
+        assert_eq!(status.warm_load_state.as_deref(), Some("failed"));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("API v1 relay runtime warm-load timed out after 120s")
+        );
     }
 
     #[tokio::test]

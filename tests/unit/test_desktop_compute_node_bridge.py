@@ -1862,7 +1862,11 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
     error_event = next(event for event in output_events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
-    assert "timed out" in error_event["message"]
+    assert error_event["relay_runtime_state"] == "failed"
+    assert error_event["running"] is False
+    assert error_event["registered"] is False
+    assert error_event["message"] == "API v1 relay runtime warm-load timed out after 0.05s"
+    assert error_event["last_error"] == error_event["message"]
     warming_status_events = [
         event
         for event in output_events

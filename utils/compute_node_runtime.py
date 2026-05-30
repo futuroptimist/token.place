@@ -284,16 +284,18 @@ class ComputeNodeRuntime:
     def ensure_model_ready(self) -> bool:
         """Initialize model runtime and report readiness."""
 
-        _log_info("Initializing LLM...")
+        _log_info("Initializing LLM model-file preflight...")
         if self.model_manager.use_mock_llm:
             _log_info("Using mock LLM based on configuration")
             return True
 
+        model_path = getattr(self.model_manager, "model_path", "unknown")
+        _log_info(f"Checking model file for API v1 runtime warmup: {model_path}")
         if self.model_manager.download_model_if_needed():
-            _log_info("Model ready for inference")
+            _log_info(f"Model file ready for runtime initialization: {model_path}")
             return True
 
-        _log_error("Failed to download or verify model")
+        _log_error("Failed to download or verify model file")
         return False
 
     def ensure_api_v1_runtime_ready(self) -> bool:
@@ -307,6 +309,8 @@ class ComputeNodeRuntime:
             _log_error("Model manager missing get_llm_instance required for API v1 warmup")
             return False
 
+        model_path = getattr(self.model_manager, "model_path", "unknown")
+        _log_info(f"API v1 runtime warmup about to instantiate model: {model_path}")
         try:
             llm_runtime = get_llm_instance()
         except Exception:
@@ -323,6 +327,8 @@ class ComputeNodeRuntime:
                 "API v1 runtime warmup failed: runtime missing callable create_chat_completion"
             )
             return False
+
+        _log_info(f"API v1 runtime warmup model instantiated: {model_path}")
 
         diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
         if isinstance(diagnostics, dict):

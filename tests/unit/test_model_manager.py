@@ -350,6 +350,29 @@ class TestModelManager:
         assert 'content' in completion['choices'][0]['message']
         assert 'Mock Response' in completion['choices'][0]['message']['content']
 
+    def test_get_llm_instance_logs_stage_diagnostics(self, model_manager, caplog):
+        """Warm-load diagnostics should show import, compute-plan, and Llama init stages."""
+        mock_llama = MagicMock()
+
+        with patch('os.path.exists', return_value=True), \
+             patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=MagicMock(return_value=mock_llama))):
+            with caplog.at_level('INFO', logger='model_manager'):
+                llm = model_manager.get_llm_instance()
+
+        assert llm == mock_llama
+        messages = [record.getMessage() for record in caplog.records]
+        assert 'Locating llama_cpp runtime for model initialization...' in messages
+        assert any(message.startswith('llama_cpp runtime located module_path=') for message in messages)
+        assert 'Selecting compute plan for model initialization...' in messages
+        assert any(
+            message.startswith('Selected compute plan for model initialization ')
+            for message in messages
+        )
+        assert any(message.startswith('About to instantiate Llama model from ') for message in messages)
+        assert any(message.startswith('Llama init started for ') for message in messages)
+        assert 'Llama init completed successfully.' in messages
+
+
     def test_get_llm_instance_real_mode(self, model_manager):
         """Test get_llm_instance in real mode when the model file exists."""
         # Create a mock for Llama

@@ -460,6 +460,8 @@ def emit(payload: Dict[str, Any]) -> None:
 def _relay_runtime_state(
     warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
 ) -> str:
+    if warm_load_state == "failed":
+        return "failed"
     if not running:
         return "stopped"
     if not warm_load_enabled:
@@ -924,9 +926,14 @@ def run(args: argparse.Namespace) -> int:
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
             if remaining_seconds <= 0:
                 warm_load_state = "failed"
-                warm_load_failed = "timed out initializing API v1 model runtime before relay registration"
+                warm_load_failed = (
+                    "API v1 relay runtime warm-load timed out after "
+                    f"{warm_load_deadline_seconds:g}s"
+                )
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 last_error = warm_load_failed
+                if warm_load_future is not None and not warm_load_future.done():
+                    warm_load_future.cancel()
                 print(
                     "desktop.compute_node_bridge.registration.gate_wait_timeout "
                     f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "

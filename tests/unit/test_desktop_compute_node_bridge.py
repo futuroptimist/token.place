@@ -376,6 +376,7 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
 def _reset_cancel_queue():
     compute_node_bridge._stdin_lines = queue.Queue()
     compute_node_bridge._stdin_reader_started = True
+    compute_node_bridge._stop_requested_latched.clear()
 
 
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
@@ -1419,6 +1420,36 @@ def test_sanitize_relay_target_preserves_ipv6_brackets():
     assert sanitized == 'http://[::1]:8000'
 
 
+def test_relay_key_fingerprint_uses_safe_helper_and_fallbacks():
+    class CryptoManager:
+        public_key_b64 = 'abcdefghijklmno'
+
+    class RelayClient:
+        crypto_manager = CryptoManager()
+
+        def _api_v1_public_key_fingerprint(self, public_key):
+            assert public_key == 'abcdefghijklmno'
+            return 'fp:abcd'
+
+    assert compute_node_bridge._relay_key_fingerprint(RelayClient()) == 'fp:abcd'
+
+    class BrokenFingerprintRelay(RelayClient):
+        def _api_v1_public_key_fingerprint(self, _public_key):
+            raise RuntimeError('fingerprint failed')
+
+    assert compute_node_bridge._relay_key_fingerprint(BrokenFingerprintRelay()) == 'unknown'
+
+    class NoHelperRelay:
+        crypto_manager = CryptoManager()
+
+    assert compute_node_bridge._relay_key_fingerprint(NoHelperRelay()) == 'abcdefgh...lmno'
+
+    class ShortKeyRelay:
+        crypto_manager = SimpleNamespace(public_key_b64='short')
+
+    assert compute_node_bridge._relay_key_fingerprint(ShortKeyRelay()) == 'unknown'
+
+
 def test_relay_response_summary_handles_non_dict_payloads():
     summary = compute_node_bridge._relay_response_summary(["unexpected"])
     assert summary == "non-dict response type=list"
@@ -2104,3 +2135,254 @@ def test_run_handles_keyboard_interrupt_from_poll_worker(capsys, monkeypatch):
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert events[-1]["type"] == "stopped"
+
+
+class ShutdownTrackingRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.stop_calls = 0
+        self.unregister_calls = 0
+        self._unregistered = False
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self):
+        if self._unregistered:
+            return True
+        self._unregistered = True
+        self.unregister_calls += 1
+        return True
+
+
+class ShutdownTrackingRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        ShutdownTrackingRuntime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = ShutdownTrackingRelayClient()
+        self.poll_calls = 0
+        self.stop_calls = 0
+        self._processed = []
+
+    def register_and_poll_once(self):
+        self.poll_calls += 1
+        return {'next_ping_in_x_seconds': 60}
+
+    def stop(self):
+        self.stop_calls += 1
+        self.relay_client.stop()
+        self.relay_client.unregister_from_relay()
+
+
+def test_run_unregisters_once_and_does_not_poll_after_cancel(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ShutdownTrackingRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    runtime = ShutdownTrackingRuntime.last_instance
+    assert runtime.poll_calls == 1
+    assert runtime.stop_calls == 1
+    assert runtime.relay_client.stop_calls >= 1
+    assert runtime.relay_client.unregister_calls == 1
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.poll.cancel_requested' in output.err
+    assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
+    assert 'desktop.compute_node_bridge.poll.worker_stopped' in output.err
+
+
+class StopFailureRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.stop_calls = 0
+        self.unregister_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+        raise RuntimeError('relay stop failed')
+
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        return True
+
+
+class StopFailureRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        StopFailureRuntime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = StopFailureRelayClient()
+        self.stop_calls = 0
+        self._processed = []
+
+    def register_and_poll_once(self):
+        return {'next_ping_in_x_seconds': 60}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+def test_run_continues_shutdown_when_relay_stop_raises(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=StopFailureRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    runtime = StopFailureRuntime.last_instance
+    assert runtime.stop_calls == 1
+    assert runtime.relay_client.stop_calls == 1
+    assert runtime.relay_client.unregister_calls == 1
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.relay.stop_failed' in output.err
+    assert 'exc_type=RuntimeError' in output.err
+    assert 'desktop.compute_node_bridge.unregister.succeeded' in output.err
+    assert json.loads(output.out.splitlines()[-1])['type'] == 'stopped'
+
+
+class UnregisterFailureRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.stop_calls = 0
+        self.unregister_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        raise TimeoutError('relay unregister timed out')
+
+
+class UnregisterFailureRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        UnregisterFailureRuntime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = UnregisterFailureRelayClient()
+        self.stop_calls = 0
+        self._processed = []
+
+    def register_and_poll_once(self):
+        return {'next_ping_in_x_seconds': 60}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+def test_run_continues_shutdown_when_unregister_raises(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=UnregisterFailureRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    runtime = UnregisterFailureRuntime.last_instance
+    assert runtime.stop_calls == 1
+    assert runtime.relay_client.stop_calls == 1
+    assert runtime.relay_client.unregister_calls == 1
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.unregister.failed' in output.err
+    assert 'exc_type=TimeoutError' in output.err
+    assert 'desktop.compute_node_bridge.poll.worker_stopped' in output.err
+    assert json.loads(output.out.splitlines()[-1])['type'] == 'stopped'
+
+
+def test_cancelable_poll_worker_invokes_cancel_callback_promptly_during_long_poll():
+    worker = compute_node_bridge._CancelablePollWorker()
+    call_started = threading.Event()
+    release_call = threading.Event()
+    cancel_calls = []
+
+    def long_poll():
+        call_started.set()
+        release_call.wait(timeout=1.0)
+        return {'ok': True}
+
+    try:
+        result = worker.call(
+            long_poll,
+            lambda: call_started.is_set(),
+            poll_interval=0.01,
+            on_cancel=lambda: cancel_calls.append('cancelled'),
+        )
+    finally:
+        release_call.set()
+        worker.shutdown()
+
+    assert result is compute_node_bridge._POLL_CANCELLED
+    assert cancel_calls == ['cancelled']
+
+
+def test_stop_requested_latches_cancel_from_stdin_queue():
+    _reset_cancel_queue()
+    compute_node_bridge._stdin_lines.put(json.dumps({'type': 'cancel'}))
+
+    assert compute_node_bridge.stop_requested() is True
+    assert compute_node_bridge.stop_requested() is True
+
+
+def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
+    stop_after_warm_started = {'armed': False}
+
+    def fake_stop_requested():
+        instance = WarmingThenApiV1Runtime.last_instance
+        if instance is not None and instance.ready_started.is_set():
+            stop_after_warm_started['armed'] = True
+            return True
+        return False
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '1')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    runtime = WarmingThenApiV1Runtime.last_instance
+    assert stop_after_warm_started['armed'] is True
+    assert runtime._processed == []
+    assert runtime._responses == [
+        {
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'request_id': 'req-1',
+            'client_public_key': 'client-key',
+            'chat_history': 'ciphertext',
+            'cipherkey': 'key',
+            'iv': 'iv',
+            'next_ping_in_x_seconds': 0,
+        }
+    ]
+    assert capsys.readouterr().out.splitlines()[-1]

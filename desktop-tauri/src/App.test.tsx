@@ -586,6 +586,42 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+
+  it('invokes backend stop and reflects stopped operator event', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      active_relay_url: 'https://token.place',
+      warm_load_state: 'ready',
+      warm_load_enabled: true,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+
+    const stopOperatorButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    fireEvent.click(stopOperatorButton);
+
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'stop_compute_node')).toBe(true)
+    );
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        active_relay_url: 'https://token.place',
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

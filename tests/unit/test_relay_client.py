@@ -422,13 +422,91 @@ class TestRelayClient:
 
         with patch('utils.networking.relay_client.requests.post') as mock_post:
             mock_post.side_effect = [success_response, failure_response]
-            assert client.unregister_from_relay() is True
+            assert client.unregister_from_relay() is False
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
             'http://primary-relay:5000/unregister',
             'http://backup-relay:6000/unregister',
         ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_retries_after_transient_failure(self, mock_post, relay_client):
+        """A failed unregister attempt should not make later attempts no-ops."""
+
+        failure_response = MagicMock()
+        failure_response.status_code = 503
+        success_response = MagicMock()
+        success_response.status_code = 200
+        mock_post.side_effect = [failure_response, success_response]
+
+        assert relay_client.unregister_from_relay() is False
+        assert relay_client.unregister_from_relay() is True
+
+        requested_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert requested_urls == [
+            'http://localhost:5000/unregister',
+            'http://localhost:5000/unregister',
+        ]
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_keeps_failed_registered_relay_for_retry(
+        self,
+        mock_post,
+        mock_crypto_manager,
+        mock_model_manager,
+    ):
+        """Partial multi-relay unregisters should retain only failed local state."""
+
+        config_values = {
+            'relay.request_timeout': 15,
+            'relay.additional_servers': ['http://backup-relay:6000'],
+        }
+
+        with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.is_production = False
+            mock_config.get.side_effect = lambda key, default=None: config_values.get(key, default)
+            mock_get_config.return_value = mock_config
+
+            client = RelayClient(
+                base_url="http://primary-relay",
+                port=5000,
+                crypto_manager=mock_crypto_manager,
+                model_manager=mock_model_manager,
+            )
+
+        primary = 'http://primary-relay:5000'
+        backup = 'http://backup-relay:6000'
+        client._api_v1_registered_relays.update({primary, backup})
+        client._api_v1_last_heartbeat_at.update({primary: 1.0, backup: 2.0})
+        client._api_v1_relay_wait_hints = {
+            primary: {'next_ping_in_x_seconds': 30},
+            backup: {'next_ping_in_x_seconds': 30},
+        }
+        success_response = MagicMock(status_code=200)
+        failure_response = MagicMock(status_code=503)
+        retry_success_response = MagicMock(status_code=200)
+        mock_post.side_effect = [success_response, failure_response, retry_success_response]
+
+        assert client.unregister_from_relay() is False
+        assert client._api_v1_registered_relays == {backup}
+        assert primary not in client._api_v1_last_heartbeat_at
+        assert primary not in client._api_v1_relay_wait_hints
+        assert backup in client._api_v1_last_heartbeat_at
+        assert backup in client._api_v1_relay_wait_hints
+
+        assert client.unregister_from_relay() is True
+
+        requested_urls = [call.args[0] for call in mock_post.call_args_list]
+        assert requested_urls == [
+            f'{primary}/unregister',
+            f'{backup}/unregister',
+            f'{backup}/unregister',
+        ]
+        assert client._api_v1_registered_relays == set()
+        assert client._api_v1_last_heartbeat_at == {}
+        assert client._api_v1_relay_wait_hints == {}
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_uses_registration_token(
@@ -3176,3 +3254,127 @@ def test_poll_api_v1_encrypted_work_continuously_sleeps_no_work_hint(monkeypatch
 
     client.poll_api_v1_encrypted_work_continuously()
     assert 0.25 in sleeps
+
+
+def _standalone_relay_client():
+    crypto = MagicMock()
+    crypto.public_key_b64 = 'mock_public_key_b64'
+    model = MagicMock()
+    config = MagicMock()
+    config.is_production = False
+    config.get.side_effect = lambda key, default=None: {'relay.request_timeout': 15}.get(key, default)
+    with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
+        return RelayClient('http://localhost', 5000, crypto, model)
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock_post):
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    client._api_v1_relay_wait_hints = {'http://localhost:5000': {'next_ping_in_x_seconds': 30}}
+    mock_post.return_value = MagicMock(status_code=200)
+
+    assert client.unregister_from_relay() is True
+    assert client.unregister_from_relay() is True
+
+    mock_post.assert_called_once_with(
+        'http://localhost:5000/unregister',
+        json={'server_public_key': 'mock_public_key_b64'},
+        timeout=15,
+    )
+    assert client._api_v1_registered_relays == set()
+    assert client._api_v1_last_heartbeat_at == {}
+    assert client._api_v1_relay_wait_hints == {}
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_poll_api_v1_encrypted_work_stop_prevents_register_and_poll(mock_post):
+    client = _standalone_relay_client()
+    client.stop()
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result == {
+        'error': 'Relay polling stopped',
+        'next_ping_in_x_seconds': 0,
+        'poll_wait_seconds': 0,
+    }
+    mock_post.assert_not_called()
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_post):
+    client = _standalone_relay_client()
+    client.start()
+    client._unregister_attempted = True
+    client._unregister_complete = True
+
+    register_response = MagicMock(status_code=200)
+    register_response.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    unregister_response = MagicMock(status_code=200)
+
+    def fake_post(url, *args, **kwargs):
+        if url.endswith('/relay/servers/register'):
+            client.stop()
+            return register_response
+        if url.endswith('/unregister'):
+            return unregister_response
+        raise AssertionError(f'Unexpected relay request: {url}')
+
+    mock_post.side_effect = fake_post
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result == {
+        'error': 'Relay polling stopped',
+        'next_ping_in_x_seconds': 0,
+        'poll_wait_seconds': 0,
+    }
+    requested_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert requested_urls == [
+        'http://localhost:5000/api/v1/relay/servers/register',
+        'http://localhost:5000/unregister',
+    ]
+    assert client._api_v1_registered_relays == set()
+    assert client._api_v1_last_heartbeat_at == {}
+    assert client._unregister_complete is True
+
+
+def test_poll_api_v1_encrypted_work_continuously_clears_previous_stop_request(monkeypatch):
+    client = _standalone_relay_client()
+    client.stop()
+    client._unregister_attempted = True
+    observed_stop_flags = []
+
+    def fake_poll():
+        observed_stop_flags.append(client._polling_stopped_by_request)
+        client.stop()
+        return {'message': 'No requests available', 'next_ping_in_x_seconds': 0}
+
+    monkeypatch.setattr(client, 'poll_api_v1_encrypted_work', fake_poll)
+    monkeypatch.setattr(relay_client_module.time, 'sleep', lambda _seconds: None)
+
+    client.poll_api_v1_encrypted_work_continuously()
+
+    assert observed_stop_flags == [False]
+    assert client.stop_polling is True
+    assert client._polling_stopped_by_request is True
+    assert client._unregister_attempted is False
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_start_after_stop_allows_api_v1_registration_again(mock_post):
+    client = _standalone_relay_client()
+    client.stop()
+    client.start()
+    register_ok = MagicMock(status_code=200)
+    register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    poll_ok = MagicMock(status_code=200)
+    poll_ok.json.return_value = {'message': 'No requests available'}
+    mock_post.side_effect = [register_ok, poll_ok]
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result['next_ping_in_x_seconds'] == 12
+    assert mock_post.call_count == 2

@@ -1,15 +1,21 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
-type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
+type UiState =
+  | "idle"
+  | "starting"
+  | "streaming"
+  | "canceled"
+  | "completed"
+  | "failed";
+type BackendMode = "auto" | "cpu" | "gpu" | "hybrid";
 
 interface BackendInfo {
   platform_label: string;
   preferred_mode: BackendMode;
-  available_backend: 'cpu' | 'cuda' | 'metal';
+  available_backend: "cpu" | "cuda" | "metal";
   availability_label: string;
 }
 
@@ -36,6 +42,8 @@ interface ComputeNodeStatus {
   warm_load_duration_ms: number | null;
   runtime_path: string | null;
   relay_runtime_path: string | null;
+  relay_runtime_state: string;
+  session_id: number;
 }
 
 interface ModelArtifactInfo {
@@ -59,20 +67,22 @@ interface SidecarEvent {
 const defaultComputeStatus: ComputeNodeStatus = {
   running: false,
   registered: false,
-  active_relay_url: '',
-  requested_mode: 'auto',
+  active_relay_url: "",
+  requested_mode: "auto",
   effective_mode: null,
   backend_available: null,
   backend_selected: null,
   backend_used: null,
   fallback_reason: null,
-  model_path: '',
+  model_path: "",
   last_error: null,
   warm_load_state: null,
   warm_load_enabled: null,
   warm_load_duration_ms: null,
   runtime_path: null,
   relay_runtime_path: null,
+  relay_runtime_state: "idle",
+  session_id: 0,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -80,55 +90,61 @@ function formatErrorMessage(error: unknown): string {
 }
 
 export function selectedModelPath(selection: string | string[] | null): string {
-  if (typeof selection === 'string') {
+  if (typeof selection === "string") {
     return selection;
   }
-  if (Array.isArray(selection) && selection.length > 0 && typeof selection[0] === 'string') {
+  if (
+    Array.isArray(selection) &&
+    selection.length > 0 &&
+    typeof selection[0] === "string"
+  ) {
     return selection[0];
   }
-  return '';
+  return "";
 }
 
 export function App() {
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
-    model_path: '',
-    relay_base_url: 'https://token.place',
-    preferred_mode: 'auto',
+    model_path: "",
+    relay_base_url: "https://token.place",
+    preferred_mode: "auto",
   });
-  const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
-  const [prompt, setPrompt] = useState('');
-  const [output, setOutput] = useState('');
-  const [requestId, setRequestId] = useState<string>('');
-  const [status, setStatus] = useState<UiState>('idle');
+  const [computeStatus, setComputeStatus] =
+    useState<ComputeNodeStatus>(defaultComputeStatus);
+  const [prompt, setPrompt] = useState("");
+  const [output, setOutput] = useState("");
+  const [requestId, setRequestId] = useState<string>("");
+  const [status, setStatus] = useState<UiState>("idle");
   const [artifact, setArtifact] = useState<ModelArtifactInfo | null>(null);
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState("");
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
-  const relayRuntimeReady =
-    computeStatus.warm_load_enabled === false ||
-    computeStatus.warm_load_state === null ||
-    computeStatus.warm_load_state === 'ready';
-  const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
+  const relayRuntimeReady = ["ready", "processing"].includes(
+    computeStatus.relay_runtime_state,
+  );
+  const computeNodeRegistered =
+    computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
-  const requestIdRef = useRef('');
+  const requestIdRef = useRef("");
 
   useEffect(() => {
-    invoke<BackendInfo>('detect_backend')
+    invoke<BackendInfo>("detect_backend")
       .then(setBackend)
       .catch((e) => setError(formatErrorMessage(e)));
 
     const initializeConfigAndArtifact = async () => {
       try {
-        const loadedConfig = await invoke<DesktopConfig>('load_config');
+        const loadedConfig = await invoke<DesktopConfig>("load_config");
         setConfig(loadedConfig);
-        const nodeStatus = await invoke<ComputeNodeStatus>('get_compute_node_status');
-        setComputeStatus(nodeStatus);
+        const nodeStatus = await invoke<ComputeNodeStatus>(
+          "get_compute_node_status",
+        );
+        setComputeStatus({ ...defaultComputeStatus, ...nodeStatus });
 
-        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
+        const info = await invoke<ModelArtifactInfo>("inspect_model_artifact");
         setArtifact(info);
-
       } catch (e) {
         setError(formatErrorMessage(e));
       }
@@ -142,22 +158,22 @@ export function App() {
   }, [requestId]);
 
   useEffect(() => {
-    const unlisten = listen<SidecarEvent>('inference_event', (evt) => {
+    const unlisten = listen<SidecarEvent>("inference_event", (evt) => {
       const payload = evt.payload;
       if (payload.request_id !== requestIdRef.current) {
         return;
       }
-      if (payload.type === 'started') {
-        setStatus('streaming');
-      } else if (payload.type === 'token' && payload.text) {
+      if (payload.type === "started") {
+        setStatus("streaming");
+      } else if (payload.type === "token" && payload.text) {
         setOutput((prev) => prev + payload.text);
-      } else if (payload.type === 'done') {
-        setStatus('completed');
-      } else if (payload.type === 'canceled') {
-        setStatus('canceled');
-      } else if (payload.type === 'error') {
-        setStatus('failed');
-        setError(payload.message ?? payload.code ?? 'unknown error');
+      } else if (payload.type === "done") {
+        setStatus("completed");
+      } else if (payload.type === "canceled") {
+        setStatus("canceled");
+      } else if (payload.type === "error") {
+        setStatus("failed");
+        setError(payload.message ?? payload.code ?? "unknown error");
       }
     });
     return () => {
@@ -166,78 +182,119 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
-      const payload = evt.payload;
-      setComputeStatus((prev) => ({
-        running:
-          typeof payload.running === 'boolean'
-            ? payload.running
-            : payload.type === 'error'
-              ? false
-              : prev.running,
-        registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
-        active_relay_url:
-          typeof payload.active_relay_url === 'string'
-            ? payload.active_relay_url
-            : prev.active_relay_url,
-        requested_mode:
-          typeof payload.requested_mode === 'string' ? payload.requested_mode : prev.requested_mode,
-        effective_mode:
-          typeof payload.effective_mode === 'string' ? payload.effective_mode : prev.effective_mode,
-        backend_available:
-          typeof payload.backend_available === 'string'
-            ? payload.backend_available
-            : prev.backend_available,
-        backend_selected:
-          typeof payload.backend_selected === 'string'
-            ? payload.backend_selected
-            : prev.backend_selected,
-        backend_used:
-          typeof payload.backend_used === 'string' ? payload.backend_used : prev.backend_used,
-        fallback_reason:
-          payload.fallback_reason === null
-            ? null
-            : typeof payload.fallback_reason === 'string'
-              ? payload.fallback_reason
-              : prev.fallback_reason,
-        model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
-        warm_load_state:
-          typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
-        warm_load_enabled:
-          typeof payload.warm_load_enabled === 'boolean'
-            ? payload.warm_load_enabled
-            : prev.warm_load_enabled,
-        warm_load_duration_ms:
-          typeof payload.warm_load_duration_ms === 'number'
-            ? payload.warm_load_duration_ms
-            : prev.warm_load_duration_ms,
-        runtime_path: typeof payload.runtime_path === 'string' ? payload.runtime_path : prev.runtime_path,
-        relay_runtime_path:
-          typeof payload.relay_runtime_path === 'string'
-            ? payload.relay_runtime_path
-            : prev.relay_runtime_path,
-        last_error:
-          payload.last_error === null
-            ? null
-            : typeof payload.last_error === 'string'
+    const unlisten = listen<Record<string, unknown>>(
+      "compute_node_event",
+      (evt) => {
+        const payload = evt.payload;
+        setComputeStatus((prev) => {
+          const payloadSessionId =
+            typeof payload.session_id === "number"
+              ? payload.session_id
+              : undefined;
+          if (
+            payloadSessionId !== undefined &&
+            payloadSessionId < prev.session_id
+          ) {
+            return prev;
+          }
+          return {
+            running:
+              typeof payload.running === "boolean"
+                ? payload.running
+                : payload.type === "error"
+                  ? false
+                  : prev.running,
+            registered:
+              typeof payload.registered === "boolean"
+                ? payload.registered
+                : prev.registered,
+            active_relay_url:
+              typeof payload.active_relay_url === "string"
+                ? payload.active_relay_url
+                : prev.active_relay_url,
+            requested_mode:
+              typeof payload.requested_mode === "string"
+                ? payload.requested_mode
+                : prev.requested_mode,
+            effective_mode:
+              typeof payload.effective_mode === "string"
+                ? payload.effective_mode
+                : prev.effective_mode,
+            backend_available:
+              typeof payload.backend_available === "string"
+                ? payload.backend_available
+                : prev.backend_available,
+            backend_selected:
+              typeof payload.backend_selected === "string"
+                ? payload.backend_selected
+                : prev.backend_selected,
+            backend_used:
+              typeof payload.backend_used === "string"
+                ? payload.backend_used
+                : prev.backend_used,
+            fallback_reason:
+              payload.fallback_reason === null
+                ? null
+                : typeof payload.fallback_reason === "string"
+                  ? payload.fallback_reason
+                  : prev.fallback_reason,
+            model_path:
+              typeof payload.model_path === "string"
+                ? payload.model_path
+                : prev.model_path,
+            warm_load_state:
+              typeof payload.warm_load_state === "string"
+                ? payload.warm_load_state
+                : prev.warm_load_state,
+            warm_load_enabled:
+              typeof payload.warm_load_enabled === "boolean"
+                ? payload.warm_load_enabled
+                : prev.warm_load_enabled,
+            warm_load_duration_ms:
+              typeof payload.warm_load_duration_ms === "number"
+                ? payload.warm_load_duration_ms
+                : prev.warm_load_duration_ms,
+            runtime_path:
+              typeof payload.runtime_path === "string"
+                ? payload.runtime_path
+                : prev.runtime_path,
+            relay_runtime_path:
+              typeof payload.relay_runtime_path === "string"
+                ? payload.relay_runtime_path
+                : prev.relay_runtime_path,
+            relay_runtime_state:
+              typeof payload.relay_runtime_state === "string"
+                ? payload.relay_runtime_state
+                : prev.relay_runtime_state,
+            session_id: payloadSessionId ?? prev.session_id,
+            last_error:
+              payload.last_error === null
+                ? null
+                : typeof payload.last_error === "string"
+                  ? payload.last_error
+                  : typeof payload.message === "string"
+                    ? payload.message
+                    : prev.last_error,
+          };
+        });
+        if (
+          payload.type === "started" ||
+          payload.type === "stopped" ||
+          payload.type === "error"
+        ) {
+          setIsStartingComputeNode(false);
+        }
+        if (payload.type === "error") {
+          const computeMessage =
+            typeof payload.last_error === "string"
               ? payload.last_error
-              : typeof payload.message === 'string'
+              : typeof payload.message === "string"
                 ? payload.message
-                : prev.last_error,
-      }));
-      if (payload.type === 'started' || payload.type === 'error') {
-        setIsStartingComputeNode(false);
-      }
-      if (payload.type === 'error') {
-        const computeMessage =
-          typeof payload.last_error === 'string'
-            ? payload.last_error
-            : typeof payload.message === 'string'
-              ? payload.message
-              : 'compute-node operator failed';
-        setError(computeMessage);
-      }
-    });
+                : "compute-node operator failed";
+          setError(computeMessage);
+        }
+      },
+    );
 
     return () => {
       unlisten.then((f) => f());
@@ -256,24 +313,30 @@ export function App() {
     () =>
       Boolean(config.model_path.trim()) &&
       Boolean(prompt.trim()) &&
-      status !== 'starting' &&
-      status !== 'streaming',
-    [config.model_path, prompt, status]
+      status !== "starting" &&
+      status !== "streaming",
+    [config.model_path, prompt, status],
   );
 
   const canStartComputeNode = useMemo(
-    () => Boolean(config.model_path.trim()) && !computeStatus.running && !isStartingComputeNode,
-    [config.model_path, computeStatus.running, isStartingComputeNode]
+    () =>
+      Boolean(config.model_path.trim()) &&
+      !computeStatus.running &&
+      !isStartingComputeNode,
+    [config.model_path, computeStatus.running, isStartingComputeNode],
   );
-  const availableBackend = backend?.available_backend ?? 'cpu';
-  const gpuCapable = availableBackend === 'metal' || availableBackend === 'cuda';
+  const availableBackend = backend?.available_backend ?? "cpu";
+  const gpuCapable =
+    availableBackend === "metal" || availableBackend === "cuda";
 
   const scheduleConfigSave = (next: DesktopConfig) => {
     if (saveTimerRef.current !== null) {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
-      invoke('save_config', { config: next }).catch((e) => setError(formatErrorMessage(e)));
+      invoke("save_config", { config: next }).catch((e) =>
+        setError(formatErrorMessage(e)),
+      );
       saveTimerRef.current = null;
     }, 300);
   };
@@ -288,7 +351,7 @@ export function App() {
       const selection = await open({
         multiple: false,
         directory: false,
-        filters: [{ name: 'GGUF models', extensions: ['gguf'] }],
+        filters: [{ name: "GGUF models", extensions: ["gguf"] }],
       });
       const path = selectedModelPath(selection);
       if (path) {
@@ -302,8 +365,8 @@ export function App() {
   const downloadModel = async () => {
     try {
       setIsDownloadingModel(true);
-      setError('');
-      const info = await invoke<ModelArtifactInfo>('download_model_artifact');
+      setError("");
+      const info = await invoke<ModelArtifactInfo>("download_model_artifact");
       setArtifact(info);
       setConfig((prev) => {
         const next = { ...prev, model_path: info.resolved_model_path };
@@ -318,14 +381,14 @@ export function App() {
   };
 
   const startInference = async () => {
-    setOutput('');
-    setError('');
-    setStatus('starting');
+    setOutput("");
+    setError("");
+    setStatus("starting");
     const nextRequestId = crypto.randomUUID();
     requestIdRef.current = nextRequestId;
     setRequestId(nextRequestId);
     try {
-      await invoke('start_inference', {
+      await invoke("start_inference", {
         request: {
           request_id: nextRequestId,
           model_path: config.model_path,
@@ -334,23 +397,23 @@ export function App() {
         },
       });
     } catch (e) {
-      setStatus('failed');
+      setStatus("failed");
       setError(formatErrorMessage(e));
     }
   };
 
   const cancelInference = async () => {
     if (!requestIdRef.current) return;
-    await invoke('cancel_inference', { request_id: requestIdRef.current });
+    await invoke("cancel_inference", { request_id: requestIdRef.current });
   };
 
   const startComputeNode = async () => {
     try {
       setIsStartingComputeNode(true);
-      setError('');
+      setError("");
       setComputeStatus((prev) => ({
         ...prev,
-        running: false,
+        running: true,
         registered: false,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
@@ -361,8 +424,10 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
+        relay_runtime_state: "starting",
+        session_id: prev.session_id + 1,
       }));
-      await invoke('start_compute_node', {
+      await invoke("start_compute_node", {
         request: {
           model_path: config.model_path,
           relay_base_url: config.relay_base_url,
@@ -384,7 +449,14 @@ export function App() {
 
   const stopComputeNode = async () => {
     try {
-      await invoke('stop_compute_node');
+      setComputeStatus((prev) => ({
+        ...prev,
+        running: false,
+        registered: false,
+        relay_runtime_state: "stopped",
+        last_error: null,
+      }));
+      await invoke("stop_compute_node");
     } catch (e) {
       setError(formatErrorMessage(e));
     }
@@ -393,8 +465,8 @@ export function App() {
   const forwardEncrypted = async () => {
     try {
       setIsForwarding(true);
-      setError('');
-      await invoke('encrypt_and_forward', {
+      setError("");
+      await invoke("encrypt_and_forward", {
         relay_base_url: config.relay_base_url,
         final_output: output,
       });
@@ -406,113 +478,212 @@ export function App() {
   };
 
   return (
-    <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
+    <main
+      style={{ maxWidth: 820, margin: "20px auto", fontFamily: "sans-serif" }}
+    >
       <h1>token.place desktop compute node</h1>
-      <p>Platform GPU availability: <strong>{backend?.availability_label ?? 'loading...'}</strong></p>
+      <p>
+        Platform GPU availability:{" "}
+        <strong>{backend?.availability_label ?? "loading..."}</strong>
+      </p>
       <label htmlFor="model-path-input">Model GGUF path</label>
-      <div style={{ display: 'flex', gap: 8 }}>
+      <div style={{ display: "flex", gap: 8 }}>
         <input
           id="model-path-input"
           value={config.model_path}
-          style={{ width: '100%' }}
-          onChange={(e) => updateConfig({ ...config, model_path: e.target.value })}
+          style={{ width: "100%" }}
+          onChange={(e) =>
+            updateConfig({ ...config, model_path: e.target.value })
+          }
         />
-        <button type="button" onClick={chooseModelPath}>Browse</button>
-        <button type="button" onClick={downloadModel} disabled={isDownloadingModel}>
-          {isDownloadingModel ? 'Downloading…' : 'Download'}
+        <button type="button" onClick={chooseModelPath}>
+          Browse
+        </button>
+        <button
+          type="button"
+          onClick={downloadModel}
+          disabled={isDownloadingModel}
+        >
+          {isDownloadingModel ? "Downloading…" : "Download"}
         </button>
       </div>
       {artifact && (
         <section style={{ marginTop: 8, fontSize: 14 }}>
           <div>
-            Canonical model family:{' '}
-            <a href={artifact.canonical_family_url} target="_blank" rel="noreferrer">
+            Canonical model family:{" "}
+            <a
+              href={artifact.canonical_family_url}
+              target="_blank"
+              rel="noreferrer"
+            >
               {artifact.canonical_family_url}
             </a>
           </div>
-          <div>Runtime GGUF filename: <code>{artifact.filename}</code></div>
           <div>
-            Runtime GGUF source:{' '}
+            Runtime GGUF filename: <code>{artifact.filename}</code>
+          </div>
+          <div>
+            Runtime GGUF source:{" "}
             <a href={artifact.url} target="_blank" rel="noreferrer">
               {artifact.url}
             </a>
           </div>
-          <div>Runtime models directory: <code>{artifact.models_dir}</code></div>
-          <div>Runtime resolved path: <code>{artifact.resolved_model_path}</code></div>
           <div>
-            Downloaded: <strong>{artifact.exists ? 'yes' : 'no'}</strong>
-            {artifact.size_bytes != null ? ` (${artifact.size_bytes.toLocaleString()} bytes)` : ''}
+            Runtime models directory: <code>{artifact.models_dir}</code>
+          </div>
+          <div>
+            Runtime resolved path: <code>{artifact.resolved_model_path}</code>
+          </div>
+          <div>
+            Downloaded: <strong>{artifact.exists ? "yes" : "no"}</strong>
+            {artifact.size_bytes != null
+              ? ` (${artifact.size_bytes.toLocaleString()} bytes)`
+              : ""}
           </div>
         </section>
       )}
 
-      <label style={{ display: 'block', marginTop: 12 }}>Compute mode</label>
+      <label style={{ display: "block", marginTop: 12 }}>Compute mode</label>
       <select
         value={config.preferred_mode}
-        onChange={(e) => updateConfig({ ...config, preferred_mode: e.target.value as BackendMode })}
+        onChange={(e) =>
+          updateConfig({
+            ...config,
+            preferred_mode: e.target.value as BackendMode,
+          })
+        }
       >
         <option value="auto">Auto</option>
         <option value="cpu">CPU only</option>
-        <option value="gpu" disabled={!gpuCapable}>GPU only</option>
-        <option value="hybrid" disabled={!gpuCapable}>Hybrid (partial GPU offload)</option>
+        <option value="gpu" disabled={!gpuCapable}>
+          GPU only
+        </option>
+        <option value="hybrid" disabled={!gpuCapable}>
+          Hybrid (partial GPU offload)
+        </option>
       </select>
-      <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
-        Operator note: GPU mode requests full offload when CUDA/Metal is available; Hybrid requests
-        partial offload. Unsupported platforms fall back to CPU with diagnostics.
+      <p style={{ marginTop: 8, fontSize: 12, color: "#555" }}>
+        Operator note: GPU mode requests full offload when CUDA/Metal is
+        available; Hybrid requests partial offload. Unsupported platforms fall
+        back to CPU with diagnostics.
       </p>
 
-      <label style={{ display: 'block', marginTop: 12 }}>Relay URL</label>
+      <label style={{ display: "block", marginTop: 12 }}>Relay URL</label>
       <input
         value={config.relay_base_url}
-        style={{ width: '100%' }}
-        onChange={(e) => updateConfig({ ...config, relay_base_url: e.target.value })}
+        style={{ width: "100%" }}
+        onChange={(e) =>
+          updateConfig({ ...config, relay_base_url: e.target.value })
+        }
       />
 
-      <section style={{ marginTop: 14, border: '1px solid #ddd', padding: 12 }}>
+      <section style={{ marginTop: 14, border: "1px solid #ddd", padding: 12 }}>
         <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
-          <button
-            disabled={!computeStatus.running}
-            onClick={stopComputeNode}
-          >
+        <div style={{ display: "flex", gap: 8 }}>
+          <button disabled={!canStartComputeNode} onClick={startComputeNode}>
+            Start operator
+          </button>
+          <button disabled={!computeStatus.running} onClick={stopComputeNode}>
             Stop operator
           </button>
         </div>
-        <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Registered: <strong>{computeNodeRegistered ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{computeStatus.warm_load_state || 'idle'}</code></p>
-        <p style={{ marginBottom: 0 }}>Runtime path: <code>{computeStatus.runtime_path || 'bridge'}</code></p>
-        <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{computeStatus.relay_runtime_path || 'bridge'}</code></p>
-        <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
-        <p style={{ marginBottom: 0 }}>Requested mode: <code>{computeStatus.requested_mode || config.preferred_mode}</code></p>
-        <p style={{ marginBottom: 0 }}>Effective mode: <code>{computeStatus.effective_mode ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend available: <code>{computeStatus.backend_available ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend selected: <code>{computeStatus.backend_selected ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend used: <code>{computeStatus.backend_used ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
-        <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
-        <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>
+          Running: <strong>{computeStatus.running ? "yes" : "no"}</strong>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Registered: <strong>{computeNodeRegistered ? "yes" : "no"}</strong>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Relay runtime state:{" "}
+          <code>{computeStatus.relay_runtime_state || "idle"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Runtime path: <code>{computeStatus.runtime_path || "bridge"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Relay runtime path:{" "}
+          <code>{computeStatus.relay_runtime_path || "bridge"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Active relay URL:{" "}
+          <code>{computeStatus.active_relay_url || config.relay_base_url}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Requested mode:{" "}
+          <code>{computeStatus.requested_mode || config.preferred_mode}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Effective mode:{" "}
+          <code>{computeStatus.effective_mode ?? "pending"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Backend available:{" "}
+          <code>{computeStatus.backend_available ?? "pending"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Backend selected:{" "}
+          <code>{computeStatus.backend_selected ?? "pending"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Backend used: <code>{computeStatus.backend_used ?? "pending"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Fallback reason:{" "}
+          <code>{computeStatus.fallback_reason || "none"}</code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Model path:{" "}
+          <code>
+            {computeStatus.model_path || config.model_path || "not set"}
+          </code>
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          Last error: <code>{computeStatus.last_error || "none"}</code>
+        </p>
       </section>
 
-      <section style={{ marginTop: 14, borderTop: '1px solid #ddd', paddingTop: 12 }}>
+      <section
+        style={{ marginTop: 14, borderTop: "1px solid #ddd", paddingTop: 12 }}
+      >
         <h2 style={{ marginTop: 0 }}>Local prompt smoke test</h2>
-        <label style={{ display: 'block', marginTop: 12 }}>Prompt</label>
-        <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={6} style={{ width: '100%' }} />
+        <label style={{ display: "block", marginTop: 12 }}>Prompt</label>
+        <textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          rows={6}
+          style={{ width: "100%" }}
+        />
 
-        <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
-          <button disabled={!canStart} onClick={startInference}>Start local inference</button>
-          <button disabled={status !== 'starting' && status !== 'streaming'} onClick={cancelInference}>Cancel</button>
+        <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+          <button disabled={!canStart} onClick={startInference}>
+            Start local inference
+          </button>
+          <button
+            disabled={status !== "starting" && status !== "streaming"}
+            onClick={cancelInference}
+          >
+            Cancel
+          </button>
           <button disabled={!output || isForwarding} onClick={forwardEncrypted}>
             Debug relay forward (disabled; API v1 E2EE only)
           </button>
         </div>
 
-        <p>Status: <strong>{status}</strong></p>
+        <p>
+          Status: <strong>{status}</strong>
+        </p>
       </section>
 
-      {error && <p style={{ color: 'crimson' }}>Error: {error}</p>}
-      <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
+      {error && <p style={{ color: "crimson" }}>Error: {error}</p>}
+      <pre
+        style={{
+          whiteSpace: "pre-wrap",
+          padding: 12,
+          border: "1px solid #ddd",
+        }}
+      >
+        {output}
+      </pre>
     </main>
   );
 }

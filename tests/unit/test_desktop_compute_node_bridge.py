@@ -379,6 +379,86 @@ def _reset_cancel_queue():
     compute_node_bridge._stop_requested_latched.clear()
 
 
+
+
+def test_run_status_payloads_include_full_operator_contract(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ApiV1Runtime)
+
+    call_count = {'count': 0}
+
+    def fake_stop_requested():
+        call_count['count'] += 1
+        return call_count['count'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://relay.example', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    required = set(compute_node_bridge.OPERATOR_STATUS_FIELDS)
+    lifecycle_events = [event for event in events if event.get('type') in {'started', 'status', 'stopped'}]
+    assert lifecycle_events
+    for event in lifecycle_events:
+        assert required.issubset(event.keys())
+    assert events[0]['registered'] is False
+    assert events[0]['relay_runtime_state'] == 'warming'
+    assert any(event.get('relay_runtime_state') == 'registering' and event.get('registered') is False for event in events)
+    assert any(event.get('relay_runtime_state') == 'processing' for event in events)
+    assert events[-1]['running'] is False
+    assert events[-1]['registered'] is False
+    assert events[-1]['relay_runtime_state'] == 'stopped'
+    assert events[-1]['last_error'] is None
+
+
+def test_run_registered_false_until_runtime_ready_and_registration_fresh(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
+
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        runtime = WarmingThenApiV1Runtime.last_instance
+        if runtime is not None and runtime.ready_started.is_set():
+            runtime.ready_release.set()
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    pre_ready_events = [
+        event for event in events
+        if event.get('type') in {'started', 'status'} and event.get('relay_runtime_state') != 'ready' and event.get('relay_runtime_state') != 'processing'
+    ]
+    assert pre_ready_events
+    assert all(event['registered'] is False for event in pre_ready_events)
+    assert any(event.get('registered') is True and event.get('relay_runtime_state') in {'ready', 'processing'} for event in events)
+
+
+def test_run_graceful_stop_clears_registration_and_last_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NullErrorHeartbeatRuntime)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    stopped = events[-1]
+    assert stopped['type'] == 'stopped'
+    assert stopped['running'] is False
+    assert stopped['registered'] is False
+    assert stopped['relay_runtime_state'] == 'stopped'
+    assert stopped['last_error'] is None
+
+
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)
@@ -571,16 +651,16 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert events == [
-        {
-            'type': 'error',
-            'message': (
-                'GPU provisioning failed for desktop Windows launch '
-                '(mode=auto, action=failed): cuda wheel install failed. '
-                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
-            ),
-        }
-    ]
+    assert events[0]['type'] == 'error'
+    assert events[0]['running'] is False
+    assert events[0]['registered'] is False
+    assert events[0]['relay_runtime_state'] == 'failed'
+    assert events[0]['last_error'] == events[0]['message']
+    assert events[0]['message'] == (
+        'GPU provisioning failed for desktop Windows launch '
+        '(mode=auto, action=failed): cuda wheel install failed. '
+        'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+    )
 
 
 def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monkeypatch):
@@ -610,17 +690,17 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert events == [
-        {
-            'type': 'error',
-            'message': (
-                'GPU provisioning failed for desktop Windows launch '
-                '(mode=auto, action=shadowed_repo_llama_cpp): '
-                'llama_cpp import shadowed by repo-local shim. '
-                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
-            ),
-        }
-    ]
+    assert events[0]['type'] == 'error'
+    assert events[0]['running'] is False
+    assert events[0]['registered'] is False
+    assert events[0]['relay_runtime_state'] == 'failed'
+    assert events[0]['last_error'] == events[0]['message']
+    assert events[0]['message'] == (
+        'GPU provisioning failed for desktop Windows launch '
+        '(mode=auto, action=shadowed_repo_llama_cpp): '
+        'llama_cpp import shadowed by repo-local shim. '
+        'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+    )
 
 
 def test_run_windows_gpu_mode_accepts_bootstrap_enabled_cuda_runtime(capsys, monkeypatch):
@@ -2112,7 +2192,12 @@ def test_run_reports_unreachable_for_non_heartbeat_response(capsys, monkeypatch)
 
     assert status == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
-    status_event = next(event for event in events if event.get("type") == "status")
+    status_event = next(
+        event
+        for event in events
+        if event.get("type") == "status"
+        and isinstance(event.get("last_error"), str)
+    )
     assert status_event["registered"] is False
     assert "relay appears unreachable" in status_event["last_error"]
 

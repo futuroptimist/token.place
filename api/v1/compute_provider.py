@@ -158,7 +158,7 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 60.0
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -182,7 +182,7 @@ class DistributedApiV1ComputeProvider:
     ) -> dict[str, Any]:
         _last_backend_path.set("distributed_relay_e2ee_pending")
         crypto_manager = self._build_request_crypto_manager()
-        relay_timeout = max(min(self.timeout_seconds, 30.0), 1.0)
+        relay_timeout = max(float(self.timeout_seconds), 1.0)
         deadline = time.time() + relay_timeout
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
 
@@ -310,101 +310,131 @@ class DistributedApiV1ComputeProvider:
                 ),
             )
 
-        poll_interval = self._poll_interval_seconds()
-        while time.time() < deadline:
+        def _cancel_relay_request(reason: str) -> None:
             try:
-                retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
-                retrieve_response = requests.post(
-                    self._relay_url("/api/v1/relay/responses/retrieve"),
+                requests.post(
+                    self._relay_url("/api/v1/relay/requests/cancel"),
                     json={
                         "client_public_key": crypto_manager.public_key_b64,
                         "request_id": relay_request_id,
+                        "reason": reason,
                     },
-                    timeout=retrieve_timeout,
+                    timeout=min(1.0, max(deadline - time.time(), 0.1)),
                 )
             except requests.RequestException:
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
-
-            if retrieve_response.status_code == 202:
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
-
-            if retrieve_response.status_code == 404:
-                raise _error_from_code(
-                    "compute_node_bridge_error",
-                    message="relay reported unknown API v1 response request id",
+                logger.debug(
+                    "api_v1.compute_provider.cancel_request_failed request_id=%s reason=%s",
+                    relay_request_id,
+                    reason,
                 )
 
-            if retrieve_response.status_code != 200:
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+        poll_interval = self._poll_interval_seconds()
+        try:
+            while time.time() < deadline:
+                try:
+                    retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
+                    retrieve_response = requests.post(
+                        self._relay_url("/api/v1/relay/responses/retrieve"),
+                        json={
+                            "client_public_key": crypto_manager.public_key_b64,
+                            "request_id": relay_request_id,
+                        },
+                        timeout=retrieve_timeout,
+                    )
+                except requests.RequestException:
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            try:
-                retrieve_payload = retrieve_response.json()
-            except ValueError:
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                if retrieve_response.status_code == 202:
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            if not isinstance(retrieve_payload, dict):
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                if retrieve_response.status_code == 404:
+                    _cancel_relay_request("unknown_request_id")
+                    raise _error_from_code(
+                        "compute_node_bridge_error",
+                        message="relay reported unknown API v1 response request id",
+                    )
 
-            if retrieve_payload.get("error"):
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                if retrieve_response.status_code in {409, 410}:
+                    raise _error_from_code(
+                        "compute_node_timeout",
+                        message="relay reported API v1 request was cancelled or expired",
+                    )
 
-            if not {"chat_history", "cipherkey", "iv"}.issubset(retrieve_payload.keys()):
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                if retrieve_response.status_code != 200:
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            decrypted_response = crypto_manager.decrypt_message(retrieve_payload)
-            if decrypted_response is None:
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                try:
+                    retrieve_payload = retrieve_response.json()
+                except ValueError:
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            if not isinstance(decrypted_response, dict):
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="decrypted relay response payload must be an object",
-                )
+                if not isinstance(retrieve_payload, dict):
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            if decrypted_response.get("protocol") != "tokenplace_api_v1_relay_e2ee":
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                if retrieve_payload.get("error"):
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            if decrypted_response.get("request_id") != relay_request_id:
-                time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
-                continue
+                if not {"chat_history", "cipherkey", "iv"}.issubset(retrieve_payload.keys()):
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            if decrypted_response.get("client_public_key") != crypto_manager.public_key_b64:
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="decrypted relay response client_public_key binding mismatch",
-                )
+                decrypted_response = crypto_manager.decrypt_message(retrieve_payload)
+                if decrypted_response is None:
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            api_v1_response = decrypted_response.get("api_v1_response")
-            if not isinstance(api_v1_response, dict):
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="decrypted relay response missing api_v1_response object",
-                )
+                if not isinstance(decrypted_response, dict):
+                    raise _error_from_code(
+                        "compute_node_invalid_payload",
+                        message="decrypted relay response payload must be an object",
+                    )
 
-            if api_v1_response.get("error"):
-                raise _error_from_code(
-                    "compute_node_bridge_error",
-                    message=f"compute node reported error: {api_v1_response.get('error')}",
-                )
+                if decrypted_response.get("protocol") != "tokenplace_api_v1_relay_e2ee":
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            assistant_message = api_v1_response.get("message")
-            if not isinstance(assistant_message, dict):
-                raise _error_from_code(
-                    "compute_node_invalid_payload",
-                    message="compute node response missing assistant message",
-                )
+                if decrypted_response.get("request_id") != relay_request_id:
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+                    continue
 
-            _last_backend_path.set("distributed_relay_e2ee")
-            return assistant_message
+                if decrypted_response.get("client_public_key") != crypto_manager.public_key_b64:
+                    raise _error_from_code(
+                        "compute_node_invalid_payload",
+                        message="decrypted relay response client_public_key binding mismatch",
+                    )
+
+                api_v1_response = decrypted_response.get("api_v1_response")
+                if not isinstance(api_v1_response, dict):
+                    raise _error_from_code(
+                        "compute_node_invalid_payload",
+                        message="decrypted relay response missing api_v1_response object",
+                    )
+
+                if api_v1_response.get("error"):
+                    raise _error_from_code(
+                        "compute_node_bridge_error",
+                        message=f"compute node reported error: {api_v1_response.get('error')}",
+                    )
+
+                assistant_message = api_v1_response.get("message")
+                if not isinstance(assistant_message, dict):
+                    raise _error_from_code(
+                        "compute_node_invalid_payload",
+                        message="compute node response missing assistant message",
+                    )
+
+                _last_backend_path.set("distributed_relay_e2ee")
+                return assistant_message
+
+        finally:
+            if time.time() >= deadline:
+                _cancel_relay_request("timeout")
 
         raise _error_from_code(
             "compute_node_timeout",

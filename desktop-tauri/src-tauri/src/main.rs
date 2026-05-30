@@ -303,8 +303,11 @@ async fn start_compute_node(
 }
 
 #[tauri::command]
-async fn stop_compute_node(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    compute_node::stop_compute_node(state.compute_node.clone())
+async fn stop_compute_node(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    compute_node::stop_compute_node(Some(app), state.compute_node.clone())
         .await
         .map_err(|e| e.to_string())
 }

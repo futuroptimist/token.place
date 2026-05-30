@@ -378,6 +378,108 @@ def _reset_cancel_queue():
     compute_node_bridge._stdin_reader_started = True
     compute_node_bridge._stop_requested_latched.clear()
 
+class RestartTrackingRuntime(FakeRuntime):
+    instances = []
+
+    def __init__(self, _config):
+        super().__init__(_config)
+        self.register_attempts = 0
+        self.stopped = False
+        self.relay_session_starts = 0
+        RestartTrackingRuntime.instances.append(self)
+
+    def start_relay_session(self):
+        self.relay_session_starts += 1
+
+    def register_and_poll_once(self):
+        self.register_attempts += 1
+        return {'next_ping_in_x_seconds': 0, 'error': None}
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_run_start_stop_start_resets_stale_cancel_and_registers_again(capsys, monkeypatch):
+    _reset_cancel_queue()
+    RestartTrackingRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RestartTrackingRuntime)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    first_stop_counter = {'count': 0}
+
+    def first_stop_requested():
+        first_stop_counter['count'] += 1
+        return first_stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', first_stop_requested)
+    assert compute_node_bridge.run(args) == 0
+    first_events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert first_events[-1]['type'] == 'stopped'
+    assert RestartTrackingRuntime.instances[0].relay_session_starts == 1
+    assert RestartTrackingRuntime.instances[0].register_attempts >= 1
+    assert RestartTrackingRuntime.instances[0].stopped is True
+
+    compute_node_bridge._stop_requested_latched.set()
+    compute_node_bridge._stdin_lines.put('{"type":"cancel"}')
+    second_stop_counter = {'count': 0}
+
+    def second_stop_requested():
+        second_stop_counter['count'] += 1
+        return second_stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', second_stop_requested)
+    assert compute_node_bridge.run(args) == 0
+    second_output = capsys.readouterr()
+    second_events = [json.loads(line) for line in second_output.out.splitlines()]
+
+    assert len(RestartTrackingRuntime.instances) == 2
+    assert RestartTrackingRuntime.instances[1].relay_session_starts == 1
+    assert RestartTrackingRuntime.instances[1].register_attempts >= 1
+    assert second_events[0]['type'] == 'started'
+    assert any(event['type'] == 'status' and event['registered'] is True for event in second_events)
+    assert second_events[-1]['type'] == 'stopped'
+    assert 'stale_cancel_messages_drained=1' in second_output.err
+
+
+def test_run_restart_falls_back_to_relay_client_start(capsys, monkeypatch):
+    _reset_cancel_queue()
+    start_calls = []
+
+    class StartableRelayClient(FakeRelayClient):
+        def start(self):
+            start_calls.append('start')
+
+    class RuntimeWithoutSessionHook(FakeRuntime):
+        def __init__(self, _config):
+            super().__init__(_config)
+            self.relay_client = StartableRelayClient()
+
+        def register_and_poll_once(self):
+            return {'next_ping_in_x_seconds': 0, 'error': None}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RuntimeWithoutSessionHook)
+    stop_counter = {'count': 0}
+
+    def stop_after_first_poll():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_first_poll)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    assert start_calls == ['start']
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.relay_client.reset' in output.err
+
 
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
     _reset_cancel_queue()

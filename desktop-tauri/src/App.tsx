@@ -97,8 +97,8 @@ function mergeComputeStatusEvent(
 ): ComputeNodeStatus {
   const payloadSession = typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
   const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
-  const isFreshStartEvent =
-    payload.type === 'started' &&
+  const isFreshSessionEvent =
+    (payload.type === 'started' || payload.type === 'error') &&
     payloadSequence === 1 &&
     !prev.running &&
     payloadSession !== null &&
@@ -107,7 +107,7 @@ function mergeComputeStatusEvent(
     prev.operator_session_id &&
     payloadSession &&
     payloadSession !== prev.operator_session_id &&
-    !isFreshStartEvent
+    !isFreshSessionEvent
   ) {
     return prev;
   }
@@ -115,7 +115,7 @@ function mergeComputeStatusEvent(
     payloadSequence !== null &&
     prev.sequence !== null &&
     payloadSequence <= prev.sequence &&
-    !isFreshStartEvent
+    !isFreshSessionEvent
   ) {
     return prev;
   }
@@ -127,7 +127,12 @@ function mergeComputeStatusEvent(
         : payload.type === 'error'
           ? false
           : prev.running,
-    registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
+    registered:
+      typeof payload.registered === 'boolean'
+        ? payload.registered
+        : payload.type === 'error'
+          ? false
+          : prev.registered,
     active_relay_url:
       typeof payload.active_relay_url === 'string'
         ? payload.active_relay_url
@@ -158,9 +163,15 @@ function mergeComputeStatusEvent(
         ? payload.relay_runtime_state
         : typeof payload.warm_load_state === 'string'
           ? payload.warm_load_state
-          : prev.relay_runtime_state,
+          : payload.type === 'error'
+            ? 'failed'
+            : prev.relay_runtime_state,
     warm_load_state:
-      typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+      typeof payload.warm_load_state === 'string'
+        ? payload.warm_load_state
+        : payload.type === 'error'
+          ? 'failed'
+          : prev.warm_load_state,
     warm_load_enabled:
       typeof payload.warm_load_enabled === 'boolean'
         ? payload.warm_load_enabled
@@ -416,6 +427,7 @@ export function App() {
         running: false,
         registered: false,
         relay_runtime_state: 'starting',
+        sequence: computeStatusRef.current.operator_session_id ? Number.MAX_SAFE_INTEGER : null,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
         effective_mode: null,

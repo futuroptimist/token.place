@@ -622,6 +622,218 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+
+  it('handles Start Stop Start with fresh registration and cleared errors', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'idle',
+      last_error: 'previous failure',
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    fireEvent.click(startButton);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(true)
+    );
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.queryByText(/Previous failure/i)).toBeNull();
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'old stale stop',
+        operator_session_id: 'old-session',
+        sequence: 9,
+      },
+    });
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
+
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'warming',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+
+    fireEvent.click((await screen.findByText('Stop operator')) as HTMLButtonElement);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'stop_compute_node')).toBe(true)
+    );
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'warming',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+  });
+
+  it('surfaces a fresh restart startup error while ignoring stale old-session events', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'idle',
+      last_error: null,
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    fireEvent.click(startButton);
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+
+    fireEvent.click((await screen.findByText('Stop operator')) as HTMLButtonElement);
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'old stale stop after restart',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'old stale error after restart',
+        operator_session_id: 'session-1',
+        sequence: 4,
+      },
+    });
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
+    expect(screen.queryByText('old stale error after restart')).toBeNull();
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        last_error: 'new session failed before started',
+        operator_session_id: 'session-2',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Last error:/).textContent).toContain(
+        'new session failed before started'
+      )
+    );
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('renders the full initial idle compute-node status contract', async () => {
     mockInitialComputeStatus({
       running: false,
@@ -904,6 +1116,45 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
+  it('surfaces fresh restart errors from a new operator session', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'stopped',
+      active_relay_url: 'https://token.place',
+      last_error: null,
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    fireEvent.click(startButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'fresh preflight failed',
+        operator_session_id: 'new-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Last error:/).textContent).toContain('fresh preflight failed')
+    );
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
   });
 
   it('ignores replayed started events from the stopped prior session', async () => {

@@ -184,6 +184,8 @@ def test_distributed_compute_provider_treats_retrieve_404_as_unknown_request(mon
             return _FakeResponse(200, {"message": "Request received"})
         if url.endswith("/api/v1/relay/responses/retrieve"):
             return _FakeResponse(404, {"error": {"message": "unknown request"}})
+        if url.endswith("/api/v1/relay/requests/cancel"):
+            return _FakeResponse(200, {"status": "cancelled"})
         raise AssertionError(f"unexpected URL {url}")
 
     monkeypatch.setattr(

@@ -21,6 +21,7 @@ from relay import (
     known_servers,
     client_inference_requests,
     client_pending_request_ids,
+    client_terminal_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -42,6 +43,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_terminal_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -57,6 +59,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_terminal_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -2232,3 +2235,109 @@ def test_api_v1_unregister_is_idempotent_when_server_already_gone(client):
     assert second.status_code == 200
     assert first.get_json()['removed'] is False
     assert second.get_json()['removed'] is False
+
+
+def test_api_v1_cancel_removes_queued_request_and_returns_terminal_status(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0')
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-cancel-queued',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+    assert client.get('/relay/diagnostics').get_json()['queue_depth'] == 1
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-cancel-queued',
+        'reason': 'timeout',
+    })
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()['removed_from_queue'] == 1
+    assert client.get('/relay/diagnostics').get_json()['queue_depth'] == 0
+
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    assert poll.get_json()['message'] == 'No requests available'
+
+    terminal = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-cancel-queued',
+    })
+    assert terminal.status_code == 410
+    assert terminal.get_json()['error']['status'] == 'timeout'
+
+
+def test_api_v1_pending_ttl_expiry_removes_queued_request_and_blocks_late_dispatch(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0')
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-expire-queued',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+    assert queued.status_code == 200
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-expire-queued']
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 2.0)
+
+    expired = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-expire-queued',
+    })
+    assert expired.status_code == 410
+    assert expired.get_json()['error']['status'] == 'expired'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+    assert client.get('/relay/diagnostics').get_json()['queue_depth'] == 0
+
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    assert poll.get_json()['message'] == 'No requests available'
+
+
+def test_api_v1_three_sequential_requests_leave_queue_depth_zero(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0')
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+
+    for idx in range(1, 4):
+        request_id = f'req-seq-{idx}'
+        queued = client.post('/api/v1/relay/requests', json={
+            'request_id': request_id,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': f'ciphertext-request-{idx}',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+        })
+        assert queued.status_code == 200
+        assert client.get('/relay/diagnostics').get_json()['queue_depth'] == 1
+
+        poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+        assert poll.status_code == 200
+        assert poll.get_json()['request_id'] == request_id
+        assert client.get('/relay/diagnostics').get_json()['queue_depth'] == 0
+
+        submitted = client.post('/api/v1/relay/responses', json={
+            'request_id': request_id,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'chat_history': f'ciphertext-response-{idx}',
+            'cipherkey': 'cipherkey-response',
+            'iv': 'iv-response',
+        })
+        assert submitted.status_code == 200
+
+        retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': request_id,
+        })
+        assert retrieved.status_code == 200
+        assert retrieved.get_json()['request_id'] == request_id
+        assert client.get('/relay/diagnostics').get_json()['queue_depth'] == 0

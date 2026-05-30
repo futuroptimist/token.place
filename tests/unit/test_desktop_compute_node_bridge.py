@@ -1940,6 +1940,112 @@ def test_run_stops_when_pre_registration_runtime_warmup_fails(capsys, monkeypatc
     assert payload["type"] == "error"
 
 
+def test_run_times_out_never_completing_pre_registration_warm_load(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class NeverReadyRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.ready_started = threading.Event()
+            self.never_release = threading.Event()
+
+        def ensure_api_v1_runtime_ready(self):
+            calls.append("warm")
+            self.ready_started.set()
+            self.never_release.wait()
+            return True
+
+        def register_and_poll_once(self):
+            calls.append("poll")
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NeverReadyRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "0.05")
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    assert calls == ["warm"]
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.registration.gate_wait_timeout' in output.err
+    assert 'desktop.compute_node_bridge.model_init.cancel_requested reason=pre_registration_timeout' in output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.register' not in output.err
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get('type') == 'error')
+    assert error_event['running'] is False
+    assert error_event['registered'] is False
+    assert error_event['warm_load_state'] == 'failed'
+    assert error_event['relay_runtime_state'] == 'failed'
+    assert error_event['last_error'] == 'API v1 relay runtime warm-load timed out after 0.05s'
+    assert events[-1]['type'] == 'stopped'
+    assert events[-1]['running'] is False
+    assert events[-1]['registered'] is False
+    assert events[-1]['last_error'] == 'API v1 relay runtime warm-load timed out after 0.05s'
+
+
+def test_run_start_after_warm_load_timeout_uses_fresh_session_and_registers(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class TimeoutThenReadyRuntime(FakeRuntime):
+        instances = []
+
+        def __init__(self, config):
+            super().__init__(config)
+            TimeoutThenReadyRuntime.instances.append(self)
+            self.instance_index = len(TimeoutThenReadyRuntime.instances)
+            self.never_release = threading.Event()
+
+        def ensure_api_v1_runtime_ready(self):
+            calls.append((self.instance_index, "warm"))
+            if self.instance_index == 1:
+                self.never_release.wait()
+            return True
+
+        def register_and_poll_once(self):
+            calls.append((self.instance_index, "poll"))
+            return {"next_ping_in_x_seconds": 0, "error": None}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=TimeoutThenReadyRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "0.05")
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    first_status = compute_node_bridge.run(args)
+    first_output = capsys.readouterr()
+    assert first_status == 1
+    assert calls == [(1, "warm")]
+    first_events = [json.loads(line) for line in first_output.out.splitlines() if line.strip()]
+    first_session = first_events[0]['operator_session_id']
+    assert any(event.get('type') == 'error' for event in first_events)
+
+    stop_counter = {'count': 0}
+
+    def stop_after_first_poll():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_first_poll)
+    second_status = compute_node_bridge.run(args)
+    second_output = capsys.readouterr()
+
+    assert second_status == 0
+    assert calls[-2:] == [(2, "warm"), (2, "poll")]
+    second_events = [json.loads(line) for line in second_output.out.splitlines() if line.strip()]
+    second_session = second_events[0]['operator_session_id']
+    assert second_session != first_session
+    assert any(event.get('registered') is True for event in second_events if event.get('type') == 'status')
+    assert 'desktop.compute_node_bridge.registration.gate_wait_done' in second_output.err
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.register' in second_output.err
+
 def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []

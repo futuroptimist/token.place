@@ -460,10 +460,29 @@ class ModelManager:
                     else:
                         try:
                             # Dynamically import Llama only when needed
+                            self.log_info("model_init.stage import_llama_cpp.start")
                             llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
+                            llama_module_path = getattr(llama_cpp, '__file__', 'unknown')
+                            self.log_info(
+                                "model_init.stage import_llama_cpp.completed "
+                                f"llama_module_path={llama_module_path}"
+                            )
                             Llama = llama_cpp.Llama
 
+                            self.log_info(
+                                "model_init.stage compute_plan.start "
+                                f"requested_mode={self.requested_compute_mode}"
+                            )
                             compute_plan = self._resolve_compute_plan()
+                            self.log_info(
+                                "model_init.stage compute_plan.completed "
+                                f"requested={compute_plan['requested_mode']} "
+                                f"effective={compute_plan['effective_mode']} "
+                                f"backend_selected={compute_plan['backend_selected']} "
+                                f"backend_used={compute_plan['backend_used']} "
+                                f"n_gpu_layers={compute_plan['n_gpu_layers']} "
+                                f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
+                            )
                             n_gpu_layers = int(compute_plan['n_gpu_layers'])
                             if self.enforce_gpu_headroom and n_gpu_layers != 0:
                                 try:
@@ -486,7 +505,12 @@ class ModelManager:
                                             'insufficient GPU memory headroom for safe offload'
                                         )
 
+                            self.log_info(
+                                "model_init.stage llama_instantiate.about_to_start "
+                                f"model_path={self.model_path} n_gpu_layers={n_gpu_layers}"
+                            )
                             self.log_info(f"Initializing Llama model from {self.model_path}...")
+                            self.log_info("model_init.stage llama_instantiate.start")
                             self.llm = Llama(
                                 model_path=self.model_path,
                                 n_gpu_layers=n_gpu_layers,
@@ -494,6 +518,7 @@ class ModelManager:
                                 chat_format=self.config.get('model.chat_format', 'llama-3'),
                                 verbose=llama_cpp_verbose_logging_enabled(),
                             )
+                            self.log_info("model_init.stage llama_instantiate.completed")
                             compute_plan['n_gpu_layers'] = n_gpu_layers
                             compute_plan['kv_cache_device'] = (
                                 compute_plan['backend_used']
@@ -523,6 +548,10 @@ class ModelManager:
                             )
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
+                            self.log_error(
+                                f"model_init.stage failed exc_type={type(e).__name__}: {e}",
+                                exc_info=True,
+                            )
                             self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)
                             return None
 

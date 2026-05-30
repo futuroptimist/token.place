@@ -78,6 +78,58 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
     model_manager.download_model_if_needed.assert_called_once_with()
 
 
+def test_compute_node_runtime_logs_artifact_ready_not_runtime_ready(caplog):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.model_path = "/tmp/model.gguf"
+    model_manager.download_model_if_needed.return_value = True
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    with caplog.at_level("INFO", logger="utils.compute_node_runtime"):
+        assert runtime.ensure_model_ready() is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Model artifact ready; runtime warmup still pending" in message
+        for message in messages
+    )
+    assert all(message != "Model ready for inference" for message in messages)
+
+
+def test_compute_node_runtime_ensure_api_v1_runtime_ready_logs_warmup_stages(caplog):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.model_path = "/tmp/model.gguf"
+    model_manager.download_model_if_needed.return_value = True
+    model_manager.last_compute_diagnostics = {"requested_mode": "cpu"}
+    llm_runtime = MagicMock()
+    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_runtime
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    with caplog.at_level("INFO", logger="utils.compute_node_runtime"):
+        assert runtime.ensure_api_v1_runtime_ready() is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "API v1 runtime warmup stage=model_artifact_check start" in messages
+    assert "API v1 runtime warmup stage=model_artifact_check completed" in messages
+    assert any(
+        message.startswith("API v1 runtime warmup stage=llm_instance_get start")
+        for message in messages
+    )
+    assert "API v1 runtime warmup stage=llm_instance_get completed" in messages
+    assert "API v1 runtime warmup stage=runtime_ready completed" in messages
+
 def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
     model_manager = MagicMock()
     model_manager.use_mock_llm = True

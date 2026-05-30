@@ -282,36 +282,44 @@ class ComputeNodeRuntime:
             self.request_adapters = list(request_adapters)
 
     def ensure_model_ready(self) -> bool:
-        """Initialize model runtime and report readiness."""
+        """Ensure the model artifact exists before warming the LLM runtime."""
 
-        _log_info("Initializing LLM...")
+        _log_info("Preparing LLM model artifact...")
         if self.model_manager.use_mock_llm:
             _log_info("Using mock LLM based on configuration")
             return True
 
+        model_path = getattr(self.model_manager, "model_path", "unknown")
+        _log_info(f"Checking model artifact before runtime warmup path={model_path}")
         if self.model_manager.download_model_if_needed():
-            _log_info("Model ready for inference")
+            _log_info(f"Model artifact ready; runtime warmup still pending path={model_path}")
             return True
 
-        _log_error("Failed to download or verify model")
+        _log_error("Failed to download or verify model artifact")
         return False
 
     def ensure_api_v1_runtime_ready(self) -> bool:
         """Warm and validate API v1 non-streaming runtime before polling."""
 
+        _log_info("API v1 runtime warmup stage=model_artifact_check start")
         if not self.ensure_model_ready():
+            _log_error("API v1 runtime warmup stage=model_artifact_check failed")
             return False
+        _log_info("API v1 runtime warmup stage=model_artifact_check completed")
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
         if not callable(get_llm_instance):
             _log_error("Model manager missing get_llm_instance required for API v1 warmup")
             return False
 
+        model_path = getattr(self.model_manager, "model_path", "unknown")
+        _log_info(f"API v1 runtime warmup stage=llm_instance_get start model_path={model_path}")
         try:
             llm_runtime = get_llm_instance()
         except Exception:
             _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
             return False
+        _log_info("API v1 runtime warmup stage=llm_instance_get completed")
 
         if llm_runtime is None:
             _log_error("API v1 runtime warmup failed: get_llm_instance returned None")
@@ -329,6 +337,7 @@ class ComputeNodeRuntime:
             diagnostics["api_v1_runtime_ready"] = True
             self.model_manager.last_compute_diagnostics = diagnostics
 
+        _log_info("API v1 runtime warmup stage=runtime_ready completed")
         return True
 
     def start_relay_polling(self) -> threading.Thread:

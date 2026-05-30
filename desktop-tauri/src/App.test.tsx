@@ -1157,6 +1157,64 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
   });
 
+
+  it('shows warm-load timeout as stopped and unregistered without stale registered state', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      relay_runtime_state: 'warming',
+      warm_load_state: 'warming',
+      active_relay_url: 'https://token.place',
+      operator_session_id: 'warm-session',
+      sequence: 2,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming')
+    );
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        warm_load_state: 'failed',
+        last_error: 'API v1 relay runtime warm-load timed out after 120s',
+        operator_session_id: 'warm-session',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Last error:/).textContent).toContain(
+        'API v1 relay runtime warm-load timed out after 120s'
+      )
+    );
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
+    const startButton = screen.getByText('Start operator') as HTMLButtonElement;
+    expect(startButton.disabled).toBe(false);
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        operator_session_id: 'warm-session',
+        sequence: 2,
+      },
+    });
+
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
   it('ignores replayed started events from the stopped prior session', async () => {
     mockInitialComputeStatus({
       running: false,

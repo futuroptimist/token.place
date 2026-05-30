@@ -253,6 +253,13 @@ def _api_v1_warm_load_wait_seconds(default: float = API_V1_WARM_LOAD_WAIT_DEFAUL
     return value
 
 
+def _format_warm_load_timeout_message(timeout_seconds: float) -> str:
+    """Return the actionable UI error for bounded pre-registration warm-load timeout."""
+
+    timeout_display = f"{timeout_seconds:g}"
+    return f"API v1 relay runtime warm-load timed out after {timeout_display}s"
+
+
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
     """Return a normalized relay error message if the response includes one."""
 
@@ -460,6 +467,8 @@ def emit(payload: Dict[str, Any]) -> None:
 def _relay_runtime_state(
     warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
 ) -> str:
+    if warm_load_state == "failed":
+        return "failed"
     if not running:
         return "stopped"
     if not warm_load_enabled:
@@ -763,6 +772,12 @@ def run(args: argparse.Namespace) -> int:
             warm_load_failed = None
             warm_load_duration_ms = None
             warm_load_started_at = time.perf_counter()
+            print(
+                "desktop.compute_node_bridge.model_init.stage runtime_ready_future.start "
+                f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "
+                f"request_id={request_id}",
+                file=sys.stderr,
+            )
             warm_load_future = _DaemonWarmLoadFuture(runtime.ensure_api_v1_runtime_ready)
             emit_status_event(
                 registered=False,
@@ -903,6 +918,7 @@ def run(args: argparse.Namespace) -> int:
             )
             return True
         warm_load_deadline_seconds = _api_v1_warm_load_wait_seconds()
+        timeout_message = _format_warm_load_timeout_message(warm_load_deadline_seconds)
         print(
             "desktop.compute_node_bridge.registration.gate_wait_start "
             f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
@@ -924,14 +940,22 @@ def run(args: argparse.Namespace) -> int:
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
             if remaining_seconds <= 0:
                 warm_load_state = "failed"
-                warm_load_failed = "timed out initializing API v1 model runtime before relay registration"
+                warm_load_failed = timeout_message
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 last_error = warm_load_failed
+                if warm_load_future is not None and not warm_load_future.done():
+                    warm_load_future.cancel()
                 print(
                     "desktop.compute_node_bridge.registration.gate_wait_timeout "
                     f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
                     f"state={warm_load_state} duration_ms={warm_load_duration_ms} "
-                    f"timeout_seconds={warm_load_deadline_seconds}",
+                    f"timeout_seconds={warm_load_deadline_seconds} message={timeout_message!r}",
+                    file=sys.stderr,
+                )
+                print(
+                    "desktop.compute_node_bridge.model_init.cancel_requested "
+                    f"reason=pre_registration_timeout relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+                    f"state={warm_load_state} duration_ms={warm_load_duration_ms}",
                     file=sys.stderr,
                 )
                 emit_status_event(
@@ -967,6 +991,14 @@ def run(args: argparse.Namespace) -> int:
                     current_last_error=last_error,
                 )
             if stop_requested():
+                if warm_load_future is not None and not warm_load_future.done():
+                    warm_load_future.cancel()
+                    print(
+                        "desktop.compute_node_bridge.model_init.cancel_requested "
+                        f"reason=operator_stop relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+                        f"state={warm_load_state}",
+                        file=sys.stderr,
+                    )
                 return False
             time.sleep(0.01)
         if warm_load_state == "failed":

@@ -1777,6 +1777,59 @@ def test_api_v1_pending_request_ttl_expires_and_removes_queue_depth(
     assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) == []
 
 
+def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeypatch):
+    assert (
+        client.post(
+            "/api/v1/relay/servers/register",
+            json={"server_public_key": DUMMY_SERVER_PUB_KEY},
+        ).status_code
+        == 200
+    )
+    queued = client.post(
+        "/api/v1/relay/requests",
+        json={
+            "request_id": "req-expired-before-response",
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "server_public_key": DUMMY_SERVER_PUB_KEY,
+            "chat_history": "ciphertext-request",
+            "cipherkey": "cipherkey-request",
+            "iv": "iv-request",
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+        },
+    )
+    assert queued.status_code == 200
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY][
+        "req-expired-before-response"
+    ]["queued_at"]
+    monkeypatch.setattr(relay_module, "PENDING_REQUEST_TTL_SECONDS", 1.0)
+    monkeypatch.setattr(relay_module.time, "time", lambda: queued_at + 2.0)
+
+    late_response = client.post(
+        "/api/v1/relay/responses",
+        json={
+            "request_id": "req-expired-before-response",
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "chat_history": "ciphertext-response",
+            "cipherkey": "cipherkey-response",
+            "iv": "iv-response",
+        },
+    )
+    assert late_response.status_code == 410
+    assert late_response.get_json()["error"]["code"] == "expired"
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+    retrieve = client.post(
+        "/api/v1/relay/responses/retrieve",
+        json={
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "request_id": "req-expired-before-response",
+        },
+    )
+    assert retrieve.status_code == 410
+    assert retrieve.get_json()["error"]["code"] == "expired"
+
+
 def test_api_v1_cancel_requires_matching_cancel_token(client):
     client.post(
         "/api/v1/relay/servers/register",

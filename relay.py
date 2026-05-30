@@ -942,7 +942,7 @@ def _select_next_server_payload(*, api_v1: bool = False):
     )
 
 
-@app.route('/next_server', methods=["GET"])
+@app.route("/next_server", methods=["GET"])
 def next_server():
     """
     Endpoint for clients to get the next server to send a request to.
@@ -953,7 +953,7 @@ def next_server():
         - error: an error message with a message and a code
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/next_server')
+        return _legacy_route_deprecated_response("/next_server")
     return _select_next_server_payload()
 
 
@@ -1362,39 +1362,51 @@ def _clear_pending_requests_for_queued_items(queued_items):
         _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
 
 
+def _pending_request_entry_is_expired(pending_entry, *, now=None):
+    if PENDING_REQUEST_TTL_SECONDS <= 0:
+        return False
+    now = time.time() if now is None else now
+    if isinstance(pending_entry, dict):
+        queued_at = pending_entry.get("queued_at")
+    else:
+        queued_at = pending_entry
+    try:
+        return (now - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS
+    except (TypeError, ValueError):
+        return True
+
+
+def _expire_pending_request_if_stale(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return False
+    with client_pending_request_ids_lock:
+        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(
+            request_id
+        )
+    if pending_entry is None or not _pending_request_entry_is_expired(pending_entry):
+        return False
+    _cancel_api_v1_request(
+        client_public_key,
+        request_id,
+        status="expired",
+        reason="pending_request_ttl_exceeded",
+    )
+    return True
+
+
 def _is_request_pending(client_public_key, request_id):
     if not client_public_key or not request_id:
         return False
-    expired = False
     with client_pending_request_ids_lock:
-        pending_ids = client_pending_request_ids.get(client_public_key)
-        if not pending_ids:
-            return False
-        pending_entry = pending_ids.get(request_id)
-        if pending_entry is None:
-            return False
-        if isinstance(pending_entry, dict):
-            queued_at = pending_entry.get("queued_at")
-        else:
-            queued_at = pending_entry
-        if (
-            PENDING_REQUEST_TTL_SECONDS > 0
-            and (time.time() - float(queued_at)) > PENDING_REQUEST_TTL_SECONDS
-        ):
-            pending_ids.pop(request_id, None)
-            if not pending_ids:
-                client_pending_request_ids.pop(client_public_key, None)
-            expired = True
-        else:
-            return True
-    if expired:
-        _cancel_api_v1_request(
-            client_public_key,
-            request_id,
-            status="expired",
-            reason="pending_request_ttl_exceeded",
+        pending_entry = client_pending_request_ids.get(client_public_key, {}).get(
+            request_id
         )
-    return False
+    if pending_entry is None:
+        return False
+    if _pending_request_entry_is_expired(pending_entry):
+        _expire_pending_request_if_stale(client_public_key, request_id)
+        return False
+    return True
 
 
 def _get_pending_cancel_token(client_public_key, request_id):
@@ -1849,6 +1861,7 @@ def api_v1_relay_responses():
 
     request_id = envelope.get("request_id")
     if isinstance(request_id, str) and request_id:
+        _expire_pending_request_if_stale(client_public_key, request_id)
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:
             LOGGER.info(
@@ -1907,6 +1920,7 @@ def api_v1_relay_responses_retrieve():
 
     client_public_key = data["client_public_key"]
     request_id = data.get("request_id")
+    _expire_pending_request_if_stale(client_public_key, request_id)
     terminal = _get_terminal_request(client_public_key, request_id)
     if terminal is not None:
         _remove_client_responses_for_request(client_public_key, request_id)
@@ -1988,7 +2002,7 @@ def api_v1_relay_responses_retrieve():
     return jsonify(response), 200
 
 
-@app.route('/faucet', methods=["POST"])
+@app.route("/faucet", methods=["POST"])
 def faucet():
     """
     Endpoint for clients to request inference given a public key.
@@ -2032,7 +2046,7 @@ def faucet():
     }
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/faucet')
+        return _legacy_route_deprecated_response("/faucet")
 
     _evict_stale_servers()
     # Parse the request data
@@ -2120,7 +2134,7 @@ def faucet():
     return jsonify({"message": "Request received"}), 200
 
 
-@app.route('/sink', methods=["POST"])
+@app.route("/sink", methods=["POST"])
 def sink():
     """
     Endpoint for server instances to announce their availability (offering a compute sink).
@@ -2135,7 +2149,7 @@ def sink():
         - next_ping_in_x_seconds: the number of seconds after which the server should send the next ping
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/sink')
+        return _legacy_route_deprecated_response("/sink")
 
     _evict_stale_servers()
     auth_error = _validate_server_registration()
@@ -2246,13 +2260,13 @@ def unregister():
     return jsonify({"message": "Server unregistered", "removed": removed}), 200
 
 
-@app.route('/source', methods=["POST"])
+@app.route("/source", methods=["POST"])
 def source():
     """
     Receives encrypted responses from the server and queues them for the client to retrieve.
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/source')
+        return _legacy_route_deprecated_response("/source")
 
     auth_error = _validate_server_registration()
     if auth_error:
@@ -2305,13 +2319,13 @@ def stream_source():
     return jsonify({"message": "Chunk stored", "final": final}), 200
 
 
-@app.route('/retrieve', methods=["POST"])
+@app.route("/retrieve", methods=["POST"])
 def retrieve():
     """
     Endpoint for clients to retrieve responses queued by the /source endpoint.
     """
     if not _legacy_routes_enabled():
-        return _legacy_route_deprecated_response('/retrieve')
+        return _legacy_route_deprecated_response("/retrieve")
 
     data = request.get_json()
     if not data or "client_public_key" not in data:

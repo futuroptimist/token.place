@@ -97,8 +97,8 @@ function mergeComputeStatusEvent(
 ): ComputeNodeStatus {
   const payloadSession = typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
   const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
-  const isFreshStartEvent =
-    payload.type === 'started' &&
+  const isFreshSessionEvent =
+    (payload.type === 'started' || payload.type === 'error') &&
     payloadSequence === 1 &&
     !prev.running &&
     payloadSession !== null &&
@@ -107,7 +107,7 @@ function mergeComputeStatusEvent(
     prev.operator_session_id &&
     payloadSession &&
     payloadSession !== prev.operator_session_id &&
-    !isFreshStartEvent
+    !isFreshSessionEvent
   ) {
     return prev;
   }
@@ -115,7 +115,7 @@ function mergeComputeStatusEvent(
     payloadSequence !== null &&
     prev.sequence !== null &&
     payloadSequence <= prev.sequence &&
-    !isFreshStartEvent
+    !isFreshSessionEvent
   ) {
     return prev;
   }

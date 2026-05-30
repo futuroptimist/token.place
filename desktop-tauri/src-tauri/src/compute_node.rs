@@ -199,9 +199,21 @@ fn sanitize_relay_target(relay_url: &str) -> String {
         .next()
         .unwrap_or(without_fragment);
     if let Some((scheme, rest)) = without_query.split_once("://") {
+        let safe_scheme = scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'));
+        if !safe_scheme || scheme.is_empty() {
+            return "unknown".into();
+        }
         let authority = rest.split('/').next().unwrap_or(rest);
         let safe_authority = authority.rsplit('@').next().unwrap_or(authority);
-        return format!("{scheme}://{safe_authority}");
+        let safe_authority: String = safe_authority
+            .chars()
+            .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+            .collect();
+        if !safe_authority.is_empty() {
+            return format!("{scheme}://{safe_authority}");
+        }
     }
     "unknown".into()
 }
@@ -789,6 +801,21 @@ mod tests {
                 .status()
                 .expect("status")
         }
+    }
+
+    #[test]
+    fn sanitize_relay_target_filters_log_control_characters() {
+        assert_eq!(
+            sanitize_relay_target(
+                "https://user:secret@example.com\nforged=1/path?token=secret#frag"
+            ),
+            "https://example.comforged=1"
+        );
+        assert_eq!(sanitize_relay_target("https://\n\t/path"), "unknown");
+        assert_eq!(
+            sanitize_relay_target("bad\nscheme://example.com"),
+            "unknown"
+        );
     }
 
     #[tokio::test]

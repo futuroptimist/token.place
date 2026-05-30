@@ -1022,6 +1022,45 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+  it('surfaces fresh restart errors from a new operator session', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'stopped',
+      active_relay_url: 'https://token.place',
+      last_error: null,
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    fireEvent.click(startButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'fresh preflight failed',
+        operator_session_id: 'new-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Last error:/).textContent).toContain('fresh preflight failed')
+    );
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
+  });
+
   it('ignores replayed started events from the stopped prior session', async () => {
     mockInitialComputeStatus({
       running: false,

@@ -379,6 +379,102 @@ def _reset_cancel_queue():
     compute_node_bridge._stop_requested_latched.clear()
 
 
+
+
+class RestartLifecycleRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.unregister_calls = 0
+        self.relay_url = 'https://token.place'
+
+    def start(self):
+        self.start_calls += 1
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        return True
+
+
+class RestartLifecycleRuntime(FakeRuntime):
+    instances = []
+
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = RestartLifecycleRelayClient()
+        self._responses = [{'next_ping_in_x_seconds': 0, 'error': None}]
+        self._processed = []
+        self.ensure_ready_calls = 0
+        self.register_calls = 0
+        self.stopped = False
+        RestartLifecycleRuntime.instances.append(self)
+
+    def ensure_api_v1_runtime_ready(self):
+        self.ensure_ready_calls += 1
+        return True
+
+    def register_and_poll_once(self):
+        self.register_calls += 1
+        if self._responses:
+            return self._responses.pop(0)
+        return {'next_ping_in_x_seconds': 0, 'error': None}
+
+    def stop(self):
+        self.stopped = True
+        self.relay_client.stop()
+        self.relay_client.unregister_from_relay()
+
+
+def test_run_start_stop_start_resets_cancel_state_and_registers_again(capsys, monkeypatch):
+    _reset_cancel_queue()
+    RestartLifecycleRuntime.instances = []
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RestartLifecycleRuntime)
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-1')
+
+    first_stop_counter = {'count': 0}
+
+    def first_stop_requested():
+        first_stop_counter['count'] += 1
+        return first_stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', first_stop_requested)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    assert compute_node_bridge.run(args) == 0
+
+    compute_node_bridge._stop_requested_latched.set()
+    compute_node_bridge._stdin_lines.put('{"type":"cancel"}\n')
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-2')
+    second_stop_counter = {'count': 0}
+
+    def second_stop_requested():
+        second_stop_counter['count'] += 1
+        return second_stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', second_stop_requested)
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event['operator_session_id'] for event in events if event['type'] == 'started'] == [
+        'session-1',
+        'session-2',
+    ]
+    assert len(RestartLifecycleRuntime.instances) == 2
+    assert [runtime.register_calls for runtime in RestartLifecycleRuntime.instances] == [1, 1]
+    assert all(runtime.ensure_ready_calls == 1 for runtime in RestartLifecycleRuntime.instances)
+    assert all(runtime.relay_client.start_calls == 1 for runtime in RestartLifecycleRuntime.instances)
+    assert all(runtime.stopped for runtime in RestartLifecycleRuntime.instances)
+    second_events = [event for event in events if event['operator_session_id'] == 'session-2']
+    assert any(event['type'] == 'status' and event['registered'] is True for event in second_events)
+
+
 def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch)

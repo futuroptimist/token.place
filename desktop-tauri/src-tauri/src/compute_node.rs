@@ -485,6 +485,12 @@ pub async fn start_compute_node(
         *next_session_id += 1;
         next_session_id.to_string()
     };
+    eprintln!(
+        "desktop.compute_node.session.start session={} relay={} model_path_set={}",
+        session_id,
+        request.relay_base_url,
+        !request.model_path.trim().is_empty()
+    );
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
@@ -546,6 +552,10 @@ pub async fn start_compute_node(
             let mut stdin_slot = state.stdin.lock().await;
             *stdin_slot = pending_stdin.take();
             let mut status = state.status.lock().await;
+            eprintln!(
+                "desktop.compute_node.bridge_spawned session={} script={}",
+                session_id, bridge_script
+            );
             *status = ComputeNodeStatus {
                 running: true,
                 registered: false,
@@ -672,13 +682,20 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    eprintln!("desktop.compute_node.stop_requested");
+    let stop_session = state.status.lock().await.operator_session_id.clone();
+    eprintln!(
+        "desktop.compute_node.stop_requested session={}",
+        stop_session.as_deref().unwrap_or("none")
+    );
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
-        eprintln!("desktop.compute_node.cancel_requested");
+        eprintln!(
+            "desktop.compute_node.cancel_requested session={}",
+            stop_session.as_deref().unwrap_or("none")
+        );
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
     }
@@ -703,7 +720,10 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
-            eprintln!("desktop.compute_node.bridge_kill_requested");
+            eprintln!(
+                "desktop.compute_node.bridge_kill_requested session={}",
+                stop_session.as_deref().unwrap_or("none")
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
             eprintln!("desktop.compute_node.bridge_process_exited killed=true");

@@ -7,6 +7,7 @@ import json
 import math
 import pytest
 import sys
+import time
 import requests
 import jsonschema
 from unittest.mock import MagicMock, patch
@@ -3378,3 +3379,62 @@ def test_start_after_stop_allows_api_v1_registration_again(mock_post):
 
     assert result['next_ping_in_x_seconds'] == 12
     assert mock_post.call_count == 2
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_start_after_stop_clears_stale_api_v1_registration_before_poll(mock_post):
+    client = _standalone_relay_client()
+    relay_url = 'http://localhost:5000'
+    client._api_v1_registered_relays.add(relay_url)
+    client._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
+    client._api_v1_relay_wait_hints[relay_url] = {
+        'next_ping_in_x_seconds': 120,
+        'poll_wait_seconds': 120,
+        'server_public_key': client.crypto_manager.public_key_b64,
+    }
+    client.stop()
+    client.start()
+
+    register_ok = MagicMock(status_code=200)
+    register_ok.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+    poll_ok = MagicMock(status_code=200)
+    poll_ok.json.return_value = {'message': 'No requests available'}
+    mock_post.side_effect = [register_ok, poll_ok]
+
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result['next_ping_in_x_seconds'] == 12
+    requested_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert requested_urls == [
+        'http://localhost:5000/api/v1/relay/servers/register',
+        'http://localhost:5000/api/v1/relay/servers/poll',
+    ]
+    assert client.api_v1_registration_fresh(relay_url) is True
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_stop_unregister_then_start_recreates_usable_poll_lifecycle(mock_post):
+    client = _standalone_relay_client()
+    relay_url = 'http://localhost:5000'
+    client._api_v1_registered_relays.add(relay_url)
+    client._api_v1_last_heartbeat_at[relay_url] = time.monotonic()
+    client._api_v1_relay_wait_hints[relay_url] = {'next_ping_in_x_seconds': 30}
+    unregister_ok = MagicMock(status_code=200)
+    register_ok = MagicMock(status_code=200)
+    register_ok.json.return_value = {'next_ping_in_x_seconds': 10, 'poll_wait_seconds': 0}
+    poll_ok = MagicMock(status_code=200)
+    poll_ok.json.return_value = {'message': 'No requests available'}
+    mock_post.side_effect = [unregister_ok, register_ok, poll_ok]
+
+    client.stop()
+    assert client.unregister_from_relay() is True
+    client.start()
+    result = client.poll_api_v1_encrypted_work()
+
+    assert result['next_ping_in_x_seconds'] == 10
+    requested_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert requested_urls == [
+        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/register',
+        'http://localhost:5000/api/v1/relay/servers/poll',
+    ]

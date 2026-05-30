@@ -769,3 +769,55 @@ def test_get_api_v1_compute_provider_for_mode_reads_fallback_from_env(monkeypatc
 
     provider = get_api_v1_compute_provider_for_mode(mode="distributed", distributed_fallback_enabled=None)
     assert isinstance(provider, LocalApiV1ComputeProvider)
+
+
+def test_distributed_compute_provider_cancels_queued_request_on_timeout(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+    posted = []
+    now = {"value": 1000.0}
+
+    def fake_time():
+        return now["value"]
+
+    def fake_sleep(seconds):
+        now["value"] += max(float(seconds), 0.0)
+
+    def fake_get(url, timeout):
+        assert url == "https://node-a.example/api/v1/relay/servers/next"
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        posted.append((url, copy.deepcopy(json), timeout))
+        if url.endswith("/api/v1/relay/requests"):
+            return _FakeResponse(200, {"message": "Request received"})
+        if url.endswith("/api/v1/relay/responses/retrieve"):
+            return _FakeResponse(202, {"status": "pending"})
+        if url.endswith("/api/v1/relay/requests/cancel"):
+            return _FakeResponse(200, {"status": "timeout", "removed": True})
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+    monkeypatch.setattr(compute_provider.time, "time", fake_time)
+    monkeypatch.setattr(compute_provider.time, "sleep", fake_sleep)
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=1)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_timeout"
+
+    cancel_payloads = [payload for url, payload, _timeout in posted if url.endswith('/api/v1/relay/requests/cancel')]
+    assert len(cancel_payloads) == 1
+    assert cancel_payloads[0]["client_public_key"] == fake_crypto.public_key_b64
+    assert cancel_payloads[0]["request_id"].startswith("api-v1-")
+    assert cancel_payloads[0]["status"] == "timeout"

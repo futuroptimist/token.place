@@ -158,7 +158,7 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 120.0
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -182,7 +182,7 @@ class DistributedApiV1ComputeProvider:
     ) -> dict[str, Any]:
         _last_backend_path.set("distributed_relay_e2ee_pending")
         crypto_manager = self._build_request_crypto_manager()
-        relay_timeout = max(min(self.timeout_seconds, 30.0), 1.0)
+        relay_timeout = max(float(self.timeout_seconds), 1.0)
         deadline = time.time() + relay_timeout
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
 
@@ -194,6 +194,26 @@ class DistributedApiV1ComputeProvider:
                     message="timed out waiting for distributed relay API v1 encrypted response",
                 )
             return remaining
+
+        def _cancel_relay_request(reason: str) -> None:
+            try:
+                requests.post(
+                    self._relay_url("/api/v1/relay/requests/cancel"),
+                    json={
+                        "client_public_key": crypto_manager.public_key_b64,
+                        "request_id": relay_request_id,
+                        "status": "timeout" if reason == "timeout" else "cancelled",
+                        "reason": reason,
+                    },
+                    timeout=min(1.0, max(deadline - time.time(), 0.1)),
+                )
+            except requests.RequestException:
+                logger.debug(
+                    "api_v1.distributed.cancel_failed request_id=%s reason=%s",
+                    relay_request_id,
+                    reason,
+                    exc_info=True,
+                )
 
         try:
             next_server_response = requests.get(
@@ -336,6 +356,23 @@ class DistributedApiV1ComputeProvider:
                     message="relay reported unknown API v1 response request id",
                 )
 
+            if retrieve_response.status_code in {409, 410}:
+                try:
+                    error_payload = retrieve_response.json()
+                except ValueError:
+                    error_payload = {}
+                error_body = error_payload.get("error") if isinstance(error_payload, dict) else {}
+                error_code = error_body.get("code") if isinstance(error_body, dict) else None
+                if error_code in {"cancelled", "expired", "timeout"}:
+                    raise _error_from_code(
+                        "compute_node_timeout" if error_code in {"expired", "timeout"} else "compute_node_bridge_timeout",
+                        message=f"relay reported API v1 request {error_code}",
+                    )
+                raise _error_from_code(
+                    "compute_node_bridge_error",
+                    message=f"relay response retrieve returned terminal status {retrieve_response.status_code}",
+                )
+
             if retrieve_response.status_code != 200:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
@@ -406,6 +443,7 @@ class DistributedApiV1ComputeProvider:
             _last_backend_path.set("distributed_relay_e2ee")
             return assistant_message
 
+        _cancel_relay_request("timeout")
         raise _error_from_code(
             "compute_node_timeout",
             message="timed out waiting for distributed relay API v1 encrypted response",

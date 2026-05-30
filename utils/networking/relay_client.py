@@ -2254,8 +2254,21 @@ class RelayClient:
                     continue
 
                 consecutive_failures = 0
+                api_v1_work_payload = (
+                    relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee'
+                    and isinstance(relay_response.get('request_id'), str)
+                    and {'chat_history', 'cipherkey', 'iv'}.issubset(relay_response.keys())
+                )
                 if relay_response.get('protocol') == 'tokenplace_api_v1_relay_e2ee':
+                    request_id = relay_response.get('request_id')
                     self.process_client_request(relay_response)
+                    if api_v1_work_payload:
+                        wait_seconds = 0.0
+                        log_info(
+                            "api_v1_e2ee.work_processed_next_poll_immediate request_id={} relay={}",
+                            request_id or "none",
+                            _sanitize_relay_target(self.relay_url),
+                        )
                 time.sleep(wait_seconds)
             except Exception as e:
                 consecutive_failures += 1

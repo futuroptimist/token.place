@@ -100,6 +100,8 @@ def reset_relay_state(monkeypatch):
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_responses.clear()
+    relay.client_pending_request_ids.clear()
+    relay.client_cancelled_request_ids.clear()
     relay.streaming_sessions.clear()
     relay.streaming_sessions_by_client.clear()
     compute_provider._build_api_v1_compute_provider.cache_clear()
@@ -111,6 +113,8 @@ def reset_relay_state(monkeypatch):
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_responses.clear()
+    relay.client_pending_request_ids.clear()
+    relay.client_cancelled_request_ids.clear()
     relay.streaming_sessions.clear()
     relay.streaming_sessions_by_client.clear()
     compute_provider._build_api_v1_compute_provider.cache_clear()
@@ -379,7 +383,6 @@ def test_api_v1_desktop_bridge_registration_poll_no_work_heartbeat():
         assert poll_payload["next_ping_in_x_seconds"] == 0
 
 
-
 def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_request(monkeypatch):
     """A desktop node that idled after no-work polling should renew before browser work."""
 
@@ -457,6 +460,83 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
     assert response.status_code == 200, response.text
     completion = _decrypt_browser_response(browser_crypto, response.json())
     assert completion["choices"][0]["message"]["content"] == "pong from desktop"
+
+
+def test_api_v1_desktop_bridge_three_sequential_turns_single_node(monkeypatch):
+    """One desktop node drains immediate sequential API v1 work without stale queue depth."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.01")
+
+    with live_relay_server() as base_url:
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=FakeDesktopModelManager(),
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 1
+        assert desktop_client.register_api_v1_compute_node(base_url)["next_ping_in_x_seconds"] > 0
+
+        monkeypatch.setattr(
+            routes,
+            "get_api_v1_compute_provider_for_mode",
+            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
+                base_url=base_url,
+                timeout_seconds=5,
+            ),
+        )
+
+        for turn in range(3):
+            browser_crypto = EncryptionManager()
+            response_holder = {}
+            payload = {
+                "model": "llama-3-8b-instruct",
+                "encrypted": True,
+                "client_public_key": browser_crypto.public_key_b64,
+                "messages": _encrypt_browser_messages(
+                    [{"role": "user", "content": f"sequential turn {turn + 1}"}]
+                ),
+                "metadata": {
+                    "inference_target": "desktop_bridge_api_v1_e2ee",
+                    "relay_path": "api_v1_e2ee",
+                },
+            }
+
+            browser_thread = threading.Thread(
+                target=lambda: response_holder.setdefault(
+                    "response",
+                    requests.post(
+                        f"{base_url}/api/v1/chat/completions",
+                        json=payload,
+                        timeout=10,
+                    ),
+                ),
+                daemon=True,
+            )
+            browser_thread.start()
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                relay_payload = desktop_client.poll_api_v1_encrypted_work()
+                if relay_payload.get("protocol") == "tokenplace_api_v1_relay_e2ee":
+                    assert desktop_client.process_client_request(relay_payload) is True
+                    break
+                time.sleep(0.01)
+            else:  # pragma: no cover - diagnostic failure path
+                pytest.fail(f"desktop did not receive turn {turn + 1}")
+
+            browser_thread.join(timeout=5)
+            response = response_holder.get("response")
+            assert response is not None
+            assert response.status_code == 200, response.text
+            completion = _decrypt_browser_response(browser_crypto, response.json())
+            assert completion["choices"][0]["message"]["content"] == "pong from desktop"
+            diagnostics = requests.get(f"{base_url}/relay/diagnostics", timeout=2).json()
+            assert diagnostics["registered_compute_nodes"][0]["queue_depth"] == 0
+            assert relay.client_inference_requests == {}
+
+        assert len(desktop_client.model_manager.runtime.calls) == 3
 
 
 @pytest.mark.parametrize("encrypted", [False, True])

@@ -1132,6 +1132,15 @@ def run(args: argparse.Namespace) -> int:
                     current_last_error=last_error,
                 )
 
+                if api_v1_payload:
+                    wait_seconds = 0.0
+                    print(
+                        "desktop.compute_node_bridge.api_v1_e2ee.work_processed_next_poll_immediate "
+                        f"relay={_sanitize_relay_target(active_relay_url)} request_id={request_id} "
+                        f"wait={wait_seconds}",
+                        file=sys.stderr,
+                    )
+
                 if _sleep_with_cancel(wait_seconds):
                     print(
                         "desktop.compute_node_bridge.stop_requested "

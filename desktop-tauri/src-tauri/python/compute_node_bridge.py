@@ -491,6 +491,17 @@ def _structured_startup_error_payload(
     return payload
 
 
+def _reset_stop_requested_state() -> None:
+    """Clear latched and queued cancel signals for a fresh operator session."""
+
+    _stop_requested_latched.clear()
+    while True:
+        try:
+            _stdin_lines.get_nowait()
+        except queue.Empty:
+            break
+
+
 def _sleep_with_cancel(seconds: float) -> bool:
     deadline = time.time() + max(seconds, 0)
     while time.time() < deadline:
@@ -501,9 +512,14 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
-    _stop_requested_latched.clear()
+    _reset_stop_requested_state()
     bridge_session_id = _bridge_session_id_from_env()
     status_sequence = 0
+    print(
+        "desktop.compute_node_bridge.session.start "
+        f"session_id={bridge_session_id} cancellation_token_reset=true",
+        file=sys.stderr,
+    )
 
     def emit_operator_event(payload: Dict[str, Any]) -> None:
         nonlocal status_sequence
@@ -573,7 +589,7 @@ def run(args: argparse.Namespace) -> int:
     relay_port = resolve_relay_port(args.relay_port, relay_url)
     print(
         "desktop.compute_node_bridge.start "
-        f"model={args.model} mode={args.mode} "
+        f"session_id={bridge_session_id} model={args.model} mode={args.mode} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
         file=sys.stderr,
@@ -606,6 +622,22 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     poll_worker = _CancelablePollWorker()
+    print(
+        "desktop.compute_node_bridge.poll.worker_created "
+        f"session_id={bridge_session_id} relay={_sanitize_relay_target(relay_url)}",
+        file=sys.stderr,
+    )
+    relay_start = getattr(runtime.relay_client, "start", None)
+    if callable(relay_start):
+        relay_start()
+        print(
+            "desktop.compute_node_bridge.relay_client.reset "
+            f"session_id={bridge_session_id} "
+            f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
+            f"key_fingerprint={_relay_key_fingerprint(runtime.relay_client)}",
+            file=sys.stderr,
+        )
+
     def build_status_payload(
         *,
         event_type: str,
@@ -993,8 +1025,10 @@ def run(args: argparse.Namespace) -> int:
             while not stop_requested():
                 active_relay_url = runtime.relay_client.relay_url
                 print(
-                    "desktop.compute_node_bridge.api_v1_e2ee.register "
-                    f"relay={_sanitize_relay_target(active_relay_url)}",
+                    "desktop.compute_node_bridge.api_v1_e2ee.register.attempted "
+                    f"session_id={bridge_session_id} "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(runtime.relay_client)}",
                     file=sys.stderr,
                 )
                 relay_response = poll_worker.call(
@@ -1036,6 +1070,7 @@ def run(args: argparse.Namespace) -> int:
 
                 print(
                     "desktop.compute_node_bridge.relay_poll "
+                    f"session_id={bridge_session_id} "
                     f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                     f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
                     f"request_id={request_id} wait={wait_seconds} summary={summary}",
@@ -1044,6 +1079,7 @@ def run(args: argparse.Namespace) -> int:
 
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.poll "
+                    f"session_id={bridge_session_id} "
                     f"relay={_sanitize_relay_target(active_relay_url)} registered={registered} "
                     f"api_v1_payload={api_v1_payload} heartbeat={has_heartbeat} "
                     f"request_id={request_id} wait={wait_seconds} summary={summary}",
@@ -1145,14 +1181,14 @@ def run(args: argparse.Namespace) -> int:
         active_relay_url = getattr(getattr(runtime, "relay_client", None), "relay_url", relay_url)
         print(
             "desktop.compute_node_bridge.stop "
-            f"relay={_sanitize_relay_target(active_relay_url)}",
+            f"session_id={bridge_session_id} relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
         request_poll_cancel(active_relay_url)
         poll_worker.shutdown()
         print(
             "desktop.compute_node_bridge.poll.worker_stopped "
-            f"relay={_sanitize_relay_target(active_relay_url)}",
+            f"session_id={bridge_session_id} relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
         if warm_load_future is not None and not warm_load_future.done():
@@ -1160,7 +1196,7 @@ def run(args: argparse.Namespace) -> int:
         runtime.stop()
         print(
             "desktop.compute_node_bridge.stopped_idle "
-            f"relay={_sanitize_relay_target(active_relay_url)}",
+            f"session_id={bridge_session_id} relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
 

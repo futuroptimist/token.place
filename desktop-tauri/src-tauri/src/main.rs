@@ -15,8 +15,16 @@ use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
 
 #[derive(Default)]
 struct AppState {
@@ -281,22 +289,36 @@ async fn start_compute_node(
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            {
+            let err_message = err.to_string();
+            let error_payload = {
                 let mut status = compute_state.status.lock().await;
-                status.running = false;
-                status.registered = false;
-                status.last_error = Some(err.to_string());
+                if status.running {
+                    None
+                } else {
+                    status.running = false;
+                    status.registered = false;
+                    status.last_error = Some(err_message.clone());
+                    status.relay_runtime_state = Some("failed".into());
+                    let sequence = status.sequence.unwrap_or(0).saturating_add(1);
+                    let updated_at_ms = current_time_ms();
+                    status.sequence = Some(sequence);
+                    status.updated_at_ms = Some(updated_at_ms);
+                    Some(serde_json::json!({
+                        "type": "error",
+                        "running": false,
+                        "registered": false,
+                        "relay_runtime_state": "failed",
+                        "last_error": err_message.clone(),
+                        "message": err_message,
+                        "operator_session_id": status.operator_session_id.clone(),
+                        "sequence": sequence,
+                        "updated_at_ms": updated_at_ms,
+                    }))
+                }
+            };
+            if let Some(payload) = error_payload {
+                let _ = app.emit("compute_node_event", payload);
             }
-            let _ = app.emit(
-                "compute_node_event",
-                serde_json::json!({
-                    "type": "error",
-                    "running": false,
-                    "registered": false,
-                    "last_error": err.to_string(),
-                    "message": err.to_string(),
-                }),
-            );
         }
     });
     Ok(())

@@ -873,6 +873,99 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
   });
 
+
+  it('shows clean Start Stop Start registered transitions and clears last error', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'stopped',
+      active_relay_url: 'https://token.place',
+      last_error: 'previous stop failed',
+      operator_session_id: 'session-1',
+      sequence: 3,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Last error:/).textContent).toContain('previous stop failed');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'starting',
+        active_relay_url: 'https://token.place',
+        model_path: '/tmp/model.gguf',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 3,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'starting',
+        active_relay_url: 'https://token.place',
+        model_path: '/tmp/model.gguf',
+        last_error: null,
+        operator_session_id: 'session-3',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        last_error: null,
+        operator_session_id: 'session-3',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
   it('accepts a fresh started event for restart after stop', async () => {
     mockInitialComputeStatus({
       running: false,

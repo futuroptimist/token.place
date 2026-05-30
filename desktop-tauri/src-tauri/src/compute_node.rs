@@ -191,6 +191,21 @@ fn command_env_value(command: &Command, key: &str) -> Option<String> {
         .map(|value| value.to_string_lossy().into_owned())
 }
 
+fn sanitize_relay_target_for_log(relay_url: &str) -> String {
+    let trimmed = relay_url.trim();
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    if let Some((scheme, rest)) = without_query.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        if host.is_empty() {
+            return "unknown".into();
+        }
+        return format!("{scheme}://{host}");
+    }
+    without_query.to_string()
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -485,6 +500,11 @@ pub async fn start_compute_node(
         *next_session_id += 1;
         next_session_id.to_string()
     };
+    let safe_relay_url = sanitize_relay_target_for_log(&request.relay_base_url);
+    eprintln!(
+        "desktop.compute_node.session.start session_id={} bridge_path={} relay={}",
+        session_id, bridge_script, safe_relay_url
+    );
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
@@ -568,6 +588,10 @@ pub async fn start_compute_node(
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
             };
+            eprintln!(
+                "desktop.compute_node.bridge_spawned session_id={} relay={}",
+                session_id, safe_relay_url
+            );
             true
         }
     };
@@ -672,13 +696,20 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    eprintln!("desktop.compute_node.stop_requested");
+    let stop_session_id = state.status.lock().await.operator_session_id.clone();
+    eprintln!(
+        "desktop.compute_node.stop_requested session_id={}",
+        stop_session_id.as_deref().unwrap_or("none")
+    );
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
-        eprintln!("desktop.compute_node.cancel_requested");
+        eprintln!(
+            "desktop.compute_node.cancel_requested session_id={}",
+            stop_session_id.as_deref().unwrap_or("none")
+        );
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
     }
@@ -703,7 +734,10 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
-            eprintln!("desktop.compute_node.bridge_kill_requested");
+            eprintln!(
+                "desktop.compute_node.bridge_kill_requested session_id={}",
+                stop_session_id.as_deref().unwrap_or("none")
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
             eprintln!("desktop.compute_node.bridge_process_exited killed=true");

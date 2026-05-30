@@ -1420,6 +1420,36 @@ def test_sanitize_relay_target_preserves_ipv6_brackets():
     assert sanitized == 'http://[::1]:8000'
 
 
+def test_relay_key_fingerprint_uses_safe_helper_and_fallbacks():
+    class CryptoManager:
+        public_key_b64 = 'abcdefghijklmno'
+
+    class RelayClient:
+        crypto_manager = CryptoManager()
+
+        def _api_v1_public_key_fingerprint(self, public_key):
+            assert public_key == 'abcdefghijklmno'
+            return 'fp:abcd'
+
+    assert compute_node_bridge._relay_key_fingerprint(RelayClient()) == 'fp:abcd'
+
+    class BrokenFingerprintRelay(RelayClient):
+        def _api_v1_public_key_fingerprint(self, _public_key):
+            raise RuntimeError('fingerprint failed')
+
+    assert compute_node_bridge._relay_key_fingerprint(BrokenFingerprintRelay()) == 'unknown'
+
+    class NoHelperRelay:
+        crypto_manager = CryptoManager()
+
+    assert compute_node_bridge._relay_key_fingerprint(NoHelperRelay()) == 'abcdefgh...lmno'
+
+    class ShortKeyRelay:
+        crypto_manager = SimpleNamespace(public_key_b64='short')
+
+    assert compute_node_bridge._relay_key_fingerprint(ShortKeyRelay()) == 'unknown'
+
+
 def test_relay_response_summary_handles_non_dict_payloads():
     summary = compute_node_bridge._relay_response_summary(["unexpected"])
     assert summary == "non-dict response type=list"

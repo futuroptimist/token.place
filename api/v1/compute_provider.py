@@ -191,6 +191,8 @@ class DistributedApiV1ComputeProvider:
         deadline = time.time() + relay_timeout
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
         relay_cancel_token = uuid.uuid4().hex
+        relay_request_enqueued = False
+        relay_cancel_attempted = False
 
         def _cancel_relay_request(status: str = "cancelled", reason: str = "requester_gave_up") -> None:
             try:
@@ -211,6 +213,13 @@ class DistributedApiV1ComputeProvider:
                     relay_request_id,
                     status,
                 )
+
+        def _cancel_relay_request_once(status: str, reason: str) -> None:
+            nonlocal relay_cancel_attempted
+            if relay_cancel_attempted:
+                return
+            relay_cancel_attempted = True
+            _cancel_relay_request(status=status, reason=reason)
 
         def _remaining_timeout() -> float:
             remaining = deadline - time.time()
@@ -337,10 +346,17 @@ class DistributedApiV1ComputeProvider:
                 ),
             )
 
+        relay_request_enqueued = True
         poll_interval = self._poll_interval_seconds()
         while time.time() < deadline:
             try:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
+            except ComputeProviderError as exc:
+                if relay_request_enqueued and exc.code == "compute_node_timeout":
+                    _cancel_relay_request_once(status="expired", reason="provider_timeout")
+                raise
+
+            try:
                 retrieve_response = requests.post(
                     self._relay_url("/api/v1/relay/responses/retrieve"),
                     json={
@@ -445,7 +461,7 @@ class DistributedApiV1ComputeProvider:
             _last_backend_path.set("distributed_relay_e2ee")
             return assistant_message
 
-        _cancel_relay_request(status="expired", reason="provider_timeout")
+        _cancel_relay_request_once(status="expired", reason="provider_timeout")
         raise _error_from_code(
             "compute_node_timeout",
             message="timed out waiting for distributed relay API v1 encrypted response",

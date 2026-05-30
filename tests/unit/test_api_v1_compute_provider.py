@@ -776,7 +776,7 @@ def test_distributed_compute_provider_timeout_after_enqueue_posts_single_cancel(
 ):
     fake_crypto = _FakeCryptoManager()
     posted = []
-    timestamps = iter([100.0, 100.1, 100.2, 101.2])
+    timestamps = iter([100.0, 100.1, 100.2, 100.9, 101.2])
 
     monkeypatch.setattr(
         compute_provider.DistributedApiV1ComputeProvider,

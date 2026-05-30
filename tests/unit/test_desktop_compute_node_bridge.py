@@ -1238,6 +1238,52 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     assert captured['mode'] == 'auto'
 
 
+def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys, monkeypatch):
+    def fake_run(_args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'compute_node_bridge.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'CUDA',
+            '--relay-url',
+            'https://relay.example',
+        ],
+    )
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'fallback-session')
+
+    status = compute_node_bridge.main()
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get("type") == "error")
+    assert payload["running"] is False
+    assert payload["registered"] is False
+    assert payload["relay_runtime_state"] == "failed"
+    assert payload["active_relay_url"] == "https://relay.example"
+    assert payload["requested_mode"] == "gpu"
+    assert payload["effective_mode"] == "pending"
+    assert payload["backend_available"] == "pending"
+    assert payload["backend_selected"] == "pending"
+    assert payload["backend_used"] == "pending"
+    assert payload["model_path"] == "/tmp/model.gguf"
+    assert payload["last_error"] == payload["message"]
+    assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
+    assert payload["warm_load_state"] == "failed"
+    assert "warm_load_enabled" in payload
+    assert payload["runtime_path"] in {"bridge", "sidecar"}
+    assert payload["relay_runtime_path"] == "bridge"
+    assert payload["operator_session_id"] == "fallback-session"
+    assert payload["sequence"] == 1
+    assert isinstance(payload["updated_at_ms"], int)
+
+
 def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch):
     monkeypatch.setattr(compute_node_bridge, 'run', lambda _args: 0)
     real_import = __import__

@@ -370,7 +370,12 @@ fn finalize_bridge_exit(
     exit_status: std::process::ExitStatus,
     saw_startup_event: bool,
     saw_error_event: bool,
+    expected_session_id: &str,
 ) -> Option<Value> {
+    if status.operator_session_id.as_deref() != Some(expected_session_id) {
+        return None;
+    }
+
     status.running = false;
     status.registered = false;
     status.relay_runtime_state = Some("stopped".into());
@@ -385,11 +390,20 @@ fn finalize_bridge_exit(
     }
 
     exit_error.map(|last_error| {
+        let sequence = status.sequence.unwrap_or(0).saturating_add(1);
+        let updated_at_ms = current_time_ms();
+        status.sequence = Some(sequence);
+        status.updated_at_ms = Some(updated_at_ms);
         serde_json::json!({
             "type": "error",
             "running": false,
             "registered": false,
+            "relay_runtime_state": "stopped",
             "last_error": last_error,
+            "message": last_error,
+            "operator_session_id": expected_session_id,
+            "sequence": sequence,
+            "updated_at_ms": updated_at_ms,
         })
     })
 }
@@ -627,7 +641,13 @@ pub async fn start_compute_node(
         let exit_status = running_child.wait().await?;
         let exit_payload = {
             let mut status = state.status.lock().await;
-            finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
+            finalize_bridge_exit(
+                &mut status,
+                exit_status,
+                saw_startup_event,
+                saw_error_event,
+                &session_id,
+            )
         };
 
         if let Some(payload) = exit_payload {
@@ -1099,12 +1119,15 @@ mod tests {
         let mut status = ComputeNodeStatus {
             running: true,
             registered: true,
+            operator_session_id: Some("current-session".into()),
+            sequence: Some(7),
             ..ComputeNodeStatus::default()
         };
         let exit_status = success_exit_status();
 
-        let payload = finalize_bridge_exit(&mut status, exit_status, false, false)
-            .expect("error payload should be emitted");
+        let payload =
+            finalize_bridge_exit(&mut status, exit_status, false, false, "current-session")
+                .expect("error payload should be emitted");
 
         assert!(!status.running);
         assert!(!status.registered);
@@ -1123,6 +1146,84 @@ mod tests {
             payload.get("last_error").and_then(Value::as_str),
             Some(last_error)
         );
+        assert_eq!(
+            payload.get("operator_session_id").and_then(Value::as_str),
+            Some("current-session")
+        );
+        assert_eq!(payload.get("sequence").and_then(Value::as_u64), Some(8));
+        assert!(payload
+            .get("updated_at_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert_eq!(status.sequence, Some(8));
+    }
+
+    #[test]
+    fn finalize_bridge_exit_suppresses_payload_for_superseded_session() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(3),
+            relay_runtime_state: Some("starting".into()),
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+
+        let payload = finalize_bridge_exit(&mut status, exit_status, false, false, "old-session");
+
+        assert!(payload.is_none());
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.sequence, Some(3));
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("starting"));
+    }
+
+    #[test]
+    fn versioned_bridge_exit_error_cannot_be_accepted_after_restart() {
+        let mut exiting_status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            operator_session_id: Some("old-session".into()),
+            sequence: Some(2),
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+        let payload = finalize_bridge_exit(
+            &mut exiting_status,
+            exit_status,
+            false,
+            false,
+            "old-session",
+        )
+        .expect("old session should emit a versioned synthetic error");
+        assert_eq!(
+            payload.get("operator_session_id").and_then(Value::as_str),
+            Some("old-session")
+        );
+        assert_eq!(payload.get("sequence").and_then(Value::as_u64), Some(3));
+        assert!(payload
+            .get("updated_at_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+
+        let mut restarted_status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            relay_runtime_state: Some("ready".into()),
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(1),
+            ..ComputeNodeStatus::default()
+        };
+
+        assert!(!update_status_from_event(&mut restarted_status, &payload));
+        assert!(restarted_status.running);
+        assert!(restarted_status.registered);
+        assert_eq!(
+            restarted_status.operator_session_id.as_deref(),
+            Some("new-session")
+        );
+        assert!(restarted_status.last_error.is_none());
     }
 
     #[test]

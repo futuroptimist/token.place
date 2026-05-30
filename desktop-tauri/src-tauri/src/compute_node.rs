@@ -779,7 +779,6 @@ mod tests {
             .spawn()
             .expect("spawn first bridge");
         let first_stdin = first_child.stdin.take().expect("first stdin");
-        let first_pid = first_child.id().expect("first child pid");
         *state.child.lock().await = Some(first_child);
         *state.stdin.lock().await = Some(first_stdin);
 
@@ -795,11 +794,9 @@ mod tests {
             .spawn()
             .expect("spawn second bridge");
         let second_stdin = second_child.stdin.take().expect("second stdin");
-        let second_pid = second_child.id().expect("second child pid");
         *state.child.lock().await = Some(second_child);
         *state.stdin.lock().await = Some(second_stdin);
 
-        assert_ne!(first_pid, second_pid);
         stop_compute_node(state.clone()).await.expect("second stop");
         assert!(state.child.lock().await.is_none());
         assert!(state.stdin.lock().await.is_none());

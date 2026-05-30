@@ -290,7 +290,7 @@ class ComputeNodeRuntime:
             return True
 
         if self.model_manager.download_model_if_needed():
-            _log_info("Model ready for inference")
+            _log_info("Model file ready; API v1 runtime still requires Llama initialization")
             return True
 
         _log_error("Failed to download or verify model")
@@ -307,6 +307,18 @@ class ComputeNodeRuntime:
             _log_error("Model manager missing get_llm_instance required for API v1 warmup")
             return False
 
+        model_path = getattr(self.model_manager, "model_path", "unknown")
+        diagnostics = getattr(self.model_manager, "last_compute_diagnostics", None)
+        requested_mode = (
+            diagnostics.get("requested_mode")
+            if isinstance(diagnostics, dict)
+            else getattr(self.model_manager, "requested_compute_mode", "unknown")
+        )
+        _log_info(
+            "API v1 runtime warmup stage=model_file_located "
+            f"model_path={model_path} requested_mode={requested_mode}"
+        )
+        _log_info("API v1 runtime warmup stage=llama_init_start")
         try:
             llm_runtime = get_llm_instance()
         except Exception:
@@ -317,6 +329,7 @@ class ComputeNodeRuntime:
             _log_error("API v1 runtime warmup failed: get_llm_instance returned None")
             return False
 
+        _log_info("API v1 runtime warmup stage=llama_init_completed")
         create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)
         if not callable(create_chat_completion):
             _log_error(
@@ -329,6 +342,7 @@ class ComputeNodeRuntime:
             diagnostics["api_v1_runtime_ready"] = True
             self.model_manager.last_compute_diagnostics = diagnostics
 
+        _log_info("API v1 runtime warmup stage=runtime_ready")
         return True
 
     def start_relay_polling(self) -> threading.Thread:

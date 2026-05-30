@@ -1870,8 +1870,76 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     ]
     assert len(warming_status_events) == 1
     assert "registration.gate_wait_timeout" in captured.err
+    assert "API v1 relay runtime warm-load timed out after 0.05s" in captured.out
     assert "api_v1_e2ee.runtime_wait.start" not in captured.err
     assert "api_v1_e2ee.runtime_wait.timeout" not in captured.err
+
+
+def test_run_start_after_pre_registration_warmup_timeout_gets_fresh_session(capsys, monkeypatch):
+    _reset_cancel_queue()
+    events = []
+    release_first_warmup = threading.Event()
+    instances = []
+
+    class RetryWarmupRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.index = len(instances)
+            instances.append(self)
+
+        def ensure_api_v1_runtime_ready(self):
+            events.append(f"warm-{self.index}")
+            if self.index == 0:
+                release_first_warmup.wait()
+                events.append("late-first-warm-done")
+                return True
+            return True
+
+        def register_and_poll_once(self):
+            events.append(f"poll-{self.index}")
+            return {"next_ping_in_x_seconds": 0}
+
+        def stop(self):
+            events.append(f"stop-{self.index}")
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RetryWarmupRuntime)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "0.02")
+    monkeypatch.setattr(compute_node_bridge, "stop_requested", lambda: False)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    try:
+        first_status = compute_node_bridge.run(args)
+        assert first_status == 1
+        assert events == ["warm-0", "stop-0"]
+
+        stop_calls = {"count": 0}
+
+        def stop_after_second_poll():
+            stop_calls["count"] += 1
+            return stop_calls["count"] > 2
+
+        monkeypatch.setattr(compute_node_bridge, "stop_requested", stop_after_second_poll)
+        monkeypatch.setenv("TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS", "0.5")
+        second_status = compute_node_bridge.run(args)
+        assert second_status == 0
+    finally:
+        release_first_warmup.set()
+
+    captured = capsys.readouterr()
+    output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    error_events = [event for event in output_events if event.get("type") == "error"]
+    assert error_events
+    assert "timed out" in error_events[0]["message"]
+    assert any(
+        event.get("registered") is True
+        for event in output_events
+        if event.get("type") == "status"
+    )
+    assert "poll-0" not in events
+    assert "poll-1" in events
 
 
 def test_run_cancel_stays_responsive_during_active_relay_poll(capsys, monkeypatch):

@@ -506,6 +506,49 @@ describe('desktop app start failure handling', () => {
   });
 
 
+  it('shows warm-load timeout as not running and keeps registration gated', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'warming',
+        warm_load_state: 'warming',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        warm_load_state: 'failed',
+        last_error: 'API v1 relay runtime warm-load timed out after 120s',
+        message: 'API v1 relay runtime warm-load timed out after 120s',
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
+    expect(screen.getByText(/Last error:/).textContent).toContain(
+      'API v1 relay runtime warm-load timed out after 120s'
+    );
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+  });
+
+
   it('replays cached warming readiness and relay runtime path without showing registered yes', async () => {
     mockInitialComputeStatus({
       running: true,

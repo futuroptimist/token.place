@@ -253,6 +253,19 @@ def _api_v1_warm_load_wait_seconds(default: float = API_V1_WARM_LOAD_WAIT_DEFAUL
     return value
 
 
+def _format_seconds_for_message(seconds: float) -> str:
+    if math.isfinite(seconds) and seconds.is_integer():
+        return str(int(seconds))
+    return f"{seconds:g}"
+
+
+def _warm_load_timeout_message(timeout_seconds: float) -> str:
+    return (
+        "API v1 relay runtime warm-load timed out after "
+        f"{_format_seconds_for_message(timeout_seconds)}s"
+    )
+
+
 def _relay_error_message(relay_response: Dict[str, Any]) -> Optional[str]:
     """Return a normalized relay error message if the response includes one."""
 
@@ -924,8 +937,10 @@ def run(args: argparse.Namespace) -> int:
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
             if remaining_seconds <= 0:
                 warm_load_state = "failed"
-                warm_load_failed = "timed out initializing API v1 model runtime before relay registration"
+                warm_load_failed = _warm_load_timeout_message(warm_load_deadline_seconds)
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
+                if warm_load_future is not None and not warm_load_future.done():
+                    warm_load_future.cancel()
                 last_error = warm_load_failed
                 print(
                     "desktop.compute_node_bridge.registration.gate_wait_timeout "

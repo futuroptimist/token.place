@@ -127,7 +127,12 @@ function mergeComputeStatusEvent(
         : payload.type === 'error'
           ? false
           : prev.running,
-    registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
+    registered:
+      typeof payload.registered === 'boolean'
+        ? payload.registered
+        : payload.type === 'error'
+          ? false
+          : prev.registered,
     active_relay_url:
       typeof payload.active_relay_url === 'string'
         ? payload.active_relay_url
@@ -158,9 +163,15 @@ function mergeComputeStatusEvent(
         ? payload.relay_runtime_state
         : typeof payload.warm_load_state === 'string'
           ? payload.warm_load_state
-          : prev.relay_runtime_state,
+          : payload.type === 'error'
+            ? 'failed'
+            : prev.relay_runtime_state,
     warm_load_state:
-      typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+      typeof payload.warm_load_state === 'string'
+        ? payload.warm_load_state
+        : payload.type === 'error'
+          ? 'failed'
+          : prev.warm_load_state,
     warm_load_enabled:
       typeof payload.warm_load_enabled === 'boolean'
         ? payload.warm_load_enabled

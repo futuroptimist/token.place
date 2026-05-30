@@ -738,6 +738,102 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
   });
 
+  it('surfaces a fresh restart startup error while ignoring stale old-session events', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'idle',
+      last_error: null,
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    fireEvent.click(startButton);
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+
+    fireEvent.click((await screen.findByText('Stop operator')) as HTMLButtonElement);
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+
+    fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'old stale stop after restart',
+        operator_session_id: 'session-1',
+        sequence: 3,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'old stale error after restart',
+        operator_session_id: 'session-1',
+        sequence: 4,
+      },
+    });
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
+    expect(screen.queryByText('old stale error after restart')).toBeNull();
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(true);
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        last_error: 'new session failed before started',
+        operator_session_id: 'session-2',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Last error:/).textContent).toContain(
+        'new session failed before started'
+      )
+    );
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed');
+    expect(((await screen.findByText('Start operator')) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('renders the full initial idle compute-node status contract', async () => {
     mockInitialComputeStatus({
       running: false,

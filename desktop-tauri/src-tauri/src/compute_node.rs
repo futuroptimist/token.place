@@ -205,7 +205,10 @@ fn sanitize_relay_target(relay_url: &str) -> String {
         if !safe_scheme || scheme.is_empty() {
             return "unknown".into();
         }
-        let authority = rest.split('/').next().unwrap_or(rest);
+        let authority = rest
+            .split(|ch: char| ch == '/' || ch.is_control() || ch.is_whitespace())
+            .next()
+            .unwrap_or(rest);
         let safe_authority = authority.rsplit('@').next().unwrap_or(authority);
         let safe_authority: String = safe_authority
             .chars()
@@ -804,12 +807,18 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_relay_target_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            sanitize_relay_target("https://user:pass@example.com/path?token=secret#frag"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
     fn sanitize_relay_target_filters_log_control_characters() {
         assert_eq!(
-            sanitize_relay_target(
-                "https://user:secret@example.com\nforged=1/path?token=secret#frag"
-            ),
-            "https://example.comforged=1"
+            sanitize_relay_target("https://example.com\nforged=1/path?token=secret#frag"),
+            "https://example.com"
         );
         assert_eq!(sanitize_relay_target("https://\n\t/path"), "unknown");
         assert_eq!(

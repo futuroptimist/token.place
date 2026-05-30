@@ -905,6 +905,57 @@ def test_run_api_v1_payload_uses_relay_api_v1_response_endpoint(capsys, monkeypa
     assert "ModuleNotFoundError: No module named 'api'" not in output.err
 
 
+def test_run_api_v1_payload_polls_immediately_after_work_even_with_long_lease(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class LongLeaseApiV1Runtime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            LongLeaseApiV1Runtime.last_instance = self
+            self._responses = [
+                {
+                    'protocol': 'tokenplace_api_v1_relay_e2ee',
+                    'version': 1,
+                    'request_id': 'req-long-lease',
+                    'client_public_key': 'client-key',
+                    'chat_history': 'ciphertext',
+                    'cipherkey': 'key',
+                    'iv': 'iv',
+                    'next_ping_in_x_seconds': 30,
+                },
+            ]
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=LongLeaseApiV1Runtime)
+
+    sleep_values = []
+
+    def fake_sleep_with_cancel(seconds):
+        sleep_values.append(seconds)
+        return True
+
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', fake_sleep_with_cancel)
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    assert sleep_values == [0.0]
+    runtime = LongLeaseApiV1Runtime.last_instance
+    assert runtime is not None
+    assert [payload['request_id'] for payload in runtime._processed] == ['req-long-lease']
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.api_v1_e2ee.work_processed_next_poll_immediate' in output.err
+    assert 'request_id=req-long-lease' in output.err
+
+
 def test_run_api_v1_payload_waits_boundedly_then_processes(capsys, monkeypatch):
     _reset_cancel_queue()
     _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)

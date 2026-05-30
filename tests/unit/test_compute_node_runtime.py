@@ -185,6 +185,23 @@ def test_compute_node_runtime_polling_thread_delegates_to_relay():
     thread.start.assert_called_once_with()
 
 
+def test_compute_node_runtime_start_relay_session_resets_relay_client_start_state():
+    relay_client = MagicMock()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    crypto_manager = MagicMock()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    runtime.start_relay_session()
+
+    relay_client.start.assert_called_once_with()
+
+
 def test_compute_node_runtime_polling_thread_supports_api_v1_only_relay_client():
     class ApiV1OnlyRelayClient:
         def __init__(self):

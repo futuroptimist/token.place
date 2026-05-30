@@ -76,6 +76,22 @@ WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
 API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
+STATUS_CONTRACT_FIELDS = (
+    "running",
+    "registered",
+    "relay_runtime_state",
+    "runtime_path",
+    "relay_runtime_path",
+    "active_relay_url",
+    "requested_mode",
+    "effective_mode",
+    "backend_available",
+    "backend_selected",
+    "backend_used",
+    "fallback_reason",
+    "model_path",
+    "last_error",
+)
 
 
 _POLL_CANCELLED = object()
@@ -523,36 +539,71 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     poll_worker = _CancelablePollWorker()
+    session_id_value = os.getenv("TOKENPLACE_COMPUTE_NODE_SESSION_ID")
+    try:
+        session_id: Optional[int] = int(session_id_value) if session_id_value else None
+    except ValueError:
+        session_id = None
+    event_sequence = 0
+
+    def operator_status_payload(
+        *,
+        event_type: str,
+        running: bool,
+        registered: bool,
+        active_relay_url: str,
+        current_last_error: Optional[str],
+        relay_state_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        nonlocal event_sequence
+        event_sequence += 1
+        diagnostics = compute_mode_diagnostics(runtime.model_manager)
+        relay_runtime_state = relay_state_override or warm_load_state
+        payload: Dict[str, Any] = {
+            "type": event_type,
+            "running": running,
+            "registered": registered,
+            "relay_runtime_state": relay_runtime_state,
+            "active_relay_url": active_relay_url,
+            "requested_mode": diagnostics.get("requested_mode"),
+            "effective_mode": diagnostics.get("effective_mode"),
+            "backend_available": diagnostics.get("backend_available"),
+            "backend_selected": diagnostics.get("backend_selected"),
+            "backend_used": diagnostics.get("backend_used"),
+            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
+            "kv_cache_device": diagnostics.get("kv_cache_device"),
+            "fallback_reason": diagnostics.get("fallback_reason"),
+            "interpreter": runtime_setup.get("interpreter", sys.executable),
+            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+            "model_path": args.model,
+            "last_error": current_last_error,
+            "warm_load_state": warm_load_state,
+            "warm_load_enabled": warm_load_enabled,
+            "warm_load_duration_ms": warm_load_duration_ms,
+            "runtime_path": runtime_path,
+            "relay_runtime_path": relay_runtime_path,
+            "sequence": event_sequence,
+            "status_contract_fields": STATUS_CONTRACT_FIELDS,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+        return payload
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
-        fresh_registered = registered and _registration_fresh(runtime.relay_client, active_relay_url)
-        diagnostics = compute_mode_diagnostics(runtime.model_manager)
+        runtime_ready = warm_load_state == "ready" or not warm_load_enabled
+        fresh_registered = (
+            registered
+            and runtime_ready
+            and _registration_fresh(runtime.relay_client, active_relay_url)
+        )
         emit(
-            {
-                "type": "status",
-                "running": True,
-                "registered": fresh_registered,
-                "active_relay_url": active_relay_url,
-                "requested_mode": diagnostics.get("requested_mode"),
-                "effective_mode": diagnostics.get("effective_mode"),
-                "backend_available": diagnostics.get("backend_available"),
-                "backend_selected": diagnostics.get("backend_selected"),
-                "backend_used": diagnostics.get("backend_used"),
-                "offloaded_layers": diagnostics.get(
-                    "offloaded_layers", diagnostics.get("n_gpu_layers")
-                ),
-                "kv_cache_device": diagnostics.get("kv_cache_device"),
-                "fallback_reason": diagnostics.get("fallback_reason"),
-                "interpreter": runtime_setup.get("interpreter", sys.executable),
-                "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
-                "model_path": args.model,
-                "last_error": current_last_error,
-                "warm_load_state": warm_load_state,
-                "warm_load_enabled": warm_load_enabled,
-                "warm_load_duration_ms": warm_load_duration_ms,
-                "runtime_path": runtime_path,
-                "relay_runtime_path": relay_runtime_path,
-            }
+            operator_status_payload(
+                event_type="status",
+                running=True,
+                registered=fresh_registered,
+                active_relay_url=active_relay_url,
+                current_last_error=current_last_error,
+            )
         )
 
     def submit_api_v1_error_response(
@@ -698,46 +749,28 @@ def run(args: argparse.Namespace) -> int:
             active_relay_url=active_relay_url,
             current_last_error=last_error,
         )
-        emit(
-            {
-                "type": "error",
-                "message": last_error,
-                "active_relay_url": runtime.relay_client.relay_url,
-                "warm_load_state": warm_load_state,
-                "warm_load_duration_ms": warm_load_duration_ms,
-                "runtime_path": runtime_path,
-                "relay_runtime_path": relay_runtime_path,
-            }
+        error_payload = operator_status_payload(
+            event_type="error",
+            running=False,
+            registered=False,
+            active_relay_url=runtime.relay_client.relay_url,
+            current_last_error=last_error,
+            relay_state_override="failed",
         )
+        error_payload["message"] = last_error
+        emit(error_payload)
         warm_load_fatal = True
 
-    diagnostics = compute_mode_diagnostics(runtime.model_manager)
     last_error: Optional[str] = None
     emit(
-        {
-            "type": "started",
-            "running": True,
-            "registered": False,
-            "active_relay_url": runtime.relay_client.relay_url,
-            "requested_mode": diagnostics.get("requested_mode"),
-            "effective_mode": diagnostics.get("effective_mode"),
-            "backend_available": diagnostics.get("backend_available"),
-            "backend_selected": diagnostics.get("backend_selected"),
-            "backend_used": diagnostics.get("backend_used"),
-            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
-            "kv_cache_device": diagnostics.get("kv_cache_device"),
-            "fallback_reason": diagnostics.get("fallback_reason"),
-            "interpreter": runtime_setup.get("interpreter", sys.executable),
-            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
-            "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
-            "use_mock_llm": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
-            "model_path": args.model,
-            "last_error": None,
-            "warm_load_state": warm_load_state,
-            "warm_load_enabled": warm_load_enabled,
-            "runtime_path": runtime_path,
-            "relay_runtime_path": relay_runtime_path,
-        }
+        operator_status_payload(
+            event_type="started",
+            running=True,
+            registered=False,
+            active_relay_url=runtime.relay_client.relay_url,
+            current_last_error=None,
+            relay_state_override="starting",
+        )
     )
     if runtime_path == "sidecar":
         print(
@@ -1060,31 +1093,16 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    diagnostics = compute_mode_diagnostics(runtime.model_manager)
+    warm_load_state = "stopped"
     emit(
-        {
-            "type": "stopped",
-            "running": False,
-            "registered": False,
-            "active_relay_url": runtime.relay_client.relay_url,
-            "requested_mode": diagnostics.get("requested_mode"),
-            "effective_mode": diagnostics.get("effective_mode"),
-            "backend_available": diagnostics.get("backend_available"),
-            "backend_selected": diagnostics.get("backend_selected"),
-            "backend_used": diagnostics.get("backend_used"),
-            "offloaded_layers": diagnostics.get("offloaded_layers", diagnostics.get("n_gpu_layers")),
-            "kv_cache_device": diagnostics.get("kv_cache_device"),
-            "fallback_reason": diagnostics.get("fallback_reason"),
-            "interpreter": runtime_setup.get("interpreter", sys.executable),
-            "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
-            "model_path": args.model,
-            "last_error": last_error,
-            "warm_load_state": warm_load_state,
-            "warm_load_enabled": warm_load_enabled,
-            "warm_load_duration_ms": warm_load_duration_ms,
-            "runtime_path": runtime_path,
-            "relay_runtime_path": relay_runtime_path,
-        }
+        operator_status_payload(
+            event_type="stopped",
+            running=False,
+            registered=False,
+            active_relay_url=runtime.relay_client.relay_url,
+            current_last_error=None if not warm_load_fatal else last_error,
+            relay_state_override="stopped",
+        )
     )
     return 1 if warm_load_fatal else 0
 

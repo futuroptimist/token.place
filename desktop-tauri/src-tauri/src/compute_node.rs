@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -37,11 +38,14 @@ pub struct ComputeNodeStatus {
     pub fallback_reason: Option<String>,
     pub model_path: String,
     pub last_error: Option<String>,
+    pub relay_runtime_state: Option<String>,
     pub warm_load_state: Option<String>,
     pub warm_load_enabled: Option<bool>,
     pub warm_load_duration_ms: Option<u64>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
+    pub session_id: Option<u64>,
+    pub sequence: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +54,7 @@ pub struct ComputeNodeState {
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub status: Arc<Mutex<ComputeNodeStatus>>,
     pub lifecycle_lock: Arc<Mutex<()>>,
+    pub active_session_id: Arc<AtomicU64>,
 }
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
@@ -199,11 +204,14 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         fallback_reason: None,
         model_path: request.model_path.clone(),
         last_error: Some(last_error),
+        relay_runtime_state: Some("failed".into()),
         warm_load_state: Some("failed".into()),
         warm_load_enabled: Some(true),
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
+        session_id: None,
+        sequence: None,
     }
 }
 
@@ -247,11 +255,20 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
+    if payload.get("relay_runtime_state").is_some() {
+        status.relay_runtime_state = payload
+            .get("relay_runtime_state")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
     if payload.get("warm_load_state").is_some() {
         status.warm_load_state = payload
             .get("warm_load_state")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        if status.relay_runtime_state.is_none() {
+            status.relay_runtime_state = status.warm_load_state.clone();
+        }
     }
     if payload.get("warm_load_enabled").is_some() {
         status.warm_load_enabled = payload.get("warm_load_enabled").and_then(Value::as_bool);
@@ -271,6 +288,12 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
+    if payload.get("session_id").is_some() {
+        status.session_id = payload.get("session_id").and_then(Value::as_u64);
+    }
+    if payload.get("sequence").is_some() {
+        status.sequence = payload.get("sequence").and_then(Value::as_u64);
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -278,6 +301,21 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .map(ToOwned::to_owned)
             .or_else(|| Some("compute-node bridge error".into()));
     }
+}
+
+fn compute_event_session_id(payload: &Value, fallback_session_id: u64) -> u64 {
+    payload
+        .get("session_id")
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback_session_id)
+}
+
+fn should_accept_compute_event(
+    payload: &Value,
+    active_session_id: u64,
+    fallback_session_id: u64,
+) -> bool {
+    compute_event_session_id(payload, fallback_session_id) == active_session_id
 }
 
 fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
@@ -319,6 +357,7 @@ fn finalize_bridge_exit(
 ) -> Option<Value> {
     status.running = false;
     status.registered = false;
+    status.relay_runtime_state = Some("stopped".into());
 
     let exit_error = bridge_exit_error(exit_status, saw_startup_event);
     if status.last_error.is_none() {
@@ -334,6 +373,7 @@ fn finalize_bridge_exit(
             "type": "error",
             "running": false,
             "registered": false,
+            "relay_runtime_state": "failed",
             "last_error": last_error,
         })
     })
@@ -359,6 +399,7 @@ pub async fn start_compute_node(
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let session_id: u64;
 
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -371,6 +412,7 @@ pub async fn start_compute_node(
         }
         *child_slot = None;
         *state.stdin.lock().await = None;
+        session_id = state.active_session_id.fetch_add(1, Ordering::SeqCst) + 1;
     }
 
     let bridge_script = resolve_bridge_script(&app);
@@ -421,6 +463,7 @@ pub async fn start_compute_node(
         .arg(format!("{:?}", request.mode).to_lowercase())
         .arg("--relay-url")
         .arg(&request.relay_base_url)
+        .env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", session_id.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -483,15 +526,39 @@ pub async fn start_compute_node(
                 fallback_reason: None,
                 model_path: request.model_path.clone(),
                 last_error: None,
+                relay_runtime_state: Some("starting".into()),
                 warm_load_state: Some("not_started".into()),
                 warm_load_enabled: Some(true),
                 warm_load_duration_ms: None,
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
+                session_id: Some(session_id),
+                sequence: Some(0),
             };
             true
         }
     };
+
+    if installed {
+        app.emit(
+            "compute_node_event",
+            serde_json::json!({
+                "type": "starting",
+                "running": true,
+                "registered": false,
+                "active_relay_url": request.relay_base_url.clone(),
+                "requested_mode": format!("{:?}", request.mode).to_lowercase(),
+                "model_path": request.model_path.clone(),
+                "relay_runtime_state": "starting",
+                "warm_load_state": "not_started",
+                "runtime_path": "bridge",
+                "relay_runtime_path": "bridge",
+                "last_error": null,
+                "session_id": session_id,
+                "sequence": 0,
+            }),
+        )?;
+    }
 
     if !installed {
         if let Some(mut abandoned_stdin) = pending_stdin.take() {
@@ -517,7 +584,7 @@ pub async fn start_compute_node(
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
-            Ok(payload) => {
+            Ok(mut payload) => {
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
                     if event_type == "error" {
                         saw_error_event = true;
@@ -525,6 +592,19 @@ pub async fn start_compute_node(
                     if event_type == "started" || event_type == "status" {
                         saw_startup_event = true;
                     }
+                }
+                if !payload.is_object() {
+                    continue;
+                }
+                if payload.get("session_id").and_then(Value::as_u64).is_none() {
+                    payload["session_id"] = Value::from(session_id);
+                }
+                if !should_accept_compute_event(
+                    &payload,
+                    state.active_session_id.load(Ordering::SeqCst),
+                    session_id,
+                ) {
+                    continue;
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -558,8 +638,11 @@ pub async fn start_compute_node(
             finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
         };
 
-        if let Some(payload) = exit_payload {
-            app.emit("compute_node_event", payload)?;
+        if let Some(mut payload) = exit_payload {
+            if state.active_session_id.load(Ordering::SeqCst) == session_id {
+                payload["session_id"] = Value::from(session_id);
+                app.emit("compute_node_event", payload)?;
+            }
         }
     } else {
         let mut status = state.status.lock().await;
@@ -574,8 +657,12 @@ pub async fn start_compute_node(
     Ok(())
 }
 
-pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
+pub async fn stop_compute_node(
+    app: Option<AppHandle>,
+    state: ComputeNodeState,
+) -> anyhow::Result<()> {
     eprintln!("desktop.compute_node.stop_requested");
+    let stopped_session_id = state.active_session_id.fetch_add(1, Ordering::SeqCst) + 1;
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
@@ -619,6 +706,36 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
+        status.relay_runtime_state = Some("stopped".into());
+        status.warm_load_state = Some("stopped".into());
+        status.last_error = None;
+        status.session_id = Some(stopped_session_id);
+        status.sequence = Some(0);
+        if let Some(app) = app {
+            app.emit(
+                "compute_node_event",
+                serde_json::json!({
+                    "type": "stopped",
+                    "running": false,
+                    "registered": false,
+                    "relay_runtime_state": "stopped",
+                    "warm_load_state": "stopped",
+                    "active_relay_url": status.active_relay_url.clone(),
+                    "requested_mode": status.requested_mode.clone(),
+                    "effective_mode": status.effective_mode.clone(),
+                    "backend_available": status.backend_available.clone(),
+                    "backend_selected": status.backend_selected.clone(),
+                    "backend_used": status.backend_used.clone(),
+                    "fallback_reason": status.fallback_reason.clone(),
+                    "model_path": status.model_path.clone(),
+                    "last_error": null,
+                    "runtime_path": status.runtime_path.clone(),
+                    "relay_runtime_path": status.relay_runtime_path.clone(),
+                    "session_id": stopped_session_id,
+                    "sequence": 0,
+                }),
+            )?;
+        }
     }
     Ok(())
 }
@@ -704,9 +821,11 @@ mod tests {
         let state = ComputeNodeState::default();
         let lifecycle_guard = state.lifecycle_lock.lock().await;
 
-        let result =
-            tokio::time::timeout(Duration::from_millis(200), stop_compute_node(state.clone()))
-                .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_compute_node(None, state.clone()),
+        )
+        .await;
 
         assert!(result.is_ok(), "stop should not block on lifecycle lock");
         drop(lifecycle_guard);
@@ -743,8 +862,11 @@ mod tests {
             status.registered = true;
         }
 
-        let stop_result =
-            tokio::time::timeout(Duration::from_secs(2), stop_compute_node(state.clone())).await;
+        let stop_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stop_compute_node(None, state.clone()),
+        )
+        .await;
         assert!(stop_result.is_ok(), "stop should complete without hanging");
         stop_result
             .expect("timeout result")
@@ -782,7 +904,9 @@ mod tests {
         *state.child.lock().await = Some(first_child);
         *state.stdin.lock().await = Some(first_stdin);
 
-        stop_compute_node(state.clone()).await.expect("first stop");
+        stop_compute_node(None, state.clone())
+            .await
+            .expect("first stop");
         assert!(state.child.lock().await.is_none());
         assert!(state.stdin.lock().await.is_none());
 
@@ -797,9 +921,46 @@ mod tests {
         *state.child.lock().await = Some(second_child);
         *state.stdin.lock().await = Some(second_stdin);
 
-        stop_compute_node(state.clone()).await.expect("second stop");
+        stop_compute_node(None, state.clone())
+            .await
+            .expect("second stop");
         assert!(state.child.lock().await.is_none());
         assert!(state.stdin.lock().await.is_none());
+    }
+
+    #[test]
+    fn should_accept_compute_event_rejects_stale_prior_session_events() {
+        let active_session_id = 2;
+        let current_payload = serde_json::json!({
+            "type": "status",
+            "session_id": 2,
+            "sequence": 1,
+        });
+        let stale_payload = serde_json::json!({
+            "type": "status",
+            "session_id": 1,
+            "sequence": 99,
+        });
+        let legacy_payload = serde_json::json!({
+            "type": "status",
+            "sequence": 1,
+        });
+
+        assert!(should_accept_compute_event(
+            &current_payload,
+            active_session_id,
+            active_session_id
+        ));
+        assert!(!should_accept_compute_event(
+            &stale_payload,
+            active_session_id,
+            active_session_id
+        ));
+        assert!(should_accept_compute_event(
+            &legacy_payload,
+            active_session_id,
+            active_session_id
+        ));
     }
 
     #[test]

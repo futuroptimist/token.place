@@ -2386,3 +2386,98 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+
+def test_status_events_include_full_operator_status_contract(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', '7')
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_payloads = [event for event in events if event['type'] in {'started', 'status', 'stopped'}]
+    assert status_payloads
+    required_fields = set(compute_node_bridge.STATUS_CONTRACT_FIELDS)
+    for payload in status_payloads:
+        assert required_fields.issubset(payload), payload
+        assert payload['session_id'] == 7
+        assert isinstance(payload['sequence'], int)
+        assert payload['relay_runtime_state'] in {'starting', 'warming', 'ready', 'stopped'}
+        assert payload['runtime_path'] in {'bridge', 'sidecar'}
+        assert payload['relay_runtime_path'] == 'bridge'
+
+
+def test_registered_remains_false_until_runtime_ready_and_relay_registration(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingTimeoutApiV1Runtime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
+    monkeypatch.setattr(compute_node_bridge, 'PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS', 0.01)
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    status_events = [event for event in events if event['type'] == 'status']
+    warming_events = [event for event in status_events if event['relay_runtime_state'] == 'warming']
+    ready_registered_events = [
+        event
+        for event in status_events
+        if event['relay_runtime_state'] == 'ready' and event['registered'] is True
+    ]
+    assert warming_events
+    assert all(event['registered'] is False for event in warming_events)
+    assert ready_registered_events
+
+
+def test_graceful_stop_status_clears_registration_and_last_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=IncompatibleRelayRuntime)
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    assert compute_node_bridge.run(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    stopped = events[-1]
+    assert stopped['type'] == 'stopped'
+    assert stopped['running'] is False
+    assert stopped['registered'] is False
+    assert stopped['relay_runtime_state'] == 'stopped'
+    assert stopped['last_error'] is None

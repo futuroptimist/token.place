@@ -488,6 +488,10 @@ pub async fn start_compute_node(
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
+    eprintln!(
+        "desktop.compute_node.session_start session_id={} bridge_script={} cancellation_token_reset=true",
+        session_id, bridge_script
+    );
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -502,7 +506,10 @@ pub async fn start_compute_node(
         .spawn();
 
     let mut child = match spawn_result {
-        Ok(child) => child,
+        Ok(child) => {
+            eprintln!("desktop.compute_node.bridge_spawned session_id={}", session_id);
+            child
+        },
         Err(err) => {
             {
                 let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -672,13 +679,20 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    eprintln!("desktop.compute_node.stop_requested");
+    let stop_session_id = state.status.lock().await.operator_session_id.clone();
+    eprintln!(
+        "desktop.compute_node.stop_requested session_id={}",
+        stop_session_id.as_deref().unwrap_or("none")
+    );
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
-        eprintln!("desktop.compute_node.cancel_requested");
+        eprintln!(
+            "desktop.compute_node.cancel_requested session_id={}",
+            stop_session_id.as_deref().unwrap_or("none")
+        );
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
     }
@@ -703,12 +717,21 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
-            eprintln!("desktop.compute_node.bridge_kill_requested");
+            eprintln!(
+                "desktop.compute_node.bridge_kill_requested session_id={}",
+                stop_session_id.as_deref().unwrap_or("none")
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
-            eprintln!("desktop.compute_node.bridge_process_exited killed=true");
+            eprintln!(
+                "desktop.compute_node.bridge_process_exited session_id={} killed=true",
+                stop_session_id.as_deref().unwrap_or("none")
+            );
         } else {
-            eprintln!("desktop.compute_node.bridge_process_exited killed=false");
+            eprintln!(
+                "desktop.compute_node.bridge_process_exited session_id={} killed=false",
+                stop_session_id.as_deref().unwrap_or("none")
+            );
         }
     }
 

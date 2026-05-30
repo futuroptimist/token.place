@@ -367,6 +367,14 @@ class ComputeNodeRuntime:
     def register_and_poll_once(self) -> Dict[str, Any]:
         """Poll relay for one encrypted API v1 work item."""
 
+        if getattr(self.relay_client, "_polling_stopped_by_request", False):
+            reset_for_restart = getattr(self.relay_client, "reset_for_restart", None)
+            if callable(reset_for_restart):
+                reset_for_restart()
+            else:
+                self.relay_client.start()
+        elif getattr(self.relay_client, "stop_polling", False):
+            self.relay_client.start()
         return self.relay_client.poll_api_v1_encrypted_work()
 
     def submit_api_v1_error_response(

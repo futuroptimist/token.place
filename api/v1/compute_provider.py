@@ -85,6 +85,11 @@ _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
         "public_message": "The LLM server took too long to respond. Please try again.",
         "status_code": 504,
     },
+    "compute_node_request_cancelled": {
+        "error_type": "timeout_error",
+        "public_message": "The LLM server request expired before it could be answered. Please try again.",
+        "status_code": 504,
+    },
     "compute_node_bridge_timeout": {
         "error_type": "timeout_error",
         "public_message": "The LLM server took too long to respond. Please try again.",
@@ -158,7 +163,7 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 120.0
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -182,9 +187,39 @@ class DistributedApiV1ComputeProvider:
     ) -> dict[str, Any]:
         _last_backend_path.set("distributed_relay_e2ee_pending")
         crypto_manager = self._build_request_crypto_manager()
-        relay_timeout = max(min(self.timeout_seconds, 30.0), 1.0)
+        relay_timeout = max(float(self.timeout_seconds), 1.0)
         deadline = time.time() + relay_timeout
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
+        relay_cancel_token = uuid.uuid4().hex
+        relay_request_enqueued = False
+        relay_cancel_attempted = False
+
+        def _cancel_relay_request(status: str = "cancelled", reason: str = "requester_gave_up") -> None:
+            try:
+                requests.post(
+                    self._relay_url("/api/v1/relay/requests/cancel"),
+                    json={
+                        "client_public_key": crypto_manager.public_key_b64,
+                        "request_id": relay_request_id,
+                        "status": status,
+                        "reason": reason,
+                        "cancel_token": relay_cancel_token,
+                    },
+                    timeout=1.0,
+                )
+            except requests.RequestException:
+                logger.debug(
+                    "api_v1.compute_provider.cancel_failed request_id=%s status=%s",
+                    relay_request_id,
+                    status,
+                )
+
+        def _cancel_relay_request_once(status: str, reason: str) -> None:
+            nonlocal relay_cancel_attempted
+            if relay_cancel_attempted:
+                return
+            relay_cancel_attempted = True
+            _cancel_relay_request(status=status, reason=reason)
 
         def _remaining_timeout() -> float:
             remaining = deadline - time.time()
@@ -194,6 +229,10 @@ class DistributedApiV1ComputeProvider:
                     message="timed out waiting for distributed relay API v1 encrypted response",
                 )
             return remaining
+
+        def _cancel_if_post_enqueue_timeout(exc: ComputeProviderError) -> None:
+            if relay_request_enqueued and exc.code == "compute_node_timeout":
+                _cancel_relay_request_once(status="expired", reason="provider_timeout")
 
         try:
             next_server_response = requests.get(
@@ -280,6 +319,7 @@ class DistributedApiV1ComputeProvider:
             "request_id": relay_request_id,
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
+            "cancel_token": relay_cancel_token,
             **encrypted_envelope,
         }
 
@@ -310,10 +350,16 @@ class DistributedApiV1ComputeProvider:
                 ),
             )
 
+        relay_request_enqueued = True
         poll_interval = self._poll_interval_seconds()
         while time.time() < deadline:
             try:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
+            except ComputeProviderError as exc:
+                _cancel_if_post_enqueue_timeout(exc)
+                raise
+
+            try:
                 retrieve_response = requests.post(
                     self._relay_url("/api/v1/relay/responses/retrieve"),
                     json={
@@ -329,6 +375,12 @@ class DistributedApiV1ComputeProvider:
             if retrieve_response.status_code == 202:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
+
+            if retrieve_response.status_code == 410:
+                raise _error_from_code(
+                    "compute_node_request_cancelled",
+                    message="relay reported API v1 request expired or was cancelled",
+                )
 
             if retrieve_response.status_code == 404:
                 raise _error_from_code(
@@ -350,7 +402,13 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if retrieve_payload.get("error"):
+            error_payload = retrieve_payload.get("error")
+            if error_payload:
+                if isinstance(error_payload, dict) and error_payload.get("code") in {"cancelled", "expired"}:
+                    raise _error_from_code(
+                        "compute_node_request_cancelled",
+                        message=f"relay reported API v1 request {error_payload.get('code')}",
+                    )
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
@@ -406,10 +464,12 @@ class DistributedApiV1ComputeProvider:
             _last_backend_path.set("distributed_relay_e2ee")
             return assistant_message
 
-        raise _error_from_code(
+        timeout_error = _error_from_code(
             "compute_node_timeout",
             message="timed out waiting for distributed relay API v1 encrypted response",
         )
+        _cancel_if_post_enqueue_timeout(timeout_error)
+        raise timeout_error
 
 
 @dataclass(frozen=True)
@@ -604,7 +664,15 @@ def _build_api_v1_compute_provider(
         return local_provider
 
     selected_target = distributed_url.rstrip("/")
-    distributed_provider = DistributedApiV1ComputeProvider(base_url=selected_target)
+    timeout_raw = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "120")
+    try:
+        timeout_seconds = max(float(timeout_raw), 1.0)
+    except (TypeError, ValueError):
+        timeout_seconds = 120.0
+    distributed_provider = DistributedApiV1ComputeProvider(
+        base_url=selected_target,
+        timeout_seconds=timeout_seconds,
+    )
     if not distributed_fallback_enabled:
         logger.info(
             "api_v1.compute_provider.selected provider=distributed mode=%s "

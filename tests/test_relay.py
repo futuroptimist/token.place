@@ -21,6 +21,7 @@ from relay import (
     known_servers,
     client_inference_requests,
     client_pending_request_ids,
+    client_terminal_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -42,6 +43,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_terminal_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -57,6 +59,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_terminal_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -2232,3 +2235,300 @@ def test_api_v1_unregister_is_idempotent_when_server_already_gone(client):
     assert second.status_code == 200
     assert first.get_json()['removed'] is False
     assert second.get_json()['removed'] is False
+
+
+
+def _api_v1_request_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_KEY, cancel_token="cancel-proof"):
+    return {
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': client_public_key,
+        'request_id': request_id,
+        'protocol': 'tokenplace_api_v1_relay_e2ee',
+        'version': 1,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+        'cancel_token': cancel_token,
+    }
+
+
+def _api_v1_response_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_KEY, ciphertext='ciphertext-response'):
+    return {
+        'client_public_key': client_public_key,
+        'request_id': request_id,
+        'chat_history': ciphertext,
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    }
+
+
+def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-expired-late-response'))
+    assert queued.status_code == 200
+    original_time = time.time
+    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+
+    response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload('req-expired-late-response'))
+
+    assert response.status_code == 410
+    error = response.get_json()['error']
+    assert error['code'] == 'expired'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+    retrieve = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-expired-late-response',
+    })
+    assert retrieve.status_code == 410
+    assert retrieve.get_json()['error']['code'] == 'expired'
+
+
+def test_api_v1_queued_response_before_ttl_survives_delayed_retrieve(client, monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    request_id = 'req-response-before-ttl'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+    assert response.status_code == 200
+    original_time = time.time
+    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+
+    assert retrieved.status_code == 200
+    assert retrieved.get_json()['chat_history'] == 'ciphertext-response'
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
+def test_api_v1_queued_response_before_ttl_survives_diagnostics_cleanup(client, monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    request_id = 'req-response-diagnostics-cleanup'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    assert client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id)).status_code == 200
+    original_time = time.time
+    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+
+    diagnostics = client.get('/relay/diagnostics')
+    assert diagnostics.status_code == 200
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+
+    assert retrieved.status_code == 200
+    assert retrieved.get_json()['chat_history'] == 'ciphertext-response'
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
+def test_api_v1_late_duplicate_response_preserves_accepted_response(client, monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    request_id = 'req-late-duplicate-response'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
+    assert client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id, ciphertext='accepted')).status_code == 200
+    original_time = time.time
+    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+
+    duplicate = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id, ciphertext='late-duplicate'))
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+
+    assert duplicate.status_code == 200
+    assert duplicate.get_json()['message'] == 'Response already queued for client'
+    assert retrieved.status_code == 200
+    assert retrieved.get_json()['chat_history'] == 'accepted'
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
+def test_api_v1_cancel_requires_matching_cancel_token(client):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-cancel-auth', cancel_token='proof')).status_code == 200
+
+    denied = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-cancel-auth',
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'wrong-proof',
+    })
+
+    assert denied.status_code == 403
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
+def test_api_v1_cancel_sanitizes_status_and_reason(client):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-sanitize-cancel', cancel_token='proof')).status_code == 200
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-sanitize-cancel',
+        'status': 'evil_status',
+        'reason': 'leaky reason',
+        'cancel_token': 'proof',
+    })
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-sanitize-cancel',
+    })
+
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()['status'] == 'cancelled'
+    assert retrieved.status_code == 410
+    error = retrieved.get_json()['error']
+    assert error['code'] == 'cancelled'
+    assert error['reason'] == 'cancelled'
+
+
+def test_api_v1_cancelled_queued_response_retrieve_returns_gone(client):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    request_id = 'req-response-then-cancel'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    assert client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id)).status_code == 200
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'proof',
+    })
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+
+    assert cancelled.status_code == 200
+    assert retrieved.status_code == 410
+    assert retrieved.get_json()['error']['code'] == 'cancelled'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_response_after_in_flight_cancel_is_rejected_and_queue_depth_zero(client):
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    request_id = 'req-dispatched-cancelled'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert poll.status_code == 200
+    assert poll.get_json()['request_id'] == request_id
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'proof',
+    })
+    response = client.post('/api/v1/relay/responses', json=_api_v1_response_payload(request_id))
+
+    assert cancelled.status_code == 200
+    assert response.status_code == 410
+    assert response.get_json()['error']['code'] == 'cancelled'
+    diagnostics = client.get('/relay/diagnostics').get_json()
+    assert diagnostics['registered_compute_nodes'][0]['queue_depth'] == 0
+
+
+def test_api_v1_cancel_only_clears_matching_client_in_flight_entry(client):
+    other_server_key = base64.b64encode(b"server_public_key_other").decode('utf-8')
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        'api_v1_in_flight_requests': {
+            'shared-req': {'expires_at': time.monotonic() + 60, 'client_public_key': DUMMY_CLIENT_PUB_KEY, 'cancel_token': 'matching-proof'}
+        },
+    }
+    known_servers[other_server_key] = {
+        'public_key': other_server_key,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+        'api_v1_in_flight_requests': {
+            'shared-req': {'expires_at': time.monotonic() + 60, 'client_public_key': 'other-client', 'cancel_token': 'other-proof'}
+        },
+    }
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'shared-req', cancel_token='matching-proof')
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'shared-req',
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'matching-proof',
+    })
+
+    assert cancelled.status_code == 200
+    assert 'api_v1_in_flight_requests' not in known_servers[DUMMY_SERVER_PUB_KEY]
+    assert 'shared-req' in known_servers[other_server_key]['api_v1_in_flight_requests']
+    assert 'other-client' not in client_terminal_request_ids
+
+
+def test_api_v1_pending_ttl_cleanup_runs_without_retrieve(client, monkeypatch):
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    known_servers[DUMMY_SERVER_PUB_KEY] = {
+        'public_key': DUMMY_SERVER_PUB_KEY,
+        'last_ping': datetime.now(),
+        'last_ping_duration': 60,
+    }
+    request_id = 'req-cleanup-without-retrieve'
+    assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
+    original_time = time.time
+    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+
+    diagnostics = client.get('/relay/diagnostics')
+
+    assert diagnostics.status_code == 200
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert client_terminal_request_ids[DUMMY_CLIENT_PUB_KEY][request_id]['status'] == 'expired'
+
+
+def test_api_v1_terminal_records_are_pruned_without_retrieve(client, monkeypatch):
+    monkeypatch.setattr(relay_module, 'TERMINAL_REQUEST_TTL_SECONDS', 1.0)
+    relay_module._mark_request_terminal(DUMMY_CLIENT_PUB_KEY, 'req-terminal-pruned', status='cancelled')
+    assert DUMMY_CLIENT_PUB_KEY in client_terminal_request_ids
+    original_time = time.time
+    monkeypatch.setattr(relay_module.time, 'time', lambda: original_time() + 2.0)
+
+    diagnostics = client.get('/relay/diagnostics')
+
+    assert diagnostics.status_code == 200
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids

@@ -1896,6 +1896,79 @@ def test_api_v1_queued_response_before_ttl_survives_diagnostics_cleanup(
     assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
 
 
+def test_api_v1_late_duplicate_response_preserves_accepted_response(
+    client, monkeypatch
+):
+    assert (
+        client.post(
+            "/api/v1/relay/servers/register",
+            json={"server_public_key": DUMMY_SERVER_PUB_KEY},
+        ).status_code
+        == 200
+    )
+    queued = client.post(
+        "/api/v1/relay/requests",
+        json={
+            "request_id": "req-duplicate-after-ttl",
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "server_public_key": DUMMY_SERVER_PUB_KEY,
+            "chat_history": "ciphertext-request",
+            "cipherkey": "cipherkey-request",
+            "iv": "iv-request",
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+        },
+    )
+    assert queued.status_code == 200
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY][
+        "req-duplicate-after-ttl"
+    ]["queued_at"]
+    monkeypatch.setattr(relay_module, "PENDING_REQUEST_TTL_SECONDS", 1.0)
+    monkeypatch.setattr(relay_module.time, "time", lambda: queued_at + 0.5)
+
+    accepted_response = client.post(
+        "/api/v1/relay/responses",
+        json={
+            "request_id": "req-duplicate-after-ttl",
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "chat_history": "accepted-ciphertext-response",
+            "cipherkey": "accepted-cipherkey-response",
+            "iv": "accepted-iv-response",
+        },
+    )
+    assert accepted_response.status_code == 200
+
+    monkeypatch.setattr(relay_module.time, "time", lambda: queued_at + 2.0)
+    duplicate_response = client.post(
+        "/api/v1/relay/responses",
+        json={
+            "request_id": "req-duplicate-after-ttl",
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "chat_history": "duplicate-ciphertext-response",
+            "cipherkey": "duplicate-cipherkey-response",
+            "iv": "duplicate-iv-response",
+        },
+    )
+    assert duplicate_response.status_code == 200
+    assert DUMMY_CLIENT_PUB_KEY in client_responses
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+    retrieve = client.post(
+        "/api/v1/relay/responses/retrieve",
+        json={
+            "client_public_key": DUMMY_CLIENT_PUB_KEY,
+            "request_id": "req-duplicate-after-ttl",
+        },
+    )
+    assert retrieve.status_code == 200
+    body = retrieve.get_json()
+    assert body["chat_history"] == "accepted-ciphertext-response"
+    assert body["cipherkey"] == "accepted-cipherkey-response"
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert DUMMY_CLIENT_PUB_KEY not in client_terminal_request_ids
+
+
 def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeypatch):
     assert (
         client.post(

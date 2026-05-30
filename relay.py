@@ -1877,6 +1877,37 @@ def api_v1_relay_responses():
 
     request_id = envelope.get("request_id")
     if isinstance(request_id, str) and request_id:
+        terminal = _get_terminal_request(client_public_key, request_id)
+        if terminal is not None:
+            LOGGER.info(
+                "relay.api_v1.response_rejected_terminal_request",
+                extra={
+                    "client_fingerprint": _safe_key_fingerprint(client_public_key),
+                    "request_id": request_id,
+                    "status": terminal.get("status", "cancelled"),
+                },
+            )
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Request is no longer waiting for a response",
+                            "code": terminal.get("status", "cancelled"),
+                            "status": terminal.get("status", "cancelled"),
+                        }
+                    }
+                ),
+                410,
+            )
+        if _has_client_response_for_request(client_public_key, request_id):
+            LOGGER.info(
+                "relay.api_v1.duplicate_response_ignored",
+                extra={
+                    "client_fingerprint": _safe_key_fingerprint(client_public_key),
+                    "request_id": request_id,
+                },
+            )
+            return jsonify({"message": "Response already queued for client"}), 200
         _expire_pending_request_if_stale(client_public_key, request_id)
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:

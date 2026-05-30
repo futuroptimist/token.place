@@ -97,7 +97,12 @@ function mergeComputeStatusEvent(
 ): ComputeNodeStatus {
   const payloadSession = typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
   const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
-  const isFreshStartEvent = payload.type === 'started' && payloadSequence === 1;
+  const isFreshStartEvent =
+    payload.type === 'started' &&
+    payloadSequence === 1 &&
+    !prev.running &&
+    payloadSession !== null &&
+    payloadSession !== prev.operator_session_id;
   if (
     prev.operator_session_id &&
     payloadSession &&
@@ -109,7 +114,7 @@ function mergeComputeStatusEvent(
   if (
     payloadSequence !== null &&
     prev.sequence !== null &&
-    payloadSequence < prev.sequence &&
+    payloadSequence <= prev.sequence &&
     !isFreshStartEvent
   ) {
     return prev;
@@ -219,6 +224,7 @@ export function App() {
   const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
+  const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend')
@@ -230,6 +236,7 @@ export function App() {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
         setConfig(loadedConfig);
         const nodeStatus = await invoke<ComputeNodeStatus>('get_compute_node_status');
+        computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
@@ -274,15 +281,13 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
-      let applied = true;
-      setComputeStatus((prev) => {
-        const next = mergeComputeStatusEvent(prev, payload);
-        applied = next !== prev;
-        return next;
-      });
-      if (!applied) {
+      const previous = computeStatusRef.current;
+      const next = mergeComputeStatusEvent(previous, payload);
+      if (next === previous) {
         return;
       }
+      computeStatusRef.current = next;
+      setComputeStatus(next);
       if (payload.type === 'started' || payload.type === 'error') {
         setIsStartingComputeNode(false);
       }
@@ -406,8 +411,8 @@ export function App() {
     try {
       setIsStartingComputeNode(true);
       setError('');
-      setComputeStatus((prev) => ({
-        ...prev,
+      const optimisticStatus = {
+        ...computeStatusRef.current,
         running: false,
         registered: false,
         relay_runtime_state: 'starting',
@@ -420,10 +425,9 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
-        operator_session_id: null,
-        sequence: null,
-        updated_at_ms: null,
-      }));
+      };
+      computeStatusRef.current = optimisticStatus;
+      setComputeStatus(optimisticStatus);
       await invoke('start_compute_node', {
         request: {
           model_path: config.model_path,
@@ -434,13 +438,15 @@ export function App() {
     } catch (e) {
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
-      setComputeStatus((prev) => ({
-        ...prev,
+      const failedStatus = {
+        ...computeStatusRef.current,
         running: false,
         registered: false,
         relay_runtime_state: 'failed',
         last_error: message,
-      }));
+      };
+      computeStatusRef.current = failedStatus;
+      setComputeStatus(failedStatus);
       setError(message);
     }
   };

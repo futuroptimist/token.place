@@ -822,9 +822,54 @@ describe('desktop app start failure handling', () => {
         sequence: 3,
       },
     });
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'old error side effect after restart',
+        operator_session_id: 'old-session',
+        sequence: 100,
+      },
+    });
 
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+    expect(screen.queryByText('old error side effect after restart')).toBeNull();
+  });
+
+  it('ignores duplicate sequence events for the current operator session', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      operator_session_id: 'session-1',
+      sequence: 5,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'duplicate sequence replay',
+        operator_session_id: 'session-1',
+        sequence: 5,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready');
     expect(screen.getByText(/Last error:/).textContent).toContain('none');
   });
 
@@ -859,6 +904,38 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
+  it('ignores replayed started events from the stopped prior session', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'stopped',
+      active_relay_url: 'https://token.place',
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'starting',
+        active_relay_url: 'https://token.place',
+        model_path: '/tmp/old-model.gguf',
+        operator_session_id: 'old-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
   });
 
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {

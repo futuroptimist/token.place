@@ -421,9 +421,13 @@ def emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def _relay_runtime_state(warm_load_state: str, *, running: bool) -> str:
+def _relay_runtime_state(
+    warm_load_state: str, *, running: bool, warm_load_enabled: bool = True
+) -> str:
     if not running:
         return "stopped"
+    if not warm_load_enabled:
+        return "ready"
     if warm_load_state == "not_started":
         return "starting"
     return warm_load_state
@@ -460,6 +464,44 @@ def _sleep_with_cancel(seconds: float) -> bool:
 
 def run(args: argparse.Namespace) -> int:
     _stop_requested_latched.clear()
+    bridge_session_id = _bridge_session_id_from_env()
+    status_sequence = 0
+
+    def emit_operator_event(payload: Dict[str, Any]) -> None:
+        nonlocal status_sequence
+        status_sequence += 1
+        payload = dict(payload)
+        payload.setdefault("operator_session_id", bridge_session_id)
+        payload.setdefault("sequence", status_sequence)
+        payload.setdefault("updated_at_ms", int(time.time() * 1000))
+        emit(payload)
+
+    def emit_startup_error(message: str) -> None:
+        warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
+        emit_operator_event(
+            {
+                "type": "error",
+                "running": False,
+                "registered": False,
+                "relay_runtime_state": "failed",
+                "active_relay_url": args.relay_url,
+                "requested_mode": _normalize_compute_mode_local(args.mode),
+                "effective_mode": "pending",
+                "backend_available": "pending",
+                "backend_selected": "pending",
+                "backend_used": "pending",
+                "fallback_reason": None,
+                "model_path": args.model,
+                "last_error": message,
+                "message": message,
+                "warm_load_state": "failed",
+                "warm_load_enabled": warm_load_enabled,
+                "warm_load_duration_ms": None,
+                "runtime_path": _runtime_path_from_env(),
+                "relay_runtime_path": "bridge",
+            }
+        )
+
     runtime_setup = ensure_desktop_llama_runtime(args.mode)
     maybe_reexec_for_runtime_refresh(runtime_setup)
     print(
@@ -477,15 +519,12 @@ def run(args: argparse.Namespace) -> int:
     if dependency_setup.get("ok") != "true":
         missing = dependency_setup.get("missing") or "unknown"
         detail = dependency_setup.get("detail") or dependency_setup.get("action") or "dependency bootstrap failed"
-        emit({
-            "type": "error",
-            "message": (
-                "desktop runtime dependency preflight failed "
-                f"(interpreter={dependency_setup.get('interpreter', sys.executable)} "
-                f"import_root={dependency_setup.get('import_root', 'unknown')} "
-                f"missing={missing}): {detail}"
-            ),
-        })
+        emit_startup_error(
+            "desktop runtime dependency preflight failed "
+            f"(interpreter={dependency_setup.get('interpreter', sys.executable)} "
+            f"import_root={dependency_setup.get('import_root', 'unknown')} "
+            f"missing={missing}): {detail}"
+        )
         return 1
     repo_llama_cpp_shim_imported = _is_repo_llama_cpp_shim(
         runtime_setup.get("llama_module_path", "")
@@ -498,7 +537,7 @@ def run(args: argparse.Namespace) -> int:
 
     gpu_runtime_error = desktop_gpu_runtime_failure_message(args.mode, runtime_setup)
     if gpu_runtime_error:
-        emit({"type": "error", "message": gpu_runtime_error})
+        emit_startup_error(gpu_runtime_error)
         return 1
 
     try:
@@ -512,7 +551,7 @@ def run(args: argparse.Namespace) -> int:
             resolve_relay_url,
         )
     except ModuleNotFoundError as exc:
-        emit({"type": "error", "message": f"runtime unavailable: {exc}"})
+        emit_startup_error(f"runtime unavailable: {exc}")
         return 1
 
     relay_url = resolve_relay_url(args.relay_url, prefer_cli=True)
@@ -552,18 +591,6 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     poll_worker = _CancelablePollWorker()
-    bridge_session_id = _bridge_session_id_from_env()
-    status_sequence = 0
-
-    def emit_operator_event(payload: Dict[str, Any]) -> None:
-        nonlocal status_sequence
-        status_sequence += 1
-        payload = dict(payload)
-        payload.setdefault("operator_session_id", bridge_session_id)
-        payload.setdefault("sequence", status_sequence)
-        payload.setdefault("updated_at_ms", int(time.time() * 1000))
-        emit(payload)
-
     def build_status_payload(
         *,
         event_type: str,
@@ -573,7 +600,9 @@ def run(args: argparse.Namespace) -> int:
         current_last_error: Optional[str],
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        relay_state = _relay_runtime_state(warm_load_state, running=running)
+        relay_state = _relay_runtime_state(
+            warm_load_state, running=running, warm_load_enabled=warm_load_enabled
+        )
         fresh_registered = (
             running
             and relay_state == "ready"

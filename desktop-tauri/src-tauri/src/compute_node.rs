@@ -229,18 +229,21 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
 
 fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> bool {
     let payload_sequence = payload.get("sequence").and_then(Value::as_u64);
-    let is_fresh_start_event =
-        payload.get("type").and_then(Value::as_str) == Some("started") && payload_sequence == Some(1);
-    if let (Some(current_session), Some(payload_session)) = (
-        status.operator_session_id.as_deref(),
-        event_session_id(payload),
-    ) {
+    let payload_session = event_session_id(payload);
+    let is_fresh_start_event = payload.get("type").and_then(Value::as_str) == Some("started")
+        && payload_sequence == Some(1)
+        && !status.running
+        && payload_session
+            .is_some_and(|session| status.operator_session_id.as_deref() != Some(session));
+    if let (Some(current_session), Some(payload_session)) =
+        (status.operator_session_id.as_deref(), payload_session)
+    {
         if current_session != payload_session && !is_fresh_start_event {
             return false;
         }
     }
     if let (Some(current_sequence), Some(payload_sequence)) = (status.sequence, payload_sequence) {
-        if payload_sequence < current_sequence && !is_fresh_start_event {
+        if payload_sequence <= current_sequence && !is_fresh_start_event {
             return false;
         }
     }
@@ -611,8 +614,13 @@ pub async fn start_compute_node(
 
     let running_child = {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
-        let mut child_slot = state.child.lock().await;
-        child_slot.take()
+        let current_session = state.status.lock().await.operator_session_id.clone();
+        if current_session.as_deref() == Some(session_id.as_str()) {
+            let mut child_slot = state.child.lock().await;
+            child_slot.take()
+        } else {
+            None
+        }
     };
 
     if let Some(mut running_child) = running_child {
@@ -627,12 +635,17 @@ pub async fn start_compute_node(
         }
     } else {
         let mut status = state.status.lock().await;
-        status.running = false;
-        status.registered = false;
+        if status.operator_session_id.as_deref() == Some(session_id.as_str()) {
+            status.running = false;
+            status.registered = false;
+        }
     }
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
-        *state.stdin.lock().await = None;
+        let current_session = state.status.lock().await.operator_session_id.clone();
+        if current_session.as_deref() == Some(session_id.as_str()) {
+            *state.stdin.lock().await = None;
+        }
     }
 
     Ok(())
@@ -937,6 +950,79 @@ mod tests {
         assert!(status.running);
         assert_eq!(status.relay_runtime_state.as_deref(), Some("warming"));
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_rejects_duplicate_sequences_and_cross_session_starts() {
+        let mut running_status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            relay_runtime_state: Some("starting".into()),
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(1),
+            ..ComputeNodeStatus::default()
+        };
+
+        let duplicate_sequence = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "stopped",
+            "operator_session_id": "new-session",
+            "sequence": 1
+        });
+        let old_started_event = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "ready",
+            "operator_session_id": "old-session",
+            "sequence": 1
+        });
+
+        assert!(!update_status_from_event(
+            &mut running_status,
+            &duplicate_sequence
+        ));
+        assert!(!update_status_from_event(
+            &mut running_status,
+            &old_started_event
+        ));
+        assert_eq!(
+            running_status.operator_session_id.as_deref(),
+            Some("new-session")
+        );
+        assert_eq!(
+            running_status.relay_runtime_state.as_deref(),
+            Some("starting")
+        );
+
+        let mut stopped_status = ComputeNodeStatus {
+            running: false,
+            registered: false,
+            relay_runtime_state: Some("stopped".into()),
+            operator_session_id: Some("old-session".into()),
+            sequence: Some(8),
+            ..ComputeNodeStatus::default()
+        };
+        let new_started_event = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "starting",
+            "operator_session_id": "new-session",
+            "sequence": 1
+        });
+
+        assert!(update_status_from_event(
+            &mut stopped_status,
+            &new_started_event
+        ));
+        assert!(stopped_status.running);
+        assert_eq!(
+            stopped_status.operator_session_id.as_deref(),
+            Some("new-session")
+        );
     }
 
     #[test]

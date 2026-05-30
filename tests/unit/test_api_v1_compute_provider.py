@@ -544,6 +544,56 @@ def test_distributed_compute_provider_timeout_after_enqueue_posts_single_cancel(
     assert cancel_posts[0][2] == 1.0
 
 
+def test_distributed_compute_provider_cancel_failure_does_not_mask_timeout(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+    posted = []
+    timestamps = iter([100.0, 100.1, 100.2, 101.2])
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.time, "time", lambda: next(timestamps))
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda url, timeout: _FakeResponse(
+            200, {"server_public_key": "server-public-key"}
+        ),
+    )
+
+    def fake_post(url, json, timeout):
+        posted.append((url, copy.deepcopy(json), timeout))
+        if url.endswith("/api/v1/relay/requests"):
+            return _FakeResponse(200, {"message": "Request received"})
+        if url.endswith("/api/v1/relay/requests/cancel"):
+            raise compute_provider.requests.RequestException("cancel offline")
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
+    provider = DistributedApiV1ComputeProvider(
+        base_url="https://node-a.example", timeout_seconds=1
+    )
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_timeout"
+
+    cancel_posts = [
+        item for item in posted if item[0].endswith("/api/v1/relay/requests/cancel")
+    ]
+    assert len(cancel_posts) == 1
+    assert cancel_posts[0][1]["status"] == "expired"
+    assert cancel_posts[0][1]["reason"] == "provider_timeout"
+    assert cancel_posts[0][2] == 1.0
+
+
 def test_distributed_compute_provider_maps_relay_410_cancelled_and_expired(monkeypatch):
     for terminal_code in ("cancelled", "expired"):
         fake_crypto = _FakeCryptoManager()
@@ -709,6 +759,51 @@ def test_get_provider_disables_local_fallback_when_configured(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_get_provider_uses_configured_distributed_timeout(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "45.5")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.timeout_seconds == 45.5
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "not-a-number")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.timeout_seconds == 120.0
+    finally:
+        compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_get_provider_floors_distributed_timeout_to_one_second(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "0.01")
+
+    compute_provider._build_api_v1_compute_provider.cache_clear()
+    try:
+        provider = compute_provider.get_api_v1_compute_provider()
+        assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
+        assert provider.timeout_seconds == 1.0
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 

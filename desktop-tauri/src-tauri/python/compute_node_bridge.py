@@ -76,6 +76,7 @@ WARM_LOAD_DEFAULT = "1"
 RUNTIME_PATH_DEFAULT = "bridge"
 API_V1_WARM_LOAD_WAIT_DEFAULT_SECONDS = 120.0
 PRE_REGISTRATION_PROGRESS_INTERVAL_SECONDS = 30.0
+_STATUS_SEQUENCE = 0
 
 
 _POLL_CANCELLED = object()
@@ -416,6 +417,21 @@ def stop_requested() -> bool:
 
 
 def emit(payload: Dict[str, Any]) -> None:
+    """Emit a structured bridge event.
+
+    Operator status payloads are the single contract consumed by Rust and the
+    React UI. They include lifecycle booleans plus relay runtime diagnostics:
+    running, registered, relay_runtime_state, runtime_path, relay_runtime_path,
+    active_relay_url, requested/effective mode, backend availability/selection/use,
+    fallback_reason, model_path, last_error, status_sequence, and emitted_at_ms.
+    """
+    if payload.get("type") in {"started", "status", "stopped"}:
+        global _STATUS_SEQUENCE
+        _STATUS_SEQUENCE += 1
+        payload.setdefault("status_sequence", _STATUS_SEQUENCE)
+        payload.setdefault("emitted_at_ms", int(time.time() * 1000))
+    if "relay_runtime_state" not in payload and "warm_load_state" in payload:
+        payload["relay_runtime_state"] = payload.get("warm_load_state")
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
 
@@ -548,6 +564,7 @@ def run(args: argparse.Namespace) -> int:
                 "model_path": args.model,
                 "last_error": current_last_error,
                 "warm_load_state": warm_load_state,
+                "relay_runtime_state": warm_load_state,
                 "warm_load_enabled": warm_load_enabled,
                 "warm_load_duration_ms": warm_load_duration_ms,
                 "runtime_path": runtime_path,
@@ -734,6 +751,7 @@ def run(args: argparse.Namespace) -> int:
             "model_path": args.model,
             "last_error": None,
             "warm_load_state": warm_load_state,
+            "relay_runtime_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
             "runtime_path": runtime_path,
             "relay_runtime_path": relay_runtime_path,
@@ -1080,6 +1098,7 @@ def run(args: argparse.Namespace) -> int:
             "model_path": args.model,
             "last_error": last_error,
             "warm_load_state": warm_load_state,
+            "relay_runtime_state": warm_load_state,
             "warm_load_enabled": warm_load_enabled,
             "warm_load_duration_ms": warm_load_duration_ms,
             "runtime_path": runtime_path,

@@ -1283,6 +1283,20 @@ def _remove_client_responses_for_request(client_public_key, request_id):
     return 0
 
 
+def _has_client_response_for_request(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return False
+    with client_responses_lock:
+        queued = client_responses.get(client_public_key)
+        if isinstance(queued, list):
+            return any(
+                isinstance(candidate, dict)
+                and candidate.get("request_id") == request_id
+                for candidate in queued
+            )
+        return isinstance(queued, dict) and queued.get("request_id") == request_id
+
+
 def _in_flight_entry_matches_client(entry, client_public_key):
     if isinstance(entry, dict):
         return entry.get("client_public_key") == client_public_key
@@ -1476,6 +1490,8 @@ def _expire_stale_pending_requests():
                 if is_expired:
                     expired.append((client_public_key, request_id))
     for client_public_key, request_id in expired:
+        if _has_client_response_for_request(client_public_key, request_id):
+            continue
         _cancel_api_v1_request(
             client_public_key,
             request_id,

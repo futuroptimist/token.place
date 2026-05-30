@@ -79,11 +79,7 @@ def _line_number_for_offset(text: str, offset: int) -> int:
 def _relay_deprecated_route_definition_lines(text: str) -> set[int]:
     """Return line numbers that are part of Flask legacy route definitions."""
     allowed_lines: set[int] = set()
-    route_markers = tuple(
-        marker
-        for route in LEGACY_ROUTES
-        for marker in (f"@app.route('{route}'", f'@app.route("{route}"')
-    )
+    route_markers = tuple(f"@app.route('{route}'" for route in LEGACY_ROUTES)
     lines = text.splitlines()
     index = 0
     while index < len(lines):

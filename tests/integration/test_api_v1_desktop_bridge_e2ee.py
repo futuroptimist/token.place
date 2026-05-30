@@ -27,6 +27,7 @@ from utils.crypto.crypto_manager import CryptoManager
 from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient
 
+
 LEGACY_ROUTE_FRAGMENTS = (
     "/sink",
     "/faucet",
@@ -251,9 +252,7 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
         desktop_thread.join(timeout=5)
 
     assert response.status_code == 200, response.text
-    assert (
-        response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
-    )
+    assert response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"] == "distributed"
     assert (
         response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"]
         == "distributed_relay_e2ee"
@@ -284,9 +283,7 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     _assert_ciphertext_only(response_posts[0], forbidden_text="pong from desktop")
 
 
-def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(
-    monkeypatch,
-):
+def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(monkeypatch):
     """One desktop node drains three sequential browser turns without stale queue depth."""
 
     with live_relay_server() as base_url:
@@ -308,12 +305,7 @@ def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(
             include_configured_servers=False,
         )
         desktop_client._request_timeout = 2
-        assert (
-            desktop_client.register_api_v1_compute_node(base_url)[
-                "next_ping_in_x_seconds"
-            ]
-            > 0
-        )
+        assert desktop_client.register_api_v1_compute_node(base_url)["next_ping_in_x_seconds"] > 0
 
         stop_desktop = threading.Event()
         processed_request_ids = []
@@ -342,9 +334,7 @@ def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(
                     "model": "llama-3-8b-instruct",
                     "encrypted": True,
                     "client_public_key": browser_crypto.public_key_b64,
-                    "messages": _encrypt_browser_messages(
-                        [{"role": "user", "content": f"turn {index}"}]
-                    ),
+                    "messages": _encrypt_browser_messages([{"role": "user", "content": f"turn {index}"}]),
                     "metadata": {
                         "inference_target": "desktop_bridge_api_v1_e2ee",
                         "relay_path": "api_v1_e2ee",
@@ -356,9 +346,7 @@ def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(
             completion = _decrypt_browser_response(browser_crypto, response.json())
             assert completion["choices"][0]["message"]["content"] == "pong from desktop"
 
-            diagnostics = requests.get(
-                f"{base_url}/relay/diagnostics", timeout=5
-            ).json()
+            diagnostics = requests.get(f"{base_url}/relay/diagnostics", timeout=5).json()
             nodes = diagnostics["registered_compute_nodes"]
             assert len(nodes) == 1
             assert nodes[0]["queue_depth"] == 0
@@ -396,12 +384,7 @@ def test_api_v1_desktop_bridge_without_response_post_times_out_instead_of_passin
             model_manager=FakeDesktopModelManager(),
             include_configured_servers=False,
         )
-        assert (
-            desktop_client.register_api_v1_compute_node(base_url)[
-                "next_ping_in_x_seconds"
-            ]
-            > 0
-        )
+        assert desktop_client.register_api_v1_compute_node(base_url)["next_ping_in_x_seconds"] > 0
 
         monkeypatch.setattr(
             routes,
@@ -474,9 +457,8 @@ def test_api_v1_desktop_bridge_registration_poll_no_work_heartbeat():
         assert poll_payload["next_ping_in_x_seconds"] == 0
 
 
-def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_request(
-    monkeypatch,
-):
+
+def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_request(monkeypatch):
     """A desktop node that idled after no-work polling should renew before browser work."""
 
     monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0.01")
@@ -496,18 +478,13 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
         assert first_no_work["message"] == "No requests available"
         assert server_key in relay.known_servers
 
-        relay.known_servers[server_key]["last_ping"] = datetime.now() - timedelta(
-            seconds=60
-        )
+        relay.known_servers[server_key]["last_ping"] = datetime.now() - timedelta(seconds=60)
         desktop_client._api_v1_last_heartbeat_at[base_url] -= 25.0
 
         renewed_no_work = desktop_client.poll_api_v1_encrypted_work()
         assert renewed_no_work["message"] == "No requests available"
         assert server_key in relay.known_servers
-        assert (
-            requests.get(f"{base_url}/api/v1/relay/servers/next", timeout=2).status_code
-            == 200
-        )
+        assert requests.get(f"{base_url}/api/v1/relay/servers/next", timeout=2).status_code == 200
 
         monkeypatch.setattr(
             routes,
@@ -549,9 +526,7 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
                 break
             time.sleep(0.02)
         else:  # pragma: no cover - diagnostic failure path
-            pytest.fail(
-                "desktop did not receive queued API v1 E2EE request after idle renewal"
-            )
+            pytest.fail("desktop did not receive queued API v1 E2EE request after idle renewal")
 
         browser_thread.join(timeout=5)
 
@@ -614,9 +589,7 @@ def _load_compute_node_bridge_module():
     module_dir = str(module_path.parent)
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
-    spec = importlib.util.spec_from_file_location(
-        "compute_node_bridge_for_test", module_path
-    )
+    spec = importlib.util.spec_from_file_location("compute_node_bridge_for_test", module_path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)

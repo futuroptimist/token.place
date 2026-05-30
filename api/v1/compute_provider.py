@@ -70,9 +70,7 @@ class ComputeProviderError(Exception):
         super().__init__(message)
         self.code = code
         self.error_type = error_type
-        self.public_message = (
-            public_message or "Unable to generate a response right now."
-        )
+        self.public_message = public_message or "Unable to generate a response right now."
         self.status_code = status_code
 
 
@@ -121,9 +119,7 @@ def _error_from_code(code: str, *, message: str) -> ComputeProviderError:
         message,
         code=code,
         error_type=mapped.get("error_type", "server_error"),
-        public_message=mapped.get(
-            "public_message", "Unable to generate a response right now."
-        ),
+        public_message=mapped.get("public_message", "Unable to generate a response right now."),
         status_code=int(mapped.get("status_code", 502)),
     )
 
@@ -172,7 +168,7 @@ class DistributedApiV1ComputeProvider:
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
         if base_url.endswith("/api/v1") and path.startswith("/api/v1/"):
-            path = path[len("/api/v1") :]
+            path = path[len("/api/v1"):]
         return f"{base_url}{path}"
 
     def _poll_interval_seconds(self) -> float:
@@ -196,9 +192,7 @@ class DistributedApiV1ComputeProvider:
         relay_request_id = f"api-v1-{uuid.uuid4().hex}"
         relay_cancel_token = uuid.uuid4().hex
 
-        def _cancel_relay_request(
-            status: str = "cancelled", reason: str = "requester_gave_up"
-        ) -> None:
+        def _cancel_relay_request(status: str = "cancelled", reason: str = "requester_gave_up") -> None:
             try:
                 requests.post(
                     self._relay_url("/api/v1/relay/requests/cancel"),
@@ -249,9 +243,7 @@ class DistributedApiV1ComputeProvider:
                 if isinstance(next_server_payload, dict)
                 else None
             )
-            error_code = (
-                error_payload.get("code") if isinstance(error_payload, dict) else None
-            )
+            error_code = error_payload.get("code") if isinstance(error_payload, dict) else None
             if error_code == "no_registered_compute_nodes":
                 raise _error_from_code(
                     "no_registered_compute_nodes",
@@ -302,9 +294,7 @@ class DistributedApiV1ComputeProvider:
         }
 
         try:
-            encrypted_envelope = crypto_manager.encrypt_message(
-                plaintext_envelope, server_public_key
-            )
+            encrypted_envelope = crypto_manager.encrypt_message(plaintext_envelope, server_public_key)
         except Exception as exc:
             raise _error_from_code(
                 "compute_node_invalid_payload",
@@ -395,10 +385,7 @@ class DistributedApiV1ComputeProvider:
 
             error_payload = retrieve_payload.get("error")
             if error_payload:
-                if isinstance(error_payload, dict) and error_payload.get("code") in {
-                    "cancelled",
-                    "expired",
-                }:
+                if isinstance(error_payload, dict) and error_payload.get("code") in {"cancelled", "expired"}:
                     raise _error_from_code(
                         "compute_node_request_cancelled",
                         message=f"relay reported API v1 request {error_payload.get('code')}",
@@ -406,9 +393,7 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if not {"chat_history", "cipherkey", "iv"}.issubset(
-                retrieve_payload.keys()
-            ):
+            if not {"chat_history", "cipherkey", "iv"}.issubset(retrieve_payload.keys()):
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
@@ -431,10 +416,7 @@ class DistributedApiV1ComputeProvider:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue
 
-            if (
-                decrypted_response.get("client_public_key")
-                != crypto_manager.public_key_b64
-            ):
+            if decrypted_response.get("client_public_key") != crypto_manager.public_key_b64:
                 raise _error_from_code(
                     "compute_node_invalid_payload",
                     message="decrypted relay response client_public_key binding mismatch",
@@ -537,12 +519,8 @@ def _config_value(key: str) -> str:
         from config import get_config
 
         value = get_config().get(key, "")
-    except (
-        Exception
-    ) as exc:  # pragma: no cover - defensive against early bootstrap cycles
-        logger.debug(
-            "api_v1.compute_provider.config_read_failed key=%s", key, exc_info=exc
-        )
+    except Exception as exc:  # pragma: no cover - defensive against early bootstrap cycles
+        logger.debug("api_v1.compute_provider.config_read_failed key=%s", key, exc_info=exc)
         return ""
     return value if isinstance(value, str) else ""
 
@@ -694,9 +672,7 @@ def _build_api_v1_compute_provider(
         target_source,
         relay_only,
     )
-    return FallbackApiV1ComputeProvider(
-        primary=distributed_provider, fallback=local_provider
-    )
+    return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
 
 
 def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
@@ -716,9 +692,10 @@ def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
     """Read and normalize API v1 provider environment configuration."""
 
     mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local").strip().lower()
-    distributed_fallback_enabled = os.environ.get(
-        "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1"
-    ).strip().lower() not in {"0", "false", "no", "off"}
+    distributed_fallback_enabled = (
+        os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
     return mode, _select_distributed_target(), distributed_fallback_enabled
 
 

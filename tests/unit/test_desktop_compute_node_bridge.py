@@ -408,8 +408,37 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     started = events[0]
     assert started['offloaded_layers'] == 0
     assert started['kv_cache_device'] == 'cpu'
+    required_status_fields = {
+        'running',
+        'registered',
+        'relay_runtime_state',
+        'runtime_path',
+        'relay_runtime_path',
+        'active_relay_url',
+        'requested_mode',
+        'effective_mode',
+        'backend_available',
+        'backend_selected',
+        'backend_used',
+        'fallback_reason',
+        'model_path',
+        'last_error',
+        'operator_session_id',
+        'sequence',
+        'updated_at_ms',
+    }
+    for event in events:
+        if event['type'] in {'started', 'status', 'stopped'}:
+            assert required_status_fields <= set(event)
+    warming_event = next(event for event in events if event.get('relay_runtime_state') == 'warming')
+    assert warming_event['registered'] is False
+    assert warming_event['effective_mode'] == 'pending'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
+    stopped = events[-1]
+    assert stopped['running'] is False
+    assert stopped['registered'] is False
+    assert stopped['relay_runtime_state'] == 'stopped'
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):

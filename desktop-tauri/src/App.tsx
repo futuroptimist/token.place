@@ -31,11 +31,15 @@ interface ComputeNodeStatus {
   fallback_reason: string | null;
   model_path: string;
   last_error: string | null;
+  relay_runtime_state: string | null;
   warm_load_state: string | null;
   warm_load_enabled: boolean | null;
   warm_load_duration_ms: number | null;
   runtime_path: string | null;
   relay_runtime_path: string | null;
+  operator_session_id: string | null;
+  sequence: number | null;
+  updated_at_ms: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -68,15 +72,121 @@ const defaultComputeStatus: ComputeNodeStatus = {
   fallback_reason: null,
   model_path: '',
   last_error: null,
+  relay_runtime_state: 'idle',
   warm_load_state: null,
   warm_load_enabled: null,
   warm_load_duration_ms: null,
   runtime_path: null,
   relay_runtime_path: null,
+  operator_session_id: null,
+  sequence: null,
+  updated_at_ms: null,
 };
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function displayStatusValue(value: string | null | undefined, fallback: string): string {
+  return value && value.trim() ? value : fallback;
+}
+
+function mergeComputeStatusEvent(
+  prev: ComputeNodeStatus,
+  payload: Record<string, unknown>
+): ComputeNodeStatus {
+  const payloadSession = typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
+  const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
+  const isFreshStartEvent =
+    payload.type === 'started' &&
+    payloadSequence === 1 &&
+    !prev.running &&
+    payloadSession !== null &&
+    payloadSession !== prev.operator_session_id;
+  if (
+    prev.operator_session_id &&
+    payloadSession &&
+    payloadSession !== prev.operator_session_id &&
+    !isFreshStartEvent
+  ) {
+    return prev;
+  }
+  if (
+    payloadSequence !== null &&
+    prev.sequence !== null &&
+    payloadSequence <= prev.sequence &&
+    !isFreshStartEvent
+  ) {
+    return prev;
+  }
+
+  return {
+    running:
+      typeof payload.running === 'boolean'
+        ? payload.running
+        : payload.type === 'error'
+          ? false
+          : prev.running,
+    registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
+    active_relay_url:
+      typeof payload.active_relay_url === 'string'
+        ? payload.active_relay_url
+        : prev.active_relay_url,
+    requested_mode:
+      typeof payload.requested_mode === 'string' ? payload.requested_mode : prev.requested_mode,
+    effective_mode:
+      typeof payload.effective_mode === 'string' ? payload.effective_mode : prev.effective_mode,
+    backend_available:
+      typeof payload.backend_available === 'string'
+        ? payload.backend_available
+        : prev.backend_available,
+    backend_selected:
+      typeof payload.backend_selected === 'string'
+        ? payload.backend_selected
+        : prev.backend_selected,
+    backend_used:
+      typeof payload.backend_used === 'string' ? payload.backend_used : prev.backend_used,
+    fallback_reason:
+      payload.fallback_reason === null
+        ? null
+        : typeof payload.fallback_reason === 'string'
+          ? payload.fallback_reason
+          : prev.fallback_reason,
+    model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
+    relay_runtime_state:
+      typeof payload.relay_runtime_state === 'string'
+        ? payload.relay_runtime_state
+        : typeof payload.warm_load_state === 'string'
+          ? payload.warm_load_state
+          : prev.relay_runtime_state,
+    warm_load_state:
+      typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+    warm_load_enabled:
+      typeof payload.warm_load_enabled === 'boolean'
+        ? payload.warm_load_enabled
+        : prev.warm_load_enabled,
+    warm_load_duration_ms:
+      typeof payload.warm_load_duration_ms === 'number'
+        ? payload.warm_load_duration_ms
+        : prev.warm_load_duration_ms,
+    runtime_path: typeof payload.runtime_path === 'string' ? payload.runtime_path : prev.runtime_path,
+    relay_runtime_path:
+      typeof payload.relay_runtime_path === 'string'
+        ? payload.relay_runtime_path
+        : prev.relay_runtime_path,
+    operator_session_id: payloadSession ?? prev.operator_session_id,
+    sequence: payloadSequence ?? prev.sequence,
+    updated_at_ms:
+      typeof payload.updated_at_ms === 'number' ? payload.updated_at_ms : prev.updated_at_ms,
+    last_error:
+      payload.last_error === null
+        ? null
+        : typeof payload.last_error === 'string'
+          ? payload.last_error
+          : typeof payload.message === 'string'
+            ? payload.message
+            : prev.last_error,
+  };
 }
 
 export function selectedModelPath(selection: string | string[] | null): string {
@@ -106,13 +216,15 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const relayRuntimeState = computeStatus.relay_runtime_state || computeStatus.warm_load_state || 'idle';
   const relayRuntimeReady =
     computeStatus.warm_load_enabled === false ||
-    computeStatus.warm_load_state === null ||
-    computeStatus.warm_load_state === 'ready';
+    relayRuntimeState === 'ready' ||
+    relayRuntimeState === 'processing';
   const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
+  const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend')
@@ -124,6 +236,7 @@ export function App() {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
         setConfig(loadedConfig);
         const nodeStatus = await invoke<ComputeNodeStatus>('get_compute_node_status');
+        computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
@@ -168,63 +281,13 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
-      setComputeStatus((prev) => ({
-        running:
-          typeof payload.running === 'boolean'
-            ? payload.running
-            : payload.type === 'error'
-              ? false
-              : prev.running,
-        registered: typeof payload.registered === 'boolean' ? payload.registered : prev.registered,
-        active_relay_url:
-          typeof payload.active_relay_url === 'string'
-            ? payload.active_relay_url
-            : prev.active_relay_url,
-        requested_mode:
-          typeof payload.requested_mode === 'string' ? payload.requested_mode : prev.requested_mode,
-        effective_mode:
-          typeof payload.effective_mode === 'string' ? payload.effective_mode : prev.effective_mode,
-        backend_available:
-          typeof payload.backend_available === 'string'
-            ? payload.backend_available
-            : prev.backend_available,
-        backend_selected:
-          typeof payload.backend_selected === 'string'
-            ? payload.backend_selected
-            : prev.backend_selected,
-        backend_used:
-          typeof payload.backend_used === 'string' ? payload.backend_used : prev.backend_used,
-        fallback_reason:
-          payload.fallback_reason === null
-            ? null
-            : typeof payload.fallback_reason === 'string'
-              ? payload.fallback_reason
-              : prev.fallback_reason,
-        model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
-        warm_load_state:
-          typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
-        warm_load_enabled:
-          typeof payload.warm_load_enabled === 'boolean'
-            ? payload.warm_load_enabled
-            : prev.warm_load_enabled,
-        warm_load_duration_ms:
-          typeof payload.warm_load_duration_ms === 'number'
-            ? payload.warm_load_duration_ms
-            : prev.warm_load_duration_ms,
-        runtime_path: typeof payload.runtime_path === 'string' ? payload.runtime_path : prev.runtime_path,
-        relay_runtime_path:
-          typeof payload.relay_runtime_path === 'string'
-            ? payload.relay_runtime_path
-            : prev.relay_runtime_path,
-        last_error:
-          payload.last_error === null
-            ? null
-            : typeof payload.last_error === 'string'
-              ? payload.last_error
-              : typeof payload.message === 'string'
-                ? payload.message
-                : prev.last_error,
-      }));
+      const previous = computeStatusRef.current;
+      const next = mergeComputeStatusEvent(previous, payload);
+      if (next === previous) {
+        return;
+      }
+      computeStatusRef.current = next;
+      setComputeStatus(next);
       if (payload.type === 'started' || payload.type === 'error') {
         setIsStartingComputeNode(false);
       }
@@ -348,10 +411,11 @@ export function App() {
     try {
       setIsStartingComputeNode(true);
       setError('');
-      setComputeStatus((prev) => ({
-        ...prev,
+      const optimisticStatus = {
+        ...computeStatusRef.current,
         running: false,
         registered: false,
+        relay_runtime_state: 'starting',
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
         effective_mode: null,
@@ -361,7 +425,9 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
-      }));
+      };
+      computeStatusRef.current = optimisticStatus;
+      setComputeStatus(optimisticStatus);
       await invoke('start_compute_node', {
         request: {
           model_path: config.model_path,
@@ -372,12 +438,15 @@ export function App() {
     } catch (e) {
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
-      setComputeStatus((prev) => ({
-        ...prev,
+      const failedStatus = {
+        ...computeStatusRef.current,
         running: false,
         registered: false,
+        relay_runtime_state: 'failed',
         last_error: message,
-      }));
+      };
+      computeStatusRef.current = failedStatus;
+      setComputeStatus(failedStatus);
       setError(message);
     }
   };
@@ -481,15 +550,15 @@ export function App() {
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeNodeRegistered ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{computeStatus.warm_load_state || 'idle'}</code></p>
-        <p style={{ marginBottom: 0 }}>Runtime path: <code>{computeStatus.runtime_path || 'bridge'}</code></p>
-        <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{computeStatus.relay_runtime_path || 'bridge'}</code></p>
-        <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>
-        <p style={{ marginBottom: 0 }}>Requested mode: <code>{computeStatus.requested_mode || config.preferred_mode}</code></p>
-        <p style={{ marginBottom: 0 }}>Effective mode: <code>{computeStatus.effective_mode ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend available: <code>{computeStatus.backend_available ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend selected: <code>{computeStatus.backend_selected ?? 'pending'}</code></p>
-        <p style={{ marginBottom: 0 }}>Backend used: <code>{computeStatus.backend_used ?? 'pending'}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState}</code></p>
+        <p style={{ marginBottom: 0 }}>Runtime path: <code>{displayStatusValue(computeStatus.runtime_path, 'pending')}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{displayStatusValue(computeStatus.relay_runtime_path, 'pending')}</code></p>
+        <p style={{ marginBottom: 0 }}>Active relay URL: <code>{displayStatusValue(computeStatus.active_relay_url, config.relay_base_url)}</code></p>
+        <p style={{ marginBottom: 0 }}>Requested mode: <code>{displayStatusValue(computeStatus.requested_mode, config.preferred_mode)}</code></p>
+        <p style={{ marginBottom: 0 }}>Effective mode: <code>{displayStatusValue(computeStatus.effective_mode, 'pending')}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend available: <code>{displayStatusValue(computeStatus.backend_available, 'pending')}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend selected: <code>{displayStatusValue(computeStatus.backend_selected, 'pending')}</code></p>
+        <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>

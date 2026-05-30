@@ -622,6 +622,322 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+  it('renders the full initial idle compute-node status contract', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      relay_runtime_state: 'idle',
+      runtime_path: null,
+      relay_runtime_path: null,
+      requested_mode: 'auto',
+      effective_mode: null,
+      backend_available: null,
+      backend_selected: null,
+      backend_used: null,
+      fallback_reason: null,
+      model_path: '',
+      last_error: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('idle');
+    expect(screen.getByText(/Runtime path:/).textContent).toContain('pending');
+    expect(screen.getByText(/Relay runtime path:/).textContent).toContain('pending');
+    expect(screen.getByText(/Effective mode:/).textContent).toContain('pending');
+    expect(screen.getByText(/Backend available:/).textContent).toContain('pending');
+    expect(screen.getByText(/Backend selected:/).textContent).toContain('pending');
+    expect(screen.getByText(/Backend used:/).textContent).toContain('pending');
+    expect(screen.getByText(/Fallback reason:/).textContent).toContain('none');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+  it('renders ready-but-not-registered and registered runtime diagnostics from bridge events', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://relay.example',
+        requested_mode: 'gpu',
+        effective_mode: 'gpu',
+        backend_available: 'cuda',
+        backend_selected: 'cuda',
+        backend_used: 'cuda',
+        fallback_reason: null,
+        model_path: '/models/cuda.gguf',
+        runtime_path: 'sidecar',
+        relay_runtime_path: 'bridge',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready');
+    expect(screen.getByText(/Runtime path:/).textContent).toContain('sidecar');
+    expect(screen.getByText(/Relay runtime path:/).textContent).toContain('bridge');
+    expect(screen.getByText(/Active relay URL:/).textContent).toContain('https://relay.example');
+    expect(screen.getByText(/Requested mode:/).textContent).toContain('gpu');
+    expect(screen.getByText(/Backend used:/).textContent).toContain('cuda');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        active_relay_url: 'https://relay.example',
+        requested_mode: 'gpu',
+        effective_mode: 'gpu',
+        backend_available: 'cuda',
+        backend_selected: 'cuda',
+        backend_used: 'cuda',
+        fallback_reason: null,
+        model_path: '/models/cuda.gguf',
+        runtime_path: 'sidecar',
+        relay_runtime_path: 'bridge',
+        last_error: null,
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+  it('renders processing, stopped, and failure lifecycle events accurately', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        relay_runtime_state: 'processing',
+        active_relay_url: 'https://token.place',
+        requested_mode: 'auto',
+        effective_mode: 'gpu',
+        backend_available: 'cuda',
+        backend_selected: 'cuda',
+        backend_used: 'cuda',
+        fallback_reason: null,
+        model_path: '/tmp/model.gguf',
+        runtime_path: 'bridge',
+        relay_runtime_path: 'bridge',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('processing'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        active_relay_url: 'https://token.place',
+        last_error: null,
+        operator_session_id: 'session-2',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'runtime failed to initialize',
+        operator_session_id: 'session-2',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('failed'));
+    expect(screen.getByText(/Last error:/).textContent).toContain('runtime failed to initialize');
+  });
+
+  it('ignores stale compute-node events from a prior operator session', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      relay_runtime_state: 'warming',
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      warm_load_enabled: true,
+      operator_session_id: 'new-session',
+      sequence: 4,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'old process failed after restart',
+        operator_session_id: 'old-session',
+        sequence: 99,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'older sequence failed after restart',
+        operator_session_id: 'new-session',
+        sequence: 3,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'old error side effect after restart',
+        operator_session_id: 'old-session',
+        sequence: 100,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+    expect(screen.queryByText('old error side effect after restart')).toBeNull();
+  });
+
+  it('ignores duplicate sequence events for the current operator session', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      operator_session_id: 'session-1',
+      sequence: 5,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: 'duplicate sequence replay',
+        operator_session_id: 'session-1',
+        sequence: 5,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
+  it('accepts a fresh started event for restart after stop', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'stopped',
+      active_relay_url: 'https://token.place',
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'starting',
+        active_relay_url: 'https://token.place',
+        model_path: '/tmp/model.gguf',
+        operator_session_id: 'new-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('starting');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+  });
+
+  it('ignores replayed started events from the stopped prior session', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'stopped',
+      active_relay_url: 'https://token.place',
+      operator_session_id: 'old-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        relay_runtime_state: 'starting',
+        active_relay_url: 'https://token.place',
+        model_path: '/tmp/old-model.gguf',
+        operator_session_id: 'old-session',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

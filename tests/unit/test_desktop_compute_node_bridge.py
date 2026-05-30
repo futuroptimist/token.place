@@ -408,8 +408,37 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     started = events[0]
     assert started['offloaded_layers'] == 0
     assert started['kv_cache_device'] == 'cpu'
+    required_status_fields = {
+        'running',
+        'registered',
+        'relay_runtime_state',
+        'runtime_path',
+        'relay_runtime_path',
+        'active_relay_url',
+        'requested_mode',
+        'effective_mode',
+        'backend_available',
+        'backend_selected',
+        'backend_used',
+        'fallback_reason',
+        'model_path',
+        'last_error',
+        'operator_session_id',
+        'sequence',
+        'updated_at_ms',
+    }
+    for event in events:
+        if event['type'] in {'started', 'status', 'stopped'}:
+            assert required_status_fields <= set(event)
+    warming_event = next(event for event in events if event.get('relay_runtime_state') == 'warming')
+    assert warming_event['registered'] is False
+    assert warming_event['effective_mode'] == 'pending'
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
+    stopped = events[-1]
+    assert stopped['running'] is False
+    assert stopped['registered'] is False
+    assert stopped['relay_runtime_state'] == 'stopped'
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):
@@ -571,16 +600,22 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert events == [
-        {
-            'type': 'error',
-            'message': (
-                'GPU provisioning failed for desktop Windows launch '
-                '(mode=auto, action=failed): cuda wheel install failed. '
-                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
-            ),
-        }
-    ]
+    assert len(events) == 1
+    payload = events[0]
+    expected_message = (
+        'GPU provisioning failed for desktop Windows launch '
+        '(mode=auto, action=failed): cuda wheel install failed. '
+        'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+    )
+    assert payload['type'] == 'error'
+    assert payload['message'] == expected_message
+    assert payload['last_error'] == expected_message
+    assert payload['running'] is False
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert payload['operator_session_id']
+    assert payload['sequence'] == 1
+    assert isinstance(payload['updated_at_ms'], int)
 
 
 def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monkeypatch):
@@ -610,17 +645,23 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
 
     assert status == 1
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert events == [
-        {
-            'type': 'error',
-            'message': (
-                'GPU provisioning failed for desktop Windows launch '
-                '(mode=auto, action=shadowed_repo_llama_cpp): '
-                'llama_cpp import shadowed by repo-local shim. '
-                'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
-            ),
-        }
-    ]
+    assert len(events) == 1
+    payload = events[0]
+    expected_message = (
+        'GPU provisioning failed for desktop Windows launch '
+        '(mode=auto, action=shadowed_repo_llama_cpp): '
+        'llama_cpp import shadowed by repo-local shim. '
+        'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+    )
+    assert payload['type'] == 'error'
+    assert payload['message'] == expected_message
+    assert payload['last_error'] == expected_message
+    assert payload['running'] is False
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert payload['operator_session_id']
+    assert payload['sequence'] == 1
+    assert isinstance(payload['updated_at_ms'], int)
 
 
 def test_run_windows_gpu_mode_accepts_bootstrap_enabled_cuda_runtime(capsys, monkeypatch):
@@ -1139,6 +1180,13 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
     payload = next(event for event in events if event.get("type") == "error")
     assert payload['type'] == 'error'
     assert payload['message'] == "runtime unavailable: No module named 'utils.compute_node_runtime'"
+    assert payload['running'] is False
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert payload['last_error'] == payload['message']
+    assert payload['operator_session_id']
+    assert payload['sequence'] == 1
+    assert isinstance(payload['updated_at_ms'], int)
 
 
 def test_main_normalizes_mode_before_run(monkeypatch):
@@ -1188,6 +1236,52 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     status = compute_node_bridge.main()
     assert status == 0
     assert captured['mode'] == 'auto'
+
+
+def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys, monkeypatch):
+    def fake_run(_args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(compute_node_bridge, 'run', fake_run)
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'compute_node_bridge.py',
+            '--model',
+            '/tmp/model.gguf',
+            '--mode',
+            'CUDA',
+            '--relay-url',
+            'https://relay.example',
+        ],
+    )
+    monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'fallback-session')
+
+    status = compute_node_bridge.main()
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    payload = next(event for event in events if event.get("type") == "error")
+    assert payload["running"] is False
+    assert payload["registered"] is False
+    assert payload["relay_runtime_state"] == "failed"
+    assert payload["active_relay_url"] == "https://relay.example"
+    assert payload["requested_mode"] == "gpu"
+    assert payload["effective_mode"] == "pending"
+    assert payload["backend_available"] == "pending"
+    assert payload["backend_selected"] == "pending"
+    assert payload["backend_used"] == "pending"
+    assert payload["model_path"] == "/tmp/model.gguf"
+    assert payload["last_error"] == payload["message"]
+    assert "compute-node bridge exited before emitting a startup event: boom" == payload["message"]
+    assert payload["warm_load_state"] == "failed"
+    assert "warm_load_enabled" in payload
+    assert payload["runtime_path"] in {"bridge", "sidecar"}
+    assert payload["relay_runtime_path"] == "bridge"
+    assert payload["operator_session_id"] == "fallback-session"
+    assert payload["sequence"] == 1
+    assert isinstance(payload["updated_at_ms"], int)
 
 
 def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch):
@@ -1713,7 +1807,11 @@ def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
     status = compute_node_bridge.run(args)
     assert status == 0
     assert call_order == ["poll", "poll"]
-    _ = capsys.readouterr()
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    status_events = [event for event in events if event.get("type") == "status"]
+    assert any(event.get("registered") is True for event in status_events)
+    assert all(event.get("relay_runtime_state") == "ready" for event in status_events)
 
 
 def test_run_sidecar_runtime_path_warms_bridge_before_registration_without_dual_opt_in(capsys, monkeypatch):
@@ -1960,6 +2058,13 @@ def test_run_fails_fast_when_dependency_preflight_fails(capsys, monkeypatch):
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     error_event = next(event for event in events if event.get("type") == "error")
     assert "dependency preflight failed" in error_event["message"]
+    assert error_event["running"] is False
+    assert error_event["registered"] is False
+    assert error_event["relay_runtime_state"] == "failed"
+    assert error_event["last_error"] == error_event["message"]
+    assert error_event["operator_session_id"]
+    assert error_event["sequence"] == 1
+    assert isinstance(error_event["updated_at_ms"], int)
 
 
 def test_cancelable_poll_worker_returns_after_empty_poll_and_reraises():

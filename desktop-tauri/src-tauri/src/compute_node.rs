@@ -11,7 +11,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -37,11 +37,15 @@ pub struct ComputeNodeStatus {
     pub fallback_reason: Option<String>,
     pub model_path: String,
     pub last_error: Option<String>,
+    pub relay_runtime_state: Option<String>,
     pub warm_load_state: Option<String>,
     pub warm_load_enabled: Option<bool>,
     pub warm_load_duration_ms: Option<u64>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
+    pub operator_session_id: Option<String>,
+    pub sequence: Option<u64>,
+    pub updated_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +54,7 @@ pub struct ComputeNodeState {
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub status: Arc<Mutex<ComputeNodeStatus>>,
     pub lifecycle_lock: Arc<Mutex<()>>,
+    pub next_session_id: Arc<Mutex<u64>>,
 }
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
@@ -186,6 +191,17 @@ fn command_env_value(command: &Command, key: &str) -> Option<String> {
         .map(|value| value.to_string_lossy().into_owned())
 }
 
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn event_session_id(payload: &Value) -> Option<&str> {
+    payload.get("operator_session_id").and_then(Value::as_str)
+}
+
 fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
     ComputeNodeStatus {
         running: false,
@@ -199,15 +215,38 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         fallback_reason: None,
         model_path: request.model_path.clone(),
         last_error: Some(last_error),
+        relay_runtime_state: Some("failed".into()),
         warm_load_state: Some("failed".into()),
         warm_load_enabled: Some(true),
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
+        operator_session_id: None,
+        sequence: None,
+        updated_at_ms: Some(current_time_ms()),
     }
 }
 
-fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
+fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> bool {
+    let payload_sequence = payload.get("sequence").and_then(Value::as_u64);
+    let payload_session = event_session_id(payload);
+    let is_fresh_start_event = payload.get("type").and_then(Value::as_str) == Some("started")
+        && payload_sequence == Some(1)
+        && !status.running
+        && payload_session
+            .is_some_and(|session| status.operator_session_id.as_deref() != Some(session));
+    if let (Some(current_session), Some(payload_session)) =
+        (status.operator_session_id.as_deref(), payload_session)
+    {
+        if current_session != payload_session && !is_fresh_start_event {
+            return false;
+        }
+    }
+    if let (Some(current_sequence), Some(payload_sequence)) = (status.sequence, payload_sequence) {
+        if payload_sequence <= current_sequence && !is_fresh_start_event {
+            return false;
+        }
+    }
     if let Some(running) = payload.get("running").and_then(Value::as_bool) {
         status.running = running;
     }
@@ -271,6 +310,20 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
+    if let Some(relay_runtime_state) = payload.get("relay_runtime_state").and_then(Value::as_str) {
+        status.relay_runtime_state = Some(relay_runtime_state.into());
+    }
+    if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
+        status.operator_session_id = Some(operator_session_id.into());
+    }
+    if let Some(sequence) = payload.get("sequence").and_then(Value::as_u64) {
+        status.sequence = Some(sequence);
+    }
+    if let Some(updated_at_ms) = payload.get("updated_at_ms").and_then(Value::as_u64) {
+        status.updated_at_ms = Some(updated_at_ms);
+    } else {
+        status.updated_at_ms = Some(current_time_ms());
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -278,6 +331,7 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .map(ToOwned::to_owned)
             .or_else(|| Some("compute-node bridge error".into()));
     }
+    true
 }
 
 fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
@@ -316,9 +370,15 @@ fn finalize_bridge_exit(
     exit_status: std::process::ExitStatus,
     saw_startup_event: bool,
     saw_error_event: bool,
+    expected_session_id: &str,
 ) -> Option<Value> {
+    if status.operator_session_id.as_deref() != Some(expected_session_id) {
+        return None;
+    }
+
     status.running = false;
     status.registered = false;
+    status.relay_runtime_state = Some("stopped".into());
 
     let exit_error = bridge_exit_error(exit_status, saw_startup_event);
     if status.last_error.is_none() {
@@ -330,11 +390,20 @@ fn finalize_bridge_exit(
     }
 
     exit_error.map(|last_error| {
+        let sequence = status.sequence.unwrap_or(0).saturating_add(1);
+        let updated_at_ms = current_time_ms();
+        status.sequence = Some(sequence);
+        status.updated_at_ms = Some(updated_at_ms);
         serde_json::json!({
             "type": "error",
             "running": false,
             "registered": false,
+            "relay_runtime_state": "stopped",
             "last_error": last_error,
+            "message": last_error,
+            "operator_session_id": expected_session_id,
+            "sequence": sequence,
+            "updated_at_ms": updated_at_ms,
         })
     })
 }
@@ -411,8 +480,14 @@ pub async fn start_compute_node(
             return Err(err);
         }
     };
+    let session_id = {
+        let mut next_session_id = state.next_session_id.lock().await;
+        *next_session_id += 1;
+        next_session_id.to_string()
+    };
     configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
+    bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
 
     let spawn_result = bridge_command
         .arg("--model")
@@ -483,11 +558,15 @@ pub async fn start_compute_node(
                 fallback_reason: None,
                 model_path: request.model_path.clone(),
                 last_error: None,
+                relay_runtime_state: Some("starting".into()),
                 warm_load_state: Some("not_started".into()),
                 warm_load_enabled: Some(true),
                 warm_load_duration_ms: None,
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
+                operator_session_id: Some(session_id.clone()),
+                sequence: Some(0),
+                updated_at_ms: Some(current_time_ms()),
             };
             true
         }
@@ -528,7 +607,9 @@ pub async fn start_compute_node(
                 }
                 {
                     let mut status = state.status.lock().await;
-                    update_status_from_event(&mut status, &payload);
+                    if !update_status_from_event(&mut status, &payload) {
+                        continue;
+                    }
                 }
                 app.emit("compute_node_event", payload)?;
             }
@@ -547,15 +628,26 @@ pub async fn start_compute_node(
 
     let running_child = {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
-        let mut child_slot = state.child.lock().await;
-        child_slot.take()
+        let current_session = state.status.lock().await.operator_session_id.clone();
+        if current_session.as_deref() == Some(session_id.as_str()) {
+            let mut child_slot = state.child.lock().await;
+            child_slot.take()
+        } else {
+            None
+        }
     };
 
     if let Some(mut running_child) = running_child {
         let exit_status = running_child.wait().await?;
         let exit_payload = {
             let mut status = state.status.lock().await;
-            finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
+            finalize_bridge_exit(
+                &mut status,
+                exit_status,
+                saw_startup_event,
+                saw_error_event,
+                &session_id,
+            )
         };
 
         if let Some(payload) = exit_payload {
@@ -563,12 +655,17 @@ pub async fn start_compute_node(
         }
     } else {
         let mut status = state.status.lock().await;
-        status.running = false;
-        status.registered = false;
+        if status.operator_session_id.as_deref() == Some(session_id.as_str()) {
+            status.running = false;
+            status.registered = false;
+        }
     }
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
-        *state.stdin.lock().await = None;
+        let current_session = state.status.lock().await.operator_session_id.clone();
+        if current_session.as_deref() == Some(session_id.as_str()) {
+            *state.stdin.lock().await = None;
+        }
     }
 
     Ok(())
@@ -619,6 +716,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
+        status.relay_runtime_state = Some("stopped".into());
+        status.last_error = None;
+        status.updated_at_ms = Some(current_time_ms());
     }
     Ok(())
 }
@@ -836,6 +936,116 @@ mod tests {
     }
 
     #[test]
+    fn update_status_from_event_ignores_stale_prior_session_events() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            relay_runtime_state: Some("warming".into()),
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(4),
+            ..ComputeNodeStatus::default()
+        };
+
+        let old_session = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "stopped",
+            "last_error": "old process failed after restart",
+            "operator_session_id": "old-session",
+            "sequence": 99
+        });
+        let old_sequence = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "stopped",
+            "last_error": "older event failed after restart",
+            "operator_session_id": "new-session",
+            "sequence": 3
+        });
+
+        assert!(!update_status_from_event(&mut status, &old_session));
+        assert!(!update_status_from_event(&mut status, &old_sequence));
+        assert!(status.running);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("warming"));
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn update_status_from_event_rejects_duplicate_sequences_and_cross_session_starts() {
+        let mut running_status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            relay_runtime_state: Some("starting".into()),
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(1),
+            ..ComputeNodeStatus::default()
+        };
+
+        let duplicate_sequence = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "stopped",
+            "operator_session_id": "new-session",
+            "sequence": 1
+        });
+        let old_started_event = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "ready",
+            "operator_session_id": "old-session",
+            "sequence": 1
+        });
+
+        assert!(!update_status_from_event(
+            &mut running_status,
+            &duplicate_sequence
+        ));
+        assert!(!update_status_from_event(
+            &mut running_status,
+            &old_started_event
+        ));
+        assert_eq!(
+            running_status.operator_session_id.as_deref(),
+            Some("new-session")
+        );
+        assert_eq!(
+            running_status.relay_runtime_state.as_deref(),
+            Some("starting")
+        );
+
+        let mut stopped_status = ComputeNodeStatus {
+            running: false,
+            registered: false,
+            relay_runtime_state: Some("stopped".into()),
+            operator_session_id: Some("old-session".into()),
+            sequence: Some(8),
+            ..ComputeNodeStatus::default()
+        };
+        let new_started_event = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "starting",
+            "operator_session_id": "new-session",
+            "sequence": 1
+        });
+
+        assert!(update_status_from_event(
+            &mut stopped_status,
+            &new_started_event
+        ));
+        assert!(stopped_status.running);
+        assert_eq!(
+            stopped_status.operator_session_id.as_deref(),
+            Some("new-session")
+        );
+    }
+
+    #[test]
     fn compute_node_status_cache_replays_warming_relay_runtime_fields() {
         let state = ComputeNodeState::default();
         let cached_status = ComputeNodeStatus {
@@ -909,12 +1119,15 @@ mod tests {
         let mut status = ComputeNodeStatus {
             running: true,
             registered: true,
+            operator_session_id: Some("current-session".into()),
+            sequence: Some(7),
             ..ComputeNodeStatus::default()
         };
         let exit_status = success_exit_status();
 
-        let payload = finalize_bridge_exit(&mut status, exit_status, false, false)
-            .expect("error payload should be emitted");
+        let payload =
+            finalize_bridge_exit(&mut status, exit_status, false, false, "current-session")
+                .expect("error payload should be emitted");
 
         assert!(!status.running);
         assert!(!status.registered);
@@ -933,6 +1146,84 @@ mod tests {
             payload.get("last_error").and_then(Value::as_str),
             Some(last_error)
         );
+        assert_eq!(
+            payload.get("operator_session_id").and_then(Value::as_str),
+            Some("current-session")
+        );
+        assert_eq!(payload.get("sequence").and_then(Value::as_u64), Some(8));
+        assert!(payload
+            .get("updated_at_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert_eq!(status.sequence, Some(8));
+    }
+
+    #[test]
+    fn finalize_bridge_exit_suppresses_payload_for_superseded_session() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(3),
+            relay_runtime_state: Some("starting".into()),
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+
+        let payload = finalize_bridge_exit(&mut status, exit_status, false, false, "old-session");
+
+        assert!(payload.is_none());
+        assert!(status.running);
+        assert!(status.registered);
+        assert_eq!(status.sequence, Some(3));
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("starting"));
+    }
+
+    #[test]
+    fn versioned_bridge_exit_error_cannot_be_accepted_after_restart() {
+        let mut exiting_status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            operator_session_id: Some("old-session".into()),
+            sequence: Some(2),
+            ..ComputeNodeStatus::default()
+        };
+        let exit_status = success_exit_status();
+        let payload = finalize_bridge_exit(
+            &mut exiting_status,
+            exit_status,
+            false,
+            false,
+            "old-session",
+        )
+        .expect("old session should emit a versioned synthetic error");
+        assert_eq!(
+            payload.get("operator_session_id").and_then(Value::as_str),
+            Some("old-session")
+        );
+        assert_eq!(payload.get("sequence").and_then(Value::as_u64), Some(3));
+        assert!(payload
+            .get("updated_at_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+
+        let mut restarted_status = ComputeNodeStatus {
+            running: true,
+            registered: true,
+            relay_runtime_state: Some("ready".into()),
+            operator_session_id: Some("new-session".into()),
+            sequence: Some(1),
+            ..ComputeNodeStatus::default()
+        };
+
+        assert!(!update_status_from_event(&mut restarted_status, &payload));
+        assert!(restarted_status.running);
+        assert!(restarted_status.registered);
+        assert_eq!(
+            restarted_status.operator_session_id.as_deref(),
+            Some("new-session")
+        );
+        assert!(restarted_status.last_error.is_none());
     }
 
     #[test]

@@ -230,6 +230,10 @@ class DistributedApiV1ComputeProvider:
                 )
             return remaining
 
+        def _cancel_if_post_enqueue_timeout(exc: ComputeProviderError) -> None:
+            if relay_request_enqueued and exc.code == "compute_node_timeout":
+                _cancel_relay_request_once(status="expired", reason="provider_timeout")
+
         try:
             next_server_response = requests.get(
                 self._relay_url("/api/v1/relay/servers/next"),
@@ -352,8 +356,7 @@ class DistributedApiV1ComputeProvider:
             try:
                 retrieve_timeout = min(poll_interval + 0.5, _remaining_timeout())
             except ComputeProviderError as exc:
-                if relay_request_enqueued and exc.code == "compute_node_timeout":
-                    _cancel_relay_request_once(status="expired", reason="provider_timeout")
+                _cancel_if_post_enqueue_timeout(exc)
                 raise
 
             try:
@@ -461,11 +464,12 @@ class DistributedApiV1ComputeProvider:
             _last_backend_path.set("distributed_relay_e2ee")
             return assistant_message
 
-        _cancel_relay_request_once(status="expired", reason="provider_timeout")
-        raise _error_from_code(
+        timeout_error = _error_from_code(
             "compute_node_timeout",
             message="timed out waiting for distributed relay API v1 encrypted response",
         )
+        _cancel_if_post_enqueue_timeout(timeout_error)
+        raise timeout_error
 
 
 @dataclass(frozen=True)

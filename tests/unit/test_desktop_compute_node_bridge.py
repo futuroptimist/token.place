@@ -2491,3 +2491,85 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+
+def test_run_restart_after_stop_creates_fresh_runtime_and_registers_again(capsys, monkeypatch):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+
+    class RestartRelayClient(FakeRelayClient):
+        def __init__(self):
+            self.relay_url = 'https://staging.token.place'
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def unregister_from_relay(self):
+            return True
+
+    class RestartRuntime:
+        instances = []
+
+        def __init__(self, _config):
+            self.model_manager = FakeModelManager()
+            self.relay_client = RestartRelayClient()
+            self.register_calls = 0
+            RestartRuntime.instances.append(self)
+
+        def ensure_api_v1_runtime_ready(self):
+            return True
+
+        def register_and_poll_once(self):
+            self.register_calls += 1
+            return {'next_ping_in_x_seconds': 0, 'poll_wait_seconds': 0}
+
+        def process_relay_request(self, _payload):
+            return True
+
+        def stop(self):
+            self.relay_client.stop()
+
+    _install_fake_runtime_module(monkeypatch, RestartRuntime)
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', lambda _seconds: True)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://staging.token.place',
+        relay_port=None,
+    )
+
+    compute_node_bridge._stop_requested_latched.set()
+    first_status = compute_node_bridge.run(args)
+    compute_node_bridge._stop_requested_latched.set()
+    second_status = compute_node_bridge.run(args)
+
+    assert first_status == 0
+    assert second_status == 0
+    assert len(RestartRuntime.instances) == 2
+    assert [runtime.register_calls for runtime in RestartRuntime.instances] == [1, 1]
+    assert all(runtime.relay_client.stop_calls >= 1 for runtime in RestartRuntime.instances)
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    started_events = [event for event in events if event['type'] == 'started']
+    registered_events = [
+        event for event in events if event['type'] == 'status' and event.get('registered') is True
+    ]
+    stopped_events = [event for event in events if event['type'] == 'stopped']
+    assert len(started_events) == 2
+    assert len(registered_events) == 2
+    assert len(stopped_events) == 2
+    assert started_events[0]['operator_session_id'] != started_events[1]['operator_session_id']
+    assert all(event['last_error'] is None for event in registered_events)
+
+
+def test_cancelable_poll_worker_shutdown_replaces_stale_poll_loop():
+    first_worker = compute_node_bridge._CancelablePollWorker()
+    first_worker.shutdown()
+    assert first_worker.call(lambda: {'unexpected': True}, lambda: False) is compute_node_bridge._POLL_CANCELLED
+
+    second_worker = compute_node_bridge._CancelablePollWorker()
+    try:
+        assert second_worker.call(lambda: {'ok': True}, lambda: False) == {'ok': True}
+    finally:
+        second_worker.shutdown()

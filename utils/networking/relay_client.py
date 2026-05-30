@@ -780,12 +780,20 @@ class RelayClient:
             return {}
         return {"X-Relay-Server-Token": self._registration_token}
 
-    def start(self):
-        """Start the polling loop by setting stop_polling to False"""
+    def reset_for_restart(self) -> None:
+        """Reset local lifecycle flags so a stopped client can register again cleanly."""
+
         self.stop_polling = False
         self._polling_stopped_by_request = False
         self._unregister_attempted = False
         self._unregister_complete = False
+        self._api_v1_registered_relays.clear()
+        self._api_v1_last_heartbeat_at.clear()
+        getattr(self, "_api_v1_relay_wait_hints", {}).clear()
+
+    def start(self):
+        """Start the polling loop by setting stop_polling to False"""
+        self.reset_for_restart()
 
     def stop(self):
         """Stop the polling loop by setting stop_polling to True"""

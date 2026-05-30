@@ -1244,6 +1244,78 @@ class TestRelayClient:
     def test_api_v1_poll_timeout_seconds_defensive(self, relay_client, expected_wait, expected_timeout):
         assert relay_client._api_v1_poll_timeout_seconds(expected_wait) == expected_timeout
 
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_stop_unregister_then_restart_registers_and_polls_again(self, mock_post, relay_client):
+        """A stopped client can be reset and reused without relaunching the desktop app."""
+
+        first_register = MagicMock(status_code=200)
+        first_register.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+        first_poll = MagicMock(status_code=200)
+        first_poll.json.return_value = {'message': 'No requests available'}
+        unregister_ok = MagicMock(status_code=200)
+        second_register = MagicMock(status_code=200)
+        second_register.json.return_value = {'next_ping_in_x_seconds': 12, 'poll_wait_seconds': 0}
+        second_poll = MagicMock(status_code=200)
+        second_poll.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [
+            first_register,
+            first_poll,
+            unregister_ok,
+            second_register,
+            second_poll,
+        ]
+
+        first_result = relay_client.poll_api_v1_encrypted_work()
+        assert first_result['next_ping_in_x_seconds'] == 12
+        assert relay_client.api_v1_registration_fresh() is True
+
+        relay_client.stop()
+        assert relay_client.unregister_from_relay() is True
+        stopped_result = relay_client.poll_api_v1_encrypted_work()
+        assert stopped_result['error'] == 'Relay polling stopped'
+
+        relay_client.reset_for_restart()
+        second_result = relay_client.poll_api_v1_encrypted_work()
+
+        assert second_result['next_ping_in_x_seconds'] == 12
+        register_urls = [
+            call.args[0]
+            for call in mock_post.call_args_list
+            if call.args[0].endswith('/api/v1/relay/servers/register')
+        ]
+        poll_urls = [
+            call.args[0]
+            for call in mock_post.call_args_list
+            if call.args[0].endswith('/api/v1/relay/servers/poll')
+        ]
+        assert register_urls == [
+            'http://localhost:5000/api/v1/relay/servers/register',
+            'http://localhost:5000/api/v1/relay/servers/register',
+        ]
+        assert poll_urls == [
+            'http://localhost:5000/api/v1/relay/servers/poll',
+            'http://localhost:5000/api/v1/relay/servers/poll',
+        ]
+        assert relay_client.api_v1_registration_fresh() is True
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_reset_for_restart_replaces_stale_poll_stop_with_usable_poll(self, mock_post, relay_client):
+        relay_client.stop()
+        assert relay_client.poll_api_v1_encrypted_work()['error'] == 'Relay polling stopped'
+
+        register_ok = MagicMock(status_code=200)
+        register_ok.json.return_value = {'next_ping_in_x_seconds': 15, 'poll_wait_seconds': 0}
+        poll_ok = MagicMock(status_code=200)
+        poll_ok.json.return_value = {'message': 'No requests available'}
+        mock_post.side_effect = [register_ok, poll_ok]
+
+        relay_client.reset_for_restart()
+        result = relay_client.poll_api_v1_encrypted_work()
+
+        assert result['next_ping_in_x_seconds'] == 15
+        assert mock_post.call_count == 2
+
     @patch('utils.networking.relay_client.requests.post')
     def test_poll_api_v1_encrypted_work_uses_derived_poll_timeout(self, mock_post, relay_client):
         register_ok = MagicMock(status_code=200)

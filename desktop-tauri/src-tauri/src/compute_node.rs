@@ -42,6 +42,8 @@ pub struct ComputeNodeStatus {
     pub warm_load_duration_ms: Option<u64>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
+    pub relay_runtime_state: String,
+    pub session_id: u64,
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +52,7 @@ pub struct ComputeNodeState {
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub status: Arc<Mutex<ComputeNodeStatus>>,
     pub lifecycle_lock: Arc<Mutex<()>>,
+    pub session_id: Arc<Mutex<u64>>,
 }
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
@@ -204,6 +207,8 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
+        relay_runtime_state: "failed".into(),
+        session_id: 0,
     }
 }
 
@@ -271,6 +276,12 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
+    if let Some(relay_runtime_state) = payload.get("relay_runtime_state").and_then(Value::as_str) {
+        status.relay_runtime_state = relay_runtime_state.into();
+    }
+    if let Some(session_id) = payload.get("session_id").and_then(Value::as_u64) {
+        status.session_id = session_id;
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -319,6 +330,7 @@ fn finalize_bridge_exit(
 ) -> Option<Value> {
     status.running = false;
     status.registered = false;
+    status.relay_runtime_state = "stopped".into();
 
     let exit_error = bridge_exit_error(exit_status, saw_startup_event);
     if status.last_error.is_none() {
@@ -334,6 +346,7 @@ fn finalize_bridge_exit(
             "type": "error",
             "running": false,
             "registered": false,
+            "relay_runtime_state": "failed",
             "last_error": last_error,
         })
     })
@@ -372,6 +385,12 @@ pub async fn start_compute_node(
         *child_slot = None;
         *state.stdin.lock().await = None;
     }
+
+    let session_id = {
+        let mut session_id = state.session_id.lock().await;
+        *session_id += 1;
+        *session_id
+    };
 
     let bridge_script = resolve_bridge_script(&app);
     let launcher = if is_python_script(&bridge_script) {
@@ -488,6 +507,8 @@ pub async fn start_compute_node(
                 warm_load_duration_ms: None,
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
+                relay_runtime_state: "starting".into(),
+                session_id,
             };
             true
         }
@@ -503,6 +524,34 @@ pub async fn start_compute_node(
             let _ = abandoned_child.wait().await;
         }
         anyhow::bail!("compute node already running; stop it before starting a new session");
+    }
+
+    {
+        let status = state.status.lock().await.clone();
+        app.emit(
+            "compute_node_event",
+            serde_json::json!({
+                "type": "status",
+                "running": status.running,
+                "registered": status.registered,
+                "active_relay_url": status.active_relay_url,
+                "requested_mode": status.requested_mode,
+                "effective_mode": status.effective_mode,
+                "backend_available": status.backend_available,
+                "backend_selected": status.backend_selected,
+                "backend_used": status.backend_used,
+                "fallback_reason": status.fallback_reason,
+                "model_path": status.model_path,
+                "last_error": status.last_error,
+                "warm_load_state": status.warm_load_state,
+                "warm_load_enabled": status.warm_load_enabled,
+                "warm_load_duration_ms": status.warm_load_duration_ms,
+                "runtime_path": status.runtime_path,
+                "relay_runtime_path": status.relay_runtime_path,
+                "relay_runtime_state": status.relay_runtime_state,
+                "session_id": status.session_id,
+            }),
+        )?;
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
@@ -525,6 +574,14 @@ pub async fn start_compute_node(
                     if event_type == "started" || event_type == "status" {
                         saw_startup_event = true;
                     }
+                }
+                let mut payload = payload;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("session_id".into(), Value::from(session_id));
+                }
+                let current_session_id = *state.session_id.lock().await;
+                if current_session_id != session_id {
+                    continue;
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -558,13 +615,20 @@ pub async fn start_compute_node(
             finalize_bridge_exit(&mut status, exit_status, saw_startup_event, saw_error_event)
         };
 
-        if let Some(payload) = exit_payload {
-            app.emit("compute_node_event", payload)?;
+        if let Some(mut payload) = exit_payload {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("session_id".into(), Value::from(session_id));
+            }
+            if *state.session_id.lock().await == session_id {
+                app.emit("compute_node_event", payload)?;
+            }
         }
     } else {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
+        status.relay_runtime_state = "stopped".into();
+        status.last_error = None;
     }
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -615,10 +679,19 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
     }
 
+    let next_session_id = {
+        let mut session_id = state.session_id.lock().await;
+        *session_id += 1;
+        *session_id
+    };
+
     {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
+        status.relay_runtime_state = "stopped".into();
+        status.last_error = None;
+        status.session_id = next_session_id;
     }
     Ok(())
 }
@@ -933,6 +1006,55 @@ mod tests {
             payload.get("last_error").and_then(Value::as_str),
             Some(last_error)
         );
+    }
+
+    #[test]
+    fn update_status_from_event_records_runtime_state_and_session_id() {
+        let mut status = ComputeNodeStatus::default();
+        let payload = serde_json::json!({
+            "type": "status",
+            "running": true,
+            "registered": false,
+            "relay_runtime_state": "warming",
+            "session_id": 3,
+        });
+
+        update_status_from_event(&mut status, &payload);
+
+        assert!(status.running);
+        assert!(!status.registered);
+        assert_eq!(status.relay_runtime_state, "warming");
+        assert_eq!(status.session_id, 3);
+    }
+
+    #[test]
+    fn stale_session_payload_would_not_overwrite_newer_status() {
+        let mut status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            relay_runtime_state: "starting".into(),
+            session_id: 2,
+            ..ComputeNodeStatus::default()
+        };
+        let stale_payload = serde_json::json!({
+            "type": "status",
+            "running": false,
+            "registered": false,
+            "relay_runtime_state": "stopped",
+            "session_id": 1,
+        });
+
+        if stale_payload
+            .get("session_id")
+            .and_then(Value::as_u64)
+            .is_none_or(|incoming| incoming >= status.session_id)
+        {
+            update_status_from_event(&mut status, &stale_payload);
+        }
+
+        assert!(status.running);
+        assert_eq!(status.relay_runtime_state, "starting");
+        assert_eq!(status.session_id, 2);
     }
 
     #[test]

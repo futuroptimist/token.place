@@ -281,10 +281,17 @@ async fn start_compute_node(
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
+            let session_id = {
+                let status_session = compute_state.status.lock().await.session_id;
+                let current_session = *compute_state.session_id.lock().await;
+                status_session.max(current_session)
+            };
             {
                 let mut status = compute_state.status.lock().await;
                 status.running = false;
                 status.registered = false;
+                status.relay_runtime_state = "failed".into();
+                status.session_id = session_id;
                 status.last_error = Some(err.to_string());
             }
             let _ = app.emit(
@@ -293,6 +300,8 @@ async fn start_compute_node(
                     "type": "error",
                     "running": false,
                     "registered": false,
+                    "relay_runtime_state": "failed",
+                    "session_id": session_id,
                     "last_error": err.to_string(),
                     "message": err.to_string(),
                 }),

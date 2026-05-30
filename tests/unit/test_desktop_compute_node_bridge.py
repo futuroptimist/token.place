@@ -160,6 +160,29 @@ class ApiV1Runtime(FakeRuntime):
         return self.relay_client.process_api_v1_chat_request(payload)
 
 
+class SequentialApiV1Runtime(ApiV1Runtime):
+    last_instance = None
+
+    def __init__(self, _config):
+        SequentialApiV1Runtime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = FakeRelayClientRouting()
+        self._responses = [
+            {
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+                'request_id': request_id,
+                'client_public_key': 'client-key',
+                'chat_history': f'ciphertext-{request_id}',
+                'cipherkey': 'key',
+                'iv': 'iv',
+                'next_ping_in_x_seconds': 30,
+            }
+            for request_id in ('req-turn-1', 'req-turn-2', 'req-turn-3')
+        ]
+        self._processed = []
+
+
 class WarmingThenApiV1Runtime(ApiV1Runtime):
     last_instance = None
 
@@ -888,6 +911,45 @@ def test_run_slow_pre_registration_warm_load_processes_without_runtime_not_ready
     assert len(warming_status_events) >= 2
     assert 'desktop.compute_node_bridge.api_v1_e2ee.error_response.submitted' not in output.err
     assert 'compute_node_runtime_not_ready' not in output.err
+
+
+def test_run_polls_immediately_after_each_api_v1_work_payload(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=SequentialApiV1Runtime)
+
+    sleep_values = []
+
+    def fake_sleep_with_cancel(seconds):
+        sleep_values.append(seconds)
+        return False
+
+    monkeypatch.setattr(compute_node_bridge, '_sleep_with_cancel', fake_sleep_with_cancel)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "0")
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'stop_requested',
+        lambda: len(SequentialApiV1Runtime.last_instance._processed) >= 3,
+    )
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    runtime = SequentialApiV1Runtime.last_instance
+    assert [payload['request_id'] for payload in runtime._processed] == [
+        'req-turn-1',
+        'req-turn-2',
+        'req-turn-3',
+    ]
+    assert sleep_values == [0.0, 0.0, 0.0]
+    output = capsys.readouterr()
+    assert output.err.count('api_v1_e2ee.work_processed_next_poll_immediate') == 3
+    assert 'request_id=req-turn-3' in output.err
 
 
 def test_run_malformed_wait_value_does_not_stop_future_api_v1_polling(capsys, monkeypatch):

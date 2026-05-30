@@ -206,6 +206,47 @@ def test_distributed_compute_provider_treats_retrieve_404_as_unknown_request(mon
         assert "unknown API v1 response request id" in str(exc)
 
 
+def test_distributed_compute_provider_cancels_relay_request_on_timeout(monkeypatch):
+    fake_crypto = _FakeCryptoManager()
+    posted_urls = []
+
+    def fake_get(url, timeout):
+        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+
+    def fake_post(url, json, timeout):
+        posted_urls.append((url, copy.deepcopy(json)))
+        if url.endswith("/api/v1/relay/requests"):
+            return _FakeResponse(200, {"message": "Request received"})
+        if url.endswith("/api/v1/relay/responses/retrieve"):
+            return _FakeResponse(202, {"status": "pending"})
+        if url.endswith("/api/v1/relay/requests/cancel"):
+            return _FakeResponse(200, {"status": "cancelled", "removed_from_queue": True})
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.requests, "get", fake_get)
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example", timeout_seconds=0.01)
+    try:
+        provider.complete_chat(
+            model_id="llama-3-8b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert exc.code == "compute_node_timeout"
+
+    cancel_calls = [item for item in posted_urls if item[0].endswith("/api/v1/relay/requests/cancel")]
+    assert len(cancel_calls) == 1
+    assert cancel_calls[0][1]["client_public_key"] == fake_crypto.public_key_b64
+    assert cancel_calls[0][1]["request_id"].startswith("api-v1-")
+
+
 def test_distributed_compute_provider_rejects_response_client_key_binding_mismatch(monkeypatch):
     """Decrypted API v1 relay responses must be bound to this client key."""
 

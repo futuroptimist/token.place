@@ -38,10 +38,13 @@ pub struct ComputeNodeStatus {
     pub model_path: String,
     pub last_error: Option<String>,
     pub warm_load_state: Option<String>,
+    pub relay_runtime_state: Option<String>,
     pub warm_load_enabled: Option<bool>,
     pub warm_load_duration_ms: Option<u64>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
+    pub session_id: u64,
+    pub status_sequence: u64,
 }
 
 #[derive(Clone, Default)]
@@ -50,6 +53,7 @@ pub struct ComputeNodeState {
     pub stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub status: Arc<Mutex<ComputeNodeStatus>>,
     pub lifecycle_lock: Arc<Mutex<()>>,
+    pub session_id: Arc<Mutex<u64>>,
 }
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
@@ -200,11 +204,21 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         model_path: request.model_path.clone(),
         last_error: Some(last_error),
         warm_load_state: Some("failed".into()),
+        relay_runtime_state: Some("failed".into()),
         warm_load_enabled: Some(true),
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
+        session_id: 0,
+        status_sequence: 0,
     }
+}
+
+fn is_current_session_payload(payload: &Value, current_session_id: u64) -> bool {
+    payload
+        .get("session_id")
+        .and_then(Value::as_u64)
+        .is_none_or(|payload_session_id| payload_session_id == current_session_id)
 }
 
 fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
@@ -252,6 +266,23 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) {
             .get("warm_load_state")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+    }
+    if payload.get("relay_runtime_state").is_some() {
+        status.relay_runtime_state = payload
+            .get("relay_runtime_state")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    } else if payload.get("warm_load_state").is_some() {
+        status.relay_runtime_state = payload
+            .get("warm_load_state")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if let Some(session_id) = payload.get("session_id").and_then(Value::as_u64) {
+        status.session_id = session_id;
+    }
+    if let Some(status_sequence) = payload.get("status_sequence").and_then(Value::as_u64) {
+        status.status_sequence = status_sequence;
     }
     if payload.get("warm_load_enabled").is_some() {
         status.warm_load_enabled = payload.get("warm_load_enabled").and_then(Value::as_bool);
@@ -335,6 +366,9 @@ fn finalize_bridge_exit(
             "running": false,
             "registered": false,
             "last_error": last_error,
+            "relay_runtime_state": status.relay_runtime_state.clone(),
+            "session_id": status.session_id,
+            "status_sequence": status.status_sequence,
         })
     })
 }
@@ -372,6 +406,12 @@ pub async fn start_compute_node(
         *child_slot = None;
         *state.stdin.lock().await = None;
     }
+
+    let session_id = {
+        let mut session_id = state.session_id.lock().await;
+        *session_id += 1;
+        *session_id
+    };
 
     let bridge_script = resolve_bridge_script(&app);
     let launcher = if is_python_script(&bridge_script) {
@@ -483,11 +523,14 @@ pub async fn start_compute_node(
                 fallback_reason: None,
                 model_path: request.model_path.clone(),
                 last_error: None,
-                warm_load_state: Some("not_started".into()),
+                warm_load_state: Some("starting".into()),
+                relay_runtime_state: Some("starting".into()),
                 warm_load_enabled: Some(true),
                 warm_load_duration_ms: None,
                 runtime_path: Some("bridge".into()),
                 relay_runtime_path: Some("bridge".into()),
+                session_id,
+                status_sequence: 0,
             };
             true
         }
@@ -517,7 +560,7 @@ pub async fn start_compute_node(
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
         match parse_compute_node_event_line(&line) {
-            Ok(payload) => {
+            Ok(mut payload) => {
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
                     if event_type == "error" {
                         saw_error_event = true;
@@ -525,6 +568,11 @@ pub async fn start_compute_node(
                     if event_type == "started" || event_type == "status" {
                         saw_startup_event = true;
                     }
+                }
+                payload["session_id"] = serde_json::json!(session_id);
+                let current_session_id = *state.session_id.lock().await;
+                if !is_current_session_payload(&payload, current_session_id) {
+                    continue;
                 }
                 {
                     let mut status = state.status.lock().await;
@@ -576,6 +624,10 @@ pub async fn start_compute_node(
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
     eprintln!("desktop.compute_node.stop_requested");
+    {
+        let mut session_id = state.session_id.lock().await;
+        *session_id += 1;
+    }
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
@@ -619,6 +671,9 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let mut status = state.status.lock().await;
         status.running = false;
         status.registered = false;
+        status.relay_runtime_state = Some("stopped".into());
+        status.warm_load_state = Some("stopped".into());
+        status.last_error = None;
     }
     Ok(())
 }
@@ -697,6 +752,25 @@ mod tests {
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[test]
+    fn stale_session_payloads_are_rejected() {
+        let stale = serde_json::json!({
+            "type": "status",
+            "session_id": 1,
+            "running": true,
+            "registered": true,
+        });
+        let current = serde_json::json!({
+            "type": "status",
+            "session_id": 2,
+            "running": true,
+            "registered": false,
+        });
+
+        assert!(!is_current_session_payload(&stale, 2));
+        assert!(is_current_session_payload(&current, 2));
     }
 
     #[tokio::test]

@@ -32,10 +32,13 @@ interface ComputeNodeStatus {
   model_path: string;
   last_error: string | null;
   warm_load_state: string | null;
+  relay_runtime_state: string | null;
   warm_load_enabled: boolean | null;
   warm_load_duration_ms: number | null;
   runtime_path: string | null;
   relay_runtime_path: string | null;
+  session_id: number | null;
+  status_sequence: number | null;
 }
 
 interface ModelArtifactInfo {
@@ -69,10 +72,13 @@ const defaultComputeStatus: ComputeNodeStatus = {
   model_path: '',
   last_error: null,
   warm_load_state: null,
+  relay_runtime_state: null,
   warm_load_enabled: null,
   warm_load_duration_ms: null,
   runtime_path: null,
   relay_runtime_path: null,
+  session_id: null,
+  status_sequence: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -106,13 +112,16 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const relayRuntimeState = computeStatus.relay_runtime_state ?? computeStatus.warm_load_state;
   const relayRuntimeReady =
     computeStatus.warm_load_enabled === false ||
-    computeStatus.warm_load_state === null ||
-    computeStatus.warm_load_state === 'ready';
+    relayRuntimeState === 'ready' ||
+    relayRuntimeState === 'processing';
   const computeNodeRegistered = computeStatus.running && computeStatus.registered && relayRuntimeReady;
   const saveTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef('');
+  const computeSessionIdRef = useRef<number | null>(null);
+  const computeStatusSequenceRef = useRef<number | null>(null);
 
   useEffect(() => {
     invoke<BackendInfo>('detect_backend')
@@ -124,6 +133,8 @@ export function App() {
         const loadedConfig = await invoke<DesktopConfig>('load_config');
         setConfig(loadedConfig);
         const nodeStatus = await invoke<ComputeNodeStatus>('get_compute_node_status');
+        computeSessionIdRef.current = nodeStatus.session_id ?? null;
+        computeStatusSequenceRef.current = nodeStatus.status_sequence ?? null;
         setComputeStatus(nodeStatus);
 
         const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
@@ -168,6 +179,27 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
+      const eventSessionId = typeof payload.session_id === 'number' ? payload.session_id : null;
+      const eventSequence = typeof payload.status_sequence === 'number' ? payload.status_sequence : null;
+
+      if (eventSessionId !== null) {
+        const currentSessionId = computeSessionIdRef.current;
+        if (currentSessionId !== null && eventSessionId < currentSessionId) {
+          return;
+        }
+        if (currentSessionId === null || eventSessionId > currentSessionId) {
+          computeSessionIdRef.current = eventSessionId;
+          computeStatusSequenceRef.current = null;
+        }
+      }
+      if (eventSequence !== null) {
+        const currentSequence = computeStatusSequenceRef.current;
+        if (currentSequence !== null && eventSequence < currentSequence) {
+          return;
+        }
+        computeStatusSequenceRef.current = eventSequence;
+      }
+
       setComputeStatus((prev) => ({
         running:
           typeof payload.running === 'boolean'
@@ -183,17 +215,29 @@ export function App() {
         requested_mode:
           typeof payload.requested_mode === 'string' ? payload.requested_mode : prev.requested_mode,
         effective_mode:
-          typeof payload.effective_mode === 'string' ? payload.effective_mode : prev.effective_mode,
+          typeof payload.effective_mode === 'string'
+            ? payload.effective_mode
+            : payload.effective_mode === null
+              ? null
+              : prev.effective_mode,
         backend_available:
           typeof payload.backend_available === 'string'
             ? payload.backend_available
-            : prev.backend_available,
+            : payload.backend_available === null
+              ? null
+              : prev.backend_available,
         backend_selected:
           typeof payload.backend_selected === 'string'
             ? payload.backend_selected
-            : prev.backend_selected,
+            : payload.backend_selected === null
+              ? null
+              : prev.backend_selected,
         backend_used:
-          typeof payload.backend_used === 'string' ? payload.backend_used : prev.backend_used,
+          typeof payload.backend_used === 'string'
+            ? payload.backend_used
+            : payload.backend_used === null
+              ? null
+              : prev.backend_used,
         fallback_reason:
           payload.fallback_reason === null
             ? null
@@ -203,6 +247,12 @@ export function App() {
         model_path: typeof payload.model_path === 'string' ? payload.model_path : prev.model_path,
         warm_load_state:
           typeof payload.warm_load_state === 'string' ? payload.warm_load_state : prev.warm_load_state,
+        relay_runtime_state:
+          typeof payload.relay_runtime_state === 'string'
+            ? payload.relay_runtime_state
+            : typeof payload.warm_load_state === 'string'
+              ? payload.warm_load_state
+              : prev.relay_runtime_state,
         warm_load_enabled:
           typeof payload.warm_load_enabled === 'boolean'
             ? payload.warm_load_enabled
@@ -216,6 +266,8 @@ export function App() {
           typeof payload.relay_runtime_path === 'string'
             ? payload.relay_runtime_path
             : prev.relay_runtime_path,
+        session_id: eventSessionId ?? prev.session_id,
+        status_sequence: eventSequence ?? prev.status_sequence,
         last_error:
           payload.last_error === null
             ? null
@@ -225,7 +277,7 @@ export function App() {
                 ? payload.message
                 : prev.last_error,
       }));
-      if (payload.type === 'started' || payload.type === 'error') {
+      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'status') {
         setIsStartingComputeNode(false);
       }
       if (payload.type === 'error') {
@@ -350,7 +402,7 @@ export function App() {
       setError('');
       setComputeStatus((prev) => ({
         ...prev,
-        running: false,
+        running: true,
         registered: false,
         active_relay_url: config.relay_base_url,
         requested_mode: config.preferred_mode,
@@ -361,6 +413,8 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
+        warm_load_state: 'starting',
+        relay_runtime_state: 'starting',
       }));
       await invoke('start_compute_node', {
         request: {
@@ -473,7 +527,7 @@ export function App() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
-            disabled={!computeStatus.running}
+            disabled={!computeStatus.running || isStartingComputeNode}
             onClick={stopComputeNode}
           >
             Stop operator
@@ -481,7 +535,7 @@ export function App() {
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
         <p style={{ marginBottom: 0 }}>Registered: <strong>{computeNodeRegistered ? 'yes' : 'no'}</strong></p>
-        <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{computeStatus.warm_load_state || 'idle'}</code></p>
+        <p style={{ marginBottom: 0 }}>Relay runtime state: <code>{relayRuntimeState || 'idle'}</code></p>
         <p style={{ marginBottom: 0 }}>Runtime path: <code>{computeStatus.runtime_path || 'bridge'}</code></p>
         <p style={{ marginBottom: 0 }}>Relay runtime path: <code>{computeStatus.relay_runtime_path || 'bridge'}</code></p>
         <p style={{ marginBottom: 0 }}>Active relay URL: <code>{computeStatus.active_relay_url || config.relay_base_url}</code></p>

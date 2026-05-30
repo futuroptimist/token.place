@@ -667,4 +667,135 @@ describe('desktop app start failure handling', () => {
     );
     expect(screen.getByText(/Error:/).textContent).toContain('event failure path');
   });
+  it('renders compute-node lifecycle status fields from bridge payloads', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        session_id: 1,
+        status_sequence: 1,
+        running: true,
+        registered: false,
+        relay_runtime_state: 'warming',
+        runtime_path: 'sidecar',
+        relay_runtime_path: 'bridge',
+        active_relay_url: 'https://relay.example',
+        requested_mode: 'gpu',
+        effective_mode: null,
+        backend_available: 'unknown',
+        backend_selected: 'unknown',
+        backend_used: 'unknown',
+        fallback_reason: null,
+        model_path: '/models/relay.gguf',
+        last_error: null,
+        warm_load_enabled: true,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('warming');
+    expect(screen.getByText(/Runtime path:/).textContent).toContain('sidecar');
+    expect(screen.getByText(/Relay runtime path:/).textContent).toContain('bridge');
+    expect(screen.getByText(/Active relay URL:/).textContent).toContain('https://relay.example');
+    expect(screen.getByText(/Requested mode:/).textContent).toContain('gpu');
+    expect(screen.getByText(/Effective mode:/).textContent).toContain('pending');
+    expect(screen.getByText(/Backend available:/).textContent).toContain('unknown');
+    expect(screen.getByText(/Model path:/).textContent).toContain('/models/relay.gguf');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        session_id: 1,
+        status_sequence: 2,
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        effective_mode: 'cuda',
+        backend_available: 'cuda',
+        backend_selected: 'cuda',
+        backend_used: 'cuda',
+        fallback_reason: null,
+        last_error: null,
+        warm_load_enabled: true,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('ready');
+    expect(screen.getByText(/Backend available:/).textContent).toContain('cuda');
+    expect(screen.getByText(/Backend selected:/).textContent).toContain('cuda');
+    expect(screen.getByText(/Backend used:/).textContent).toContain('cuda');
+    expect(screen.getByText(/Fallback reason:/).textContent).toContain('none');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        session_id: 1,
+        status_sequence: 3,
+        running: true,
+        registered: true,
+        relay_runtime_state: 'processing',
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Relay runtime state:/).textContent).toContain('processing'));
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        session_id: 1,
+        status_sequence: 4,
+        running: false,
+        registered: false,
+        relay_runtime_state: 'stopped',
+        last_error: null,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
+  });
+
+  it('ignores stale compute-node events from a prior bridge session', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        session_id: 2,
+        status_sequence: 1,
+        running: true,
+        registered: true,
+        relay_runtime_state: 'ready',
+        warm_load_enabled: true,
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        session_id: 1,
+        status_sequence: 99,
+        running: false,
+        registered: false,
+        relay_runtime_state: 'failed',
+        last_error: 'old bridge failed after restart',
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+    expect(screen.getByText(/Last error:/).textContent).toContain('none');
+  });
+
 });

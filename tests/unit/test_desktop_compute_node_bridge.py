@@ -408,8 +408,69 @@ def test_run_emits_operator_status_events_and_heartbeat_registration(capsys, mon
     started = events[0]
     assert started['offloaded_layers'] == 0
     assert started['kv_cache_device'] == 'cpu'
+    required_fields = {
+        'running',
+        'registered',
+        'relay_runtime_state',
+        'runtime_path',
+        'relay_runtime_path',
+        'active_relay_url',
+        'requested_mode',
+        'effective_mode',
+        'backend_available',
+        'backend_selected',
+        'backend_used',
+        'fallback_reason',
+        'model_path',
+        'last_error',
+        'status_sequence',
+        'emitted_at_ms',
+    }
+    for event in events:
+        if event['type'] in {'started', 'status', 'stopped'}:
+            assert required_fields <= set(event), event
     assert any(event.get('registered') is False for event in events if event['type'] == 'status')
     assert any(event.get('registered') is True for event in events if event['type'] == 'status')
+    assert events[-1]['running'] is False
+    assert events[-1]['registered'] is False
+
+
+
+def test_run_keeps_registered_false_until_runtime_ready(capsys, monkeypatch):
+    _reset_cancel_queue()
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmingThenApiV1Runtime)
+
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        instance = WarmingThenApiV1Runtime.last_instance
+        if instance is not None and instance.ready_started.is_set() and stop_counter['count'] > 3:
+            instance.ready_release.set()
+        return stop_counter['count'] > 8
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    warming = [event for event in events if event.get('relay_runtime_state') == 'warming']
+    assert warming
+    assert all(event.get('registered') is False for event in warming)
+    assert any(
+        event.get('type') == 'status'
+        and event.get('relay_runtime_state') == 'ready'
+        and event.get('registered') is True
+        for event in events
+    )
 
 
 def test_run_reports_model_initialization_failures(capsys, monkeypatch):

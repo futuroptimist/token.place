@@ -1920,7 +1920,6 @@ def api_v1_relay_responses_retrieve():
 
     client_public_key = data["client_public_key"]
     request_id = data.get("request_id")
-    _expire_pending_request_if_stale(client_public_key, request_id)
     terminal = _get_terminal_request(client_public_key, request_id)
     if terminal is not None:
         _remove_client_responses_for_request(client_public_key, request_id)
@@ -1940,6 +1939,24 @@ def api_v1_relay_responses_retrieve():
         )
 
     response = _pop_client_response(client_public_key, request_id)
+    if response is None:
+        _expire_pending_request_if_stale(client_public_key, request_id)
+        terminal = _get_terminal_request(client_public_key, request_id)
+        if terminal is not None:
+            status = terminal.get("status", "cancelled")
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": f"Request {status}",
+                            "code": status,
+                            "status": status,
+                            "reason": terminal.get("reason", status),
+                        }
+                    }
+                ),
+                410,
+            )
     if response is None:
         if _is_request_pending(client_public_key, request_id):
             LOGGER.debug(

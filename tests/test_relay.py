@@ -21,6 +21,7 @@ from relay import (
     known_servers,
     client_inference_requests,
     client_pending_request_ids,
+    client_terminal_request_ids,
     client_responses,
     streaming_sessions,
     streaming_sessions_by_client,
@@ -42,6 +43,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_terminal_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -57,6 +59,7 @@ def client():
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
+    client_terminal_request_ids.clear()
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
@@ -1574,6 +1577,138 @@ def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_qu
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
     )
     assert unknown.status_code == 404
+
+
+def test_api_v1_cancel_removes_queued_request_and_retrieve_returns_gone(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-cancelled',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+
+    cancelled = client.post(
+        '/api/v1/relay/requests/cancel',
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-cancelled',
+            'status': 'expired',
+            'reason': 'provider_timeout',
+        },
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()['removed_from_queue'] == 1
+    assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) == []
+
+    diagnostics = client.get('/relay/diagnostics').get_json()
+    server = next(
+        item
+        for item in diagnostics['registered_compute_nodes']
+        if item['server_public_key'] == DUMMY_SERVER_PUB_KEY
+    )
+    assert server['queue_depth'] == 0
+
+    retrieve = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-cancelled'},
+    )
+    assert retrieve.status_code == 410
+    assert retrieve.get_json()['error']['code'] == 'expired'
+
+    polled = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    assert polled.status_code == 200
+    assert polled.get_json()['message'] == 'No requests available'
+
+
+def test_api_v1_pending_request_ttl_expires_and_removes_queue_depth(client, monkeypatch):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json={
+            'request_id': 'req-expired',
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'chat_history': 'ciphertext-request',
+            'cipherkey': 'cipherkey-request',
+            'iv': 'iv-request',
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+        },
+    )
+    assert queued.status_code == 200
+    queued_at = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-expired']
+    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 1.0)
+    monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 2.0)
+
+    retrieve = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-expired'},
+    )
+    assert retrieve.status_code == 410
+    assert retrieve.get_json()['error']['code'] == 'expired'
+    assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) == []
+
+
+def test_api_v1_sequential_single_node_queue_depth_returns_to_zero(client):
+    client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+
+    for index in range(3):
+        request_id = f'req-turn-{index}'
+        queued = client.post(
+            '/api/v1/relay/requests',
+            json={
+                'request_id': request_id,
+                'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                'server_public_key': DUMMY_SERVER_PUB_KEY,
+                'chat_history': f'ciphertext-request-{index}',
+                'cipherkey': f'cipherkey-request-{index}',
+                'iv': f'iv-request-{index}',
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+            },
+        )
+        assert queued.status_code == 200
+
+        polled = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+        assert polled.status_code == 200
+        assert polled.get_json()['request_id'] == request_id
+
+        submitted = client.post(
+            '/api/v1/relay/responses',
+            json={
+                'request_id': request_id,
+                'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                'chat_history': f'ciphertext-response-{index}',
+                'cipherkey': f'cipherkey-response-{index}',
+                'iv': f'iv-response-{index}',
+                'protocol': 'tokenplace_api_v1_relay_e2ee',
+                'version': 1,
+            },
+        )
+        assert submitted.status_code == 200
+
+        retrieved = client.post(
+            '/api/v1/relay/responses/retrieve',
+            json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': request_id},
+        )
+        assert retrieved.status_code == 200
+        diagnostics = client.get('/relay/diagnostics').get_json()
+        server = next(
+            item
+            for item in diagnostics['registered_compute_nodes']
+            if item['server_public_key'] == DUMMY_SERVER_PUB_KEY
+        )
+        assert server['queue_depth'] == 0
 
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):

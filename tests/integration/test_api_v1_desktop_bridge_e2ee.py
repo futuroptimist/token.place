@@ -279,6 +279,82 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     _assert_ciphertext_only(response_posts[0], forbidden_text="pong from desktop")
 
 
+def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(monkeypatch):
+    """One desktop node drains three sequential browser turns without stale queue depth."""
+
+    with live_relay_server() as base_url:
+        monkeypatch.setattr(
+            routes,
+            "get_api_v1_compute_provider_for_mode",
+            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
+                base_url=base_url,
+                timeout_seconds=5,
+            ),
+        )
+
+        model_manager = FakeDesktopModelManager()
+        desktop_client = RelayClient(
+            base_url=base_url,
+            port=None,
+            crypto_manager=CryptoManager(),
+            model_manager=model_manager,
+            include_configured_servers=False,
+        )
+        desktop_client._request_timeout = 2
+        assert desktop_client.register_api_v1_compute_node(base_url)["next_ping_in_x_seconds"] > 0
+
+        stop_desktop = threading.Event()
+        processed_request_ids = []
+
+        def desktop_worker():
+            deadline = time.time() + 10
+            while time.time() < deadline and not stop_desktop.is_set():
+                payload = desktop_client.poll_api_v1_encrypted_work()
+                if payload.get("protocol") == "tokenplace_api_v1_relay_e2ee":
+                    processed_request_ids.append(payload["request_id"])
+                    desktop_client.process_client_request(payload)
+                    if len(processed_request_ids) >= 3:
+                        stop_desktop.set()
+                        return
+                    continue
+                time.sleep(0.01)
+
+        thread = threading.Thread(target=desktop_worker, daemon=True)
+        thread.start()
+
+        browser_crypto = EncryptionManager()
+        for index in range(3):
+            response = requests.post(
+                f"{base_url}/api/v1/chat/completions",
+                json={
+                    "model": "llama-3-8b-instruct",
+                    "encrypted": True,
+                    "client_public_key": browser_crypto.public_key_b64,
+                    "messages": _encrypt_browser_messages(
+                        [{"role": "user", "content": f"turn {index}"}]
+                    ),
+                    "metadata": {
+                        "inference_target": "desktop_bridge_api_v1_e2ee",
+                        "relay_path": "api_v1_e2ee",
+                    },
+                },
+                timeout=10,
+            )
+            assert response.status_code == 200, response.text
+            completion = _decrypt_browser_response(browser_crypto, response.json())
+            assert completion["choices"][0]["message"]["content"] == "pong from desktop"
+
+            diagnostics = requests.get(f"{base_url}/relay/diagnostics", timeout=5).json()
+            nodes = diagnostics["registered_compute_nodes"]
+            assert len(nodes) == 1
+            assert nodes[0]["queue_depth"] == 0
+
+        thread.join(timeout=5)
+
+    assert len(processed_request_ids) == 3
+    assert len(model_manager.runtime.calls) == 3
+
+
 def test_api_v1_desktop_bridge_without_response_post_times_out_instead_of_passing(
     monkeypatch,
 ):

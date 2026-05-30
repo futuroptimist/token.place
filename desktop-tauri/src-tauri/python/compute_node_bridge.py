@@ -852,7 +852,16 @@ def run(args: argparse.Namespace) -> int:
         )
         relay_stop = getattr(relay_client, "stop", None)
         if callable(relay_stop):
-            relay_stop()
+            try:
+                relay_stop()
+            except Exception as exc:
+                print(
+                    "desktop.compute_node_bridge.relay.stop_failed "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    f"exc_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
         unregister = getattr(relay_client, "unregister_from_relay", None)
         if callable(unregister):
             print(

@@ -461,6 +461,8 @@ PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SE
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 api_v1_in_flight_requests_lock = threading.Lock()
+api_v1_round_robin_lock = threading.Lock()
+api_v1_round_robin_cursor = 0
 streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
@@ -620,7 +622,12 @@ def _live_server_diagnostics() -> list[dict[str, Any]]:
 def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
+    global api_v1_round_robin_cursor
+
     removed = known_servers.pop(server_public_key, None) is not None
+    if removed:
+        with api_v1_round_robin_lock:
+            api_v1_round_robin_cursor = api_v1_round_robin_cursor % max(len(known_servers), 1)
     dropped_requests = []
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
@@ -847,19 +854,56 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
+def _next_server_unavailable_response(*, api_v1: bool):
+    if api_v1:
+        return jsonify({
+            'error': {
+                'message': 'No registered compute nodes are available on this relay.',
+                'code': 'no_registered_compute_nodes',
+            }
+        }), 503
+    return jsonify({'error': {'message': 'No servers available', 'code': 503}}), 503
+
+
 def _select_next_server_payload(*, api_v1: bool = False):
+    """Select the next fresh compute node.
+
+    API v1 uses deterministic in-memory round-robin order over fresh registered
+    compute nodes. New or re-registered-after-unregister nodes enter at the end
+    of the insertion-ordered registry. Legacy /next_server keeps its previous
+    random balancing behavior while it remains enabled.
+    """
+
+    global api_v1_round_robin_cursor
+
     _evict_stale_servers()
     if not known_servers:
-        if api_v1:
-            return jsonify({
-                'error': {
-                    'message': 'No registered compute nodes are available on this relay.',
-                    'code': 'no_registered_compute_nodes',
-                }
-            }), 503
-        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-    server_public_key = secrets.choice(list(known_servers.keys()))
-    return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+        return _next_server_unavailable_response(api_v1=api_v1)
+
+    if not api_v1:
+        server_public_key = secrets.choice(list(known_servers.keys()))
+        return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+
+    with api_v1_round_robin_lock:
+        eligible_server_keys = list(known_servers.keys())
+        if not eligible_server_keys:
+            return _next_server_unavailable_response(api_v1=api_v1)
+
+        selected_index = api_v1_round_robin_cursor % len(eligible_server_keys)
+        server_public_key = eligible_server_keys[selected_index]
+        selected_public_key = known_servers[server_public_key]['public_key']
+        api_v1_round_robin_cursor = (selected_index + 1) % len(eligible_server_keys)
+
+    LOGGER.info(
+        "relay.api_v1.server_selected",
+        extra={
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
+            "round_robin_index": selected_index,
+            "eligible_server_count": len(eligible_server_keys),
+            "selection_reason": "round_robin_fresh_registered",
+        },
+    )
+    return jsonify({'server_public_key': selected_public_key})
 
 @app.route('/next_server', methods=['GET'])
 def next_server():
@@ -1412,7 +1456,7 @@ def api_v1_relay_servers_register():
         }
         log_event = "server.registered"
     known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
-    LOGGER.info(log_event, extra={"server_public_key": public_key})
+    LOGGER.info(log_event, extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
 
     return jsonify({
         'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
@@ -1439,7 +1483,7 @@ def api_v1_relay_servers_poll():
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
     known_servers[public_key]['last_ping'] = datetime.now()
     known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
-    LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
+    LOGGER.info("server.heartbeat", extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
 
     poll_wait_seconds = _api_v1_poll_wait_seconds()
     known_servers[public_key]['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
@@ -1491,7 +1535,7 @@ def api_v1_relay_servers_poll():
     LOGGER.info(
         "relay.api_v1.request_dispatched",
         extra={
-            "server_public_key": public_key,
+            "server_fingerprint": _safe_key_fingerprint(public_key),
             "request_id": first_request.get("request_id"),
             "queued_at_unix": queued_at,
             "dispatched_at_unix": time.time(),
@@ -1538,7 +1582,7 @@ def api_v1_relay_requests():
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
-            "server_public_key": server_public_key,
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
             "request_id": envelope.get("request_id"),
             "queued_at_unix": queued_at,
             "queue_depth": queue_depth,

@@ -449,6 +449,8 @@ def _validate_server_registration():
 
 
 known_servers = {}
+server_round_robin_lock = threading.Lock()
+server_round_robin_next_index = 0
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
@@ -847,9 +849,35 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
+def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any]]:
+    """Select the next live compute node in registration-order round-robin order."""
+
+    global server_round_robin_next_index
+    ordered_keys = list(known_servers.keys())
+    if not ordered_keys:
+        return None, {
+            "eligible_count": 0,
+            "round_robin_index": 0,
+            "round_robin_position": None,
+        }
+
+    with server_round_robin_lock:
+        eligible_count = len(ordered_keys)
+        round_robin_index = server_round_robin_next_index % eligible_count
+        server_public_key = ordered_keys[round_robin_index]
+        server_round_robin_next_index = (round_robin_index + 1) % eligible_count
+        return server_public_key, {
+            "eligible_count": eligible_count,
+            "round_robin_index": server_round_robin_next_index,
+            "round_robin_position": round_robin_index,
+        }
+
+
 def _select_next_server_payload(*, api_v1: bool = False):
-    _evict_stale_servers()
+    global server_round_robin_next_index
+    evicted = _evict_stale_servers()
     if not known_servers:
+        server_round_robin_next_index = 0
         if api_v1:
             return jsonify({
                 'error': {
@@ -858,7 +886,33 @@ def _select_next_server_payload(*, api_v1: bool = False):
                 }
             }), 503
         return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-    server_public_key = secrets.choice(list(known_servers.keys()))
+    if not api_v1:
+        server_public_key = secrets.choice(list(known_servers.keys()))
+        return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+
+    server_public_key, selection = _select_round_robin_server_key()
+    if not server_public_key or server_public_key not in known_servers:
+        if api_v1:
+            return jsonify({
+                'error': {
+                    'message': 'No registered compute nodes are available on this relay.',
+                    'code': 'no_registered_compute_nodes',
+                }
+            }), 503
+        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
+
+    LOGGER.info(
+        "relay.server_selected",
+        extra={
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
+            "selection_policy": "registration_order_round_robin",
+            "round_robin_index": selection.get("round_robin_index"),
+            "round_robin_position": selection.get("round_robin_position"),
+            "eligible_count": selection.get("eligible_count"),
+            "evicted_stale_count": len(evicted),
+            "api_v1": api_v1,
+        },
+    )
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
 
 @app.route('/next_server', methods=['GET'])
@@ -1389,6 +1443,7 @@ def _pop_client_response(client_public_key, request_id=None):
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
 def api_v1_relay_servers_register():
     """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
+    global server_round_robin_next_index
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
@@ -1405,6 +1460,8 @@ def api_v1_relay_servers_register():
         known_servers[public_key]['last_ping'] = datetime.now()
         log_event = "server.reregister"
     else:
+        if not known_servers:
+            server_round_robin_next_index = 0
         known_servers[public_key] = {
             'public_key': public_key,
             'last_ping': datetime.now(),

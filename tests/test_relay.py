@@ -2133,6 +2133,15 @@ def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(clien
     assert result['json']['chat_history'] == 'legacy-ciphertext-request'
 
 
+def test_api_v1_next_selects_single_fresh_api_v1_node(client):
+    server_key = _server_key('single_fresh_api_v1')
+    _register_api_v1_server(client, server_key)
+
+    selections = [_next_api_v1_server_key(client) for _ in range(3)]
+
+    assert selections == [server_key, server_key, server_key]
+
+
 def test_api_v1_next_round_robins_two_registered_compute_nodes(client):
     server_a = _server_key('round_robin_a')
     server_b = _server_key('round_robin_b')
@@ -2156,7 +2165,7 @@ def test_api_v1_next_round_robins_three_registered_compute_nodes(client):
     assert selections == [server_a, server_b, server_c, server_a, server_b, server_c]
 
 
-def test_api_v1_next_filters_out_legacy_only_servers(client):
+def test_api_v1_next_ignores_legacy_sink_registered_nodes(client):
     legacy_server = _server_key('legacy_only')
     api_server_a = _server_key('api_filter_a')
     api_server_b = _server_key('api_filter_b')
@@ -2212,6 +2221,28 @@ def test_api_v1_round_robin_preserves_next_node_after_earlier_server_eviction(cl
         server_c,
     ]
     assert server_a not in known_servers
+
+
+def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    server_a = _server_key('cursor_target_expired_a')
+    server_b = _server_key('cursor_target_expired_b')
+    server_c = _server_key('cursor_target_expired_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert _next_api_v1_server_key(client) == server_a
+    known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_c,
+        server_a,
+        server_c,
+        server_a,
+    ]
+    assert server_b not in known_servers
+
 
 def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(client):
     server_a = _server_key('queue_a')
@@ -2310,6 +2341,7 @@ def test_api_v1_round_robin_selection_is_concurrency_safe(client):
     assert len(selections) == 20
     assert selections.count(server_a) == 10
     assert selections.count(server_b) == 10
+
 
 def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}

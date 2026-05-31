@@ -449,7 +449,7 @@ def _validate_server_registration():
 
 
 known_servers = {}
-server_round_robin_lock = threading.Lock()
+server_round_robin_lock = threading.RLock()
 server_round_robin_next_index = 0
 API_V1_SERVER_MARKER = "api_v1_registered"
 client_inference_requests = {}
@@ -566,44 +566,46 @@ def _evict_stale_servers() -> list[str]:
     default_stale_after = _server_stale_seconds()
     now_monotonic = time.monotonic()
     evicted: list[str] = []
-    for server_public_key, payload in list(known_servers.items()):
-        polling_until = payload.get("polling_until_monotonic")
-        if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
-            continue
-        with api_v1_in_flight_requests_lock:
-            in_flight_requests = payload.get("api_v1_in_flight_requests")
-            if isinstance(in_flight_requests, dict):
-                for request_id, entry in list(in_flight_requests.items()):
-                    if not isinstance(request_id, str) or not request_id:
-                        continue
-                    expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
-                    if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
-                        continue
-                    if in_flight_requests.get(request_id) == entry:
-                        in_flight_requests.pop(request_id, None)
+    with server_round_robin_lock:
+        server_items = list(known_servers.items())
+        for server_public_key, payload in server_items:
+            polling_until = payload.get("polling_until_monotonic")
+            if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+                continue
+            with api_v1_in_flight_requests_lock:
+                in_flight_requests = payload.get("api_v1_in_flight_requests")
+                if isinstance(in_flight_requests, dict):
+                    for request_id, entry in list(in_flight_requests.items()):
+                        if not isinstance(request_id, str) or not request_id:
+                            continue
+                        expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
+                        if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
+                            continue
+                        if in_flight_requests.get(request_id) == entry:
+                            in_flight_requests.pop(request_id, None)
 
-                has_active_in_flight_requests = any(
-                    isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
-                    and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
-                    for entry in in_flight_requests.values()
-                )
-                if has_active_in_flight_requests:
-                    continue
-                payload.pop("api_v1_in_flight_requests", None)
+                    has_active_in_flight_requests = any(
+                        isinstance((entry.get("expires_at") if isinstance(entry, dict) else entry), (int, float))
+                        and (entry.get("expires_at") if isinstance(entry, dict) else entry) > now_monotonic
+                        for entry in in_flight_requests.values()
+                    )
+                    if has_active_in_flight_requests:
+                        continue
+                    payload.pop("api_v1_in_flight_requests", None)
 
-        in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
-        if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
-            continue
-        payload.pop("api_v1_in_flight_until_monotonic", None)
-        payload.pop("api_v1_in_flight_request_id", None)
-        stale_after = payload.get("last_ping_duration", default_stale_after)
-        if not isinstance(stale_after, (int, float)):
-            stale_after = default_stale_after
-        stale_after = max(float(stale_after), 1.0)
-        if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
-            continue
-        if _unregister_server(server_public_key):
-            evicted.append(server_public_key)
+            in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+            if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+                continue
+            payload.pop("api_v1_in_flight_until_monotonic", None)
+            payload.pop("api_v1_in_flight_request_id", None)
+            stale_after = payload.get("last_ping_duration", default_stale_after)
+            if not isinstance(stale_after, (int, float)):
+                stale_after = default_stale_after
+            stale_after = max(float(stale_after), 1.0)
+            if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
+                continue
+            if _unregister_server(server_public_key):
+                evicted.append(server_public_key)
     return evicted
 
 
@@ -888,8 +890,8 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
-def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any]]:
-    """Select the next API v1 compute node in registration-order round-robin order."""
+def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
+    """Select and snapshot the next API v1 compute node in registration-order round-robin order."""
 
     global server_round_robin_next_index
     with server_round_robin_lock:
@@ -900,46 +902,47 @@ def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any]]:
                 "eligible_count": 0,
                 "round_robin_index": 0,
                 "round_robin_position": None,
-            }
+            }, None
 
         eligible_count = len(ordered_keys)
         round_robin_index = server_round_robin_next_index % eligible_count
         server_public_key = ordered_keys[round_robin_index]
+        server_payload = dict(known_servers[server_public_key])
         server_round_robin_next_index = (round_robin_index + 1) % eligible_count
         return server_public_key, {
             "eligible_count": eligible_count,
             "round_robin_index": server_round_robin_next_index,
             "round_robin_position": round_robin_index,
-        }
+        }, server_payload
 
 
 def _select_next_server_payload(*, api_v1: bool = False):
     global server_round_robin_next_index
     evicted = _evict_stale_servers()
-    if not known_servers:
-        server_round_robin_next_index = 0
-        if api_v1:
-            return jsonify({
-                'error': {
-                    'message': 'No registered compute nodes are available on this relay.',
-                    'code': 'no_registered_compute_nodes',
-                }
-            }), 503
-        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-    if not api_v1:
-        server_public_key = secrets.choice(list(known_servers.keys()))
-        return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+    with server_round_robin_lock:
+        if not known_servers:
+            server_round_robin_next_index = 0
+            if api_v1:
+                return jsonify({
+                    'error': {
+                        'message': 'No registered compute nodes are available on this relay.',
+                        'code': 'no_registered_compute_nodes',
+                    }
+                }), 503
+            return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
+        if not api_v1:
+            server_public_key = secrets.choice(list(known_servers.keys()))
+            server_payload = dict(known_servers[server_public_key])
+            return jsonify({'server_public_key': server_payload['public_key']})
 
-    server_public_key, selection = _select_round_robin_server_key()
-    if not server_public_key or server_public_key not in known_servers:
-        if api_v1:
-            return jsonify({
-                'error': {
-                    'message': 'No registered compute nodes are available on this relay.',
-                    'code': 'no_registered_compute_nodes',
-                }
-            }), 503
-        return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
+    server_public_key, selection, server_payload = _select_round_robin_server_key()
+    if not server_public_key or server_payload is None:
+        return jsonify({
+            'error': {
+                'message': 'No registered compute nodes are available on this relay.',
+                'code': 'no_registered_compute_nodes',
+            }
+        }), 503
 
     LOGGER.info(
         "relay.server_selected",
@@ -953,7 +956,7 @@ def _select_next_server_payload(*, api_v1: bool = False):
             "api_v1": api_v1,
         },
     )
-    return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
+    return jsonify({'server_public_key': server_payload['public_key']})
 
 @app.route('/next_server', methods=['GET'])
 def next_server():
@@ -1496,32 +1499,34 @@ def api_v1_relay_servers_register():
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
 
-    existing_payload = known_servers.get(public_key)
-    existing_api_v1_count = len(_api_v1_round_robin_keys())
-    if existing_payload and existing_payload.get(API_V1_SERVER_MARKER):
-        existing_payload['last_ping'] = datetime.now()
-        log_event = "server.reregister"
-    else:
-        if existing_api_v1_count == 0:
-            server_round_robin_next_index = 0
-        if existing_payload:
+    lease_seconds = _api_v1_lease_seconds()
+    with server_round_robin_lock:
+        existing_payload = known_servers.get(public_key)
+        existing_api_v1_count = len(_api_v1_round_robin_keys())
+        if existing_payload and existing_payload.get(API_V1_SERVER_MARKER):
             existing_payload['last_ping'] = datetime.now()
-            known_servers.pop(public_key, None)
-            known_servers[public_key] = existing_payload
+            log_event = "server.reregister"
         else:
-            known_servers[public_key] = {
-                'public_key': public_key,
-                'last_ping': datetime.now(),
-                'last_ping_duration': _api_v1_lease_seconds(),
-            }
+            if existing_api_v1_count == 0:
+                server_round_robin_next_index = 0
+            if existing_payload:
+                existing_payload['last_ping'] = datetime.now()
+                known_servers.pop(public_key, None)
+                known_servers[public_key] = existing_payload
+            else:
+                known_servers[public_key] = {
+                    'public_key': public_key,
+                    'last_ping': datetime.now(),
+                    'last_ping_duration': lease_seconds,
+                }
+            known_servers[public_key][API_V1_SERVER_MARKER] = True
+            log_event = "server.registered"
+        known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
-        log_event = "server.registered"
-    known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
-    known_servers[public_key][API_V1_SERVER_MARKER] = True
     LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({
-        'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration'],
+        'next_ping_in_x_seconds': lease_seconds,
         'poll_wait_seconds': _api_v1_poll_wait_seconds(),
     }), 200
 
@@ -1939,17 +1944,19 @@ def sink():
         return jsonify({'error': 'Invalid public key'}), 400
 
     # Update or add the server to known_servers
-    if public_key in known_servers:
-        known_servers[public_key]['last_ping'] = datetime.now()
-    else:
-        known_servers[public_key] = {
-            'public_key': public_key,
-            'last_ping': datetime.now(),
-            'last_ping_duration': 10
-        }
+    with server_round_robin_lock:
+        if public_key in known_servers:
+            known_servers[public_key]['last_ping'] = datetime.now()
+        else:
+            known_servers[public_key] = {
+                'public_key': public_key,
+                'last_ping': datetime.now(),
+                'last_ping_duration': 10
+            }
+        next_ping_duration = known_servers[public_key]['last_ping_duration']
 
     response_data = {
-        'next_ping_in_x_seconds': known_servers[public_key]['last_ping_duration']
+        'next_ping_in_x_seconds': next_ping_duration
     }
 
     # Check if there are any client requests for this server

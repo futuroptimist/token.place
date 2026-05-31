@@ -41,6 +41,7 @@ def client():
     os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
+    relay_module.server_round_robin_next_index = 0
     client_inference_requests.clear()
     client_pending_request_ids.clear()
     client_terminal_request_ids.clear()
@@ -57,6 +58,7 @@ def client():
         os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
+    relay_module.server_round_robin_next_index = 0
     client_inference_requests.clear()
     client_pending_request_ids.clear()
     client_terminal_request_ids.clear()
@@ -101,11 +103,7 @@ def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, m
 def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(client):
     """Client discovery and response polling stay outside the public API quota."""
 
-    known_servers[DUMMY_SERVER_PUB_KEY] = {
-        "public_key": DUMMY_SERVER_PUB_KEY,
-        "last_ping": datetime.now(),
-        "last_ping_duration": 60,
-    }
+    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
     client_pending_request_ids[DUMMY_CLIENT_PUB_KEY] = {"request-1": time.time()}
 
     next_responses = [client.get("/api/v1/relay/servers/next") for _ in range(65)]
@@ -183,6 +181,38 @@ def test_next_server_evicts_stale_nodes(client):
     assert response.status_code == 503
     assert payload["error"]["message"] == "No servers available"
     assert DUMMY_SERVER_PUB_KEY not in known_servers
+
+
+def _server_key(label):
+    return base64.b64encode(f"server_public_key_{label}".encode()).decode("utf-8")
+
+
+def _register_api_v1_server(client, server_public_key):
+    response = client.post(
+        '/api/v1/relay/servers/register',
+        json={'server_public_key': server_public_key},
+    )
+    assert response.status_code == 200
+    return response
+
+
+def _next_api_v1_server_key(client):
+    response = client.get('/api/v1/relay/servers/next')
+    assert response.status_code == 200
+    return response.get_json()['server_public_key']
+
+
+def _queue_api_v1_request(client, *, server_public_key, request_id, client_public_key=None):
+    response = client.post('/api/v1/relay/requests', json={
+        'request_id': request_id,
+        'client_public_key': client_public_key or f'{DUMMY_CLIENT_PUB_KEY}-{request_id}',
+        'server_public_key': server_public_key,
+        'chat_history': f'ciphertext-{request_id}',
+        'cipherkey': f'cipherkey-{request_id}',
+        'iv': f'iv-{request_id}',
+    })
+    assert response.status_code == 200
+    return response
 
 # --- Test /sink ---
 
@@ -1903,7 +1933,7 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert response_plaintext not in json.dumps(retrieved_payload)
 
 
-def test_api_v1_poll_requeues_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
+def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
 
@@ -1930,9 +1960,8 @@ def test_api_v1_poll_requeues_popped_work_if_server_unregistered_before_dispatch
     poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 404
 
-    queued_after = client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
-    assert len(queued_after) == 1
-    assert queued_after[0]['request_id'] == 'req-requeue-on-unregister-race'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
 
 
 def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
@@ -2103,6 +2132,394 @@ def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(clien
     assert result['json']['chat_history'] == 'legacy-ciphertext-request'
 
 
+def test_api_v1_next_selects_single_fresh_api_v1_node(client):
+    server_key = _server_key('single_fresh_api_v1')
+    _register_api_v1_server(client, server_key)
+
+    selections = [_next_api_v1_server_key(client) for _ in range(3)]
+
+    assert selections == [server_key, server_key, server_key]
+
+
+def test_api_v1_next_round_robins_two_registered_compute_nodes(client):
+    server_a = _server_key('round_robin_a')
+    server_b = _server_key('round_robin_b')
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    selections = [_next_api_v1_server_key(client) for _ in range(4)]
+
+    assert selections == [server_a, server_b, server_a, server_b]
+
+
+def test_api_v1_next_round_robins_three_registered_compute_nodes(client):
+    server_a = _server_key('round_robin_three_a')
+    server_b = _server_key('round_robin_three_b')
+    server_c = _server_key('round_robin_three_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    selections = [_next_api_v1_server_key(client) for _ in range(6)]
+
+    assert selections == [server_a, server_b, server_c, server_a, server_b, server_c]
+
+
+def test_api_v1_next_ignores_legacy_sink_registered_nodes(client):
+    legacy_server = _server_key('legacy_only')
+    api_server_a = _server_key('api_filter_a')
+    api_server_b = _server_key('api_filter_b')
+
+    legacy_registration = client.post('/sink', json={'server_public_key': legacy_server})
+    assert legacy_registration.status_code == 200
+    _register_api_v1_server(client, api_server_a)
+    _register_api_v1_server(client, api_server_b)
+
+    selections = [_next_api_v1_server_key(client) for _ in range(4)]
+
+    assert selections == [api_server_a, api_server_b, api_server_a, api_server_b]
+    assert legacy_server not in selections
+
+
+def test_api_v1_round_robin_preserves_next_node_after_selected_server_unregisters(client):
+    server_a = _server_key('cursor_selected_removed_a')
+    server_b = _server_key('cursor_selected_removed_b')
+    server_c = _server_key('cursor_selected_removed_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert _next_api_v1_server_key(client) == server_a
+
+    unregistered = client.post('/unregister', json={'server_public_key': server_a})
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_b,
+        server_c,
+        server_b,
+        server_c,
+    ]
+
+
+def test_api_v1_round_robin_preserves_next_node_after_earlier_server_eviction(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    server_a = _server_key('cursor_evicted_a')
+    server_b = _server_key('cursor_evicted_b')
+    server_c = _server_key('cursor_evicted_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert _next_api_v1_server_key(client) == server_a
+    known_servers[server_a]['last_ping'] = datetime.now() - timedelta(seconds=5)
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_b,
+        server_c,
+        server_b,
+        server_c,
+    ]
+    assert server_a not in known_servers
+
+
+def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    server_a = _server_key('cursor_target_expired_a')
+    server_b = _server_key('cursor_target_expired_b')
+    server_c = _server_key('cursor_target_expired_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert _next_api_v1_server_key(client) == server_a
+    known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_c,
+        server_a,
+        server_c,
+        server_a,
+    ]
+    assert server_b not in known_servers
+
+
+
+def test_api_v1_poll_marks_claimed_request_terminal_if_server_removed(client, monkeypatch):
+    server_key = _server_key('poll_removed')
+    request_id = 'req-poll-removed'
+    _register_api_v1_server(client, server_key)
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, request_id, cancel_token='proof')
+    client_inference_requests[server_key] = [{
+        'request_id': request_id,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+        'e2ee_v1': True,
+    }]
+
+    def pop_and_remove(public_key):
+        queued_requests = client_inference_requests.get(public_key, [])
+        claimed = queued_requests.pop(0) if queued_requests else None
+        if not queued_requests:
+            client_inference_requests.pop(public_key, None)
+        relay_module._remove_known_server(public_key)
+        return claimed
+
+    terminalized_without_server_lock = []
+    original_cancel = relay_module._cancel_api_v1_request
+
+    def cancel_without_server_lock(*args, **kwargs):
+        terminalized_without_server_lock.append(
+            not relay_module.server_round_robin_lock._is_owned()
+        )
+        return original_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(relay_module, '_pop_next_api_v1_request', pop_and_remove)
+    monkeypatch.setattr(relay_module, '_cancel_api_v1_request', cancel_without_server_lock)
+
+    response = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_key})
+
+    assert response.status_code == 404
+    assert response.get_json()['error']['code'] == 404
+    assert terminalized_without_server_lock == [True]
+    assert server_key not in known_servers
+    assert server_key not in client_inference_requests
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    assert retrieved.status_code == 410
+    assert retrieved.get_json()['error'] == {
+        'message': 'Request expired',
+        'code': 'expired',
+        'status': 'expired',
+        'reason': 'provider_timeout',
+    }
+
+    late_response = client.post('/api/v1/relay/responses', json={
+        'request_id': request_id,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    })
+    assert late_response.status_code == 410
+    assert late_response.get_json()['error']['status'] == 'expired'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+class _LockCheckingKnownServers(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.values_checked_under_server_lock = False
+
+    def values(self):
+        if relay_module.server_round_robin_lock._is_owned():
+            self.values_checked_under_server_lock = True
+        return super().values()
+
+
+def test_api_v1_cancel_token_lookup_scans_known_servers_under_registry_lock(client, monkeypatch):
+    request_id = 'req-cancel-token-lock-scan'
+    checking_servers = _LockCheckingKnownServers({
+        DUMMY_SERVER_PUB_KEY: {
+            'public_key': DUMMY_SERVER_PUB_KEY,
+            'last_ping': datetime.now(),
+            'last_ping_duration': 60,
+            relay_module.API_V1_SERVER_MARKER: True,
+            'api_v1_in_flight_requests': {
+                request_id: {
+                    'expires_at': time.monotonic() + 60,
+                    'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                    'cancel_token': 'proof',
+                },
+            },
+        },
+    })
+    monkeypatch.setattr(relay_module, 'known_servers', checking_servers)
+
+    token = relay_module._cancel_token_for_queued_or_in_flight_request(
+        DUMMY_CLIENT_PUB_KEY,
+        request_id,
+    )
+
+    assert token == 'proof'
+    assert checking_servers.values_checked_under_server_lock is True
+
+
+def test_api_v1_cancel_scans_known_servers_under_registry_lock(client, monkeypatch):
+    request_id = 'req-cancel-lock-scan'
+    checking_servers = _LockCheckingKnownServers({
+        DUMMY_SERVER_PUB_KEY: {
+            'public_key': DUMMY_SERVER_PUB_KEY,
+            'last_ping': datetime.now(),
+            'last_ping_duration': 60,
+            relay_module.API_V1_SERVER_MARKER: True,
+            'api_v1_in_flight_requests': {
+                request_id: {
+                    'expires_at': time.monotonic() + 60,
+                    'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                    'cancel_token': 'proof',
+                },
+            },
+        },
+    })
+    monkeypatch.setattr(relay_module, 'known_servers', checking_servers)
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, request_id, cancel_token='proof')
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'proof',
+    })
+
+    assert cancelled.status_code == 200
+    assert checking_servers.values_checked_under_server_lock is True
+    assert 'api_v1_in_flight_requests' not in checking_servers[DUMMY_SERVER_PUB_KEY]
+
+
+def test_api_v1_request_enqueue_rejects_legacy_only_server_without_queue_entry(client):
+    legacy_server = _server_key('enqueue_legacy_only')
+    legacy_registration = client.post('/sink', json={'server_public_key': legacy_server})
+    assert legacy_registration.status_code == 200
+
+    response = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-legacy-only',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': legacy_server,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+
+    assert response.status_code == 404
+    assert legacy_server not in client_inference_requests
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+
+
+def test_api_v1_request_enqueue_rejects_removed_server_without_queue_entry(client):
+    server_key = _server_key('enqueue_removed')
+    _register_api_v1_server(client, server_key)
+    assert client.post('/unregister', json={'server_public_key': server_key}).status_code == 200
+
+    response = client.post('/api/v1/relay/requests', json={
+        'request_id': 'req-removed-server',
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'server_public_key': server_key,
+        'chat_history': 'ciphertext-request',
+        'cipherkey': 'cipherkey-request',
+        'iv': 'iv-request',
+    })
+
+    assert response.status_code == 404
+    assert server_key not in client_inference_requests
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+
+
+def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(client):
+    server_a = _server_key('queue_a')
+    server_b = _server_key('queue_b')
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    selected_servers = []
+    for idx in range(4):
+        selected_server = _next_api_v1_server_key(client)
+        selected_servers.append(selected_server)
+        _queue_api_v1_request(
+            client,
+            server_public_key=selected_server,
+            request_id=f'req-round-robin-{idx}',
+        )
+
+    assert selected_servers == [server_a, server_b, server_a, server_b]
+
+    first_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
+    second_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
+    first_b = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_b})
+    second_b = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_b})
+
+    assert [first_a.status_code, second_a.status_code, first_b.status_code, second_b.status_code] == [200] * 4
+    assert first_a.get_json()['request_id'] == 'req-round-robin-0'
+    assert second_a.get_json()['request_id'] == 'req-round-robin-2'
+    assert first_b.get_json()['request_id'] == 'req-round-robin-1'
+    assert second_b.get_json()['request_id'] == 'req-round-robin-3'
+
+
+def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    server_a = _server_key('skip_a')
+    server_b = _server_key('skip_b')
+    server_c = _server_key('skip_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert [_next_api_v1_server_key(client) for _ in range(3)] == [server_a, server_b, server_c]
+
+    known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [server_a, server_c, server_a, server_c]
+    assert server_b not in known_servers
+
+    unregistered = client.post('/unregister', json={'server_public_key': server_a})
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+    assert [_next_api_v1_server_key(client) for _ in range(2)] == [server_c, server_c]
+
+
+def test_api_v1_reregistered_round_robin_node_reenters_at_end(client):
+    server_a = _server_key('reregister_a')
+    server_b = _server_key('reregister_b')
+    server_c = _server_key('reregister_c')
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+    _register_api_v1_server(client, server_c)
+
+    assert client.post('/unregister', json={'server_public_key': server_b}).status_code == 200
+    _register_api_v1_server(client, server_b)
+
+    assert [_next_api_v1_server_key(client) for _ in range(6)] == [
+        server_a,
+        server_c,
+        server_b,
+        server_a,
+        server_c,
+        server_b,
+    ]
+
+
+def test_api_v1_round_robin_selection_is_concurrency_safe(client):
+    server_a = _server_key('concurrent_a')
+    server_b = _server_key('concurrent_b')
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    selections = []
+    lock = threading.Lock()
+
+    def select_next():
+        with app.test_client() as thread_client:
+            selected = _next_api_v1_server_key(thread_client)
+        with lock:
+            selections.append(selected)
+
+    threads = [threading.Thread(target=select_next) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+
+    assert len(selections) == 20
+    assert selections.count(server_a) == 10
+    assert selections.count(server_b) == 10
+
+
 def test_api_v1_next_keeps_in_flight_server_alive_then_expires(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
@@ -2268,6 +2685,7 @@ def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeyp
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-expired-late-response'))
     assert queued.status_code == 200
@@ -2294,6 +2712,7 @@ def test_api_v1_queued_response_before_ttl_survives_delayed_retrieve(client, mon
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     request_id = 'req-response-before-ttl'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
@@ -2319,6 +2738,7 @@ def test_api_v1_queued_response_before_ttl_survives_diagnostics_cleanup(client, 
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     request_id = 'req-response-diagnostics-cleanup'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
@@ -2344,6 +2764,7 @@ def test_api_v1_late_duplicate_response_preserves_accepted_response(client, monk
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     request_id = 'req-late-duplicate-response'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id)).status_code == 200
@@ -2369,6 +2790,7 @@ def test_api_v1_cancel_requires_matching_cancel_token(client):
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-cancel-auth', cancel_token='proof')).status_code == 200
 
@@ -2389,6 +2811,7 @@ def test_api_v1_cancel_sanitizes_status_and_reason(client):
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-sanitize-cancel', cancel_token='proof')).status_code == 200
 
@@ -2417,6 +2840,7 @@ def test_api_v1_cancelled_queued_response_retrieve_returns_gone(client):
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     request_id = 'req-response-then-cancel'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
@@ -2445,6 +2869,7 @@ def test_api_v1_response_after_in_flight_cancel_is_rejected_and_queue_depth_zero
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     request_id = 'req-dispatched-cancelled'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200
@@ -2474,6 +2899,7 @@ def test_api_v1_cancel_only_clears_matching_client_in_flight_entry(client):
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
         'api_v1_in_flight_requests': {
             'shared-req': {'expires_at': time.monotonic() + 60, 'client_public_key': DUMMY_CLIENT_PUB_KEY, 'cancel_token': 'matching-proof'}
         },
@@ -2482,6 +2908,7 @@ def test_api_v1_cancel_only_clears_matching_client_in_flight_entry(client):
         'public_key': other_server_key,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
         'api_v1_in_flight_requests': {
             'shared-req': {'expires_at': time.monotonic() + 60, 'client_public_key': 'other-client', 'cancel_token': 'other-proof'}
         },
@@ -2508,6 +2935,7 @@ def test_api_v1_pending_ttl_cleanup_runs_without_retrieve(client, monkeypatch):
         'public_key': DUMMY_SERVER_PUB_KEY,
         'last_ping': datetime.now(),
         'last_ping_duration': 60,
+        relay_module.API_V1_SERVER_MARKER: True,
     }
     request_id = 'req-cleanup-without-retrieve'
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id, cancel_token='proof')).status_code == 200

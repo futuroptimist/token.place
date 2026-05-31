@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -449,6 +450,8 @@ def _validate_server_registration():
 
 
 known_servers = {}
+relay_server_round_robin_cursor = 0
+relay_server_round_robin_lock = threading.Lock()
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
@@ -621,6 +624,10 @@ def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
     removed = known_servers.pop(server_public_key, None) is not None
+    if removed and not known_servers:
+        with relay_server_round_robin_lock:
+            global relay_server_round_robin_cursor
+            relay_server_round_robin_cursor = 0
     dropped_requests = []
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
@@ -847,6 +854,12 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
+def _server_public_key_fingerprint(public_key: str) -> str:
+    """Return a short, non-sensitive fingerprint for relay diagnostics/logs."""
+
+    return hashlib.sha256(public_key.encode("utf-8")).hexdigest()[:12]
+
+
 def _select_next_server_payload(*, api_v1: bool = False):
     _evict_stale_servers()
     if not known_servers:
@@ -858,7 +871,27 @@ def _select_next_server_payload(*, api_v1: bool = False):
                 }
             }), 503
         return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-    server_public_key = secrets.choice(list(known_servers.keys()))
+
+    # Python dictionaries preserve insertion order, so this cycles compute nodes in
+    # registration order. A node that unregisters and later registers again is
+    # inserted at the end of the current cycle.
+    with relay_server_round_robin_lock:
+        global relay_server_round_robin_cursor
+        server_public_keys = list(known_servers.keys())
+        selected_position = relay_server_round_robin_cursor % len(server_public_keys)
+        server_public_key = server_public_keys[selected_position]
+        relay_server_round_robin_cursor = (selected_position + 1) % len(server_public_keys)
+
+    LOGGER.info(
+        "relay.server_selected",
+        extra={
+            "selection_strategy": "round_robin",
+            "server_fingerprint": _server_public_key_fingerprint(server_public_key),
+            "round_robin_position": selected_position,
+            "eligible_server_count": len(server_public_keys),
+            "api_v1": api_v1,
+        },
+    )
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
 
 @app.route('/next_server', methods=['GET'])

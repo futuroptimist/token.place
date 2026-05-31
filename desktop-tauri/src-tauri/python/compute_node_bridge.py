@@ -134,9 +134,6 @@ class _DaemonWarmLoadFuture:
     def result(self, timeout: Optional[float] = None) -> Any:
         return self._future.result(timeout=timeout)
 
-    def cancel(self) -> bool:
-        return self._future.cancel()
-
 
 class _CancelablePollWorker:
     """Run one relay poll at a time while the bridge keeps checking for cancel."""
@@ -932,8 +929,10 @@ def run(args: argparse.Namespace) -> int:
                 )
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 last_error = warm_load_failed
-                if warm_load_future is not None and not warm_load_future.done():
-                    warm_load_future.cancel()
+                # Do not cancel the warm-load Future here: the underlying daemon
+                # thread cannot be forcibly stopped, and cancelling the Future can
+                # race with the worker setting its result/exception.  The failed
+                # warm-load state above makes the bridge ignore any late completion.
                 print(
                     "desktop.compute_node_bridge.registration.gate_wait_timeout "
                     f"relay={_sanitize_relay_target(runtime.relay_client.relay_url)} "
@@ -1240,8 +1239,9 @@ def run(args: argparse.Namespace) -> int:
             f"relay={_sanitize_relay_target(active_relay_url)}",
             file=sys.stderr,
         )
-        if warm_load_future is not None and not warm_load_future.done():
-            warm_load_future.cancel()
+        # Leave any still-running warm-load thread alone.  It is daemonized so it
+        # cannot keep process shutdown alive, and bridge state has already moved
+        # on to stop/failure handling.
         runtime.stop()
         print(
             "desktop.compute_node_bridge.stopped_idle "

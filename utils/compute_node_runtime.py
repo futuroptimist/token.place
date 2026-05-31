@@ -282,7 +282,7 @@ class ComputeNodeRuntime:
             self.request_adapters = list(request_adapters)
 
     def ensure_model_ready(self) -> bool:
-        """Initialize model runtime and report readiness."""
+        """Download or verify the model file before runtime initialization."""
 
         _log_info("Initializing LLM model-file preflight...")
         if self.model_manager.use_mock_llm:

@@ -537,8 +537,7 @@ class ModelManager:
                             self.log_info("Llama init completed successfully.")
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
-                            self.log_error(f"Llama init failed: {e}", exc_info=True)
-                            self.log_error(f"Failed to initialize Llama model: {e}")
+                            self.log_error(f"Failed to initialize Llama model: {e}", exc_info=True)
                             return None
 
         return self.llm

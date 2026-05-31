@@ -43,6 +43,52 @@ def test_compute_node_runtime_ensure_model_ready_download_success():
     model_manager.download_model_if_needed.assert_called_once_with()
 
 
+def test_compute_node_runtime_model_file_preflight_log_is_not_runtime_ready(caplog):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.model_path = "/tmp/model.gguf"
+    model_manager.download_model_if_needed.return_value = True
+    relay_client = MagicMock()
+    crypto_manager = MagicMock()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=crypto_manager,
+    )
+
+    with caplog.at_level("INFO", logger="utils.compute_node_runtime"):
+        assert runtime.ensure_model_ready() is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Model ready for inference" not in messages
+    assert "Model file ready for runtime initialization: /tmp/model.gguf" in messages
+
+
+def test_compute_node_runtime_warmup_logs_model_instantiation_stages(caplog):
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.model_path = "/tmp/model.gguf"
+    model_manager.last_compute_diagnostics = {"requested_mode": "cpu"}
+    llm_runtime = MagicMock()
+    llm_runtime.create_chat_completion = lambda **_kwargs: {}
+    model_manager.get_llm_instance.return_value = llm_runtime
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    with caplog.at_level("INFO", logger="utils.compute_node_runtime"):
+        assert runtime.ensure_api_v1_runtime_ready() is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "API v1 runtime warmup about to instantiate model: /tmp/model.gguf" in messages
+    assert "API v1 runtime warmup model instantiated: /tmp/model.gguf" in messages
+
+
 def test_compute_node_runtime_ensure_model_ready_with_mock_model():
     model_manager = MagicMock()
     model_manager.use_mock_llm = True

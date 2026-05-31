@@ -2648,3 +2648,182 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+
+def _load_desktop_operator_parity_contract():
+    contract_path = Path(__file__).resolve().parents[2] / 'tests' / 'fixtures' / 'desktop_operator_parity_contract.json'
+    return json.loads(contract_path.read_text(encoding='utf-8'))
+
+
+class PlatformReadyRuntime(ApiV1Runtime):
+    last_instance = None
+    backend = 'cpu'
+    requested_mode = 'cpu'
+
+    def __init__(self, _config):
+        super().__init__(_config)
+        PlatformReadyRuntime.last_instance = self
+        self._set_ready_diagnostics()
+
+    def _set_ready_diagnostics(self):
+        gpu_backend = self.backend in {'cuda', 'metal'}
+        self.model_manager.last_compute_diagnostics = {
+            'requested_mode': self.requested_mode,
+            'effective_mode': 'gpu' if gpu_backend else 'cpu',
+            'backend_available': self.backend,
+            'backend_selected': self.backend,
+            'backend_used': self.backend,
+            'n_gpu_layers': -1 if gpu_backend else 0,
+            'offloaded_layers': -1 if gpu_backend else 0,
+            'kv_cache_device': 'gpu' if gpu_backend else 'cpu',
+            'fallback_reason': None,
+        }
+
+    def ensure_api_v1_runtime_ready(self):
+        self._set_ready_diagnostics()
+        self.model_manager.last_compute_diagnostics['api_v1_runtime_ready'] = True
+        return True
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        case
+        for case in _load_desktop_operator_parity_contract()['platform_matrix']
+        if case['name'] in {
+            'windows_cuda_capable_path',
+            'macos_metal_capable_path',
+            'cpu_fallback_path',
+        }
+    ],
+    ids=lambda case: case['name'],
+)
+def test_platform_neutral_status_contract_registers_only_after_ready_backend(case, capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    backend = case['expected_registration_backend_used']
+    mode = 'gpu' if backend in {'cuda', 'metal'} else 'cpu'
+
+    class RuntimeForCase(PlatformReadyRuntime):
+        last_instance = None
+        requested_mode = mode
+        backend = case['expected_registration_backend_used']
+
+        def __init__(self, config):
+            super().__init__(config)
+            RuntimeForCase.last_instance = self
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RuntimeForCase)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': backend,
+            'detected_device': backend,
+            'runtime_action': case['expected_runtime_action'],
+            'fallback_reason': '',
+            'interpreter': sys.executable,
+            'llama_module_path': 'site-packages/llama_cpp/__init__.py',
+        },
+    )
+
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode=mode,
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    output = capsys.readouterr()
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    status_events = [event for event in events if event['type'] == 'status']
+    assert status_events
+    assert any(
+        event['registered'] is False
+        and event['relay_runtime_state'] in {'starting', 'warming'}
+        and event['backend_used'] == 'pending'
+        for event in status_events
+    )
+    registered_events = [event for event in status_events if event['registered'] is True]
+    assert registered_events
+    for event in registered_events:
+        assert event['running'] is True
+        assert event['relay_runtime_state'] in {'ready', 'processing'}
+        assert event['backend_available'] == backend
+        assert event['backend_selected'] == backend
+        assert event['backend_used'] == backend
+        assert event['last_error'] is None
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Prompt 2 will make macOS GPU runtime failures fail closed with Metal-specific diagnostics.',
+)
+@pytest.mark.parametrize(
+    'action,fallback_reason,expected_fragment',
+    [
+        ('failed', 'Metal build failed: install xcode command line tools', 'Metal build failed'),
+        ('shadowed_repo_llama_cpp', 'llama_cpp import shadowed by repo-local shim', 'repo-local shim'),
+    ],
+)
+def test_macos_platform_runtime_failures_keep_registration_false_and_actionable(
+    action, fallback_reason, expected_fragment, capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': action,
+            'fallback_reason': fallback_reason,
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        },
+    )
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'darwin')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='gpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(events) == 1
+    payload = events[0]
+    assert payload['type'] == 'error'
+    assert payload['running'] is False
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert expected_fragment in payload['last_error']
+    assert 'macOS' in payload['last_error'] or 'Metal' in payload['last_error']
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Prompt 4 will add real macOS relay lifecycle parity coverage beyond inspect/probe smoke tests.',
+)
+def test_macos_packaged_operator_workflow_contract_has_real_relay_lifecycle_coverage():
+    workflow_path = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
+    workflow = workflow_path.read_text(encoding='utf-8')
+    macos_section = workflow.split('desktop-operator-packaged-e2e-macos:', 1)[1]
+
+    assert 'TOKENPLACE_REQUIRE_REAL_RELAY_LIFECYCLE_E2E' in macos_section
+    assert 'multi-turn' in macos_section.lower()

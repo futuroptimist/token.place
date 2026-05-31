@@ -945,3 +945,95 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')
+
+
+def _load_desktop_operator_parity_contract():
+    contract_path = REPO_ROOT / 'tests' / 'fixtures' / 'desktop_operator_parity_contract.json'
+    return json.loads(contract_path.read_text(encoding='utf-8'))
+
+
+def test_desktop_operator_parity_contract_defines_required_platform_matrix():
+    contract = _load_desktop_operator_parity_contract()
+
+    assert contract['api'] == 'v1_non_streaming_e2ee'
+    assert contract['relay_blind_e2ee'] is True
+    assert set(contract['platforms']) == {
+        'windows_cuda',
+        'macos_metal',
+        'cpu_fallback',
+        'missing_runtime_dependency',
+    }
+    assert {
+        'startup',
+        'warm_load_before_registration',
+        'runtime_detection',
+        'gpu_backend_selection',
+        'relay_registration_after_runtime_ready',
+        'ui_status_fields',
+        'stop_operator',
+        'start_after_stop',
+        'packaged_resource_resolution',
+        'dependency_isolation',
+        'error_fallback_behavior',
+    } <= set(contract['lifecycle'])
+    assert 'registered_true_requires' in contract['status_contract']
+    assert 'backend_fields' in contract['status_contract']
+    assert 'error_contract' in contract['status_contract']
+    assert len(contract['platform_matrix']) == 4
+
+
+@pytest.mark.parametrize(
+    'case',
+    _load_desktop_operator_parity_contract()['platform_matrix'],
+    ids=lambda case: case['name'],
+)
+def test_desktop_runtime_platform_matrix_fixture_matches_probe_contract(monkeypatch, case):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'platform', case['sys_platform'])
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(
+            backend=case['probe_backend'],
+            gpu=case['probe_gpu_offload_supported'],
+            device=case['probe_backend'],
+            error=case.get('probe_error'),
+        ),
+    )
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(case['mode'])
+
+    assert result['selected_backend'] == case['expected_selected_backend']
+    expected_action = case.get('expected_runtime_action_when_bootstrap_disabled')
+    if expected_action is None:
+        expected_action = case['expected_runtime_action']
+    assert result['runtime_action'] == expected_action
+    if case['name'] == 'missing_runtime_dependency_path':
+        assert case['expected_last_error_contains'] in result['fallback_reason']
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Prompt 2 will replace macOS probe-only GPU setup with Metal runtime bootstrap.',
+)
+def test_macos_gpu_runtime_bootstrap_contract_attempts_metal_repair(monkeypatch):
+    class _DarwinSys:
+        platform = 'darwin'
+        executable = sys.executable
+        prefix = sys.prefix
+        argv = [str(MODULE_PATH)]
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _DarwinSys)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([_probe(backend='cpu', gpu=False), _probe(backend='metal', gpu=True)])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=REPO_ROOT)
+
+    assert result['selected_backend'] == 'metal'
+    assert result['runtime_action'] in {'installed_metal_reexec', 'installed_gpu_reexec'}

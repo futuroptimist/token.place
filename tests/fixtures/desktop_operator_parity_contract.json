@@ -1,0 +1,143 @@
+{
+  "contract_version": 1,
+  "api": "v1_non_streaming_e2ee",
+  "relay_blind_e2ee": true,
+  "platforms": {
+    "windows_cuda": {
+      "os": "win32",
+      "capability": "cuda",
+      "gpu_mode_backend": "cuda",
+      "bootstrap": "gpu_runtime_repair_or_existing_cuda_runtime",
+      "packaged_resource_resolution": "sidecar_resources_or_repo_runtime_root",
+      "known_gap": null
+    },
+    "macos_metal": {
+      "os": "darwin",
+      "capability": "metal",
+      "gpu_mode_backend": "metal",
+      "bootstrap": "gpu_runtime_repair_or_existing_metal_runtime",
+      "packaged_resource_resolution": "app_bundle_resources_or_repo_runtime_root",
+      "known_gap": "Metal runtime bootstrap is currently probe-only; Prompt 2 makes macOS a first-class bootstrap target."
+    },
+    "cpu_fallback": {
+      "os": "any",
+      "capability": "cpu",
+      "gpu_mode_backend": "cpu",
+      "bootstrap": "no_gpu_repair_required_for_cpu_mode",
+      "packaged_resource_resolution": "same_python_bridge_import_root",
+      "known_gap": null
+    },
+    "missing_runtime_dependency": {
+      "os": "any",
+      "capability": "missing",
+      "gpu_mode_backend": "pending",
+      "bootstrap": "fail_closed_with_actionable_last_error",
+      "packaged_resource_resolution": "must_not_import_repo_local_llama_cpp_shim",
+      "known_gap": null
+    }
+  },
+  "lifecycle": [
+    "startup",
+    "warm_load_before_registration",
+    "runtime_detection",
+    "gpu_backend_selection",
+    "relay_registration_after_runtime_ready",
+    "ui_status_fields",
+    "stop_operator",
+    "start_after_stop",
+    "packaged_resource_resolution",
+    "dependency_isolation",
+    "error_fallback_behavior"
+  ],
+  "status_contract": {
+    "registered_true_requires": [
+      "running is true",
+      "relay_runtime_state is ready or processing",
+      "relay registration succeeded and is fresh",
+      "API v1 runtime that will answer relay work is ready"
+    ],
+    "backend_fields": {
+      "backend_available": "detected runtime capability, pending before relay runtime is ready",
+      "backend_selected": "operator-selected backend for the runtime that answers relay work",
+      "backend_used": "actual backend used by that runtime after warm-load"
+    },
+    "error_contract": {
+      "last_error": "null when healthy; otherwise clear, actionable, platform-specific remediation text",
+      "fail_closed": "relay registration remains false when runtime/dependency setup cannot preserve API v1 E2EE operator behavior"
+    },
+    "ui_fields": [
+      "running",
+      "registered",
+      "relay_runtime_state",
+      "runtime_path",
+      "relay_runtime_path",
+      "active_relay_url",
+      "requested_mode",
+      "effective_mode",
+      "backend_available",
+      "backend_selected",
+      "backend_used",
+      "fallback_reason",
+      "model_path",
+      "last_error",
+      "operator_session_id",
+      "sequence",
+      "updated_at_ms"
+    ]
+  },
+  "platform_matrix": [
+    {
+      "name": "windows_cuda_capable_path",
+      "sys_platform": "win32",
+      "mode": "gpu",
+      "probe_backend": "cuda",
+      "probe_gpu_offload_supported": true,
+      "expected_selected_backend": "cuda",
+      "expected_runtime_action": "already_supported",
+      "expected_registration_backend_used": "cuda"
+    },
+    {
+      "name": "macos_metal_capable_path",
+      "sys_platform": "darwin",
+      "mode": "gpu",
+      "probe_backend": "metal",
+      "probe_gpu_offload_supported": true,
+      "expected_selected_backend": "metal",
+      "expected_runtime_action": "already_supported",
+      "expected_registration_backend_used": "metal"
+    },
+    {
+      "name": "cpu_fallback_path",
+      "sys_platform": "linux",
+      "mode": "cpu",
+      "probe_backend": "cpu",
+      "probe_gpu_offload_supported": false,
+      "expected_selected_backend": "cpu",
+      "expected_runtime_action": "skipped",
+      "expected_registration_backend_used": "cpu"
+    },
+    {
+      "name": "missing_runtime_dependency_path",
+      "sys_platform": "win32",
+      "mode": "gpu",
+      "probe_backend": "missing",
+      "probe_gpu_offload_supported": false,
+      "probe_error": "llama-cpp-python is not importable",
+      "expected_selected_backend": "cpu",
+      "expected_runtime_action_when_bootstrap_disabled": "probe_only",
+      "expected_last_error_contains": "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
+    }
+  ],
+  "known_gaps": [
+    {
+      "id": "macos-metal-bootstrap-probe-only",
+      "owner_prompt": 2,
+      "expected_future": "darwin gpu/auto/hybrid bootstrap attempts Metal-capable llama-cpp-python repair before falling back"
+    },
+    {
+      "id": "macos-real-relay-lifecycle-e2e",
+      "owner_prompt": 4,
+      "expected_future": "macOS packaged operator CI covers warm-load, register, multi-turn API v1 relay chat, Stop, Start after Stop, and diagnostics"
+    }
+  ]
+}

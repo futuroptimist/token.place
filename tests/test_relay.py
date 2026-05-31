@@ -2244,7 +2244,7 @@ def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(clien
 
 
 
-def test_api_v1_poll_clears_claimed_request_if_server_removed(client, monkeypatch):
+def test_api_v1_poll_marks_claimed_request_terminal_if_server_removed(client, monkeypatch):
     server_key = _server_key('poll_removed')
     request_id = 'req-poll-removed'
     _register_api_v1_server(client, server_key)
@@ -2275,6 +2275,29 @@ def test_api_v1_poll_clears_claimed_request_if_server_removed(client, monkeypatc
     assert server_key not in known_servers
     assert server_key not in client_inference_requests
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': request_id,
+    })
+    assert retrieved.status_code == 410
+    assert retrieved.get_json()['error'] == {
+        'message': 'Request expired',
+        'code': 'expired',
+        'status': 'expired',
+        'reason': 'provider_timeout',
+    }
+
+    late_response = client.post('/api/v1/relay/responses', json={
+        'request_id': request_id,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'ciphertext-response',
+        'cipherkey': 'cipherkey-response',
+        'iv': 'iv-response',
+    })
+    assert late_response.status_code == 410
+    assert late_response.get_json()['error']['status'] == 'expired'
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
 
 class _LockCheckingKnownServers(dict):

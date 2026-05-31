@@ -1560,17 +1560,19 @@ def api_v1_relay_servers_poll():
         server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
     LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
-    def _clear_claimed_request(claimed_request):
+    def _mark_claimed_request_terminal(claimed_request):
         if not isinstance(claimed_request, dict):
             return
         if bool(claimed_request.get('e2ee_v1')):
-            _clear_pending_request(
+            _cancel_api_v1_request(
                 claimed_request.get('client_public_key'),
                 claimed_request.get('request_id'),
+                status='expired',
+                reason='provider_timeout',
             )
 
     def _server_not_found_response(claimed_request=None):
-        _clear_claimed_request(claimed_request)
+        _mark_claimed_request_terminal(claimed_request)
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     first_request = None

@@ -2648,3 +2648,149 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+
+def _desktop_parity_contract():
+    contract_path = (
+        Path(__file__).resolve().parents[2]
+        / 'tests'
+        / 'fixtures'
+        / 'desktop_operator_parity_contract.json'
+    )
+    return json.loads(contract_path.read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        case
+        for case in _desktop_parity_contract()['platform_matrix']
+        if case['id'] in {'windows_cuda_capable', 'macos_metal_capable', 'cpu_fallback'}
+    ],
+    ids=lambda case: case['id'],
+)
+def test_platform_neutral_status_contract_registers_only_ready_runtime_backend(
+    capsys, monkeypatch, case
+):
+    _reset_cancel_queue()
+    backend = case['expected_registration_backend']
+    requested_mode = 'cpu' if backend == 'cpu' else 'auto'
+
+    class ReadyBackendRuntime(ApiV1Runtime):
+        def ensure_api_v1_runtime_ready(self):
+            self.model_manager.last_compute_diagnostics = {
+                'requested_mode': requested_mode,
+                'effective_mode': 'cpu' if backend == 'cpu' else 'gpu',
+                'backend_available': backend,
+                'backend_selected': backend,
+                'backend_used': backend,
+                'n_gpu_layers': 0 if backend == 'cpu' else -1,
+                'offloaded_layers': 0 if backend == 'cpu' else 42,
+                'kv_cache_device': backend,
+                'fallback_reason': None,
+            }
+            return True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ReadyBackendRuntime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': backend,
+            'detected_device': backend,
+            'runtime_action': case['expected_runtime_action'],
+            'interpreter': sys.executable,
+            'llama_module_path': f'/fake/site-packages/llama_cpp_{backend}/__init__.py',
+            'fallback_reason': '',
+        },
+    )
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 3
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode=requested_mode,
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    warming_events = [event for event in events if event.get('relay_runtime_state') == 'warming']
+    assert warming_events
+    assert all(event['registered'] is False for event in warming_events)
+    ready_registered_events = [
+        event
+        for event in events
+        if event.get('type') == 'status'
+        and event.get('registered') is True
+        and event.get('relay_runtime_state') == 'ready'
+    ]
+    assert ready_registered_events
+    for event in ready_registered_events:
+        assert event['backend_available'] == backend
+        assert event['backend_selected'] == backend
+        assert event['backend_used'] == backend
+        assert event['last_error'] is None
+
+
+def test_platform_runtime_failure_status_is_actionable_and_not_registered(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'failed',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+            'fallback_reason': 'CUDA source build failed: install CUDA toolkit',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'desktop_gpu_runtime_failure_message',
+        lambda mode, setup: (
+            'GPU provisioning failed for desktop Windows launch '
+            f"(mode={mode}, action={setup['runtime_action']}): {setup['fallback_reason']}. "
+            'Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support.'
+        ),
+    )
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_port=None
+    )
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get('type') == 'error')
+    assert error_event['registered'] is False
+    assert error_event['relay_runtime_state'] == 'failed'
+    assert 'CUDA source build failed' in error_event['last_error']
+    assert 'Verify CUDA runtime prerequisites' in error_event['last_error']
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Prompt 4 will add macOS real lifecycle parity coverage beyond packaged/inspect/no-relay smoke tests.',
+)
+def test_macos_real_operator_lifecycle_parity_gap_is_captured():
+    workflow = (
+        Path(__file__).resolve().parents[2]
+        / '.github'
+        / 'workflows'
+        / 'desktop-operator-e2e.yml'
+    ).read_text(encoding='utf-8')
+
+    assert 'Run macOS warm-load relay registration multi-turn lifecycle e2e' in workflow
+    assert 'test_desktop_operator_lifecycle_e2e.py' in workflow
+    assert 'TOKENPLACE_REQUIRE_MACOS_RELAY_LIFECYCLE_E2E' in workflow

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "status_contract": {
+    "startup_warm_load": "Warm-load API v1 relay runtime before registration when warm-load is enabled; emit running status while warming and keep registered=false until ready.",
+    "runtime_detection": "Detect the llama-cpp backend in the same sidecar/import root that will answer relay work.",
+    "gpu_backend_selection": "Windows CUDA and macOS Metal are first-class GPU backends; CPU mode and unsupported hosts fall back to CPU with diagnostics.",
+    "relay_registration_eligibility": "Registered: yes is valid only when the operator is running, relay runtime is ready, runtime registration is fresh, and relay registration/poll succeeds.",
+    "ui_field_states": "UI lifecycle fields use the shared ComputeNodeStatus shape: running, registered, relay_runtime_state, warm_load_state, backend_available, backend_selected, backend_used, fallback_reason, last_error, runtime_path, relay_runtime_path, operator_session_id, sequence, and updated_at_ms.",
+    "stop_operator": "Stop cancels relay polling, unregisters/stops runtime state where available, and emits running=false registered=false relay_runtime_state=stopped.",
+    "start_after_stop": "A new Start after Stop gets a fresh session, ignores stale old-session events, clears stale errors, and must re-establish readiness/registration before showing Registered: yes.",
+    "packaged_resource_resolution": "Packaged Windows and macOS apps resolve the same bridge/runtime resources from Tauri resources, executable-adjacent resources, or manifest fallbacks without using legacy relay endpoints.",
+    "dependency_isolation": "Desktop sidecars run with isolated Python import paths so repo shims/user site packages cannot shadow the packaged runtime that answers relay work.",
+    "error_fallback_behavior": "GPU/runtime/dependency failures fail closed for relay work, do not expose plaintext payloads, and emit actionable last_error diagnostics while keeping registered=false."
+  },
+  "platform_matrix": [
+    {
+      "id": "windows_cuda_capable",
+      "platform": "win32",
+      "requested_mode": "auto",
+      "probe_backend": "cuda",
+      "probe_gpu_offload_supported": true,
+      "probe_device": "cuda",
+      "expected_selected_backend": "cuda",
+      "expected_runtime_action": "already_supported",
+      "expected_registration_backend": "cuda"
+    },
+    {
+      "id": "macos_metal_capable",
+      "platform": "darwin",
+      "requested_mode": "auto",
+      "probe_backend": "metal",
+      "probe_gpu_offload_supported": true,
+      "probe_device": "metal",
+      "expected_selected_backend": "metal",
+      "expected_runtime_action": "already_supported",
+      "expected_registration_backend": "metal"
+    },
+    {
+      "id": "cpu_fallback",
+      "platform": "linux",
+      "requested_mode": "cpu",
+      "probe_backend": "cpu",
+      "probe_gpu_offload_supported": false,
+      "probe_device": "cpu",
+      "expected_selected_backend": "cpu",
+      "expected_runtime_action": "skipped",
+      "expected_registration_backend": "cpu"
+    },
+    {
+      "id": "missing_runtime_dependency",
+      "platform": "linux",
+      "requested_mode": "auto",
+      "probe_backend": "missing",
+      "probe_gpu_offload_supported": false,
+      "probe_device": "none",
+      "probe_error": "No module named llama_cpp",
+      "expected_selected_backend": "cpu",
+      "expected_runtime_action": "probe_only",
+      "expected_registration_backend": "pending",
+      "expected_fallback_contains": "GPU runtime unavailable"
+    }
+  ],
+  "known_gaps": [
+    {
+      "id": "macos_runtime_bootstrap_probe_only",
+      "prompt_owner": "Prompt 2",
+      "current_behavior": "macOS missing/CPU-only Metal runtime returns runtime_action=probe_only instead of attempting Metal bootstrap/repair.",
+      "expected_behavior": "macOS auto/gpu/hybrid launch attempts Metal-capable llama-cpp-python bootstrap and reports a Metal action or actionable failure."
+    },
+    {
+      "id": "macos_real_operator_lifecycle_coverage",
+      "prompt_owner": "Prompt 4",
+      "current_behavior": "macOS coverage is still mostly packaged/inspect/no-relay oriented and does not prove staging-style warm-load, registration, multi-turn relay chat, Stop, Start after Stop, and diagnostics as one real lifecycle.",
+      "expected_behavior": "macOS has the same real packaged operator lifecycle coverage as Windows for warm-load, relay registration, API v1 E2EE chat, multi-turn cleanup, Stop, Start after Stop, and diagnostics."
+    }
+  ]
+}

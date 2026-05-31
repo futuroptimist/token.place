@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from unittest.mock import call, MagicMock
 
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
     apply_compute_mode,
+    compute_mode_diagnostics,
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
     LegacyRelayRequestAdapter,
@@ -737,3 +740,48 @@ def test_compute_node_runtime_stop_continues_when_unregister_raises():
         call.stop(),
         call.unregister_from_relay(),
     ]
+
+
+def _desktop_parity_contract():
+    contract_path = (
+        Path(__file__).resolve().parents[2]
+        / 'tests'
+        / 'fixtures'
+        / 'desktop_operator_parity_contract.json'
+    )
+    return json.loads(contract_path.read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize(
+    'case',
+    _desktop_parity_contract()['platform_matrix'],
+    ids=lambda case: case['id'],
+)
+def test_compute_mode_status_contract_is_platform_neutral_for_parity_matrix(case):
+    manager = MagicMock()
+    requested_mode = case['requested_mode']
+
+    normalized = apply_compute_mode(manager, requested_mode)
+    initial = compute_mode_diagnostics(manager)
+
+    assert normalized in {'auto', 'cpu', 'gpu', 'hybrid'}
+    assert initial['requested_mode'] == normalized
+    assert {'backend_available', 'backend_selected', 'backend_used', 'fallback_reason'} <= set(
+        initial
+    )
+
+    backend = case['expected_registration_backend']
+    if backend != 'pending':
+        manager.last_compute_diagnostics = {
+            'requested_mode': normalized,
+            'effective_mode': 'cpu' if backend == 'cpu' else 'gpu',
+            'backend_available': backend,
+            'backend_selected': backend,
+            'backend_used': backend,
+            'n_gpu_layers': 0 if backend == 'cpu' else -1,
+            'fallback_reason': None,
+        }
+        ready = compute_mode_diagnostics(manager)
+        assert ready['backend_available'] == backend
+        assert ready['backend_selected'] == backend
+        assert ready['backend_used'] == backend

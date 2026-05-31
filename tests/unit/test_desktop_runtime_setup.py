@@ -945,3 +945,109 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')
+
+
+def _desktop_parity_contract():
+    contract_path = (
+        REPO_ROOT / 'tests' / 'fixtures' / 'desktop_operator_parity_contract.json'
+    )
+    return json.loads(contract_path.read_text(encoding='utf-8'))
+
+
+def test_desktop_operator_parity_contract_defines_required_lifecycle_surfaces():
+    contract = _desktop_parity_contract()
+
+    assert contract['schema_version'] == 1
+    assert set(contract['status_contract']) == {
+        'startup_warm_load',
+        'runtime_detection',
+        'gpu_backend_selection',
+        'relay_registration_eligibility',
+        'ui_field_states',
+        'stop_operator',
+        'start_after_stop',
+        'packaged_resource_resolution',
+        'dependency_isolation',
+        'error_fallback_behavior',
+    }
+    assert [case['id'] for case in contract['platform_matrix']] == [
+        'windows_cuda_capable',
+        'macos_metal_capable',
+        'cpu_fallback',
+        'missing_runtime_dependency',
+    ]
+    assert {gap['id'] for gap in contract['known_gaps']} == {
+        'macos_runtime_bootstrap_probe_only',
+        'macos_real_operator_lifecycle_coverage',
+    }
+
+
+@pytest.mark.parametrize(
+    'case', _desktop_parity_contract()['platform_matrix'], ids=lambda case: case['id']
+)
+def test_desktop_runtime_platform_matrix_matches_parity_contract(monkeypatch, case):
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        'sys',
+        type(
+            'SysStub',
+            (),
+            {
+                'platform': case['platform'],
+                'executable': sys.executable,
+                'prefix': sys.prefix,
+                'argv': [str(MODULE_PATH)],
+            },
+        ),
+    )
+    monkeypatch.delenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(
+            backend=case['probe_backend'],
+            gpu=case['probe_gpu_offload_supported'],
+            device=case['probe_device'],
+            error=case.get('probe_error'),
+        ),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(case['requested_mode'])
+
+    assert result['selected_backend'] == case['expected_selected_backend']
+    assert result['runtime_action'] == case['expected_runtime_action']
+    if expected_reason := case.get('expected_fallback_contains'):
+        assert expected_reason in result['fallback_reason']
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Prompt 2 will replace macOS probe-only Metal runtime bootstrap with first-class Metal repair/install.',
+)
+def test_macos_missing_metal_runtime_bootstrap_gap_is_captured(monkeypatch):
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        'sys',
+        type(
+            'DarwinSysStub',
+            (),
+            {
+                'platform': 'darwin',
+                'executable': sys.executable,
+                'prefix': sys.prefix,
+                'argv': [str(MODULE_PATH)],
+            },
+        ),
+    )
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='cpu', gpu=False, device='cpu'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
+
+    assert result['selected_backend'] == 'metal'
+    assert result['runtime_action'] in {'installed_metal_reexec', 'already_supported'}

@@ -1578,9 +1578,11 @@ def api_v1_relay_servers_poll():
     first_request = None
     deadline = time.monotonic() + poll_wait_seconds
     while True:
+        server_missing = False
         with server_round_robin_lock:
-            if public_key not in known_servers:
-                return _server_not_found_response(first_request)
+            server_missing = public_key not in known_servers
+        if server_missing:
+            return _server_not_found_response(first_request)
         with client_inference_requests_changed:
             first_request = _pop_next_api_v1_request(public_key)
             if first_request is not None:
@@ -1590,19 +1592,23 @@ def api_v1_relay_servers_poll():
                 break
             client_inference_requests_changed.wait(timeout=remaining)
 
+    server_missing = False
     with server_round_robin_lock:
         server_payload = known_servers.get(public_key)
         if server_payload is None:
-            return _server_not_found_response(first_request)
-        server_payload.pop('polling_until_monotonic', None)
+            server_missing = True
+        else:
+            server_payload.pop('polling_until_monotonic', None)
 
-        if first_request is None:
-            server_payload['last_ping'] = datetime.now()
-            return jsonify({
-                'message': 'No requests available',
-                'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else max(server_payload['last_ping_duration'], 1),
-                'poll_wait_seconds': poll_wait_seconds,
-            }), 200
+            if first_request is None:
+                server_payload['last_ping'] = datetime.now()
+                return jsonify({
+                    'message': 'No requests available',
+                    'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else max(server_payload['last_ping_duration'], 1),
+                    'poll_wait_seconds': poll_wait_seconds,
+                }), 200
+    if server_missing:
+        return _server_not_found_response(first_request)
 
     queue_wait_ms = None
     queued_at = first_request.pop('_queued_at', None)
@@ -1610,18 +1616,22 @@ def api_v1_relay_servers_poll():
         queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
     request_id = first_request.get('request_id')
     if isinstance(request_id, str) and request_id:
+        server_missing = False
         with server_round_robin_lock:
             server_payload = known_servers.get(public_key)
             if server_payload is None:
-                return _server_not_found_response(first_request)
-            with api_v1_in_flight_requests_lock:
-                in_flight_requests = server_payload.setdefault('api_v1_in_flight_requests', {})
-                if isinstance(in_flight_requests, dict):
-                    in_flight_requests[request_id] = {
-                        'expires_at': time.monotonic() + _api_v1_in_flight_ttl_seconds(),
-                        'client_public_key': first_request.get('client_public_key'),
-                        'cancel_token': first_request.get('cancel_token'),
-                    }
+                server_missing = True
+            else:
+                with api_v1_in_flight_requests_lock:
+                    in_flight_requests = server_payload.setdefault('api_v1_in_flight_requests', {})
+                    if isinstance(in_flight_requests, dict):
+                        in_flight_requests[request_id] = {
+                            'expires_at': time.monotonic() + _api_v1_in_flight_ttl_seconds(),
+                            'client_public_key': first_request.get('client_public_key'),
+                            'cancel_token': first_request.get('cancel_token'),
+                        }
+        if server_missing:
+            return _server_not_found_response(first_request)
 
     LOGGER.info(
         "relay.api_v1.request_dispatched",

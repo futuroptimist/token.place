@@ -2266,12 +2266,23 @@ def test_api_v1_poll_marks_claimed_request_terminal_if_server_removed(client, mo
         relay_module._remove_known_server(public_key)
         return claimed
 
+    terminalized_without_server_lock = []
+    original_cancel = relay_module._cancel_api_v1_request
+
+    def cancel_without_server_lock(*args, **kwargs):
+        terminalized_without_server_lock.append(
+            not relay_module.server_round_robin_lock._is_owned()
+        )
+        return original_cancel(*args, **kwargs)
+
     monkeypatch.setattr(relay_module, '_pop_next_api_v1_request', pop_and_remove)
+    monkeypatch.setattr(relay_module, '_cancel_api_v1_request', cancel_without_server_lock)
 
     response = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_key})
 
     assert response.status_code == 404
     assert response.get_json()['error']['code'] == 404
+    assert terminalized_without_server_lock == [True]
     assert server_key not in known_servers
     assert server_key not in client_inference_requests
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids

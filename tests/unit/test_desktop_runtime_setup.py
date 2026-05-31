@@ -945,3 +945,104 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')
+
+
+def _load_parity_matrix():
+    matrix_path = (
+        REPO_ROOT / "tests" / "fixtures" / "desktop_operator_parity_matrix.json"
+    )
+    return json.loads(matrix_path.read_text(encoding="utf-8"))
+
+
+class _PlatformStub:
+    executable = sys.executable
+    prefix = sys.prefix
+    argv = [str(MODULE_PATH)]
+
+    def __init__(self, platform):
+        self.platform = platform
+
+
+def _probe_from_matrix_case(case):
+    probe = case["probe"]
+    return _probe(
+        backend=probe["backend"],
+        gpu=probe["gpu"],
+        device=probe["device"],
+        error=probe.get("error"),
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(case, id=case["id"])
+        for case in _load_parity_matrix()["platform_cases"]
+        if "expect" in case
+    ],
+)
+def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
+    monkeypatch.setattr(desktop_runtime_setup, "sys", _PlatformStub(case["platform"]))
+    monkeypatch.delenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.delenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, raising=False)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        "_probe_llama_runtime",
+        lambda **_: _probe_from_matrix_case(case),
+    )
+    invoked = {"pip": False, "source_repair": False}
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        "_windows_cuda_source_repair",
+        lambda _requirements_path: (invoked.update(source_repair=True), "")
+        and (False, "unexpected"),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        "_run_pip_install",
+        lambda *_args, **_kwargs: (invoked.update(pip=True), "")
+        and (False, "unexpected"),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        case["mode"], repo_root=REPO_ROOT
+    )
+
+    expected = case["expect"]
+    assert result["selected_backend"] == expected["selected_backend"]
+    assert result["runtime_action"] == expected["runtime_action"]
+    if "fallback_reason" in expected:
+        assert result.get("fallback_reason", "") == expected["fallback_reason"]
+    if "fallback_reason_contains" in expected:
+        assert expected["fallback_reason_contains"] in result.get("fallback_reason", "")
+    if case["id"] in {
+        "macos_metal_capable",
+        "cpu_fallback",
+        "missing_runtime_dependency",
+    }:
+        assert invoked == {"pip": False, "source_repair": False}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Prompt 2 will replace macOS probe-only runtime behavior with Metal bootstrap support.",
+)
+def test_macos_missing_metal_runtime_bootstrap_gap_is_captured(monkeypatch):
+    case = next(
+        case
+        for case in _load_parity_matrix()["platform_cases"]
+        if case["id"] == "macos_metal_bootstrap_gap"
+    )
+    monkeypatch.setattr(desktop_runtime_setup, "sys", _PlatformStub(case["platform"]))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        "_probe_llama_runtime",
+        lambda **_: _probe_from_matrix_case(case),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
+        case["mode"], repo_root=REPO_ROOT
+    )
+
+    assert result["selected_backend"] == case["expect_future"]["selected_backend"]
+    assert result["runtime_action"] == case["expect_future"]["runtime_action"]

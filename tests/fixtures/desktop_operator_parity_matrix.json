@@ -75,8 +75,8 @@
             },
             "expect": {
                 "selected_backend": "cpu",
-                "runtime_action": "probe_only",
-                "fallback_reason_contains": "GPU runtime unavailable"
+                "runtime_action": "failed",
+                "fallback_reason_contains": "desktop model runtime dependency unavailable"
             }
         },
         {
@@ -94,7 +94,12 @@
                 "selected_backend": "metal",
                 "runtime_action": "installed_metal_reexec"
             },
-            "known_gap": "Prompt 2 will replace macOS probe-only behavior with first-class Metal bootstrap support."
+            "known_gap": "The macOS bootstrap follow-up will replace probe-only behavior with first-class Metal bootstrap support.",
+            "expect": {
+                "selected_backend": "cpu",
+                "runtime_action": "probe_only",
+                "fallback_reason_contains": "desktop auto-repair is currently Windows-focused"
+            }
         }
     ]
 }

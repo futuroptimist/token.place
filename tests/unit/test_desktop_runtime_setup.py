@@ -1019,15 +1019,16 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         "macos_metal_capable",
         "cpu_fallback",
         "missing_runtime_dependency",
+        "macos_metal_bootstrap_gap",
     }:
         assert invoked == {"pip": False, "source_repair": False}
 
 
 @pytest.mark.xfail(
     strict=True,
-    reason="Prompt 2 will replace macOS probe-only runtime behavior with Metal bootstrap support.",
+    reason="The macOS bootstrap follow-up will replace probe-only runtime behavior with Metal bootstrap support.",
 )
-def test_macos_missing_metal_runtime_bootstrap_gap_is_captured(monkeypatch):
+def test_macos_missing_metal_runtime_bootstrap_gap_future_parity(monkeypatch):
     case = next(
         case
         for case in _load_parity_matrix()["platform_cases"]

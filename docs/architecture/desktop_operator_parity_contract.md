@@ -9,7 +9,7 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 | Platform path | Expected capability | Bootstrap expectation |
 | --- | --- | --- |
 | Windows CUDA-capable | Detect CUDA-capable `llama-cpp-python` and select CUDA for GPU/auto modes. | If GPU runtime is missing and bootstrap is explicitly enabled, repair or install a CUDA-capable runtime; fail closed with actionable diagnostics when GPU mode cannot be provisioned. |
-| macOS Metal-capable | Detect Metal-capable `llama-cpp-python` and select Metal for GPU/auto modes. | Target parity is first-class Metal runtime bootstrap. Current known gap: missing Metal runtime is probe-only until Prompt 2. |
+| macOS Metal-capable | Detect Metal-capable `llama-cpp-python` and select Metal for GPU/auto modes. | Target parity is first-class Metal runtime bootstrap. Current known gap: missing Metal runtime is probe-only until the macOS bootstrap follow-up lands. |
 | CPU fallback | Honor explicit CPU mode and report CPU backend fields. | Do not attempt GPU bootstrap in CPU mode. |
 | Missing runtime/dependency | Fail closed before relay registration when bridge dependencies are unavailable. | Report the missing interpreter/import root/module or install failure without logging plaintext payloads. |
 
@@ -28,5 +28,5 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 
 ## Known gaps captured by tests
 
-- macOS missing Metal runtime bootstrap currently reports `probe_only`; Prompt 2 should make this a first-class Metal repair/install path.
-- macOS packaged operator tests currently cover resource layout more than real operator lifecycle parity; Prompts 3 and 4 should add packaged launcher/resource parity and lifecycle e2e coverage.
+- macOS missing Metal runtime bootstrap currently reports `probe_only`; the macOS bootstrap follow-up should make this a first-class Metal repair/install path.
+- macOS packaged operator tests currently cover resource layout more than real operator lifecycle parity; follow-up work should add packaged launcher/resource parity and lifecycle e2e coverage.

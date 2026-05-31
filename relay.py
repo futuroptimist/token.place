@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
@@ -449,6 +449,8 @@ def _validate_server_registration():
 
 
 known_servers = {}
+relay_dispatch_lock = threading.RLock()
+round_robin_next_index = 0
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
@@ -620,7 +622,8 @@ def _live_server_diagnostics() -> list[dict[str, Any]]:
 def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
-    removed = known_servers.pop(server_public_key, None) is not None
+    with relay_dispatch_lock:
+        removed = known_servers.pop(server_public_key, None) is not None
     dropped_requests = []
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
@@ -847,9 +850,42 @@ def _legacy_route_deprecated_response(route_name: str):
     }), 410
 
 
-def _select_next_server_payload(*, api_v1: bool = False):
+def _fresh_registered_server_keys() -> list[str]:
+    """Return currently eligible compute node keys in deterministic registration order."""
+
     _evict_stale_servers()
-    if not known_servers:
+    return [
+        server_public_key
+        for server_public_key, payload in known_servers.items()
+        if isinstance(payload, dict) and payload.get("public_key") == server_public_key
+    ]
+
+
+def _select_round_robin_server_key() -> tuple[str | None, int, int]:
+    """Select the next fresh compute node using in-memory round-robin order.
+
+    The deterministic order is current registration order. If a node unregisters
+    and later registers again, Python dict insertion order places it at the end
+    of the cycle.
+    """
+
+    global round_robin_next_index
+    with relay_dispatch_lock:
+        server_keys = _fresh_registered_server_keys()
+        total_servers = len(server_keys)
+        if total_servers == 0:
+            round_robin_next_index = 0
+            return None, 0, 0
+
+        selected_position = round_robin_next_index % total_servers
+        selected_key = server_keys[selected_position]
+        round_robin_next_index = (selected_position + 1) % total_servers
+        return selected_key, selected_position, total_servers
+
+
+def _select_next_server_payload(*, api_v1: bool = False):
+    server_public_key, selected_position, total_servers = _select_round_robin_server_key()
+    if server_public_key is None:
         if api_v1:
             return jsonify({
                 'error': {
@@ -858,7 +894,16 @@ def _select_next_server_payload(*, api_v1: bool = False):
                 }
             }), 503
         return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-    server_public_key = secrets.choice(list(known_servers.keys()))
+
+    LOGGER.info(
+        "relay.server_selected",
+        extra={
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
+            "selection_policy": "round_robin",
+            "round_robin_position": selected_position,
+            "eligible_server_count": total_servers,
+        },
+    )
     return jsonify({'server_public_key': known_servers[server_public_key]['public_key']})
 
 @app.route('/next_server', methods=['GET'])
@@ -1401,17 +1446,18 @@ def api_v1_relay_servers_register():
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
 
-    if public_key in known_servers:
-        known_servers[public_key]['last_ping'] = datetime.now()
-        log_event = "server.reregister"
-    else:
-        known_servers[public_key] = {
-            'public_key': public_key,
-            'last_ping': datetime.now(),
-            'last_ping_duration': _api_v1_lease_seconds(),
-        }
-        log_event = "server.registered"
-    known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
+    with relay_dispatch_lock:
+        if public_key in known_servers:
+            known_servers[public_key]['last_ping'] = datetime.now()
+            log_event = "server.reregister"
+        else:
+            known_servers[public_key] = {
+                'public_key': public_key,
+                'last_ping': datetime.now(),
+                'last_ping_duration': _api_v1_lease_seconds(),
+            }
+            log_event = "server.registered"
+        known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
     LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({

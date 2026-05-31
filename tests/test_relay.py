@@ -41,6 +41,7 @@ def client():
     os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
+    relay_module.round_robin_next_index = 0
     client_inference_requests.clear()
     client_pending_request_ids.clear()
     client_terminal_request_ids.clear()
@@ -57,6 +58,7 @@ def client():
         os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
+    relay_module.round_robin_next_index = 0
     client_inference_requests.clear()
     client_pending_request_ids.clear()
     client_terminal_request_ids.clear()
@@ -2238,9 +2240,180 @@ def test_api_v1_unregister_is_idempotent_when_server_already_gone(client):
 
 
 
-def _api_v1_request_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_KEY, cancel_token="cancel-proof"):
+def _rr_server_key(label: str) -> str:
+    return base64.b64encode(f"round_robin_server_{label}".encode("utf-8")).decode("utf-8")
+
+
+def _register_api_v1_server(client, server_public_key: str):
+    response = client.post(
+        '/api/v1/relay/servers/register',
+        json={'server_public_key': server_public_key},
+    )
+    assert response.status_code == 200
+    return response
+
+
+def _next_api_v1_server(client) -> str:
+    response = client.get('/api/v1/relay/servers/next')
+    assert response.status_code == 200
+    return response.get_json()['server_public_key']
+
+
+def test_api_v1_next_round_robin_two_fresh_registered_nodes(client):
+    server_a = _rr_server_key('a')
+    server_b = _rr_server_key('b')
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    assert [_next_api_v1_server(client) for _ in range(4)] == [
+        server_a,
+        server_b,
+        server_a,
+        server_b,
+    ]
+
+
+def test_api_v1_requests_queue_to_round_robin_selected_servers_and_poll_isolated(client):
+    server_a = _rr_server_key('a')
+    server_b = _rr_server_key('b')
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    selected_servers = []
+    for idx in range(4):
+        selected = _next_api_v1_server(client)
+        selected_servers.append(selected)
+        queued = client.post(
+            '/api/v1/relay/requests',
+            json=_api_v1_request_payload(
+                f'req-rr-{idx}',
+                server_public_key=selected,
+                client_public_key=f'{DUMMY_CLIENT_PUB_KEY}-{idx}',
+                cancel_token=f'proof-{idx}',
+            ),
+        )
+        assert queued.status_code == 200
+
+    assert selected_servers == [server_a, server_b, server_a, server_b]
+    assert [item['request_id'] for item in client_inference_requests[server_a]] == [
+        'req-rr-0',
+        'req-rr-2',
+    ]
+    assert [item['request_id'] for item in client_inference_requests[server_b]] == [
+        'req-rr-1',
+        'req-rr-3',
+    ]
+
+    first_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
+    first_b = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_b})
+    second_a = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_a})
+    second_b = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_b})
+
+    assert first_a.get_json()['request_id'] == 'req-rr-0'
+    assert first_b.get_json()['request_id'] == 'req-rr-1'
+    assert second_a.get_json()['request_id'] == 'req-rr-2'
+    assert second_b.get_json()['request_id'] == 'req-rr-3'
+
+
+def test_api_v1_next_round_robin_three_nodes(client):
+    server_a = _rr_server_key('a')
+    server_b = _rr_server_key('b')
+    server_c = _rr_server_key('c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert [_next_api_v1_server(client) for _ in range(6)] == [
+        server_a,
+        server_b,
+        server_c,
+        server_a,
+        server_b,
+        server_c,
+    ]
+
+
+def test_api_v1_next_round_robin_skips_expired_and_unregistered_nodes(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    server_a = _rr_server_key('a')
+    server_b = _rr_server_key('b')
+    server_c = _rr_server_key('c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
+    relay_module.round_robin_next_index = 0
+    assert [_next_api_v1_server(client) for _ in range(4)] == [
+        server_a,
+        server_c,
+        server_a,
+        server_c,
+    ]
+    assert server_b not in known_servers
+
+    unregistered = client.post('/unregister', json={'server_public_key': server_a})
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+    assert [_next_api_v1_server(client) for _ in range(3)] == [server_c, server_c, server_c]
+
+
+def test_api_v1_reregistered_node_reenters_round_robin_at_end(client):
+    server_a = _rr_server_key('a')
+    server_b = _rr_server_key('b')
+    server_c = _rr_server_key('c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert client.post('/unregister', json={'server_public_key': server_b}).status_code == 200
+    _register_api_v1_server(client, server_b)
+    relay_module.round_robin_next_index = 0
+
+    # Re-registering after unregister inserts the node at the end of registration order.
+    assert [_next_api_v1_server(client) for _ in range(6)] == [
+        server_a,
+        server_c,
+        server_b,
+        server_a,
+        server_c,
+        server_b,
+    ]
+
+
+def test_api_v1_next_round_robin_selection_is_lock_protected(client):
+    server_a = _rr_server_key('a')
+    server_b = _rr_server_key('b')
+    for server_key in (server_a, server_b):
+        _register_api_v1_server(client, server_key)
+
+    selections = []
+    selections_lock = threading.Lock()
+
+    def _select_once():
+        with app.test_client() as thread_client:
+            selected = _next_api_v1_server(thread_client)
+        with selections_lock:
+            selections.append(selected)
+
+    threads = [threading.Thread(target=_select_once) for _ in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+
+    assert selections.count(server_a) == 5
+    assert selections.count(server_b) == 5
+
+
+def _api_v1_request_payload(
+    request_id,
+    *,
+    client_public_key=DUMMY_CLIENT_PUB_KEY,
+    server_public_key=DUMMY_SERVER_PUB_KEY,
+    cancel_token="cancel-proof",
+):
     return {
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'server_public_key': server_public_key,
         'client_public_key': client_public_key,
         'request_id': request_id,
         'protocol': 'tokenplace_api_v1_relay_e2ee',

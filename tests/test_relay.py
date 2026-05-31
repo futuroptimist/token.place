@@ -1933,7 +1933,7 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert response_plaintext not in json.dumps(retrieved_payload)
 
 
-def test_api_v1_poll_requeues_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
+def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
 
@@ -1960,9 +1960,8 @@ def test_api_v1_poll_requeues_popped_work_if_server_unregistered_before_dispatch
     poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 404
 
-    queued_after = client_inference_requests.get(DUMMY_SERVER_PUB_KEY, [])
-    assert len(queued_after) == 1
-    assert queued_after[0]['request_id'] == 'req-requeue-on-unregister-race'
+    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
 
 
 def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
@@ -2245,10 +2244,11 @@ def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(clien
 
 
 
-def test_api_v1_poll_requeues_claimed_request_if_server_removed(client, monkeypatch):
+def test_api_v1_poll_clears_claimed_request_if_server_removed(client, monkeypatch):
     server_key = _server_key('poll_removed')
     request_id = 'req-poll-removed'
     _register_api_v1_server(client, server_key)
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, request_id, cancel_token='proof')
     client_inference_requests[server_key] = [{
         'request_id': request_id,
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
@@ -2273,7 +2273,8 @@ def test_api_v1_poll_requeues_claimed_request_if_server_removed(client, monkeypa
     assert response.status_code == 404
     assert response.get_json()['error']['code'] == 404
     assert server_key not in known_servers
-    assert client_inference_requests[server_key][0]['request_id'] == request_id
+    assert server_key not in client_inference_requests
+    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
 
 
 class _LockCheckingKnownServers(dict):
@@ -2285,6 +2286,34 @@ class _LockCheckingKnownServers(dict):
         if relay_module.server_round_robin_lock._is_owned():
             self.values_checked_under_server_lock = True
         return super().values()
+
+
+def test_api_v1_cancel_token_lookup_scans_known_servers_under_registry_lock(client, monkeypatch):
+    request_id = 'req-cancel-token-lock-scan'
+    checking_servers = _LockCheckingKnownServers({
+        DUMMY_SERVER_PUB_KEY: {
+            'public_key': DUMMY_SERVER_PUB_KEY,
+            'last_ping': datetime.now(),
+            'last_ping_duration': 60,
+            relay_module.API_V1_SERVER_MARKER: True,
+            'api_v1_in_flight_requests': {
+                request_id: {
+                    'expires_at': time.monotonic() + 60,
+                    'client_public_key': DUMMY_CLIENT_PUB_KEY,
+                    'cancel_token': 'proof',
+                },
+            },
+        },
+    })
+    monkeypatch.setattr(relay_module, 'known_servers', checking_servers)
+
+    token = relay_module._cancel_token_for_queued_or_in_flight_request(
+        DUMMY_CLIENT_PUB_KEY,
+        request_id,
+    )
+
+    assert token == 'proof'
+    assert checking_servers.values_checked_under_server_lock is True
 
 
 def test_api_v1_cancel_scans_known_servers_under_registry_lock(client, monkeypatch):

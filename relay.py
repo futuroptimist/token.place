@@ -1414,15 +1414,16 @@ def _cancel_token_for_queued_or_in_flight_request(client_public_key, request_id)
                 ):
                     token = item.get("cancel_token")
                     return token if isinstance(token, str) and token else None
-    with api_v1_in_flight_requests_lock:
-        for server_payload in known_servers.values():
-            in_flight_requests = server_payload.get("api_v1_in_flight_requests")
-            if not isinstance(in_flight_requests, dict):
-                continue
-            entry = in_flight_requests.get(request_id)
-            if isinstance(entry, dict) and entry.get("client_public_key") == client_public_key:
-                token = entry.get("cancel_token")
-                return token if isinstance(token, str) and token else None
+    with server_round_robin_lock:
+        with api_v1_in_flight_requests_lock:
+            for server_payload in known_servers.values():
+                in_flight_requests = server_payload.get("api_v1_in_flight_requests")
+                if not isinstance(in_flight_requests, dict):
+                    continue
+                entry = in_flight_requests.get(request_id)
+                if isinstance(entry, dict) and entry.get("client_public_key") == client_public_key:
+                    token = entry.get("cancel_token")
+                    return token if isinstance(token, str) and token else None
     return None
 
 
@@ -1559,16 +1560,17 @@ def api_v1_relay_servers_poll():
         server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
     LOGGER.info("server.heartbeat", extra={"server_public_key": public_key})
 
-    def _requeue_claimed_request(claimed_request):
-        if claimed_request is None:
+    def _clear_claimed_request(claimed_request):
+        if not isinstance(claimed_request, dict):
             return
-        with client_inference_requests_changed:
-            queued_requests = client_inference_requests.setdefault(public_key, [])
-            queued_requests.insert(0, claimed_request)
-            client_inference_requests_changed.notify_all()
+        if bool(claimed_request.get('e2ee_v1')):
+            _clear_pending_request(
+                claimed_request.get('client_public_key'),
+                claimed_request.get('request_id'),
+            )
 
     def _server_not_found_response(claimed_request=None):
-        _requeue_claimed_request(claimed_request)
+        _clear_claimed_request(claimed_request)
         return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
 
     first_request = None

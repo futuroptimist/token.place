@@ -103,11 +103,7 @@ def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, m
 def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(client):
     """Client discovery and response polling stay outside the public API quota."""
 
-    known_servers[DUMMY_SERVER_PUB_KEY] = {
-        "public_key": DUMMY_SERVER_PUB_KEY,
-        "last_ping": datetime.now(),
-        "last_ping_duration": 60,
-    }
+    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
     client_pending_request_ids[DUMMY_CLIENT_PUB_KEY] = {"request-1": time.time()}
 
     next_responses = [client.get("/api/v1/relay/servers/next") for _ in range(65)]
@@ -2159,6 +2155,63 @@ def test_api_v1_next_round_robins_three_registered_compute_nodes(client):
 
     assert selections == [server_a, server_b, server_c, server_a, server_b, server_c]
 
+
+def test_api_v1_next_filters_out_legacy_only_servers(client):
+    legacy_server = _server_key('legacy_only')
+    api_server_a = _server_key('api_filter_a')
+    api_server_b = _server_key('api_filter_b')
+
+    legacy_registration = client.post('/sink', json={'server_public_key': legacy_server})
+    assert legacy_registration.status_code == 200
+    _register_api_v1_server(client, api_server_a)
+    _register_api_v1_server(client, api_server_b)
+
+    selections = [_next_api_v1_server_key(client) for _ in range(4)]
+
+    assert selections == [api_server_a, api_server_b, api_server_a, api_server_b]
+    assert legacy_server not in selections
+
+
+def test_api_v1_round_robin_preserves_next_node_after_selected_server_unregisters(client):
+    server_a = _server_key('cursor_selected_removed_a')
+    server_b = _server_key('cursor_selected_removed_b')
+    server_c = _server_key('cursor_selected_removed_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert _next_api_v1_server_key(client) == server_a
+
+    unregistered = client.post('/unregister', json={'server_public_key': server_a})
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_b,
+        server_c,
+        server_b,
+        server_c,
+    ]
+
+
+def test_api_v1_round_robin_preserves_next_node_after_earlier_server_eviction(client, monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    server_a = _server_key('cursor_evicted_a')
+    server_b = _server_key('cursor_evicted_b')
+    server_c = _server_key('cursor_evicted_c')
+    for server_key in (server_a, server_b, server_c):
+        _register_api_v1_server(client, server_key)
+
+    assert _next_api_v1_server_key(client) == server_a
+    known_servers[server_a]['last_ping'] = datetime.now() - timedelta(seconds=5)
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_b,
+        server_c,
+        server_b,
+        server_c,
+    ]
+    assert server_a not in known_servers
 
 def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(client):
     server_a = _server_key('queue_a')

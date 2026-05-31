@@ -451,6 +451,7 @@ def _validate_server_registration():
 known_servers = {}
 server_round_robin_lock = threading.Lock()
 server_round_robin_next_index = 0
+API_V1_SERVER_MARKER = "api_v1_registered"
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
@@ -619,10 +620,48 @@ def _live_server_diagnostics() -> list[dict[str, Any]]:
     return diagnostics
 
 
+def _api_v1_round_robin_keys() -> list[str]:
+    """Return API v1-capable compute node keys in registration order."""
+
+    return [
+        server_public_key
+        for server_public_key, payload in known_servers.items()
+        if bool(payload.get(API_V1_SERVER_MARKER))
+    ]
+
+
+def _remove_known_server(server_public_key: str) -> bool:
+    """Remove a known server while preserving the API v1 round-robin cursor."""
+
+    global server_round_robin_next_index
+    with server_round_robin_lock:
+        api_v1_ordered_keys = _api_v1_round_robin_keys()
+        if server_public_key not in known_servers:
+            return False
+
+        is_api_v1_candidate = server_public_key in api_v1_ordered_keys
+        if is_api_v1_candidate:
+            removed_position = api_v1_ordered_keys.index(server_public_key)
+            current_position = server_round_robin_next_index % len(api_v1_ordered_keys)
+
+        known_servers.pop(server_public_key, None)
+
+        if is_api_v1_candidate:
+            remaining_count = len(api_v1_ordered_keys) - 1
+            if remaining_count <= 0:
+                server_round_robin_next_index = 0
+            elif removed_position < current_position:
+                server_round_robin_next_index = (current_position - 1) % remaining_count
+            else:
+                server_round_robin_next_index = current_position % remaining_count
+
+        return True
+
+
 def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
-    removed = known_servers.pop(server_public_key, None) is not None
+    removed = _remove_known_server(server_public_key)
     dropped_requests = []
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
@@ -850,18 +889,19 @@ def _legacy_route_deprecated_response(route_name: str):
 
 
 def _select_round_robin_server_key() -> tuple[str | None, dict[str, Any]]:
-    """Select the next live compute node in registration-order round-robin order."""
+    """Select the next API v1 compute node in registration-order round-robin order."""
 
     global server_round_robin_next_index
-    ordered_keys = list(known_servers.keys())
-    if not ordered_keys:
-        return None, {
-            "eligible_count": 0,
-            "round_robin_index": 0,
-            "round_robin_position": None,
-        }
-
     with server_round_robin_lock:
+        ordered_keys = _api_v1_round_robin_keys()
+        if not ordered_keys:
+            server_round_robin_next_index = 0
+            return None, {
+                "eligible_count": 0,
+                "round_robin_index": 0,
+                "round_robin_position": None,
+            }
+
         eligible_count = len(ordered_keys)
         round_robin_index = server_round_robin_next_index % eligible_count
         server_public_key = ordered_keys[round_robin_index]
@@ -1456,19 +1496,28 @@ def api_v1_relay_servers_register():
     if not public_key:
         return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
 
-    if public_key in known_servers:
-        known_servers[public_key]['last_ping'] = datetime.now()
+    existing_payload = known_servers.get(public_key)
+    existing_api_v1_count = len(_api_v1_round_robin_keys())
+    if existing_payload and existing_payload.get(API_V1_SERVER_MARKER):
+        existing_payload['last_ping'] = datetime.now()
         log_event = "server.reregister"
     else:
-        if not known_servers:
+        if existing_api_v1_count == 0:
             server_round_robin_next_index = 0
-        known_servers[public_key] = {
-            'public_key': public_key,
-            'last_ping': datetime.now(),
-            'last_ping_duration': _api_v1_lease_seconds(),
-        }
+        if existing_payload:
+            existing_payload['last_ping'] = datetime.now()
+            known_servers.pop(public_key, None)
+            known_servers[public_key] = existing_payload
+        else:
+            known_servers[public_key] = {
+                'public_key': public_key,
+                'last_ping': datetime.now(),
+                'last_ping_duration': _api_v1_lease_seconds(),
+            }
+        known_servers[public_key][API_V1_SERVER_MARKER] = True
         log_event = "server.registered"
     known_servers[public_key]['last_ping_duration'] = _api_v1_lease_seconds()
+    known_servers[public_key][API_V1_SERVER_MARKER] = True
     LOGGER.info(log_event, extra={"server_public_key": public_key})
 
     return jsonify({

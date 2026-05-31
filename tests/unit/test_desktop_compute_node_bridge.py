@@ -2648,3 +2648,174 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+
+@pytest.mark.parametrize(
+    'platform_id,backend',
+    [
+        ('windows_cuda_capable', 'cuda'),
+        ('macos_metal_capable', 'metal'),
+        ('cpu_fallback', 'cpu'),
+    ],
+)
+def test_platform_neutral_status_contract_registers_only_after_ready_and_reports_runtime_backend(
+    capsys, monkeypatch, platform_id, backend
+):
+    _reset_cancel_queue()
+    matrix_path = Path(__file__).resolve().parents[2] / 'tests' / 'fixtures' / 'desktop_operator_parity_matrix.json'
+    matrix = json.loads(matrix_path.read_text(encoding='utf-8'))
+    assert any(entry['id'] == platform_id for entry in matrix['platforms'])
+
+    class BackendReadyRuntime(ApiV1Runtime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            BackendReadyRuntime.last_instance = self
+            self.model_manager.last_compute_diagnostics = {
+                'requested_mode': 'auto',
+                'effective_mode': 'pending',
+                'backend_available': 'unknown',
+                'backend_selected': 'unknown',
+                'backend_used': 'unknown',
+                'n_gpu_layers': -1,
+                'offloaded_layers': -1,
+                'kv_cache_device': 'gpu' if backend != 'cpu' else 'cpu',
+                'fallback_reason': None,
+            }
+
+        def ensure_api_v1_runtime_ready(self):
+            self.model_manager.last_compute_diagnostics = {
+                'requested_mode': 'auto',
+                'effective_mode': backend if backend != 'cpu' else 'cpu_fallback',
+                'backend_available': backend,
+                'backend_selected': backend,
+                'backend_used': backend,
+                'n_gpu_layers': -1 if backend != 'cpu' else 0,
+                'offloaded_layers': -1 if backend != 'cpu' else 0,
+                'kv_cache_device': 'gpu' if backend != 'cpu' else 'cpu',
+                'fallback_reason': None if backend != 'cpu' else 'no CUDA/Metal backend is supported on this platform',
+            }
+            return True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=BackendReadyRuntime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': backend,
+            'detected_device': backend,
+            'runtime_action': 'already_supported' if backend != 'cpu' else 'probe_only',
+            'fallback_reason': '',
+            'interpreter': sys.executable,
+            'llama_module_path': 'site-packages/llama_cpp/__init__.py',
+        },
+    )
+    stop_counter = {'count': 0}
+
+    def stop_after_ready_status():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_ready_status)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    lifecycle_events = [event for event in events if event['type'] in {'started', 'status'}]
+
+    assert lifecycle_events[0]['registered'] is False
+    assert lifecycle_events[0]['relay_runtime_state'] in {'starting', 'warming'}
+    assert lifecycle_events[0]['backend_used'] == 'pending'
+    ready_registered = [
+        event for event in lifecycle_events
+        if event.get('relay_runtime_state') == 'ready' and event.get('registered') is True
+    ]
+    assert ready_registered
+    for event in ready_registered:
+        assert event['backend_available'] == backend
+        assert event['backend_selected'] == backend
+        assert event['backend_used'] == backend
+        assert event['last_error'] is None
+
+
+def test_status_contract_keeps_registered_false_when_relay_registration_is_not_fresh(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+
+    class StaleRegistrationRuntime(ApiV1Runtime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.relay_client = StaleRelayClient()
+            self._responses = [{'next_ping_in_x_seconds': 0, 'error': None}]
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=StaleRegistrationRuntime)
+    stop_counter = {'count': 0}
+
+    def stop_after_status():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', stop_after_status)
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None
+    )
+
+    assert compute_node_bridge.run(args) == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    status_events = [event for event in events if event['type'] == 'status']
+
+    assert status_events
+    assert all(event['registered'] is False for event in status_events)
+
+
+def test_missing_desktop_dependency_status_error_is_actionable_and_never_registered(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {
+            'ok': 'false',
+            'action': 'requirements_missing',
+            'missing': 'psutil,requests',
+            'interpreter': sys.executable,
+            'import_root': '/Applications/token.place.app/Contents/Resources',
+            'requirements': '/Applications/token.place.app/Contents/Resources/python/requirements_desktop_runtime.txt',
+            'detail': 'requirements file is missing from packaged resources',
+        },
+    )
+    args = SimpleNamespace(
+        model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_port=None
+    )
+
+    assert compute_node_bridge.run(args) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    error = events[0]
+
+    assert error['type'] == 'error'
+    assert error['registered'] is False
+    assert error['relay_runtime_state'] == 'failed'
+    assert 'desktop runtime dependency preflight failed' in error['last_error']
+    assert 'missing=psutil,requests' in error['last_error']
+    assert 'interpreter=' in error['last_error']
+    assert 'import_root=/Applications/token.place.app/Contents/Resources' in error['last_error']
+
+
+@pytest.mark.xfail(strict=True, reason='Prompt 4 adds real macOS packaged operator lifecycle coverage')
+def test_macos_packaged_operator_e2e_covers_full_lifecycle_parity():
+    workflow = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
+    body = workflow.read_text(encoding='utf-8')
+
+    assert 'macos' in body.lower()
+    assert 'test_packaged_operator_e2e.py' in body
+    assert 'multi-turn' in body.lower()
+    assert 'start-after-stop' in body.lower()

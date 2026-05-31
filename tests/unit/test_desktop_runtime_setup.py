@@ -945,3 +945,122 @@ def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runti
     assert '--target' in captured['cmd']
     target_idx = captured['cmd'].index('--target') + 1
     assert captured['cmd'][target_idx] == str(home_dir / '.token_place_desktop_site')
+
+
+def _load_desktop_operator_parity_matrix():
+    matrix_path = REPO_ROOT / 'tests' / 'fixtures' / 'desktop_operator_parity_matrix.json'
+    return json.loads(matrix_path.read_text(encoding='utf-8'))
+
+
+def test_desktop_operator_parity_matrix_defines_required_platform_paths():
+    matrix = _load_desktop_operator_parity_matrix()
+    entries = {entry['id']: entry for entry in matrix['platforms']}
+
+    assert {
+        'windows_cuda_capable',
+        'macos_metal_capable',
+        'cpu_fallback',
+        'missing_runtime_or_dependency',
+    } <= set(entries)
+    assert entries['windows_cuda_capable']['gpu_backend_selection']['auto'] == 'cuda'
+    assert entries['macos_metal_capable']['gpu_backend_selection']['auto'] == 'metal'
+    assert entries['cpu_fallback']['ui_status']['warming_registered'] is False
+    assert entries['missing_runtime_or_dependency']['registration_eligibility'] == 'never registered'
+    assert any(gap['id'] == 'macos_runtime_bootstrap_probe_only' for gap in matrix['known_gaps'])
+
+
+@pytest.mark.parametrize(
+    'matrix_id,sys_platform,mode,initial_probe,expected_action,expected_backend',
+    [
+        (
+            'windows_cuda_capable',
+            'win32',
+            'auto',
+            _probe(backend='cuda', gpu=True, device='cuda'),
+            'already_supported',
+            'cuda',
+        ),
+        (
+            'macos_metal_capable',
+            'darwin',
+            'auto',
+            _probe(backend='metal', gpu=True, device='metal'),
+            'already_supported',
+            'metal',
+        ),
+        (
+            'cpu_fallback',
+            'linux',
+            'cpu',
+            _probe(backend='cpu', gpu=False, device='cpu'),
+            'skipped',
+            'cpu',
+        ),
+        (
+            'missing_runtime_or_dependency',
+            'linux',
+            'auto',
+            _probe(backend='missing', gpu=False, device='none', error='No module named llama_cpp'),
+            'probe_only',
+            'cpu',
+        ),
+    ],
+)
+def test_desktop_runtime_setup_platform_matrix_probe_paths(
+    monkeypatch, matrix_id, sys_platform, mode, initial_probe, expected_action, expected_backend
+):
+    matrix = _load_desktop_operator_parity_matrix()
+    assert any(entry['id'] == matrix_id for entry in matrix['platforms'])
+
+    sys_stub = type(
+        'SysStub',
+        (),
+        {
+            'platform': sys_platform,
+            'executable': sys.executable,
+            'prefix': sys.prefix,
+            'argv': [str(MODULE_PATH)],
+        },
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', sys_stub)
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: initial_probe)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime(mode, repo_root=REPO_ROOT)
+
+    assert result['runtime_action'] == expected_action
+    assert result['selected_backend'] == expected_backend
+    assert result['detected_device'] == initial_probe.detected_device
+    if matrix_id == 'missing_runtime_or_dependency':
+        assert 'No module named llama_cpp' in result['fallback_reason']
+        assert result['interpreter'] == sys.executable
+
+
+@pytest.mark.xfail(strict=True, reason='Prompt 2 adds first-class macOS Metal runtime bootstrap')
+def test_macos_metal_runtime_bootstrap_repairs_missing_gpu_runtime(monkeypatch, tmp_path):
+    sys_stub = type(
+        'SysStub',
+        (),
+        {
+            'platform': 'darwin',
+            'executable': sys.executable,
+            'prefix': sys.prefix,
+            'argv': [str(MODULE_PATH)],
+        },
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', sys_stub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([
+        _probe(backend='missing', gpu=False, device='none', error='No module named llama_cpp'),
+        _probe(backend='metal', gpu=True, device='metal'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'not windows'))
+
+    requirements = tmp_path / 'resources' / 'requirements.txt'
+    requirements.parent.mkdir(parents=True)
+    requirements.write_text('llama-cpp-python==0.3.16\n', encoding='utf-8')
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
+
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert result['selected_backend'] == 'metal'

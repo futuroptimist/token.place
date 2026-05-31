@@ -1,0 +1,108 @@
+{
+  "contract_version": 1,
+  "platforms": [
+    {
+      "id": "windows_cuda_capable",
+      "os": "windows",
+      "sys_platform": "win32",
+      "accelerator": "cuda",
+      "startup": "warm-load before relay registration",
+      "runtime_detection": "llama-cpp-python reports CUDA and GPU offload support",
+      "gpu_backend_selection": {
+        "auto": "cuda",
+        "gpu": "cuda",
+        "hybrid": "cuda",
+        "cpu": "cpu"
+      },
+      "registration_eligibility": "registered only after API v1 runtime is ready and relay registration is fresh",
+      "ui_status": {
+        "warming_registered": false,
+        "ready_registered_after_relay": true,
+        "backend_used": "cuda"
+      },
+      "stop_start": "Stop emits stopped status; Start after Stop creates a fresh relay session and may register again",
+      "packaged_resource_resolution": "prefer packaged resources/requirements.txt when repo requirements.txt is absent",
+      "dependency_isolation": "desktop bridge dependencies install into .token_place_desktop_site or user fallback target",
+      "error_fallback": "GPU modes fail closed with actionable CUDA provisioning diagnostics when repair cannot provide CUDA"
+    },
+    {
+      "id": "macos_metal_capable",
+      "os": "macos",
+      "sys_platform": "darwin",
+      "accelerator": "metal",
+      "startup": "warm-load before relay registration",
+      "runtime_detection": "llama-cpp-python reports Metal and GPU offload support",
+      "gpu_backend_selection": {
+        "auto": "metal",
+        "gpu": "metal",
+        "hybrid": "metal",
+        "cpu": "cpu"
+      },
+      "registration_eligibility": "registered only after API v1 runtime is ready and relay registration is fresh",
+      "ui_status": {
+        "warming_registered": false,
+        "ready_registered_after_relay": true,
+        "backend_used": "metal"
+      },
+      "stop_start": "same lifecycle contract as Windows",
+      "packaged_resource_resolution": "packaged .app resolves the same bridge/runtime modules and requirements as Windows packages",
+      "dependency_isolation": "desktop bridge dependencies install into app-local/user isolated target, not the repo shim path",
+      "error_fallback": "GPU modes fail closed or surface actionable Metal provisioning diagnostics when Metal runtime support is expected",
+      "known_gap": "runtime bootstrap is probe-only until Prompt 2 adds first-class Metal repair/install"
+    },
+    {
+      "id": "cpu_fallback",
+      "os": "any",
+      "sys_platform": "linux",
+      "accelerator": "cpu",
+      "startup": "warm-load before relay registration unless disabled",
+      "runtime_detection": "no CUDA/Metal backend is available or CPU mode is explicit",
+      "gpu_backend_selection": {
+        "auto": "cpu_fallback",
+        "gpu": "cpu_fallback",
+        "hybrid": "cpu_fallback",
+        "cpu": "cpu"
+      },
+      "registration_eligibility": "registered only after CPU runtime is ready and relay registration is fresh",
+      "ui_status": {
+        "warming_registered": false,
+        "ready_registered_after_relay": true,
+        "backend_used": "cpu"
+      },
+      "error_fallback": "fallback_reason explains unavailable CUDA/Metal support without implying relay registration succeeded"
+    },
+    {
+      "id": "missing_runtime_or_dependency",
+      "os": "any",
+      "sys_platform": "linux",
+      "accelerator": "missing",
+      "startup": "fail before relay registration when required bridge dependencies or runtime imports are unavailable",
+      "runtime_detection": "probe reports missing and includes interpreter/module diagnostics",
+      "gpu_backend_selection": {
+        "auto": "failed",
+        "gpu": "failed",
+        "hybrid": "failed",
+        "cpu": "failed"
+      },
+      "registration_eligibility": "never registered",
+      "ui_status": {
+        "warming_registered": false,
+        "ready_registered_after_relay": false,
+        "backend_used": "pending"
+      },
+      "error_fallback": "last_error names missing modules, interpreter, import root, and next recovery clue"
+    }
+  ],
+  "known_gaps": [
+    {
+      "id": "macos_runtime_bootstrap_probe_only",
+      "owner_prompt": 2,
+      "expectation": "darwin GPU modes should bootstrap/repair Metal runtime instead of returning probe_only"
+    },
+    {
+      "id": "macos_real_operator_lifecycle_e2e",
+      "owner_prompt": 4,
+      "expectation": "macOS packaged operator E2E should cover warm-load, register, multi-turn API v1 relay chat, Stop, Start after Stop, and diagnostics"
+    }
+  ]
+}

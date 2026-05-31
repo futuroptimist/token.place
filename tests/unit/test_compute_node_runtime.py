@@ -737,3 +737,48 @@ def test_compute_node_runtime_stop_continues_when_unregister_raises():
         call.stop(),
         call.unregister_from_relay(),
     ]
+
+
+@pytest.mark.parametrize(
+    'requested_mode,backend_available,gpu_supported,expected_effective,expected_selected,expected_used',
+    [
+        ('auto', 'cuda', True, 'cuda', 'cuda', 'cuda'),
+        ('gpu', 'metal', True, 'metal', 'metal', 'metal'),
+        ('hybrid', 'metal', True, 'hybrid_metal', 'metal', 'metal'),
+        ('auto', 'cpu', False, 'cpu_fallback', 'cpu', 'cpu'),
+        ('cpu', 'metal', True, 'cpu', 'cpu', 'cpu'),
+    ],
+)
+def test_compute_mode_diagnostics_platform_neutral_backend_contract(
+    monkeypatch,
+    requested_mode,
+    backend_available,
+    gpu_supported,
+    expected_effective,
+    expected_selected,
+    expected_used,
+):
+    from utils.llm.model_manager import ModelManager
+
+    manager = object.__new__(ModelManager)
+    manager.default_n_gpu_layers = -1
+    manager.hybrid_n_gpu_layers = 24
+    manager.requested_compute_mode = normalize_compute_mode(requested_mode)
+    monkeypatch.setattr(
+        ModelManager,
+        '_platform_gpu_backend',
+        staticmethod(lambda: None if backend_available == 'cpu' else backend_available),
+    )
+    monkeypatch.setattr(
+        ModelManager,
+        '_llama_gpu_offload_available',
+        staticmethod(lambda: gpu_supported),
+    )
+
+    diagnostics = manager._resolve_compute_plan()
+
+    assert diagnostics['effective_mode'] == expected_effective
+    assert diagnostics['backend_selected'] == expected_selected
+    assert diagnostics['backend_used'] == expected_used
+    if expected_used == 'cpu' and requested_mode != 'cpu' and backend_available == 'cpu':
+        assert diagnostics['fallback_reason'] == 'no CUDA/Metal backend is supported on this platform'

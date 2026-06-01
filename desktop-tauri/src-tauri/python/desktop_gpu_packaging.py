@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional, Union
 
 
 @dataclass(frozen=True)
@@ -15,13 +15,13 @@ class LlamaCppInstallPlan:
     platform: str
     backend: str
     package_spec: str
-    cmake_args: str | None
+    cmake_args: Optional[str]
     force_cmake: bool
-    index_url: str | None = None
+    index_url: Optional[str] = None
     only_binary: bool = False
     no_binary: bool = False
 
-    def pip_install_args(self) -> list[str]:
+    def pip_install_args(self) -> List[str]:
         args = ["--upgrade", "--no-cache-dir"]
         if self.index_url:
             args.extend(["--index-url", self.index_url])
@@ -42,7 +42,7 @@ class LlamaCppInstallPlan:
         return env
 
 
-def llama_cpp_requirement_spec(requirements_path: str | Path = "requirements.txt") -> str:
+def llama_cpp_requirement_spec(requirements_path: Union[str, Path] = "requirements.txt") -> str:
     """Return pinned llama-cpp-python requirement from requirements.txt."""
 
     path = Path(requirements_path)
@@ -58,8 +58,8 @@ def llama_cpp_requirement_spec(requirements_path: str | Path = "requirements.txt
 
 
 def llama_cpp_install_plan(
-    platform: str | None = None,
-    requirements_path: str | Path = "requirements.txt",
+    platform: Optional[str] = None,
+    requirements_path: Union[str, Path] = "requirements.txt",
 ) -> LlamaCppInstallPlan:
     """Return explicit, conservative desktop install plan for llama-cpp-python."""
 
@@ -99,9 +99,9 @@ def llama_cpp_install_plan(
 
 
 def llama_cpp_install_plan_fallbacks(
-    platform: str | None = None,
-    requirements_path: str | Path = "requirements.txt",
-) -> list[LlamaCppInstallPlan]:
+    platform: Optional[str] = None,
+    requirements_path: Union[str, Path] = "requirements.txt",
+) -> List[LlamaCppInstallPlan]:
     """Return ordered install plans with conservative fallbacks per platform."""
 
     primary = llama_cpp_install_plan(platform=platform, requirements_path=requirements_path)

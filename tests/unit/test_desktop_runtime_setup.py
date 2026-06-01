@@ -856,6 +856,94 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
     assert captured['cmd'][:5] == [sys.executable, '-m', 'pip', 'install', '--force-reinstall']
 
 
+def test_macos_metal_bootstrap_disabled_is_probe_only_with_clear_reason(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe(error='Metal missing'))
+    invoked = {'pip': False}
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (invoked.update(pip=True), '') and (False, 'unexpected'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert result['runtime_action'] == 'metal_probe_only'
+    assert result['selected_backend'] == 'cpu'
+    assert desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV in result['fallback_reason']
+    assert invoked['pip'] is False
+
+
+def test_macos_metal_install_failure_falls_back_for_auto_but_is_fatal_for_gpu(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe(error='Metal missing'))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'clang: error: metal build failed'),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        'llama_cpp_install_plan_fallbacks',
+        lambda **_kwargs: [
+            desktop_runtime_setup.LlamaCppInstallPlan(
+                platform='darwin',
+                backend='metal',
+                package_spec='llama-cpp-python==0.3.16',
+                cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off',
+                force_cmake=True,
+                index_url='https://pypi.org/simple',
+                no_binary=True,
+            )
+        ],
+    )
+
+    auto_result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+    gpu_result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=REPO_ROOT)
+
+    assert auto_result['runtime_action'] == 'metal_cpu_fallback'
+    assert 'using CPU runtime' in auto_result['fallback_reason']
+    assert desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', auto_result) is None
+    assert gpu_result['runtime_action'] == 'metal_install_failed'
+    assert desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', gpu_result)
+
+
+def test_macos_metal_install_plan_uses_source_build_timeout_and_env(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([_probe(error='Metal missing'), _probe(backend='metal', gpu=True, device='metal')])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin',
+        backend='metal',
+        package_spec='llama-cpp-python==0.3.16',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off',
+        force_cmake=True,
+        index_url='https://pypi.org/simple',
+        no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    captured = {}
+
+    def _capture_run(cmd, env, timeout_seconds=desktop_runtime_setup.PIP_INSTALL_TIMEOUT_SECONDS):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        captured['timeout_seconds'] = timeout_seconds
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_run)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('hybrid', repo_root=REPO_ROOT)
+
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert captured['env']['CMAKE_ARGS'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
+    assert captured['env']['FORCE_CMAKE'] == '1'
+    assert captured['timeout_seconds'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+
+
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
     repo_root = tmp_path / 'RepoRoot'
     repo_root.mkdir(parents=True)
@@ -1040,12 +1128,12 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         "_windows_cuda_source_repair",
         _matrix_source_repair,
     )
-    monkeypatch.setattr(
-        desktop_runtime_setup,
-        "_run_pip_install",
-        lambda *_args, **_kwargs: (invoked.update(pip=True), "")
-        and (False, "unexpected"),
-    )
+    def _matrix_pip_install(*_args, **_kwargs):
+        invoked.update(pip=True)
+        result = case.get("pip_install_result", {"ok": False, "log": "unexpected"})
+        return result["ok"], result["log"]
+
+    monkeypatch.setattr(desktop_runtime_setup, "_run_pip_install", _matrix_pip_install)
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime(
         case["mode"], repo_root=REPO_ROOT
@@ -1077,36 +1165,9 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         "macos_metal_capable",
         "cpu_fallback",
         "missing_runtime_dependency",
-        "macos_metal_bootstrap_gap",
     }:
         assert invoked == {"pip": False, "source_repair": False}
     if case["id"] == "windows_missing_runtime_bootstrap_repair":
         assert invoked == {"pip": False, "source_repair": True}
-
-
-# The non-xfail platform-matrix test above asserts today's macOS probe_only
-# behavior. This strict xfail records only the desired future Metal bootstrap
-# behavior without weakening the current gap lock.
-@pytest.mark.xfail(
-    strict=True,
-    reason="The macOS bootstrap follow-up will replace probe-only runtime behavior with Metal bootstrap support.",
-)
-def test_macos_missing_metal_runtime_bootstrap_gap_future_parity(monkeypatch):
-    case = next(
-        case
-        for case in _load_parity_matrix()["platform_cases"]
-        if case["id"] == "macos_metal_bootstrap_gap"
-    )
-    monkeypatch.setattr(desktop_runtime_setup, "sys", _PlatformStub(case["platform"]))
-    monkeypatch.setattr(
-        desktop_runtime_setup,
-        "_probe_llama_runtime",
-        lambda **_: _probe_from_matrix_case(case),
-    )
-
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime(
-        case["mode"], repo_root=REPO_ROOT
-    )
-
-    assert result["selected_backend"] == case["expect_future"]["selected_backend"]
-    assert result["runtime_action"] == case["expect_future"]["runtime_action"]
+    if case["id"] == "macos_metal_bootstrap_gap":
+        assert invoked == {"pip": True, "source_repair": False}

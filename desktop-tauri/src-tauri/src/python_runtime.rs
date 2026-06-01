@@ -187,13 +187,16 @@ pub fn resolve_runtime_import_root(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
 }
 
 fn mode_requests_gpu(mode: &ComputeMode) -> bool {
-    matches!(mode, ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid)
+    matches!(
+        mode,
+        ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+    )
 }
 
 fn should_enable_runtime_bootstrap_for(
@@ -202,10 +205,14 @@ fn should_enable_runtime_bootstrap_for(
     mode: &ComputeMode,
     bootstrap_disabled: bool,
 ) -> bool {
-    target_os == "windows"
-        && target_arch == "x86_64"
-        && mode_requests_gpu(mode)
-        && !bootstrap_disabled
+    if bootstrap_disabled || !mode_requests_gpu(mode) {
+        return false;
+    }
+
+    matches!(
+        (target_os, target_arch),
+        ("windows", "x86_64") | ("macos", "aarch64") | ("macos", "x86_64")
+    )
 }
 
 pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
@@ -224,12 +231,12 @@ pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -390,8 +397,13 @@ mod tests {
     #[test]
     fn resolve_runtime_import_root_detects_nested_up_layout() {
         let temp = TempDir::new().expect("tempdir");
-        let script = temp.path().join("resources").join("python").join("model_bridge.py");
-        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        let script = temp
+            .path()
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script dir");
         std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
         let import_root = temp.path().join("resources").join("_up_").join("_up_");
         std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");
@@ -401,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_bootstrap_only_enabled_for_windows_x64_gpu_modes() {
+    fn runtime_bootstrap_enabled_for_supported_desktop_gpu_modes() {
         assert!(should_enable_runtime_bootstrap_for(
             "windows",
             "x86_64",
@@ -426,9 +438,27 @@ mod tests {
             &ComputeMode::Cpu,
             false
         ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "macos",
+            "aarch64",
+            &ComputeMode::Auto,
+            false
+        ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "macos",
+            "x86_64",
+            &ComputeMode::Hybrid,
+            false
+        ));
         assert!(!should_enable_runtime_bootstrap_for(
             "linux",
             "x86_64",
+            &ComputeMode::Gpu,
+            false
+        ));
+        assert!(!should_enable_runtime_bootstrap_for(
+            "windows",
+            "aarch64",
             &ComputeMode::Gpu,
             false
         ));

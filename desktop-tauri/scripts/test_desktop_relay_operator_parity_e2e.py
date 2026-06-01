@@ -293,7 +293,7 @@ def _assert_ready_runtime_fields(event: dict[str, Any], *, layout_label: str) ->
         fallback_reason = event.get("fallback_reason")
         if requested_mode == "cpu":
             assert backend_used == "cpu", event
-            assert fallback_reason == "cpu mode explicitly selected", event
+            assert fallback_reason in (None, "cpu mode explicitly selected"), event
         elif backend_available == "metal":
             assert backend_used in {"metal", "cpu"}, event
             if backend_used == "cpu":

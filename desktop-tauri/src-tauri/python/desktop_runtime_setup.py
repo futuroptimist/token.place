@@ -53,7 +53,6 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "unavailable",
         "metal_install_failed",
         "metal_cpu_fallback",
-        "installed_metal_reexec",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -481,7 +480,7 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
     if (
         current_platform == "darwin"
         and selected_mode != "gpu"
-        and runtime_action not in {"failed", "metal_install_failed", "metal_cpu_fallback"}
+        and runtime_action not in {"failed", "metal_install_failed"}
     ):
         return None
 
@@ -742,9 +741,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         after = _probe_runtime(target_root)
         plan_satisfied = backend_probe_satisfies_install_plan(plan, after)
         verified_backend = after.gpu_offload_supported and after.backend == plan.backend
-        accepted_source_probe = (
-            plan.backend != "metal" and plan_satisfied and after.backend != plan.backend
-        )
+        accepted_source_probe = plan_satisfied and after.backend != plan.backend
         if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
             if verified_backend:
                 reason = f"installed {after.backend.upper()} runtime; re-executing sidecar"

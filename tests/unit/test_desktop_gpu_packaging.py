@@ -19,7 +19,9 @@ from desktop_gpu_packaging import (
 
 
 def test_windows_install_plan_requests_cuda_then_cpu_fallback():
-    plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
+    plans = llama_cpp_install_plan_fallbacks(
+        platform="win32", requirements_path=ROOT / "requirements.txt"
+    )
     assert len(plans) == 2
 
     gpu_plan = plans[0]
@@ -38,29 +40,34 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert cpu_fallback.no_binary is False
 
 
-def test_macos_install_plan_requests_metal_then_source_fallback():
-    plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT / "requirements.txt")
+def test_macos_install_plan_requests_metal_then_cpu_fallback():
+    plans = llama_cpp_install_plan_fallbacks(
+        platform="darwin", requirements_path=ROOT / "requirements.txt"
+    )
     assert len(plans) == 2
 
-    wheel_plan = plans[0]
-    assert wheel_plan.backend == "metal"
-    assert wheel_plan.index_url == "https://pypi.org/simple"
-    assert wheel_plan.only_binary is True
-
-    source_fallback = plans[1]
-    assert source_fallback.backend == "metal"
-    assert source_fallback.index_url == "https://pypi.org/simple"
-    assert source_fallback.only_binary is False
-    assert source_fallback.force_cmake is True
-    assert source_fallback.no_binary is True
-    assert source_fallback.pip_env() == {
+    metal_plan = plans[0]
+    assert metal_plan.backend == "metal"
+    assert metal_plan.index_url == "https://pypi.org/simple"
+    assert metal_plan.only_binary is False
+    assert metal_plan.force_cmake is True
+    assert metal_plan.no_binary is True
+    assert metal_plan.pip_env() == {
         "CMAKE_ARGS": "-DGGML_METAL=on -DGGML_NATIVE=off",
         "FORCE_CMAKE": "1",
     }
 
+    cpu_fallback = plans[1]
+    assert cpu_fallback.backend == "cpu"
+    assert cpu_fallback.index_url == "https://pypi.org/simple"
+    assert cpu_fallback.only_binary is False
+    assert cpu_fallback.no_binary is False
+
 
 def test_linux_install_plan_remains_cpu_default():
-    plans = llama_cpp_install_plan_fallbacks(platform="linux", requirements_path=ROOT / "requirements.txt")
+    plans = llama_cpp_install_plan_fallbacks(
+        platform="linux", requirements_path=ROOT / "requirements.txt"
+    )
     assert len(plans) == 1
 
     plan = plans[0]
@@ -72,9 +79,7 @@ def test_linux_install_plan_remains_cpu_default():
 def test_requirement_spec_parses_comments_and_blank_lines(tmp_path):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text(
-        "# comment\n\n"
-        "numpy==2.0.0\n"
-        "llama-cpp-python==0.3.16\n",
+        "# comment\n\n" "numpy==2.0.0\n" "llama-cpp-python==0.3.16\n",
         encoding="utf-8",
     )
 
@@ -133,7 +138,9 @@ def test_llama_cpp_install_plan_uses_current_platform_by_default(monkeypatch):
 
 
 def test_windows_cpu_fallback_install_args_allow_wheel_or_source():
-    plans = llama_cpp_install_plan_fallbacks(platform="win32", requirements_path=ROOT / "requirements.txt")
+    plans = llama_cpp_install_plan_fallbacks(
+        platform="win32", requirements_path=ROOT / "requirements.txt"
+    )
     cpu_fallback = plans[1]
 
     assert cpu_fallback.pip_install_args() == [
@@ -145,11 +152,16 @@ def test_windows_cpu_fallback_install_args_allow_wheel_or_source():
     ]
 
 
-def test_macos_source_fallback_install_args_force_source_build():
-    plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT / "requirements.txt")
-    source_fallback = plans[1]
+def test_macos_primary_install_args_force_metal_source_build():
+    plans = llama_cpp_install_plan_fallbacks(
+        platform="darwin", requirements_path=ROOT / "requirements.txt"
+    )
+    metal_plan = plans[0]
 
-    assert source_fallback.pip_install_args() == [
+    assert metal_plan.backend == "metal"
+    assert metal_plan.cmake_args == "-DGGML_METAL=on -DGGML_NATIVE=off"
+    assert metal_plan.force_cmake is True
+    assert metal_plan.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",
         "--index-url",
@@ -171,17 +183,23 @@ def test_llama_cpp_install_plan_uses_current_platform_for_windows(monkeypatch):
 
 
 def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
-    plan = llama_cpp_install_plan(platform="darwin", requirements_path=ROOT / "requirements.txt")
+    plan = llama_cpp_install_plan(
+        platform="darwin", requirements_path=ROOT / "requirements.txt"
+    )
 
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
     assert plan.index_url == "https://pypi.org/simple"
-    assert plan.only_binary is True
-    assert plan.no_binary is False
+    assert plan.cmake_args == "-DGGML_METAL=on -DGGML_NATIVE=off"
+    assert plan.force_cmake is True
+    assert plan.only_binary is False
+    assert plan.no_binary is True
 
 
 def test_non_desktop_platform_fallbacks_return_only_primary_plan():
-    plans = llama_cpp_install_plan_fallbacks(platform="freebsd13", requirements_path=ROOT / "requirements.txt")
+    plans = llama_cpp_install_plan_fallbacks(
+        platform="freebsd13", requirements_path=ROOT / "requirements.txt"
+    )
 
     assert len(plans) == 1
     assert plans[0].platform == "freebsd13"
@@ -215,7 +233,11 @@ def test_backend_probe_satisfies_plan_for_matching_backend():
         cmake_args="-DGGML_CUDA=on",
         force_cmake=True,
     )
-    probe = SimpleNamespace(backend="cuda", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+    probe = SimpleNamespace(
+        backend="cuda",
+        llama_module_path="site-packages/llama_cpp/__init__.py",
+        error=None,
+    )
 
     assert backend_probe_satisfies_install_plan(plan, probe) is True
 
@@ -228,7 +250,11 @@ def test_backend_probe_rejects_mismatched_cuda_backend():
         cmake_args="-DGGML_CUDA=on",
         force_cmake=True,
     )
-    probe = SimpleNamespace(backend="cpu", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+    probe = SimpleNamespace(
+        backend="cpu",
+        llama_module_path="site-packages/llama_cpp/__init__.py",
+        error=None,
+    )
 
     assert backend_probe_satisfies_install_plan(plan, probe) is False
 
@@ -241,7 +267,11 @@ def test_backend_probe_accepts_macos_metal_source_build_with_clean_import_probe(
         cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
         force_cmake=True,
     )
-    probe = SimpleNamespace(backend="cpu", llama_module_path="site-packages/llama_cpp/__init__.py", error=None)
+    probe = SimpleNamespace(
+        backend="cpu",
+        llama_module_path="site-packages/llama_cpp/__init__.py",
+        error=None,
+    )
 
     assert backend_probe_satisfies_install_plan(plan, probe) is True
 
@@ -254,6 +284,8 @@ def test_backend_probe_rejects_macos_metal_source_build_when_probe_errors():
         cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
         force_cmake=True,
     )
-    probe = SimpleNamespace(backend="missing", llama_module_path="missing", error="import failed")
+    probe = SimpleNamespace(
+        backend="missing", llama_module_path="missing", error="import failed"
+    )
 
     assert backend_probe_satisfies_install_plan(plan, probe) is False

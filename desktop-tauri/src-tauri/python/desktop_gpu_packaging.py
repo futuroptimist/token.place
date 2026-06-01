@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+LLAMA_CPP_PYPI_INDEX_URL = "https://pypi.org/simple"
+LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE = "https://abetlen.github.io/llama-cpp-python/whl"
+LLAMA_CPP_CPU_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/cpu"
+LLAMA_CPP_METAL_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/metal"
+
 
 @dataclass(frozen=True)
 class LlamaCppInstallPlan:
@@ -18,6 +23,7 @@ class LlamaCppInstallPlan:
     cmake_args: str | None
     force_cmake: bool
     index_url: str | None = None
+    extra_index_url: str | None = None
     only_binary: bool = False
     no_binary: bool = False
 
@@ -25,11 +31,13 @@ class LlamaCppInstallPlan:
         args = ["--upgrade", "--no-cache-dir"]
         if self.index_url:
             args.extend(["--index-url", self.index_url])
+        if self.extra_index_url:
+            args.extend(["--extra-index-url", self.extra_index_url])
         if self.only_binary:
             args.extend(["--only-binary", "llama-cpp-python"])
         if self.no_binary:
             args.extend(["--no-binary", "llama-cpp-python"])
-        if self.index_url:
+        if self.index_url or self.extra_index_url:
             args.append("--prefer-binary")
         return args
 
@@ -73,7 +81,7 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args="-DGGML_CUDA=on",
             force_cmake=True,
-            index_url="https://pypi.org/simple",
+            index_url=LLAMA_CPP_PYPI_INDEX_URL,
             only_binary=False,
             no_binary=True,
         )
@@ -85,7 +93,8 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args=None,
             force_cmake=False,
-            index_url="https://pypi.org/simple",
+            index_url=LLAMA_CPP_PYPI_INDEX_URL,
+            extra_index_url=LLAMA_CPP_METAL_WHEEL_INDEX_URL,
             only_binary=True,
             no_binary=False,
         )
@@ -119,7 +128,8 @@ def llama_cpp_install_plan_fallbacks(
                 package_spec="llama-cpp-python",
                 cmake_args=None,
                 force_cmake=False,
-                index_url="https://pypi.org/simple",
+                index_url=LLAMA_CPP_PYPI_INDEX_URL,
+                extra_index_url=LLAMA_CPP_CPU_WHEEL_INDEX_URL,
                 only_binary=True,
                 no_binary=False,
             )
@@ -138,7 +148,7 @@ def llama_cpp_install_plan_fallbacks(
                 package_spec=primary.package_spec,
                 cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
                 force_cmake=True,
-                index_url="https://pypi.org/simple",
+                index_url=LLAMA_CPP_PYPI_INDEX_URL,
                 only_binary=False,
                 no_binary=True,
             )
@@ -150,7 +160,8 @@ def llama_cpp_install_plan_fallbacks(
                 package_spec=primary.package_spec,
                 cmake_args=None,
                 force_cmake=False,
-                index_url="https://pypi.org/simple",
+                index_url=LLAMA_CPP_PYPI_INDEX_URL,
+                extra_index_url=LLAMA_CPP_CPU_WHEEL_INDEX_URL,
                 only_binary=True,
                 no_binary=False,
             )

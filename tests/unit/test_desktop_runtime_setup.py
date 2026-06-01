@@ -719,8 +719,11 @@ def test_fallback_unpinned_plans_cover_win_darwin_and_other_platforms():
     assert [plan.backend for plan in win_plans] == ['cuda', 'cpu']
     assert [plan.backend for plan in darwin_plans] == ['metal', 'metal', 'cpu']
     assert [plan.backend for plan in linux_plans] == ['cpu']
+    assert win_plans[1].extra_index_url == desktop_runtime_setup.LLAMA_CPP_CPU_WHEEL_INDEX_URL
+    assert darwin_plans[0].extra_index_url == desktop_runtime_setup.LLAMA_CPP_METAL_WHEEL_INDEX_URL
     assert darwin_plans[0].only_binary is True
     assert darwin_plans[1].no_binary is True
+    assert darwin_plans[2].extra_index_url == desktop_runtime_setup.LLAMA_CPP_CPU_WHEEL_INDEX_URL
     assert darwin_plans[2].only_binary is True
 
 

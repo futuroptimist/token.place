@@ -11,6 +11,8 @@ if str(DESKTOP_PYTHON) not in sys.path:
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
+    LLAMA_CPP_CPU_WHEEL_INDEX_URL,
+    LLAMA_CPP_METAL_WHEEL_INDEX_URL,
     backend_probe_satisfies_install_plan,
     llama_cpp_install_plan,
     llama_cpp_install_plan_fallbacks,
@@ -34,6 +36,7 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.package_spec == "llama-cpp-python"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
+    assert cpu_fallback.extra_index_url == LLAMA_CPP_CPU_WHEEL_INDEX_URL
     assert cpu_fallback.only_binary is True
     assert cpu_fallback.no_binary is False
 
@@ -45,6 +48,7 @@ def test_macos_install_plan_requests_metal_then_cpu_fallback():
     metal_wheel_plan = plans[0]
     assert metal_wheel_plan.backend == "metal"
     assert metal_wheel_plan.index_url == "https://pypi.org/simple"
+    assert metal_wheel_plan.extra_index_url == LLAMA_CPP_METAL_WHEEL_INDEX_URL
     assert metal_wheel_plan.only_binary is True
     assert metal_wheel_plan.force_cmake is False
     assert metal_wheel_plan.no_binary is False
@@ -64,6 +68,7 @@ def test_macos_install_plan_requests_metal_then_cpu_fallback():
     cpu_fallback = plans[2]
     assert cpu_fallback.backend == "cpu"
     assert cpu_fallback.index_url == "https://pypi.org/simple"
+    assert cpu_fallback.extra_index_url == LLAMA_CPP_CPU_WHEEL_INDEX_URL
     assert cpu_fallback.only_binary is True
     assert cpu_fallback.no_binary is False
 
@@ -116,6 +121,7 @@ def test_pip_install_args_include_index_and_binary_flags():
         cmake_args=None,
         force_cmake=False,
         index_url="https://example.invalid/simple",
+        extra_index_url="https://wheels.example.invalid/simple",
         only_binary=True,
         no_binary=True,
     )
@@ -125,6 +131,8 @@ def test_pip_install_args_include_index_and_binary_flags():
         "--no-cache-dir",
         "--index-url",
         "https://example.invalid/simple",
+        "--extra-index-url",
+        "https://wheels.example.invalid/simple",
         "--only-binary",
         "llama-cpp-python",
         "--no-binary",
@@ -150,6 +158,8 @@ def test_windows_cpu_fallback_install_args_only_accept_wheels():
         "--no-cache-dir",
         "--index-url",
         "https://pypi.org/simple",
+        "--extra-index-url",
+        LLAMA_CPP_CPU_WHEEL_INDEX_URL,
         "--only-binary",
         "llama-cpp-python",
         "--prefer-binary",
@@ -166,6 +176,8 @@ def test_macos_metal_install_args_try_wheel_before_source_build():
         "--no-cache-dir",
         "--index-url",
         "https://pypi.org/simple",
+        "--extra-index-url",
+        LLAMA_CPP_METAL_WHEEL_INDEX_URL,
         "--only-binary",
         "llama-cpp-python",
         "--prefer-binary",
@@ -191,6 +203,8 @@ def test_macos_cpu_fallback_install_args_only_accept_pinned_wheels():
         "--no-cache-dir",
         "--index-url",
         "https://pypi.org/simple",
+        "--extra-index-url",
+        LLAMA_CPP_CPU_WHEEL_INDEX_URL,
         "--only-binary",
         "llama-cpp-python",
         "--prefer-binary",
@@ -213,6 +227,7 @@ def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
     assert plan.index_url == "https://pypi.org/simple"
+    assert plan.extra_index_url == LLAMA_CPP_METAL_WHEEL_INDEX_URL
     assert plan.only_binary is True
     assert plan.no_binary is False
     assert plan.force_cmake is False

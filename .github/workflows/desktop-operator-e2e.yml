@@ -11,10 +11,12 @@ on:
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
+      - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
       - 'relay.py'
+      - 'api/v1/**'
       - 'requirements.txt'
   push:
     branches: [ main, master ]
@@ -27,10 +29,12 @@ on:
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
+      - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
       - 'relay.py'
+      - 'api/v1/**'
       - 'requirements.txt'
 
 jobs:
@@ -127,6 +131,18 @@ jobs:
       - name: Run packaged operator bridge e2e (Windows)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
 
+      - name: Run desktop relay operator parity e2e (Windows)
+        run: python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
+
+      - name: Upload desktop relay parity logs on failure (Windows)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-relay-operator-parity-logs-windows
+          path: .desktop-e2e-logs/
+          include-hidden-files: true
+          if-no-files-found: warn
+
 
   desktop-operator-packaged-inspect-python39-macos:
     runs-on: macos-latest
@@ -196,7 +212,19 @@ jobs:
       - name: Run packaged operator bridge e2e (macOS)
         run: python desktop-tauri/scripts/test_packaged_operator_e2e.py
 
+      - name: Run desktop relay operator parity e2e (macOS)
+        run: python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
+
       - name: Run desktop no-relay lifecycle e2e (macOS, required)
         env:
           TOKENPLACE_REQUIRE_NO_RELAY_E2E: "1"
         run: python desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py
+
+      - name: Upload desktop e2e logs on failure (macOS)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-operator-e2e-logs-macos
+          path: .desktop-e2e-logs/
+          include-hidden-files: true
+          if-no-files-found: warn

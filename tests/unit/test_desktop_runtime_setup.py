@@ -166,7 +166,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
 
 
-def test_macos_metal_source_install_clean_cpu_probe_returns_metal_reexec(monkeypatch):
+def test_macos_metal_source_install_clean_cpu_probe_reexecs_without_reporting_metal(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     probes = iter([
@@ -199,11 +199,13 @@ def test_macos_metal_source_install_clean_cpu_probe_returns_metal_reexec(monkeyp
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
 
     assert len(install_calls) == 1
-    assert result['selected_backend'] == 'metal'
+    assert result['selected_backend'] == 'cpu'
     assert result['runtime_action'] == 'installed_metal_reexec'
     assert 'installed METAL runtime from source' in result['fallback_reason']
     assert result['detected_device'] == 'cpu'
     assert result['llama_module_path'].endswith('llama_cpp/__init__.py')
+    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
+    assert message and 'installed_metal_reexec' in message
 
 def test_macos_bootstrap_disabled_reports_metal_probe_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))

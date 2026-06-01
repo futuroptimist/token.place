@@ -49,6 +49,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "shadowed_repo_llama_cpp",
         "unavailable",
         "metal_install_failed",
+        "installed_metal_reexec",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -737,13 +738,15 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
             if verified_backend:
                 reason = f"installed {after.backend.upper()} runtime; re-executing sidecar"
+                selected_backend = plan.backend
             else:
                 reason = (
                     f"installed {plan.backend.upper()} runtime from source; follow-up probe imported "
                     f"llama_cpp from {after.llama_module_path}; re-executing sidecar for hardware probe"
                 )
+                selected_backend = "cpu"
             return {
-                "selected_backend": plan.backend,
+                "selected_backend": selected_backend,
                 "fallback_reason": reason,
                 "runtime_action": _installed_reexec_action(plan.backend),
                 **_probe_result_payload(after),

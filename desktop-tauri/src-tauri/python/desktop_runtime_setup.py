@@ -476,7 +476,7 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
-    if before.backend == "missing":
+    if before.backend == "missing" and not sys.platform.startswith("win"):
         return {
             "selected_backend": "cpu",
             "fallback_reason": (

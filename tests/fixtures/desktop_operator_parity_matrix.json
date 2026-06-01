@@ -80,6 +80,36 @@
             }
         },
         {
+            "id": "windows_missing_runtime_bootstrap_repair",
+            "label": "Windows fresh install explicit CUDA bootstrap repair path",
+            "platform": "win32",
+            "mode": "auto",
+            "env": {
+                "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP": "1"
+            },
+            "probe": {
+                "backend": "missing",
+                "gpu": false,
+                "device": "none",
+                "error": "No module named 'llama_cpp'"
+            },
+            "after_probe": {
+                "backend": "cuda",
+                "gpu": true,
+                "device": "cuda",
+                "error": null
+            },
+            "source_repair_result": {
+                "ok": true,
+                "log": "ok"
+            },
+            "expect": {
+                "selected_backend": "cuda",
+                "runtime_action": "installed_cuda_reexec",
+                "fallback_reason": "installed CUDA runtime; re-executing sidecar"
+            }
+        },
+        {
             "id": "macos_metal_bootstrap_gap",
             "label": "Known gap: macOS missing Metal runtime bootstrap is probe-only today",
             "platform": "darwin",

@@ -455,10 +455,18 @@ fn should_enable_runtime_bootstrap_for(
     mode: &ComputeMode,
     bootstrap_disabled: bool,
 ) -> bool {
-    target_os == "windows"
-        && target_arch == "x86_64"
-        && mode_requests_gpu(mode)
-        && !bootstrap_disabled
+    if bootstrap_disabled || !mode_requests_gpu(mode) {
+        return false;
+    }
+
+    let normalized_arch = if target_arch == "amd64" {
+        "x86_64"
+    } else {
+        target_arch
+    };
+
+    (target_os == "windows" && normalized_arch == "x86_64")
+        || (target_os == "macos" && matches!(normalized_arch, "aarch64" | "arm64" | "x86_64"))
 }
 
 pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
@@ -813,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_bootstrap_only_enabled_for_windows_x64_gpu_modes() {
+    fn runtime_bootstrap_enabled_for_supported_gpu_platforms() {
         assert!(should_enable_runtime_bootstrap_for(
             "windows",
             "x86_64",
@@ -835,6 +843,30 @@ mod tests {
         assert!(!should_enable_runtime_bootstrap_for(
             "windows",
             "x86_64",
+            &ComputeMode::Cpu,
+            false
+        ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "macos",
+            "aarch64",
+            &ComputeMode::Auto,
+            false
+        ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "macos",
+            "arm64",
+            &ComputeMode::Hybrid,
+            false
+        ));
+        assert!(should_enable_runtime_bootstrap_for(
+            "macos",
+            "x86_64",
+            &ComputeMode::Gpu,
+            false
+        ));
+        assert!(!should_enable_runtime_bootstrap_for(
+            "macos",
+            "arm64",
             &ComputeMode::Cpu,
             false
         ));

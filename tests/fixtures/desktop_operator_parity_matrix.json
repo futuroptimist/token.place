@@ -44,7 +44,7 @@
             },
             "expect": {
                 "selected_backend": "metal",
-                "runtime_action": "already_supported",
+                "runtime_action": "metal_already_supported",
                 "fallback_reason": "",
                 "registration_eligible_after_warm_load": true
             }
@@ -127,26 +127,33 @@
         },
         {
             "id": "macos_metal_bootstrap_gap",
-            "label": "Known gap: macOS missing Metal runtime bootstrap is probe-only today",
+            "label": "macOS missing Metal runtime bootstrap repair path",
             "platform": "darwin",
             "mode": "auto",
+            "env": {
+                "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP": "1"
+            },
             "probe": {
                 "backend": "cpu",
                 "gpu": false,
                 "device": "cpu",
                 "error": "Metal runtime wheel missing"
             },
-            "expect_future": {
-                "selected_backend": "metal",
-                "runtime_action": "installed_metal_reexec"
+            "after_probe": {
+                "backend": "metal",
+                "gpu": true,
+                "device": "metal",
+                "error": null
             },
-            "known_gap": "The macOS bootstrap follow-up will replace probe-only behavior with first-class Metal bootstrap support.",
+            "pip_install_result": {
+                "ok": true,
+                "log": "ok"
+            },
             "expect": {
-                "selected_backend": "cpu",
-                "runtime_action": "probe_only",
-                "fallback_reason_contains": "desktop auto-repair is currently Windows-focused",
-                "registration_eligible_after_warm_load": false,
-                "relay_runtime_state": "pending"
+                "selected_backend": "metal",
+                "runtime_action": "installed_metal_reexec",
+                "fallback_reason": "installed METAL runtime; re-executing sidecar",
+                "registration_eligible_after_warm_load": true
             }
         }
     ],

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+LLAMA_CPP_PYPI_INDEX_URL = "https://pypi.org/simple"
+LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE = "https://abetlen.github.io/llama-cpp-python/whl"
+LLAMA_CPP_CPU_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/cpu"
+LLAMA_CPP_METAL_WHEEL_INDEX_URL = f"{LLAMA_CPP_PREBUILT_WHEEL_INDEX_BASE}/metal"
+
 
 @dataclass(frozen=True)
 class LlamaCppInstallPlan:
@@ -18,6 +23,7 @@ class LlamaCppInstallPlan:
     cmake_args: str | None
     force_cmake: bool
     index_url: str | None = None
+    extra_index_url: str | None = None
     only_binary: bool = False
     no_binary: bool = False
 
@@ -25,11 +31,13 @@ class LlamaCppInstallPlan:
         args = ["--upgrade", "--no-cache-dir"]
         if self.index_url:
             args.extend(["--index-url", self.index_url])
+        if self.extra_index_url:
+            args.extend(["--extra-index-url", self.extra_index_url])
         if self.only_binary:
             args.extend(["--only-binary", "llama-cpp-python"])
         if self.no_binary:
             args.extend(["--no-binary", "llama-cpp-python"])
-        if self.index_url:
+        if self.index_url or self.extra_index_url:
             args.append("--prefer-binary")
         return args
 
@@ -73,7 +81,7 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args="-DGGML_CUDA=on",
             force_cmake=True,
-            index_url="https://pypi.org/simple",
+            index_url=LLAMA_CPP_PYPI_INDEX_URL,
             only_binary=False,
             no_binary=True,
         )
@@ -85,8 +93,10 @@ def llama_cpp_install_plan(
             package_spec=package_spec,
             cmake_args=None,
             force_cmake=False,
-            index_url="https://pypi.org/simple",
+            index_url=LLAMA_CPP_PYPI_INDEX_URL,
+            extra_index_url=LLAMA_CPP_METAL_WHEEL_INDEX_URL,
             only_binary=True,
+            no_binary=False,
         )
 
     return LlamaCppInstallPlan(
@@ -110,7 +120,7 @@ def llama_cpp_install_plan_fallbacks(
     if primary.platform.startswith("win"):
         # If CUDA builds are unavailable for this ABI, fall back to
         # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
-        # without requiring local native compilation toolchains.
+        # without entering another native compilation path.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -118,18 +128,21 @@ def llama_cpp_install_plan_fallbacks(
                 package_spec="llama-cpp-python",
                 cmake_args=None,
                 force_cmake=False,
-                index_url="https://pypi.org/simple",
-                # Allow both wheels and source so Windows CI can recover when
-                # PyPI does not provide a compatible binary for the runner ABI.
-                only_binary=False,
+                index_url=LLAMA_CPP_PYPI_INDEX_URL,
+                extra_index_url=LLAMA_CPP_CPU_WHEEL_INDEX_URL,
+                only_binary=True,
                 no_binary=False,
             )
         )
 
     if primary.platform == "darwin":
-        # The Metal wheel can intermittently fail integrity checks in CI.
-        # Fall back to a deterministic source build with Metal enabled and
-        # GGML native tuning disabled to avoid arm64 i8mm compile issues.
+        # Prefer a prebuilt macOS wheel first so packaged apps do not require
+        # Xcode/CMake when PyPI already has a compatible Metal-enabled wheel.
+        # Fall back to a deterministic Metal source build only when the wheel is
+        # unavailable, then try an unpinned CPU wheel for auto/hybrid recovery
+        # without entering another native build path. The CPU wheel index may not
+        # carry the repo pin for every supported macOS ABI, so keep this
+        # fallback version-flexible while preserving wheel-only installation.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -137,9 +150,22 @@ def llama_cpp_install_plan_fallbacks(
                 package_spec=primary.package_spec,
                 cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
                 force_cmake=True,
-                index_url="https://pypi.org/simple",
+                index_url=LLAMA_CPP_PYPI_INDEX_URL,
                 only_binary=False,
                 no_binary=True,
+            )
+        )
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="cpu",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url=LLAMA_CPP_PYPI_INDEX_URL,
+                extra_index_url=LLAMA_CPP_CPU_WHEEL_INDEX_URL,
+                only_binary=True,
+                no_binary=False,
             )
         )
 

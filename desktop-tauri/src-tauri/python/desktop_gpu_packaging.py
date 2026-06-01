@@ -83,11 +83,11 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="metal",
             package_spec=package_spec,
-            cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
-            force_cmake=True,
+            cmake_args=None,
+            force_cmake=False,
             index_url="https://pypi.org/simple",
-            only_binary=False,
-            no_binary=True,
+            only_binary=True,
+            no_binary=False,
         )
 
     return LlamaCppInstallPlan(
@@ -111,7 +111,7 @@ def llama_cpp_install_plan_fallbacks(
     if primary.platform.startswith("win"):
         # If CUDA builds are unavailable for this ABI, fall back to
         # an unpinned CPU wheel from PyPI to keep desktop CI/release buildable
-        # without requiring local native compilation toolchains.
+        # without entering another native compilation path.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -120,16 +120,29 @@ def llama_cpp_install_plan_fallbacks(
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
-                # Allow both wheels and source so Windows CI can recover when
-                # PyPI does not provide a compatible binary for the runner ABI.
-                only_binary=False,
+                only_binary=True,
                 no_binary=False,
             )
         )
 
     if primary.platform == "darwin":
-        # If Metal build prerequisites are unavailable, auto/hybrid mode may
-        # visibly fall back to CPU while explicit GPU mode fails closed.
+        # Prefer a prebuilt macOS wheel first so packaged apps do not require
+        # Xcode/CMake when PyPI already has a compatible Metal-enabled wheel.
+        # Fall back to a deterministic Metal source build only when the wheel is
+        # unavailable, then try a CPU wheel for auto/hybrid recovery without
+        # entering another native build path.
+        plans.append(
+            LlamaCppInstallPlan(
+                platform=primary.platform,
+                backend="metal",
+                package_spec=primary.package_spec,
+                cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+                force_cmake=True,
+                index_url="https://pypi.org/simple",
+                only_binary=False,
+                no_binary=True,
+            )
+        )
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -138,7 +151,7 @@ def llama_cpp_install_plan_fallbacks(
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",
-                only_binary=False,
+                only_binary=True,
                 no_binary=False,
             )
         )

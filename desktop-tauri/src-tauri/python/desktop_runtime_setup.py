@@ -15,6 +15,7 @@ from typing import Dict, Optional
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
+    backend_probe_satisfies_install_plan,
     llama_cpp_install_plan_fallbacks,
     llama_cpp_requirement_spec,
 )
@@ -51,8 +52,23 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
-PIP_SOURCE_BUILD_TIMEOUT_SECONDS = int(
-    os.getenv("TOKEN_PLACE_DESKTOP_PIP_SOURCE_BUILD_TIMEOUT_SECONDS", "1800")
+DEFAULT_PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+PIP_SOURCE_BUILD_TIMEOUT_SECONDS = _parse_positive_int_env(
+    "TOKEN_PLACE_DESKTOP_PIP_SOURCE_BUILD_TIMEOUT_SECONDS",
+    DEFAULT_PIP_SOURCE_BUILD_TIMEOUT_SECONDS,
 )
 INSTALL_ERROR_SUMMARY_MAX_LEN = 512
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
@@ -462,7 +478,17 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
 
     reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
     platform_label = "macOS" if current_platform == "darwin" else "Windows"
-    backend_hint = "Metal" if current_platform == "darwin" else "CUDA"
+    policy = _runtime_bootstrap_policy()
+    if not policy.bootstrap_supported:
+        return (
+            f"GPU provisioning failed for desktop {platform_label} launch "
+            f"(mode={selected_mode}, action={runtime_action}): {reason}. "
+            f"GPU runtime bootstrap is not supported for platform={policy.platform} "
+            f"arch={policy.arch}; install a compatible llama-cpp-python runtime manually "
+            "or use CPU mode."
+        )
+
+    backend_hint = "Metal" if policy.expected_backend == "metal" else "CUDA"
     return (
         f"GPU provisioning failed for desktop {platform_label} launch "
         f"(mode={selected_mode}, action={runtime_action}): {reason}. "
@@ -693,11 +719,23 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             continue
 
         after = _probe_runtime(target_root)
-        if after.gpu_offload_supported and after.backend in {"cuda", "metal"}:
+        if (
+            after.gpu_offload_supported
+            and after.backend in {"cuda", "metal"}
+            and backend_probe_satisfies_install_plan(plan, after)
+        ):
             return {
                 "selected_backend": after.backend,
                 "fallback_reason": f"installed {after.backend.upper()} runtime; re-executing sidecar",
                 "runtime_action": _installed_reexec_action(after.backend),
+                **_probe_result_payload(after),
+            }
+
+        if plan.backend in {"cuda", "metal"} and backend_probe_satisfies_install_plan(plan, after):
+            return {
+                "selected_backend": plan.backend,
+                "fallback_reason": f"installed {plan.backend.upper()} runtime; re-executing sidecar",
+                "runtime_action": _installed_reexec_action(plan.backend),
                 **_probe_result_payload(after),
             }
 
@@ -859,6 +897,16 @@ def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
 
     if detected_platform == "darwin":
         return [
+            LlamaCppInstallPlan(
+                platform=detected_platform,
+                backend="metal",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
+                index_url="https://pypi.org/simple",
+                only_binary=True,
+                no_binary=False,
+            ),
             LlamaCppInstallPlan(
                 platform=detected_platform,
                 backend="metal",

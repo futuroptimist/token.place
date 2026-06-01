@@ -166,7 +166,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
 
 
-def test_macos_metal_source_install_cpu_probe_falls_back_without_reporting_metal(monkeypatch):
+def test_macos_metal_source_install_clean_cpu_probe_returns_metal_reexec(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     probes = iter([
@@ -198,10 +198,11 @@ def test_macos_metal_source_install_cpu_probe_falls_back_without_reporting_metal
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
 
-    assert len(install_calls) == 2
-    assert result['selected_backend'] == 'cpu'
-    assert result['runtime_action'] == 'metal_cpu_fallback'
-    assert 'backend=cpu gpu_offload_supported=False' in result['fallback_reason']
+    assert len(install_calls) == 1
+    assert result['selected_backend'] == 'metal'
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert 'installed METAL runtime from source' in result['fallback_reason']
+    assert result['detected_device'] == 'cpu'
     assert result['llama_module_path'].endswith('llama_cpp/__init__.py')
 
 def test_macos_bootstrap_disabled_reports_metal_probe_only(monkeypatch):
@@ -256,6 +257,24 @@ def test_macos_bootstrap_disabled_missing_llama_cpp_fails_before_probe_only(monk
     assert 'desktop model runtime dependency unavailable' in result['fallback_reason']
     assert 'llama_module_path=' in result['fallback_reason']
     assert invoked['pip'] is False
+
+def test_macos_missing_runtime_failure_message_is_fatal_for_auto_and_hybrid(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'arm64')
+    runtime_setup = {
+        'selected_backend': 'cpu',
+        'runtime_action': 'failed',
+        'fallback_reason': "desktop model runtime dependency unavailable (No module named 'llama_cpp')",
+    }
+
+    auto_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', runtime_setup)
+    hybrid_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('hybrid', runtime_setup)
+
+    assert auto_message is not None
+    assert hybrid_message is not None
+    assert "No module named 'llama_cpp'" in auto_message
+    assert 'Metal' in auto_message
+
 
 def test_macos_metal_install_failure_falls_back_for_auto(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))

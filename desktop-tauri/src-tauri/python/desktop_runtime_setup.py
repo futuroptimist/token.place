@@ -471,9 +471,9 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
     runtime_action = str(runtime_setup.get("runtime_action", "none")).lower()
     if selected_backend != "cpu" or runtime_action not in GPU_RUNTIME_FATAL_ACTIONS:
         return None
-    if current_platform == "darwin" and selected_mode != "gpu":
-        return None
     if runtime_action in {"probe_only", "metal_probe_only"}:
+        return None
+    if current_platform == "darwin" and selected_mode != "gpu" and runtime_action != "failed":
         return None
 
     reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
@@ -731,16 +731,21 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             continue
 
         after = _probe_runtime(target_root)
-        if (
-            plan.backend in {"cuda", "metal"}
-            and after.gpu_offload_supported
-            and after.backend == plan.backend
-            and backend_probe_satisfies_install_plan(plan, after)
-        ):
+        plan_satisfied = backend_probe_satisfies_install_plan(plan, after)
+        verified_backend = after.gpu_offload_supported and after.backend == plan.backend
+        accepted_source_probe = plan_satisfied and after.backend != plan.backend
+        if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
+            if verified_backend:
+                reason = f"installed {after.backend.upper()} runtime; re-executing sidecar"
+            else:
+                reason = (
+                    f"installed {plan.backend.upper()} runtime from source; follow-up probe imported "
+                    f"llama_cpp from {after.llama_module_path}; re-executing sidecar for hardware probe"
+                )
             return {
-                "selected_backend": after.backend,
-                "fallback_reason": f"installed {after.backend.upper()} runtime; re-executing sidecar",
-                "runtime_action": _installed_reexec_action(after.backend),
+                "selected_backend": plan.backend,
+                "fallback_reason": reason,
+                "runtime_action": _installed_reexec_action(plan.backend),
                 **_probe_result_payload(after),
             }
 

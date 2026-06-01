@@ -1,16 +1,13 @@
-# Copy this file to /opt/sugarkube/helm-values/token-place-values.yaml on a sugarkube node.
+# Deprecated local compatibility values for ad-hoc Kubernetes experiments.
+# Sugarkube staging/prod values live in the Sugarkube repo and deploy the
+# canonical OCI chart with an immutable GHCR image tag.
 
 image:
-  repository: tokenplace-relay
-  tag: latest
-
-relay:
-  host: 0.0.0.0
-  port: 5010
-  extraArgs: []
+  repository: ghcr.io/futuroptimist/tokenplace-relay
+  tag: main-latest
 
 env:
-  TOKEN_PLACE_ENV: production
-
-nodeSelector:
-  kubernetes.io/arch: arm64
+  XDG_CONFIG_HOME: /tmp/.config
+  XDG_DATA_HOME: /tmp/.local/share
+  XDG_CACHE_HOME: /tmp/.cache
+  XDG_STATE_HOME: /tmp/.local/state

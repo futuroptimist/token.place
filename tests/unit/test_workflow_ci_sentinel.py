@@ -8,7 +8,7 @@ import yaml
 WORKFLOW_DIR = Path(".github/workflows")
 PR_REQUIRED_WORKFLOWS = {
     "ci.yml",
-    "build.yml",
+    "ci-image.yml",
     "desktop-operator-e2e.yml",
     "desktop-release.yml",
 }
@@ -43,15 +43,14 @@ def test_required_workflows_trigger_on_pull_requests() -> None:
     )
 
 
-def test_build_workflow_keeps_pr_paths_gate_in_sync_with_push_paths() -> None:
-    workflow_data = _load_workflow(WORKFLOW_DIR / "build.yml")
-    on_block = _workflow_on_block(workflow_data, "build.yml")
+def test_image_workflow_keeps_pull_request_validate_only() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-image.yml")
+    on_block = _workflow_on_block(workflow_data, "ci-image.yml")
 
-    push_paths = set((on_block.get("push") or {}).get("paths") or [])
-    pr_paths = set((on_block.get("pull_request") or {}).get("paths") or [])
+    assert "pull_request" in on_block, "ci-image.yml must validate relay image changes on PRs"
+    assert "workflow_dispatch" in on_block, "ci-image.yml should support manual validate-only builds"
 
-    assert push_paths, "build.yml push trigger should define changed-file paths"
-    assert pr_paths, "build.yml pull_request trigger should define changed-file paths"
-    assert push_paths == pr_paths, (
-        "build.yml push/pull_request path filters must match so PR checks mirror push behavior"
+    publish_job = workflow_data["jobs"]["publish"]
+    assert "github.event_name == 'push'" in publish_job["if"], (
+        "ci-image.yml publish job must stay push-only so PR and workflow_dispatch runs validate only"
     )

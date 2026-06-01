@@ -268,12 +268,23 @@ Artifact references:
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - v0.1.0 launch alignment: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
-- Preferred staging/prod tag: immutable `main-<shortsha>` (`main-latest` is convenience-only)
+- Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
 
-Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo.
+Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo. The current app-specific deploy command is:
 
+```bash
+just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Once Sugarkube P5 lands, the equivalent generic command is:
+
+```bash
+just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+```
+
+- GHCR-first release workflow: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
   - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)
@@ -770,7 +781,7 @@ Alternatively, you can visit http://127.0.0.1:5010 in your browser to use the we
 
 ### Raspberry Pi 5 deployment
 
-For a complete walkthrough of the Raspberry Pi 5 setup—including hardware recommendations, Docker instructions, k3s cluster steps, and troubleshooting (including rpi-clone prompts)—see [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials).
+For a complete walkthrough of the Raspberry Pi 5 setup—including hardware recommendations, Sugarkube deployment, k3s cluster steps, and troubleshooting (including rpi-clone prompts)—see [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials).
 
 If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, deploy token.place via Sugarkube's Helm OCI install/upgrade flow using the published token.place chart and image tags (see the Sugarkube runbooks linked above), rather than local chart bundle copies.
 

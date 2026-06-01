@@ -302,23 +302,36 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    The `playbooks/site.yml` playbook provides an
    Ansible equivalent if you prefer automation.
 
-3. **Build the relay container and load it into the cluster**
+3. **Deploy the published GHCR image and OCI chart with Sugarkube**
+
+   Do not build a staging or production relay image locally. Find a successful
+   **Build and publish GHCR relay image** run (`.github/workflows/ci-image.yml`),
+   copy the immutable Sugarkube tag from the workflow summary, and confirm the
+   **Publish Helm chart** run (`.github/workflows/ci-helm.yml`) has published the
+   chart version you intend to deploy.
+
+   From a Sugarkube checkout, deploy staging with the current token.place wrapper:
 
    ```bash
-   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-   sudo k3s ctr images import tokenplace-relay:latest
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-4. **Deploy the Kubernetes manifests**
+   Once Sugarkube P5 lands, the same deployment should use the generic app flow:
 
    ```bash
-   kubectl create namespace tokenplace
-   kubectl -n tokenplace apply -f k8s/
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-5. **Expose the relay service**
+   Canonical artifacts are `ghcr.io/futuroptimist/tokenplace-relay` and
+   `oci://ghcr.io/futuroptimist/charts/tokenplace`. See
+   [Sugarkube release workflow](ops/sugarkube-release.md) for the full contract.
 
-   Patch the service to type `NodePort` so `cloudflared` can reach it:
+4. **Expose the relay service**
+
+   Configure your Sugarkube ingress/Cloudflare route for the Helm-managed
+   `tokenplace` service. If you are intentionally testing the legacy raw
+   manifests in a throwaway cluster, patch the service to type `NodePort` so
+   `cloudflared` can reach it:
 
    ```bash
    kubectl -n tokenplace patch svc tokenplace-relay \
@@ -326,7 +339,7 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    kubectl -n tokenplace get svc tokenplace-relay
    ```
 
-6. **Create a Cloudflare Tunnel to the NodePort**
+5. **Create a Cloudflare Tunnel to the NodePort**
 
    On the control-plane node:
 

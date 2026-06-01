@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 
-WORKFLOW_PATH = Path(".github/workflows/build.yml")
+WORKFLOW_PATH = Path(".github/workflows/ci-image.yml")
 
 
 def _extract_block(text: str, header: str) -> str:
@@ -15,19 +15,19 @@ def _extract_block(text: str, header: str) -> str:
     return match.group(1)
 
 
-def test_relay_build_workflow_targets_multi_arch_and_ghcr_metadata() -> None:
+def test_relay_image_workflow_targets_multi_arch_and_ghcr_metadata() -> None:
     workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
 
-    platforms_match = re.search(r"platforms:\s*([^\n]+)", workflow_text)
-    assert platforms_match is not None, "Build step should declare target platforms"
-    platforms = {part.strip() for part in platforms_match.group(1).split(",") if part.strip()}
-    assert {"linux/amd64", "linux/arm64"}.issubset(platforms)
+    platform_sets = [
+        {part.strip() for part in match.split(",") if part.strip()}
+        for match in re.findall(r"platforms:\s*([^\n]+)", workflow_text)
+    ]
+    assert platform_sets, "Build steps should declare target platforms"
+    assert any({"linux/amd64", "linux/arm64"}.issubset(platforms) for platforms in platform_sets)
 
-    tags_block = _extract_block(workflow_text, "tags")
-    assert any(
-        line.strip().startswith("type=sha")
-        for line in tags_block.splitlines()
-    ), "Metadata step should publish immutable sha-* tags"
+    assert "sha-${short_sha}" in workflow_text, "Workflow should publish immutable sha-* tags"
+    assert "main-${short_sha}" in workflow_text, "Workflow should publish immutable main-* tags"
+    assert "main-latest" in workflow_text, "Workflow should publish the documented convenience tag"
 
     labels_block = _extract_block(workflow_text, "labels")
     assert any(

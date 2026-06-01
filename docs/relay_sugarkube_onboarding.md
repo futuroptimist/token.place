@@ -111,9 +111,21 @@ Assumption: cert-manager is installed and the configured ClusterIssuer (for exam
 
 > Run the following from a **Sugarkube checkout**, not from token.place.
 
-Use the values files and version file that live in Sugarkube for your environment; `PATH/TO/*` placeholders below are intentionally repo-local to Sugarkube.
+Use the values files and version file that live in Sugarkube for your environment; `PATH/TO/*` placeholders below are intentionally repo-local to Sugarkube. The GHCR-first release checklist lives in [docs/ops/sugarkube-release.md](ops/sugarkube-release.md).
 
-First install pattern:
+Current app-specific staging deploy wrapper:
+
+```bash
+just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Future generic Sugarkube app wrapper, once P5 lands:
+
+```bash
+just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Lower-level install pattern:
 
 ```bash
 just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA

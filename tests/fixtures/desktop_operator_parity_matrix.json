@@ -153,7 +153,7 @@
     "known_gaps": [
         {
             "id": "macos_packaged_operator_lifecycle_parity",
-            "source_prompt": "prompt_4",
+            "tracking_context": "macOS packaged operator lifecycle parity coverage is intentionally deferred until lightweight workflow inspection is replaced by packaged end-to-end lifecycle coverage.",
             "platform": "darwin",
             "scope": "packaged_operator_lifecycle_e2e",
             "status": "known_gap",

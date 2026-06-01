@@ -1084,6 +1084,9 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         assert invoked == {"pip": False, "source_repair": True}
 
 
+# The non-xfail platform-matrix test above asserts today's macOS probe_only
+# behavior. This strict xfail records only the desired future Metal bootstrap
+# behavior without weakening the current gap lock.
 @pytest.mark.xfail(
     strict=True,
     reason="The macOS bootstrap follow-up will replace probe-only runtime behavior with Metal bootstrap support.",

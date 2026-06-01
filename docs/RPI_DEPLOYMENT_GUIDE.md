@@ -209,15 +209,24 @@ USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**.
 Because the EEPROM’s “USB boot” setting also covers NVMe devices,
  the Pi will continue to boot from this drive without further changes.
 
-## Running the Relay with Docker Compose
+## Running the Relay with Docker Compose (local development only)
 
-On any single Pi you can run the relay directly:
+For staging and production Sugarkube deploys, do not build or run a local relay
+image first. Use the GHCR-first workflow in
+[`docs/ops/sugarkube-release.md`](ops/sugarkube-release.md): copy an immutable
+`ghcr.io/futuroptimist/tokenplace-relay:main-REPLACE_SHORTSHA` tag from
+`ci-image.yml`, confirm the chart at
+`oci://ghcr.io/futuroptimist/charts/tokenplace`, then deploy from Sugarkube with
+`just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA` or, after
+Sugarkube P5, `just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA`.
+
+On a single Pi used only for local development, you can run the relay directly:
 
 ```bash
 docker compose up -d  # start the relay container in the background
 ```
 
-The relay listens on port 5000. To expose it publicly, create a Cloudflare Tunnel:
+The relay listens on port 5000. To expose a local-development relay publicly, create a Cloudflare Tunnel:
 
 ```bash
 sudo apt install -y cloudflared               # install Cloudflare Tunnel client
@@ -302,18 +311,34 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    The `playbooks/site.yml` playbook provides an
    Ansible equivalent if you prefer automation.
 
-3. **Build the relay container and load it into the cluster**
+3. **Deploy the published relay image through Sugarkube**
+
+   Use the canonical GHCR image and OCI chart instead of building on the Pi.
+   From a Sugarkube checkout, replace `main-REPLACE_SHORTSHA` with the immutable
+   tag from a successful `ci-image.yml` workflow summary:
 
    ```bash
-   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-   sudo k3s ctr images import tokenplace-relay:latest
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-4. **Deploy the Kubernetes manifests**
+   Once Sugarkube P5 lands, the equivalent generic command is:
 
    ```bash
-   kubectl create namespace tokenplace
-   kubectl -n tokenplace apply -f k8s/
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+   The chart remains `oci://ghcr.io/futuroptimist/charts/tokenplace`, and the
+   relay image remains `ghcr.io/futuroptimist/tokenplace-relay`.
+
+4. **Optional local raw-manifest experiment**
+
+   The raw files under `k8s/` are examples only. If you intentionally use them
+   on a scratch cluster, edit their `image:` fields to a published GHCR tag such
+   as `ghcr.io/futuroptimist/tokenplace-relay:main-REPLACE_SHORTSHA` first:
+
+   ```bash
+   kubectl create namespace tokenplace-local
+   kubectl -n tokenplace-local apply -f k8s/
    ```
 
 5. **Expose the relay service**

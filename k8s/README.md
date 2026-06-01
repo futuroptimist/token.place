@@ -1,49 +1,67 @@
-# Kubernetes Manifests for token.place Relay
+# Kubernetes manifests for token.place relay
 
-These manifests run `relay.py` as a Deployment and expose it via a Service.
+The production/staging path for token.place on Sugarkube is GHCR-first:
+GitHub Actions publishes the canonical relay image and Helm chart, and Sugarkube
+deploys immutable GHCR tags. Start with
+[`docs/ops/sugarkube-release.md`](../docs/ops/sugarkube-release.md) for the
+operator workflow.
 
-1. Build and push the Docker image:
+## Canonical Sugarkube deploy path
+
+Canonical artifacts:
+
+- Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
+- Relay image workflow: `.github/workflows/ci-image.yml`
+- Chart source: `charts/tokenplace`
+- Chart OCI reference: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Chart workflow: `.github/workflows/ci-helm.yml`
+
+Staging deploy flow:
+
+1. Find a successful `ci-image.yml` run on `main`.
+2. Copy the immutable image tag from the workflow summary or GHCR package page.
+   Use a tag like `main-REPLACE_SHORTSHA`, not `main-latest`, for validation.
+3. Confirm or publish the chart with `ci-helm.yml`.
+4. From a Sugarkube checkout, deploy with the current app-specific recipe:
+
    ```bash
-   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-   # push to your registry or import to k3s
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
    ```
-2. Apply the manifests:
+
+5. Once Sugarkube P5 lands, use the generic recipe:
+
    ```bash
-   kubectl apply -f k8s/
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-Edit `relay-deployment.yaml` to point `image:` at your registry if needed.
+## Legacy raw manifests
 
-## Sugarkube Helm bundle
+The YAML files in this directory are low-level examples for local k3s
+experiments. They are not the canonical Sugarkube release surface and should not
+be used for staging or production rollouts.
 
-The [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image applies
-Helm bundles from `/etc/sugarkube/helm-bundles.d/` once the k3s cluster reports
-`Ready`. This repository now ships a chart under
-[`k8s/charts/tokenplace-relay/`](charts/tokenplace-relay) plus a matching bundle
-definition in [`k8s/sugarkube/`](sugarkube/).
+If you intentionally test these manifests locally, edit the `image:` fields to a
+published GHCR tag first, for example:
 
-Copy the bundle into place on a sugarkube host to deploy the relay via Helm:
-
-```bash
-sudo cp k8s/sugarkube/token-place.env \
-  /etc/sugarkube/helm-bundles.d/token-place.env
-sudo cp k8s/sugarkube/token-place-values.yaml \
-  /opt/sugarkube/helm-values/token-place-values.yaml
+```yaml
+image: ghcr.io/futuroptimist/tokenplace-relay:main-REPLACE_SHORTSHA
 ```
 
-The env file targets the in-repo chart at `/opt/projects/token.place` and waits
-for `deployment.apps/tokenplace-relay` to roll out before marking the bundle as
-healthy. Override image details or resource settings by editing the values file
-after copying it.
+Then apply them to a scratch namespace:
+
+```bash
+kubectl create namespace tokenplace-local
+kubectl -n tokenplace-local apply -f k8s/
+```
 
 ## Raspberry Pi pod manifest
 
-For a Raspberry Pi k3s cluster, use `relay-raspi-pod.yaml` to run a single
-ARM64 pod. The manifest now passes `--host 0.0.0.0 --port 5010` and sets
-`TOKEN_PLACE_ENV=production` so the Service and observability stacks can reach it:
+For a local Raspberry Pi k3s experiment, `relay-raspi-pod.yaml` runs a single
+ARM64 pod. Prefer the published multi-architecture GHCR image tag above instead
+of building on the Pi.
 
 ```bash
-kubectl apply -f k8s/relay-raspi-pod.yaml
+kubectl -n tokenplace-local apply -f k8s/relay-raspi-pod.yaml
 ```
 
 The deployment manifest includes resource requests/limits and basic health

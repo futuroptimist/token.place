@@ -35,6 +35,30 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - `main-latest` is convenience-only
 - Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
 
+
+## Canonical Sugarkube release flow
+
+For the full GHCR-first contract, see
+[`docs/ops/sugarkube-release.md`](ops/sugarkube-release.md). In summary:
+
+1. Find a successful `ci-image.yml` run on `main`.
+2. Copy the immutable image tag from the workflow summary or GHCR package page.
+3. Confirm or publish the chart with `ci-helm.yml`.
+4. Deploy from a Sugarkube checkout with the current app-specific recipe:
+
+   ```bash
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+5. Once Sugarkube P5 lands, use the generic app recipe:
+
+   ```bash
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+The lower-level `helm-oci-*` commands below remain useful for debugging the
+underlying chart inputs, but the app-specific Sugarkube recipe is the main path.
+
 ## Deployment commands (run from Sugarkube repo)
 
 > These commands run from a **Sugarkube checkout**, not from token.place.

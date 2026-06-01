@@ -6,30 +6,33 @@ GPU-backed `server.py` process running on a dedicated Windows 11 host with an RT
 > **Status note (April 2026):** Canonical migration sequencing now lives in
 > [docs/roadmap/desktop_compute_node_migration.md](roadmap/desktop_compute_node_migration.md).
 > For relay-on-sugarkube operator workflows, start with
-> [docs/relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md) and the environment runbooks:
-> [docs/k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
+> [docs/ops/sugarkube-release.md](ops/sugarkube-release.md), then use the
+> environment runbooks: [docs/k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),
 > [docs/k3s-sugarkube-staging.md](k3s-sugarkube-staging.md), and
 > [docs/k3s-sugarkube-prod.md](k3s-sugarkube-prod.md).
 
 ## Container image
 
-Multi-architecture images (linux/amd64 and linux/arm64) are published to GitHub Container Registry
-as `ghcr.io/<org-or-user>/tokenplace-relay`. Each build is tagged with both an immutable
-`sha-<shortsha>` and any matching semver tag.
+Multi-architecture images (linux/amd64 and linux/arm64) are published by
+`.github/workflows/ci-image.yml` to GitHub Container Registry as
+`ghcr.io/futuroptimist/tokenplace-relay`. Pull requests and `workflow_dispatch`
+runs build and smoke-test only. Pushes to `main` publish `main-<shortsha>`,
+`main-latest`, and `sha-<shortsha>`; semver Git tags publish the matching
+`vX.Y.Z` image tag plus `sha-<shortsha>`.
 
 Prefer pinning releases by digest in production to guarantee immutability and eliminate the risk of
 tag reuse:
 
 ```yaml
 image:
-  repository: ghcr.io/example/tokenplace-relay
-  digest: sha256:0123456789abcdef...
-  tag: ""  # leave empty when digest is provided so the chart renders `repo@digest`
+  repository: ghcr.io/futuroptimist/tokenplace-relay
+  tag: main-REPLACE_SHORTSHA
 ```
 
-When `image.digest` is supplied the Helm helper emits `repository@digest`. Falling back to
-`image.tag` renders `repository:tag`, and leaving both empty resolves to the chart `appVersion`.
-Digest pinning avoids supply-chain surprises and should be the default for production releases.
+When `image.digest` is supplied the Helm helper emits `repository@digest`. Otherwise
+`image.tag` renders `repository:tag`. Use immutable `main-<shortsha>` tags for staging
+validation and semver tags such as `v0.1.0` for release candidates. The chart default
+`main-latest` exists for lint/render convenience only.
 
 The container exposes port `5010` internally. Runtime environment variables:
 
@@ -91,55 +94,43 @@ Kubernetes continuously verifies the relay’s health:
 
 ## Helm deployment workflow
 
-1. Add the chart directory to your Helm repository or package it locally.
-2. Prepare an override file (for example, `relay-values.yaml`) with environment-specific values:
-   ```yaml
-   image:
-     repository: ghcr.io/example/tokenplace-relay
-     digest: sha256:0123456789abcdef...
-   ingress:
-     hosts:
-       - host: relay.staging.example.com
-         paths:
-           - path: /
-             pathType: Prefix
-     tls:
-       - secretName: relay-staging-tls
-         hosts:
-           - relay.staging.example.com
-   gpuExternalName:
-     host: gpu-box.example.com
-     port: 5015
-   upstream:
-     url: http://gpu-server:5015
-   serviceMonitor:
-     enabled: true
-     namespaceSelector:
-       matchNames:
-         - monitoring
-   networkPolicy:
-     extraEgress:
-       - to:
-           - ipBlock:
-               cidr: 203.0.113.42/32
-         ports:
-           - protocol: TCP
-             port: 5015
-   ```
-3. Deploy with Helm:
+The canonical Sugarkube chart is `charts/tokenplace`, published by
+`.github/workflows/ci-helm.yml` as
+`oci://ghcr.io/futuroptimist/charts/tokenplace`. Chart versions are immutable;
+the workflow refuses to overwrite an existing OCI chart version.
+
+Production and staging operators should not package a local chart or deploy
+`./deploy/charts/tokenplace-relay`. Use this GHCR-first flow instead:
+
+1. Find a successful `ci-image.yml` run on `main`.
+2. Copy the immutable image tag from the workflow summary or GHCR package page:
+   `main-REPLACE_SHORTSHA`.
+3. Confirm or publish the chart with `ci-helm.yml`.
+4. From a Sugarkube checkout, deploy with the current app-specific recipe:
+
    ```bash
-   helm upgrade --install relay ./deploy/charts/tokenplace-relay \
-     --namespace tokenplace --create-namespace \
-     -f relay-values.yaml
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
    ```
-4. After rollout, verify the health and readiness probes:
+
+5. Once Sugarkube P5 lands, use the generic app recipe:
+
    ```bash
-   kubectl -n tokenplace get pods -l app.kubernetes.io/name=tokenplace-relay
-   kubectl -n tokenplace get ingress relay-tokenplace-relay
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
    ```
-5. Optional: enable the `ServiceMonitor` by setting `serviceMonitor.enabled: true`. Labels default to
-   `{ release: kube-prometheus-stack }`, interval `30s`, and path `/metrics` on the `http` port so the
-   kube-prometheus-stack discovers the metrics endpoint without extra overrides.
+
+6. After rollout, verify the health and readiness probes:
+
+   ```bash
+   kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
+   kubectl -n tokenplace get pods -l app.kubernetes.io/name=tokenplace
+   kubectl -n tokenplace get ingress tokenplace
+   curl -fsS https://staging.token.place/livez
+   curl -fsS https://staging.token.place/healthz
+   ```
+
+Optional: enable Prometheus scraping in the Sugarkube environment values if the
+cluster has a compatible monitoring stack. Keep relay-owned state and diagnostics
+relay-blind: ciphertext only plus safe routing metadata.
 
 ## Running `server.py` on Windows 11 (RTX 4090 host)
 

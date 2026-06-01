@@ -1,4 +1,4 @@
-name: Build relay container image
+name: Validate relay container image
 
 on:
   pull_request:
@@ -16,8 +16,6 @@ on:
     branches:
       - main
       - codex/**
-    tags:
-      - 'v*'
     paths:
       - Dockerfile
       - docker/relay/**
@@ -35,13 +33,13 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/tokenplace-relay
 
 jobs:
-  build-and-push:
+  validate:
     runs-on: ubuntu-latest
     env:
-      PUSH_IMAGE: ${{ github.event_name == 'push' && github.repository == 'futuroptimist/token.place' && github.ref == 'refs/heads/main' }}
+      # Canonical publishing moved to ci-image.yml so this sentinel workflow is validation-only.
+      PUSH_IMAGE: false
     permissions:
       contents: read
-      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,15 +69,7 @@ jobs:
             org.opencontainers.image.created={{ timestamp }}
             org.opencontainers.image.licenses=MIT
 
-      - name: Login to GHCR
-        if: env.PUSH_IMAGE == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push multi-arch image
+      - name: Build multi-arch image without publishing
         id: build
         uses: docker/build-push-action@v5
         with:
@@ -92,7 +82,13 @@ jobs:
           provenance: "mode=max"
           sbom: true
 
-      - name: Image digest
-        if: env.PUSH_IMAGE == 'true'
+      - name: Validation summary
         run: |
-          echo "Digest: ${{ steps.build.outputs.digest }}"
+          {
+            echo "## Relay image validation"
+            echo ""
+            echo "Built image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}`"
+            echo "Pushed: false"
+            echo ""
+            echo "Canonical GHCR publishing is handled by `.github/workflows/ci-image.yml`."
+          } >> "$GITHUB_STEP_SUMMARY"

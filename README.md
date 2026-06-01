@@ -273,7 +273,21 @@ Artifact references:
 - Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo.
+The release path is GHCR-first: find a successful `ci-image.yml` run, copy the
+immutable `main-REPLACE_SHORTSHA` tag, confirm/publish the chart with
+`ci-helm.yml`, then deploy from Sugarkube with:
 
+```bash
+just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+```
+
+After Sugarkube P5 lands, the generic deployment command is:
+
+```bash
+just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+```
+
+- Release workflow: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
   - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)

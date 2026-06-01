@@ -91,6 +91,7 @@ def _packaged_env(tmp_root: Path, resources_root: Path, relay_url: str, *, sessi
             "TOKENPLACE_DESKTOP_WARM_LOAD": "1",
             "TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS": "30",
             "TOKENPLACE_OPERATOR_SESSION_ID": session_id,
+            "TOKENPLACE_COMPUTE_NODE_SESSION_ID": session_id,
             "TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.05",
             "TOKENPLACE_API_V1_RELAY_LONG_POLL_SECONDS": "0.05",
             "TOKENPLACE_DISTRIBUTED_COMPUTE_URL": relay_url,
@@ -332,7 +333,8 @@ def _read_file(path: Path) -> str:
         return ""
 
 
-def _assert_relay_observed_api_v1_success(relay_stdout: Path, *, min_turns: int) -> None:
+def _assert_relay_observed_api_v1_success(relay_stdout: Path, stdout_handle: Any, *, min_turns: int) -> None:
+    stdout_handle.flush()
     logs = _read_file(relay_stdout)
     assert logs.count("relay.api_v1.request_queued") >= min_turns, logs[-4000:]
     assert logs.count("relay.api_v1.response_received") >= min_turns, logs[-4000:]
@@ -358,10 +360,14 @@ def _run_operator_session(
         layout_label=layout_label,
         session_index=session_index,
     )
-    _wait_for_registered(bridge, relay_url, layout_label=layout_label)
-    for offset in range(turns):
-        _chat_turn(relay_url, relay_public_key, turn=(session_index * 10) + offset)
-        _wait_for_queue_depth_zero(relay_url, layout_label=layout_label)
+    try:
+        _wait_for_registered(bridge, relay_url, layout_label=layout_label)
+        for offset in range(turns):
+            _chat_turn(relay_url, relay_public_key, turn=(session_index * 10) + offset)
+            _wait_for_queue_depth_zero(relay_url, layout_label=layout_label)
+    except Exception:
+        bridge.stop()
+        raise
     return bridge
 
 
@@ -371,6 +377,7 @@ def _run_layout_parity(
     resources_root: Path,
     relay_url: str,
     relay_stdout: Path,
+    relay_stdout_handle: Any,
     *,
     layout_label: str,
 ) -> None:
@@ -405,7 +412,7 @@ def _run_layout_parity(
     restarted.stop()
     assert restarted.process.returncode == 0, f"bridge restart exited {restarted.process.returncode}: {restarted.log_path}"
     _wait_for_no_registered_nodes(relay_url, layout_label=layout_label)
-    _assert_relay_observed_api_v1_success(relay_stdout, min_turns=4)
+    _assert_relay_observed_api_v1_success(relay_stdout, relay_stdout_handle, min_turns=4)
 
 
 def _start_relay(relay_port: int, stdout_path: Path, stderr_path: Path) -> tuple[subprocess.Popen[str], Any, Any]:
@@ -423,10 +430,11 @@ def _start_relay(relay_port: int, stdout_path: Path, stderr_path: Path) -> tuple
             "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS": "20",
             "TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.05",
             "TOKENPLACE_API_V1_RELAY_LONG_POLL_SECONDS": "0.05",
+            "PYTHONUNBUFFERED": "1",
         }
     )
-    stdout_handle = stdout_path.open("w", encoding="utf-8")
-    stderr_handle = stderr_path.open("w", encoding="utf-8")
+    stdout_handle = stdout_path.open("w", encoding="utf-8", buffering=1)
+    stderr_handle = stderr_path.open("w", encoding="utf-8", buffering=1)
     relay = subprocess.Popen(  # noqa: S603
         [
             sys.executable,
@@ -478,6 +486,7 @@ def main() -> int:
                 standard_resources,
                 relay_url,
                 relay_stdout,
+                relay_stdout_handle,
                 layout_label="standard resources",
             )
             _run_layout_parity(
@@ -486,6 +495,7 @@ def main() -> int:
                 mac_resources,
                 relay_url,
                 relay_stdout,
+                relay_stdout_handle,
                 layout_label="macOS Contents/Resources",
             )
         finally:

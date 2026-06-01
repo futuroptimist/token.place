@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import platform as platform_module
 import subprocess
 import sys
 import time
@@ -14,9 +15,19 @@ from typing import Dict, Optional
 
 from desktop_gpu_packaging import (
     LlamaCppInstallPlan,
+    llama_cpp_install_plan,
     llama_cpp_install_plan_fallbacks,
     llama_cpp_requirement_spec,
 )
+
+
+@dataclass(frozen=True)
+class RuntimeBootstrapPolicy:
+    platform: str
+    arch: str
+    backend: Optional[str]
+    bootstrap_supported: bool
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -32,10 +43,105 @@ class RuntimeProbe:
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
 GPU_RUNTIME_FATAL_ACTIONS = frozenset(
-    {"failed", "installed_cpu_fallback", "shadowed_repo_llama_cpp", "unavailable"}
+    {
+        "failed",
+        "installed_cpu_fallback",
+        "metal_cpu_fallback",
+        "metal_install_failed",
+        "shadowed_repo_llama_cpp",
+        "unavailable",
+    }
 )
+
+
+def _normalized_machine(value: Optional[str] = None) -> str:
+    machine = (value or platform_module.machine() or "").strip().lower()
+    return {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "arm64": "aarch64",
+    }.get(machine, machine)
+
+
+def _runtime_bootstrap_policy(
+    *,
+    platform_name: Optional[str] = None,
+    machine: Optional[str] = None,
+) -> RuntimeBootstrapPolicy:
+    platform_name = (platform_name or sys.platform).lower()
+    arch = _normalized_machine(machine)
+
+    if platform_name.startswith("win"):
+        if arch == "x86_64":
+            return RuntimeBootstrapPolicy(
+                platform=platform_name,
+                arch=arch,
+                backend="cuda",
+                bootstrap_supported=True,
+                reason="Windows x86_64 CUDA runtime bootstrap is supported",
+            )
+        return RuntimeBootstrapPolicy(
+            platform=platform_name,
+            arch=arch,
+            backend="cuda",
+            bootstrap_supported=False,
+            reason=f"CUDA bootstrap is only enabled for Windows x86_64 (detected arch={arch or 'unknown'})",
+        )
+
+    if platform_name == "darwin":
+        if arch in {"x86_64", "aarch64"}:
+            return RuntimeBootstrapPolicy(
+                platform=platform_name,
+                arch=arch,
+                backend="metal",
+                bootstrap_supported=True,
+                reason="macOS Metal runtime bootstrap is supported",
+            )
+        return RuntimeBootstrapPolicy(
+            platform=platform_name,
+            arch=arch,
+            backend="metal",
+            bootstrap_supported=False,
+            reason=f"Metal bootstrap is only enabled for macOS arm64/x86_64 (detected arch={arch or 'unknown'})",
+        )
+
+    return RuntimeBootstrapPolicy(
+        platform=platform_name,
+        arch=arch,
+        backend=None,
+        bootstrap_supported=False,
+        reason=f"desktop runtime bootstrap is probe-only on platform={platform_name} arch={arch or 'unknown'}",
+    )
+
+
+def _runtime_action_for_already_supported(backend: str) -> str:
+    if backend == "metal":
+        return "metal_already_supported"
+    return "already_supported"
+
+
+def _runtime_action_for_installed_backend(backend: str) -> str:
+    if backend == "metal":
+        return "installed_metal_reexec"
+    if backend == "cuda":
+        return "installed_cuda_reexec"
+    return "installed_gpu_reexec"
+
+
+def _runtime_action_for_cpu_fallback(policy: RuntimeBootstrapPolicy) -> str:
+    if policy.backend == "metal":
+        return "metal_cpu_fallback"
+    return "installed_cpu_fallback"
+
+
+def _runtime_action_for_install_failure(policy: RuntimeBootstrapPolicy) -> str:
+    if policy.backend == "metal":
+        return "metal_install_failed"
+    return "failed"
+
 PIP_INSTALL_TIMEOUT_SECONDS = 300
 PIP_SOURCE_BUILD_TIMEOUT_SECONDS = 1800
+SOURCE_BUILD_TIMEOUT_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_SOURCE_BUILD_TIMEOUT_SECONDS"
 INSTALL_ERROR_SUMMARY_MAX_LEN = 512
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
@@ -269,11 +375,80 @@ def _run_pip_install(
     return False, (install.stderr or install.stdout or "").strip()
 
 
-def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
+def _source_build_timeout_seconds() -> int:
+    configured = os.getenv(SOURCE_BUILD_TIMEOUT_ENV, "").strip()
+    if not configured:
+        return PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+    try:
+        timeout = int(configured)
+    except ValueError:
+        return PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+    return timeout if timeout > 0 else PIP_SOURCE_BUILD_TIMEOUT_SECONDS
+
+
+def _unversioned_source_plan(backend: str, platform_name: str) -> LlamaCppInstallPlan:
+    cmake_args = None
+    if backend == "cuda":
+        cmake_args = "-DGGML_CUDA=on"
+    elif backend == "metal":
+        cmake_args = "-DGGML_METAL=on -DGGML_NATIVE=off"
+
+    return LlamaCppInstallPlan(
+        platform=platform_name,
+        backend=backend,
+        package_spec="llama-cpp-python",
+        cmake_args=cmake_args,
+        force_cmake=backend in {"cuda", "metal"},
+        index_url="https://pypi.org/simple",
+        only_binary=False,
+        no_binary=True,
+    )
+
+
+def _source_repair_plan(
+    backend: str, requirements_path: Path, platform_name: str
+) -> LlamaCppInstallPlan:
+    try:
+        plans = llama_cpp_install_plan_fallbacks(
+            platform=platform_name,
+            requirements_path=requirements_path,
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        plans = _fallback_unpinned_plans(platform_name)
+
+    for plan in plans:
+        if plan.backend == backend and plan.no_binary:
+            return plan
+
+    try:
+        plan = llama_cpp_install_plan(platform=platform_name, requirements_path=requirements_path)
+    except (FileNotFoundError, OSError, ValueError):
+        fallback_plans = _fallback_unpinned_plans(platform_name)
+        plan = fallback_plans[0] if fallback_plans else _unversioned_source_plan(backend, platform_name)
+
+    return LlamaCppInstallPlan(
+        platform=platform_name,
+        backend=backend,
+        package_spec=plan.package_spec,
+        cmake_args=plan.cmake_args,
+        force_cmake=plan.force_cmake,
+        index_url=plan.index_url,
+        only_binary=False,
+        no_binary=True,
+    )
+
+
+def _source_repair(
+    backend: str,
+    requirements_path: Path,
+    *,
+    platform_name: Optional[str] = None,
+) -> tuple[bool, str]:
+    platform_name = (platform_name or sys.platform).lower()
+    plan = _source_repair_plan(backend, requirements_path, platform_name)
     env = os.environ.copy()
-    env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
-    env["FORCE_CMAKE"] = "1"
-    package_spec = "llama-cpp-python"
+    env.update(plan.pip_env())
+    package_spec = plan.package_spec
     metadata_warning = ""
     try:
         package_spec = llama_cpp_requirement_spec(requirements_path)
@@ -299,7 +474,7 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
         "--verbose",
         package_spec,
     ]
-    ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
+    ok, output = _run_pip_install(cmd, env, timeout_seconds=_source_build_timeout_seconds())
     if not metadata_warning:
         return ok, output
 
@@ -310,6 +485,10 @@ def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
     lines = detail.splitlines()
     lines[-1] = f"{lines[-1]} ({metadata_warning})"
     return ok, "\n".join(lines)
+
+
+def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
+    return _source_repair("cuda", requirements_path, platform_name="win32")
 
 
 def _summarize_install_error(raw: str) -> str:
@@ -400,7 +579,7 @@ def maybe_reexec_for_runtime_refresh(
 ) -> None:
     if not allow_reexec:
         return
-    if runtime_setup.get("runtime_action") != "installed_cuda_reexec":
+    if runtime_setup.get("runtime_action") not in {"installed_cuda_reexec", "installed_metal_reexec"}:
         return
     if os.environ.get(REEXEC_GUARD_ENV) == "1":
         return
@@ -413,21 +592,38 @@ def maybe_reexec_for_runtime_refresh(
 
 
 def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]) -> str | None:
-    """Return fatal runtime bootstrap diagnostics for Windows desktop GPU launch modes."""
+    """Return fatal runtime bootstrap diagnostics for desktop GPU launch modes."""
 
-    if sys.platform != "win32" or mode not in GPU_MODES:
+    selected_mode = (mode or "auto").strip().lower()
+    if selected_mode not in GPU_MODES:
+        return None
+
+    policy = _runtime_bootstrap_policy()
+    if policy.backend not in {"cuda", "metal"}:
         return None
 
     selected_backend = str(runtime_setup.get("selected_backend", "cpu")).lower()
     runtime_action = str(runtime_setup.get("runtime_action", "none")).lower()
-    if selected_backend != "cpu" or runtime_action not in GPU_RUNTIME_FATAL_ACTIONS:
+    if selected_backend != "cpu":
+        return None
+
+    if policy.backend == "metal":
+        fatal_action = selected_mode == "gpu" and (
+            runtime_action in GPU_RUNTIME_FATAL_ACTIONS or runtime_action.endswith("_probe_only")
+        )
+    else:
+        fatal_action = runtime_action in GPU_RUNTIME_FATAL_ACTIONS
+
+    if not fatal_action:
         return None
 
     reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
+    platform_label = "macOS Metal" if policy.backend == "metal" else "desktop Windows"
+    prerequisite_label = "Metal runtime prerequisites" if policy.backend == "metal" else "CUDA runtime prerequisites"
     return (
-        "GPU provisioning failed for desktop Windows launch "
-        f"(mode={mode}, action={runtime_action}): {reason}. "
-        "Verify CUDA runtime prerequisites and llama-cpp-python CUDA build support."
+        f"GPU provisioning failed for {platform_label} launch "
+        f"(mode={selected_mode}, action={runtime_action}): {reason}. "
+        f"Verify {prerequisite_label} and llama-cpp-python {policy.backend.upper()} build support."
     )
 
 
@@ -472,28 +668,29 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         return {
             "selected_backend": before.backend,
             "fallback_reason": "",
-            "runtime_action": "already_supported",
+            "runtime_action": _runtime_action_for_already_supported(before.backend),
             **_probe_result_payload(before),
         }
 
-    if before.backend == "missing" and not sys.platform.startswith("win"):
+    policy = _runtime_bootstrap_policy()
+    if not policy.bootstrap_supported:
+        if before.backend == "missing":
+            return {
+                "selected_backend": "cpu",
+                "fallback_reason": (
+                    f"desktop model runtime dependency unavailable ({before.error or 'llama_cpp missing'}); "
+                    f"interpreter={before.interpreter}; import_root={target_root}; "
+                    "install llama-cpp-python for the desktop runtime before registering with the relay"
+                ),
+                "runtime_action": "failed",
+                **_probe_result_payload(before),
+            }
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
-                f"desktop model runtime dependency unavailable ({before.error or 'llama_cpp missing'}); "
-                f"interpreter={before.interpreter}; import_root={target_root}; "
-                "install llama-cpp-python for the desktop runtime before registering with the relay"
-            ),
-            "runtime_action": "failed",
-            **_probe_result_payload(before),
-        }
-
-    if not sys.platform.startswith("win"):
-        return {
-            "selected_backend": "cpu",
-            "fallback_reason": (
-                f"GPU runtime unavailable ({before.error or before.backend}); "
-                "desktop auto-repair is currently Windows-focused"
+                f"{policy.reason}; runtime probe found backend={before.backend} "
+                f"error={before.error or 'none'}; interpreter={before.interpreter}; "
+                f"import_root={target_root}"
             ),
             "runtime_action": "probe_only",
             **_probe_result_payload(before),
@@ -503,9 +700,10 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         return {
             "selected_backend": "cpu",
             "fallback_reason": (
-                f"desktop runtime bootstrap disabled by {DISABLE_BOOTSTRAP_ENV}=1"
+                f"desktop runtime bootstrap disabled by {DISABLE_BOOTSTRAP_ENV}=1; "
+                f"backend={policy.backend}; interpreter={before.interpreter}; import_root={target_root}"
             ),
-            "runtime_action": "probe_only",
+            "runtime_action": "metal_probe_only" if policy.backend == "metal" else "probe_only",
             **_probe_result_payload(before),
         }
 
@@ -514,9 +712,10 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             "selected_backend": "cpu",
             "fallback_reason": (
                 "desktop runtime bootstrap skipped during normal startup; set "
-                f"{ENABLE_BOOTSTRAP_ENV}=1 to allow runtime repair/install"
+                f"{ENABLE_BOOTSTRAP_ENV}=1 to allow {policy.backend} runtime repair/install; "
+                f"interpreter={before.interpreter}; import_root={target_root}"
             ),
-            "runtime_action": "probe_only",
+            "runtime_action": "metal_probe_only" if policy.backend == "metal" else "probe_only",
             **_probe_result_payload(before),
         }
 
@@ -524,22 +723,29 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     last_error = ""
 
     should_repair, repair_skip_reason = _should_attempt_source_repair()
-    if should_repair:
-        source_ok, source_log = _windows_cuda_source_repair(requirements_path)
+    if should_repair and policy.backend:
+        if policy.backend == "cuda" and policy.platform.startswith("win"):
+            source_ok, source_log = _windows_cuda_source_repair(requirements_path)
+        else:
+            source_ok, source_log = _source_repair(
+                policy.backend,
+                requirements_path,
+                platform_name=policy.platform,
+            )
         if source_ok:
             _clear_source_repair_failure()
             after = _probe_runtime(target_root)
-            if after.gpu_offload_supported and after.backend == "cuda":
+            if after.gpu_offload_supported and after.backend == policy.backend:
                 return {
-                    "selected_backend": "cuda",
-                    "fallback_reason": "installed CUDA runtime; re-executing sidecar",
-                    "runtime_action": "installed_cuda_reexec",
+                    "selected_backend": policy.backend,
+                    "fallback_reason": f"installed {policy.backend.upper()} runtime; re-executing sidecar",
+                    "runtime_action": _runtime_action_for_installed_backend(policy.backend),
                     **_probe_result_payload(after),
                 }
             source_detail = _summarize_install_error(source_log)
             last_error = (
-                "CUDA source reinstall completed but runtime still CPU-only; "
-                "check CUDA toolkit/build tools"
+                f"{policy.backend.upper()} source reinstall completed but runtime still CPU-only; "
+                f"check {policy.backend.upper()} toolkit/build prerequisites"
             )
             if source_detail and source_detail != "install failed":
                 last_error = f"{last_error}; source repair detail: {source_detail}"
@@ -552,11 +758,11 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 
     try:
         plans = llama_cpp_install_plan_fallbacks(
-            platform=sys.platform,
+            platform=policy.platform,
             requirements_path=requirements_path,
         )
-    except (FileNotFoundError, ValueError):
-        plans = _fallback_unpinned_plans(sys.platform)
+    except (FileNotFoundError, OSError, ValueError):
+        plans = _fallback_unpinned_plans(policy.platform)
 
     for plan in plans:
         env = os.environ.copy()
@@ -570,32 +776,42 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             *plan.pip_install_args(),
             plan.package_spec,
         ]
-        ok, log_output = _run_pip_install(cmd, env)
+        timeout_seconds = (
+            _source_build_timeout_seconds() if plan.no_binary else PIP_INSTALL_TIMEOUT_SECONDS
+        )
+        ok, log_output = _run_pip_install(cmd, env, timeout_seconds=timeout_seconds)
         if not ok:
             last_error = _summarize_install_error(log_output)
             continue
 
         after = _probe_runtime(target_root)
-        if after.gpu_offload_supported and after.backend in {"cuda", "metal"}:
+        if (
+            after.gpu_offload_supported
+            and after.backend == plan.backend
+            and plan.backend in {"cuda", "metal"}
+        ):
             return {
                 "selected_backend": after.backend,
-                "fallback_reason": "installed GPU runtime; re-executing sidecar",
-                "runtime_action": "installed_cuda_reexec",
+                "fallback_reason": f"installed {after.backend.upper()} runtime; re-executing sidecar",
+                "runtime_action": _runtime_action_for_installed_backend(after.backend),
                 **_probe_result_payload(after),
             }
 
         if plan.backend == "cpu":
             return {
                 "selected_backend": "cpu",
-                "fallback_reason": "GPU runtime unavailable after repair; using CPU runtime",
-                "runtime_action": "installed_cpu_fallback",
+                "fallback_reason": (
+                    f"{policy.backend.upper() if policy.backend else 'GPU'} runtime unavailable after repair; "
+                    "using CPU runtime"
+                ),
+                "runtime_action": _runtime_action_for_cpu_fallback(policy),
                 **_probe_result_payload(after),
             }
 
     return {
         "selected_backend": "cpu",
-        "fallback_reason": before.error or last_error or "unable to install a GPU-capable runtime",
-        "runtime_action": "failed",
+        "fallback_reason": before.error or last_error or f"unable to install a {policy.backend or 'GPU'}-capable runtime",
+        "runtime_action": _runtime_action_for_install_failure(policy),
         **_probe_result_payload(before),
     }
 

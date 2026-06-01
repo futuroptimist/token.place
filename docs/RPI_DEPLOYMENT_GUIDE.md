@@ -302,31 +302,61 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    The `playbooks/site.yml` playbook provides an
    Ansible equivalent if you prefer automation.
 
-3. **Build the relay container and load it into the cluster**
+3. **Deploy the published GHCR image and OCI chart with Sugarkube**
+
+   Do not build a staging or production relay image locally. Find a successful
+   **Build and publish GHCR relay image** run (`.github/workflows/ci-image.yml`),
+   copy the immutable Sugarkube tag from the workflow summary, and confirm the
+   **Publish Helm chart** run (`.github/workflows/ci-helm.yml`) has published the
+   chart version you intend to deploy.
+
+   From a Sugarkube checkout, deploy staging with the current token.place wrapper:
 
    ```bash
-   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-   sudo k3s ctr images import tokenplace-relay:latest
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-4. **Deploy the Kubernetes manifests**
+   Once Sugarkube P5 lands, the same deployment should use the generic app flow:
 
    ```bash
-   kubectl create namespace tokenplace
-   kubectl -n tokenplace apply -f k8s/
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-5. **Expose the relay service**
+   Canonical artifacts are `ghcr.io/futuroptimist/tokenplace-relay` and
+   `oci://ghcr.io/futuroptimist/charts/tokenplace`. See
+   [Sugarkube release workflow](ops/sugarkube-release.md) for the full contract.
 
-   Patch the service to type `NodePort` so `cloudflared` can reach it:
+4. **Expose the Helm-managed relay service**
+
+   Configure your Sugarkube ingress and Cloudflare route for the Helm-managed
+   `tokenplace` service. The canonical Sugarkube path routes traffic through
+   the cluster ingress controller; do not create a localhost `30500` tunnel for
+   this path because the Helm chart does not create that legacy NodePort.
+
+   Verify that the Helm release created the expected service before updating
+   the Cloudflare route:
+
+   ```bash
+   kubectl -n tokenplace get svc tokenplace
+   kubectl -n tokenplace get ingress tokenplace
+   ```
+
+   After the route is active, your relay is reachable at
+   `https://relay.your-domain.com` (or `https://your-domain.com` if you use the
+   zone apex) and traffic is forwarded through Sugarkube ingress.
+
+5. **Optional: test the legacy raw manifests with a local NodePort tunnel**
+
+   Use this only for throwaway raw-manifest experiments, not for the canonical
+   Sugarkube Helm deployment above. The legacy manifests expose
+   `tokenplace-relay`; patch that legacy service to type `NodePort` so
+   `cloudflared` can reach it:
 
    ```bash
    kubectl -n tokenplace patch svc tokenplace-relay \
      -p '{"spec": {"type": "NodePort", "ports": [{"port": 5000, "nodePort": 30500}]}}'
    kubectl -n tokenplace get svc tokenplace-relay
    ```
-
-6. **Create a Cloudflare Tunnel to the NodePort**
 
    On the control-plane node:
 
@@ -336,7 +366,7 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    cloudflared tunnel create tokenplace-prod
    ```
 
-   Write `~/.cloudflared/config.yml`:
+   Write `~/.cloudflared/config.yml` for the legacy NodePort:
 
    ```yaml
    tunnel: TUNNEL_ID
@@ -350,25 +380,13 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
 
    > **Tip:** The `hostname` value can also be the zone's apex domain. Replace
    > `relay.your-domain.com` with your root domain to expose the relay at the
-   > base URL:
-   >
-   > ```yaml
-   > ingress:
-   >   - hostname: your-domain.com
-   >     service: http://localhost:30500
-   >   - service: http_status:404
-   > ```
-   >
-   > Cloudflare handles the DNS record via CNAME flattening.
+   > base URL. Cloudflare handles the DNS record via CNAME flattening.
 
    Start the tunnel and keep it running:
 
    ```bash
    cloudflared tunnel run tokenplace-prod
    ```
-
-After the tunnel is active, your relay is reachable at `https://relay.your-domain.com` (or `https://your-domain.com` if you used the apex domain) and traffic is
-forwarded into the k3s cluster.
 
 ## Troubleshooting
 

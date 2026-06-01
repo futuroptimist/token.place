@@ -5,9 +5,9 @@ strategy:
 
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
-  tag: "main"
+  tag: "main-latest"
   digest: ""
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 imagePullSecrets: []
 

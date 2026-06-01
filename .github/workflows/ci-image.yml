@@ -30,6 +30,8 @@ jobs:
       sha_tag: ${{ steps.tags.outputs.sha_tag }}
       ref_kind: ${{ steps.tags.outputs.ref_kind }}
       semver_tag: ${{ steps.tags.outputs.semver_tag }}
+      deploy_tag: ${{ steps.tags.outputs.deploy_tag }}
+      publish: ${{ steps.tags.outputs.publish }}
 
     steps:
       - name: Checkout repository
@@ -46,6 +48,8 @@ jobs:
           ref="${GITHUB_REF}"
           ref_kind="other"
           semver_tag=""
+          publish="false"
+          deploy_tag=""
 
           short_sha="$(git rev-parse --short=7 HEAD)"
           created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -55,6 +59,8 @@ jobs:
 
           if [[ "${event_name}" == "push" && "${ref}" == "refs/heads/main" ]]; then
             ref_kind="main"
+            publish="true"
+            deploy_tag="main-${short_sha}"
             publish_tags="${repository}:main-${short_sha}"$'\n'"${repository}:main-latest"$'\n'"${sha_tag}"
           elif [[ "${event_name}" == "push" && "${ref}" == refs/tags/* ]]; then
             ref_kind="tag"
@@ -71,6 +77,8 @@ jobs:
               echo "Unsafe docker tag derived from ref: ${semver_tag}" >&2
               exit 1
             fi
+            publish="true"
+            deploy_tag="${semver_tag}"
             publish_tags="${repository}:${semver_tag}"$'\n'"${sha_tag}"
           fi
 
@@ -80,6 +88,8 @@ jobs:
           echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
           echo "ref_kind=${ref_kind}" >> "$GITHUB_OUTPUT"
           echo "semver_tag=${semver_tag}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "deploy_tag=${deploy_tag}" >> "$GITHUB_OUTPUT"
           echo "publish_tags<<EOF" >> "$GITHUB_OUTPUT"
           echo "${publish_tags}" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -101,6 +111,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+            org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
@@ -174,6 +185,22 @@ jobs:
           curl -fsS http://127.0.0.1:5011/metrics >/dev/null
           docker exec tokenplace-relay-smoke-readonly sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+      - name: Publish validation summary
+        run: |
+          {
+            echo "## Relay image validation"
+            echo ""
+            echo "Repository: `${{ steps.tags.outputs.repository }}`"
+            echo "Commit: `${{ steps.tags.outputs.short_sha }}`"
+            if [[ "${{ steps.tags.outputs.publish }}" == "true" ]]; then
+              echo "Publishing will be handled by the publish job."
+              echo "Immutable Sugarkube tag after publish: `${{ steps.tags.outputs.deploy_tag }}`"
+            else
+              echo "Pushed: false"
+              echo "This pull_request/workflow_dispatch run is validate-only; publish by pushing to `main` or a semver tag `vX.Y.Z`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish:
     name: Publish relay image
     runs-on: ubuntu-latest
@@ -215,6 +242,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
             org.opencontainers.image.created=${{ needs.build-and-smoke.outputs.created }}
+            org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
@@ -225,9 +253,11 @@ jobs:
             echo ""
             if [[ "${{ needs.build-and-smoke.outputs.ref_kind }}" == "main" ]]; then
               echo "Immutable tag: \`ghcr.io/futuroptimist/tokenplace-relay:main-${{ needs.build-and-smoke.outputs.short_sha }}\`"
+              echo "Sugarkube deploy tag: \`main-${{ needs.build-and-smoke.outputs.short_sha }}\`"
               echo "Mutable tag: \`ghcr.io/futuroptimist/tokenplace-relay:main-latest\`"
             elif [[ "${{ needs.build-and-smoke.outputs.ref_kind }}" == "tag" ]]; then
               echo "Release tag: \`ghcr.io/futuroptimist/tokenplace-relay:${{ needs.build-and-smoke.outputs.semver_tag }}\`"
+              echo "Sugarkube deploy tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
             echo ""

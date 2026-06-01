@@ -15,12 +15,9 @@ This document explains the improvements made to make token.place work seamlessly
 
 ## Docker Containerization
 
-We've implemented Docker support for easy deployment:
+The repository-root `Dockerfile` is the canonical relay image source used by `.github/workflows/ci-image.yml`; `config/docker-compose.yml` remains useful for local development. Sugarkube staging and production should use the published GHCR image and OCI chart documented in [ops/sugarkube-release.md](ops/sugarkube-release.md).
 
-- `docker/Dockerfile.relay` - Relay component container
-- `config/docker-compose.yml` - Launches the relay service
-
-### Building and Running with Docker
+### Building and Running with Docker for local development
 
 ```bash
 # Build and start the relay service

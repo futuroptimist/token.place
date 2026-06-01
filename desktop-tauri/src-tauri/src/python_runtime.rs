@@ -6,6 +6,173 @@ use crate::backend::ComputeMode;
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PythonResourceRoot {
+    pub root: PathBuf,
+    pub layout: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPythonResource {
+    pub resource_root: PathBuf,
+    pub resource_layout: &'static str,
+    pub script_path: PathBuf,
+}
+
+fn push_resource_root(
+    candidates: &mut Vec<PythonResourceRoot>,
+    root: PathBuf,
+    layout: &'static str,
+) {
+    if candidates.iter().any(|candidate| candidate.root == root) {
+        return;
+    }
+    candidates.push(PythonResourceRoot { root, layout });
+}
+
+pub fn python_resource_root_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Vec<PythonResourceRoot> {
+    let mut candidates = Vec::new();
+
+    if let Some(resource_dir) = resource_dir {
+        push_resource_root(
+            &mut candidates,
+            resource_dir.to_path_buf(),
+            "tauri-resource-dir",
+        );
+    }
+
+    if let Some(exe_path) = exe_path {
+        if let Some(exe_dir) = exe_path.parent() {
+            push_resource_root(
+                &mut candidates,
+                exe_dir.join("resources"),
+                "executable-resources",
+            );
+            push_resource_root(
+                &mut candidates,
+                exe_dir.to_path_buf(),
+                "executable-python-dir",
+            );
+            if let Some(parent_dir) = exe_dir.parent() {
+                push_resource_root(
+                    &mut candidates,
+                    parent_dir.join("_up_").join("resources"),
+                    "windows-updater-resources",
+                );
+                push_resource_root(
+                    &mut candidates,
+                    parent_dir.join("Resources"),
+                    "macos-app-resources",
+                );
+                push_resource_root(
+                    &mut candidates,
+                    parent_dir.join("resources"),
+                    "linux-app-resources",
+                );
+            }
+        }
+    }
+
+    push_resource_root(&mut candidates, manifest_dir.to_path_buf(), "dev-src-tauri");
+    candidates
+}
+
+pub fn python_resource_script_candidates(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Vec<ResolvedPythonResource> {
+    python_resource_root_candidates(exe_path, manifest_dir, resource_dir)
+        .into_iter()
+        .map(|candidate| ResolvedPythonResource {
+            script_path: candidate.root.join("python").join(script_name),
+            resource_root: candidate.root,
+            resource_layout: candidate.layout,
+        })
+        .collect()
+}
+
+pub fn resolve_python_resource_script(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> anyhow::Result<ResolvedPythonResource> {
+    let candidates =
+        python_resource_script_candidates(script_name, exe_path, manifest_dir, resource_dir);
+    candidates
+        .iter()
+        .find(|candidate| candidate.script_path.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            let attempted = candidates
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "{}:{}",
+                        candidate.resource_layout,
+                        candidate.script_path.to_string_lossy()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::anyhow!(
+                "unable to locate bundled Python resource script '{script_name}'; attempted resource roots/scripts: {attempted}"
+            )
+        })
+}
+
+pub fn configure_python_subprocess_env_blocking(
+    command: &mut Command,
+    script_path: &Path,
+    manifest_dir: &Path,
+) -> Option<PathBuf> {
+    command.env("PYTHONNOUSERSITE", "1");
+    let import_root = resolve_runtime_import_root(Some(script_path), manifest_dir);
+    if let Some(import_root) = &import_root {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root);
+        let mut components = Vec::new();
+        if let Some(script_dir) = script_path.parent() {
+            components.push(script_dir.to_path_buf());
+        }
+        components.push(import_root.clone());
+        if let Ok(joined) = std::env::join_paths(components) {
+            command.env("PYTHONPATH", joined);
+        } else {
+            command.env("PYTHONPATH", import_root);
+        }
+    }
+    import_root
+}
+
+pub fn configure_python_subprocess_env_async(
+    command: &mut tokio::process::Command,
+    script_path: &Path,
+    manifest_dir: &Path,
+) -> Option<PathBuf> {
+    command.env("PYTHONNOUSERSITE", "1");
+    let import_root = resolve_runtime_import_root(Some(script_path), manifest_dir);
+    if let Some(import_root) = &import_root {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root);
+        let mut components = Vec::new();
+        if let Some(script_dir) = script_path.parent() {
+            components.push(script_dir.to_path_buf());
+        }
+        components.push(import_root.clone());
+        if let Ok(joined) = std::env::join_paths(components) {
+            command.env("PYTHONPATH", joined);
+        } else {
+            command.env("PYTHONPATH", import_root);
+        }
+    }
+    import_root
+}
+
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
     pub program: String,
@@ -32,6 +199,12 @@ impl PythonLauncher {
         cmd.args(&self.args);
         cmd.arg(script_path);
         cmd
+    }
+
+    pub fn display(&self) -> String {
+        format!("{} {}", self.program, self.args.join(" "))
+            .trim()
+            .to_string()
     }
 }
 
@@ -187,13 +360,16 @@ pub fn resolve_runtime_import_root(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
 }
 
 fn mode_requests_gpu(mode: &ComputeMode) -> bool {
-    matches!(mode, ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid)
+    matches!(
+        mode,
+        ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+    )
 }
 
 fn should_enable_runtime_bootstrap_for(
@@ -224,12 +400,12 @@ pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -390,14 +566,84 @@ mod tests {
     #[test]
     fn resolve_runtime_import_root_detects_nested_up_layout() {
         let temp = TempDir::new().expect("tempdir");
-        let script = temp.path().join("resources").join("python").join("model_bridge.py");
-        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        let script = temp
+            .path()
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script dir");
         std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
         let import_root = temp.path().join("resources").join("_up_").join("_up_");
         std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");
 
         let resolved = resolve_runtime_import_root(Some(&script), Path::new("/missing"));
         assert_eq!(resolved.as_deref(), Some(import_root.as_path()));
+    }
+
+    #[test]
+    fn shared_resource_helper_resolves_macos_app_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let resources = temp
+            .path()
+            .join("Token Place.app")
+            .join("Contents")
+            .join("Resources");
+        let python_dir = resources.join("python");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::write(python_dir.join("compute_node_bridge.py"), "print('ok')\n")
+            .expect("write bridge");
+        std::fs::create_dir_all(resources.join("utils")).expect("create utils");
+        let exe_path = temp
+            .path()
+            .join("Token Place.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("token.place");
+
+        let resolved = resolve_python_resource_script(
+            "compute_node_bridge.py",
+            Some(&exe_path),
+            Path::new("/missing/src-tauri"),
+            None,
+        )
+        .expect("resolve macOS resource bridge");
+
+        assert_eq!(resolved.resource_root, resources);
+        assert_eq!(resolved.resource_layout, "macos-app-resources");
+    }
+
+    #[test]
+    fn subprocess_env_ignores_existing_pythonpath_and_disables_user_site() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("resources");
+        let script = root.join("python").join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create python dir");
+        std::fs::create_dir_all(root.join("utils")).expect("create utils");
+        let mut command = Command::new("python3");
+
+        let import_root =
+            configure_python_subprocess_env_blocking(&mut command, &script, Path::new("/missing"));
+        assert_eq!(import_root.as_deref(), Some(root.as_path()));
+        let env_value = |key: &str| {
+            command
+                .get_envs()
+                .find_map(|(env_key, value)| (env_key == key).then_some(value))
+                .flatten()
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(env_value("PYTHONNOUSERSITE").as_deref(), Some("1"));
+        let pythonpath = env_value("PYTHONPATH").expect("PYTHONPATH set");
+        assert!(pythonpath.contains(
+            &script
+                .parent()
+                .expect("script parent")
+                .to_string_lossy()
+                .to_string()
+        ));
+        assert!(pythonpath.contains(&root.to_string_lossy().to_string()));
+        assert!(!pythonpath.contains("should/not/leak"));
     }
 
     #[test]

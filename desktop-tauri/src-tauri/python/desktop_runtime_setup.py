@@ -167,10 +167,8 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
     python_root = Path(__file__).resolve().parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
     pythonpath_entries = [str(python_root), str(repo_root)]
-    if existing_pythonpath:
-        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(Path(__file__).resolve())
@@ -690,6 +688,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
             "interpreter": sys.executable,
             "import_root": str(root),
             "requirements": str(requirements_path),
+            "dependency_target": target_dir_str,
             "detail": _summarize_install_error(output),
         }
 
@@ -702,6 +701,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
         "interpreter": sys.executable,
         "import_root": str(root),
         "requirements": str(requirements_path),
+        "dependency_target": target_dir_str,
     }
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()

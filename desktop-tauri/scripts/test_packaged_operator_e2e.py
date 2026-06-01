@@ -107,6 +107,24 @@ def create_macos_bundle_layout(tmp_root: Path) -> Path:
     return create_packaged_layout(resources_tmp_root, resources_dir_name="Resources")
 
 
+def validate_unified_resource_root(resources_root: Path) -> None:
+    required = (
+        "python/compute_node_bridge.py",
+        "python/model_bridge.py",
+        "python/inference_sidecar.py",
+        "python/desktop_runtime_setup.py",
+        "python/path_bootstrap.py",
+        "python/requirements_desktop_runtime.txt",
+        "utils",
+        "config.py",
+        "encrypt.py",
+        "requirements.txt",
+    )
+    missing = [entry for entry in required if not (resources_root / entry).exists()]
+    assert not missing, f"unified resource root {resources_root} missing: {missing}"
+
+
+
 def _packaged_env(
     tmp_root: Path,
     resources_root: Path | None = None,
@@ -114,6 +132,7 @@ def _packaged_env(
     extra_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     resources_root = resources_root or (tmp_root / "resources")
+    validate_unified_resource_root(resources_root)
     home_dir = tmp_root / "home"
     home_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -415,12 +434,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         tmp_path = Path(tmpdir)
         bridge_script = create_packaged_layout(tmp_path)
+        (tmp_path / "llama_cpp.py").write_text("# repo-local shim must not shadow runtime imports\n", encoding="utf-8")
+        validate_unified_resource_root(tmp_path / "resources")
         run_desktop_dependency_preflight(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
+        validate_unified_resource_root(mac_resources_root)
         run_desktop_dependency_preflight(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)

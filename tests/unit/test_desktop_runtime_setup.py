@@ -1110,3 +1110,69 @@ def test_macos_missing_metal_runtime_bootstrap_gap_future_parity(monkeypatch):
 
     assert result["selected_backend"] == case["expect_future"]["selected_backend"]
     assert result["runtime_action"] == case["expect_future"]["runtime_action"]
+
+
+def _load_path_bootstrap_module():
+    spec = importlib.util.spec_from_file_location(
+        'path_bootstrap_under_test', PYTHON_MODULE_DIR / 'path_bootstrap.py'
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_path_bootstrap_prefers_site_packages_over_repo_local_llama_shim(monkeypatch, tmp_path):
+    path_bootstrap = _load_path_bootstrap_module()
+    runtime_root = tmp_path / 'runtime'
+    python_dir = runtime_root / 'python'
+    python_dir.mkdir(parents=True)
+    (runtime_root / 'utils').mkdir()
+    (runtime_root / 'llama_cpp.py').write_text('# packaged repo shim\n', encoding='utf-8')
+    fake_site = tmp_path / 'venv' / 'lib' / 'site-packages'
+    fake_site.mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [str(fake_site)]
+        path_bootstrap.ensure_runtime_import_paths(str(python_dir / 'model_bridge.py'))
+        assert str(fake_site) in sys.path
+        assert str(runtime_root) in sys.path
+        assert sys.path.index(str(runtime_root)) > sys.path.index(str(fake_site))
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_probe_subprocess_env_disables_user_site_and_uses_deterministic_pythonpath(
+    monkeypatch, tmp_path
+):
+    runtime_root = tmp_path / 'runtime'
+    (runtime_root / 'utils').mkdir(parents=True)
+    captured = {}
+
+    def _capture_run(_cmd, **kwargs):
+        captured['env'] = kwargs['env']
+        class Result:
+            returncode = 0
+            stdout = json.dumps(
+                {
+                    'backend': 'cpu',
+                    'gpu_offload_supported': False,
+                    'detected_device': 'cpu',
+                    'interpreter': sys.executable,
+                    'prefix': sys.prefix,
+                    'llama_module_path': 'missing',
+                }
+            )
+            stderr = ''
+        return Result()
+
+    monkeypatch.setenv('PYTHONPATH', '/user/site/should/not/leak')
+    monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _capture_run)
+
+    desktop_runtime_setup._probe_llama_runtime(runtime_root=runtime_root)
+
+    env = captured['env']
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert '/user/site/should/not/leak' not in env['PYTHONPATH']
+    assert str(runtime_root) in env['PYTHONPATH']

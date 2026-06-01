@@ -1,36 +1,36 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 
-WORKFLOW_PATH = Path(".github/workflows/build.yml")
+WORKFLOW_PATH = Path(".github/workflows/ci-image.yml")
 
 
-def _extract_block(text: str, header: str) -> str:
-    pattern = rf"^[ \t]*{header}:\s*\|\n((?:[ \t]+.+\n)+)"
-    match = re.search(pattern, text, re.MULTILINE)
-    if not match:
-        raise AssertionError(f"Could not find block for {header!r}")
-    return match.group(1)
-
-
-def test_relay_build_workflow_targets_multi_arch_and_ghcr_metadata() -> None:
+def test_relay_image_workflow_is_canonical_ghcr_publisher() -> None:
     workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
 
-    platforms_match = re.search(r"platforms:\s*([^\n]+)", workflow_text)
-    assert platforms_match is not None, "Build step should declare target platforms"
-    platforms = {part.strip() for part in platforms_match.group(1).split(",") if part.strip()}
-    assert {"linux/amd64", "linux/arm64"}.issubset(platforms)
+    assert "ghcr.io/futuroptimist/tokenplace-relay" in workflow_text
+    assert "ghcr.io/democratizedspace/tokenplace-relay" not in workflow_text
+    assert "file: Dockerfile" in workflow_text
+    assert "push: false" in workflow_text
+    assert "push: true" in workflow_text
 
-    tags_block = _extract_block(workflow_text, "tags")
-    assert any(
-        line.strip().startswith("type=sha")
-        for line in tags_block.splitlines()
-    ), "Metadata step should publish immutable sha-* tags"
 
-    labels_block = _extract_block(workflow_text, "labels")
-    assert any(
-        line.strip().startswith("org.opencontainers.image.licenses=")
-        for line in labels_block.splitlines()
-    ), "OCI metadata should declare the image license"
+def test_relay_image_workflow_tags_main_and_semver_releases() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "${repository}:main-${short_sha}" in workflow_text
+    assert "${repository}:main-latest" in workflow_text
+    assert "${repository}:sha-${short_sha}" in workflow_text
+    assert "${repository}:${semver_tag}" in workflow_text
+    assert "Immutable Sugarkube tag" in workflow_text
+
+
+def test_relay_image_workflow_targets_multi_arch_and_oci_metadata() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "platforms: linux/amd64,linux/arm64" in workflow_text
+    assert "org.opencontainers.image.source=" in workflow_text
+    assert "org.opencontainers.image.revision=" in workflow_text
+    assert "org.opencontainers.image.created=" in workflow_text
+    assert "org.opencontainers.image.licenses=MIT" in workflow_text

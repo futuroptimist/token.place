@@ -1,13 +1,10 @@
-# Copy this file to /opt/sugarkube/helm-values/token-place-values.yaml on a sugarkube node.
+# Legacy local values example. Copy only for disposable bundle-hook experiments.
+# For Sugarkube staging/prod, use the Sugarkube repo's token.place values and
+# deploy with: just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
 
 image:
-  repository: tokenplace-relay
-  tag: latest
-
-relay:
-  host: 0.0.0.0
-  port: 5010
-  extraArgs: []
+  repository: ghcr.io/futuroptimist/tokenplace-relay
+  tag: main-latest
 
 env:
   TOKEN_PLACE_ENV: production

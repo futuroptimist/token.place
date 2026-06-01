@@ -17,7 +17,7 @@ This document explains the improvements made to make token.place work seamlessly
 
 We've implemented Docker support for easy deployment:
 
-- `docker/Dockerfile.relay` - Relay component container
+- `Dockerfile` - Canonical relay component container
 - `config/docker-compose.yml` - Launches the relay service
 
 ### Building and Running with Docker

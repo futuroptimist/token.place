@@ -101,6 +101,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+            org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
@@ -174,6 +175,32 @@ jobs:
           curl -fsS http://127.0.0.1:5011/metrics >/dev/null
           docker exec tokenplace-relay-smoke-readonly sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+      - name: Publish validation summary
+        run: |
+          {
+            echo "## Relay image validation"
+            echo ""
+            echo "Repository: `${{ steps.tags.outputs.repository }}`"
+            echo "Commit: `${{ steps.tags.outputs.short_sha }}`"
+            echo "Canonical Dockerfile: `Dockerfile`"
+            echo "Smoke tests: passed"
+            echo ""
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              echo "Publish: skipped for pull_request"
+              echo "Immutable Sugarkube tag after merge: `main-${{ steps.tags.outputs.short_sha }}` if this commit is pushed to `main`"
+            elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "Publish: skipped for workflow_dispatch; manual runs validate only"
+              echo "Immutable Sugarkube tag: not published by this run"
+            else
+              echo "Publish: handled by the publish job when this is `main` or a valid `vX.Y.Z` tag push"
+              if [[ "${{ steps.tags.outputs.ref_kind }}" == "main" ]]; then
+                echo "Immutable Sugarkube tag: `main-${{ steps.tags.outputs.short_sha }}`"
+              elif [[ "${{ steps.tags.outputs.ref_kind }}" == "tag" ]]; then
+                echo "Immutable Sugarkube tag: `${{ steps.tags.outputs.semver_tag }}`"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish:
     name: Publish relay image
     runs-on: ubuntu-latest
@@ -215,6 +242,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
             org.opencontainers.image.created=${{ needs.build-and-smoke.outputs.created }}
+            org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
@@ -224,10 +252,12 @@ jobs:
             echo "## Relay image tags"
             echo ""
             if [[ "${{ needs.build-and-smoke.outputs.ref_kind }}" == "main" ]]; then
-              echo "Immutable tag: \`ghcr.io/futuroptimist/tokenplace-relay:main-${{ needs.build-and-smoke.outputs.short_sha }}\`"
+              echo "Immutable Sugarkube tag: \`main-${{ needs.build-and-smoke.outputs.short_sha }}\`"
+              echo "Immutable image: \`ghcr.io/futuroptimist/tokenplace-relay:main-${{ needs.build-and-smoke.outputs.short_sha }}\`"
               echo "Mutable tag: \`ghcr.io/futuroptimist/tokenplace-relay:main-latest\`"
             elif [[ "${{ needs.build-and-smoke.outputs.ref_kind }}" == "tag" ]]; then
-              echo "Release tag: \`ghcr.io/futuroptimist/tokenplace-relay:${{ needs.build-and-smoke.outputs.semver_tag }}\`"
+              echo "Immutable Sugarkube tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
+              echo "Release image: \`ghcr.io/futuroptimist/tokenplace-relay:${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
             echo ""

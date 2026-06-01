@@ -75,5 +75,5 @@ E2EE client-flow probe; health/root checks alone do not prove register/poll/requ
 
 ## Notes
 
-- Avoid stale local-chart/legacy-contract workflows (`./deploy/charts/tokenplace-relay`).
+- Avoid stale local-chart/legacy-contract workflows deployment.
 - Redis/shared-state/multi-replica relay architecture remains future work and out of scope.

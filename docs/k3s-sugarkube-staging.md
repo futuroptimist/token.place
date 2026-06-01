@@ -109,6 +109,6 @@ If operators use a non-default staging hostname, apply the same checks with that
 ## Notes
 
 - Keep API v1 relay-blind E2EE guardrails intact.
-- Do not depend on local chart path deployment (`./deploy/charts/tokenplace-relay`) for
+- Do not depend on local chart path deployment deployment for
   Sugarkube steady-state operations.
 - Do not require `gpuExternalName` or `TOKENPLACE_RELAY_UPSTREAM_URL` for staging relay readiness.

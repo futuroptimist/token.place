@@ -9,7 +9,7 @@ spec:
     kubernetes.io/arch: arm64
   containers:
     - name: relay
-      image: tokenplace-relay:latest
+      image: ghcr.io/futuroptimist/tokenplace-relay:main-latest
       imagePullPolicy: IfNotPresent
       command: ["python", "relay.py"]
       args:

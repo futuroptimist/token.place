@@ -39,11 +39,27 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Release contract: [ops/sugarkube-release.md](ops/sugarkube-release.md)
 - Launch version alignment for v0.1.0: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
 - Before publishing, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
+
+## Canonical staging deployment command
+
+Run from a Sugarkube checkout after copying the immutable image tag from a successful `ci-image.yml`
+run and confirming the `ci-helm.yml` chart version:
+
+```bash
+just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Once Sugarkube P5 lands, use the generic app command:
+
+```bash
+just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+```
 
 ## Default hostnames
 
@@ -445,5 +461,5 @@ Interpretation:
 - Keep API v1 relay-blind E2EE invariants intact (ciphertext only + safe routing metadata).
 - Do not treat legacy relay endpoints as active production path.
 - Do not require `TOKENPLACE_RELAY_UPSTREAM_URL` for relay-only Sugarkube readiness.
-- Do not use local chart path deployment (`./deploy/charts/tokenplace-relay`) for Sugarkube
+- Do not use local chart path deployment deployment for Sugarkube
   steady-state operations.

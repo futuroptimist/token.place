@@ -21,16 +21,16 @@ def _load_env(path: Path) -> dict[str, str]:
     return env
 
 
-def test_bundle_env_targets_local_chart():
-    """Ensure the sugarkube bundle points Helm at the in-repo chart."""
+def test_bundle_env_targets_published_oci_chart():
+    """Ensure the legacy sugarkube bundle points Helm at the canonical OCI chart."""
     env = _load_env(BUNDLE_ENV_PATH)
 
-    assert env["RELEASE"] == "tokenplace-relay"
-    assert env["CHART"].endswith("k8s/charts/tokenplace-relay")
+    assert env["RELEASE"] == "tokenplace"
+    assert env["CHART"] == "oci://ghcr.io/futuroptimist/charts/tokenplace"
     assert env["VALUES_FILE"].endswith("helm-values/token-place-values.yaml")
     assert env["NAMESPACE"] == "tokenplace"
     wait_targets = {target.strip() for target in env["WAIT_TARGETS"].split(",")}
-    assert "deployment.apps/tokenplace-relay" in wait_targets
+    assert "deployment.apps/tokenplace" in wait_targets
 
 
 def test_bundle_values_pin_arm64_and_production_env():
@@ -43,9 +43,9 @@ def test_bundle_values_pin_arm64_and_production_env():
     env_vars = values["env"]
     assert env_vars["TOKEN_PLACE_ENV"] == "production"
 
-    relay = values["relay"]
-    assert relay["host"] == "0.0.0.0"
-    assert relay["port"] == 5010
+    image = values["image"]
+    assert image["repository"] == "ghcr.io/futuroptimist/tokenplace-relay"
+    assert image["tag"] == "main-latest"
 
 
 def test_bundle_values_do_not_pin_redis_storage_backend():

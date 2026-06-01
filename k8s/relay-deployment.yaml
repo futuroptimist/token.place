@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: relay
-        image: tokenplace-relay:latest
+        image: ghcr.io/futuroptimist/tokenplace-relay:main-latest
         ports:
         - containerPort: 5000
         env:

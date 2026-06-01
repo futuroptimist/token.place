@@ -8,7 +8,7 @@ import yaml
 WORKFLOW_DIR = Path(".github/workflows")
 PR_REQUIRED_WORKFLOWS = {
     "ci.yml",
-    "build.yml",
+    "ci-image.yml",
     "desktop-operator-e2e.yml",
     "desktop-release.yml",
 }
@@ -43,15 +43,21 @@ def test_required_workflows_trigger_on_pull_requests() -> None:
     )
 
 
-def test_build_workflow_keeps_pr_paths_gate_in_sync_with_push_paths() -> None:
-    workflow_data = _load_workflow(WORKFLOW_DIR / "build.yml")
-    on_block = _workflow_on_block(workflow_data, "build.yml")
+def test_ci_image_workflow_is_the_only_active_relay_image_publisher() -> None:
+    publishers = []
+    for path in WORKFLOW_DIR.glob("*.yml"):
+        text = path.read_text(encoding="utf-8")
+        if "docker/build-push-action" in text and "push: true" in text:
+            publishers.append(path.name)
 
-    push_paths = set((on_block.get("push") or {}).get("paths") or [])
-    pr_paths = set((on_block.get("pull_request") or {}).get("paths") or [])
+    assert publishers == ["ci-image.yml"]
 
-    assert push_paths, "build.yml push trigger should define changed-file paths"
-    assert pr_paths, "build.yml pull_request trigger should define changed-file paths"
-    assert push_paths == pr_paths, (
-        "build.yml push/pull_request path filters must match so PR checks mirror push behavior"
-    )
+
+def test_ci_image_workflow_builds_prs_without_publishing() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-image.yml")
+    on_block = _workflow_on_block(workflow_data, "ci-image.yml")
+
+    assert "pull_request" in on_block
+    text = (WORKFLOW_DIR / "ci-image.yml").read_text(encoding="utf-8")
+    assert "push: false" in text
+    assert "github.event_name == 'push'" in text

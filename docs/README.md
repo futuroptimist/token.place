@@ -18,6 +18,7 @@ testing, and deploying token.place. For an expanded overview of every directory,
 - **Run or deploy the services**
   - Start here: [README.md](../README.md#quickstart)
   - Also see: [RPI_DEPLOYMENT_GUIDE.md](RPI_DEPLOYMENT_GUIDE.md),
+    [ops/sugarkube-release.md](ops/sugarkube-release.md),
     [docker-compose.yml](../docker-compose.yml), [k8s/](../k8s/),
     [relay_sugarkube_onboarding.md](relay_sugarkube_onboarding.md),
     [k3s-sugarkube-dev.md](k3s-sugarkube-dev.md),

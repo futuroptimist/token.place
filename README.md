@@ -274,6 +274,7 @@ Artifact references:
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo.
 
+- Release contract: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
   - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)
@@ -772,7 +773,7 @@ Alternatively, you can visit http://127.0.0.1:5010 in your browser to use the we
 
 For a complete walkthrough of the Raspberry Pi 5 setup—including hardware recommendations, Docker instructions, k3s cluster steps, and troubleshooting (including rpi-clone prompts)—see [docs/RPI_DEPLOYMENT_GUIDE.md](docs/RPI_DEPLOYMENT_GUIDE.md#bill-of-materials).
 
-If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, deploy token.place via Sugarkube's Helm OCI install/upgrade flow using the published token.place chart and image tags (see the Sugarkube runbooks linked above), rather than local chart bundle copies.
+If you're booting via the [`sugarkube`](https://github.com/futuroptimist/sugarkube) Pi image, deploy token.place via Sugarkube's GHCR-first Helm OCI flow: copy the immutable image tag from `ci-image.yml`, confirm the `ci-helm.yml` chart version, then run `just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA` from Sugarkube. Once Sugarkube P5 lands, use `just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA`.
 
 ## Testing
 

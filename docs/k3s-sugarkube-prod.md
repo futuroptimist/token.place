@@ -110,7 +110,7 @@ If operators override hostname/routing, use the equivalent production host in th
 ## Notes
 
 - Preserve API v1 relay-blind E2EE guardrails (relay sees ciphertext + routing metadata only).
-- Do not rely on local chart path deployment (`./deploy/charts/tokenplace-relay`) for
+- Do not rely on local chart path deployment deployment for
   Sugarkube steady-state operations.
 - Do not require `gpuExternalName` or `TOKENPLACE_RELAY_UPSTREAM_URL` for production relay
   readiness in this relay-only phase.

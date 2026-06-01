@@ -22,6 +22,30 @@ rpi-imager --config ./imager-config.json token-place-lite.img.xz
 
 </details>
 
+## Sugarkube GHCR-first deployment path
+
+For a Sugarkube-managed Raspberry Pi cluster, do not build a local relay image as the staging or
+production deployment input. Use the GitHub Actions artifacts instead:
+
+1. Find a successful token.place `ci-image.yml` run on `main`.
+2. Copy the immutable image tag from the workflow summary or GHCR package page.
+3. Confirm or publish the canonical chart with `ci-helm.yml`: `oci://ghcr.io/futuroptimist/charts/tokenplace`.
+4. Deploy from a Sugarkube checkout with the current app-specific command:
+
+```bash
+just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Once Sugarkube P5 lands, use the generic app command:
+
+```bash
+just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Replace `main-REPLACE_SHORTSHA` with the immutable tag printed by `ci-image.yml`, for example
+`main-deadbee`. See [ops/sugarkube-release.md](ops/sugarkube-release.md) for the full release
+contract.
+
 ## Bill of Materials
 
 - **Raspberry Pi 5** boards (4GB or 8GB RAM)
@@ -209,9 +233,9 @@ USB 3.0 on the Pi 5 typically tops out around **350–400 MB/s**.
 Because the EEPROM’s “USB boot” setting also covers NVMe devices,
  the Pi will continue to boot from this drive without further changes.
 
-## Running the Relay with Docker Compose
+## Local-development appendix: running the relay with Docker Compose
 
-On any single Pi you can run the relay directly:
+On any single Pi you can run the relay directly for local development or diagnostics. This is not the Sugarkube staging/production path:
 
 ```bash
 docker compose up -d  # start the relay container in the background
@@ -243,10 +267,11 @@ Run the tunnel:
 cloudflared tunnel run tokenplace-relay  # run the tunnel using the above config
 ```
 
-## Deploying on a k3s Cluster
+## Legacy local-development appendix: raw k3s manifests
 
 The steps below create a tiny Kubernetes cluster across several Pi boards and expose the relay via a
-Cloudflare Tunnel.
+Cloudflare Tunnel for local experimentation. For Sugarkube staging or production, use the GHCR-first
+workflow above instead.
 
 ### Prerequisites
 
@@ -302,18 +327,21 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    The `playbooks/site.yml` playbook provides an
    Ansible equivalent if you prefer automation.
 
-3. **Build the relay container and load it into the cluster**
+3. **Choose a published relay image tag**
+
+   Use a GHCR tag from `ci-image.yml`; for example:
 
    ```bash
-   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-   sudo k3s ctr images import tokenplace-relay:latest
+   IMAGE_TAG=main-REPLACE_SHORTSHA
    ```
 
 4. **Deploy the Kubernetes manifests**
 
    ```bash
    kubectl create namespace tokenplace
-   kubectl -n tokenplace apply -f k8s/
+   kubectl -n tokenplace apply -f k8s/relay-deployment.yaml -f k8s/relay-service.yaml
+   kubectl -n tokenplace set image deployment/tokenplace-relay \
+     relay=ghcr.io/futuroptimist/tokenplace-relay:${IMAGE_TAG}
    ```
 
 5. **Expose the relay service**

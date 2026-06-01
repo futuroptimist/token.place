@@ -15,12 +15,15 @@ This document explains the improvements made to make token.place work seamlessly
 
 ## Docker Containerization
 
-We've implemented Docker support for easy deployment:
+We've implemented Docker support for local development, while Sugarkube staging/prod releases use the GHCR-published image and OCI chart:
 
-- `docker/Dockerfile.relay` - Relay component container
+- `Dockerfile` - Canonical relay component container used by `ci-image.yml`
 - `config/docker-compose.yml` - Launches the relay service
 
-### Building and Running with Docker
+### Local development with Docker
+
+These commands are for local development only; staging/prod operators should follow
+[ops/sugarkube-release.md](ops/sugarkube-release.md).
 
 ```bash
 # Build and start the relay service

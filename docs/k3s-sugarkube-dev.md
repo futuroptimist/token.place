@@ -52,6 +52,21 @@ Upgrade existing release with an explicit tag:
 just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=<DEV_VALUES_FILE> tag=main-REPLACE_SHORTSHA default_tag=main-REPLACE_SHORTSHA
 ```
 
+Current app-specific Sugarkube recipe:
+
+```bash
+just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+```
+
+Future generic Sugarkube recipe after P5 lands:
+
+```bash
+just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+```
+
+The lower-level `helm-oci-install` and `helm-oci-upgrade` examples below remain useful for debugging
+Sugarkube internals, but the release contract prefers the app-specific command above.
+
 ## Validation checklist
 
 ```bash

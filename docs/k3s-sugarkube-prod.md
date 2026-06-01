@@ -40,6 +40,21 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 
 Use the values files and version file that live in Sugarkube for your environment; `PATH/TO/*` placeholders below are intentionally repo-local to Sugarkube.
 >
+Current app-specific Sugarkube recipe:
+
+```bash
+just tokenplace-oci-deploy env=prod tag=v0.1.0
+```
+
+Future generic Sugarkube recipe after P5 lands:
+
+```bash
+just app-deploy app=tokenplace env=prod tag=v0.1.0
+```
+
+The lower-level `helm-oci-install` and `helm-oci-upgrade` examples below remain useful for debugging
+Sugarkube internals, but the release contract prefers the app-specific command above.
+
 ## Ingress TLS + Cloudflare Tunnel contract
 
 - Cloudflare Tunnel still owns public DNS/Tunnel routing for `token.place` to Traefik.

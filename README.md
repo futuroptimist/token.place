@@ -268,12 +268,15 @@ Artifact references:
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - v0.1.0 launch alignment: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
-- Preferred staging/prod tag: immutable `main-<shortsha>` (`main-latest` is convenience-only)
+- Preferred staging candidate tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
+- Sugarkube deploy command today: `just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA`
+- Future generic Sugarkube command after P5 lands: `just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA`
 - Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo.
 
+- GHCR-first release runbook: [`docs/ops/sugarkube-release.md`](docs/ops/sugarkube-release.md)
 - Relay onboarding: [`docs/relay_sugarkube_onboarding.md`](docs/relay_sugarkube_onboarding.md)
 - Environment runbooks:
   - [`docs/k3s-sugarkube-dev.md`](docs/k3s-sugarkube-dev.md)

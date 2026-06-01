@@ -8,7 +8,7 @@ import yaml
 WORKFLOW_DIR = Path(".github/workflows")
 PR_REQUIRED_WORKFLOWS = {
     "ci.yml",
-    "build.yml",
+    "ci-image.yml",
     "desktop-operator-e2e.yml",
     "desktop-release.yml",
 }
@@ -43,15 +43,16 @@ def test_required_workflows_trigger_on_pull_requests() -> None:
     )
 
 
-def test_build_workflow_keeps_pr_paths_gate_in_sync_with_push_paths() -> None:
-    workflow_data = _load_workflow(WORKFLOW_DIR / "build.yml")
-    on_block = _workflow_on_block(workflow_data, "build.yml")
+def test_ci_image_workflow_publishes_only_from_canonical_push_refs() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "ci-image.yml")
+    on_block = _workflow_on_block(workflow_data, "ci-image.yml")
 
-    push_paths = set((on_block.get("push") or {}).get("paths") or [])
-    pr_paths = set((on_block.get("pull_request") or {}).get("paths") or [])
+    assert "pull_request" in on_block
+    assert "main" in (on_block.get("push") or {}).get("branches", [])
+    assert "v*" in (on_block.get("push") or {}).get("tags", [])
 
-    assert push_paths, "build.yml push trigger should define changed-file paths"
-    assert pr_paths, "build.yml pull_request trigger should define changed-file paths"
-    assert push_paths == pr_paths, (
-        "build.yml push/pull_request path filters must match so PR checks mirror push behavior"
-    )
+    workflow_text = (WORKFLOW_DIR / "ci-image.yml").read_text(encoding="utf-8")
+    assert "github.event_name == 'push'" in workflow_text
+    assert "github.repository == 'futuroptimist/token.place'" in workflow_text
+    assert "workflow_dispatch" in workflow_text
+    assert "validation only" in workflow_text

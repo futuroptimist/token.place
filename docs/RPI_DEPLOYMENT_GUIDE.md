@@ -22,6 +22,32 @@ rpi-imager --config ./imager-config.json token-place-lite.img.xz
 
 </details>
 
+## Sugarkube relay deployment path
+
+For Sugarkube-managed relay deployments, do not build the staging or production image on a Pi. Use
+the GHCR-first release path:
+
+1. Find a successful `ci-image.yml` run for the candidate commit.
+2. Copy the immutable image tag from the workflow summary or GHCR package page, for example
+   `main-REPLACE_SHORTSHA`.
+3. Confirm that `ci-helm.yml` has validated and published the chart version at
+   `oci://ghcr.io/futuroptimist/charts/tokenplace`.
+4. From a Sugarkube checkout, deploy with the current app-specific recipe:
+
+   ```bash
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+5. Once Sugarkube generic app recipes land, use:
+
+   ```bash
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+See [ops/sugarkube-release.md](ops/sugarkube-release.md) for the canonical token.place image/chart
+release contract. Local Docker commands below are for host preparation or development only, not the
+Sugarkube staging/prod deploy path.
+
 ## Bill of Materials
 
 - **Raspberry Pi 5** boards (4GB or 8GB RAM)
@@ -48,7 +74,7 @@ Contributions describing different configurations are welcome so the project can
    sudo apt update && sudo apt full-upgrade  # refresh package list and upgrade the OS
    sudo rpi-eeprom-update -a                 # install the latest firmware
    ```
-4. Clone the repository and install Docker:
+4. Clone the repository and install Docker for local development or troubleshooting:
    ```bash
    git clone https://github.com/futuroptimist/token.place.git  # download the project
    cd token.place                                             # enter the project folder
@@ -302,14 +328,25 @@ k3sup join   --server-host pi-1.local --user token --host pi-3.local
    The `playbooks/site.yml` playbook provides an
    Ansible equivalent if you prefer automation.
 
-3. **Build the relay container and load it into the cluster**
+3. **Deploy the GHCR-published relay through Sugarkube**
+
+   Use the immutable image tag from a successful `ci-image.yml` run and deploy from a Sugarkube
+   checkout:
 
    ```bash
-   docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .
-   sudo k3s ctr images import tokenplace-relay:latest
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
    ```
 
-4. **Deploy the Kubernetes manifests**
+   Once the generic Sugarkube app recipes land, use:
+
+   ```bash
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+4. **Local-development manifest fallback**
+
+   Only for local k3s troubleshooting, apply the legacy manifests after importing or retagging a
+   development image for your cluster:
 
    ```bash
    kubectl create namespace tokenplace

@@ -11,11 +11,11 @@ One-click repo task: containerize relay.py, ship multi-arch images, helm-ize, an
    - Structured JSON logs; optional `/metrics` (Prometheus counter for requests).
 
 2. **Multi-arch build & publish**
-   - `.github/workflows/build.yml` using Docker Buildx to publish **linux/amd64 + linux/arm64** images to **GHCR**.
+   - `.github/workflows/ci-image.yml` using Docker Buildx to publish **linux/amd64 + linux/arm64** images to **GHCR**.
    - Tags: semver (if applicable) and immutable `sha-<shortsha>`; set `org.opencontainers.image.*` labels including source/revision/created.
    - No implicit `:latest` push.
 
-3. **Helm chart (`deploy/charts/tokenplace-relay`)**
+3. **Helm chart (`charts/tokenplace`)**
    - `Deployment` with liveness/readiness probes, securityContext hardening (non-root UID 1000, drop ALL, read-only root, RuntimeDefault seccomp), and resource requests/limits appropriate for Pi 5.
    - `Service` (ClusterIP) and optional `ServiceMonitor` gated by values.
    - `Ingress` for `relay.<domain>`; annotations for cert-manager (`letsencrypt-dns01`); values control hosts/TLS.

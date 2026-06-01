@@ -128,6 +128,32 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 Production pattern uses `PATH/TO/tokenplace.values.prod.yaml` with the same approved
 immutable tag.
 
+
+## Canonical GHCR-first release path
+
+Before using environment-specific commands, follow the release contract in
+[ops/sugarkube-release.md](ops/sugarkube-release.md):
+
+1. Find a successful `ci-image.yml` run for the candidate commit.
+2. Copy the immutable image tag from the workflow summary or GHCR package page, for example
+   `main-REPLACE_SHORTSHA`.
+3. Confirm or publish the canonical chart with `ci-helm.yml` at
+   `oci://ghcr.io/futuroptimist/charts/tokenplace`.
+4. Deploy from a Sugarkube checkout with the current app-specific command:
+
+   ```bash
+   just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+5. Once Sugarkube generic app recipes land, use:
+
+   ```bash
+   just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
+   ```
+
+Local Docker builds and local chart paths are development-only fallbacks; they are not the
+Sugarkube staging/prod release path.
+
 ## Validation (staging example)
 
 ```bash

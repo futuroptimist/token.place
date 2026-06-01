@@ -37,6 +37,10 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 BRIDGE_READY_TIMEOUT_SECONDS = 90.0
 STOP_TIMEOUT_SECONDS = 20.0
 PUBLIC_KEY_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])")
+PRE_REGISTRATION_READY_LOG = "desktop.compute_node_bridge.model_init.ready"
+PRE_REGISTRATION_REASON_LOG = "reason=pre_registration"
+REGISTRATION_START_LOG = "desktop.compute_node_bridge.api_v1_e2ee.register"
+REGISTRATION_SUCCEEDED_LOG = "desktop.compute_node_bridge.registration.succeeded"
 
 
 # The packaged import helper lives in test_packaged_operator_e2e.py, but Python
@@ -110,6 +114,7 @@ class BridgeProcess:
         self.process = process
         self.log_path = log_path
         self.events: list[dict[str, Any]] = []
+        self.output_lines: list[str] = []
         self._thread = threading.Thread(target=self._read_output, daemon=True)
         self._thread.start()
 
@@ -117,6 +122,7 @@ class BridgeProcess:
         assert self.process.stdout is not None
         for line in self.process.stdout:
             _append_log(self.log_path, line)
+            self.output_lines.append(line.rstrip("\n"))
             stripped = line.strip()
             if not stripped or not stripped.startswith("{"):
                 continue
@@ -196,6 +202,19 @@ def _redacted_diagnostics(relay_url: str) -> dict[str, Any]:
             key = node["server_public_key"]
             node["server_public_key"] = f"{key[:8]}…{key[-4:]}"
     return payload
+
+
+def _assert_warm_load_before_registration(bridge: BridgeProcess, *, layout_label: str) -> None:
+    ready_seen = False
+    for line_number, line in enumerate(list(bridge.output_lines), start=1):
+        if PRE_REGISTRATION_READY_LOG in line and PRE_REGISTRATION_REASON_LOG in line:
+            ready_seen = True
+        if not ready_seen and (REGISTRATION_START_LOG in line or REGISTRATION_SUCCEEDED_LOG in line):
+            raise AssertionError(
+                f"{layout_label} registered before pre-registration warm-load was ready: "
+                f"line={line_number} log={bridge.log_path} event={line}"
+            )
+    assert ready_seen, f"{layout_label} never logged pre-registration warm-load readiness: {bridge.log_path}"
 
 
 def _wait_for_registered(bridge: BridgeProcess, relay_url: str, *, layout_label: str) -> dict[str, Any]:
@@ -362,6 +381,7 @@ def _run_operator_session(
     )
     try:
         _wait_for_registered(bridge, relay_url, layout_label=layout_label)
+        _assert_warm_load_before_registration(bridge, layout_label=layout_label)
         for offset in range(turns):
             _chat_turn(relay_url, relay_public_key, turn=(session_index * 10) + offset)
             _wait_for_queue_depth_zero(relay_url, layout_label=layout_label)

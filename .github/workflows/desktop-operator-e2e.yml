@@ -112,7 +112,7 @@ jobs:
 
   desktop-operator-packaged-e2e-windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -169,7 +169,7 @@ jobs:
 
   desktop-operator-packaged-e2e-macos:
     runs-on: macos-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 

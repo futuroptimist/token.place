@@ -1058,6 +1058,21 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         assert result.get("fallback_reason", "") == expected["fallback_reason"]
     if "fallback_reason_contains" in expected:
         assert expected["fallback_reason_contains"] in result.get("fallback_reason", "")
+    if "last_error_contains" in expected:
+        assert expected["last_error_contains"] in result.get("fallback_reason", "")
+    if expected.get("registration_eligible_after_warm_load") is False:
+        assert expected["runtime_action"] in {"failed", "probe_only", "pending"}
+        assert expected.get("relay_runtime_state") in {"failed", "pending"}
+    if case["id"] == "missing_runtime_dependency":
+        assert expected["backend_available"] == "unavailable"
+        assert expected["backend_selected"] == "pending"
+        assert expected["backend_used"] == "pending"
+        assert result["runtime_action"] == "failed"
+    if case["id"] == "cpu_fallback":
+        assert expected["registration_eligible_after_warm_load"] is True
+        assert expected["backend_available"] == "cpu"
+        assert expected["backend_selected"] == "cpu"
+        assert expected["backend_used"] == "cpu"
     if case["id"] in {
         "macos_metal_capable",
         "cpu_fallback",

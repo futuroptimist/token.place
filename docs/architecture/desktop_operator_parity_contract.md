@@ -17,8 +17,8 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 
 1. **Startup / warm-load**: the bridge emits `started` first, then warms the same Python runtime that will process API v1 relay work before registration.
 2. **Runtime detection**: `backend_available`, `backend_selected`, and `backend_used` must describe the active relay-processing runtime, not a stale probe or a UI-only runtime.
-3. **GPU backend selection**: Windows CUDA and macOS Metal are equivalent GPU-capable outcomes. CPU is valid only for explicit CPU mode or an actionable fallback.
-4. **Relay registration eligibility**: `registered: true` is allowed only when the operator is running, the relay runtime is `ready` or `processing`, warm-load has completed, and API v1 relay registration is fresh for the active relay URL.
+3. **GPU backend selection**: Windows CUDA and macOS Metal are equivalent GPU-capable outcomes. CPU is valid for explicit CPU mode and may be used for documented non-GPU fallback cases, but CPU fallback never by itself authorizes relay registration; registration still waits for a warmed relay-processing runtime. Missing `llama_cpp` is not a CPU fallback and must fail closed until a usable runtime is installed.
+4. **Relay registration eligibility**: `registered: true` is allowed only when the operator is running, the relay runtime is `ready` or `processing`, warm-load has completed, and API v1 relay registration is fresh for the active relay URL. Missing desktop runtime dependencies, failed runtime setup, and `probe_only`/pending bootstrap states are not registration-eligible; `registered` stays `false` until the relay-processing runtime proves readiness.
 5. **UI field states**: while the runtime is `starting` or `warming`, effective/backend fields remain `pending`; once ready, fields reflect the active runtime. `Last error` is empty when healthy and actionable when not.
 6. **Stop operator**: Stop cancels polling, unregisters from the relay when possible, stops the relay client, emits `stopped`, and reports `registered: false`.
 7. **Start after Stop**: a new start gets a fresh operator session and sequence stream; stale stop/error events from an old session must not overwrite the active session.
@@ -29,4 +29,4 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 ## Known gaps captured by tests
 
 - macOS missing Metal runtime bootstrap currently reports `probe_only`; the macOS bootstrap follow-up should make this a first-class Metal repair/install path.
-- macOS packaged operator tests currently cover resource layout more than real operator lifecycle parity; follow-up work should add packaged launcher/resource parity and lifecycle e2e coverage.
+- macOS packaged operator tests currently cover resource layout and no-relay autostart more than real packaged operator lifecycle parity. Follow-up work should add packaged macOS e2e coverage for warm-load, API v1 relay registration, multi-turn API v1 relay chat, Stop, Start after Stop, and diagnostics without expanding this parity-contract scope.

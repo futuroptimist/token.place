@@ -52,6 +52,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "shadowed_repo_llama_cpp",
         "unavailable",
         "metal_install_failed",
+        "metal_cpu_fallback",
         "installed_metal_reexec",
     }
 )
@@ -477,7 +478,11 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
         return None
     if runtime_action in {"probe_only", "metal_probe_only"}:
         return None
-    if current_platform == "darwin" and selected_mode != "gpu" and runtime_action != "failed":
+    if (
+        current_platform == "darwin"
+        and selected_mode != "gpu"
+        and runtime_action not in {"failed", "metal_install_failed", "metal_cpu_fallback"}
+    ):
         return None
 
     reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
@@ -737,7 +742,9 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
         after = _probe_runtime(target_root)
         plan_satisfied = backend_probe_satisfies_install_plan(plan, after)
         verified_backend = after.gpu_offload_supported and after.backend == plan.backend
-        accepted_source_probe = plan_satisfied and after.backend != plan.backend
+        accepted_source_probe = (
+            plan.backend != "metal" and plan_satisfied and after.backend != plan.backend
+        )
         if plan.backend in {"cuda", "metal"} and (verified_backend or accepted_source_probe):
             if verified_backend:
                 reason = f"installed {after.backend.upper()} runtime; re-executing sidecar"
@@ -773,6 +780,18 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                 f"{plan.backend.upper()} install completed but follow-up probe reported "
                 f"backend={after.backend} gpu_offload_supported={after.gpu_offload_supported}"
             )
+            if plan.backend == "metal":
+                return {
+                    "selected_backend": "cpu",
+                    "fallback_reason": (
+                        f"Metal runtime install completed but follow-up probe did not report "
+                        f"Metal GPU offload; backend={after.backend} "
+                        f"gpu_offload_supported={after.gpu_offload_supported}; "
+                        f"llama_module_path={after.llama_module_path}"
+                    ),
+                    "runtime_action": _install_failure_action(expected_backend),
+                    **_probe_result_payload(after),
+                }
 
         if plan.backend == "cpu":
             reason = (

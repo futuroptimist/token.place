@@ -166,7 +166,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
 
 
-def test_macos_metal_source_install_clean_cpu_probe_reexecs_without_reporting_metal(monkeypatch):
+def test_macos_metal_source_install_clean_cpu_probe_fails_auto_without_reexec(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     probes = iter([
@@ -200,12 +200,14 @@ def test_macos_metal_source_install_clean_cpu_probe_reexecs_without_reporting_me
 
     assert len(install_calls) == 1
     assert result['selected_backend'] == 'cpu'
-    assert result['runtime_action'] == 'installed_metal_reexec'
-    assert 'installed METAL runtime from source' in result['fallback_reason']
+    assert result['runtime_action'] == 'metal_install_failed'
+    assert 'follow-up probe did not report Metal GPU offload' in result['fallback_reason']
     assert result['detected_device'] == 'cpu'
     assert result['llama_module_path'].endswith('llama_cpp/__init__.py')
-    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
-    assert message and 'installed_metal_reexec' in message
+    auto_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result)
+    hybrid_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('hybrid', result)
+    assert auto_message and 'metal_install_failed' in auto_message
+    assert hybrid_message and 'metal_install_failed' in hybrid_message
 
 
 def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_reexec(monkeypatch):
@@ -242,7 +244,7 @@ def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_re
     assert len(install_calls) == 1
     assert result['selected_backend'] == 'cpu'
     assert result['runtime_action'] == 'metal_install_failed'
-    assert 'explicit GPU mode requires the follow-up probe to report GPU offload' in result['fallback_reason']
+    assert 'follow-up probe did not report Metal GPU offload' in result['fallback_reason']
     assert result['detected_device'] == 'cpu'
     message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
     assert message and 'metal_install_failed' in message
@@ -318,7 +320,7 @@ def test_macos_missing_runtime_failure_message_is_fatal_for_auto_and_hybrid(monk
     assert 'Metal' in auto_message
 
 
-def test_macos_metal_install_failure_falls_back_for_auto(monkeypatch):
+def test_macos_metal_install_failure_cpu_fallback_is_fatal_for_auto_and_hybrid(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
@@ -343,6 +345,10 @@ def test_macos_metal_install_failure_falls_back_for_auto(monkeypatch):
     assert result['selected_backend'] == 'cpu'
     assert result['runtime_action'] == 'metal_cpu_fallback'
     assert 'using CPU runtime' in result['fallback_reason']
+    auto_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result)
+    hybrid_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('hybrid', result)
+    assert auto_message and 'metal_cpu_fallback' in auto_message
+    assert hybrid_message and 'metal_cpu_fallback' in hybrid_message
 
 
 def test_macos_metal_install_failure_is_fatal_for_gpu(monkeypatch):

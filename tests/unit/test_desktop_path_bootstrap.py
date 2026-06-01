@@ -1,6 +1,7 @@
 """Unit tests for desktop Python path bootstrap behavior."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -235,12 +236,19 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
         monkeypatch.chdir(cwd)
         monkeypatch.setenv('PYTHONNOUSERSITE', '1')
         monkeypatch.setattr(path_bootstrap.site, 'USER_SITE', str(user_site))
-        sys.path[:] = ['', str(user_site), str(site_packages)]
+        sys.path[:] = [
+            '',
+            str(cwd / '.'),
+            str(user_site),
+            str(site_packages),
+            str(cwd) + os.sep,
+        ]
 
         path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
 
         assert '' not in sys.path
         assert str(user_site) not in sys.path
+        assert all(Path(entry).resolve() != cwd.resolve() for entry in sys.path)
         assert str(resources_root) in sys.path
         assert sys.path.index(str(resources_root)) == 0
 

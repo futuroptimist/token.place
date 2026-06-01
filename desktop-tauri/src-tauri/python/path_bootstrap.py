@@ -60,11 +60,11 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
 
     cwd = Path.cwd().resolve()
     if (cwd / "llama_cpp.py").is_file():
-        cwd_str = str(cwd)
-        while "" in sys.path:
-            sys.path.remove("")
-        while cwd_str in sys.path:
-            sys.path.remove(cwd_str)
+        sys.path[:] = [
+            entry
+            for entry in sys.path
+            if entry != "" and Path(entry).resolve() != cwd
+        ]
 
     # Keep repo roots importable for `utils.*` / `config` while avoiding local
     # llama_cpp.py shim precedence over site-packages.

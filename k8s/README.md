@@ -43,7 +43,8 @@ or import a local development image, then apply the manifests manually:
 
 ```bash
 docker build -t tokenplace-relay:latest -f Dockerfile .
-kubectl apply -f k8s/
+kubectl apply -f k8s/relay-deployment.yaml
+kubectl apply -f k8s/relay-service.yaml
 ```
 
 Edit the `image:` field in the manifest for your test registry if needed. Do not

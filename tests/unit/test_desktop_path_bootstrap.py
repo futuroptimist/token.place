@@ -1,6 +1,7 @@
 """Unit tests for desktop Python path bootstrap behavior."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -207,3 +208,64 @@ def test_bootstrap_adds_resolved_cwd_when_candidate_uses_non_resolved_path(
         assert str(repo_root.resolve()) in sys.path
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_imports(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    resources_root = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources'
+    script = resources_root / 'python' / 'model_bridge.py'
+    user_site = tmp_path / 'home' / '.local' / 'site-packages'
+    site_packages = tmp_path / 'venv' / 'Lib' / 'site-packages'
+    cwd = tmp_path / 'repo'
+
+    (resources_root / 'utils').mkdir(parents=True)
+    (resources_root / 'config.py').write_text('VALUE = "packaged"\n', encoding='utf-8')
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    user_site.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    cwd.mkdir()
+    (cwd / 'llama_cpp.py').write_text('SOURCE = "cwd-shim"\n', encoding='utf-8')
+    (site_packages / 'llama_cpp.py').write_text('SOURCE = "site-packages"\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    original_config_module = sys.modules.get('config')
+    original_llama_module = sys.modules.get('llama_cpp')
+    try:
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv('PYTHONNOUSERSITE', '1')
+        monkeypatch.setattr(path_bootstrap.site, 'USER_SITE', str(user_site))
+        sys.path[:] = [
+            '',
+            str(cwd / '.'),
+            str(user_site),
+            str(site_packages),
+            str(cwd) + os.sep,
+        ]
+
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+
+        assert '' not in sys.path
+        assert str(user_site) not in sys.path
+        assert all(Path(entry).resolve() != cwd.resolve() for entry in sys.path)
+        assert str(resources_root) in sys.path
+        assert sys.path.index(str(resources_root)) == 0
+
+        for module_name in ('config', 'llama_cpp'):
+            sys.modules.pop(module_name, None)
+        import config  # noqa: PLC0415
+        import llama_cpp  # noqa: PLC0415
+
+        assert Path(config.__file__).resolve() == (resources_root / 'config.py').resolve()
+        assert Path(llama_cpp.__file__).resolve() == (site_packages / 'llama_cpp.py').resolve()
+    finally:
+        sys.path[:] = original_sys_path
+        if original_config_module is None:
+            sys.modules.pop('config', None)
+        else:
+            sys.modules['config'] = original_config_module
+        if original_llama_module is None:
+            sys.modules.pop('llama_cpp', None)
+        else:
+            sys.modules['llama_cpp'] = original_llama_module

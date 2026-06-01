@@ -377,7 +377,7 @@ pub async fn start_sidecar(
 }
 
 #[cfg(test)]
-mod tests {
+mod runtime_bootstrap_tests {
     use super::*;
 
     #[test]
@@ -385,9 +385,14 @@ mod tests {
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Auto);
 
+        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            Some("1")
+        } else {
+            None
+        };
         assert_eq!(
             command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
-            Some("1")
+            expected
         );
     }
 
@@ -395,7 +400,10 @@ mod tests {
     fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
         let mut cpu_command = Command::new("python");
         configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
-        assert_eq!(command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV), None);
+        assert_eq!(
+            command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
 
         let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
         let previous = std::env::var(disable_key).ok();

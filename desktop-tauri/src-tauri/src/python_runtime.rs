@@ -150,6 +150,256 @@ pub fn resolve_python_launcher(var_name: &str) -> anyhow::Result<PythonLauncher>
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceLayoutKind {
+    TauriResourceDir,
+    WindowsResources,
+    LinuxResources,
+    MacOsAppResources,
+    ExecutablePythonSibling,
+    DevSourceTree,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRootCandidate {
+    pub root: PathBuf,
+    pub layout: ResourceLayoutKind,
+}
+
+fn push_unique_resource_root(
+    candidates: &mut Vec<ResourceRootCandidate>,
+    root: PathBuf,
+    layout: ResourceLayoutKind,
+) {
+    if candidates.iter().any(|candidate| candidate.root == root) {
+        return;
+    }
+    candidates.push(ResourceRootCandidate { root, layout });
+}
+
+fn exe_sibling_resources_layout() -> ResourceLayoutKind {
+    if cfg!(target_os = "windows") {
+        ResourceLayoutKind::WindowsResources
+    } else {
+        ResourceLayoutKind::LinuxResources
+    }
+}
+
+pub fn resource_root_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+) -> Vec<ResourceRootCandidate> {
+    let mut candidates = Vec::new();
+
+    if let Some(resource_dir) = tauri_resource_dir {
+        push_unique_resource_root(
+            &mut candidates,
+            resource_dir.to_path_buf(),
+            ResourceLayoutKind::TauriResourceDir,
+        );
+    }
+
+    if let Some(exe_path) = exe_path {
+        if let Some(exe_dir) = exe_path.parent() {
+            push_unique_resource_root(
+                &mut candidates,
+                exe_dir.join("resources"),
+                exe_sibling_resources_layout(),
+            );
+            push_unique_resource_root(
+                &mut candidates,
+                exe_dir.join("python"),
+                ResourceLayoutKind::ExecutablePythonSibling,
+            );
+            if let Some(contents_dir) = exe_dir.parent() {
+                push_unique_resource_root(
+                    &mut candidates,
+                    contents_dir.join("Resources"),
+                    ResourceLayoutKind::MacOsAppResources,
+                );
+                push_unique_resource_root(
+                    &mut candidates,
+                    contents_dir.join("resources"),
+                    ResourceLayoutKind::LinuxResources,
+                );
+                push_unique_resource_root(
+                    &mut candidates,
+                    contents_dir.join("_up_").join("resources"),
+                    ResourceLayoutKind::WindowsResources,
+                );
+            }
+        }
+    }
+
+    push_unique_resource_root(
+        &mut candidates,
+        manifest_dir.to_path_buf(),
+        ResourceLayoutKind::DevSourceTree,
+    );
+    candidates
+}
+
+pub fn bridge_script_candidates_from_resource_roots(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    bridge_script_candidates_from_candidates(
+        script_name,
+        &resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir),
+    )
+}
+
+fn bridge_script_candidates_from_candidates(
+    script_name: &str,
+    root_candidates: &[ResourceRootCandidate],
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root_candidate in root_candidates {
+        match root_candidate.layout {
+            ResourceLayoutKind::ExecutablePythonSibling => {
+                candidates.push(root_candidate.root.join(script_name));
+            }
+            ResourceLayoutKind::DevSourceTree => {
+                candidates.push(root_candidate.root.join("python").join(script_name));
+            }
+            _ => {
+                candidates.push(root_candidate.root.join("python").join(script_name));
+                candidates.push(root_candidate.root.join(script_name));
+            }
+        }
+    }
+    candidates
+}
+
+pub fn resolve_bridge_script_path(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+    interpreter: Option<&str>,
+) -> Result<PathBuf, String> {
+    let root_candidates = resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir);
+    let bridge_candidates = bridge_script_candidates_from_candidates(script_name, &root_candidates);
+    bridge_candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            format_bridge_script_resolution_error(
+                script_name,
+                &root_candidates,
+                &bridge_candidates,
+                interpreter,
+            )
+        })
+}
+
+pub fn format_bridge_script_resolution_error(
+    script_name: &str,
+    root_candidates: &[ResourceRootCandidate],
+    bridge_candidates: &[PathBuf],
+    interpreter: Option<&str>,
+) -> String {
+    let attempted_roots = if root_candidates.is_empty() {
+        "<none>".into()
+    } else {
+        root_candidates
+            .iter()
+            .map(|candidate| format!("{:?}:{}", candidate.layout, candidate.root.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let attempted_bridge_paths = if bridge_candidates.is_empty() {
+        "<none>".into()
+    } else {
+        bridge_candidates
+            .iter()
+            .map(|candidate| candidate.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let selected_layout = root_candidates
+        .first()
+        .map(|candidate| format!("{:?}", candidate.layout))
+        .unwrap_or_else(|| "<unknown>".into());
+    let interpreter = interpreter.unwrap_or("<unresolved>");
+    format!(
+        "unable to locate desktop Python bridge script '{script_name}'; selected_layout={selected_layout}; interpreter={interpreter}; attempted_resource_roots=[{attempted_roots}]; attempted_bridge_paths=[{attempted_bridge_paths}]"
+    )
+}
+
+pub fn describe_resource_layout(
+    script_path: &Path,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+) -> (PathBuf, ResourceLayoutKind) {
+    for candidate in resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir) {
+        if script_path.starts_with(&candidate.root) {
+            return (candidate.root, candidate.layout);
+        }
+    }
+    let root = script_path
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| manifest_dir.to_path_buf());
+    (root, ResourceLayoutKind::DevSourceTree)
+}
+
+pub fn disable_python_user_site<C>(command: &mut C)
+where
+    C: PythonEnvCommand,
+{
+    command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+}
+
+pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
+where
+    C: PythonEnvCommand,
+{
+    disable_python_user_site(command);
+    command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
+    let python_dir = import_root.join("python");
+    let pythonpath = if python_dir.is_dir() {
+        std::env::join_paths([import_root, python_dir.as_path()])
+            .unwrap_or_else(|_| import_root.as_os_str().to_owned())
+    } else {
+        import_root.as_os_str().to_owned()
+    };
+    command.set_env("PYTHONPATH", pythonpath);
+}
+
+pub trait PythonEnvCommand {
+    fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>;
+}
+
+impl PythonEnvCommand for Command {
+    fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.env(key, value);
+    }
+}
+
+impl PythonEnvCommand for tokio::process::Command {
+    fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.env(key, value);
+    }
+}
+
 pub fn resolve_runtime_import_root(
     script_path: Option<&Path>,
     manifest_dir: &Path,
@@ -187,13 +437,16 @@ pub fn resolve_runtime_import_root(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
 }
 
 fn mode_requests_gpu(mode: &ComputeMode) -> bool {
-    matches!(mode, ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid)
+    matches!(
+        mode,
+        ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+    )
 }
 
 fn should_enable_runtime_bootstrap_for(
@@ -232,12 +485,12 @@ pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -398,14 +651,173 @@ mod tests {
     #[test]
     fn resolve_runtime_import_root_detects_nested_up_layout() {
         let temp = TempDir::new().expect("tempdir");
-        let script = temp.path().join("resources").join("python").join("model_bridge.py");
-        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        let script = temp
+            .path()
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script dir");
         std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
         let import_root = temp.path().join("resources").join("_up_").join("_up_");
         std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");
 
         let resolved = resolve_runtime_import_root(Some(&script), Path::new("/missing"));
         assert_eq!(resolved.as_deref(), Some(import_root.as_path()));
+    }
+
+    #[test]
+    fn resource_root_candidates_support_macos_app_and_windows_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let mac_exe = temp
+            .path()
+            .join("TokenPlace.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let roots = resource_root_candidates(Some(&mac_exe), &manifest_dir, None);
+
+        assert!(roots.iter().any(|candidate| {
+            candidate.layout == ResourceLayoutKind::MacOsAppResources
+                && candidate.root.ends_with("Contents/Resources")
+        }));
+        assert!(roots.iter().any(|candidate| {
+            candidate.layout == ResourceLayoutKind::DevSourceTree && candidate.root == manifest_dir
+        }));
+
+        let exe = temp.path().join("App").join("token.place.exe");
+        let exe_roots = resource_root_candidates(Some(&exe), &manifest_dir, None);
+        let expected_layout = if cfg!(target_os = "windows") {
+            ResourceLayoutKind::WindowsResources
+        } else {
+            ResourceLayoutKind::LinuxResources
+        };
+        assert!(exe_roots.iter().any(|candidate| {
+            candidate.layout == expected_layout && candidate.root.ends_with("App/resources")
+        }));
+    }
+
+    #[test]
+    fn exe_sibling_resources_layout_matches_target_os() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp.path().join("bin").join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let roots = resource_root_candidates(Some(&exe), &manifest_dir, None);
+        let exe_resources = roots
+            .iter()
+            .find(|candidate| candidate.root.ends_with("bin/resources"))
+            .expect("exe resources candidate");
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(exe_resources.layout, ResourceLayoutKind::WindowsResources);
+        } else {
+            assert_eq!(exe_resources.layout, ResourceLayoutKind::LinuxResources);
+        }
+    }
+
+    #[test]
+    fn describe_resource_layout_reports_linux_exe_resources_on_non_windows() {
+        if cfg!(target_os = "windows") {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp.path().join("bin").join("token.place");
+        let script = temp
+            .path()
+            .join("bin")
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let (_root, layout) = describe_resource_layout(&script, Some(&exe), &manifest_dir, None);
+
+        assert_eq!(layout, ResourceLayoutKind::LinuxResources);
+    }
+
+    #[test]
+    fn bridge_script_candidates_are_generated_from_shared_resource_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp
+            .path()
+            .join("TokenPlace.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let model_candidates = bridge_script_candidates_from_resource_roots(
+            "model_bridge.py",
+            Some(&exe),
+            &manifest_dir,
+            None,
+        );
+        let compute_candidates = bridge_script_candidates_from_resource_roots(
+            "compute_node_bridge.py",
+            Some(&exe),
+            &manifest_dir,
+            None,
+        );
+
+        assert_eq!(model_candidates.len(), compute_candidates.len());
+        assert!(model_candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("Contents/Resources/python/model_bridge.py")));
+        assert!(compute_candidates.iter().any(|candidate| {
+            candidate.ends_with("Contents/Resources/python/compute_node_bridge.py")
+        }));
+    }
+
+    #[test]
+    fn configure_python_subprocess_env_uses_deterministic_pythonpath() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("Resources");
+        std::fs::create_dir_all(root.join("python")).expect("create python dir");
+        let mut command = Command::new("python");
+
+        configure_python_subprocess_env(&mut command, &root);
+
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(envs.get("PYTHONNOUSERSITE").map(String::as_str), Some("1"));
+        assert_eq!(
+            envs.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT")
+                .map(String::as_str),
+            Some(root.to_str().expect("root str"))
+        );
+        let pythonpath_entries: Vec<_> = std::env::split_paths(std::ffi::OsStr::new(
+            envs.get("PYTHONPATH").expect("PYTHONPATH"),
+        ))
+        .collect();
+        assert_eq!(pythonpath_entries, vec![root.clone(), root.join("python")]);
     }
 
     #[test]

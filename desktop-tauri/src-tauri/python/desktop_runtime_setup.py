@@ -52,7 +52,7 @@ GPU_RUNTIME_FATAL_ACTIONS = frozenset(
         "shadowed_repo_llama_cpp",
         "unavailable",
         "metal_install_failed",
-        "installed_metal_reexec",
+        "metal_cpu_fallback",
     }
 )
 PIP_INSTALL_TIMEOUT_SECONDS = 300
@@ -477,7 +477,11 @@ def desktop_gpu_runtime_failure_message(mode: str, runtime_setup: Dict[str, str]
         return None
     if runtime_action in {"probe_only", "metal_probe_only"}:
         return None
-    if current_platform == "darwin" and selected_mode != "gpu" and runtime_action != "failed":
+    if (
+        current_platform == "darwin"
+        and selected_mode != "gpu"
+        and runtime_action not in {"failed", "metal_install_failed"}
+    ):
         return None
 
     reason = runtime_setup.get("fallback_reason") or "unknown runtime bootstrap failure"
@@ -773,6 +777,18 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                 f"{plan.backend.upper()} install completed but follow-up probe reported "
                 f"backend={after.backend} gpu_offload_supported={after.gpu_offload_supported}"
             )
+            if plan.backend == "metal":
+                return {
+                    "selected_backend": "cpu",
+                    "fallback_reason": (
+                        f"Metal runtime install completed but follow-up probe did not report "
+                        f"Metal GPU offload; backend={after.backend} "
+                        f"gpu_offload_supported={after.gpu_offload_supported}; "
+                        f"llama_module_path={after.llama_module_path}"
+                    ),
+                    "runtime_action": _install_failure_action(expected_backend),
+                    **_probe_result_payload(after),
+                }
 
         if plan.backend == "cpu":
             reason = (
@@ -819,18 +835,32 @@ def _desktop_dependency_target(runtime_root: Path) -> Path:
     return runtime_root / ".token_place_desktop_site"
 
 
+def _is_writable_directory(candidate: Path) -> tuple[bool, Optional[str]]:
+    probe = candidate / ".token_place_write_probe"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True, None
+    except OSError as exc:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, str(exc)
+
+
 def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
     preferred_targets = [
-        _desktop_dependency_target(runtime_root),
-        Path.home() / ".token_place_desktop_site",
+        ("runtime_root", _desktop_dependency_target(runtime_root)),
+        ("home_fallback", Path.home() / ".token_place_desktop_site"),
     ]
     errors: list[str] = []
-    for candidate in preferred_targets:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
+    for label, candidate in preferred_targets:
+        ok, error = _is_writable_directory(candidate)
+        if ok:
             return candidate, None
-        except OSError as exc:
-            errors.append(f"{candidate}: {exc}")
+        errors.append(f"{label}={candidate}: {error}")
     return None, "; ".join(errors) if errors else "no writable install target"
 
 
@@ -891,6 +921,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
             "interpreter": sys.executable,
             "import_root": str(root),
             "requirements": str(requirements_path),
+            "dependency_target": target_dir_str,
             "detail": _summarize_install_error(output),
         }
 
@@ -903,6 +934,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
         "interpreter": sys.executable,
         "import_root": str(root),
         "requirements": str(requirements_path),
+        "dependency_target": target_dir_str,
     }
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()

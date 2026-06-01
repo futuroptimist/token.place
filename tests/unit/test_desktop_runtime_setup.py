@@ -166,7 +166,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
 
 
-def test_macos_metal_source_install_clean_cpu_probe_reexecs_without_reporting_metal(monkeypatch):
+def test_macos_metal_source_install_clean_cpu_probe_reexecs_auto(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     probes = iter([
@@ -201,11 +201,13 @@ def test_macos_metal_source_install_clean_cpu_probe_reexecs_without_reporting_me
     assert len(install_calls) == 1
     assert result['selected_backend'] == 'cpu'
     assert result['runtime_action'] == 'installed_metal_reexec'
-    assert 'installed METAL runtime from source' in result['fallback_reason']
+    assert 're-executing sidecar for hardware probe' in result['fallback_reason']
     assert result['detected_device'] == 'cpu'
     assert result['llama_module_path'].endswith('llama_cpp/__init__.py')
-    message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
-    assert message and 'installed_metal_reexec' in message
+    auto_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result)
+    hybrid_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('hybrid', result)
+    assert auto_message is None
+    assert hybrid_message is None
 
 
 def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_reexec(monkeypatch):
@@ -246,6 +248,32 @@ def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_re
     assert result['detected_device'] == 'cpu'
     message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
     assert message and 'metal_install_failed' in message
+
+
+def test_macos_metal_install_unsatisfied_cpu_probe_fails_before_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([
+        _probe(backend='cpu', gpu=False, device='cpu', error='Metal runtime missing'),
+        _probe(backend='cpu', gpu=False, device='cpu', error='Metal still unavailable'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    monkeypatch.setattr(desktop_runtime_setup, 'backend_probe_satisfies_install_plan', lambda *_: False)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert result['selected_backend'] == 'cpu'
+    assert result['runtime_action'] == 'metal_install_failed'
+    assert 'follow-up probe did not report Metal GPU offload' in result['fallback_reason']
+    assert 'backend=cpu' in result['fallback_reason']
+
 
 def test_macos_bootstrap_disabled_reports_metal_probe_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
@@ -318,7 +346,7 @@ def test_macos_missing_runtime_failure_message_is_fatal_for_auto_and_hybrid(monk
     assert 'Metal' in auto_message
 
 
-def test_macos_metal_install_failure_falls_back_for_auto(monkeypatch):
+def test_macos_metal_install_failure_cpu_fallback_recovers_auto_and_hybrid(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
@@ -343,6 +371,12 @@ def test_macos_metal_install_failure_falls_back_for_auto(monkeypatch):
     assert result['selected_backend'] == 'cpu'
     assert result['runtime_action'] == 'metal_cpu_fallback'
     assert 'using CPU runtime' in result['fallback_reason']
+    auto_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result)
+    hybrid_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('hybrid', result)
+    gpu_message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
+    assert auto_message is None
+    assert hybrid_message is None
+    assert gpu_message and 'metal_cpu_fallback' in gpu_message
 
 
 def test_macos_metal_install_failure_is_fatal_for_gpu(monkeypatch):
@@ -1313,7 +1347,6 @@ def _probe_from_matrix_payload(probe):
 def _probe_from_matrix_case(case):
     return _probe_from_matrix_payload(case["probe"])
 
-
 @pytest.mark.parametrize(
     "case",
     [
@@ -1397,3 +1430,40 @@ def test_desktop_operator_parity_platform_matrix(monkeypatch, case):
         assert invoked == {"pip": False, "source_repair": True}
     if case["id"] == "macos_metal_bootstrap_gap":
         assert invoked == {"pip": True, "source_repair": False}
+
+
+def test_resolve_desktop_dependency_target_prefers_writable_runtime_target(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'runtime'
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir()
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+
+    target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
+
+    assert error is None
+    assert target == runtime_root / '.token_place_desktop_site'
+    assert target.is_dir()
+
+
+def test_resolve_desktop_dependency_target_uses_home_only_when_runtime_probe_fails(
+    monkeypatch, tmp_path
+):
+    runtime_root = tmp_path / 'runtime'
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir()
+    probes = []
+
+    def _fake_writable(candidate):
+        probes.append(candidate)
+        if candidate == runtime_root / '.token_place_desktop_site':
+            return False, 'read-only runtime target'
+        return True, None
+
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+    monkeypatch.setattr(desktop_runtime_setup, '_is_writable_directory', _fake_writable)
+
+    target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
+
+    assert error is None
+    assert target == home_dir / '.token_place_desktop_site'
+    assert probes == [runtime_root / '.token_place_desktop_site', target]

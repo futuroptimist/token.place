@@ -58,9 +58,19 @@ def test_linux_no_bundle_layout_contains_python_runtime_resources() -> None:
         ("python/path_bootstrap.py", "resources/python/path_bootstrap.py"),
         "python/path_bootstrap.py",
     )
-    _assert_any_exists(staging_root, ("requirements.txt", "resources/requirements.txt"), "requirements.txt")
-    _assert_any_exists(staging_root, ("utils", "resources/utils"), "utils/")
-    _assert_any_exists(staging_root, ("config.py", "resources/config.py"), "config.py")
+    # Tauri can preserve repo-root resources in the no-bundle debug tree via the
+    # relative `_up_/_up_` resource path used by bundled config entries.
+    _assert_any_exists(
+        staging_root,
+        ("requirements.txt", "resources/requirements.txt", "_up_/_up_/requirements.txt"),
+        "requirements.txt",
+    )
+    _assert_any_exists(staging_root, ("utils", "resources/utils", "_up_/_up_/utils"), "utils/")
+    _assert_any_exists(
+        staging_root,
+        ("config.py", "resources/config.py", "_up_/_up_/config.py"),
+        "config.py",
+    )
 
 
 if __name__ == "__main__":

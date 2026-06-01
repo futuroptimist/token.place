@@ -6,6 +6,239 @@ use crate::backend::ComputeMode;
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopResourceLayout {
+    RuntimeResourceDir,
+    ExeAdjacentResources,
+    ExeAdjacentPython,
+    ParentResources,
+    MacOsAppResources,
+    WindowsUpdaterResources,
+    DevelopmentSourceTree,
+}
+
+impl DesktopResourceLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DesktopResourceLayout::RuntimeResourceDir => "runtime-resource-dir",
+            DesktopResourceLayout::ExeAdjacentResources => "exe-adjacent-resources",
+            DesktopResourceLayout::ExeAdjacentPython => "exe-adjacent-python",
+            DesktopResourceLayout::ParentResources => "parent-resources",
+            DesktopResourceLayout::MacOsAppResources => "macos-app-contents-resources",
+            DesktopResourceLayout::WindowsUpdaterResources => "windows-updater-resources",
+            DesktopResourceLayout::DevelopmentSourceTree => "development-source-tree",
+        }
+    }
+
+    pub fn is_packaged(self) -> bool {
+        !matches!(self, DesktopResourceLayout::DevelopmentSourceTree)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopResourceRoot {
+    pub root: PathBuf,
+    pub python_dir: PathBuf,
+    pub layout: DesktopResourceLayout,
+}
+
+impl DesktopResourceRoot {
+    pub fn bridge_path(&self, script_name: &str) -> PathBuf {
+        self.python_dir.join(script_name)
+    }
+
+    pub fn is_packaged(&self) -> bool {
+        self.layout.is_packaged()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDesktopPythonResource {
+    pub resource_root: DesktopResourceRoot,
+    pub script_path: PathBuf,
+}
+
+fn push_unique_resource_root(
+    candidates: &mut Vec<DesktopResourceRoot>,
+    root: PathBuf,
+    python_dir: PathBuf,
+    layout: DesktopResourceLayout,
+) {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.root == root && candidate.python_dir == python_dir)
+    {
+        return;
+    }
+    candidates.push(DesktopResourceRoot {
+        root,
+        python_dir,
+        layout,
+    });
+}
+
+pub fn desktop_resource_root_candidates(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Vec<DesktopResourceRoot> {
+    let mut candidates = Vec::new();
+
+    if let Some(resource_dir) = resource_dir {
+        push_unique_resource_root(
+            &mut candidates,
+            resource_dir.to_path_buf(),
+            resource_dir.join("python"),
+            DesktopResourceLayout::RuntimeResourceDir,
+        );
+    }
+
+    if let Some(current_exe) = exe_path {
+        if let Some(exe_dir) = current_exe.parent() {
+            push_unique_resource_root(
+                &mut candidates,
+                exe_dir.join("resources"),
+                exe_dir.join("resources").join("python"),
+                DesktopResourceLayout::ExeAdjacentResources,
+            );
+            push_unique_resource_root(
+                &mut candidates,
+                exe_dir.to_path_buf(),
+                exe_dir.join("python"),
+                DesktopResourceLayout::ExeAdjacentPython,
+            );
+            if let Some(parent_dir) = exe_dir.parent() {
+                push_unique_resource_root(
+                    &mut candidates,
+                    parent_dir.join("Resources"),
+                    parent_dir.join("Resources").join("python"),
+                    DesktopResourceLayout::MacOsAppResources,
+                );
+                push_unique_resource_root(
+                    &mut candidates,
+                    parent_dir.join("resources"),
+                    parent_dir.join("resources").join("python"),
+                    DesktopResourceLayout::ParentResources,
+                );
+                push_unique_resource_root(
+                    &mut candidates,
+                    parent_dir.join("_up_").join("resources"),
+                    parent_dir.join("_up_").join("resources").join("python"),
+                    DesktopResourceLayout::WindowsUpdaterResources,
+                );
+            }
+        }
+    }
+
+    let dev_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| manifest_dir.to_path_buf());
+    push_unique_resource_root(
+        &mut candidates,
+        dev_root,
+        manifest_dir.join("python"),
+        DesktopResourceLayout::DevelopmentSourceTree,
+    );
+
+    candidates
+}
+
+pub fn resolve_desktop_python_resource(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Result<ResolvedDesktopPythonResource, String> {
+    let candidates = desktop_resource_root_candidates(exe_path, manifest_dir, resource_dir);
+    let attempted: Vec<String> = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{} (root={}, layout={}, packaged={})",
+                candidate.bridge_path(script_name).display(),
+                candidate.root.display(),
+                candidate.layout.as_str(),
+                candidate.is_packaged()
+            )
+        })
+        .collect();
+
+    for candidate in candidates {
+        let script_path = candidate.bridge_path(script_name);
+        if script_path.is_file() {
+            return Ok(ResolvedDesktopPythonResource {
+                resource_root: candidate,
+                script_path,
+            });
+        }
+    }
+
+    Err(format!(
+        "unable to locate {script_name}; attempted resource roots/interpreter import layouts: {}",
+        attempted.join("; ")
+    ))
+}
+
+pub fn runtime_import_root_for_resource(
+    resolved: &ResolvedDesktopPythonResource,
+    manifest_dir: &Path,
+) -> Option<PathBuf> {
+    if resolved.resource_root.root.join("utils").is_dir()
+        || resolved.resource_root.root.join("config.py").is_file()
+    {
+        return Some(resolved.resource_root.root.clone());
+    }
+    resolve_runtime_import_root(Some(&resolved.script_path), manifest_dir)
+}
+
+fn deterministic_pythonpath_entries(
+    resolved: &ResolvedDesktopPythonResource,
+    manifest_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    entries.push(resolved.resource_root.python_dir.clone());
+    if let Some(import_root) = runtime_import_root_for_resource(resolved, manifest_dir) {
+        if !entries.iter().any(|entry| entry == &import_root) {
+            entries.push(import_root);
+        }
+    }
+    entries
+}
+
+pub fn configure_blocking_python_environment(
+    command: &mut Command,
+    resolved: &ResolvedDesktopPythonResource,
+    manifest_dir: &Path,
+) {
+    command.env("PYTHONNOUSERSITE", "1");
+    if let Some(import_root) = runtime_import_root_for_resource(resolved, manifest_dir) {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root);
+    }
+    if let Ok(joined) =
+        std::env::join_paths(deterministic_pythonpath_entries(resolved, manifest_dir))
+    {
+        command.env("PYTHONPATH", joined);
+    }
+}
+
+pub fn configure_tokio_python_environment(
+    command: &mut tokio::process::Command,
+    resolved: &ResolvedDesktopPythonResource,
+    manifest_dir: &Path,
+) {
+    command.env("PYTHONNOUSERSITE", "1");
+    if let Some(import_root) = runtime_import_root_for_resource(resolved, manifest_dir) {
+        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root);
+    }
+    if let Ok(joined) =
+        std::env::join_paths(deterministic_pythonpath_entries(resolved, manifest_dir))
+    {
+        command.env("PYTHONPATH", joined);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PythonLauncher {
     pub program: String,
@@ -187,13 +420,16 @@ pub fn resolve_runtime_import_root(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        candidate.join("utils").is_dir() || candidate.join("config.py").is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
 }
 
 fn mode_requests_gpu(mode: &ComputeMode) -> bool {
-    matches!(mode, ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid)
+    matches!(
+        mode,
+        ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+    )
 }
 
 fn should_enable_runtime_bootstrap_for(
@@ -224,12 +460,12 @@ pub fn should_enable_runtime_bootstrap(mode: &ComputeMode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use tempfile::TempDir;
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
@@ -390,14 +626,128 @@ mod tests {
     #[test]
     fn resolve_runtime_import_root_detects_nested_up_layout() {
         let temp = TempDir::new().expect("tempdir");
-        let script = temp.path().join("resources").join("python").join("model_bridge.py");
-        std::fs::create_dir_all(script.parent().expect("script parent")).expect("create script dir");
+        let script = temp
+            .path()
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        std::fs::create_dir_all(script.parent().expect("script parent"))
+            .expect("create script dir");
         std::fs::write(&script, "#!/usr/bin/env python3\n").expect("write script");
         let import_root = temp.path().join("resources").join("_up_").join("_up_");
         std::fs::create_dir_all(import_root.join("utils")).expect("create utils dir");
 
         let resolved = resolve_runtime_import_root(Some(&script), Path::new("/missing"));
         assert_eq!(resolved.as_deref(), Some(import_root.as_path()));
+    }
+
+    #[test]
+    fn shared_resource_root_resolves_macos_app_compute_and_model_bridges() {
+        let temp = TempDir::new().expect("tempdir");
+        let app_root = temp.path().join("TokenPlace.app").join("Contents");
+        let macos_dir = app_root.join("MacOS");
+        let resources_root = app_root.join("Resources");
+        let python_dir = resources_root.join("python");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(resources_root.join("utils")).expect("create utils dir");
+        std::fs::write(python_dir.join("compute_node_bridge.py"), "# compute\n")
+            .expect("write compute bridge");
+        std::fs::write(python_dir.join("model_bridge.py"), "# model\n")
+            .expect("write model bridge");
+        let exe_path = macos_dir.join("token.place");
+
+        let compute = resolve_desktop_python_resource(
+            "compute_node_bridge.py",
+            Some(&exe_path),
+            temp.path(),
+            None,
+        )
+        .expect("resolve compute bridge");
+        let model =
+            resolve_desktop_python_resource("model_bridge.py", Some(&exe_path), temp.path(), None)
+                .expect("resolve model bridge");
+
+        assert_eq!(compute.resource_root.root, resources_root);
+        assert_eq!(model.resource_root.root, compute.resource_root.root);
+        assert_eq!(
+            compute.resource_root.layout,
+            DesktopResourceLayout::MacOsAppResources
+        );
+        assert!(compute.resource_root.is_packaged());
+        assert_eq!(
+            runtime_import_root_for_resource(&compute, temp.path()),
+            Some(resources_root)
+        );
+    }
+
+    #[test]
+    fn shared_resource_root_preserves_windows_resources_resolution() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe_dir = temp.path().join("TokenPlace");
+        let resources_root = exe_dir.join("resources");
+        let python_dir = resources_root.join("python");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(resources_root.join("utils")).expect("create utils dir");
+        std::fs::write(python_dir.join("compute_node_bridge.py"), "# compute\n")
+            .expect("write bridge");
+        let exe_path = exe_dir.join("token.place.exe");
+
+        let resolved = resolve_desktop_python_resource(
+            "compute_node_bridge.py",
+            Some(&exe_path),
+            temp.path(),
+            None,
+        )
+        .expect("resolve bridge");
+
+        assert_eq!(
+            resolved.script_path,
+            python_dir.join("compute_node_bridge.py")
+        );
+        assert_eq!(resolved.resource_root.root, resources_root);
+        assert_eq!(
+            resolved.resource_root.layout,
+            DesktopResourceLayout::ExeAdjacentResources
+        );
+    }
+
+    #[test]
+    fn deterministic_pythonpath_ignores_existing_user_site_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let resources_root = temp.path().join("resources");
+        let python_dir = resources_root.join("python");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(resources_root.join("utils")).expect("create utils dir");
+        let script_path = python_dir.join("model_bridge.py");
+        std::fs::write(&script_path, "# model\n").expect("write model bridge");
+        let resolved = ResolvedDesktopPythonResource {
+            resource_root: DesktopResourceRoot {
+                root: resources_root.clone(),
+                python_dir: python_dir.clone(),
+                layout: DesktopResourceLayout::RuntimeResourceDir,
+            },
+            script_path,
+        };
+        std::env::set_var("PYTHONPATH", "/Users/example/Library/Python/site-packages");
+        let mut command = Command::new("python3");
+
+        configure_blocking_python_environment(&mut command, &resolved, temp.path());
+        let pythonpath = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "PYTHONPATH").then(|| value.expect("pythonpath value").to_os_string())
+            })
+            .expect("pythonpath set");
+        let entries: Vec<_> = std::env::split_paths(&pythonpath).collect();
+
+        assert_eq!(entries, vec![python_dir, resources_root]);
+        assert_eq!(
+            command
+                .get_envs()
+                .find_map(|(key, value)| (key == "PYTHONNOUSERSITE").then(|| value.unwrap())),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        std::env::remove_var("PYTHONPATH");
     }
 
     #[test]

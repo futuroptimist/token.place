@@ -207,3 +207,37 @@ def test_bootstrap_adds_resolved_cwd_when_candidate_uses_non_resolved_path(
         assert str(repo_root.resolve()) in sys.path
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_bootstrap_removes_cwd_repo_llama_shim_for_packaged_import_root(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    resources_root = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources'
+    script = resources_root / 'python' / 'model_bridge.py'
+    repo_cwd = tmp_path / 'repo-cwd'
+    site_packages = tmp_path / 'venv' / 'site-packages'
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    repo_cwd.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    (repo_cwd / 'llama_cpp.py').write_text('SOURCE = "repo-cwd-shim"\n', encoding='utf-8')
+    (site_packages / 'llama_cpp.py').write_text('SOURCE = "site-packages"\n', encoding='utf-8')
+    script.write_text('# bridge\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(resources_root))
+
+    original_sys_path = list(sys.path)
+    original_modules = dict(sys.modules)
+    try:
+        monkeypatch.chdir(repo_cwd)
+        sys.path[:] = ['', str(site_packages)]
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        sys.modules.pop('llama_cpp', None)
+        import llama_cpp  # noqa: PLC0415
+
+        assert '' not in sys.path
+        assert str(repo_cwd.resolve()) not in sys.path[: sys.path.index(str(site_packages)) + 1]
+        assert Path(llama_cpp.__file__).resolve() == (site_packages / 'llama_cpp.py').resolve()
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.clear()
+        sys.modules.update(original_modules)

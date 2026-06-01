@@ -126,6 +126,59 @@ def _packaged_env(
     return env
 
 
+
+def validate_unified_resource_root(tmp_root: Path, *, resources_root: Path | None = None) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    python_dir = resources_root / "python"
+    required_root_entries = ("utils", "config.py", "encrypt.py", "requirements.txt")
+    required_python_entries = (
+        "compute_node_bridge.py",
+        "model_bridge.py",
+        "inference_sidecar.py",
+        "desktop_runtime_setup.py",
+        "path_bootstrap.py",
+        "requirements_desktop_runtime.txt",
+    )
+    missing = [str(resources_root / entry) for entry in required_root_entries if not (resources_root / entry).exists()]
+    missing.extend(str(python_dir / entry) for entry in required_python_entries if not (python_dir / entry).is_file())
+    assert not missing, f"unified packaged resource root is incomplete ({resources_root}): {missing}"
+
+    env = _packaged_env(tmp_root, resources_root)
+    assert env["PYTHONNOUSERSITE"] == "1"
+    pythonpath_entries = env["PYTHONPATH"].split(os.pathsep)
+    assert pythonpath_entries == [str(python_dir)]
+    assert env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] == str(resources_root)
+
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os, pathlib, site, sys; "
+                "python_dir=pathlib.Path(r'" + str(python_dir) + "'); "
+                "sys.path.insert(0, str(python_dir)); "
+                "from path_bootstrap import ensure_runtime_import_paths; "
+                "ensure_runtime_import_paths(str(python_dir / 'model_bridge.py')); "
+                "print(json.dumps({"
+                "'no_user_site': not site.ENABLE_USER_SITE, "
+                "'import_root': os.environ.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT'), "
+                "'first_paths': sys.path[:3]"
+                "}))"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    payload = json.loads(result.stdout.strip())
+    assert payload["no_user_site"] is True, combined
+    assert payload["import_root"] == str(resources_root), combined
+    assert str(resources_root) in payload["first_paths"], combined
+
 def run_desktop_dependency_preflight(tmp_root: Path, *, resources_root: Path | None = None) -> None:
     resources_root = resources_root or (tmp_root / "resources")
     env = _packaged_env(tmp_root, resources_root)
@@ -415,12 +468,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         tmp_path = Path(tmpdir)
         bridge_script = create_packaged_layout(tmp_path)
+        validate_unified_resource_root(tmp_path)
         run_desktop_dependency_preflight(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
+        validate_unified_resource_root(tmp_path, resources_root=mac_resources_root)
         run_desktop_dependency_preflight(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)

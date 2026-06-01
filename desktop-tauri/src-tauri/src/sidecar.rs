@@ -218,7 +218,24 @@ fn configure_runtime_pythonpath(command: &mut Command, sidecar_path: &str) {
 }
 
 fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
-    if should_enable_runtime_bootstrap(mode) {
+    configure_runtime_bootstrap_env_with_decision(
+        command,
+        mode,
+        should_enable_runtime_bootstrap(mode),
+    );
+}
+
+fn configure_runtime_bootstrap_env_with_decision(
+    command: &mut Command,
+    mode: &ComputeMode,
+    bootstrap_enabled: bool,
+) {
+    if bootstrap_enabled
+        && matches!(
+            mode,
+            ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+        )
+    {
         command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
     }
 }
@@ -377,13 +394,13 @@ pub async fn start_sidecar(
 }
 
 #[cfg(test)]
-mod tests {
+mod bootstrap_tests {
     use super::*;
 
     #[test]
     fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
         let mut command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Auto);
+        configure_runtime_bootstrap_env_with_decision(&mut command, &ComputeMode::Auto, true);
 
         assert_eq!(
             command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
@@ -394,8 +411,11 @@ mod tests {
     #[test]
     fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
         let mut cpu_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
-        assert_eq!(command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV), None);
+        configure_runtime_bootstrap_env_with_decision(&mut cpu_command, &ComputeMode::Cpu, true);
+        assert_eq!(
+            command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            None
+        );
 
         let disable_key = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
         let previous = std::env::var(disable_key).ok();
@@ -404,7 +424,11 @@ mod tests {
             std::env::set_var(disable_key, "1");
         }
         let mut disabled_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut disabled_command, &ComputeMode::Auto);
+        configure_runtime_bootstrap_env_with_decision(
+            &mut disabled_command,
+            &ComputeMode::Auto,
+            false,
+        );
         if let Some(value) = previous {
             // SAFETY: restore prior process env for test isolation.
             unsafe {

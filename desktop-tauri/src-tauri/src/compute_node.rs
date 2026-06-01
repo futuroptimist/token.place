@@ -1,7 +1,7 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{
-    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
-    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    self, resolve_python_launcher, should_enable_runtime_bootstrap, PythonLauncher,
+    ResolvedDesktopPythonResource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -82,101 +82,47 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
-fn bridge_script_candidates(
+fn resolve_bridge_script(app: &AppHandle) -> Result<ResolvedDesktopPythonResource, String> {
+    python_runtime::resolve_desktop_python_resource(
+        "compute_node_bridge.py",
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        app.path().resource_dir().ok().as_deref(),
+    )
+}
+
+fn resolve_bridge_script_for_paths(
     exe_path: Option<&Path>,
     manifest_dir: &Path,
     resource_dir: Option<&Path>,
-) -> Vec<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(resource_dir) = resource_dir {
-        candidates.push(resource_dir.join("python").join("compute_node_bridge.py"));
-        candidates.push(resource_dir.join("compute_node_bridge.py"));
-    }
-
-    if let Some(exe_path) = exe_path {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(
-                exe_dir
-                    .join("resources")
-                    .join("python")
-                    .join("compute_node_bridge.py"),
-            );
-            candidates.push(exe_dir.join("python").join("compute_node_bridge.py"));
-            if let Some(parent_dir) = exe_dir.parent() {
-                candidates.push(
-                    parent_dir
-                        .join("_up_")
-                        .join("resources")
-                        .join("python")
-                        .join("compute_node_bridge.py"),
-                );
-                candidates.push(
-                    parent_dir
-                        .join("Resources")
-                        .join("python")
-                        .join("compute_node_bridge.py"),
-                );
-                candidates.push(
-                    parent_dir
-                        .join("resources")
-                        .join("python")
-                        .join("compute_node_bridge.py"),
-                );
-            }
-        }
-    }
-
-    candidates.push(manifest_dir.join("python").join("compute_node_bridge.py"));
-    candidates
-}
-
-fn resolve_bridge_script(app: &AppHandle) -> String {
-    let exe_path = std::env::current_exe().ok();
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let resource_dir = app.path().resource_dir().ok();
-    let candidates =
-        bridge_script_candidates(exe_path.as_deref(), manifest_dir, resource_dir.as_deref());
-
-    if let Some(path) = first_existing_script(candidates) {
-        return path;
-    }
-
-    "python/compute_node_bridge.py".into()
-}
-
-fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> {
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-fn configure_runtime_pythonpath(command: &mut Command, manifest_dir: &Path, bridge_script: &str) {
-    command.env("PYTHONNOUSERSITE", "1");
-    if let Some(import_root) =
-        resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir)
-    {
-        command.env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &import_root);
-        match std::env::var("PYTHONPATH") {
-            Ok(existing) if !existing.trim().is_empty() => {
-                let mut components = vec![import_root.clone()];
-                components.extend(std::env::split_paths(&existing));
-                if let Ok(joined) = std::env::join_paths(components) {
-                    command.env("PYTHONPATH", joined);
-                } else {
-                    command.env("PYTHONPATH", import_root);
-                }
-            }
-            _ => {
-                command.env("PYTHONPATH", import_root);
-            }
-        }
-    }
+) -> Result<ResolvedDesktopPythonResource, String> {
+    python_runtime::resolve_desktop_python_resource(
+        "compute_node_bridge.py",
+        exe_path,
+        manifest_dir,
+        resource_dir,
+    )
 }
 
 fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
-    if should_enable_runtime_bootstrap(mode) {
+    configure_runtime_bootstrap_env_with_decision(
+        command,
+        mode,
+        should_enable_runtime_bootstrap(mode),
+    );
+}
+
+fn configure_runtime_bootstrap_env_with_decision(
+    command: &mut Command,
+    mode: &ComputeMode,
+    bootstrap_enabled: bool,
+) {
+    if bootstrap_enabled
+        && matches!(
+            mode,
+            ComputeMode::Auto | ComputeMode::Gpu | ComputeMode::Hybrid
+        )
+    {
         command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
     }
 }
@@ -478,7 +424,17 @@ pub async fn start_compute_node(
         *state.stdin.lock().await = None;
     }
 
-    let bridge_script = resolve_bridge_script(&app);
+    let resolved_bridge = match resolve_bridge_script(&app) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            {
+                let mut status = state.status.lock().await;
+                *status = startup_failure_status(&request, err.clone());
+            }
+            return Err(anyhow::anyhow!(err));
+        }
+    };
+    let bridge_script = resolved_bridge.script_path.to_string_lossy().into_owned();
     let launcher = if is_python_script(&bridge_script) {
         match tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
             .await
@@ -506,7 +462,7 @@ pub async fn start_compute_node(
         None
     };
 
-    let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
+    let mut bridge_command = match build_bridge_command(&bridge_script, launcher.clone()) {
         Ok(command) => command,
         Err(err) => {
             {
@@ -522,12 +478,23 @@ pub async fn start_compute_node(
         next_session_id.to_string()
     };
     eprintln!(
-        "desktop.compute_node.session.start operator_session_id={} relay={} bridge={} cancellation_token_reset=true",
+        "desktop.compute_node.session.start operator_session_id={} relay={} resource_root={} bridge={} interpreter={} layout={} packaged={} cancellation_token_reset=true",
         session_id,
         sanitize_relay_target(&request.relay_base_url),
-        bridge_script
+        resolved_bridge.resource_root.root.display(),
+        bridge_script,
+        launcher
+            .as_ref()
+            .map(|python| python.program.as_str())
+            .unwrap_or("native"),
+        resolved_bridge.resource_root.layout.as_str(),
+        resolved_bridge.resource_root.is_packaged()
     );
-    configure_runtime_pythonpath(&mut bridge_command, manifest_dir, &bridge_script);
+    python_runtime::configure_tokio_python_environment(
+        &mut bridge_command,
+        &resolved_bridge,
+        manifest_dir,
+    );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
 
@@ -737,14 +704,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         let _ = stdin.flush().await;
     }
 
-    let mut owned_child = None;
-    for _ in 0..20 {
-        if let Some(child) = state.child.lock().await.take() {
-            owned_child = Some(child);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let owned_child = state.child.lock().await.take();
 
     if let Some(mut child) = owned_child {
         let mut exited = child.try_wait()?.is_some();
@@ -868,13 +828,8 @@ mod tests {
             ..ComputeNodeStatus::default()
         };
 
-        let payload = finalize_bridge_exit(
-            &mut status,
-            success_exit_status(),
-            true,
-            true,
-            "session-1",
-        );
+        let payload =
+            finalize_bridge_exit(&mut status, success_exit_status(), true, true, "session-1");
 
         assert!(payload.is_none());
         assert!(!status.running);
@@ -1353,17 +1308,21 @@ mod tests {
             .join("repo")
             .join("desktop-tauri")
             .join("src-tauri");
-        let candidates = bridge_script_candidates(Some(&exe_path), &manifest_dir, None);
+        let candidates =
+            python_runtime::desktop_resource_root_candidates(Some(&exe_path), &manifest_dir, None);
 
-        assert!(candidates
-            .iter()
-            .any(|candidate| candidate.ends_with("resources/python/compute_node_bridge.py")));
-        assert!(candidates
-            .iter()
-            .any(|candidate| candidate.ends_with("Resources/python/compute_node_bridge.py")));
+        assert!(candidates.iter().any(|candidate| candidate
+            .bridge_path("compute_node_bridge.py")
+            .ends_with("resources/python/compute_node_bridge.py")));
+        assert!(candidates.iter().any(|candidate| candidate
+            .bridge_path("compute_node_bridge.py")
+            .ends_with("Resources/python/compute_node_bridge.py")));
         assert_eq!(
-            candidates.last().expect("manifest candidate"),
-            &manifest_dir.join("python").join("compute_node_bridge.py")
+            candidates
+                .last()
+                .expect("manifest candidate")
+                .bridge_path("compute_node_bridge.py"),
+            manifest_dir.join("python").join("compute_node_bridge.py")
         );
     }
 
@@ -1377,10 +1336,10 @@ mod tests {
         std::fs::write(&bridge, "print('ok')\n").expect("write bridge");
 
         let exe_path = exe_dir.join("token.place.exe");
-        let candidates = bridge_script_candidates(Some(&exe_path), temp.path(), None);
-        let resolved = first_existing_script(candidates).expect("resolved bridge path");
+        let resolved = resolve_bridge_script_for_paths(Some(&exe_path), temp.path(), None)
+            .expect("resolved bridge path");
 
-        assert_eq!(Path::new(&resolved), bridge);
+        assert_eq!(resolved.script_path, bridge);
     }
 
     #[test]
@@ -1398,10 +1357,10 @@ mod tests {
         std::fs::write(&resources_bridge, "print('resources')\n").expect("write resources bridge");
 
         let exe_path = exe_dir.join("token.place");
-        let candidates = bridge_script_candidates(Some(&exe_path), temp.path(), None);
-        let resolved = first_existing_script(candidates).expect("resolved bridge path");
+        let resolved = resolve_bridge_script_for_paths(Some(&exe_path), temp.path(), None)
+            .expect("resolved bridge path");
 
-        assert_eq!(Path::new(&resolved), resources_bridge);
+        assert_eq!(resolved.script_path, resources_bridge);
     }
 
     #[test]
@@ -1410,22 +1369,28 @@ mod tests {
         let resource_dir = temp.path().join("runtime-resources");
         let exe_dir = temp.path().join("Local").join("token.place");
         let exe_path = exe_dir.join("token.place.exe");
-        let candidates =
-            bridge_script_candidates(Some(&exe_path), temp.path(), Some(&resource_dir));
+        let candidates = python_runtime::desktop_resource_root_candidates(
+            Some(&exe_path),
+            temp.path(),
+            Some(&resource_dir),
+        );
 
         assert_eq!(
-            candidates.first().expect("first candidate"),
-            &resource_dir.join("python").join("compute_node_bridge.py")
+            candidates
+                .first()
+                .expect("first candidate")
+                .bridge_path("compute_node_bridge.py"),
+            resource_dir.join("python").join("compute_node_bridge.py")
         );
-        assert!(candidates.iter().any(|candidate| {
-            candidate.ends_with("_up_/resources/python/compute_node_bridge.py")
-        }));
+        assert!(candidates.iter().any(|candidate| candidate
+            .bridge_path("compute_node_bridge.py")
+            .ends_with("_up_/resources/python/compute_node_bridge.py")));
     }
 
     #[test]
     fn configure_runtime_bootstrap_env_sets_enable_flag_for_gpu_mode() {
         let mut command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
+        configure_runtime_bootstrap_env_with_decision(&mut command, &ComputeMode::Hybrid, true);
 
         assert_eq!(
             command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
@@ -1436,7 +1401,7 @@ mod tests {
     #[test]
     fn configure_runtime_bootstrap_env_omits_enable_flag_for_cpu_mode_and_when_disabled() {
         let mut cpu_command = Command::new("python");
-        configure_runtime_bootstrap_env(&mut cpu_command, &ComputeMode::Cpu);
+        configure_runtime_bootstrap_env_with_decision(&mut cpu_command, &ComputeMode::Cpu, true);
         assert_eq!(
             command_env_value(&cpu_command, ENABLE_RUNTIME_BOOTSTRAP_ENV),
             None

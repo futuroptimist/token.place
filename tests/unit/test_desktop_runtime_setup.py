@@ -249,6 +249,32 @@ def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_re
     message = desktop_runtime_setup.desktop_gpu_runtime_failure_message('gpu', result)
     assert message and 'metal_install_failed' in message
 
+
+def test_macos_metal_install_unsatisfied_cpu_probe_fails_before_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    probes = iter([
+        _probe(backend='cpu', gpu=False, device='cpu', error='Metal runtime missing'),
+        _probe(backend='cpu', gpu=False, device='cpu', error='Metal still unavailable'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    monkeypatch.setattr(desktop_runtime_setup, 'backend_probe_satisfies_install_plan', lambda *_: False)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert result['selected_backend'] == 'cpu'
+    assert result['runtime_action'] == 'metal_install_failed'
+    assert 'follow-up probe did not report Metal GPU offload' in result['fallback_reason']
+    assert 'backend=cpu' in result['fallback_reason']
+
+
 def test_macos_bootstrap_disabled_reports_metal_probe_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.DISABLE_BOOTSTRAP_ENV, '1')

@@ -1,9 +1,9 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
-    describe_resource_layout, disable_python_user_site, resolve_python_launcher,
-    resolve_runtime_import_root, should_enable_runtime_bootstrap, PythonLauncher,
-    ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
+    resolve_python_launcher, resolve_runtime_import_root, should_enable_runtime_bootstrap,
+    PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -97,18 +97,32 @@ fn bridge_script_candidates(
     )
 }
 
-fn resolve_bridge_script(app: &AppHandle) -> String {
+fn resolve_bridge_script_for(
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    resource_dir: Option<&Path>,
+    interpreter: Option<&str>,
+) -> Result<String, String> {
+    resolve_bridge_script_path(
+        "compute_node_bridge.py",
+        exe_path,
+        manifest_dir,
+        resource_dir,
+        interpreter,
+    )
+    .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn resolve_bridge_script(app: &AppHandle) -> Result<String, String> {
     let exe_path = std::env::current_exe().ok();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let resource_dir = app.path().resource_dir().ok();
-    let candidates =
-        bridge_script_candidates(exe_path.as_deref(), manifest_dir, resource_dir.as_deref());
-
-    if let Some(path) = first_existing_script(candidates) {
-        return path;
-    }
-
-    "python/compute_node_bridge.py".into()
+    resolve_bridge_script_for(
+        exe_path.as_deref(),
+        manifest_dir,
+        resource_dir.as_deref(),
+        None,
+    )
 }
 
 fn first_existing_script(candidates: Vec<std::path::PathBuf>) -> Option<String> {
@@ -434,7 +448,16 @@ pub async fn start_compute_node(
         *state.stdin.lock().await = None;
     }
 
-    let bridge_script = resolve_bridge_script(&app);
+    let bridge_script = match resolve_bridge_script(&app) {
+        Ok(bridge_script) => bridge_script,
+        Err(err) => {
+            {
+                let mut status = state.status.lock().await;
+                *status = startup_failure_status(&request, err.clone());
+            }
+            return Err(anyhow::anyhow!(err));
+        }
+    };
     let launcher = if is_python_script(&bridge_script) {
         match tokio::task::spawn_blocking(|| resolve_python_launcher("TOKEN_PLACE_SIDECAR_PYTHON"))
             .await
@@ -1332,6 +1355,54 @@ mod tests {
             Some("new-session")
         );
         assert!(restarted_status.last_error.is_none());
+    }
+
+    #[test]
+    fn compute_bridge_missing_macos_app_resources_reports_attempts_without_dev_fallback() {
+        let temp = TempDir::new().expect("tempdir");
+        let app_root = temp.path().join("TokenPlace.app");
+        let exe_path = app_root.join("Contents").join("MacOS").join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let error = resolve_bridge_script_for(Some(&exe_path), &manifest_dir, None, None)
+            .expect_err("missing compute bridge should fail closed");
+
+        assert!(error.contains("compute_node_bridge.py"));
+        assert!(error.contains("attempted_resource_roots="));
+        assert!(error.contains("attempted_bridge_paths="));
+        assert!(error.contains("MacOsAppResources"));
+        assert!(error.contains("Contents/Resources/python/compute_node_bridge.py"));
+        assert!(error.contains("interpreter=<unresolved>"));
+    }
+
+    #[test]
+    fn startup_failure_status_clears_visible_running_session_state_for_resolution_errors() {
+        let request = ComputeNodeRequest {
+            model_path: "model.gguf".into(),
+            relay_base_url: "https://relay.example".into(),
+            mode: ComputeMode::Auto,
+        };
+
+        let status = startup_failure_status(
+            &request,
+            "unable to locate desktop Python bridge script 'compute_node_bridge.py'".into(),
+        );
+
+        assert!(!status.running);
+        assert!(!status.registered);
+        assert_eq!(status.operator_session_id, None);
+        assert_eq!(status.sequence, None);
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("failed"));
+        assert_eq!(status.warm_load_state.as_deref(), Some("failed"));
+        assert!(status
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("compute_node_bridge.py"));
     }
 
     #[test]

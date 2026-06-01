@@ -1110,3 +1110,40 @@ def test_macos_missing_metal_runtime_bootstrap_gap_future_parity(monkeypatch):
 
     assert result["selected_backend"] == case["expect_future"]["selected_backend"]
     assert result["runtime_action"] == case["expect_future"]["runtime_action"]
+
+
+def test_resolve_desktop_dependency_target_prefers_writable_runtime_target(monkeypatch, tmp_path):
+    runtime_root = tmp_path / 'runtime'
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir()
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+
+    target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
+
+    assert error is None
+    assert target == runtime_root / '.token_place_desktop_site'
+    assert target.is_dir()
+
+
+def test_resolve_desktop_dependency_target_uses_home_only_when_runtime_probe_fails(
+    monkeypatch, tmp_path
+):
+    runtime_root = tmp_path / 'runtime'
+    home_dir = tmp_path / 'home'
+    home_dir.mkdir()
+    probes = []
+
+    def _fake_writable(candidate):
+        probes.append(candidate)
+        if candidate == runtime_root / '.token_place_desktop_site':
+            return False, 'read-only runtime target'
+        return True, None
+
+    monkeypatch.setattr(desktop_runtime_setup.Path, 'home', staticmethod(lambda: home_dir))
+    monkeypatch.setattr(desktop_runtime_setup, '_is_writable_directory', _fake_writable)
+
+    target, error = desktop_runtime_setup._resolve_desktop_dependency_target(runtime_root)
+
+    assert error is None
+    assert target == home_dir / '.token_place_desktop_site'
+    assert probes == [runtime_root / '.token_place_desktop_site', target]

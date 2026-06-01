@@ -246,8 +246,18 @@ pub fn bridge_script_candidates_from_resource_roots(
     manifest_dir: &Path,
     tauri_resource_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
+    bridge_script_candidates_from_candidates(
+        script_name,
+        &resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir),
+    )
+}
+
+fn bridge_script_candidates_from_candidates(
+    script_name: &str,
+    root_candidates: &[ResourceRootCandidate],
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    for root_candidate in resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir) {
+    for root_candidate in root_candidates {
         match root_candidate.layout {
             ResourceLayoutKind::ExecutablePythonSibling => {
                 candidates.push(root_candidate.root.join(script_name));
@@ -262,6 +272,63 @@ pub fn bridge_script_candidates_from_resource_roots(
         }
     }
     candidates
+}
+
+pub fn resolve_bridge_script_path(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+    interpreter: Option<&str>,
+) -> Result<PathBuf, String> {
+    let root_candidates = resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir);
+    let bridge_candidates = bridge_script_candidates_from_candidates(script_name, &root_candidates);
+    bridge_candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            format_bridge_script_resolution_error(
+                script_name,
+                &root_candidates,
+                &bridge_candidates,
+                interpreter,
+            )
+        })
+}
+
+pub fn format_bridge_script_resolution_error(
+    script_name: &str,
+    root_candidates: &[ResourceRootCandidate],
+    bridge_candidates: &[PathBuf],
+    interpreter: Option<&str>,
+) -> String {
+    let attempted_roots = if root_candidates.is_empty() {
+        "<none>".into()
+    } else {
+        root_candidates
+            .iter()
+            .map(|candidate| format!("{:?}:{}", candidate.layout, candidate.root.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let attempted_bridge_paths = if bridge_candidates.is_empty() {
+        "<none>".into()
+    } else {
+        bridge_candidates
+            .iter()
+            .map(|candidate| candidate.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let selected_layout = root_candidates
+        .first()
+        .map(|candidate| format!("{:?}", candidate.layout))
+        .unwrap_or_else(|| "<unknown>".into());
+    let interpreter = interpreter.unwrap_or("<unresolved>");
+    format!(
+        "unable to locate desktop Python bridge script '{script_name}'; selected_layout={selected_layout}; interpreter={interpreter}; attempted_resource_roots=[{attempted_roots}]; attempted_bridge_paths=[{attempted_bridge_paths}]"
+    )
 }
 
 pub fn describe_resource_layout(

@@ -67,19 +67,31 @@ fn resolve_model_bridge_script_path() -> Result<PathBuf, String> {
     })
 }
 
-fn configure_runtime_pythonpath(
+fn configure_runtime_pythonpath_for(
     command: &mut std::process::Command,
     bridge_script: &Path,
+    manifest_dir: &Path,
 ) -> Option<PathBuf> {
-    // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
-    // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    python_runtime::disable_python_user_site(command);
     let import_root =
         python_runtime::resolve_runtime_import_root(Some(bridge_script), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
         python_runtime::configure_python_subprocess_env(command, import_root);
     }
     import_root
+}
+
+fn configure_runtime_pythonpath(
+    command: &mut std::process::Command,
+    bridge_script: &Path,
+) -> Option<PathBuf> {
+    // NOTE: CARGO_MANIFEST_DIR is compile-time and primarily helps local/dev launches.
+    // Packaged end-user launches rely on python/path_bootstrap.py for runtime import roots.
+    configure_runtime_pythonpath_for(
+        command,
+        bridge_script,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
 }
 
 fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
@@ -343,6 +355,34 @@ fn main() {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find_map(|(env_key, value)| (env_key == key).then_some(value))
+            .flatten()
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn model_bridge_disables_user_site_when_import_root_is_unresolved() {
+        let temp = TempDir::new().expect("tempdir");
+        let bridge = temp.path().join("python").join("model_bridge.py");
+        std::fs::create_dir_all(bridge.parent().expect("bridge parent"))
+            .expect("create bridge dir");
+        std::fs::write(&bridge, "print('ok')\n").expect("write bridge");
+        let manifest_dir = temp.path().join("missing-manifest");
+        let mut command = std::process::Command::new("python");
+
+        let import_root = configure_runtime_pythonpath_for(&mut command, &bridge, &manifest_dir);
+
+        assert!(import_root.is_none());
+        assert_eq!(
+            std_command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert!(std_command_env_value(&command, "PYTHONPATH").is_none());
+    }
 
     #[test]
     fn model_bridge_candidates_include_packaged_resources() {

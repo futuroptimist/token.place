@@ -177,6 +177,14 @@ fn push_unique_resource_root(
     candidates.push(ResourceRootCandidate { root, layout });
 }
 
+fn exe_sibling_resources_layout() -> ResourceLayoutKind {
+    if cfg!(target_os = "windows") {
+        ResourceLayoutKind::WindowsResources
+    } else {
+        ResourceLayoutKind::LinuxResources
+    }
+}
+
 pub fn resource_root_candidates(
     exe_path: Option<&Path>,
     manifest_dir: &Path,
@@ -197,12 +205,7 @@ pub fn resource_root_candidates(
             push_unique_resource_root(
                 &mut candidates,
                 exe_dir.join("resources"),
-                ResourceLayoutKind::WindowsResources,
-            );
-            push_unique_resource_root(
-                &mut candidates,
-                exe_dir.join("resources"),
-                ResourceLayoutKind::LinuxResources,
+                exe_sibling_resources_layout(),
             );
             push_unique_resource_root(
                 &mut candidates,
@@ -249,6 +252,9 @@ pub fn bridge_script_candidates_from_resource_roots(
             ResourceLayoutKind::ExecutablePythonSibling => {
                 candidates.push(root_candidate.root.join(script_name));
             }
+            ResourceLayoutKind::DevSourceTree => {
+                candidates.push(root_candidate.root.join("python").join(script_name));
+            }
             _ => {
                 candidates.push(root_candidate.root.join("python").join(script_name));
                 candidates.push(root_candidate.root.join(script_name));
@@ -277,11 +283,18 @@ pub fn describe_resource_layout(
     (root, ResourceLayoutKind::DevSourceTree)
 }
 
-pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
+pub fn disable_python_user_site<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+}
+
+pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
+where
+    C: PythonEnvCommand,
+{
+    disable_python_user_site(command);
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
     let python_dir = import_root.join("python");
     let pythonpath = if python_dir.is_dir() {
@@ -603,12 +616,63 @@ mod tests {
             candidate.layout == ResourceLayoutKind::DevSourceTree && candidate.root == manifest_dir
         }));
 
-        let windows_exe = temp.path().join("App").join("token.place.exe");
-        let windows_roots = resource_root_candidates(Some(&windows_exe), &manifest_dir, None);
-        assert!(windows_roots.iter().any(|candidate| {
-            candidate.layout == ResourceLayoutKind::WindowsResources
-                && candidate.root.ends_with("App/resources")
+        let exe = temp.path().join("App").join("token.place.exe");
+        let exe_roots = resource_root_candidates(Some(&exe), &manifest_dir, None);
+        let expected_layout = if cfg!(target_os = "windows") {
+            ResourceLayoutKind::WindowsResources
+        } else {
+            ResourceLayoutKind::LinuxResources
+        };
+        assert!(exe_roots.iter().any(|candidate| {
+            candidate.layout == expected_layout && candidate.root.ends_with("App/resources")
         }));
+    }
+
+    #[test]
+    fn exe_sibling_resources_layout_matches_target_os() {
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp.path().join("bin").join("token.place");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let roots = resource_root_candidates(Some(&exe), &manifest_dir, None);
+        let exe_resources = roots
+            .iter()
+            .find(|candidate| candidate.root.ends_with("bin/resources"))
+            .expect("exe resources candidate");
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(exe_resources.layout, ResourceLayoutKind::WindowsResources);
+        } else {
+            assert_eq!(exe_resources.layout, ResourceLayoutKind::LinuxResources);
+        }
+    }
+
+    #[test]
+    fn describe_resource_layout_reports_linux_exe_resources_on_non_windows() {
+        if cfg!(target_os = "windows") {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let exe = temp.path().join("bin").join("token.place");
+        let script = temp
+            .path()
+            .join("bin")
+            .join("resources")
+            .join("python")
+            .join("model_bridge.py");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+
+        let (_root, layout) = describe_resource_layout(&script, Some(&exe), &manifest_dir, None);
+
+        assert_eq!(layout, ResourceLayoutKind::LinuxResources);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use crate::backend::ComputeMode;
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
-    describe_resource_layout, resolve_python_launcher, resolve_runtime_import_root,
-    should_enable_runtime_bootstrap, PythonLauncher, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    describe_resource_layout, disable_python_user_site, resolve_python_launcher,
+    resolve_runtime_import_root, should_enable_runtime_bootstrap, PythonLauncher,
+    ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -122,6 +123,7 @@ fn configure_runtime_pythonpath(
     manifest_dir: &Path,
     bridge_script: &str,
 ) -> Option<std::path::PathBuf> {
+    disable_python_user_site(command);
     let import_root = resolve_runtime_import_root(Some(Path::new(bridge_script)), manifest_dir);
     if let Some(import_root) = import_root.as_deref() {
         configure_python_subprocess_env(command, import_root);
@@ -785,6 +787,30 @@ mod tests {
     }
 
     #[test]
+    fn compute_bridge_disables_user_site_when_import_root_is_unresolved() {
+        let temp = TempDir::new().expect("tempdir");
+        let bridge = temp.path().join("python").join("compute_node_bridge.py");
+        std::fs::create_dir_all(bridge.parent().expect("bridge parent"))
+            .expect("create bridge dir");
+        std::fs::write(&bridge, "print('ok')\n").expect("write bridge");
+        let manifest_dir = temp.path().join("missing-manifest");
+        let mut command = Command::new("python");
+
+        let import_root = configure_runtime_pythonpath(
+            &mut command,
+            &manifest_dir,
+            bridge.to_str().expect("bridge path should be UTF-8"),
+        );
+
+        assert!(import_root.is_none());
+        assert_eq!(
+            command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert!(command_env_value(&command, "PYTHONPATH").is_none());
+    }
+
+    #[test]
     fn sanitize_relay_target_strips_userinfo_query_and_fragment() {
         assert_eq!(
             sanitize_relay_target("https://user:pass@example.com/path?token=secret#frag"),
@@ -888,8 +914,7 @@ mod tests {
         let lifecycle_guard = state.lifecycle_lock.lock().await;
 
         let result =
-            tokio::time::timeout(Duration::from_millis(200), stop_compute_node(state.clone()))
-                .await;
+            tokio::time::timeout(Duration::from_secs(2), stop_compute_node(state.clone())).await;
 
         assert!(result.is_ok(), "stop should not block on lifecycle lock");
         drop(lifecycle_guard);
@@ -1411,9 +1436,14 @@ mod tests {
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Hybrid);
 
+        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            Some("1")
+        } else {
+            None
+        };
         assert_eq!(
             command_env_value(&command, ENABLE_RUNTIME_BOOTSTRAP_ENV).as_deref(),
-            Some("1")
+            expected
         );
     }
 

@@ -261,6 +261,72 @@ def run_compute_bridge_import_probe(tmp_root: Path, *, resources_root: Path | No
     for marker in forbidden_any_output:
         assert marker not in combined, combined
 
+
+def run_unified_root_import_policy_probe(
+    tmp_root: Path, *, resources_root: Path | None = None
+) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    env = _packaged_env(tmp_root, resources_root)
+    userbase = tmp_root / "userbase"
+    fake_user_site = (
+        userbase
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    fake_user_site.mkdir(parents=True, exist_ok=True)
+    repo_like_cwd = tmp_root / "repo-like-cwd"
+    repo_like_cwd.mkdir(parents=True, exist_ok=True)
+    (repo_like_cwd / "llama_cpp.py").write_text(
+        "raise RuntimeError('repo shim imported')\n", encoding="utf-8"
+    )
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(resources_root / "python"),
+            str(resources_root),
+            str(fake_user_site),
+            str(repo_like_cwd),
+        ]
+    )
+    env["PYTHONUSERBASE"] = str(userbase)
+
+    bootstrap = resources_root / "python" / "path_bootstrap.py"
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, site, sys; "
+                f"sys.path.insert(0, {str(bootstrap.parent)!r}); "
+                "from path_bootstrap import ensure_runtime_import_paths; "
+                f"ensure_runtime_import_paths({str(bootstrap)!r}); "
+                "payload={"
+                "'import_root': str(pathlib.Path(__import__('os').environ['TOKEN_PLACE_PYTHON_IMPORT_ROOT']).resolve()), "
+                "'first_path': str(pathlib.Path(sys.path[0]).resolve()), "
+                "'has_utils': pathlib.Path(sys.path[0], 'utils').is_dir(), "
+                "'has_config': pathlib.Path(sys.path[0], 'config.py').is_file(), "
+                "'user_site_present': any(pathlib.Path(p or '.').resolve() == pathlib.Path(site.USER_SITE).resolve() for p in sys.path if site.USER_SITE), "
+                "'cwd_present': any(pathlib.Path(p or '.').resolve() == pathlib.Path.cwd().resolve() for p in sys.path), "
+                "'llama_shim_before_site': next((i for i,p in enumerate(sys.path) if pathlib.Path(p or '.', 'llama_cpp.py').is_file()), 9999) < next((i for i,p in enumerate(sys.path) if 'site-packages' in p or 'dist-packages' in p), 9999)"
+                "}; print(json.dumps(payload, sort_keys=True))"
+            ),
+        ],
+        cwd=repo_like_cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    payload = json.loads(result.stdout.strip())
+    assert payload["first_path"] == str(resources_root.resolve()), combined
+    assert payload["has_utils"] is True, combined
+    assert payload["has_config"] is True, combined
+    assert payload["user_site_present"] is False, combined
+    assert payload["cwd_present"] is False, combined
+    assert payload["llama_shim_before_site"] is False, combined
+
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
     if not hasattr(stdout, "readline"):
         return
@@ -416,12 +482,14 @@ def main() -> int:
         tmp_path = Path(tmpdir)
         bridge_script = create_packaged_layout(tmp_path)
         run_desktop_dependency_preflight(tmp_path)
+        run_unified_root_import_policy_probe(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
         run_desktop_dependency_preflight(tmp_path, resources_root=mac_resources_root)
+        run_unified_root_import_policy_probe(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
 

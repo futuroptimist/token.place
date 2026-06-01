@@ -618,18 +618,32 @@ def _desktop_dependency_target(runtime_root: Path) -> Path:
     return runtime_root / ".token_place_desktop_site"
 
 
+def _is_writable_directory(candidate: Path) -> tuple[bool, Optional[str]]:
+    probe = candidate / ".token_place_write_probe"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True, None
+    except OSError as exc:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, str(exc)
+
+
 def _resolve_desktop_dependency_target(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
     preferred_targets = [
-        _desktop_dependency_target(runtime_root),
-        Path.home() / ".token_place_desktop_site",
+        ("runtime_root", _desktop_dependency_target(runtime_root)),
+        ("home_fallback", Path.home() / ".token_place_desktop_site"),
     ]
     errors: list[str] = []
-    for candidate in preferred_targets:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
+    for label, candidate in preferred_targets:
+        ok, error = _is_writable_directory(candidate)
+        if ok:
             return candidate, None
-        except OSError as exc:
-            errors.append(f"{candidate}: {exc}")
+        errors.append(f"{label}={candidate}: {error}")
     return None, "; ".join(errors) if errors else "no writable install target"
 
 
@@ -690,6 +704,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
             "interpreter": sys.executable,
             "import_root": str(root),
             "requirements": str(requirements_path),
+            "dependency_target": target_dir_str,
             "detail": _summarize_install_error(output),
         }
 
@@ -702,6 +717,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None) -> D
         "interpreter": sys.executable,
         "import_root": str(root),
         "requirements": str(requirements_path),
+        "dependency_target": target_dir_str,
     }
 def _fallback_unpinned_plans(platform: str) -> list[LlamaCppInstallPlan]:
     detected_platform = platform.lower()

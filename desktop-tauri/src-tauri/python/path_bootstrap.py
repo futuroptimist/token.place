@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import site
 import sys
 from pathlib import Path
 
@@ -40,11 +41,30 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
 
     # Preserve candidate priority: first valid candidate should be first on sys.path.
     for candidate_str in reversed(valid_candidates):
-        if candidate_str not in sys.path:
-            sys.path.insert(0, candidate_str)
+        while candidate_str in sys.path:
+            sys.path.remove(candidate_str)
+        sys.path.insert(0, candidate_str)
+
+    if os.environ.get("PYTHONNOUSERSITE") == "1":
+        user_site = getattr(site, "USER_SITE", None)
+        if user_site:
+            user_site_path = Path(user_site).resolve()
+            sys.path[:] = [
+                entry
+                for entry in sys.path
+                if Path(entry or ".").resolve() != user_site_path
+            ]
 
     if not avoid_llama_cpp_shadowing:
         return
+
+    cwd = Path.cwd().resolve()
+    if (cwd / "llama_cpp.py").is_file():
+        cwd_str = str(cwd)
+        while "" in sys.path:
+            sys.path.remove("")
+        while cwd_str in sys.path:
+            sys.path.remove(cwd_str)
 
     # Keep repo roots importable for `utils.*` / `config` while avoiding local
     # llama_cpp.py shim precedence over site-packages.
@@ -59,10 +79,6 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
                 sys.path.remove("")
             while cwd in sys.path:
                 sys.path.remove(cwd)
-            # Preserve an explicit resolved cwd path when candidate/cwd differ
-            # by symlink representation.
-            if cwd != candidate_str:
-                sys.path.append(cwd)
 
         while candidate_str in sys.path:
             sys.path.remove(candidate_str)

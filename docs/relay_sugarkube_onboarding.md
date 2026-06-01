@@ -39,11 +39,11 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Launch version alignment for v0.1.0: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
-- Before publishing, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
+- Before publishing, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1`; if chart `0.1.1` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.1` does not exist, proceed with publishing chart package version `0.1.1`.
 
 ## Default hostnames
 
@@ -274,7 +274,7 @@ Verification commands:
 ```bash
 # Compare local chart metadata with OCI package metadata.
 helm show chart ./charts/tokenplace
-helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0
+helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1
 
 # Render local and OCI manifests, then diff strategy/env sections.
 # For staging candidate validation, set this to the immutable image tag deployed by Sugarkube.
@@ -282,7 +282,7 @@ IMAGE_TAG=main-REPLACE_SHORTSHA
 
 
 helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-local.yaml
-helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-oci.yaml
+helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-oci.yaml
 diff -u /tmp/tokenplace-local.yaml /tmp/tokenplace-oci.yaml | less
 ```
 
@@ -350,7 +350,7 @@ for d in docs:
         if dupes:
             print(f"{d.get('metadata', {}).get('name','<unknown>')}:{c.get('name','<unknown>')} duplicates: {', '.join(dupes)}")
 PY
-helm upgrade --install tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0 --namespace tokenplace --dry-run=client
+helm upgrade --install tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1 --namespace tokenplace --dry-run=client
 ```
 
 Expected:
@@ -397,7 +397,7 @@ curl -fsS https://staging.token.place/metrics | head -n 40
 For final v0.1.0 release readiness, verify all four identifiers explicitly (separate from staging candidate validation):
 
 - Git release tag: `v0.1.0`
-- Chart package version: `0.1.0` (with chart `appVersion: "0.1.0"`)
+- Chart package version: `0.1.1` (with chart `appVersion: "0.1.0"`)
 - Chart appVersion: `"0.1.0"`
 - Relay image tag: `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 

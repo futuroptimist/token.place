@@ -267,10 +267,10 @@ Artifact references:
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- v0.1.0 launch alignment: Git tag `v0.1.0`, chart package version `0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
+- v0.1.0 runtime/release alignment: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, and release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
 - Preferred staging/prod tag: immutable `main-<shortsha>` copied from the `ci-image.yml` workflow summary (`main-latest` is convenience-only)
 - Canonical release tag after pushing a Git release tag is the matching semver image tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
-- Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.0`; if chart `0.1.0` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.0` does not exist, proceed with publishing chart package version `0.1.0`.
+- Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1`; if chart `0.1.1` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.1` does not exist, proceed with publishing chart package version `0.1.1`.
 
 Sugarkube values, wrappers, and operator workflows are maintained in the Sugarkube repo. The current app-specific deploy command is:
 

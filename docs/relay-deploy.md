@@ -159,7 +159,7 @@ Sugarkube staging or production.
    security software.
 8. Confirm connectivity from the k3s cluster by resolving the DNS entry:
    ```bash
-   kubectl -n tokenplace exec deploy/relay-tokenplace-relay -- \
+   kubectl -n tokenplace exec deploy/tokenplace -- \
      getent hosts gpu-server
    ```
 

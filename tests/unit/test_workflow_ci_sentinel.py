@@ -54,3 +54,12 @@ def test_image_workflow_keeps_pull_request_validate_only() -> None:
     assert "github.event_name == 'push'" in publish_job["if"], (
         "ci-image.yml publish job must stay push-only so PR and workflow_dispatch runs validate only"
     )
+
+
+def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
+    chart = yaml.safe_load(Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8"))
+    values = yaml.safe_load(Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8"))
+
+    assert chart["version"] == "0.1.1"
+    assert values["image"]["tag"] == "main-latest"
+    assert values["image"]["pullPolicy"] == "Always"

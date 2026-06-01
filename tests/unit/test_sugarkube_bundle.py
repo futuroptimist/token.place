@@ -40,6 +40,7 @@ def test_bundle_values_use_canonical_image_and_tmp_xdg_defaults():
     image = values["image"]
     assert image["repository"] == "ghcr.io/futuroptimist/tokenplace-relay"
     assert image["tag"] == "main-latest"
+    assert image["pullPolicy"] == "Always"
 
     env_vars = values["env"]
     assert env_vars["XDG_CONFIG_HOME"] == "/tmp/.config"

@@ -5,6 +5,7 @@
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
   tag: main-latest
+  pullPolicy: Always
 
 env:
   XDG_CONFIG_HOME: /tmp/.config

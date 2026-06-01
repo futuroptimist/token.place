@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import importlib.util
 import json
 import os
 import platform
@@ -153,15 +154,25 @@ class BridgeProcess:
                 self.process.wait(timeout=5)
 
 
+def _llama_cpp_available() -> bool:
+    return importlib.util.find_spec("llama_cpp") is not None
+
+
 def _bridge_compute_mode() -> str:
     """Return the packaged bridge mode for the mock parity harness."""
 
+    current_platform = platform.system()
     # Windows desktop auto/gpu modes intentionally fail closed when a GPU-capable
     # llama-cpp-python runtime is missing. This e2e runs with USE_MOCK_LLM=1 and
     # must avoid requiring CUDA/llama_cpp provisioning on hosted Windows CI before
-    # it can validate relay lifecycle parity. Keep auto mode elsewhere so the
-    # existing macOS Metal/CPU-fallback diagnostics remain covered.
-    if platform.system() == "Windows":
+    # it can validate relay lifecycle parity.
+    if current_platform == "Windows":
+        return "cpu"
+    # Hosted macOS runners may also lack llama-cpp-python. In that case auto mode
+    # exits before relay registration, so use explicit CPU for this mock harness.
+    # Keep auto mode when the runtime is importable so Metal/CPU-fallback
+    # diagnostics remain covered on provisioned macOS environments.
+    if current_platform == "Darwin" and not _llama_cpp_available():
         return "cpu"
     return "auto"
 
@@ -276,10 +287,14 @@ def _assert_ready_runtime_fields(event: dict[str, Any], *, layout_label: str) ->
     assert isinstance(event.get("warm_load_duration_ms"), int), event
 
     if platform.system() == "Darwin" and "macOS" in layout_label:
+        requested_mode = str(event.get("requested_mode") or "")
         backend_available = str(event.get("backend_available") or "")
         backend_used = str(event.get("backend_used") or "")
         fallback_reason = event.get("fallback_reason")
-        if backend_available == "metal":
+        if requested_mode == "cpu":
+            assert backend_used == "cpu", event
+            assert fallback_reason == "cpu mode explicitly selected", event
+        elif backend_available == "metal":
             assert backend_used in {"metal", "cpu"}, event
             if backend_used == "cpu":
                 assert fallback_reason, event

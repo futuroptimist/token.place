@@ -8,6 +8,7 @@ from utils.compute_node_runtime import (
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
     LegacyRelayRequestAdapter,
+    compute_mode_diagnostics,
     first_env,
     format_relay_target,
     is_api_v1_relay_payload,
@@ -122,6 +123,33 @@ def test_compute_node_runtime_ensure_model_ready_download_failure():
 
     assert runtime.ensure_model_ready() is False
     model_manager.download_model_if_needed.assert_called_once_with()
+
+
+def test_compute_mode_diagnostics_reports_backend_parity_fields():
+    model_manager = MagicMock()
+
+    assert apply_compute_mode(model_manager, "auto") == "auto"
+    pending = compute_mode_diagnostics(model_manager)
+    assert pending["backend_available"] == "unknown"
+    assert pending["backend_selected"] == "unknown"
+    assert pending["backend_used"] == "unknown"
+    assert pending["fallback_reason"] is None
+
+    model_manager.last_compute_diagnostics = {
+        "requested_mode": "auto",
+        "effective_mode": "gpu",
+        "backend_available": "metal",
+        "backend_selected": "metal",
+        "backend_used": "metal",
+        "n_gpu_layers": -1,
+        "fallback_reason": "metal runtime warmed for API v1 relay processing",
+    }
+
+    ready = compute_mode_diagnostics(model_manager)
+    assert ready["backend_available"] == "metal"
+    assert ready["backend_selected"] == "metal"
+    assert ready["backend_used"] == "metal"
+    assert ready["fallback_reason"] == "metal runtime warmed for API v1 relay processing"
 
 
 def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():

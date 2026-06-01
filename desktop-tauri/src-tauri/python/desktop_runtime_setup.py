@@ -476,6 +476,18 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
             **_probe_result_payload(before),
         }
 
+    if before.backend == "missing" and not sys.platform.startswith("win"):
+        return {
+            "selected_backend": "cpu",
+            "fallback_reason": (
+                f"desktop model runtime dependency unavailable ({before.error or 'llama_cpp missing'}); "
+                f"interpreter={before.interpreter}; import_root={target_root}; "
+                "install llama-cpp-python for the desktop runtime before registering with the relay"
+            ),
+            "runtime_action": "failed",
+            **_probe_result_payload(before),
+        }
+
     if not sys.platform.startswith("win"):
         return {
             "selected_backend": "cpu",

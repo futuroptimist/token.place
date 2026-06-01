@@ -378,6 +378,54 @@ def _reset_cancel_queue():
     compute_node_bridge._stdin_reader_started = True
     compute_node_bridge._stop_requested_latched.clear()
 
+
+def _load_desktop_operator_parity_matrix():
+    matrix_path = Path(__file__).resolve().parents[1] / 'fixtures' / 'desktop_operator_parity_matrix.json'
+    return json.loads(matrix_path.read_text(encoding='utf-8'))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        'macOS packaged operator lifecycle parity does not yet exercise real warm-load, '
+        'registration, multi-turn API v1 relay chat, stop/start, and diagnostics coverage'
+    ),
+)
+def test_macos_packaged_operator_lifecycle_parity_gap_is_captured():
+    matrix = _load_desktop_operator_parity_matrix()
+    gap = next(
+        item
+        for item in matrix.get('known_gaps', [])
+        if item.get('id') == 'macos_packaged_operator_lifecycle_parity'
+    )
+    assert gap['platform'] == 'darwin'
+    assert gap['status'] == 'known_gap'
+    assert gap['missing_coverage'] == [
+        'warm_load',
+        'register',
+        'multi_turn_api_v1_relay_chat',
+        'stop',
+        'start_after_stop',
+        'diagnostics',
+    ]
+
+    workflow_path = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
+    workflow = workflow_path.read_text(encoding='utf-8').lower()
+    assert 'macos-latest' in workflow
+    assert 'test_packaged_operator_e2e.py' in workflow
+    assert 'test_desktop_no_relay_autostart_e2e.py' in workflow
+
+    macos_lifecycle_markers = [
+        'warm-load',
+        'api v1 relay registration',
+        'multi-turn api v1 relay chat',
+        'stop operator',
+        'start after stop',
+        'diagnostics',
+    ]
+    for marker in macos_lifecycle_markers:
+        assert marker in workflow
+
 class RestartTrackingRuntime(FakeRuntime):
     instances = []
 
@@ -2648,3 +2696,215 @@ def test_run_cancel_during_warm_load_exits_without_registering(capsys, monkeypat
         }
     ]
     assert capsys.readouterr().out.splitlines()[-1]
+
+class StaleFreshnessRuntime(FakeRuntime):
+    def __init__(self, _config):
+        self.model_manager = FakeModelManager()
+        self.relay_client = StaleRelayClient()
+        self._responses = [{"next_ping_in_x_seconds": 0, "error": None}]
+        self._processed = []
+
+
+class MetalApiV1ParityRuntime(ApiV1Runtime):
+    def __init__(self, _config):
+        super().__init__(_config)
+        self.model_manager.last_compute_diagnostics = None
+
+    def ensure_api_v1_runtime_ready(self):
+        self.model_manager.last_compute_diagnostics = {
+            "requested_mode": "gpu",
+            "effective_mode": "gpu",
+            "backend_available": "metal",
+            "backend_selected": "metal",
+            "backend_used": "metal",
+            "n_gpu_layers": -1,
+            "offloaded_layers": -1,
+            "kv_cache_device": "metal",
+            "fallback_reason": None,
+        }
+        return True
+
+
+def test_platform_neutral_status_registered_only_after_fresh_ready_runtime(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=StaleFreshnessRuntime)
+    stop_counter = {"count": 0}
+
+    def fake_stop_requested():
+        stop_counter["count"] += 1
+        return stop_counter["count"] > 3
+
+    monkeypatch.setattr(compute_node_bridge, "stop_requested", fake_stop_requested)
+    args = SimpleNamespace(
+        model="/tmp/model.gguf",
+        mode="cpu",
+        relay_url="https://token.place",
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    assert any(event.get("relay_runtime_state") == "ready" for event in events)
+    assert not any(event.get("registered") is True for event in events)
+    stale_status = next(
+        event
+        for event in events
+        if event.get("type") == "status" and event.get("relay_runtime_state") == "ready"
+    )
+    assert stale_status["registered"] is False
+    assert "unreachable, old, or incompatible" in stale_status["last_error"]
+
+
+def test_platform_neutral_status_backend_fields_follow_relay_processing_runtime(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=MetalApiV1ParityRuntime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "ensure_desktop_llama_runtime",
+        lambda _mode: {
+            "selected_backend": "metal",
+            "detected_device": "metal",
+            "runtime_action": "already_supported",
+            "interpreter": sys.executable,
+            "llama_module_path": "/opt/site-packages/llama_cpp/__init__.py",
+            "fallback_reason": "",
+        },
+    )
+    stop_counter = {"count": 0}
+
+    def fake_stop_requested():
+        stop_counter["count"] += 1
+        return stop_counter["count"] > 4
+
+    monkeypatch.setattr(compute_node_bridge, "stop_requested", fake_stop_requested)
+    args = SimpleNamespace(
+        model="/tmp/model.gguf",
+        mode="gpu",
+        relay_url="https://token.place",
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    registered_events = [event for event in events if event.get("registered") is True]
+    assert registered_events
+    for event in registered_events:
+        assert event["relay_runtime_state"] in {"ready", "processing"}
+        assert event["backend_available"] == "metal"
+        assert event["backend_selected"] == "metal"
+        assert event["backend_used"] == "metal"
+        assert event["last_error"] is None
+
+
+def test_platform_neutral_runtime_setup_failure_last_error_is_actionable(
+    capsys, monkeypatch
+):
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cpu',
+            'detected_device': 'none',
+            'runtime_action': 'failed',
+            'interpreter': '/opt/token.place/python',
+            'llama_module_path': 'missing',
+            'fallback_reason': 'No module named llama_cpp; install llama-cpp-python',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'desktop_gpu_runtime_failure_message',
+        lambda _mode, _setup: (
+            'desktop model runtime setup failed '
+            '(interpreter=/opt/token.place/python import_root=/runtime missing=llama_cpp): '
+            'install llama-cpp-python before relay registration'
+        ),
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {'ok': 'true', 'missing': '', 'action': 'already_available'},
+    )
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    status = compute_node_bridge.run(args)
+
+    assert status == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    payload = events[-1]
+    assert payload['type'] == 'error'
+    assert payload['registered'] is False
+    assert payload['relay_runtime_state'] == 'failed'
+    assert payload['last_error'] == payload['message']
+    assert 'desktop model runtime setup failed' in payload['last_error']
+    assert 'interpreter=/opt/token.place/python' in payload['last_error']
+    assert 'missing=llama_cpp' in payload['last_error']
+    assert 'before relay registration' in payload['last_error']
+
+
+def test_platform_neutral_dependency_failure_last_error_is_actionable(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "ensure_desktop_python_dependencies",
+        lambda **_: {
+            "ok": "false",
+            "action": "install_failed",
+            "missing": "cryptography,requests",
+            "interpreter": "/Applications/token.place.app/Contents/MacOS/python",
+            "import_root": "/Applications/token.place.app/Contents/Resources",
+            "detail": "pip install failed for desktop bridge dependencies",
+        },
+    )
+    args = SimpleNamespace(
+        model="/tmp/model.gguf",
+        mode="auto",
+        relay_url="https://token.place",
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    payload = events[0]
+    assert payload["type"] == "error"
+    assert payload["registered"] is False
+    assert payload["relay_runtime_state"] == "failed"
+    assert payload["last_error"] == payload["message"]
+    assert "desktop runtime dependency preflight failed" in payload["last_error"]
+    assert (
+        "interpreter=/Applications/token.place.app/Contents/MacOS/python"
+        in payload["last_error"]
+    )
+    assert (
+        "import_root=/Applications/token.place.app/Contents/Resources"
+        in payload["last_error"]
+    )
+    assert "missing=cryptography,requests" in payload["last_error"]

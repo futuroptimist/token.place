@@ -1,0 +1,172 @@
+{
+    "contract_version": 1,
+    "status_contract": {
+        "registered_true_requires": [
+            "operator process is running",
+            "relay runtime state is ready or processing",
+            "runtime that will answer relay work has completed warm-load",
+            "relay API v1 registration or poll response is fresh for the active relay URL"
+        ],
+        "backend_fields_describe": "the runtime instance that processes API v1 relay work, not an earlier probe or unrelated UI-side runtime",
+        "last_error": "null when healthy; otherwise concise, actionable, platform-specific diagnostics without plaintext payload content",
+        "registered_false_until_runtime_ready": "registered must remain false when runtime_action is failed/pending/probe_only or when backend fields are pending/unavailable; relay registration is allowed only after the relay-processing runtime has proven readiness",
+        "cpu_fallback_policy": "CPU fallback is intentionally allowed only for explicit CPU mode or documented non-GPU fallback cases, and it does not imply relay registration until readiness is proven by the relay-processing runtime"
+    },
+    "platform_cases": [
+        {
+            "id": "windows_cuda_capable",
+            "label": "Windows CUDA-capable path",
+            "platform": "win32",
+            "mode": "auto",
+            "probe": {
+                "backend": "cuda",
+                "gpu": true,
+                "device": "cuda",
+                "error": null
+            },
+            "expect": {
+                "selected_backend": "cuda",
+                "runtime_action": "already_supported",
+                "fallback_reason": "",
+                "registration_eligible_after_warm_load": true
+            }
+        },
+        {
+            "id": "macos_metal_capable",
+            "label": "macOS Metal-capable path",
+            "platform": "darwin",
+            "mode": "auto",
+            "probe": {
+                "backend": "metal",
+                "gpu": true,
+                "device": "metal",
+                "error": null
+            },
+            "expect": {
+                "selected_backend": "metal",
+                "runtime_action": "already_supported",
+                "fallback_reason": "",
+                "registration_eligible_after_warm_load": true
+            }
+        },
+        {
+            "id": "cpu_fallback",
+            "label": "CPU fallback path",
+            "platform": "linux",
+            "mode": "cpu",
+            "probe": {
+                "backend": "cpu",
+                "gpu": false,
+                "device": "cpu",
+                "error": null
+            },
+            "expect": {
+                "selected_backend": "cpu",
+                "runtime_action": "skipped",
+                "fallback_reason_contains": "cpu mode explicitly selected",
+                "registration_eligible_after_warm_load": true,
+                "backend_available": "cpu",
+                "backend_selected": "cpu",
+                "backend_used": "cpu"
+            }
+        },
+        {
+            "id": "missing_runtime_dependency",
+            "label": "Missing runtime/dependency path",
+            "platform": "linux",
+            "mode": "auto",
+            "probe": {
+                "backend": "missing",
+                "gpu": false,
+                "device": "none",
+                "error": "No module named 'llama_cpp'"
+            },
+            "expect": {
+                "selected_backend": "cpu",
+                "runtime_action": "failed",
+                "fallback_reason_contains": "desktop model runtime dependency unavailable",
+                "registration_eligible_after_warm_load": false,
+                "backend_available": "unavailable",
+                "backend_selected": "pending",
+                "backend_used": "pending",
+                "relay_runtime_state": "failed",
+                "last_error_contains": "desktop model runtime dependency unavailable"
+            },
+            "known_gap": "None: missing llama_cpp is a hard dependency failure, not an automatic CPU fallback, until a relay-processing runtime is installed and warmed."
+        },
+        {
+            "id": "windows_missing_runtime_bootstrap_repair",
+            "label": "Windows fresh install explicit CUDA bootstrap repair path",
+            "platform": "win32",
+            "mode": "auto",
+            "env": {
+                "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP": "1"
+            },
+            "probe": {
+                "backend": "missing",
+                "gpu": false,
+                "device": "none",
+                "error": "No module named 'llama_cpp'"
+            },
+            "after_probe": {
+                "backend": "cuda",
+                "gpu": true,
+                "device": "cuda",
+                "error": null
+            },
+            "source_repair_result": {
+                "ok": true,
+                "log": "ok"
+            },
+            "expect": {
+                "selected_backend": "cuda",
+                "runtime_action": "installed_cuda_reexec",
+                "fallback_reason": "installed CUDA runtime; re-executing sidecar",
+                "registration_eligible_after_warm_load": true
+            }
+        },
+        {
+            "id": "macos_metal_bootstrap_gap",
+            "label": "Known gap: macOS missing Metal runtime bootstrap is probe-only today",
+            "platform": "darwin",
+            "mode": "auto",
+            "probe": {
+                "backend": "cpu",
+                "gpu": false,
+                "device": "cpu",
+                "error": "Metal runtime wheel missing"
+            },
+            "expect_future": {
+                "selected_backend": "metal",
+                "runtime_action": "installed_metal_reexec"
+            },
+            "known_gap": "The macOS bootstrap follow-up will replace probe-only behavior with first-class Metal bootstrap support.",
+            "expect": {
+                "selected_backend": "cpu",
+                "runtime_action": "probe_only",
+                "fallback_reason_contains": "desktop auto-repair is currently Windows-focused",
+                "registration_eligible_after_warm_load": false,
+                "relay_runtime_state": "pending"
+            }
+        }
+    ],
+    "known_gaps": [
+        {
+            "id": "macos_packaged_operator_lifecycle_parity",
+            "tracking_context": "macOS packaged operator lifecycle parity coverage is intentionally deferred until lightweight workflow inspection is replaced by packaged end-to-end lifecycle coverage.",
+            "platform": "darwin",
+            "scope": "packaged_operator_lifecycle_e2e",
+            "status": "known_gap",
+            "missing_coverage": [
+                "warm_load",
+                "register",
+                "multi_turn_api_v1_relay_chat",
+                "stop",
+                "start_after_stop",
+                "diagnostics"
+            ],
+            "current_workflow_inspection": "desktop-operator-e2e.yml macOS packaged jobs run packaged bridge/resource inspect and no-relay autostart checks, but do not execute real packaged operator API v1 relay lifecycle parity.",
+            "must_not_implement_in_prompt_1": true
+        }
+    ]
+}

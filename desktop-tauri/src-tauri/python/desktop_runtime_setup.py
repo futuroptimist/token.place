@@ -645,6 +645,18 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 
     disabled_reason = _bootstrap_disabled_reason()
     if disabled_reason:
+        if before.backend == "missing":
+            return {
+                "selected_backend": "cpu",
+                "fallback_reason": (
+                    f"desktop model runtime dependency unavailable ({before.error or 'llama_cpp missing'}); "
+                    f"interpreter={before.interpreter}; import_root={target_root}; "
+                    f"prefix={before.prefix}; llama_module_path={before.llama_module_path}; "
+                    "install llama-cpp-python for the desktop runtime before registering with the relay"
+                ),
+                "runtime_action": "failed",
+                **_probe_result_payload(before),
+            }
         action = "metal_probe_only" if expected_backend == "metal" else "probe_only"
         return {
             "selected_backend": "cpu",
@@ -720,8 +732,9 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
 
         after = _probe_runtime(target_root)
         if (
-            after.gpu_offload_supported
-            and after.backend in {"cuda", "metal"}
+            plan.backend in {"cuda", "metal"}
+            and after.gpu_offload_supported
+            and after.backend == plan.backend
             and backend_probe_satisfies_install_plan(plan, after)
         ):
             return {
@@ -731,13 +744,11 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                 **_probe_result_payload(after),
             }
 
-        if plan.backend in {"cuda", "metal"} and backend_probe_satisfies_install_plan(plan, after):
-            return {
-                "selected_backend": plan.backend,
-                "fallback_reason": f"installed {plan.backend.upper()} runtime; re-executing sidecar",
-                "runtime_action": _installed_reexec_action(plan.backend),
-                **_probe_result_payload(after),
-            }
+        if plan.backend in {"cuda", "metal"}:
+            last_error = (
+                f"{plan.backend.upper()} install completed but follow-up probe reported "
+                f"backend={after.backend} gpu_offload_supported={after.gpu_offload_supported}"
+            )
 
         if plan.backend == "cpu":
             reason = (

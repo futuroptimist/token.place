@@ -129,8 +129,8 @@ def llama_cpp_install_plan_fallbacks(
         # Prefer a prebuilt macOS wheel first so packaged apps do not require
         # Xcode/CMake when PyPI already has a compatible Metal-enabled wheel.
         # Fall back to a deterministic Metal source build only when the wheel is
-        # unavailable, then try a CPU wheel for auto/hybrid recovery without
-        # entering another native build path.
+        # unavailable, then try a pinned CPU wheel for auto/hybrid recovery
+        # without entering another native build path.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
@@ -147,7 +147,7 @@ def llama_cpp_install_plan_fallbacks(
             LlamaCppInstallPlan(
                 platform=primary.platform,
                 backend="cpu",
-                package_spec="llama-cpp-python",
+                package_spec=primary.package_spec,
                 cmake_args=None,
                 force_cmake=False,
                 index_url="https://pypi.org/simple",

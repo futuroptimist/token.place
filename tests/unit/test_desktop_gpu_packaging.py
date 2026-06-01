@@ -181,10 +181,11 @@ def test_macos_metal_install_args_try_wheel_before_source_build():
     ]
 
 
-def test_macos_cpu_fallback_install_args_only_accept_wheels():
+def test_macos_cpu_fallback_install_args_only_accept_pinned_wheels():
     plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT / "requirements.txt")
     cpu_fallback = plans[2]
 
+    assert cpu_fallback.package_spec.startswith("llama-cpp-python==")
     assert cpu_fallback.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",

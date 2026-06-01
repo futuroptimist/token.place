@@ -9,6 +9,7 @@ import platform
 import plistlib
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 STALE_BRANDS = ("tokenplace Desktop", "tokenplace Desktop Setup", "desktop/electron-builder")
@@ -30,11 +31,45 @@ def _fail(msg: str) -> None:
     raise SystemExit(msg)
 
 
+def _format_command_failure(cmd: list[str], result: subprocess.CompletedProcess[str]) -> str:
+    return f"Command failed ({' '.join(cmd)}):\n{result.stdout}\n{result.stderr}"
+
+
 def _run(cmd: list[str]) -> str:
     result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        _fail(f"Command failed ({' '.join(cmd)}):\n{result.stdout}\n{result.stderr}")
+        _fail(_format_command_failure(cmd, result))
     return f"{result.stdout}\n{result.stderr}".strip()
+
+
+def _run_with_retries(
+    cmd: list[str],
+    *,
+    attempts: int,
+    retry_messages: tuple[str, ...],
+    delay_seconds: float = 2.0,
+) -> str:
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            return f"{result.stdout}\n{result.stderr}".strip()
+
+        last_result = result
+        combined_output = f"{result.stdout}\n{result.stderr}".lower()
+        should_retry = attempt < attempts and any(message.lower() in combined_output for message in retry_messages)
+        if not should_retry:
+            break
+
+        print(
+            f"::warning::Command {' '.join(cmd)} failed with a transient disk image error; "
+            f"retrying attempt {attempt + 1}/{attempts}."
+        )
+        time.sleep(delay_seconds)
+
+    if last_result is None:
+        _fail(f"Command failed ({' '.join(cmd)}): no attempts were run")
+    _fail(_format_command_failure(cmd, last_result))
 
 
 def _sha256(path: Path) -> str:
@@ -57,7 +92,11 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool) -> None:
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
     with tempfile.TemporaryDirectory(prefix="token-place-dmg-mount-") as mount_dir:
-        _run(["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mount_dir, str(dmg_path)])
+        _run_with_retries(
+            ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mount_dir, str(dmg_path)],
+            attempts=4,
+            retry_messages=("Resource temporarily unavailable", "Resource busy"),
+        )
         try:
             root = Path(mount_dir)
             apps = sorted(p for p in root.iterdir() if p.is_dir() and p.suffix == ".app")

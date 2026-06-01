@@ -114,3 +114,41 @@ def test_preview_notice_uses_full_signing_decision_in_stage_step() -> None:
     assert 'APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}' in text
     assert 'APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}' in text
     assert 'if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then' in text
+
+
+def test_validator_retries_transient_hdiutil_attach_errors(monkeypatch) -> None:
+    import importlib.util
+    import subprocess
+
+    script_path = Path('scripts/validate_desktop_tauri_release_artifacts.py')
+    spec = importlib.util.spec_from_file_location('validate_desktop_tauri_release_artifacts', script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+
+    calls = []
+
+    def fake_run(cmd, *, check, capture_output, text):
+        calls.append(cmd)
+        assert check is False
+        assert capture_output is True
+        assert text is True
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(cmd, 1, '', 'hdiutil: attach failed - Resource temporarily unavailable')
+        return subprocess.CompletedProcess(cmd, 0, '/dev/disk4', '')
+
+    sleeps = []
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    monkeypatch.setattr(validator.time, 'sleep', sleeps.append)
+
+    output = validator._run_with_retries(
+        ['hdiutil', 'attach', 'release-artifacts/example.dmg'],
+        attempts=4,
+        retry_messages=('Resource temporarily unavailable', 'Resource busy'),
+        delay_seconds=0.01,
+    )
+
+    assert output == '/dev/disk4'
+    assert len(calls) == 2
+    assert sleeps == [0.01]

@@ -745,6 +745,19 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
                     f"llama_cpp from {after.llama_module_path}; re-executing sidecar for hardware probe"
                 )
                 selected_backend = "cpu"
+                if selected_mode == "gpu":
+                    reason = (
+                        f"{plan.backend.upper()} source install completed but explicit GPU mode "
+                        "requires the follow-up probe to report GPU offload before re-exec; "
+                        f"backend={after.backend} gpu_offload_supported={after.gpu_offload_supported}; "
+                        f"llama_module_path={after.llama_module_path}"
+                    )
+                    return {
+                        "selected_backend": "cpu",
+                        "fallback_reason": reason,
+                        "runtime_action": _install_failure_action(expected_backend),
+                        **_probe_result_payload(after),
+                    }
             return {
                 "selected_backend": selected_backend,
                 "fallback_reason": reason,

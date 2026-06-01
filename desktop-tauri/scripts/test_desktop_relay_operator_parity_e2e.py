@@ -153,6 +153,19 @@ class BridgeProcess:
                 self.process.wait(timeout=5)
 
 
+def _bridge_compute_mode() -> str:
+    """Return the packaged bridge mode for the mock parity harness."""
+
+    # Windows desktop auto/gpu modes intentionally fail closed when a GPU-capable
+    # llama-cpp-python runtime is missing. This e2e runs with USE_MOCK_LLM=1 and
+    # must avoid requiring CUDA/llama_cpp provisioning on hosted Windows CI before
+    # it can validate relay lifecycle parity. Keep auto mode elsewhere so the
+    # existing macOS Metal/CPU-fallback diagnostics remain covered.
+    if platform.system() == "Windows":
+        return "cpu"
+    return "auto"
+
+
 def _start_bridge(
     tmp_root: Path,
     bridge_script: Path,
@@ -174,7 +187,7 @@ def _start_bridge(
             "--model",
             "mock.gguf",
             "--mode",
-            "auto",
+            _bridge_compute_mode(),
             "--relay-url",
             relay_url,
         ],

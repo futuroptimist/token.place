@@ -83,10 +83,11 @@ def llama_cpp_install_plan(
             platform=detected_platform,
             backend="metal",
             package_spec=package_spec,
-            cmake_args=None,
-            force_cmake=False,
+            cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
+            force_cmake=True,
             index_url="https://pypi.org/simple",
-            only_binary=True,
+            only_binary=False,
+            no_binary=True,
         )
 
     return LlamaCppInstallPlan(
@@ -127,19 +128,18 @@ def llama_cpp_install_plan_fallbacks(
         )
 
     if primary.platform == "darwin":
-        # The Metal wheel can intermittently fail integrity checks in CI.
-        # Fall back to a deterministic source build with Metal enabled and
-        # GGML native tuning disabled to avoid arm64 i8mm compile issues.
+        # If Metal build prerequisites are unavailable, auto/hybrid mode may
+        # visibly fall back to CPU while explicit GPU mode fails closed.
         plans.append(
             LlamaCppInstallPlan(
                 platform=primary.platform,
-                backend="metal",
-                package_spec=primary.package_spec,
-                cmake_args="-DGGML_METAL=on -DGGML_NATIVE=off",
-                force_cmake=True,
+                backend="cpu",
+                package_spec="llama-cpp-python",
+                cmake_args=None,
+                force_cmake=False,
                 index_url="https://pypi.org/simple",
                 only_binary=False,
-                no_binary=True,
+                no_binary=False,
             )
         )
 

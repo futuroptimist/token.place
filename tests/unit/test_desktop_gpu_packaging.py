@@ -38,25 +38,26 @@ def test_windows_install_plan_requests_cuda_then_cpu_fallback():
     assert cpu_fallback.no_binary is False
 
 
-def test_macos_install_plan_requests_metal_then_source_fallback():
+def test_macos_install_plan_requests_metal_then_cpu_fallback():
     plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT / "requirements.txt")
     assert len(plans) == 2
 
-    wheel_plan = plans[0]
-    assert wheel_plan.backend == "metal"
-    assert wheel_plan.index_url == "https://pypi.org/simple"
-    assert wheel_plan.only_binary is True
-
-    source_fallback = plans[1]
-    assert source_fallback.backend == "metal"
-    assert source_fallback.index_url == "https://pypi.org/simple"
-    assert source_fallback.only_binary is False
-    assert source_fallback.force_cmake is True
-    assert source_fallback.no_binary is True
-    assert source_fallback.pip_env() == {
+    metal_plan = plans[0]
+    assert metal_plan.backend == "metal"
+    assert metal_plan.index_url == "https://pypi.org/simple"
+    assert metal_plan.only_binary is False
+    assert metal_plan.force_cmake is True
+    assert metal_plan.no_binary is True
+    assert metal_plan.pip_env() == {
         "CMAKE_ARGS": "-DGGML_METAL=on -DGGML_NATIVE=off",
         "FORCE_CMAKE": "1",
     }
+
+    cpu_fallback = plans[1]
+    assert cpu_fallback.backend == "cpu"
+    assert cpu_fallback.index_url == "https://pypi.org/simple"
+    assert cpu_fallback.only_binary is False
+    assert cpu_fallback.no_binary is False
 
 
 def test_linux_install_plan_remains_cpu_default():
@@ -145,11 +146,11 @@ def test_windows_cpu_fallback_install_args_allow_wheel_or_source():
     ]
 
 
-def test_macos_source_fallback_install_args_force_source_build():
+def test_macos_metal_install_args_force_source_build():
     plans = llama_cpp_install_plan_fallbacks(platform="darwin", requirements_path=ROOT / "requirements.txt")
-    source_fallback = plans[1]
+    metal_plan = plans[0]
 
-    assert source_fallback.pip_install_args() == [
+    assert metal_plan.pip_install_args() == [
         "--upgrade",
         "--no-cache-dir",
         "--index-url",
@@ -176,8 +177,10 @@ def test_llama_cpp_install_plan_darwin_selects_metal_plan_with_pypi_index():
     assert plan.backend == "metal"
     assert plan.package_spec.startswith("llama-cpp-python==")
     assert plan.index_url == "https://pypi.org/simple"
-    assert plan.only_binary is True
-    assert plan.no_binary is False
+    assert plan.only_binary is False
+    assert plan.no_binary is True
+    assert plan.force_cmake is True
+    assert plan.cmake_args == "-DGGML_METAL=on -DGGML_NATIVE=off"
 
 
 def test_non_desktop_platform_fallbacks_return_only_primary_plan():

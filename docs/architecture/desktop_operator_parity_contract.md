@@ -2,7 +2,7 @@
 
 This contract is the source of truth for cross-platform token.place desktop compute-node behavior on Windows and macOS. The desktop app should use shared Tauri/Rust/Python bridge code plus small platform capability adapters; it must not fork operator lifecycle behavior by OS.
 
-The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.json` mirrors this contract for unit tests.
+The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.json` mirrors this contract for unit tests, including the shared macOS packaged lifecycle coverage entrypoint so the contract no longer records that path as a known gap.
 
 ## Platforms and runtime capabilities
 

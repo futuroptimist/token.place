@@ -10,17 +10,16 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 - Lets users either browse to an existing GGUF or download the configured GGUF
   artifact into the shared models directory.
 - Runtime backend preference controls expose `auto`, `metal`, `cuda`, and `cpu` modes.
-- Background compute-node mode that registers and polls via `/sink`, decrypts requests, runs local inference, and posts responses to `/source` (or `/stream/source` when streaming is requested by the relay contract).
+- Background compute-node mode that warm-loads locally, registers through API v1 E2EE relay compute-node routes, polls for ciphertext work, runs local inference, and submits encrypted responses.
 - Sidecar-driven local prompt smoke-test output with explicit cancellation.
-- Optional debug-only relay forward action for manual `/next_server` + `/faucet` checks.
+- Optional debug-only relay forward action remains disabled for production; active relay behavior is API v1 E2EE only.
 
 ## Compute-node bridge behavior
 
 Desktop includes a Python compute-node bridge
-(`src-tauri/python/compute_node_bridge.py`) that reuses
-`utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
-The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
-Root `server.py` remains the canonical compute-node entrypoint; this desktop path must stay parity-aligned on the same legacy relay contract until post-parity API v1 migration work begins.
+(`src-tauri/python/compute_node_bridge.py`) that reuses shared runtime logic while driving the active API v1 E2EE relay operator lifecycle.
+The bridge runs as the primary operator path and emits the shared status/event contract: running/registered state, active relay URL, runtime path, backend availability/selection/usage, fallback reason, model path, relay runtime state, session sequence, and last error.
+Root `server.py` remains the canonical compute-node entrypoint; desktop behavior should stay parity-aligned with shared Python bridge/runtime code rather than forking Windows and macOS lifecycles.
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:
@@ -61,13 +60,14 @@ source-build recipe:
 After a successful repair, the sidecar automatically re-execs once so the active
 process immediately uses the repaired runtime (no manual restart/environment flag required).
 
-### Platform packaging assumptions (documented, not fully automated in MVP)
+### Platform runtime and parity assumptions
 
-- **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.
-- **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build.
+- **macOS Apple Silicon/supported Metal Macs**: run with a Metal-enabled llama.cpp sidecar build for GPU release claims.
+- **Windows 10/11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build for GPU release claims.
 - CPU fallback mode is available in both cases, with explicit fallback details
   surfaced in `desktop.runtime_setup ... fallback_reason=...` and
   `compute_runtime ... fallback_reason=...`.
+- Windows/macOS releases use one shared parity checklist for dependency isolation, packaged resource resolution, warm-load before register, relay registration, multi-turn API v1 E2EE chat, Stop, Start after Stop, and two-node round-robin participation: see [Desktop parity validation checklist](../docs/desktop_parity_validation.md).
 
 ## Privacy defaults
 
@@ -169,6 +169,17 @@ It prints:
   (`requested`, `effective`, `backend_available`, `backend_used`,
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,
   `fallback_reason`, `interpreter`, `llama_module_path`)
+
+### Shared desktop parity validation
+
+Use the shared wrapper for packaged bridge and API v1 relay parity checks:
+
+```bash
+python desktop-tauri/scripts/run_desktop_parity_checks.py --profile local-cpu
+make desktop-parity-check
+```
+
+CI uses the same wrapper with `--profile ci-windows` and `--profile ci-macos`. Hardware CUDA/Metal checks and staging two-node round-robin sign-off remain local/staging validation, not generic CI proof; see [Desktop parity validation checklist](../docs/desktop_parity_validation.md).
 
 ### Regression and smoke tests
 

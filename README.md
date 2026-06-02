@@ -592,7 +592,7 @@ up correctly.
 
 ### hardware acceleration
 
-If you want to also utilize your GPU (instead of just your CPU), follow these platform-specific instructions.
+If you want to also utilize your GPU (instead of just your CPU), follow these platform-specific instructions. Desktop release validation treats Windows CUDA, macOS Metal, CPU fallback, and shared operator lifecycle parity as a single checklist; see [Desktop parity validation checklist](docs/desktop_parity_validation.md) before making desktop runtime or release claims.
 
 #### windows
 
@@ -657,7 +657,7 @@ then reinstall `llama-cpp-python` with Metal support:
 
 ```sh
 brew install cmake
-CMAKE_ARGS="-DLLAMA_METAL=on" FORCE_CMAKE=1 pip install llama-cpp-python --force-reinstall --upgrade
+CMAKE_ARGS="-DGGML_METAL=on" FORCE_CMAKE=1 pip install llama-cpp-python --force-reinstall --upgrade
 ```
 
 #### unix/linux

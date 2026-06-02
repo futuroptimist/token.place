@@ -375,7 +375,7 @@ Warning:
 
 ### Required external compute node validation checklist (sign-off gate)
 
-Run this in staging before production promotion:
+Run this in staging before production promotion. When the external node is the desktop operator, also run the shared [desktop parity validation checklist](desktop_parity_validation.md) so Windows/macOS behavior, hardware fallback, Stop/Start lifecycle, and two-node round-robin evidence do not drift.
 
 1. External compute node registers successfully to relay.
 2. Relay `/healthz` `knownServers` increments from `0` to `>=1`.
@@ -391,6 +391,8 @@ curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/relay/diagnostics
 curl -fsS https://staging.token.place/metrics | head -n 40
 ```
+
+Desktop-specific staging checks should include safe queue-depth and Stop/Start checks from [desktop_parity_validation.md](desktop_parity_validation.md). Treat health probes as necessary but insufficient: production round-robin claims require evidence that two registered nodes both poll and receive encrypted work over the validation window.
 
 ### Image tag, chart version, and Git tag must be validated independently
 

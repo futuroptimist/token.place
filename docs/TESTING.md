@@ -56,6 +56,17 @@ E2E tests validate complete user workflows:
 python -m pytest tests/test_e2e_*.py
 ```
 
+### Desktop Operator Parity Tests
+
+Desktop operator parity tests validate the shared Windows/macOS lifecycle contract: dependency isolation, packaged resource resolution, warm-load before register, API v1 E2EE relay registration, multi-turn relay chat, Stop, Start after Stop, and CPU fallback diagnostics. The shared entry point keeps local and CI commands aligned:
+
+```sh
+python desktop-tauri/scripts/run_desktop_parity_checks.py --profile local-cpu
+make desktop-parity-check
+```
+
+CI uses `--profile ci-windows` and `--profile ci-macos` in `.github/workflows/desktop-operator-e2e.yml`. Hardware CUDA/Metal validation and staging two-node round-robin sign-off are local/staging-only checks because generic CI runners do not provide release-class GPUs or a real external relay fleet. See [Desktop parity validation checklist](desktop_parity_validation.md) for the full checklist, lifecycle UI field table, and copy-paste staging/status commands.
+
 ### Visual Verification Tests
 
 **Pytest marker**: `visual`

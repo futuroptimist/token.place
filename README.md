@@ -87,8 +87,15 @@ Make targets surface the same workflows in shorthand:
 
 - `make lint` → run the full pre-commit suite (formatters, linters, tests)
 - `make test` → execute `./run_all_tests.sh`
+- `make desktop-parity-checks` → run the local shared desktop parity entry point
 - `make docker-build` → build the relay Docker image used by remote nodes
 - `make k8s-deploy` → apply the current Kubernetes manifests
+
+Desktop parity validation is a shared Windows/macOS release requirement. Before claiming desktop compute-node or two-node round-robin production readiness, follow `docs/desktop_parity_validation.md` for Windows CUDA, macOS Metal, CPU fallback, packaged resource resolution, API v1 E2EE relay lifecycle, Stop/Start, staging queue-depth, and round-robin evidence. The local deterministic entry point is:
+
+```bash
+python desktop-tauri/scripts/run_desktop_parity_checks.py
+```
 
 ### Key environment variables
 

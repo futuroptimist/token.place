@@ -9,7 +9,7 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 | Platform path | Expected capability | Bootstrap expectation |
 | --- | --- | --- |
 | Windows CUDA-capable | Detect CUDA-capable `llama-cpp-python` and select CUDA for GPU/auto modes. | If GPU runtime is missing and bootstrap is explicitly enabled, repair or install a CUDA-capable runtime; fail closed with actionable diagnostics when GPU mode cannot be provisioned. |
-| macOS Metal-capable | Detect Metal-capable `llama-cpp-python` and select Metal for GPU/auto modes. | Target parity is first-class Metal runtime bootstrap. Current known gap: missing Metal runtime is probe-only until the macOS bootstrap follow-up lands. |
+| macOS Metal-capable | Detect Metal-capable `llama-cpp-python` and select Metal for GPU/auto modes. | If GPU runtime is missing and bootstrap is explicitly enabled, repair or install a Metal-capable runtime; fail closed with actionable diagnostics when GPU mode cannot be provisioned. |
 | CPU fallback | Honor explicit CPU mode and report CPU backend fields. | Do not attempt GPU bootstrap in CPU mode. |
 | Missing runtime/dependency | Fail closed before relay registration when bridge dependencies are unavailable. | Report the missing interpreter/import root/module or install failure without logging plaintext payloads. |
 
@@ -26,7 +26,6 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 9. **Dependency isolation**: desktop dependency installs use the desktop-specific target/import root and avoid user-site leakage; repo-local shims must not shadow site-packages runtime modules.
 10. **Error/fallback behavior**: relay-owned logs/state remain ciphertext-only plus safe routing metadata. Any runtime, dependency, or registration failure must fail closed with diagnostics that explain platform, action, interpreter/import root when relevant, and a next step.
 
-## Known gaps captured by tests
+## Validation checklist
 
-- macOS missing Metal runtime bootstrap currently reports `probe_only`; the macOS bootstrap follow-up should make this a first-class Metal repair/install path.
-- macOS packaged operator tests currently cover resource layout and no-relay autostart more than real packaged operator lifecycle parity. Follow-up work should add packaged macOS e2e coverage for warm-load, API v1 relay registration, multi-turn API v1 relay chat, Stop, Start after Stop, and diagnostics without expanding this parity-contract scope.
+The release and development checklist that keeps this contract evergreen lives in [Desktop parity validation checklist](../desktop_parity_validation.md). Use that shared checklist for Windows CUDA, macOS Metal, CPU fallback, packaged resource resolution, warm-load, API v1 E2EE relay registration/chat, Stop, Start after Stop, and two-node round-robin release evidence.

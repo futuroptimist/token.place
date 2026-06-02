@@ -179,7 +179,7 @@ curl -fsS https://token.place/
 ```
 
 Optional note: true relay traffic validation requires a registered external compute node and an
-E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`).
+E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
 
 ### Desktop compute-node HTTP 403 / pre-app rejection diagnostics
 

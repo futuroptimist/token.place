@@ -236,6 +236,8 @@ during tests or `https://token.place/api/v1` in production.
 - `tests/unit/test_path_handling.py` - Quick checks for path utilities on each OS
 - `tests/platform_tests/test_path_handling.py` - Tests path handling across platforms
 - `tests/platform_tests/test_config.py` - Tests configuration loading on different platforms
+- `desktop-tauri/scripts/run_desktop_parity_checks.py` - Shared Windows/macOS desktop operator parity entry point
+- `desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py` - Local mocked API v1 E2EE relay lifecycle parity
 
 **Key Scenarios Tested**:
 - Correct path resolution across Windows, macOS, and Linux
@@ -244,6 +246,11 @@ during tests or `https://token.place/api/v1` in production.
   isolated when they patch runtime settings
 - Platform-specific behavior adaptations
 - Support for XDG environment variables like `XDG_CONFIG_HOME` and `XDG_STATE_HOME`
+- Desktop operator parity across Windows CUDA, macOS Metal, CPU fallback, packaged resource
+  resolution, warm-load before registration, relay registration, multi-turn API v1 E2EE chat,
+  Stop, Start after Stop, and two-node round-robin staging participation. See
+  [Desktop Windows/macOS parity validation](desktop_parity_validation.md) for CI-only,
+  local-only, and staging-only release gates.
 
 ### 5. Security and Failure Recovery
 

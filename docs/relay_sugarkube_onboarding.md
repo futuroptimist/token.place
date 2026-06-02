@@ -375,7 +375,9 @@ Warning:
 
 ### Required external compute node validation checklist (sign-off gate)
 
-Run this in staging before production promotion:
+Run this in staging before production promotion. For desktop-backed claims, use the shared
+Windows/macOS checklist in [desktop_parity_validation.md](desktop_parity_validation.md) rather than
+separate platform notes that can drift.
 
 1. External compute node registers successfully to relay.
 2. Relay `/healthz` `knownServers` increments from `0` to `>=1`.
@@ -383,13 +385,19 @@ Run this in staging before production promotion:
 4. Client encrypted request is accepted/queued by relay.
 5. Compute node receives and processes the queued request.
 6. Client retrieves encrypted response successfully.
+7. Before making two-node/round-robin production claims, register one Windows CUDA desktop node and
+   one macOS Metal desktop node to staging and verify both participate in API v1 E2EE request
+   selection without changing relay round-robin behavior.
 
 Example checks:
 
 ```bash
-curl -fsS https://staging.token.place/healthz
-curl -fsS https://staging.token.place/relay/diagnostics
-curl -fsS https://staging.token.place/metrics | head -n 40
+STAGING_RELAY=https://staging.token.place
+curl -fsS "$STAGING_RELAY/healthz"
+curl -fsS "$STAGING_RELAY/relay/diagnostics"
+curl -fsS "$STAGING_RELAY/metrics" | head -n 40
+curl -fsS "$STAGING_RELAY/relay/diagnostics" \
+  | python -c 'import json,sys; d=json.load(sys.stdin); print([(i, n.get("queue_depth")) for i,n in enumerate(d.get("registered_compute_nodes", []), 1)])'
 ```
 
 ### Image tag, chart version, and Git tag must be validated independently

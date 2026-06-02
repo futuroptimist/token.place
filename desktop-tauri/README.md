@@ -10,17 +10,24 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 - Lets users either browse to an existing GGUF or download the configured GGUF
   artifact into the shared models directory.
 - Runtime backend preference controls expose `auto`, `metal`, `cuda`, and `cpu` modes.
-- Background compute-node mode that registers and polls via `/sink`, decrypts requests, runs local inference, and posts responses to `/source` (or `/stream/source` when streaming is requested by the relay contract).
+- Background compute-node mode that warm-loads the model runtime, registers to the relay only after readiness, polls for API v1 E2EE work, decrypts locally, runs inference, and submits encrypted responses.
 - Sidecar-driven local prompt smoke-test output with explicit cancellation.
-- Optional debug-only relay forward action for manual `/next_server` + `/faucet` checks.
+- Optional debug-only relay forward action remains disabled for active runtime paths; relay validation must use API v1 E2EE.
 
 ## Compute-node bridge behavior
 
 Desktop includes a Python compute-node bridge
 (`src-tauri/python/compute_node_bridge.py`) that reuses
-`utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
-The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
-Root `server.py` remains the canonical compute-node entrypoint; this desktop path must stay parity-aligned on the same legacy relay contract until post-parity API v1 migration work begins.
+`utils.compute_node_runtime` for the active API v1 E2EE relay lifecycle.
+The bridge runs as the primary operator path and emits shared status events
+(running/registered, relay runtime state, active relay URL, backend mode, model
+path, fallback reason, and last error). Root `server.py` remains the canonical
+compute-node entrypoint; desktop behavior must stay parity-aligned with the
+shared API v1 E2EE relay contract.
+
+See [`../docs/desktop_parity_validation.md`](../docs/desktop_parity_validation.md)
+for the evergreen Windows/macOS parity checklist, manual release-validation
+commands, expected UI fields by lifecycle state, and platform runtime guidance.
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:
@@ -63,11 +70,13 @@ process immediately uses the repaired runtime (no manual restart/environment fla
 
 ### Platform packaging assumptions (documented, not fully automated in MVP)
 
-- **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.
-- **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build.
+- **macOS Apple Silicon**: run with a Metal-enabled `llama-cpp-python` sidecar build.
+- **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled `llama-cpp-python` sidecar build.
 - CPU fallback mode is available in both cases, with explicit fallback details
   surfaced in `desktop.runtime_setup ... fallback_reason=...` and
   `compute_runtime ... fallback_reason=...`.
+- Windows and macOS share the same operator lifecycle contract; platform-specific
+  code should only adapt runtime install/probe and launcher/resource discovery.
 
 ## Privacy defaults
 
@@ -146,6 +155,12 @@ Both flags are equivalent opt-in toggles and intended for troubleshooting.
 
 
 ### Manual runtime verification
+
+Use the shared parity entry point for local/CI bridge validation:
+
+```bash
+python desktop-tauri/scripts/run_desktop_parity_checks.py
+```
 
 Use the helper below to print authoritative runtime wiring details from the same
 Python environment used by desktop sidecars:

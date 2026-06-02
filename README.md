@@ -205,6 +205,7 @@ The `desktop-tauri/` app is the forward-looking desktop path, but it is currentl
 
 See also:
 
+- [`docs/desktop_parity_validation.md`](docs/desktop_parity_validation.md) for the shared Windows/macOS operator parity and release-validation checklist.
 - [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
@@ -248,6 +249,10 @@ See [docs/architecture/api_v1_e2ee_relay.md](docs/architecture/api_v1_e2ee_relay
   contracts after parity and operational readiness gates are complete.
 - **Operator platform targets:** Windows 11 + NVIDIA/CUDA and macOS Apple Silicon + Metal first,
   CPU fallback always supported, Raspberry Pi as a later low-power compute-node target.
+
+For desktop release validation, use the shared Windows/macOS parity checklist in
+[docs/desktop_parity_validation.md](docs/desktop_parity_validation.md) before making production
+claims about desktop relay participation or two-node round-robin behavior.
 
 ## sugarkube deployment
 
@@ -657,7 +662,7 @@ then reinstall `llama-cpp-python` with Metal support:
 
 ```sh
 brew install cmake
-CMAKE_ARGS="-DLLAMA_METAL=on" FORCE_CMAKE=1 pip install llama-cpp-python --force-reinstall --upgrade
+CMAKE_ARGS="-DGGML_METAL=on" FORCE_CMAKE=1 pip install llama-cpp-python --force-reinstall --upgrade
 ```
 
 #### unix/linux

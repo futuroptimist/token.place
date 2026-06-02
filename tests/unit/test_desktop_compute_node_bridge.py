@@ -10,6 +10,7 @@ import threading
 import time
 
 import pytest
+import yaml
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -384,23 +385,27 @@ def _load_desktop_operator_parity_matrix():
     return json.loads(matrix_path.read_text(encoding='utf-8'))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        'macOS packaged operator lifecycle parity does not yet exercise real warm-load, '
-        'registration, multi-turn API v1 relay chat, stop/start, and diagnostics coverage'
-    ),
-)
-def test_macos_packaged_operator_lifecycle_parity_gap_is_captured():
+def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
     matrix = _load_desktop_operator_parity_matrix()
-    gap = next(
-        item
+    assert all(
+        item.get('id') != 'macos_packaged_operator_lifecycle_parity'
         for item in matrix.get('known_gaps', [])
+    )
+
+    coverage = next(
+        item
+        for item in matrix.get('lifecycle_coverage', [])
         if item.get('id') == 'macos_packaged_operator_lifecycle_parity'
     )
-    assert gap['platform'] == 'darwin'
-    assert gap['status'] == 'known_gap'
-    assert gap['missing_coverage'] == [
+    assert coverage['platform'] == 'darwin'
+    assert coverage['status'] == 'covered_by_shared_entrypoint'
+    assert (
+        coverage['shared_entrypoint']
+        == 'desktop-tauri/scripts/run_desktop_parity_checks.py'
+    )
+    assert coverage['covered_checks'] == [
+        'packaged_resource_resolution',
+        'dependency_isolation',
         'warm_load',
         'register',
         'multi_turn_api_v1_relay_chat',
@@ -409,22 +414,34 @@ def test_macos_packaged_operator_lifecycle_parity_gap_is_captured():
         'diagnostics',
     ]
 
-    workflow_path = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'desktop-operator-e2e.yml'
-    workflow = workflow_path.read_text(encoding='utf-8').lower()
-    assert 'macos-latest' in workflow
-    assert 'test_packaged_operator_e2e.py' in workflow
-    assert 'test_desktop_no_relay_autostart_e2e.py' in workflow
-
-    macos_lifecycle_markers = [
-        'warm-load',
-        'api v1 relay registration',
-        'multi-turn api v1 relay chat',
-        'stop operator',
-        'start after stop',
-        'diagnostics',
+    workflow_path = (
+        Path(__file__).resolve().parents[2]
+        / '.github'
+        / 'workflows'
+        / 'desktop-operator-e2e.yml'
+    )
+    workflow = yaml.load(
+        workflow_path.read_text(encoding='utf-8'),
+        Loader=yaml.BaseLoader,
+    )
+    macos_job = workflow['jobs']['desktop-operator-packaged-e2e-macos']
+    macos_run_commands = [
+        step.get('run', '')
+        for step in macos_job['steps']
+        if isinstance(step, dict)
     ]
-    for marker in macos_lifecycle_markers:
-        assert marker in workflow
+    runner_path = Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']
+    runner = runner_path.read_text(encoding='utf-8')
+
+    assert macos_job['runs-on'] == 'macos-latest'
+    assert f"python {coverage['shared_entrypoint']}" in macos_run_commands
+    assert any(
+        'test_desktop_no_relay_autostart_e2e.py' in command
+        for command in macos_run_commands
+    )
+    for script in coverage['required_scripts']:
+        assert Path(script).name in runner
+
 
 class RestartTrackingRuntime(FakeRuntime):
     instances = []

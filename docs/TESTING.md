@@ -232,10 +232,14 @@ during tests or `https://token.place/api/v1` in production.
 
 **User Journey**: Users run token.place on different operating systems.
 
+Desktop operator Windows/macOS parity is covered by the shared checklist in [Desktop parity validation checklist](desktop_parity_validation.md). Use it for release validation across Windows CUDA, macOS Metal, CPU fallback, packaged resource resolution, warm-load before register, API v1 E2EE multi-turn chat, Stop, Start after Stop, staging queue-depth checks, and two-node round-robin evidence.
+
 **Test Files**:
 - `tests/unit/test_path_handling.py` - Quick checks for path utilities on each OS
 - `tests/platform_tests/test_path_handling.py` - Tests path handling across platforms
 - `tests/platform_tests/test_config.py` - Tests configuration loading on different platforms
+- `desktop-tauri/scripts/run_desktop_parity_checks.py` - Local shared entry point for packaged resource and API v1 E2EE relay lifecycle parity checks
+- `.github/workflows/desktop-operator-e2e.yml` - CI-only Windows/macOS packaged parity jobs
 
 **Key Scenarios Tested**:
 - Correct path resolution across Windows, macOS, and Linux

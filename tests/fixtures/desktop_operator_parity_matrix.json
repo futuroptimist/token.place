@@ -157,14 +157,19 @@
             }
         }
     ],
-    "known_gaps": [
+    "known_gaps": [],
+    "lifecycle_coverage": [
         {
             "id": "macos_packaged_operator_lifecycle_parity",
-            "tracking_context": "macOS packaged operator lifecycle parity coverage is intentionally deferred until lightweight workflow inspection is replaced by packaged end-to-end lifecycle coverage.",
+            "tracking_context": "macOS packaged operator lifecycle parity is validated through the shared desktop parity runner used by the macOS packaged CI job.",
             "platform": "darwin",
             "scope": "packaged_operator_lifecycle_e2e",
-            "status": "known_gap",
-            "missing_coverage": [
+            "status": "covered_by_shared_entrypoint",
+            "shared_entrypoint": "desktop-tauri/scripts/run_desktop_parity_checks.py",
+            "workflow": ".github/workflows/desktop-operator-e2e.yml",
+            "covered_checks": [
+                "packaged_resource_resolution",
+                "dependency_isolation",
                 "warm_load",
                 "register",
                 "multi_turn_api_v1_relay_chat",
@@ -172,8 +177,10 @@
                 "start_after_stop",
                 "diagnostics"
             ],
-            "current_workflow_inspection": "desktop-operator-e2e.yml macOS packaged jobs run packaged bridge/resource inspect and no-relay autostart checks, but do not execute real packaged operator API v1 relay lifecycle parity.",
-            "must_not_implement_in_prompt_1": true
+            "required_scripts": [
+                "desktop-tauri/scripts/test_packaged_operator_e2e.py",
+                "desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py"
+            ]
         }
     ]
 }

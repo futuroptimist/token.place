@@ -10,17 +10,17 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 - Lets users either browse to an existing GGUF or download the configured GGUF
   artifact into the shared models directory.
 - Runtime backend preference controls expose `auto`, `metal`, `cuda`, and `cpu` modes.
-- Background compute-node mode that registers and polls via `/sink`, decrypts requests, runs local inference, and posts responses to `/source` (or `/stream/source` when streaming is requested by the relay contract).
+- Background compute-node mode that warm-loads the local runtime, registers through API v1 E2EE relay routes, polls for encrypted work, runs local inference, and submits encrypted non-streaming responses.
 - Sidecar-driven local prompt smoke-test output with explicit cancellation.
-- Optional debug-only relay forward action for manual `/next_server` + `/faucet` checks.
+- Shared Windows/macOS operator lifecycle behavior for warm-load, register, multi-turn chat, Stop, Start after Stop, and diagnostics.
 
 ## Compute-node bridge behavior
 
 Desktop includes a Python compute-node bridge
-(`src-tauri/python/compute_node_bridge.py`) that reuses
-`utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
-The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
-Root `server.py` remains the canonical compute-node entrypoint; this desktop path must stay parity-aligned on the same legacy relay contract until post-parity API v1 migration work begins.
+(`src-tauri/python/compute_node_bridge.py`) that reuses shared runtime and API v1 E2EE relay logic for desktop compute-node work. The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, warm-load state, runtime backend fields, and last error).
+Root `server.py` remains the canonical non-desktop compute-node entrypoint; desktop behavior must stay parity-aligned with the shared API v1 E2EE relay contract and must not reintroduce legacy relay endpoints or API v1 streaming.
+
+See [Desktop parity validation checklist](../docs/desktop_parity_validation.md) for the evergreen Windows/macOS release checklist, expected UI fields by lifecycle state, staging commands, queue-depth checks, Stop/Start checks, and two-node round-robin evidence requirements.
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:
@@ -38,36 +38,28 @@ npm ci
 npm run tauri dev
 ```
 
-During normal startup, desktop sidecars probe the active sidecar interpreter and, on
-Windows in `auto`/`gpu`/`hybrid` modes, automatically run a one-time CUDA runtime
-repair when the runtime is CPU-only. They emit:
+During normal startup, desktop sidecars probe the active sidecar interpreter and, in GPU-capable modes, use platform-specific runtime bootstrap/repair where supported (Windows CUDA and macOS Metal) while preserving shared bridge lifecycle behavior. They emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
-Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable the
-Windows auto-repair path and keep startup in probe-only mode (useful for
-packaging/troubleshooting while preserving normal CPU fallback diagnostics).
+Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable runtime bootstrap and keep startup in probe-only mode (useful for packaging/troubleshooting while preserving fallback diagnostics).
 
-When Windows CUDA repair is needed, desktop uses the same interpreter binary that
-launches the sidecar process (`sys.executable`) and applies the repo
-source-build recipe:
+When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) and applies the repo-pinned `llama-cpp-python` source-build recipe with the platform flag:
 
-- `CMAKE_ARGS=-DGGML_CUDA=on`
-- `FORCE_CMAKE=1`
-- `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+- Windows CUDA: `CMAKE_ARGS=-DGGML_CUDA=on`
+- macOS Metal: `CMAKE_ARGS=-DGGML_METAL=on`
+- Both: `FORCE_CMAKE=1` and `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
 
-After a successful repair, the sidecar automatically re-execs once so the active
-process immediately uses the repaired runtime (no manual restart/environment flag required).
+After a successful repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required).
 
-### Platform packaging assumptions (documented, not fully automated in MVP)
+### Platform runtime expectations
 
-- **macOS Apple Silicon**: run with a Metal-enabled llama.cpp sidecar build.
-- **Windows 11 + NVIDIA GPU**: run with a CUDA-enabled llama.cpp sidecar build.
-- CPU fallback mode is available in both cases, with explicit fallback details
-  surfaced in `desktop.runtime_setup ... fallback_reason=...` and
-  `compute_runtime ... fallback_reason=...`.
+- **macOS Apple Silicon**: validate with a Metal-enabled llama.cpp sidecar build and packaged `.app/Contents/Resources` resource resolution.
+- **Windows 11 + NVIDIA GPU**: validate with a CUDA-enabled llama.cpp sidecar build.
+- CPU fallback mode is available in both cases, with explicit fallback details surfaced in `desktop.runtime_setup ... fallback_reason=...` and `compute_runtime ... fallback_reason=...`. Missing `llama_cpp` is a dependency failure, not silent CPU fallback.
+- `backend_available` reports runtime capability, `backend_selected` reports policy selection, and `backend_used` reports the initialized relay-processing runtime. GPU release claims depend on `backend_used`.
 
 ## Privacy defaults
 
@@ -172,6 +164,10 @@ It prints:
 
 ### Regression and smoke tests
 
+- Shared local desktop parity entry point (packaged resources + API v1 E2EE relay lifecycle):
+  ```bash
+  python desktop-tauri/scripts/run_desktop_parity_checks.py
+  ```
 - Operator startup regression coverage (bridge startup event + surfaced errors):
   ```bash
   pytest -q --noconftest tests/unit/test_desktop_compute_node_bridge.py

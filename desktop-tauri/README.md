@@ -17,10 +17,14 @@ This folder contains the forward-looking Tauri desktop MVP for token.place.
 ## Compute-node bridge behavior
 
 Desktop includes a Python compute-node bridge
-(`src-tauri/python/compute_node_bridge.py`) that reuses
-`utils.compute_node_runtime` for the legacy relay `/sink` + `/source` flow used by `server.py`.
-The bridge runs as the primary operator path and emits status events (running/registered, active relay URL, backend mode, model path, and last error).
-Root `server.py` remains the canonical compute-node entrypoint; this desktop path must stay parity-aligned on the same legacy relay contract until post-parity API v1 migration work begins.
+(`src-tauri/python/compute_node_bridge.py`) that reuses shared runtime helpers while driving the
+API v1 relay-blind E2EE operator lifecycle: warm-load the relay-processing runtime, register to
+the active relay URL, poll for ciphertext work, process locally, submit ciphertext responses, and
+unregister on Stop when possible. The bridge runs as the primary operator path and emits status
+events (running/registered, active relay URL, backend mode, model path, and last error).
+Root `server.py` remains the canonical compute-node entrypoint; this desktop path must stay
+parity-aligned with API v1 E2EE behavior and must not revive deprecated legacy relay endpoints as
+production fallbacks.
 
 The fake sidecar remains available at `sidecar/fake_llama_sidecar.py` for CI
 and fast local testing:
@@ -184,3 +188,101 @@ It prints:
   Pass means desktop-side diagnostics and `compute_node_bridge.py` `started` events both report
   CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
   startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.
+
+## Desktop parity release validation checklist
+
+Use this checklist for every desktop operator release claim and for any change that touches the Tauri UI, Rust status/event bridge, packaged resources, Python bridge, runtime bootstrap, relay API v1 integration, or operator lifecycle. Windows and macOS should share one behavior checklist; platform-specific notes should explain runtime installation/probe differences only.
+
+| Area | Windows CUDA expectation | macOS Metal expectation | CPU/fallback expectation | Where to validate |
+| --- | --- | --- | --- | --- |
+| GPU runtime | NVIDIA driver, CUDA toolkit/build tools, and a CUDA-capable `llama-cpp-python` are present for `auto`, `gpu`, or `hybrid` modes. | Apple Silicon or Metal-capable macOS has Xcode Command Line Tools and a Metal-capable `llama-cpp-python`. | Explicit `cpu` mode skips GPU bootstrap/probe requirements and reports CPU fields. | Local hardware + `verify_desktop_runtime.py`; CI can only cover mocked parity unless self-hosted GPU runners are added. |
+| Dependency isolation | Desktop imports resolve from the desktop target/import root and site-packages, not user-site leakage or repo-local shims. | Same. Packaged `.app` resource layout must resolve the same bridge and import roots as dev. | Missing runtime/dependency fails closed before relay registration. | CI packaged inspect smoke and local `inspect` wrapper. |
+| Packaged resource resolution | Packaged app resolves the Python bridge, requirements, runtime import root, and launcher used by dev flows. | Same for `.app` resources and Python launcher lookup. | Diagnostics include action, interpreter/import root, and next step without plaintext. | CI packaged bridge e2e. |
+| Warm-load before register | Runtime warms before API v1 relay registration. | Same. | CPU mode still warms before registration. | CI/local relay parity e2e. |
+| Relay registration | Register only after the active relay-processing runtime is ready for the active relay URL. | Same. | Fallback alone does not authorize registration; readiness does. | CI/local relay parity e2e; staging external node. |
+| Multi-turn API v1 E2EE chat | Desktop processes multiple ciphertext requests and returns ciphertext responses without API v1 streaming. | Same. | CPU mode may be slower but behavior is identical. | CI/local relay parity e2e; staging client flow. |
+| Stop | Stop cancels polling, unregisters when possible, emits stopped, and reports unregistered. | Same. | Same. | CI/local relay parity e2e and no-relay lifecycle e2e. |
+| Start after Stop | New start gets a fresh session/sequence; stale events from old sessions do not overwrite active state. | Same. | Same. | CI/local relay parity e2e. |
+| Two-node round-robin participation | A Windows node can be one of the two active relay participants without changing relay round-robin behavior. | A macOS node can be the other active participant with equivalent lifecycle semantics. | CPU nodes can participate only after warm readiness and should be labeled as CPU in diagnostics. | Staging-only with two external nodes; do not claim production round-robin until both platforms pass. |
+
+### Lifecycle UI field expectations
+
+| Lifecycle state | Running/status | Registration/polling | Runtime/backend fields | Model/work fields | Last error/action |
+| --- | --- | --- | --- | --- | --- |
+| idle | Operator stopped; no active session. | `registered=false`; no polling. | Requested mode may show saved preference; effective/backend fields are empty or `pending`. | No active request; queue depth may be unknown until a relay check runs. | Empty. |
+| warming | Operator starting and model warm-load in progress. | `registered=false`; relay registration is blocked. | `backend_available` may be probe-derived; `backend_selected` shows the intended backend; `backend_used` remains `pending` until runtime init completes. | Model path/interpreter/import root may be shown; no request is processed. | Empty unless warm-load fails. |
+| ready/registering | Warm-load complete; registration request in flight. | `registered=false` until relay acknowledges the active URL/session. | `backend_available`, `backend_selected`, and `backend_used` describe the warmed relay-processing runtime. | Ready for relay work; queue depth may still be unknown. | Empty or actionable registration error. |
+| registered/polling | Operator running and registered. | `registered=true`; polling active against the active relay URL. | Backend fields remain stable for the active session. | Queue depth and last poll metadata may update; no plaintext prompts/responses are displayed. | Empty when healthy. |
+| processing | Operator is handling a relay request. | Registration remains true unless the relay rejects/unregisters. | Backend fields continue to report the active runtime used for inference. | Active request id/safe metadata, byte counts, and timing may update; plaintext remains in memory only and is never logged. | Empty unless inference/submission fails. |
+| stopped | User requested Stop or lifecycle completed shutdown. | `registered=false`; polling canceled; unregister attempted where possible. | Last known backend may remain visible as historical metadata; no active runtime work. | No active request; queue depth checks are manual/relay-derived. | Empty for clean stop; actionable if unregister failed. |
+| failed | Startup, runtime, dependency, registration, polling, inference, or submission failed. | `registered=false` unless failure occurred after relay state became stale; next Start must create a fresh session. | Fields identify requested/selected/used backend as far as known plus fallback reason. | No new work should be accepted after fail-closed errors. | Actionable message with platform, action, interpreter/import root when relevant, and next step; no plaintext/ciphertext payload dumps. |
+
+### Runtime field interpretation
+
+- `backend_available` is the capability detected in the desktop Python environment, such as CUDA, Metal, CPU-only, or unavailable. It answers “what can this interpreter import and initialize?”
+- `backend_selected` is the backend desktop intends to use after applying the user preference (`auto`, `gpu`/`hybrid`, `metal`, `cuda`, or `cpu`) and platform adapter decisions.
+- `backend_used` is the backend actually used by the warmed relay-processing runtime. Release validation should trust this field over a stale probe when deciding whether CUDA/Metal parity passed.
+- `fallback_reason` explains why selected and used backends differ, or why the runtime failed closed. Treat `user_requested_cpu`, `gpu_unavailable_cpu_fallback`, `probe_only`, `missing_llama_cpp`, `shadowed_repo_llama_cpp`, and install/bootstrap failures differently; only a warmed runtime with an acceptable reason may register.
+
+### Manual validation commands
+
+Run commands from the repository root unless noted.
+
+```bash
+# Local relay e2e parity: packaged resources, warm-load, register, multi-turn API v1 E2EE, Stop, Start after Stop.
+desktop-tauri/scripts/validate_desktop_parity.sh local
+
+# Equivalent Make target for local release checks.
+make desktop-parity-checks
+
+# Dependency-isolated packaged inspect smoke only.
+TOKEN_PLACE_INSPECT_ONLY=1 python desktop-tauri/scripts/test_packaged_operator_e2e.py
+# or
+desktop-tauri/scripts/validate_desktop_parity.sh inspect
+
+# Runtime/status check for the desktop Python environment.
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
+
+# Windows CUDA smoke from PowerShell.
+python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\path\to\model.gguf
+
+# macOS Metal runtime check.
+CMAKE_ARGS="-DGGML_METAL=on" FORCE_CMAKE=1 python -m pip install llama-cpp-python --force-reinstall --no-cache-dir --verbose
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode metal --model /path/to/model.gguf
+
+# Explicit CPU fallback check.
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode cpu --model /path/to/model.gguf
+
+# Desktop status and relay health checks.
+curl -fsS http://127.0.0.1:5010/healthz
+curl -fsS http://127.0.0.1:5010/relay/diagnostics
+curl -fsS http://127.0.0.1:5010/metrics | head -n 40
+
+# Queue-depth checks. Prefer metrics when available; diagnostics are safe metadata only.
+curl -fsS http://127.0.0.1:5010/metrics | rg 'queue|knownServers|registered|poll'
+curl -fsS http://127.0.0.1:5010/relay/diagnostics | python -m json.tool
+
+# Stop/Start checks use the parity e2e by default; for manual UI validation, click Stop,
+# confirm registered=false/polling stopped, click Start, and confirm a new session registers.
+python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
+```
+
+Staging-only validation requires a deployed relay plus real external compute nodes:
+
+```bash
+STAGING_RELAY=https://staging.token.place
+curl -fsS "$STAGING_RELAY/livez"
+curl -fsS "$STAGING_RELAY/healthz"
+curl -fsS "$STAGING_RELAY/relay/diagnostics"
+curl -fsS "$STAGING_RELAY/metrics" | head -n 80
+# After one Windows CUDA node and one macOS Metal node register, verify knownServers >= 2
+# and run an encrypted API v1 client flow that observes both nodes participating across turns.
+```
+
+### Do not fork platform behavior
+
+- Put shared operator lifecycle behavior in the common Python bridge/runtime path first.
+- Keep the Rust/Tauri status and event contract shared across Windows and macOS.
+- Use platform adapters only for runtime installation, launcher discovery, packaging layout, and backend probe differences.
+- Do not add Windows-only or macOS-only lifecycle state machines, registration rules, Stop/Start semantics, relay routes, or API v1 streaming behavior.
+- Do not alter relay round-robin behavior to make a desktop validation pass; validation should reveal platform drift, not mask relay scheduling issues.

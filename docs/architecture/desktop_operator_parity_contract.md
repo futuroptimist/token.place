@@ -26,7 +26,16 @@ The machine-readable matrix in `tests/fixtures/desktop_operator_parity_matrix.js
 9. **Dependency isolation**: desktop dependency installs use the desktop-specific target/import root and avoid user-site leakage; repo-local shims must not shadow site-packages runtime modules.
 10. **Error/fallback behavior**: relay-owned logs/state remain ciphertext-only plus safe routing metadata. Any runtime, dependency, or registration failure must fail closed with diagnostics that explain platform, action, interpreter/import root when relevant, and a next step.
 
+## Release validation checklist
+
+The human-facing evergreen checklist lives in
+[`desktop-tauri/README.md#desktop-parity-release-validation-checklist`](../../desktop-tauri/README.md#desktop-parity-release-validation-checklist).
+Use it for every Windows/macOS release validation pass so CUDA, Metal, CPU fallback, dependency
+isolation, packaged resource resolution, warm-load, API v1 E2EE relay chat, Stop/Start, and
+two-node round-robin participation are evaluated together instead of drifting into separate
+platform checklists.
+
 ## Known gaps captured by tests
 
-- macOS missing Metal runtime bootstrap currently reports `probe_only`; the macOS bootstrap follow-up should make this a first-class Metal repair/install path.
-- macOS packaged operator tests currently cover resource layout and no-relay autostart more than real packaged operator lifecycle parity. Follow-up work should add packaged macOS e2e coverage for warm-load, API v1 relay registration, multi-turn API v1 relay chat, Stop, Start after Stop, and diagnostics without expanding this parity-contract scope.
+- CI-hosted Windows/macOS parity tests use deterministic local relay and mock-runtime flows unless a hardware-backed runner is attached. Real CUDA and Metal acceleration remain local/staging release-validation requirements.
+- Two-node round-robin production claims require staging validation with at least one Windows CUDA node and one macOS Metal node registered to the same API v1 relay.

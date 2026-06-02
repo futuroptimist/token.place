@@ -1,6 +1,7 @@
 name: Desktop operator app e2e
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - '.github/workflows/desktop-operator-e2e.yml'
@@ -12,6 +13,7 @@ on:
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
+      - 'desktop-tauri/scripts/validate_desktop_parity.sh'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -30,6 +32,7 @@ on:
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
+      - 'desktop-tauri/scripts/validate_desktop_parity.sh'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'

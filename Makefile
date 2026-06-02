@@ -1,4 +1,4 @@
-.PHONY: lint test format docker-build k8s-deploy
+.PHONY: lint test format docker-build k8s-deploy desktop-parity-checks
 
 lint:
 	pre-commit run --all-files
@@ -14,3 +14,7 @@ docker-build:
 
 k8s-deploy:
 	kubectl apply -f k8s/
+
+
+desktop-parity-checks:
+	desktop-tauri/scripts/validate_desktop_parity.sh local

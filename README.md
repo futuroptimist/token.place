@@ -207,6 +207,7 @@ See also:
 
 - [`docs/design/tauri_desktop_client.md`](docs/design/tauri_desktop_client.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`desktop-tauri/README.md#desktop-parity-release-validation-checklist`](desktop-tauri/README.md#desktop-parity-release-validation-checklist) for the shared Windows/macOS desktop parity release checklist
 
 
 ## API v1 E2EE architecture baseline (v0.1.0)

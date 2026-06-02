@@ -180,6 +180,44 @@ Stress tests include:
 These tests are skipped by default in CI to keep build times reasonable, but can be
 enabled for release validation or when investigating performance regressions.
 
+## Desktop operator parity validation
+
+Desktop operator parity is a shared Windows/macOS release gate, not two independent platform checklists. Use [`desktop-tauri/README.md#desktop-parity-release-validation-checklist`](../desktop-tauri/README.md#desktop-parity-release-validation-checklist) as the evergreen checklist for Windows CUDA, macOS Metal, CPU fallback, dependency isolation, packaged resource resolution, warm-load before register, relay registration, multi-turn API v1 E2EE chat, Stop, Start after Stop, and two-node round-robin participation.
+
+### CI-only or CI-primary checks
+
+```sh
+python desktop-tauri/scripts/test_packaged_operator_e2e.py
+python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
+TOKENPLACE_REQUIRE_NO_RELAY_E2E=1 python desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py
+```
+
+These run in `.github/workflows/desktop-operator-e2e.yml` on Windows and macOS where possible. CI uses mocked/local relay flows for deterministic API v1 E2EE lifecycle coverage; it does not prove real CUDA or Metal hardware acceleration unless a runner with that hardware is used.
+
+### Local-only hardware checks
+
+```sh
+desktop-tauri/scripts/validate_desktop_parity.sh local
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
+python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --model C:\path\to\model.gguf
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode metal --model /path/to/model.gguf
+python desktop-tauri/scripts/verify_desktop_runtime.py --mode cpu --model /path/to/model.gguf
+```
+
+Run these on actual Windows NVIDIA/CUDA and macOS Apple Silicon/Metal hosts before claiming desktop GPU parity. `backend_used` from the warmed runtime is the release-signoff field; `backend_available` and `backend_selected` explain capability and intent, while `fallback_reason` explains divergence or fail-closed setup errors.
+
+### Staging-only checks
+
+```sh
+STAGING_RELAY=https://staging.token.place
+curl -fsS "$STAGING_RELAY/livez"
+curl -fsS "$STAGING_RELAY/healthz"
+curl -fsS "$STAGING_RELAY/relay/diagnostics"
+curl -fsS "$STAGING_RELAY/metrics" | head -n 80
+```
+
+Staging sign-off requires one Windows CUDA node and one macOS Metal node to register to the same relay, complete encrypted multi-turn API v1 chat, pass Stop/Start checks, and demonstrate two-node round-robin participation without changing relay scheduling behavior.
+
 ## User Journeys and E2E Testing
 
 token.place tests are organized around key user journeys that represent how users interact with the system:

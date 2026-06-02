@@ -366,6 +366,35 @@ Verification focus:
 - Validate end-to-end register/poll/request/reply path with an actual external node, not relay
   pod health alone.
 
+
+### Desktop parity staging validation (Windows + macOS)
+
+Before making two-node or round-robin production claims, staging must include one external
+Windows CUDA desktop operator and one external macOS Metal desktop operator registered to the same
+API v1 relay. Use the shared desktop parity checklist in
+[`../desktop-tauri/README.md#desktop-parity-release-validation-checklist`](../desktop-tauri/README.md#desktop-parity-release-validation-checklist) rather than maintaining platform-specific checklists.
+
+Copy-paste staging checks:
+
+```bash
+STAGING_RELAY=https://staging.token.place
+curl -fsS "$STAGING_RELAY/livez"
+curl -fsS "$STAGING_RELAY/healthz"
+curl -fsS "$STAGING_RELAY/relay/diagnostics"
+curl -fsS "$STAGING_RELAY/metrics" | head -n 80
+# Queue-depth and participation hints should remain safe routing metadata only.
+curl -fsS "$STAGING_RELAY/metrics" | rg 'queue|knownServers|registered|poll'
+```
+
+Sign-off expectations:
+
+1. Both desktop operators warm-load before registration.
+2. `/healthz` and diagnostics show at least two known/registered external compute nodes.
+3. A multi-turn encrypted API v1 client flow receives ciphertext responses without API v1 streaming.
+4. Stop on each platform unregisters or stops polling and reports `registered=false`.
+5. Start after Stop creates a fresh session and re-registers.
+6. Round-robin participation is observed across the two nodes without changing relay scheduling behavior.
+
 ### 6) Health checks green before true relay flow validation
 
 Warning:

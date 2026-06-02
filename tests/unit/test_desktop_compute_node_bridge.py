@@ -10,6 +10,7 @@ import threading
 import time
 
 import pytest
+import yaml
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -419,13 +420,25 @@ def test_macos_packaged_operator_lifecycle_parity_uses_shared_entrypoint():
         / 'workflows'
         / 'desktop-operator-e2e.yml'
     )
-    workflow = workflow_path.read_text(encoding='utf-8').lower()
+    workflow = yaml.load(
+        workflow_path.read_text(encoding='utf-8'),
+        Loader=yaml.BaseLoader,
+    )
+    macos_job = workflow['jobs']['desktop-operator-packaged-e2e-macos']
+    macos_run_commands = [
+        step.get('run', '')
+        for step in macos_job['steps']
+        if isinstance(step, dict)
+    ]
     runner_path = Path(__file__).resolve().parents[2] / coverage['shared_entrypoint']
     runner = runner_path.read_text(encoding='utf-8')
 
-    assert 'macos-latest' in workflow
-    assert f"python {coverage['shared_entrypoint']}" in workflow
-    assert 'test_desktop_no_relay_autostart_e2e.py' in workflow
+    assert macos_job['runs-on'] == 'macos-latest'
+    assert f"python {coverage['shared_entrypoint']}" in macos_run_commands
+    assert any(
+        'test_desktop_no_relay_autostart_e2e.py' in command
+        for command in macos_run_commands
+    )
     for script in coverage['required_scripts']:
         assert Path(script).name in runner
 

@@ -2925,3 +2925,42 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
         in payload["last_error"]
     )
     assert "missing=cryptography,requests" in payload["last_error"]
+
+
+def test_pre_registration_runtime_discovery_failure_is_actionable_and_unregistered(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class DiscoveryFailureRuntime(ApiV1Runtime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.last_runtime_error = 'llama_cpp_runtime_discovery_timeout after 0.05s'
+
+        def ensure_api_v1_runtime_ready(self):
+            return False
+
+        def register_and_poll_once(self):  # pragma: no cover - must not register/poll after failed warm-load
+            raise AssertionError('runtime should not register or poll after discovery failure')
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=DiscoveryFailureRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.5')
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get('type') == 'error')
+    assert error_event['registered'] is False
+    assert error_event['relay_runtime_state'] == 'failed'
+    assert error_event['warm_load_state'] == 'failed'
+    assert error_event['last_error'] == 'llama_cpp_runtime_discovery_timeout after 0.05s'
+    assert error_event['message'] == error_event['last_error']
+    assert 'desktop.compute_node_bridge.model_init.failed' in captured.err
+    assert 'server.registered' not in captured.err

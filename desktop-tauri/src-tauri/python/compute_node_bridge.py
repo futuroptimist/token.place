@@ -643,6 +643,9 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
+    record_probe = getattr(runtime.model_manager, "record_desktop_runtime_probe", None)
+    if callable(record_probe):
+        record_probe(runtime_setup)
     apply_compute_mode(runtime.model_manager, args.mode)
 
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)
@@ -786,7 +789,11 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:
                 ready = False
                 warm_load_state = "failed"
-                warm_load_failed = "failed to initialize API v1 model runtime"
+                warm_load_failed = str(
+                    getattr(runtime, "last_runtime_error", None)
+                    or getattr(runtime.model_manager, "last_runtime_init_error", None)
+                    or "failed to initialize API v1 model runtime"
+                )
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
                     "desktop.compute_node_bridge.api_v1_e2ee.runtime_wait.exception "
@@ -801,7 +808,11 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:
                 ready = False
                 warm_load_state = "failed"
-                warm_load_failed = "failed to initialize API v1 model runtime"
+                warm_load_failed = str(
+                    getattr(runtime, "last_runtime_error", None)
+                    or getattr(runtime.model_manager, "last_runtime_init_error", None)
+                    or "failed to initialize API v1 model runtime"
+                )
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
                 print(
                     "desktop.compute_node_bridge.model_init.exception "
@@ -815,7 +826,11 @@ def run(args: argparse.Namespace) -> int:
         warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)
         if not ready:
             warm_load_state = "failed"
-            warm_load_failed = "failed to initialize API v1 model runtime"
+            warm_load_failed = str(
+                getattr(runtime, "last_runtime_error", None)
+                or getattr(runtime.model_manager, "last_runtime_init_error", None)
+                or "failed to initialize API v1 model runtime"
+            )
             print(
                 "desktop.compute_node_bridge.model_init.failed "
                 f"reason={reason} relay={_sanitize_relay_target(active_relay_url)} "

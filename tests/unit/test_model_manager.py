@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -271,7 +272,7 @@ class TestModelManager:
         mock_llama = MagicMock()
         instance = MagicMock()
         mock_llama.return_value = instance
-        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama)
+        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama, GGML_USE_CUDA=True, llama_supports_gpu_offload=lambda: True)
 
         with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
              patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
@@ -300,7 +301,7 @@ class TestModelManager:
         mock_llama = MagicMock()
         instance = MagicMock()
         mock_llama.return_value = instance
-        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama)
+        mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama, GGML_USE_CUDA=True, llama_supports_gpu_offload=lambda: True)
 
         with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
              patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
@@ -317,7 +318,7 @@ class TestModelManager:
         instance = MagicMock()
 
         mock_llama = MagicMock(return_value=instance)
-        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama)), \
+        with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=mock_llama, GGML_USE_CUDA=True, llama_supports_gpu_offload=lambda: True)), \
              patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory') as mock_can_allocate, \
              patch('utils.llm.model_manager.os.path.exists', return_value=True), \
              patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')), \
@@ -1029,3 +1030,96 @@ class TestModelManager:
         assert 'interpreter=' in summary
         assert 'llama_module_path=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary
+
+
+def test_llama_runtime_discovery_timeout_is_bounded(monkeypatch):
+    from utils.llm import model_manager as mm
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_RUNTIME_DISCOVERY_TIMEOUT_SECONDS', '0.01')
+
+    def hang_find_spec(_name):
+        time.sleep(0.2)
+        return None
+
+    monkeypatch.setattr(mm.importlib.util, 'find_spec', hang_find_spec)
+
+    started_at = time.perf_counter()
+    with pytest.raises(mm.LlamaRuntimeDiscoveryTimeout) as excinfo:
+        mm._import_llama_cpp_runtime(require_real_runtime=True)
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 0.15
+    assert excinfo.value.stage == 'llama_cpp_runtime_discovery_timeout'
+    assert 'llama_cpp_runtime_discovery_timeout' in str(excinfo.value)
+
+
+def test_desktop_runtime_probe_reused_for_compute_plan(tmp_path):
+    model_path = tmp_path / 'test_model.gguf'
+    model_path.write_bytes(b'fake model data')
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    values = {
+        'model.filename': 'test_model.gguf',
+        'model.url': 'https://example.com/model.gguf',
+        'model.download_chunk_size_mb': 1,
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.context_size': 2048,
+        'model.chat_format': 'llama-3',
+        'model.n_gpu_layers': -1,
+        'model.gpu_memory_headroom_percent': 0.1,
+        'model.enforce_gpu_memory_headroom': True,
+    }
+    mock_config.get.side_effect = lambda key, default=None: values.get(key, default)
+    manager = ModelManager(mock_config)
+    manager.record_desktop_runtime_probe({
+        'selected_backend': 'cuda',
+        'detected_device': 'cuda',
+        'runtime_action': 'already_supported',
+        'interpreter': r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\python.exe',
+        'prefix': r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311',
+        'llama_module_path': r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\llama_cpp\\__init__.py',
+    })
+    manager.requested_compute_mode = 'gpu'
+
+    with patch.object(manager, '_platform_gpu_backend', side_effect=AssertionError('duplicate backend probe')), \
+         patch.object(manager, '_llama_gpu_offload_available', side_effect=AssertionError('duplicate gpu probe')):
+        plan = manager._resolve_compute_plan()
+
+    assert plan['backend_available'] == 'cuda'
+    assert plan['backend_selected'] == 'cuda'
+    assert plan['backend_used'] == 'cuda'
+    assert plan['fallback_reason'] is None
+
+
+def test_windows_extended_path_repo_shim_detection_handles_spaces(monkeypatch, tmp_path):
+    from utils.llm import model_manager as mm
+
+    repo_root = tmp_path / 'token.place desktop'
+    repo_root.mkdir()
+    shim = repo_root / 'llama_cpp.py'
+    shim.write_text('# shim\n', encoding='utf-8')
+    monkeypatch.setattr(mm, 'REPO_LLAMA_CPP_SHIM', shim.resolve())
+
+    extended = r'\\?\\' + str(shim)
+    assert mm._is_repo_llama_cpp_shim(extended)
+
+def test_llama_gpu_probe_timeout_is_actionable(monkeypatch):
+    from utils.llm import model_manager as mm
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_RUNTIME_DISCOVERY_TIMEOUT_SECONDS', '0.01')
+
+    def hang_gpu_probe():
+        time.sleep(0.2)
+        return True
+
+    fake_llama = SimpleNamespace(
+        Llama=MagicMock(),
+        GGML_USE_CUDA=True,
+        llama_supports_gpu_offload=hang_gpu_probe,
+    )
+
+    with pytest.raises(mm.LlamaRuntimeDiscoveryTimeout) as excinfo:
+        mm._llama_runtime_capabilities_from_module(fake_llama)
+
+    assert excinfo.value.stage == 'llama_cpp_gpu_probe_timeout'

@@ -8,6 +8,30 @@ import sys
 from pathlib import Path
 
 
+def _normalize_path_key(path: str | Path) -> str:
+    raw = str(path).replace("\\", "/")
+    if raw.startswith("//?//UNC//"):
+        raw = "//" + raw[9:]
+    elif raw.startswith("//?/UNC/"):
+        raw = "//" + raw[8:]
+    elif raw.startswith("//?//"):
+        raw = raw[5:]
+    elif raw.startswith("//?/"):
+        raw = raw[4:]
+    while "//" in raw:
+        raw = raw.replace("//", "/")
+    return os.path.normcase(raw).casefold()
+
+
+def _same_path(left: str | Path, right: str | Path) -> bool:
+    try:
+        if Path(left).resolve() == Path(right).resolve():
+            return True
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return _normalize_path_key(left) == _normalize_path_key(right)
+
+
 def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
@@ -52,7 +76,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             sys.path[:] = [
                 entry
                 for entry in sys.path
-                if Path(entry or ".").resolve() != user_site_path
+                if not _same_path(entry or ".", user_site_path)
             ]
 
     if not avoid_llama_cpp_shadowing:
@@ -63,7 +87,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
         sys.path[:] = [
             entry
             for entry in sys.path
-            if entry != "" and Path(entry).resolve() != cwd
+            if entry != "" and not _same_path(entry, cwd)
         ]
 
     # Keep repo roots importable for `utils.*` / `config` while avoiding local
@@ -74,7 +98,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             continue
 
         cwd = str(Path.cwd().resolve())
-        if candidate.resolve() == Path.cwd().resolve():
+        if _same_path(candidate, Path.cwd()):
             while "" in sys.path:
                 sys.path.remove("")
             while cwd in sys.path:

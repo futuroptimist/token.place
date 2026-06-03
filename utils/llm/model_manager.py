@@ -9,6 +9,7 @@ import json
 import sys
 import importlib
 import subprocess
+import tempfile
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -123,6 +124,17 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
         }
 
 
+def _llama_cpp_probe_subprocess_cwd() -> str:
+    """Return a neutral cwd so python -c probes cannot shadow installed llama_cpp."""
+
+    # Python prepends the subprocess cwd as sys.path[0] for ``python -c``.  If the
+    # bridge is launched from the repository/runtime root, that implicit entry can
+    # resolve the repo-local llama_cpp.py shim before the sanitized PYTHONPATH.
+    # Run probe children from a neutral temp directory instead; import precedence
+    # then comes from the sanitized PYTHONPATH we pass explicitly.
+    return tempfile.gettempdir()
+
+
 def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
     """Run a llama_cpp runtime probe in a killable subprocess and return JSON output."""
 
@@ -144,6 +156,7 @@ def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optio
             text=True,
             timeout=timeout,
             env=env,
+            cwd=_llama_cpp_probe_subprocess_cwd(),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -261,6 +274,7 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
             text=True,
             timeout=timeout,
             env=env,
+            cwd=_llama_cpp_probe_subprocess_cwd(),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:

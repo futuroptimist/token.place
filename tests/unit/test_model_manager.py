@@ -1254,6 +1254,40 @@ def test_sanitize_llama_cpp_import_paths_does_not_stat_sys_path_entries(tmp_path
     assert sanitized_path[0] == str(site_packages)
 
 
+def test_llama_cpp_probe_subprocess_cwd_does_not_shadow_sanitized_pythonpath(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    repo_root = tmp_path / 'repo runtime root'
+    repo_root.mkdir()
+    (repo_root / 'llama_cpp.py').write_text('raise RuntimeError("repo shim should not win")')
+    site_packages = tmp_path / 'venv' / 'Lib' / 'site-packages'
+    package_dir = site_packages / 'llama_cpp'
+    package_dir.mkdir(parents=True)
+    (package_dir / '__init__.py').write_text('INSTALLED_RUNTIME = True\n')
+
+    original_sys_path = list(sys.path)
+    original_module = sys.modules.pop('llama_cpp', None)
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setattr(model_manager_module, 'REPO_ROOT', repo_root)
+    monkeypatch.setattr(model_manager_module, 'REPO_LLAMA_CPP_SHIM', repo_root / 'llama_cpp.py')
+    monkeypatch.setattr(sys, 'path', [str(repo_root), str(site_packages)])
+
+    try:
+        model_manager_module._sanitize_llama_cpp_import_paths()
+        spec_diagnostics = model_manager_module._find_llama_cpp_spec_in_subprocess(timeout_seconds=5)
+        import_diagnostics = model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=5)
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop('llama_cpp', None)
+        if original_module is not None:
+            sys.modules['llama_cpp'] = original_module
+
+    assert not model_manager_module._is_repo_llama_cpp_shim(spec_diagnostics['module_path'])
+    assert Path(spec_diagnostics['module_path']).parent == package_dir
+    assert not model_manager_module._is_repo_llama_cpp_shim(import_diagnostics['module_path'])
+    assert Path(import_diagnostics['module_path']).parent == package_dir
+
+
 def test_llama_cpp_runtime_discovery_timeout_does_not_mutate_parent_import_state(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

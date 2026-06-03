@@ -1449,6 +1449,7 @@ def test_import_llama_cpp_runtime_success_records_sanitized_parent_import(monkey
     from utils.llm import model_manager as model_manager_module
 
     fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+    sys.modules.pop('llama_cpp', None)
     calls = []
 
     monkeypatch.setattr(
@@ -1849,104 +1850,57 @@ def test_parent_import_signal_guard_wraps_generic_timeout_and_restores_prior_tim
     assert signal_calls[-1] == (model_manager_module.signal.SIGALRM, previous_handler)
 
 
-def test_parent_import_thread_fallback_returns_imported_module(monkeypatch):
+def test_parent_import_guard_imports_real_module_without_mocking_guard_modules(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    runtime_dir = tmp_path / 'runtime'
+    runtime_dir.mkdir()
+    (runtime_dir / 'llama_cpp.py').write_text(
+        "VALUE = 'imported by parent guard'\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(runtime_dir))
+    sys.modules.pop('llama_cpp', None)
+
+    try:
+        imported = model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=1.0)
+    finally:
+        sys.modules.pop('llama_cpp', None)
+
+    assert imported.VALUE == 'imported by parent guard'
+    assert Path(imported.__file__).parent == runtime_dir
+
+
+def test_parent_import_guard_returns_already_imported_module_without_reimport(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: object())
-    monkeypatch.setattr(model_manager_module.threading, 'main_thread', lambda: object())
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+    monkeypatch.setitem(sys.modules, 'llama_cpp', fake_runtime)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('should not re-import')),
+    )
 
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
 
 
-def test_parent_import_thread_fallback_reports_alive_worker_timeout(monkeypatch):
+def test_parent_import_guard_fails_closed_when_signal_guard_unavailable(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
-    class NeverFinishesThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-        def join(self, _timeout):
-            pass
-
-        def is_alive(self):
-            return True
-
-    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: SimpleNamespace(name='test-worker'))
-    monkeypatch.setattr(model_manager_module.threading, 'main_thread', lambda: SimpleNamespace(name='test-main'))
-    monkeypatch.setattr(model_manager_module.threading, 'Thread', NeverFinishesThread)
+    sys.modules.pop('llama_cpp', None)
+    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('unsafe parent import attempted')),
+    )
 
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
         model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
 
     assert exc_info.value.stage == 'llama_cpp_import'
-
-
-def test_parent_import_thread_fallback_handles_empty_timeout_and_error_results(monkeypatch):
-    from utils.llm import model_manager as model_manager_module
-
-    class NoResultThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-        def join(self, _timeout):
-            pass
-
-        def is_alive(self):
-            return False
-
-    class ImmediateThread:
-        def __init__(self, target, *args, **kwargs):
-            self._target = target
-
-        def start(self):
-            self._target()
-
-        def join(self, _timeout):
-            pass
-
-        def is_alive(self):
-            return False
-
-    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: object())
-    monkeypatch.setattr(model_manager_module.threading, 'main_thread', lambda: object())
-    monkeypatch.setattr(model_manager_module.threading, 'Thread', NoResultThread)
-    with pytest.raises(ImportError, match='completed without result'):
-        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
-
-    monkeypatch.setattr(model_manager_module.threading, 'Thread', ImmediateThread)
-    monkeypatch.setattr(
-        model_manager_module.importlib,
-        'import_module',
-        lambda _name: (_ for _ in ()).throw(TimeoutError('worker timeout')),
-    )
-    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
-        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
-
-    monkeypatch.setattr(
-        model_manager_module.importlib,
-        'import_module',
-        lambda _name: (_ for _ in ()).throw(
-            model_manager_module.LlamaCppRuntimeStageTimeout('llama_cpp_import', 0.01)
-        ),
-    )
-    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
-        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
-
-    monkeypatch.setattr(
-        model_manager_module.importlib,
-        'import_module',
-        lambda _name: (_ for _ in ()).throw(RuntimeError('worker import failed')),
-    )
-    with pytest.raises(RuntimeError, match='worker import failed'):
-        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+    assert exc_info.value.timeout_seconds == 0.01
 
 
 def test_detect_llama_runtime_capabilities_preserves_import_timeout(monkeypatch):

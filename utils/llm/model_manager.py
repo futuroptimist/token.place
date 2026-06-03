@@ -387,10 +387,39 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
 
 
 def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp in this process with a recoverable timeout where possible."""
+    """Import llama_cpp in this process with bounded recoverability safeguards.
+
+    On Windows and other platforms without SIGALRM/ITIMER_REAL there is no
+    recoverable in-process way to interrupt a first native extension import that
+    hangs while holding the GIL.  Starting a daemon Python worker there can leave
+    the bridge stuck before it can report a warm-load failure, so the no-SIGALRM
+    path fails closed unless ``llama_cpp`` is already imported.  POSIX main-thread
+    imports use SIGALRM.  POSIX non-main imports retain the short Python-thread
+    guard used by warm-load tests, but Windows never relies on that non-recoverable
+    fallback for first import.
+    """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
-    if threading.current_thread() is threading.main_thread() and hasattr(signal, 'SIGALRM'):
+    already_imported = sys.modules.get('llama_cpp')
+    if already_imported is not None:
+        return already_imported
+
+    signal_guard_available = (
+        hasattr(signal, 'SIGALRM')
+        and hasattr(signal, 'ITIMER_REAL')
+        and hasattr(signal, 'setitimer')
+    )
+    if not signal_guard_available:
+        logger.error(
+            "llama_cpp parent import guard unavailable; failing closed "
+            "timeout_seconds=%s interpreter=%s thread=%s",
+            f"{timeout:g}",
+            sys.executable,
+            getattr(threading.current_thread(), 'name', 'unknown'),
+        )
+        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+
+    if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
         previous_timer = signal.setitimer(signal.ITIMER_REAL, timeout)
 

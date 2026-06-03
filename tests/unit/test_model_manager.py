@@ -1802,3 +1802,217 @@ def test_download_file_in_chunks_handles_request_start_failures(standalone_model
             'https://example.com/model.gguf',
             1,
         ) is False
+
+
+def test_canonical_path_for_compare_returns_none_when_stringification_fails_twice():
+    from utils.llm import model_manager as model_manager_module
+
+    class BrokenPath:
+        def __str__(self):
+            raise OSError('unreadable path text')
+
+    assert model_manager_module._canonical_path_for_compare(BrokenPath()) is None
+
+
+def test_parent_import_signal_guard_wraps_generic_timeout_and_restores_prior_timer(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    setitimer_calls = []
+    signal_calls = []
+    previous_handler = object()
+
+    monkeypatch.setattr(model_manager_module.signal, 'getsignal', lambda _sig: previous_handler)
+
+    def _fake_signal(sig, handler):
+        signal_calls.append((sig, handler))
+
+    def _fake_setitimer(timer, seconds, interval=0):
+        setitimer_calls.append((timer, seconds, interval))
+        if seconds == 0.25:
+            return (2.0, 0.5)
+        return (0.0, 0.0)
+
+    monkeypatch.setattr(model_manager_module.signal, 'signal', _fake_signal)
+    monkeypatch.setattr(model_manager_module.signal, 'setitimer', _fake_setitimer)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(TimeoutError('generic timeout')),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.25)
+
+    assert exc_info.value.stage == 'llama_cpp_import'
+    assert (model_manager_module.signal.ITIMER_REAL, 0, 0) in setitimer_calls
+    assert (model_manager_module.signal.ITIMER_REAL, 2.0, 0.5) in setitimer_calls
+    assert signal_calls[-1] == (model_manager_module.signal.SIGALRM, previous_handler)
+
+
+def test_parent_import_thread_fallback_returns_imported_module(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: object())
+    monkeypatch.setattr(model_manager_module.threading, 'main_thread', lambda: object())
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+
+    assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
+
+
+def test_parent_import_thread_fallback_reports_alive_worker_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class NeverFinishesThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, _timeout):
+            pass
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: SimpleNamespace(name='test-worker'))
+    monkeypatch.setattr(model_manager_module.threading, 'main_thread', lambda: SimpleNamespace(name='test-main'))
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', NeverFinishesThread)
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+
+    assert exc_info.value.stage == 'llama_cpp_import'
+
+
+def test_parent_import_thread_fallback_handles_empty_timeout_and_error_results(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class NoResultThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, _timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    class ImmediateThread:
+        def __init__(self, target, *args, **kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def join(self, _timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: object())
+    monkeypatch.setattr(model_manager_module.threading, 'main_thread', lambda: object())
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', NoResultThread)
+    with pytest.raises(ImportError, match='completed without result'):
+        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', ImmediateThread)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(TimeoutError('worker timeout')),
+    )
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppRuntimeStageTimeout('llama_cpp_import', 0.01)
+        ),
+    )
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(RuntimeError('worker import failed')),
+    )
+    with pytest.raises(RuntimeError, match='worker import failed'):
+        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+
+
+def test_detect_llama_runtime_capabilities_preserves_import_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppRuntimeStageTimeout('llama_cpp_import', 0.02)
+        ),
+    )
+
+    diagnostics = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert diagnostics['backend'] == 'missing'
+    assert diagnostics['gpu_offload_supported'] is False
+    assert diagnostics['error'] == 'llama_cpp_import_timeout after 0.02s'
+
+
+def test_gpu_compute_plan_falls_back_when_runtime_reports_no_gpu_backend(standalone_model_manager):
+    standalone_model_manager.requested_compute_mode = 'gpu'
+
+    with patch.object(
+        standalone_model_manager,
+        '_runtime_capabilities',
+        return_value={
+            'backend': 'cpu',
+            'gpu_offload_supported': False,
+            'detected_device': 'cpu',
+            'llama_module_path': 'unknown',
+            'error': None,
+        },
+    ):
+        plan = standalone_model_manager._resolve_compute_plan()
+
+    assert plan['effective_mode'] == 'cpu_fallback'
+    assert plan['backend_available'] == 'cpu'
+    assert plan['fallback_reason'] == 'no CUDA/Metal backend is supported on this platform'
+
+
+def test_hybrid_compute_plan_falls_back_when_backend_lacks_offload(standalone_model_manager):
+    standalone_model_manager.requested_compute_mode = 'hybrid'
+
+    with patch.object(
+        standalone_model_manager,
+        '_runtime_capabilities',
+        return_value={
+            'backend': 'metal',
+            'gpu_offload_supported': False,
+            'detected_device': 'cpu',
+            'llama_module_path': '/site-packages/llama_cpp/__init__.py',
+            'error': None,
+        },
+    ):
+        plan = standalone_model_manager._resolve_compute_plan()
+
+    assert plan['effective_mode'] == 'cpu_fallback'
+    assert plan['backend_available'] == 'metal'
+    assert plan['fallback_reason'] == 'llama-cpp-python runtime does not expose metal GPU offload support'
+
+
+def test_production_log_helper_suppresses_logger_call(standalone_model_manager):
+    standalone_model_manager.config.is_production = True
+
+    with patch('utils.llm.model_manager.logger.log') as log:
+        standalone_model_manager.log_info('hidden in production')
+
+    log.assert_not_called()

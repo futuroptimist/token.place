@@ -96,7 +96,7 @@ def _packaged_env(tmp_root: Path, resources_root: Path, relay_url: str, *, sessi
             "TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS": "30",
             "TOKENPLACE_OPERATOR_SESSION_ID": session_id,
             "TOKENPLACE_COMPUTE_NODE_SESSION_ID": session_id,
-            "TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.05",
+            "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "2",
             "TOKENPLACE_API_V1_RELAY_LONG_POLL_SECONDS": "0.05",
             "TOKENPLACE_DISTRIBUTED_COMPUTE_URL": relay_url,
             "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL": relay_url,
@@ -465,7 +465,7 @@ def _start_relay(relay_port: int, stdout_path: Path, stderr_path: Path) -> tuple
             "TOKENPLACE_DISTRIBUTED_COMPUTE_URL": relay_url,
             "TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL": relay_url,
             "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS": "20",
-            "TOKENPLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.05",
+            "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "2",
             "TOKENPLACE_API_V1_RELAY_LONG_POLL_SECONDS": "0.05",
             "PYTHONUNBUFFERED": "1",
         }

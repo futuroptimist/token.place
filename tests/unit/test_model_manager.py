@@ -881,7 +881,7 @@ class TestModelManager:
             assert ModelManager._llama_gpu_offload_available() is False
 
     def test_get_llm_instance_mock_mode_refreshes_compute_diagnostics(self, model_manager):
-        """Mock mode should persist diagnostics from resolved compute plan."""
+        """Mock mode should persist diagnostics without probing llama_cpp."""
         model_manager.use_mock_llm = True
         expected_plan = {
             'requested_mode': 'hybrid',
@@ -893,11 +893,13 @@ class TestModelManager:
             'fallback_reason': None,
         }
 
-        with patch.object(model_manager, '_resolve_compute_plan', return_value=expected_plan):
+        with patch.object(model_manager, '_mock_compute_plan', return_value=expected_plan), \
+             patch.object(model_manager, '_resolve_compute_plan') as resolve_plan:
             llm = model_manager.get_llm_instance()
 
         assert isinstance(llm, MagicMock)
         assert model_manager.last_compute_diagnostics == expected_plan
+        resolve_plan.assert_not_called()
 
     def test_platform_gpu_backend_linux_detects_metal_marker(self):
         """Linux backend detection should return Metal when CUDA is unavailable."""

@@ -625,6 +625,44 @@ class ModelManager:
         runtime = self._runtime_capabilities() if self is not None else detect_llama_runtime_capabilities()
         return bool(runtime.get('gpu_offload_supported', False))
 
+    def _mock_compute_plan(self) -> Dict[str, Any]:
+        """Return lightweight diagnostics for mock LLM mode without probing llama_cpp."""
+
+        requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
+        probe = _coerce_desktop_runtime_probe(getattr(self, 'desktop_runtime_probe', None))
+        runtime_error = None
+        backend = 'cpu'
+        gpu_runtime_supported = False
+        if probe is not None:
+            runtime_error = probe.get('error')
+            backend = str(probe.get('backend') or 'cpu')
+            gpu_runtime_supported = bool(probe.get('gpu_offload_supported', False))
+
+        gpu_requested = requested in {'auto', 'gpu', 'hybrid'} and int(self.default_n_gpu_layers) != 0
+        fallback_reason = None
+        backend_selected = backend if gpu_requested else 'cpu'
+        backend_used = backend_selected
+        n_gpu_layers = 0
+        effective_mode = 'cpu'
+
+        if gpu_requested and backend in {'cuda', 'metal'} and gpu_runtime_supported:
+            effective_mode = backend if requested == 'gpu' else (f'hybrid_{backend}' if requested == 'hybrid' else backend)
+            n_gpu_layers = -1 if requested in {'auto', 'gpu'} else max(1, int(self.hybrid_n_gpu_layers))
+        elif gpu_requested:
+            backend_used = 'cpu'
+            fallback_reason = runtime_error or 'mock LLM mode does not require llama_cpp GPU probing'
+            effective_mode = 'cpu_fallback' if requested != 'cpu' else 'cpu'
+        return {
+            'requested_mode': requested,
+            'effective_mode': effective_mode,
+            'backend_available': backend,
+            'backend_selected': backend_selected,
+            'backend_used': backend_used,
+            'n_gpu_layers': n_gpu_layers,
+            'fallback_reason': fallback_reason,
+            'mock_runtime': True,
+        }
+
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
         runtime = self._runtime_capabilities()
@@ -870,7 +908,7 @@ class ModelManager:
         # Check if mocking is enabled via configuration
         if self.use_mock_llm:
             self.log_info("Using Mock LLM instance based on USE_MOCK_LLM configuration.")
-            self.last_compute_diagnostics = self._resolve_compute_plan()
+            self.last_compute_diagnostics = self._mock_compute_plan()
             mock_llama_instance = MagicMock()
             mock_response = {
                 'choices': [

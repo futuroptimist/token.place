@@ -9,6 +9,7 @@ import json
 import sys
 import importlib
 import queue
+import subprocess
 import threading
 from pathlib import Path
 from threading import Lock
@@ -156,22 +157,83 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
     )
     return {
         'import_root': import_root,
-        'removed_entries': moved,
+        'deprioritized_entries': moved,
         'sys_path_count': len(sys.path),
     }
 
 
+def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+    """Validate llama_cpp import in a killable subprocess before in-process import."""
+
+    timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+    pythonpath_entries = [str(entry or Path.cwd()) for entry in sys.path]
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
+    code = (
+        "import importlib, json, sys\n"
+        "llama_cpp = importlib.import_module('llama_cpp')\n"
+        "print(json.dumps({\n"
+        "    'module_path': getattr(llama_cpp, '__file__', None),\n"
+        "    'interpreter': sys.executable,\n"
+        "}))\n"
+    )
+    started_at = time.perf_counter()
+    logger.info(
+        "llama_cpp import watchdog start timeout_seconds=%s interpreter=%s",
+        f"{timeout:g}",
+        sys.executable,
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.error(
+            "llama_cpp import watchdog timeout duration_ms=%s timeout_seconds=%s interpreter=%s",
+            duration_ms,
+            f"{timeout:g}",
+            sys.executable,
+        )
+        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout) from exc
+
+    duration_ms = int((time.perf_counter() - started_at) * 1000)
+    if completed.returncode != 0:
+        stderr = (completed.stderr or '').strip()
+        raise ImportError(
+            "llama_cpp import watchdog failed "
+            f"returncode={completed.returncode} stderr={stderr[:500]}"
+        )
+
+    stdout = (completed.stdout or '').strip().splitlines()
+    diagnostics: Dict[str, Any] = {}
+    if stdout:
+        try:
+            parsed = json.loads(stdout[-1])
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            diagnostics = parsed
+    logger.info(
+        "llama_cpp import watchdog complete duration_ms=%s module_path=%s",
+        duration_ms,
+        diagnostics.get('module_path') or 'unknown',
+    )
+    return diagnostics
+
+
 def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seconds: Optional[float] = None):
     """Import llama_cpp while guarding against the repo-local test shim with bounded stages."""
-    path_diagnostics = _run_llama_runtime_stage(
-        'llama_cpp_import_path_sanitize',
-        _sanitize_llama_cpp_import_paths,
-        timeout_seconds=timeout_seconds,
-    )
+    path_diagnostics = _sanitize_llama_cpp_import_paths()
     logger.info(
-        "llama_cpp import path sanitized import_root=%s removed_entries=%s sys_path_count=%s",
+        "llama_cpp import path sanitized import_root=%s deprioritized_entries=%s sys_path_count=%s",
         path_diagnostics.get('import_root'),
-        len(path_diagnostics.get('removed_entries', [])),
+        len(path_diagnostics.get('deprioritized_entries', [])),
         path_diagnostics.get('sys_path_count'),
     )
 
@@ -197,11 +259,8 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
             "install llama-cpp-python and ensure site-packages wins import priority."
         )
 
-    llama_cpp = _run_llama_runtime_stage(
-        'llama_cpp_import',
-        lambda: importlib.import_module('llama_cpp'),
-        timeout_seconds=timeout_seconds,
-    )
+    _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
+    llama_cpp = importlib.import_module('llama_cpp')
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",

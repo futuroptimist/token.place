@@ -1120,3 +1120,43 @@ def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
     assert not model_manager_module._is_repo_llama_cpp_shim(
         r'\\?\\C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\llama_cpp\\__init__.py'
     )
+
+
+def test_llama_cpp_import_watchdog_timeout_uses_subprocess(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    def _timeout_run(*_args, **kwargs):
+        raise model_manager_module.subprocess.TimeoutExpired(
+            cmd=kwargs.get('args', ['python']),
+            timeout=kwargs.get('timeout'),
+        )
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', _timeout_run)
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+        model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=0.01)
+
+    assert exc_info.value.stage == 'llama_cpp_import'
+    assert 'llama_cpp_import after 0.01s' in str(exc_info.value)
+
+
+def test_sanitize_llama_cpp_import_paths_reports_deprioritized_entries(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    (tmp_path / 'llama_cpp.py').write_text('raise RuntimeError("repo shim")')
+    site_packages = tmp_path / 'venv' / 'Lib' / 'site-packages'
+    site_packages.mkdir(parents=True)
+    original_sys_path = list(sys.path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(model_manager_module, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(model_manager_module, 'REPO_LLAMA_CPP_SHIM', tmp_path / 'llama_cpp.py')
+    monkeypatch.setattr(sys, 'path', [str(tmp_path), str(site_packages), '/other'])
+
+    try:
+        diagnostics = model_manager_module._sanitize_llama_cpp_import_paths()
+    finally:
+        sys.path[:] = original_sys_path
+
+    assert diagnostics['deprioritized_entries'] == [str(tmp_path)]
+    assert 'removed_entries' not in diagnostics
+    assert diagnostics['sys_path_count'] == 3

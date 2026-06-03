@@ -1737,6 +1737,30 @@ def test_cpu_compute_plan_returns_cpu_diagnostics_with_imported_runtime(standalo
     }
 
 
+def test_cpu_compute_plan_ignores_gpu_probe_timeout(standalone_model_manager):
+    standalone_model_manager.requested_compute_mode = 'cpu'
+
+    with patch.object(standalone_model_manager, '_runtime_capabilities', return_value={
+        'backend': 'missing',
+        'gpu_offload_supported': False,
+        'detected_device': 'none',
+        'llama_module_path': 'unknown',
+        'error': 'llama_cpp_gpu_probe_timeout after 0.01s',
+    }) as runtime_capabilities:
+        plan = standalone_model_manager._resolve_compute_plan()
+
+    runtime_capabilities.assert_called_once()
+    assert plan == {
+        'requested_mode': 'cpu',
+        'effective_mode': 'cpu',
+        'backend_available': 'cpu',
+        'backend_selected': 'cpu',
+        'backend_used': 'cpu',
+        'n_gpu_layers': 0,
+        'fallback_reason': None,
+    }
+
+
 def test_download_file_in_chunks_handles_request_start_failures(standalone_model_manager):
     from utils.llm import model_manager as model_manager_module
 

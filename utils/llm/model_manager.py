@@ -754,12 +754,13 @@ class ModelManager:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
         runtime = self._runtime_capabilities()
         runtime_error = str(runtime.get('error') or '')
-        if runtime_error.endswith('_timeout') or '_timeout after ' in runtime_error:
-            raise RuntimeError(runtime_error)
         backend = str(runtime.get('backend') or 'cpu')
         backend_available = backend if backend in {'cuda', 'metal'} else 'cpu'
         gpu_runtime_supported = bool(runtime.get('gpu_offload_supported', False))
         fallback_reason = None
+
+        if requested != 'cpu' and (runtime_error.endswith('_timeout') or '_timeout after ' in runtime_error):
+            raise RuntimeError(runtime_error)
 
         if requested == 'auto':
             requested_layers = int(self.default_n_gpu_layers)

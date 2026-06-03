@@ -1029,3 +1029,27 @@ class TestModelManager:
         assert 'interpreter=' in summary
         assert 'llama_module_path=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary
+
+    def test_successful_desktop_probe_diagnostics_are_reused_for_compute_plan(self, model_manager):
+        """The desktop preflight probe should avoid duplicate fragile discovery during warm-load."""
+        model_manager.set_llama_runtime_probe({
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'already_supported',
+            'interpreter': r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\python.exe',
+            'llama_module_path': (
+                r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\'
+                r'site-packages\\llama_cpp\\__init__.py'
+            ),
+            'fallback_reason': None,
+        })
+        model_manager.requested_compute_mode = 'gpu'
+
+        with patch('utils.llm.model_manager.detect_llama_runtime_capabilities') as detect:
+            plan = model_manager._resolve_compute_plan()
+
+        detect.assert_not_called()
+        assert plan['backend_available'] == 'cuda'
+        assert plan['backend_selected'] == 'cuda'
+        assert plan['backend_used'] == 'cuda'
+        assert plan['n_gpu_layers'] == -1

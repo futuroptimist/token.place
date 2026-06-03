@@ -643,6 +643,9 @@ def run(args: argparse.Namespace) -> int:
     )
 
     runtime.model_manager.model_path = args.model
+    set_runtime_probe = getattr(runtime.model_manager, "set_llama_runtime_probe", None)
+    if callable(set_runtime_probe):
+        set_runtime_probe(runtime_setup)
     apply_compute_mode(runtime.model_manager, args.mode)
 
     warm_load_enabled = _env_enabled("TOKENPLACE_DESKTOP_WARM_LOAD", WARM_LOAD_DEFAULT)

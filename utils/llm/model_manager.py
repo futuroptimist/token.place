@@ -9,9 +9,9 @@ import json
 import sys
 import importlib
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from unittest.mock import MagicMock
-from typing import Dict, List, Any, Optional, Union, Tuple, Iterable
+from typing import Callable, Dict, List, Any, Optional, Union, Tuple, Iterable, TypeVar
 
 from utils.system import resource_monitor
 
@@ -19,22 +19,123 @@ from utils.system import resource_monitor
 logger = logging.getLogger('model_manager')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
+DEFAULT_LLAMA_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
+_T = TypeVar('_T')
+
+
+class LlamaCppRuntimeTimeout(TimeoutError):
+    """Raised when a llama_cpp discovery/import/probe stage exceeds its bound."""
+
+    def __init__(self, stage: str, timeout_seconds: float):
+        self.stage = stage
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"{stage}_timeout after {timeout_seconds:g}s")
+
+
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def llama_runtime_stage_timeout_seconds() -> float:
+    return _parse_positive_float_env(
+        'TOKEN_PLACE_LLAMA_RUNTIME_STAGE_TIMEOUT_SECONDS',
+        DEFAULT_LLAMA_RUNTIME_STAGE_TIMEOUT_SECONDS,
+    )
+
+
+def _strip_windows_extended_path_prefix(path_value: str) -> str:
+    if path_value.startswith('\\\\?\\UNC\\'):
+        return '\\\\' + path_value[8:]
+    if path_value.startswith('\\\\?\\'):
+        return path_value[4:]
+    return path_value
+
+
+def _normalize_path_for_comparison(path_value: Any) -> Optional[str]:
+    if not path_value:
+        return None
+    try:
+        stripped = _strip_windows_extended_path_prefix(str(path_value))
+        resolved = str(Path(stripped).resolve())
+    except (TypeError, ValueError, OSError):
+        resolved = _strip_windows_extended_path_prefix(str(path_value))
+    return resolved.replace('\\', '/').lower()
+
+
+def _run_bounded_runtime_stage(
+    stage: str,
+    fn: Callable[[], _T],
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> _T:
+    timeout = llama_runtime_stage_timeout_seconds() if timeout_seconds is None else timeout_seconds
+    result: list[Any] = []
+    error: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            result.append(fn())
+        except BaseException as exc:  # pragma: no cover - re-raised by caller
+            error.append(exc)
+
+    worker = Thread(target=_target, name=f'tokenplace-{stage}', daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise LlamaCppRuntimeTimeout(stage, timeout)
+    if error:
+        raise error[0]
+    return result[0] if result else None  # type: ignore[return-value]
 
 
 def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     """Return True when llama_cpp resolves to the repository-local shim."""
     if not module_path:
         return False
-    try:
-        return Path(str(module_path)).resolve() == REPO_LLAMA_CPP_SHIM
-    except (TypeError, ValueError, OSError):
-        return False
+    module_normalized = _normalize_path_for_comparison(module_path)
+    shim_normalized = _normalize_path_for_comparison(REPO_LLAMA_CPP_SHIM)
+    return bool(module_normalized and shim_normalized and module_normalized == shim_normalized)
 
 
-def _import_llama_cpp_runtime(*, require_real_runtime: bool = True):
+def _import_llama_cpp_runtime(
+    *,
+    require_real_runtime: bool = True,
+    timeout_seconds: Optional[float] = None,
+    log_stage: Optional[Callable[[str], None]] = None,
+):
     """Import llama_cpp while guarding against the repo-local test shim."""
-    llama_spec = importlib.util.find_spec('llama_cpp')
+
+    def _log(message: str) -> None:
+        if callable(log_stage):
+            log_stage(message)
+
+    import_root = os.getenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '').strip() or str(REPO_ROOT)
+    _log(
+        "llama_cpp runtime discovery stage=resolve_import_root "
+        f"interpreter={sys.executable} import_root={import_root} "
+        f"prefix={sys.prefix}"
+    )
+
+    started_at = time.perf_counter()
+    _log("llama_cpp runtime discovery stage=find_spec start")
+    llama_spec = _run_bounded_runtime_stage(
+        'llama_cpp_runtime_discovery',
+        lambda: importlib.util.find_spec('llama_cpp'),
+        timeout_seconds=timeout_seconds,
+    )
     llama_module_path = getattr(llama_spec, 'origin', None)
+    _log(
+        "llama_cpp runtime discovery stage=find_spec done "
+        f"duration_ms={int((time.perf_counter() - started_at) * 1000)} "
+        f"module_path={llama_module_path or 'missing'}"
+    )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
         sys.modules.pop('llama_cpp', None)
@@ -43,8 +144,19 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True):
             "install llama-cpp-python and ensure site-packages wins import priority."
         )
 
-    llama_cpp = importlib.import_module('llama_cpp')
+    started_at = time.perf_counter()
+    _log("llama_cpp runtime discovery stage=import start")
+    llama_cpp = _run_bounded_runtime_stage(
+        'llama_cpp_import',
+        lambda: importlib.import_module('llama_cpp'),
+        timeout_seconds=timeout_seconds,
+    )
     llama_module_path = getattr(llama_cpp, '__file__', None)
+    _log(
+        "llama_cpp runtime discovery stage=import done "
+        f"duration_ms={int((time.perf_counter() - started_at) * 1000)} "
+        f"module_path={llama_module_path or 'unknown'}"
+    )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
         sys.modules.pop('llama_cpp', None)
@@ -55,19 +167,8 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True):
 
     return llama_cpp
 
-
-def detect_llama_runtime_capabilities() -> Dict[str, Any]:
-    """Return backend/offload capability details from the installed llama_cpp runtime."""
-    try:
-        llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
-    except Exception as exc:
-        return {
-            'backend': 'missing',
-            'gpu_offload_supported': False,
-            'detected_device': 'none',
-            'error': str(exc),
-        }
-
+def _capabilities_from_llama_cpp(llama_cpp: Any, *, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+    """Return backend/offload capability details from an imported llama_cpp module."""
     backend = 'cpu'
     cuda_markers = (
         'GGML_USE_CUDA',
@@ -90,7 +191,15 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     gpu_offload_supported = False
     if callable(supports_gpu):
         try:
-            gpu_offload_supported = bool(supports_gpu())
+            gpu_offload_supported = bool(
+                _run_bounded_runtime_stage(
+                    'llama_cpp_gpu_probe',
+                    supports_gpu,
+                    timeout_seconds=timeout_seconds,
+                )
+            )
+        except LlamaCppRuntimeTimeout:
+            raise
         except Exception:
             gpu_offload_supported = False
     else:
@@ -112,6 +221,27 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'error': None,
     }
 
+
+def detect_llama_runtime_capabilities(
+    llama_cpp: Any = None, *, timeout_seconds: Optional[float] = None
+) -> Dict[str, Any]:
+    """Return backend/offload capability details from the installed llama_cpp runtime."""
+    try:
+        runtime = llama_cpp or _import_llama_cpp_runtime(
+            require_real_runtime=True,
+            timeout_seconds=timeout_seconds,
+        )
+        return _capabilities_from_llama_cpp(runtime, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        return {
+            'backend': 'missing',
+            'gpu_offload_supported': False,
+            'detected_device': 'none',
+            'interpreter': sys.executable,
+            'prefix': sys.prefix,
+            'llama_module_path': 'missing',
+            'error': str(exc),
+        }
 
 def llama_cpp_verbose_logging_enabled() -> bool:
     """Return whether raw llama.cpp verbose logging should be enabled."""
@@ -167,6 +297,7 @@ class ModelManager:
         self.gpu_headroom_percent = config.get('model.gpu_memory_headroom_percent', 0.1)
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
         self.requested_compute_mode = 'auto'
+        self.llama_runtime_probe: Optional[Dict[str, Any]] = None
         self.last_compute_diagnostics = {
             'requested_mode': 'auto',
             'effective_mode': 'pending',
@@ -177,17 +308,49 @@ class ModelManager:
             'fallback_reason': None,
         }
 
-    @staticmethod
-    def _platform_gpu_backend() -> Optional[str]:
-        runtime = detect_llama_runtime_capabilities()
+    def set_llama_runtime_probe(self, runtime_probe: Dict[str, Any]) -> None:
+        """Record successful desktop runtime probe diagnostics for model init."""
+        if not isinstance(runtime_probe, dict):
+            return
+        if runtime_probe.get('runtime_action') == 'shadowed_repo_llama_cpp':
+            return
+        backend = str(runtime_probe.get('selected_backend') or runtime_probe.get('backend') or 'cpu')
+        gpu_supported = (
+            backend in {'cuda', 'metal'}
+            or str(runtime_probe.get('detected_device', '')).lower() in {'cuda', 'metal'}
+        )
+        self.llama_runtime_probe = {
+            'backend': backend,
+            'gpu_offload_supported': gpu_supported,
+            'detected_device': runtime_probe.get('detected_device') or backend,
+            'interpreter': runtime_probe.get('interpreter') or sys.executable,
+            'prefix': runtime_probe.get('prefix') or sys.prefix,
+            'llama_module_path': runtime_probe.get('llama_module_path') or 'unknown',
+            'error': runtime_probe.get('fallback_reason'),
+        }
+
+    def _runtime_capabilities(self) -> Dict[str, Any]:
+        if self.llama_runtime_probe is not None:
+            return dict(self.llama_runtime_probe)
+        return detect_llama_runtime_capabilities()
+
+    def _platform_gpu_backend(self=None) -> Optional[str]:
+        runtime = (
+            self._runtime_capabilities()
+            if isinstance(self, ModelManager)
+            else detect_llama_runtime_capabilities()
+        )
         backend = str(runtime.get('backend') or 'cpu')
         if backend in {'cuda', 'metal'}:
             return backend
         return None
 
-    @staticmethod
-    def _llama_gpu_offload_available() -> bool:
-        runtime = detect_llama_runtime_capabilities()
+    def _llama_gpu_offload_available(self=None) -> bool:
+        runtime = (
+            self._runtime_capabilities()
+            if isinstance(self, ModelManager)
+            else detect_llama_runtime_capabilities()
+        )
         return bool(runtime.get('gpu_offload_supported', False))
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
@@ -461,12 +624,24 @@ class ModelManager:
                         try:
                             # Dynamically import Llama only when needed
                             self.log_info("Locating llama_cpp runtime for model initialization...")
-                            llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
+                            llama_cpp = _import_llama_cpp_runtime(
+                                require_real_runtime=True,
+                                timeout_seconds=llama_runtime_stage_timeout_seconds(),
+                                log_stage=self.log_info,
+                            )
                             self.log_info(
                                 "llama_cpp runtime located "
                                 f"module_path={getattr(llama_cpp, '__file__', 'unknown')}"
                             )
                             Llama = llama_cpp.Llama
+                            imported_runtime_identity = detect_llama_runtime_capabilities(
+                                llama_cpp,
+                                timeout_seconds=llama_runtime_stage_timeout_seconds(),
+                            )
+                            if imported_runtime_identity.get('error'):
+                                raise RuntimeError(imported_runtime_identity['error'])
+                            if not self.llama_runtime_probe:
+                                self.llama_runtime_probe = imported_runtime_identity
 
                             self.log_info("Selecting compute plan for model initialization...")
                             compute_plan = self._resolve_compute_plan()
@@ -519,7 +694,7 @@ class ModelManager:
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
                             self.last_compute_diagnostics = compute_plan
-                            runtime_identity = detect_llama_runtime_capabilities()
+                            runtime_identity = imported_runtime_identity
                             self.log_info(
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "

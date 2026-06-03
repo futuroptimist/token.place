@@ -33,6 +33,10 @@ class FakeModelManager:
         self.default_n_gpu_layers = -1
         self.requested_compute_mode = 'auto'
         self.last_compute_diagnostics = None
+        self.llama_runtime_probe = None
+
+    def set_llama_runtime_probe(self, runtime_probe):
+        self.llama_runtime_probe = dict(runtime_probe)
 
 
 class FakeRelayClient:
@@ -2925,3 +2929,51 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
         in payload["last_error"]
     )
     assert "missing=cryptography,requests" in payload["last_error"]
+
+
+def test_run_passes_successful_runtime_probe_to_model_manager(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class ProbeRuntime(NullErrorHeartbeatRuntime):
+        last_instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            ProbeRuntime.last_instance = self
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ProbeRuntime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'already_supported',
+            'interpreter': r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\python.exe',
+            'llama_module_path': (
+                r'C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\'
+                r'site-packages\\llama_cpp\\__init__.py'
+            ),
+            'fallback_reason': '',
+        },
+    )
+    call_count = {'n': 0}
+
+    def fake_stop_requested():
+        call_count['n'] += 1
+        return call_count['n'] > 1
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+
+    status = compute_node_bridge.run(SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='auto',
+        relay_url='https://token.place',
+        relay_port=None,
+    ))
+
+    assert status == 0
+    assert ProbeRuntime.last_instance is not None
+    assert ProbeRuntime.last_instance.model_manager.llama_runtime_probe['selected_backend'] == 'cuda'
+    output = capsys.readouterr()
+    assert 'desktop.runtime_setup mode=auto selected_backend=cuda' in output.err

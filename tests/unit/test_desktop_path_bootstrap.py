@@ -269,3 +269,10 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
             sys.modules.pop('llama_cpp', None)
         else:
             sys.modules['llama_cpp'] = original_llama_module
+
+
+def test_normalized_path_key_treats_windows_extended_prefix_and_spaces_as_same(path_bootstrap):
+    regular = r"C:\Users\danie\AppData\Local\token.place desktop"
+    extended = r"\\?\C:\Users\danie\AppData\Local\token.place desktop"
+
+    assert path_bootstrap._normalized_path_key(regular) == path_bootstrap._normalized_path_key(extended)

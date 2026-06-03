@@ -8,6 +8,23 @@ import sys
 from pathlib import Path
 
 
+def _strip_windows_extended_path_prefix(path_value: str) -> str:
+    if path_value.startswith('\\\\?\\UNC\\'):
+        return '\\\\' + path_value[8:]
+    if path_value.startswith('\\\\?\\'):
+        return path_value[4:]
+    return path_value
+
+
+def _normalized_path_key(path_value: object) -> str:
+    stripped = _strip_windows_extended_path_prefix(str(path_value))
+    try:
+        resolved = str(Path(stripped).resolve())
+    except (TypeError, ValueError, OSError):
+        resolved = stripped
+    return resolved.replace('\\', '/').lower()
+
+
 def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
@@ -36,7 +53,10 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
         has_runtime_modules = (candidate / "utils").is_dir() or (candidate / "config.py").is_file()
         if has_runtime_modules:
             candidate_str = str(candidate)
-            if candidate_str not in valid_candidates:
+            if not any(
+                _normalized_path_key(candidate_str) == _normalized_path_key(existing)
+                for existing in valid_candidates
+            ):
                 valid_candidates.append(candidate_str)
 
     # Preserve candidate priority: first valid candidate should be first on sys.path.
@@ -52,7 +72,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             sys.path[:] = [
                 entry
                 for entry in sys.path
-                if Path(entry or ".").resolve() != user_site_path
+                if _normalized_path_key(entry or ".") != _normalized_path_key(user_site_path)
             ]
 
     if not avoid_llama_cpp_shadowing:
@@ -63,7 +83,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
         sys.path[:] = [
             entry
             for entry in sys.path
-            if entry != "" and Path(entry).resolve() != cwd
+            if entry != "" and _normalized_path_key(entry) != _normalized_path_key(cwd)
         ]
 
     # Keep repo roots importable for `utils.*` / `config` while avoiding local
@@ -74,7 +94,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             continue
 
         cwd = str(Path.cwd().resolve())
-        if candidate.resolve() == Path.cwd().resolve():
+        if _normalized_path_key(candidate) == _normalized_path_key(Path.cwd()):
             while "" in sys.path:
                 sys.path.remove("")
             while cwd in sys.path:

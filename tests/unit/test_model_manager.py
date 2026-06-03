@@ -4,6 +4,7 @@ Unit tests for the model manager module.
 import os
 import pytest
 import shutil
+import time
 from unittest.mock import MagicMock, patch
 import json
 import sys
@@ -1523,6 +1524,100 @@ def test_import_llama_cpp_runtime_rejects_shim_from_parent_import(monkeypatch):
         assert 'llama_cpp' not in sys.modules
     finally:
         sys.modules.pop('llama_cpp', None)
+
+
+def test_import_llama_cpp_runtime_reports_parent_import_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 1},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_run_llama_cpp_import_watchdog',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+
+    def _slow_parent_import(_name):
+        time.sleep(0.2)
+        return SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', _slow_parent_import)
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+        model_manager_module._import_llama_cpp_runtime(timeout_seconds=0.01)
+
+    assert exc_info.value.stage == 'llama_cpp_import'
+    assert model_manager_module._format_runtime_stage_timeout(exc_info.value) == (
+        'llama_cpp_import_timeout after 0.01s'
+    )
+
+
+def test_detect_llama_runtime_capabilities_preserves_gpu_probe_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_runtime = SimpleNamespace(
+        __file__='/site-packages/llama_cpp/__init__.py',
+        llama_supports_gpu_offload=lambda: True,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: fake_runtime,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppRuntimeStageTimeout('llama_cpp_gpu_probe', 0.01)
+        ),
+    )
+
+    diagnostics = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert diagnostics['backend'] == 'missing'
+    assert diagnostics['gpu_offload_supported'] is False
+    assert diagnostics['error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+
+
+def test_get_llm_instance_records_gpu_probe_timeout(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, **_kwargs):
+            raise AssertionError('Llama should not initialize after GPU probe timeout')
+
+    fake_runtime = SimpleNamespace(
+        __file__='/site-packages/llama_cpp/__init__.py',
+        Llama=FakeLlama,
+        llama_supports_gpu_offload=lambda: True,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: fake_runtime,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppRuntimeStageTimeout('llama_cpp_gpu_probe', 0.01)
+        ),
+    )
+
+    with patch('os.path.exists', return_value=True):
+        llm = standalone_model_manager.get_llm_instance()
+
+    assert llm is None
+    assert standalone_model_manager.last_runtime_init_error == 'llama_cpp_gpu_probe_timeout after 0.01s'
+
 
 def test_windows_unc_prefix_and_empty_shim_detection_helpers():
     from utils.llm import model_manager as model_manager_module

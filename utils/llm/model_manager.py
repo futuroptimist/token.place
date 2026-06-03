@@ -9,6 +9,9 @@ import json
 import sys
 import importlib
 import subprocess
+import queue
+import signal
+import threading
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -31,6 +34,10 @@ class LlamaCppRuntimeStageTimeout(TimeoutError):
         self.stage = stage
         self.timeout_seconds = timeout_seconds
         super().__init__(f"{stage} after {timeout_seconds:g}s")
+
+
+def _format_runtime_stage_timeout(exc: LlamaCppRuntimeStageTimeout) -> str:
+    return f"{exc.stage}_timeout after {exc.timeout_seconds:g}s"
 
 
 def _strip_windows_extended_path_prefix(path_text: str) -> str:
@@ -379,6 +386,69 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     return diagnostics
 
 
+def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
+    """Import llama_cpp in this process with a recoverable timeout where possible."""
+
+    timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, 'SIGALRM'):
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, timeout)
+
+        def _handle_timeout(_signum, _frame):
+            raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+
+        signal.signal(signal.SIGALRM, _handle_timeout)
+        try:
+            return importlib.import_module('llama_cpp')
+        except TimeoutError as exc:
+            if isinstance(exc, LlamaCppRuntimeStageTimeout):
+                raise
+            raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout) from exc
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer[0] > 0:
+                signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            result_queue.put(('ok', importlib.import_module('llama_cpp')))
+        except LlamaCppRuntimeStageTimeout as exc:
+            result_queue.put(('timeout', exc))
+        except TimeoutError as exc:
+            result_queue.put(('timeout', LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)))
+        except Exception as exc:
+            result_queue.put(('error', exc))
+
+    worker = threading.Thread(
+        target=_target,
+        name='llama_cpp_parent_import_guard',
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        logger.error(
+            "llama_cpp parent import timeout timeout_seconds=%s interpreter=%s",
+            f"{timeout:g}",
+            sys.executable,
+        )
+        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+
+    try:
+        status, value = result_queue.get_nowait()
+    except queue.Empty as exc:
+        raise ImportError('llama_cpp parent import completed without result') from exc
+
+    if status == 'ok':
+        return value
+    if status == 'timeout':
+        raise value
+    raise value
+
+
 def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seconds: Optional[float] = None):
     """Import llama_cpp while guarding against the repo-local test shim with bounded stages."""
     path_diagnostics = _sanitize_llama_cpp_import_paths()
@@ -405,7 +475,7 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
         )
 
     _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    llama_cpp = importlib.import_module('llama_cpp')
+    llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",
@@ -427,6 +497,13 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
     """Return backend/offload capability details from the installed llama_cpp runtime."""
     try:
         llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
+    except LlamaCppRuntimeStageTimeout as exc:
+        return {
+            'backend': 'missing',
+            'gpu_offload_supported': False,
+            'detected_device': 'none',
+            'error': _format_runtime_stage_timeout(exc),
+        }
     except Exception as exc:
         return {
             'backend': 'missing',
@@ -464,6 +541,16 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
                 backend = str(probe.get('backend') or backend)
             else:
                 gpu_offload_supported = bool(supports_gpu())
+        except LlamaCppRuntimeStageTimeout as exc:
+            return {
+                'backend': 'missing',
+                'gpu_offload_supported': False,
+                'detected_device': 'none',
+                'interpreter': sys.executable,
+                'prefix': sys.prefix,
+                'llama_module_path': module_path or 'unknown',
+                'error': _format_runtime_stage_timeout(exc),
+            }
         except Exception:
             gpu_offload_supported = False
     else:
@@ -667,6 +754,8 @@ class ModelManager:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
         runtime = self._runtime_capabilities()
         runtime_error = str(runtime.get('error') or '')
+        if runtime_error.endswith('_timeout') or '_timeout after ' in runtime_error:
+            raise RuntimeError(runtime_error)
         backend = str(runtime.get('backend') or 'cpu')
         backend_available = backend if backend in {'cuda', 'metal'} else 'cpu'
         gpu_runtime_supported = bool(runtime.get('gpu_offload_supported', False))
@@ -1017,7 +1106,7 @@ class ModelManager:
                         except Exception as e:
                             self.last_runtime_init_error = str(e)
                             if isinstance(e, LlamaCppRuntimeStageTimeout):
-                                self.last_runtime_init_error = f"{e.stage}_timeout after {e.timeout_seconds:g}s"
+                                self.last_runtime_init_error = _format_runtime_stage_timeout(e)
                             self.log_error(
                                 f"Failed to initialize Llama model: {self.last_runtime_init_error}",
                                 exc_info=True,

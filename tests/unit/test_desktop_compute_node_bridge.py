@@ -2925,3 +2925,49 @@ def test_platform_neutral_dependency_failure_last_error_is_actionable(
         in payload["last_error"]
     )
     assert "missing=cryptography,requests" in payload["last_error"]
+
+
+def test_pre_registration_warmup_failure_reports_runtime_stage_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+    calls = []
+
+    class RuntimeDiscoveryFailureRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            calls.append('warm')
+            self.model_manager.last_runtime_init_error = 'llama_cpp_import_timeout after 0.01s'
+            return False
+
+        def register_and_poll_once(self):
+            calls.append('poll')
+            return {'next_ping_in_x_seconds': 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=RuntimeDiscoveryFailureRuntime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'runtime_action': 'already_supported',
+            'interpreter': sys.executable,
+            'llama_module_path': '/opt/site-packages/llama_cpp/__init__.py',
+            'fallback_reason': '',
+        },
+    )
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '1')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='gpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+
+    assert calls == ['warm']
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get('type') == 'error')
+    assert error_event['registered'] is False
+    assert error_event['warm_load_state'] == 'failed'
+    assert error_event['last_error'] == 'llama_cpp_import_timeout after 0.01s'
+    assert error_event['message'] == 'llama_cpp_import_timeout after 0.01s'

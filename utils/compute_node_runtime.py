@@ -313,12 +313,17 @@ class ComputeNodeRuntime:
         _log_info(f"API v1 runtime warmup about to instantiate model: {model_path}")
         try:
             llm_runtime = get_llm_instance()
-        except Exception:
+        except Exception as exc:
+            setattr(self.model_manager, 'last_runtime_init_error', str(exc))
             _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
             return False
 
         if llm_runtime is None:
-            _log_error("API v1 runtime warmup failed: get_llm_instance returned None")
+            detail = getattr(self.model_manager, 'last_runtime_init_error', None)
+            message = "API v1 runtime warmup failed: get_llm_instance returned None"
+            if detail:
+                message = f"{message} ({detail})"
+            _log_error(message)
             return False
 
         create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)

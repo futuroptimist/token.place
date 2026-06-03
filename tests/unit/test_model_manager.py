@@ -1029,3 +1029,94 @@ class TestModelManager:
         assert 'interpreter=' in summary
         assert 'llama_module_path=' in summary
         assert 'fallback_reason=runtime missing cuda support' in summary
+
+
+@pytest.fixture
+def standalone_model_manager(tmp_path):
+    mock_config = MagicMock()
+    mock_config.is_production = False
+    model_file = tmp_path / 'test_model.gguf'
+    model_file.write_bytes(b'fake model data')
+
+    def _get(key, default=None):
+        values = {
+            'model.filename': 'test_model.gguf',
+            'model.url': 'https://example.com/model.gguf',
+            'model.download_chunk_size_mb': 1,
+            'paths.models_dir': str(tmp_path),
+            'model.use_mock': False,
+            'model.context_size': 2048,
+            'model.chat_format': 'llama-3',
+            'model.n_gpu_layers': -1,
+            'model.hybrid_n_gpu_layers': 24,
+            'model.gpu_memory_headroom_percent': 0.1,
+            'model.enforce_gpu_memory_headroom': True,
+        }
+        return values.get(key, default)
+
+    mock_config.get.side_effect = _get
+    return ModelManager(mock_config)
+
+
+def test_llama_cpp_runtime_stage_timeout_is_bounded(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+    import time as time_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '0.01')
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+        model_manager_module._run_llama_runtime_stage(
+            'llama_cpp_runtime_discovery',
+            lambda: time_module.sleep(1),
+        )
+
+    assert exc_info.value.stage == 'llama_cpp_runtime_discovery'
+    assert 'llama_cpp_runtime_discovery after 0.01s' in str(exc_info.value)
+
+
+def test_get_llm_instance_records_bounded_runtime_discovery_timeout(standalone_model_manager):
+    from utils.llm import model_manager as model_manager_module
+
+    with patch('os.path.exists', return_value=True), \
+         patch(
+             'utils.llm.model_manager._import_llama_cpp_runtime',
+             side_effect=model_manager_module.LlamaCppRuntimeStageTimeout(
+                 'llama_cpp_import',
+                 0.01,
+             ),
+         ):
+        llm = standalone_model_manager.get_llm_instance()
+
+    assert llm is None
+    assert standalone_model_manager.last_runtime_init_error == 'llama_cpp_import_timeout after 0.01s'
+
+
+def test_desktop_runtime_probe_is_reused_for_compute_plan(standalone_model_manager):
+    standalone_model_manager.desktop_runtime_probe = {
+        'runtime_action': 'already_supported',
+        'selected_backend': 'cuda',
+        'detected_device': 'cuda',
+        'gpu_offload_supported': True,
+        'interpreter': r'C:\\Python311\\python.exe',
+        'llama_module_path': r'C:\\Python311\\Lib\\site-packages\\llama_cpp\\__init__.py',
+    }
+
+    with patch('utils.llm.model_manager.detect_llama_runtime_capabilities') as detect:
+        plan = standalone_model_manager._resolve_compute_plan()
+
+    detect.assert_not_called()
+    assert plan['backend_available'] == 'cuda'
+    assert plan['backend_selected'] == 'cuda'
+    assert plan['n_gpu_layers'] == -1
+
+
+def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
+    from utils.llm import model_manager as model_manager_module
+
+    shim = model_manager_module.REPO_LLAMA_CPP_SHIM
+    extended = '\\\\?\\' + str(shim)
+
+    assert model_manager_module._is_repo_llama_cpp_shim(extended)
+    assert not model_manager_module._is_repo_llama_cpp_shim(
+        r'\\?\\C:\\Users\\danie\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\llama_cpp\\__init__.py'
+    )

@@ -9,7 +9,6 @@ import json
 import sys
 import importlib
 import subprocess
-import tempfile
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -124,24 +123,94 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
         }
 
 
-def _llama_cpp_probe_subprocess_cwd() -> str:
-    """Return a neutral cwd so python -c probes cannot shadow installed llama_cpp."""
+def _llama_cpp_probe_sys_path_entries() -> list[str]:
+    """Return explicit child probe import paths without implicit cwd shadow entries."""
 
-    # Python prepends the subprocess cwd as sys.path[0] for ``python -c``.  If the
-    # bridge is launched from the repository/runtime root, that implicit entry can
-    # resolve the repo-local llama_cpp.py shim before the sanitized PYTHONPATH.
-    # Run probe children from a neutral temp directory instead; import precedence
-    # then comes from the sanitized PYTHONPATH we pass explicitly.
-    return tempfile.gettempdir()
+    cwd_compare = _canonical_path_for_compare(Path.cwd())
+    entries: list[str] = []
+    seen: set[str] = set()
+    for entry in sys.path:
+        if not isinstance(entry, str):
+            continue
+        if entry == '':
+            # In a child ``python -c`` process, an empty sys.path entry means that
+            # child's cwd.  Do not pass it through because either the repo cwd or a
+            # shared temp cwd can shadow the packaged llama_cpp runtime.
+            continue
+        compare = _canonical_path_for_compare(entry)
+        if compare is not None and cwd_compare is not None and compare == cwd_compare:
+            continue
+        dedupe_key = compare or entry
+        if dedupe_key in seen:
+            continue
+        entries.append(entry)
+        seen.add(dedupe_key)
+    return entries
+
+
+def _llama_cpp_probe_env() -> Dict[str, str]:
+    """Return subprocess env with an explicit sanitized import path contract."""
+
+    pythonpath_entries = _llama_cpp_probe_sys_path_entries()
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
+    env['TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'] = json.dumps(pythonpath_entries)
+    return env
+
+
+def _llama_cpp_probe_code(user_code: str) -> str:
+    """Prefix probe code so cwd/sys.path[0] cannot shadow the runtime."""
+
+    return (
+        "import json as _token_place_json, os as _token_place_os, sys as _token_place_sys\n"
+        "_token_place_probe_path = _token_place_json.loads("
+        "_token_place_os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', '[]'))\n"
+        "_token_place_cwd = _token_place_os.path.normcase("
+        "_token_place_os.path.normpath(_token_place_os.getcwd()))\n"
+        "_token_place_existing = []\n"
+        "for _token_place_entry in _token_place_sys.path:\n"
+        "    if not isinstance(_token_place_entry, str) or not _token_place_entry:\n"
+        "        continue\n"
+        "    _token_place_compare = _token_place_os.path.normcase("
+        "_token_place_os.path.normpath(_token_place_os.path.abspath(_token_place_entry)))\n"
+        "    if _token_place_compare == _token_place_cwd:\n"
+        "        continue\n"
+        "    _token_place_existing.append((_token_place_compare, _token_place_entry))\n"
+        "if isinstance(_token_place_probe_path, list):\n"
+        "    _token_place_explicit = []\n"
+        "    _token_place_seen = set()\n"
+        "    for _token_place_entry in _token_place_probe_path:\n"
+        "        if not isinstance(_token_place_entry, str) or not _token_place_entry:\n"
+        "            continue\n"
+        "        _token_place_compare = _token_place_os.path.normcase("
+        "_token_place_os.path.normpath(_token_place_os.path.abspath(_token_place_entry)))\n"
+        "        if _token_place_compare == _token_place_cwd or _token_place_compare in _token_place_seen:\n"
+        "            continue\n"
+        "        _token_place_explicit.append(_token_place_entry)\n"
+        "        _token_place_seen.add(_token_place_compare)\n"
+        "    _token_place_sys.path[:] = _token_place_explicit + ["
+        "_token_place_entry for _token_place_compare, _token_place_entry in _token_place_existing "
+        "if _token_place_compare not in _token_place_seen]\n"
+        "del _token_place_json, _token_place_os, _token_place_probe_path\n"
+        "del _token_place_cwd, _token_place_existing, _token_place_seen\n"
+        + user_code
+    )
+
+
+def _llama_cpp_probe_subprocess_cwd() -> str:
+    """Return a cwd that should be ignored by child probe import resolution."""
+
+    # Python prepends the subprocess cwd as sys.path[0] for ``python -c``.  Probe
+    # code immediately replaces sys.path with TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH,
+    # so neither the repo cwd nor a shared temp cwd can shadow the runtime.
+    return os.path.dirname(sys.executable) or os.getcwd()
 
 
 def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
     """Run a llama_cpp runtime probe in a killable subprocess and return JSON output."""
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
-    pythonpath_entries = [str(entry or Path.cwd()) for entry in sys.path]
-    env = os.environ.copy()
-    env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
+    env = _llama_cpp_probe_env()
     started_at = time.perf_counter()
     logger.info(
         "llama_cpp runtime process stage start stage=%s timeout_seconds=%s interpreter=%s",
@@ -151,7 +220,7 @@ def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optio
     )
     try:
         completed = subprocess.run(
-            [sys.executable, '-c', code],
+            [sys.executable, '-c', _llama_cpp_probe_code(code)],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -250,9 +319,7 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     """Validate llama_cpp import in a killable subprocess before parent import."""
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
-    pythonpath_entries = [str(entry or Path.cwd()) for entry in sys.path]
-    env = os.environ.copy()
-    env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
+    env = _llama_cpp_probe_env()
     code = (
         "import importlib, json, sys\n"
         "llama_cpp = importlib.import_module('llama_cpp')\n"
@@ -269,7 +336,7 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     )
     try:
         completed = subprocess.run(
-            [sys.executable, '-c', code],
+            [sys.executable, '-c', _llama_cpp_probe_code(code)],
             capture_output=True,
             text=True,
             timeout=timeout,

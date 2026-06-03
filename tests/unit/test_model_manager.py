@@ -1260,6 +1260,9 @@ def test_llama_cpp_probe_subprocess_cwd_does_not_shadow_sanitized_pythonpath(tmp
     repo_root = tmp_path / 'repo runtime root'
     repo_root.mkdir()
     (repo_root / 'llama_cpp.py').write_text('raise RuntimeError("repo shim should not win")')
+    hostile_cwd = tmp_path / 'shared temp'
+    hostile_cwd.mkdir()
+    (hostile_cwd / 'llama_cpp.py').write_text('raise RuntimeError("temp shim should not win")')
     site_packages = tmp_path / 'venv' / 'Lib' / 'site-packages'
     package_dir = site_packages / 'llama_cpp'
     package_dir.mkdir(parents=True)
@@ -1270,6 +1273,7 @@ def test_llama_cpp_probe_subprocess_cwd_does_not_shadow_sanitized_pythonpath(tmp
     monkeypatch.chdir(repo_root)
     monkeypatch.setattr(model_manager_module, 'REPO_ROOT', repo_root)
     monkeypatch.setattr(model_manager_module, 'REPO_LLAMA_CPP_SHIM', repo_root / 'llama_cpp.py')
+    monkeypatch.setattr(model_manager_module, '_llama_cpp_probe_subprocess_cwd', lambda: str(hostile_cwd))
     monkeypatch.setattr(sys, 'path', [str(repo_root), str(site_packages)])
 
     try:
@@ -1286,6 +1290,21 @@ def test_llama_cpp_probe_subprocess_cwd_does_not_shadow_sanitized_pythonpath(tmp
     assert Path(spec_diagnostics['module_path']).parent == package_dir
     assert not model_manager_module._is_repo_llama_cpp_shim(import_diagnostics['module_path'])
     assert Path(import_diagnostics['module_path']).parent == package_dir
+
+
+def test_llama_cpp_probe_env_excludes_implicit_cwd_entries(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    repo_root = tmp_path / 'repo'
+    repo_root.mkdir()
+    site_packages = tmp_path / 'venv' / 'site-packages'
+    site_packages.mkdir(parents=True)
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setattr(sys, 'path', ['', str(repo_root), str(site_packages), str(site_packages)])
+
+    entries = model_manager_module._llama_cpp_probe_sys_path_entries()
+
+    assert entries == [str(site_packages)]
 
 
 def test_llama_cpp_runtime_discovery_timeout_does_not_mutate_parent_import_state(monkeypatch):

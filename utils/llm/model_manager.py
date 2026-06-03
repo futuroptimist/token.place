@@ -8,13 +8,12 @@ from utils.networking.http_requests_compat import requests
 import json
 import sys
 import importlib
-import queue
 import subprocess
-import threading
+import tempfile
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
-from typing import Dict, List, Any, Optional, Union, Tuple, Iterable
+from typing import Dict, List, Any, Optional, Union, Iterable
 
 from utils.system import resource_monitor
 
@@ -78,49 +77,6 @@ def _runtime_stage_timeout_seconds() -> float:
     return value if value > 0 else DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS
 
 
-def _run_llama_runtime_stage(stage: str, fn, *, timeout_seconds: Optional[float] = None):
-    timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
-    started_at = time.perf_counter()
-    results: 'queue.Queue[Tuple[bool, Any]]' = queue.Queue(maxsize=1)
-
-    def _target() -> None:
-        try:
-            results.put((True, fn()))
-        except BaseException as exc:  # pragma: no cover - surfaced by caller
-            results.put((False, exc))
-
-    worker = threading.Thread(
-        target=_target,
-        name=f'tokenplace-{stage}',
-        daemon=True,
-    )
-    logger.info(
-        "llama_cpp runtime stage start stage=%s timeout_seconds=%s interpreter=%s",
-        stage,
-        f"{timeout:g}",
-        sys.executable,
-    )
-    worker.start()
-    try:
-        ok, value = results.get(timeout=timeout)
-    except queue.Empty as exc:
-        duration_ms = int((time.perf_counter() - started_at) * 1000)
-        logger.error(
-            "llama_cpp runtime stage timeout stage=%s duration_ms=%s timeout_seconds=%s interpreter=%s",
-            stage,
-            duration_ms,
-            f"{timeout:g}",
-            sys.executable,
-        )
-        raise LlamaCppRuntimeStageTimeout(stage, timeout) from exc
-
-    duration_ms = int((time.perf_counter() - started_at) * 1000)
-    logger.info("llama_cpp runtime stage complete stage=%s duration_ms=%s", stage, duration_ms)
-    if ok:
-        return value
-    raise value
-
-
 def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
     """Keep app imports available while preventing repo-local llama_cpp shim precedence."""
 
@@ -132,13 +88,17 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
         shim_entries: list[str] = []
         preserved_entries: list[str] = []
 
+        cwd_text = os.getcwd()
         for entry in sys.path:
-            entry_path = Path(_strip_windows_extended_path_prefix(str(entry or Path.cwd())))
-            compare = _canonical_path_for_compare(entry_path)
+            entry_text = str(entry or cwd_text)
+            compare = _canonical_path_for_compare(entry_text)
+            # Avoid probing every sys.path entry with stat/is_file here: on Windows,
+            # offline shares or slow filesystem roots can block before the bounded
+            # subprocess discovery/import stages start.  The repository shim path is
+            # known, so string-normalized repo/cwd comparisons are sufficient.
             shadows_repo_shim = (
                 compare is not None
                 and (compare == repo_root_compare or compare == cwd_compare)
-                and (entry_path / 'llama_cpp.py').is_file()
             )
             if shadows_repo_shim:
                 shim_entries.append(entry)
@@ -162,7 +122,6 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
             'deprioritized_entries': moved,
             'sys_path_count': len(sys.path),
         }
-
 
 
 def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
@@ -276,7 +235,7 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
     )
 
 def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
-    """Validate llama_cpp import in a killable subprocess before in-process import."""
+    """Validate llama_cpp import in a killable subprocess before parent import."""
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
     pythonpath_entries = [str(entry or Path.cwd()) for entry in sys.path]
@@ -340,6 +299,100 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     return diagnostics
 
 
+class _ParentImportWatchdog:
+    """Kill this process if the native llama_cpp parent import exceeds the deadline."""
+
+    def __init__(self, stage: str, timeout_seconds: float) -> None:
+        self.stage = stage
+        self.timeout_seconds = timeout_seconds
+        self._cancel_path: Optional[str] = None
+        self._process: Optional[subprocess.Popen] = None
+
+    def __enter__(self):
+        fd, cancel_path = tempfile.mkstemp(prefix=f'tokenplace-{self.stage}-', suffix='.cancel')
+        os.close(fd)
+        os.unlink(cancel_path)
+        self._cancel_path = cancel_path
+        watchdog_code = (
+            "import os, signal, sys, time\n"
+            "pid = int(sys.argv[1])\n"
+            "timeout = float(sys.argv[2])\n"
+            "cancel_path = sys.argv[3]\n"
+            "stage = sys.argv[4]\n"
+            "deadline = time.monotonic() + timeout\n"
+            "while time.monotonic() < deadline:\n"
+            "    if os.path.exists(cancel_path):\n"
+            "        raise SystemExit(0)\n"
+            "    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))\n"
+            "if os.path.exists(cancel_path):\n"
+            "    raise SystemExit(0)\n"
+            "print(f'{stage}_timeout after {timeout:g}s', file=sys.stderr, flush=True)\n"
+            "if os.name == 'nt':\n"
+            "    import subprocess\n"
+            "    subprocess.run(\n"
+            "        ['taskkill', '/PID', str(pid), '/T', '/F'],\n"
+            "        stdout=subprocess.DEVNULL,\n"
+            "        stderr=subprocess.DEVNULL,\n"
+            "        check=False,\n"
+            "    )\n"
+            "else:\n"
+            "    os.kill(pid, signal.SIGTERM)\n"
+        )
+        self._process = subprocess.Popen(
+            [
+                sys.executable,
+                '-c',
+                watchdog_code,
+                str(os.getpid()),
+                f'{self.timeout_seconds:g}',
+                cancel_path,
+                self.stage,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=os.name != 'nt',
+        )
+        logger.info(
+            "llama_cpp parent import watchdog armed stage=%s timeout_seconds=%s pid=%s",
+            self.stage,
+            f"{self.timeout_seconds:g}",
+            self._process.pid,
+        )
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        if self._cancel_path:
+            try:
+                Path(self._cancel_path).write_text('cancelled')
+            except OSError:
+                pass
+        if self._process is not None:
+            try:
+                self._process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+        if self._cancel_path:
+            try:
+                os.unlink(self._cancel_path)
+            except OSError:
+                pass
+
+
+def _import_module_with_parent_watchdog(
+    module_name: str,
+    *,
+    timeout_seconds: Optional[float] = None,
+):
+    timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+    with _ParentImportWatchdog('llama_cpp_import', timeout):
+        return importlib.import_module(module_name)
+
+
 def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seconds: Optional[float] = None):
     """Import llama_cpp while guarding against the repo-local test shim with bounded stages."""
     path_diagnostics = _sanitize_llama_cpp_import_paths()
@@ -366,7 +419,10 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
         )
 
     _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    llama_cpp = importlib.import_module('llama_cpp')
+    llama_cpp = _import_module_with_parent_watchdog(
+        'llama_cpp',
+        timeout_seconds=timeout_seconds,
+    )
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",

@@ -1058,22 +1058,6 @@ def standalone_model_manager(tmp_path):
     return ModelManager(mock_config)
 
 
-def test_llama_cpp_runtime_stage_timeout_is_bounded(monkeypatch):
-    from utils.llm import model_manager as model_manager_module
-    import time as time_module
-
-    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '0.01')
-
-    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
-        model_manager_module._run_llama_runtime_stage(
-            'llama_cpp_runtime_discovery',
-            lambda: time_module.sleep(1),
-        )
-
-    assert exc_info.value.stage == 'llama_cpp_runtime_discovery'
-    assert 'llama_cpp_runtime_discovery after 0.01s' in str(exc_info.value)
-
-
 def test_get_llm_instance_records_bounded_runtime_discovery_timeout(standalone_model_manager):
     from utils.llm import model_manager as model_manager_module
 
@@ -1212,6 +1196,58 @@ def test_sanitize_llama_cpp_import_paths_reports_deprioritized_entries(tmp_path,
     assert diagnostics['deprioritized_entries'] == [str(tmp_path)]
     assert 'removed_entries' not in diagnostics
     assert diagnostics['sys_path_count'] == 3
+
+
+def test_sanitize_llama_cpp_import_paths_does_not_stat_sys_path_entries(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    site_packages = tmp_path / 'venv' / 'Lib' / 'site-packages'
+    site_packages.mkdir(parents=True)
+    original_sys_path = list(sys.path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(model_manager_module, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(model_manager_module, 'REPO_LLAMA_CPP_SHIM', tmp_path / 'llama_cpp.py')
+    monkeypatch.setattr(sys, 'path', [str(tmp_path), str(site_packages), '/slow/share'])
+
+    def _no_stat(self):
+        raise AssertionError(f'path stat should not run during sanitization: {self}')
+
+    monkeypatch.setattr(Path, 'is_file', _no_stat)
+    try:
+        diagnostics = model_manager_module._sanitize_llama_cpp_import_paths()
+        sanitized_path = list(sys.path)
+    finally:
+        sys.path[:] = original_sys_path
+
+    assert diagnostics['deprioritized_entries'] == [str(tmp_path)]
+    assert sanitized_path[0] == str(site_packages)
+
+
+def test_parent_import_runs_under_process_watchdog(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    entered = []
+
+    class FakeWatchdog:
+        def __init__(self, stage, timeout_seconds):
+            entered.append((stage, timeout_seconds))
+
+        def __enter__(self):
+            entered.append('enter')
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            entered.append('exit')
+
+    fake_module = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+    monkeypatch.setattr(model_manager_module, '_ParentImportWatchdog', FakeWatchdog)
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda name: fake_module)
+
+    assert model_manager_module._import_module_with_parent_watchdog(
+        'llama_cpp',
+        timeout_seconds=0.25,
+    ) is fake_module
+    assert entered == [('llama_cpp_import', 0.25), 'enter', 'exit']
 
 
 def test_llama_cpp_runtime_discovery_timeout_does_not_mutate_parent_import_state(monkeypatch):

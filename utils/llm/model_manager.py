@@ -9,7 +9,6 @@ import json
 import sys
 import importlib
 import subprocess
-import tempfile
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -299,100 +298,6 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     return diagnostics
 
 
-class _ParentImportWatchdog:
-    """Kill this process if the native llama_cpp parent import exceeds the deadline."""
-
-    def __init__(self, stage: str, timeout_seconds: float) -> None:
-        self.stage = stage
-        self.timeout_seconds = timeout_seconds
-        self._cancel_path: Optional[str] = None
-        self._process: Optional[subprocess.Popen] = None
-
-    def __enter__(self):
-        fd, cancel_path = tempfile.mkstemp(prefix=f'tokenplace-{self.stage}-', suffix='.cancel')
-        os.close(fd)
-        os.unlink(cancel_path)
-        self._cancel_path = cancel_path
-        watchdog_code = (
-            "import os, signal, sys, time\n"
-            "pid = int(sys.argv[1])\n"
-            "timeout = float(sys.argv[2])\n"
-            "cancel_path = sys.argv[3]\n"
-            "stage = sys.argv[4]\n"
-            "deadline = time.monotonic() + timeout\n"
-            "while time.monotonic() < deadline:\n"
-            "    if os.path.exists(cancel_path):\n"
-            "        raise SystemExit(0)\n"
-            "    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))\n"
-            "if os.path.exists(cancel_path):\n"
-            "    raise SystemExit(0)\n"
-            "print(f'{stage}_timeout after {timeout:g}s', file=sys.stderr, flush=True)\n"
-            "if os.name == 'nt':\n"
-            "    import subprocess\n"
-            "    subprocess.run(\n"
-            "        ['taskkill', '/PID', str(pid), '/T', '/F'],\n"
-            "        stdout=subprocess.DEVNULL,\n"
-            "        stderr=subprocess.DEVNULL,\n"
-            "        check=False,\n"
-            "    )\n"
-            "else:\n"
-            "    os.kill(pid, signal.SIGTERM)\n"
-        )
-        self._process = subprocess.Popen(
-            [
-                sys.executable,
-                '-c',
-                watchdog_code,
-                str(os.getpid()),
-                f'{self.timeout_seconds:g}',
-                cancel_path,
-                self.stage,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=os.name != 'nt',
-        )
-        logger.info(
-            "llama_cpp parent import watchdog armed stage=%s timeout_seconds=%s pid=%s",
-            self.stage,
-            f"{self.timeout_seconds:g}",
-            self._process.pid,
-        )
-        return self
-
-    def __exit__(self, _exc_type, _exc, _tb) -> None:
-        if self._cancel_path:
-            try:
-                Path(self._cancel_path).write_text('cancelled')
-            except OSError:
-                pass
-        if self._process is not None:
-            try:
-                self._process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-        if self._cancel_path:
-            try:
-                os.unlink(self._cancel_path)
-            except OSError:
-                pass
-
-
-def _import_module_with_parent_watchdog(
-    module_name: str,
-    *,
-    timeout_seconds: Optional[float] = None,
-):
-    timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
-    with _ParentImportWatchdog('llama_cpp_import', timeout):
-        return importlib.import_module(module_name)
-
-
 def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seconds: Optional[float] = None):
     """Import llama_cpp while guarding against the repo-local test shim with bounded stages."""
     path_diagnostics = _sanitize_llama_cpp_import_paths()
@@ -419,10 +324,7 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
         )
 
     _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    llama_cpp = _import_module_with_parent_watchdog(
-        'llama_cpp',
-        timeout_seconds=timeout_seconds,
-    )
+    llama_cpp = importlib.import_module('llama_cpp')
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",
@@ -582,6 +484,7 @@ class ModelManager:
         self.enforce_gpu_headroom = config.get('model.enforce_gpu_memory_headroom', True)
         self.requested_compute_mode = 'auto'
         self.desktop_runtime_probe: Optional[Dict[str, Any]] = None
+        self._imported_llama_cpp_module_path: Optional[str] = None
         self.last_compute_diagnostics = {
             'requested_mode': 'auto',
             'effective_mode': 'pending',
@@ -596,24 +499,30 @@ class ModelManager:
         probe = _coerce_desktop_runtime_probe(getattr(self, 'desktop_runtime_probe', None))
         if probe is not None:
             probe_module_path = probe.get('llama_module_path')
-            if probe_module_path and probe_module_path != 'unknown':
-                imported_runtime = detect_llama_runtime_capabilities()
-                imported_module_path = imported_runtime.get('llama_module_path')
-                if (
-                    imported_module_path
-                    and imported_module_path != 'unknown'
-                    and _canonical_path_for_compare(probe_module_path)
-                    != _canonical_path_for_compare(imported_module_path)
-                ):
-                    imported_runtime = dict(imported_runtime)
-                    imported_runtime['error'] = 'llama_cpp_runtime_probe_mismatch'
-                    if self is not None:
-                        self.log_warning(
-                            "Desktop runtime probe module path mismatch; using imported runtime probe "
-                            f"desktop_probe_path={probe_module_path} "
-                            f"imported_path={imported_module_path}"
-                        )
-                    return imported_runtime
+            imported_module_path = getattr(self, '_imported_llama_cpp_module_path', None)
+            if (
+                probe_module_path
+                and probe_module_path != 'unknown'
+                and imported_module_path
+                and imported_module_path != 'unknown'
+                and _canonical_path_for_compare(probe_module_path)
+                != _canonical_path_for_compare(imported_module_path)
+            ):
+                if self is not None:
+                    self.log_warning(
+                        "Desktop runtime probe module path mismatch; refusing to reuse probe "
+                        f"desktop_probe_path={probe_module_path} "
+                        f"imported_path={imported_module_path}"
+                    )
+                return {
+                    'backend': 'cpu',
+                    'gpu_offload_supported': False,
+                    'detected_device': 'cpu',
+                    'interpreter': sys.executable,
+                    'prefix': sys.prefix,
+                    'llama_module_path': imported_module_path,
+                    'error': 'llama_cpp_runtime_probe_mismatch',
+                }
             if self is not None:
                 self.log_info(
                     "Using desktop runtime probe diagnostics for compute plan "
@@ -637,8 +546,11 @@ class ModelManager:
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
-        backend_available = self._platform_gpu_backend() or 'cpu'
-        gpu_runtime_supported = self._llama_gpu_offload_available()
+        runtime = self._runtime_capabilities()
+        runtime_error = str(runtime.get('error') or '')
+        backend = str(runtime.get('backend') or 'cpu')
+        backend_available = backend if backend in {'cuda', 'metal'} else 'cpu'
+        gpu_runtime_supported = bool(runtime.get('gpu_offload_supported', False))
         fallback_reason = None
 
         if requested == 'auto':
@@ -651,7 +563,7 @@ class ModelManager:
             ):
                 n_gpu_layers = 0
                 fallback_reason = (
-                    'no CUDA/Metal backend is supported on this platform'
+                    runtime_error or 'no CUDA/Metal backend is supported on this platform'
                     if backend_available == 'cpu'
                     else (
                         f'llama-cpp-python runtime does not expose {backend_available} '
@@ -680,7 +592,7 @@ class ModelManager:
             }
 
         if backend_available == 'cpu':
-            fallback_reason = 'no CUDA/Metal backend is supported on this platform'
+            fallback_reason = runtime_error or 'no CUDA/Metal backend is supported on this platform'
         elif not gpu_runtime_supported:
             fallback_reason = (
                 f'llama-cpp-python runtime does not expose {backend_available} GPU offload support'
@@ -908,9 +820,10 @@ class ModelManager:
                             # Dynamically import Llama only when needed
                             self.log_info("Locating llama_cpp runtime for model initialization...")
                             llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
+                            self._imported_llama_cpp_module_path = getattr(llama_cpp, '__file__', None)
                             self.log_info(
                                 "llama_cpp runtime located "
-                                f"module_path={getattr(llama_cpp, '__file__', 'unknown')}"
+                                f"module_path={self._imported_llama_cpp_module_path or 'unknown'}"
                             )
                             Llama = llama_cpp.Llama
 

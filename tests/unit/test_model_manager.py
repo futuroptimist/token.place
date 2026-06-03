@@ -273,8 +273,13 @@ class TestModelManager:
         mock_llama.return_value = instance
         mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama)
 
-        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+        with patch.object(model_manager, '_runtime_capabilities', return_value={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'llama_module_path': 'unknown',
+            'error': None,
+        }):
             result = model_manager.get_llm_instance()
 
         assert result is instance
@@ -302,8 +307,13 @@ class TestModelManager:
         mock_llama.return_value = instance
         mock_import_llama_cpp_runtime.return_value = SimpleNamespace(Llama=mock_llama)
 
-        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+        with patch.object(model_manager, '_runtime_capabilities', return_value={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'llama_module_path': 'unknown',
+            'error': None,
+        }):
             result = model_manager.get_llm_instance()
 
         assert result is instance
@@ -321,8 +331,13 @@ class TestModelManager:
              patch('utils.llm.model_manager.resource_monitor.can_allocate_gpu_memory') as mock_can_allocate, \
              patch('utils.llm.model_manager.os.path.exists', return_value=True), \
              patch('utils.llm.model_manager.os.path.getsize', side_effect=OSError('stat failed')), \
-             patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+             patch.object(model_manager, '_runtime_capabilities', return_value={
+                 'backend': 'cuda',
+                 'gpu_offload_supported': True,
+                 'detected_device': 'cuda',
+                 'llama_module_path': 'unknown',
+                 'error': None,
+             }):
 
             result = model_manager.get_llm_instance()
 
@@ -790,8 +805,13 @@ class TestModelManager:
         model_manager.requested_compute_mode = 'auto'
         model_manager.default_n_gpu_layers = -1
 
-        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=False):
+        with patch.object(model_manager, '_runtime_capabilities', return_value={
+            'backend': 'cuda',
+            'gpu_offload_supported': False,
+            'detected_device': 'cpu',
+            'llama_module_path': 'unknown',
+            'error': None,
+        }):
             plan = model_manager._resolve_compute_plan()
 
         assert plan['requested_mode'] == 'auto'
@@ -806,8 +826,13 @@ class TestModelManager:
         model_manager.requested_compute_mode = 'auto'
         model_manager.default_n_gpu_layers = 0
 
-        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+        with patch.object(model_manager, '_runtime_capabilities', return_value={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'llama_module_path': 'unknown',
+            'error': None,
+        }):
             plan = model_manager._resolve_compute_plan()
 
         assert plan['effective_mode'] == 'cpu'
@@ -949,8 +974,13 @@ class TestModelManager:
     def test_resolve_compute_plan_gpu_and_hybrid_success_paths(self, model_manager):
         """Explicit gpu/hybrid requests should emit expected diagnostics."""
         model_manager.requested_compute_mode = 'gpu'
-        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+        with patch.object(model_manager, '_runtime_capabilities', return_value={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'llama_module_path': 'unknown',
+            'error': None,
+        }):
             gpu_plan = model_manager._resolve_compute_plan()
 
         assert gpu_plan['effective_mode'] == 'cuda'
@@ -960,8 +990,13 @@ class TestModelManager:
 
         model_manager.requested_compute_mode = 'hybrid'
         model_manager.hybrid_n_gpu_layers = -5
-        with patch.object(model_manager, '_platform_gpu_backend', return_value='cuda'), \
-             patch.object(model_manager, '_llama_gpu_offload_available', return_value=True):
+        with patch.object(model_manager, '_runtime_capabilities', return_value={
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'llama_module_path': 'unknown',
+            'error': None,
+        }):
             hybrid_plan = model_manager._resolve_compute_plan()
 
         assert hybrid_plan['effective_mode'] == 'hybrid_cuda'
@@ -1098,7 +1133,7 @@ def test_desktop_runtime_probe_is_reused_for_compute_plan(standalone_model_manag
     ) as detect:
         plan = standalone_model_manager._resolve_compute_plan()
 
-    assert detect.call_count == 2
+    detect.assert_not_called()
     assert plan['backend_available'] == 'cuda'
     assert plan['backend_selected'] == 'cuda'
     assert plan['n_gpu_layers'] == -1
@@ -1114,22 +1149,18 @@ def test_desktop_runtime_probe_mismatch_falls_back_to_imported_runtime(standalon
         'llama_module_path': '/old/site-packages/llama_cpp/__init__.py',
     }
 
-    with patch(
-        'utils.llm.model_manager.detect_llama_runtime_capabilities',
-        return_value={
-            'backend': 'cpu',
-            'gpu_offload_supported': False,
-            'detected_device': 'cpu',
-            'llama_module_path': '/new/site-packages/llama_cpp/__init__.py',
-            'error': None,
-        },
-    ):
+    standalone_model_manager._imported_llama_cpp_module_path = '/new/site-packages/llama_cpp/__init__.py'
+
+    with patch('utils.llm.model_manager.detect_llama_runtime_capabilities') as detect:
         plan = standalone_model_manager._resolve_compute_plan()
+
+    detect.assert_not_called()
 
     assert plan['effective_mode'] == 'cpu_fallback'
     assert plan['backend_available'] == 'cpu'
     assert plan['backend_used'] == 'cpu'
     assert plan['n_gpu_layers'] == 0
+    assert plan['fallback_reason'] == 'llama_cpp_runtime_probe_mismatch'
 
 
 def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
@@ -1221,33 +1252,6 @@ def test_sanitize_llama_cpp_import_paths_does_not_stat_sys_path_entries(tmp_path
 
     assert diagnostics['deprioritized_entries'] == [str(tmp_path)]
     assert sanitized_path[0] == str(site_packages)
-
-
-def test_parent_import_runs_under_process_watchdog(monkeypatch):
-    from utils.llm import model_manager as model_manager_module
-
-    entered = []
-
-    class FakeWatchdog:
-        def __init__(self, stage, timeout_seconds):
-            entered.append((stage, timeout_seconds))
-
-        def __enter__(self):
-            entered.append('enter')
-            return self
-
-        def __exit__(self, _exc_type, _exc, _tb):
-            entered.append('exit')
-
-    fake_module = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-    monkeypatch.setattr(model_manager_module, '_ParentImportWatchdog', FakeWatchdog)
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda name: fake_module)
-
-    assert model_manager_module._import_module_with_parent_watchdog(
-        'llama_cpp',
-        timeout_seconds=0.25,
-    ) is fake_module
-    assert entered == [('llama_cpp_import', 0.25), 'enter', 'exit']
 
 
 def test_llama_cpp_runtime_discovery_timeout_does_not_mutate_parent_import_state(monkeypatch):

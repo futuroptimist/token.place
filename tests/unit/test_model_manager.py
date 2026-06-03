@@ -1523,3 +1523,146 @@ def test_import_llama_cpp_runtime_rejects_shim_from_parent_import(monkeypatch):
         assert 'llama_cpp' not in sys.modules
     finally:
         sys.modules.pop('llama_cpp', None)
+
+def test_windows_unc_prefix_and_empty_shim_detection_helpers():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._strip_windows_extended_path_prefix(
+        '\\\\?\\UNC\\server\\share\\llama_cpp.py'
+    ) == '\\\\server\\share\\llama_cpp.py'
+    assert model_manager_module._is_repo_llama_cpp_shim(None) is False
+
+
+def test_llama_cpp_probe_sys_path_entries_skips_non_string_entries(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    cwd = tmp_path / 'repo'
+    cwd.mkdir()
+    first = tmp_path / 'site-packages'
+    first.mkdir()
+    duplicate = tmp_path / 'site-packages' / '..' / 'site-packages'
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(
+        model_manager_module.sys,
+        'path',
+        [str(first), 123, '', str(cwd), str(duplicate)],
+    )
+
+    assert model_manager_module._llama_cpp_probe_sys_path_entries() == [str(first)]
+
+
+def test_detect_llama_runtime_capabilities_uses_subprocess_probe_for_imported_module(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_llama_cpp = SimpleNamespace(
+        __file__='/site-packages/llama_cpp/__init__.py',
+        GGML_USE_CUDA=True,
+        llama_supports_gpu_offload=lambda: False,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: fake_llama_cpp,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda: {
+            'backend': 'metal',
+            'gpu_offload_supported': True,
+            'detected_device': 'metal',
+            'llama_module_path': fake_llama_cpp.__file__,
+            'error': None,
+        },
+    )
+
+    payload = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert payload['backend'] == 'metal'
+    assert payload['gpu_offload_supported'] is True
+    assert payload['llama_module_path'] == fake_llama_cpp.__file__
+
+
+def test_desktop_runtime_probe_coercion_rejects_failed_or_error_actions():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._coerce_desktop_runtime_probe({
+        'runtime_action': 'failed',
+        'selected_backend': 'cuda',
+        'gpu_offload_supported': True,
+    }) is None
+    assert model_manager_module._coerce_desktop_runtime_probe({
+        'runtime_action': 'install_required',
+        'selected_backend': 'cuda',
+        'error': 'missing cuda runtime',
+    }) is None
+
+
+def test_mock_compute_plan_reuses_successful_gpu_desktop_probe(standalone_model_manager):
+    standalone_model_manager.requested_compute_mode = 'hybrid'
+    standalone_model_manager.hybrid_n_gpu_layers = 12
+    standalone_model_manager.desktop_runtime_probe = {
+        'runtime_action': 'already_supported',
+        'selected_backend': 'metal',
+        'detected_device': 'metal',
+        'gpu_offload_supported': True,
+        'llama_module_path': '/site-packages/llama_cpp/__init__.py',
+    }
+
+    plan = standalone_model_manager._mock_compute_plan()
+
+    assert plan['effective_mode'] == 'hybrid_metal'
+    assert plan['backend_available'] == 'metal'
+    assert plan['backend_used'] == 'metal'
+    assert plan['n_gpu_layers'] == 12
+    assert plan['fallback_reason'] is None
+
+
+def test_cpu_compute_plan_returns_cpu_diagnostics_with_imported_runtime(standalone_model_manager):
+    standalone_model_manager.requested_compute_mode = 'cpu'
+
+    with patch.object(standalone_model_manager, '_runtime_capabilities', return_value={
+        'backend': 'cuda',
+        'gpu_offload_supported': True,
+        'detected_device': 'cuda',
+        'llama_module_path': '/site-packages/llama_cpp/__init__.py',
+        'error': None,
+    }) as runtime_capabilities:
+        plan = standalone_model_manager._resolve_compute_plan()
+
+    runtime_capabilities.assert_called_once()
+    assert plan == {
+        'requested_mode': 'cpu',
+        'effective_mode': 'cpu',
+        'backend_available': 'cuda',
+        'backend_selected': 'cpu',
+        'backend_used': 'cpu',
+        'n_gpu_layers': 0,
+        'fallback_reason': None,
+    }
+
+
+def test_download_file_in_chunks_handles_request_start_failures(standalone_model_manager):
+    from utils.llm import model_manager as model_manager_module
+
+    file_path = os.path.join(standalone_model_manager.models_dir, 'request_failure.gguf')
+
+    with patch(
+        'utils.llm.model_manager.requests.get',
+        side_effect=model_manager_module.requests.Timeout('too slow'),
+    ):
+        assert standalone_model_manager.download_file_in_chunks(
+            file_path,
+            'https://example.com/model.gguf',
+            1,
+        ) is False
+
+    with patch(
+        'utils.llm.model_manager.requests.get',
+        side_effect=model_manager_module.requests.RequestException('connection failed'),
+    ):
+        assert standalone_model_manager.download_file_in_chunks(
+            file_path,
+            'https://example.com/model.gguf',
+            1,
+        ) is False

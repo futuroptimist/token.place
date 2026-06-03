@@ -1619,6 +1619,35 @@ def test_get_llm_instance_records_gpu_probe_timeout(standalone_model_manager, mo
     assert standalone_model_manager.last_runtime_init_error == 'llama_cpp_gpu_probe_timeout after 0.01s'
 
 
+def test_get_llm_instance_cpu_mode_does_not_probe_runtime_capabilities(standalone_model_manager, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_runtime = SimpleNamespace(
+        __file__='/site-packages/llama_cpp/__init__.py',
+        Llama=FakeLlama,
+    )
+    standalone_model_manager.requested_compute_mode = 'cpu'
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_runtime',
+        lambda **_kwargs: fake_runtime,
+    )
+
+    with patch('os.path.exists', return_value=True), \
+         patch.object(standalone_model_manager, '_runtime_capabilities') as runtime_capabilities:
+        llm = standalone_model_manager.get_llm_instance()
+
+    assert isinstance(llm, FakeLlama)
+    assert llm.kwargs['n_gpu_layers'] == 0
+    runtime_capabilities.assert_not_called()
+    assert standalone_model_manager.last_compute_diagnostics['requested_mode'] == 'cpu'
+    assert standalone_model_manager.last_compute_diagnostics['backend_used'] == 'cpu'
+
+
 def test_windows_unc_prefix_and_empty_shim_detection_helpers():
     from utils.llm import model_manager as model_manager_module
 
@@ -1713,23 +1742,17 @@ def test_mock_compute_plan_reuses_successful_gpu_desktop_probe(standalone_model_
     assert plan['fallback_reason'] is None
 
 
-def test_cpu_compute_plan_returns_cpu_diagnostics_with_imported_runtime(standalone_model_manager):
+def test_cpu_compute_plan_returns_cpu_diagnostics_without_runtime_probe(standalone_model_manager):
     standalone_model_manager.requested_compute_mode = 'cpu'
 
-    with patch.object(standalone_model_manager, '_runtime_capabilities', return_value={
-        'backend': 'cuda',
-        'gpu_offload_supported': True,
-        'detected_device': 'cuda',
-        'llama_module_path': '/site-packages/llama_cpp/__init__.py',
-        'error': None,
-    }) as runtime_capabilities:
+    with patch.object(standalone_model_manager, '_runtime_capabilities') as runtime_capabilities:
         plan = standalone_model_manager._resolve_compute_plan()
 
-    runtime_capabilities.assert_called_once()
+    runtime_capabilities.assert_not_called()
     assert plan == {
         'requested_mode': 'cpu',
         'effective_mode': 'cpu',
-        'backend_available': 'cuda',
+        'backend_available': 'cpu',
         'backend_selected': 'cpu',
         'backend_used': 'cpu',
         'n_gpu_layers': 0,
@@ -1740,16 +1763,10 @@ def test_cpu_compute_plan_returns_cpu_diagnostics_with_imported_runtime(standalo
 def test_cpu_compute_plan_ignores_gpu_probe_timeout(standalone_model_manager):
     standalone_model_manager.requested_compute_mode = 'cpu'
 
-    with patch.object(standalone_model_manager, '_runtime_capabilities', return_value={
-        'backend': 'missing',
-        'gpu_offload_supported': False,
-        'detected_device': 'none',
-        'llama_module_path': 'unknown',
-        'error': 'llama_cpp_gpu_probe_timeout after 0.01s',
-    }) as runtime_capabilities:
+    with patch.object(standalone_model_manager, '_runtime_capabilities') as runtime_capabilities:
         plan = standalone_model_manager._resolve_compute_plan()
 
-    runtime_capabilities.assert_called_once()
+    runtime_capabilities.assert_not_called()
     assert plan == {
         'requested_mode': 'cpu',
         'effective_mode': 'cpu',

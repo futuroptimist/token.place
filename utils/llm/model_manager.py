@@ -752,6 +752,17 @@ class ModelManager:
 
     def _resolve_compute_plan(self) -> Dict[str, Any]:
         requested = str(getattr(self, 'requested_compute_mode', 'auto')).lower()
+        if requested == 'cpu':
+            return {
+                'requested_mode': requested,
+                'effective_mode': 'cpu',
+                'backend_available': 'cpu',
+                'backend_selected': 'cpu',
+                'backend_used': 'cpu',
+                'n_gpu_layers': 0,
+                'fallback_reason': None,
+            }
+
         runtime = self._runtime_capabilities()
         runtime_error = str(runtime.get('error') or '')
         backend = str(runtime.get('backend') or 'cpu')
@@ -759,7 +770,7 @@ class ModelManager:
         gpu_runtime_supported = bool(runtime.get('gpu_offload_supported', False))
         fallback_reason = None
 
-        if requested != 'cpu' and (runtime_error.endswith('_timeout') or '_timeout after ' in runtime_error):
+        if runtime_error.endswith('_timeout') or '_timeout after ' in runtime_error:
             raise RuntimeError(runtime_error)
 
         if requested == 'auto':
@@ -787,17 +798,6 @@ class ModelManager:
                 'backend_used': 'cpu' if fallback_reason else backend_selected,
                 'n_gpu_layers': n_gpu_layers,
                 'fallback_reason': fallback_reason,
-            }
-
-        if requested == 'cpu':
-            return {
-                'requested_mode': requested,
-                'effective_mode': 'cpu',
-                'backend_available': backend_available,
-                'backend_selected': 'cpu',
-                'backend_used': 'cpu',
-                'n_gpu_layers': 0,
-                'fallback_reason': None,
             }
 
         if backend_available == 'cpu':
@@ -1087,7 +1087,13 @@ class ModelManager:
                             compute_plan['device_backend'] = compute_plan['backend_used']
                             compute_plan['device_name'] = 'unreported'
                             self.last_compute_diagnostics = compute_plan
-                            runtime_identity = self._runtime_capabilities()
+                            if compute_plan['requested_mode'] == 'cpu':
+                                runtime_identity = {
+                                    'interpreter': sys.executable,
+                                    'llama_module_path': self._imported_llama_cpp_module_path or 'unknown',
+                                }
+                            else:
+                                runtime_identity = self._runtime_capabilities()
                             self.log_info(
                                 "compute_runtime "
                                 f"requested={compute_plan['requested_mode']} "

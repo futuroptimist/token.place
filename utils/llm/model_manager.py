@@ -23,6 +23,7 @@ logger = logging.getLogger('model_manager')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
+_LLAMA_CPP_IMPORT_PATH_LOCK = Lock()
 
 
 class LlamaCppRuntimeStageTimeout(TimeoutError):
@@ -49,7 +50,7 @@ def _canonical_path_for_compare(module_path: Any) -> Optional[str]:
         return None
     try:
         path_text = _strip_windows_extended_path_prefix(str(module_path))
-        return os.path.normcase(os.path.normpath(str(Path(path_text).resolve())))
+        return os.path.normcase(os.path.normpath(os.path.abspath(path_text)))
     except (TypeError, ValueError, OSError):
         try:
             return os.path.normcase(os.path.normpath(_strip_windows_extended_path_prefix(str(module_path))))
@@ -123,44 +124,156 @@ def _run_llama_runtime_stage(stage: str, fn, *, timeout_seconds: Optional[float]
 def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
     """Keep app imports available while preventing repo-local llama_cpp shim precedence."""
 
-    import_root = os.environ.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '').strip() or str(REPO_ROOT)
-    moved: list[str] = []
-    repo_root_compare = _canonical_path_for_compare(REPO_ROOT)
-    cwd_compare = _canonical_path_for_compare(Path.cwd())
-    shim_entries: list[str] = []
-    preserved_entries: list[str] = []
+    with _LLAMA_CPP_IMPORT_PATH_LOCK:
+        import_root = os.environ.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '').strip() or str(REPO_ROOT)
+        moved: list[str] = []
+        repo_root_compare = _canonical_path_for_compare(REPO_ROOT)
+        cwd_compare = _canonical_path_for_compare(Path.cwd())
+        shim_entries: list[str] = []
+        preserved_entries: list[str] = []
 
-    for entry in sys.path:
-        entry_path = Path(_strip_windows_extended_path_prefix(str(entry or Path.cwd())))
-        compare = _canonical_path_for_compare(entry_path)
-        shadows_repo_shim = (
-            compare is not None
-            and (compare == repo_root_compare or compare == cwd_compare)
-            and (entry_path / 'llama_cpp.py').is_file()
+        for entry in sys.path:
+            entry_path = Path(_strip_windows_extended_path_prefix(str(entry or Path.cwd())))
+            compare = _canonical_path_for_compare(entry_path)
+            shadows_repo_shim = (
+                compare is not None
+                and (compare == repo_root_compare or compare == cwd_compare)
+                and (entry_path / 'llama_cpp.py').is_file()
+            )
+            if shadows_repo_shim:
+                shim_entries.append(entry)
+                moved.append(entry or '<cwd>')
+                continue
+            preserved_entries.append(entry)
+
+        preferred_index = len(preserved_entries)
+        for idx, entry in enumerate(preserved_entries):
+            normalized = str(entry).replace('\\', '/').lower()
+            if 'site-packages' in normalized or 'dist-packages' in normalized:
+                preferred_index = idx + 1
+
+        sys.path[:] = (
+            preserved_entries[:preferred_index]
+            + shim_entries
+            + preserved_entries[preferred_index:]
         )
-        if shadows_repo_shim:
-            shim_entries.append(entry)
-            moved.append(entry or '<cwd>')
-            continue
-        preserved_entries.append(entry)
+        return {
+            'import_root': import_root,
+            'deprioritized_entries': moved,
+            'sys_path_count': len(sys.path),
+        }
 
-    preferred_index = len(preserved_entries)
-    for idx, entry in enumerate(preserved_entries):
-        normalized = str(entry).replace('\\', '/').lower()
-        if 'site-packages' in normalized or 'dist-packages' in normalized:
-            preferred_index = idx + 1
 
-    sys.path[:] = (
-        preserved_entries[:preferred_index]
-        + shim_entries
-        + preserved_entries[preferred_index:]
+
+def _run_llama_cpp_python_probe(stage: str, code: str, *, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+    """Run a llama_cpp runtime probe in a killable subprocess and return JSON output."""
+
+    timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+    pythonpath_entries = [str(entry or Path.cwd()) for entry in sys.path]
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
+    started_at = time.perf_counter()
+    logger.info(
+        "llama_cpp runtime process stage start stage=%s timeout_seconds=%s interpreter=%s",
+        stage,
+        f"{timeout:g}",
+        sys.executable,
     )
-    return {
-        'import_root': import_root,
-        'deprioritized_entries': moved,
-        'sys_path_count': len(sys.path),
-    }
+    try:
+        completed = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.error(
+            "llama_cpp runtime process stage timeout stage=%s duration_ms=%s timeout_seconds=%s interpreter=%s",
+            stage,
+            duration_ms,
+            f"{timeout:g}",
+            sys.executable,
+        )
+        raise LlamaCppRuntimeStageTimeout(stage, timeout) from exc
 
+    duration_ms = int((time.perf_counter() - started_at) * 1000)
+    if completed.returncode != 0:
+        stderr = (completed.stderr or '').strip()
+        raise ImportError(
+            f"{stage} failed returncode={completed.returncode} stderr={stderr[:500]}"
+        )
+
+    stdout = (completed.stdout or '').strip().splitlines()
+    diagnostics: Dict[str, Any] = {}
+    if stdout:
+        try:
+            parsed = json.loads(stdout[-1])
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            diagnostics = parsed
+    logger.info(
+        "llama_cpp runtime process stage complete stage=%s duration_ms=%s module_path=%s",
+        stage,
+        duration_ms,
+        diagnostics.get('module_path') or diagnostics.get('llama_module_path') or 'unknown',
+    )
+    return diagnostics
+
+
+def _find_llama_cpp_spec_in_subprocess(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+    code = (
+        "import importlib.util, json, sys\n"
+        "spec = importlib.util.find_spec('llama_cpp')\n"
+        "print(json.dumps({\n"
+        "    'module_path': getattr(spec, 'origin', None) if spec else None,\n"
+        "    'interpreter': sys.executable,\n"
+        "}))\n"
+    )
+    return _run_llama_cpp_python_probe(
+        'llama_cpp_runtime_discovery',
+        code,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
+    code = (
+        "import importlib, json, sys\n"
+        "llama_cpp = importlib.import_module('llama_cpp')\n"
+        "cuda_markers = ('GGML_USE_CUDA', 'GGML_CUDA', 'LLAMA_CUDA', 'GGML_USE_CUBLAS', 'LLAMA_CUBLAS')\n"
+        "metal_markers = ('GGML_USE_METAL', 'GGML_METAL', 'LLAMA_METAL')\n"
+        "backend = 'cpu'\n"
+        "if any(bool(getattr(llama_cpp, marker, False)) for marker in cuda_markers):\n"
+        "    backend = 'cuda'\n"
+        "elif any(bool(getattr(llama_cpp, marker, False)) for marker in metal_markers):\n"
+        "    backend = 'metal'\n"
+        "supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)\n"
+        "gpu_supported = False\n"
+        "if callable(supports_gpu):\n"
+        "    gpu_supported = bool(supports_gpu())\n"
+        "else:\n"
+        "    gpu_supported = backend in {'cuda', 'metal'}\n"
+        "if gpu_supported and backend == 'cpu':\n"
+        "    backend = 'metal' if sys.platform == 'darwin' else 'cuda'\n"
+        "print(json.dumps({\n"
+        "    'backend': backend,\n"
+        "    'gpu_offload_supported': gpu_supported,\n"
+        "    'detected_device': backend if gpu_supported else 'cpu',\n"
+        "    'interpreter': sys.executable,\n"
+        "    'prefix': sys.prefix,\n"
+        "    'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),\n"
+        "    'error': None,\n"
+        "}))\n"
+    )
+    return _run_llama_cpp_python_probe(
+        'llama_cpp_gpu_probe',
+        code,
+        timeout_seconds=timeout_seconds,
+    )
 
 def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
     """Validate llama_cpp import in a killable subprocess before in-process import."""
@@ -237,15 +350,8 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
         path_diagnostics.get('sys_path_count'),
     )
 
-    def _find_spec():
-        return importlib.util.find_spec('llama_cpp')
-
-    llama_spec = _run_llama_runtime_stage(
-        'llama_cpp_runtime_discovery',
-        _find_spec,
-        timeout_seconds=timeout_seconds,
-    )
-    llama_module_path = getattr(llama_spec, 'origin', None)
+    spec_diagnostics = _find_llama_cpp_spec_in_subprocess(timeout_seconds=timeout_seconds)
+    llama_module_path = spec_diagnostics.get('module_path')
     logger.info(
         "llama_cpp runtime discovery complete module_path=%s interpreter=%s",
         llama_module_path or 'missing',
@@ -310,11 +416,15 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
 
     supports_gpu = getattr(llama_cpp, 'llama_supports_gpu_offload', None)
     gpu_offload_supported = False
+    module_path = getattr(llama_cpp, '__file__', None)
     if callable(supports_gpu):
         try:
-            gpu_offload_supported = bool(
-                _run_llama_runtime_stage('llama_cpp_gpu_probe', supports_gpu)
-            )
+            if module_path:
+                probe = _probe_llama_cpp_capabilities_in_subprocess()
+                gpu_offload_supported = bool(probe.get('gpu_offload_supported', False))
+                backend = str(probe.get('backend') or backend)
+            else:
+                gpu_offload_supported = bool(supports_gpu())
         except Exception:
             gpu_offload_supported = False
     else:
@@ -332,10 +442,9 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         'detected_device': backend if gpu_offload_supported else 'cpu',
         'interpreter': sys.executable,
         'prefix': sys.prefix,
-        'llama_module_path': getattr(llama_cpp, '__file__', 'unknown'),
+        'llama_module_path': module_path or 'unknown',
         'error': None,
     }
-
 
 def _coerce_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(probe, dict):
@@ -430,12 +539,32 @@ class ModelManager:
     def _runtime_capabilities(self=None) -> Dict[str, Any]:
         probe = _coerce_desktop_runtime_probe(getattr(self, 'desktop_runtime_probe', None))
         if probe is not None:
-            self.log_info(
-                "Using desktop runtime probe diagnostics for compute plan "
-                f"backend={probe['backend']} interpreter={probe['interpreter']} "
-                f"llama_module_path={probe['llama_module_path']} "
-                f"runtime_action={probe.get('runtime_action', 'unknown')}"
-            )
+            probe_module_path = probe.get('llama_module_path')
+            if probe_module_path and probe_module_path != 'unknown':
+                imported_runtime = detect_llama_runtime_capabilities()
+                imported_module_path = imported_runtime.get('llama_module_path')
+                if (
+                    imported_module_path
+                    and imported_module_path != 'unknown'
+                    and _canonical_path_for_compare(probe_module_path)
+                    != _canonical_path_for_compare(imported_module_path)
+                ):
+                    imported_runtime = dict(imported_runtime)
+                    imported_runtime['error'] = 'llama_cpp_runtime_probe_mismatch'
+                    if self is not None:
+                        self.log_warning(
+                            "Desktop runtime probe module path mismatch; using imported runtime probe "
+                            f"desktop_probe_path={probe_module_path} "
+                            f"imported_path={imported_module_path}"
+                        )
+                    return imported_runtime
+            if self is not None:
+                self.log_info(
+                    "Using desktop runtime probe diagnostics for compute plan "
+                    f"backend={probe['backend']} interpreter={probe['interpreter']} "
+                    f"llama_module_path={probe['llama_module_path']} "
+                    f"runtime_action={probe.get('runtime_action', 'unknown')}"
+                )
             return probe
         return detect_llama_runtime_capabilities()
 

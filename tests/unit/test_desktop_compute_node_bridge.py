@@ -2971,3 +2971,43 @@ def test_pre_registration_warmup_failure_reports_runtime_stage_error(capsys, mon
     assert error_event['warm_load_state'] == 'failed'
     assert error_event['last_error'] == 'llama_cpp_import_timeout after 0.01s'
     assert error_event['message'] == 'llama_cpp_import_timeout after 0.01s'
+
+
+class CurrentStageTimeoutWarmupRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        super().__init__(_config)
+        CurrentStageTimeoutWarmupRuntime.last_instance = self
+        self.ready_started = threading.Event()
+
+    def ensure_api_v1_runtime_ready(self):
+        self.model_manager.last_runtime_init_error = 'llama_cpp_gpu_probe_timeout after 0.01s'
+        self.ready_started.set()
+        time.sleep(0.2)
+        return True
+
+
+def test_pre_registration_warmup_timeout_reports_current_runtime_stage(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=CurrentStageTimeoutWarmupRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '1')
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS', '0.01')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+
+    runtime = CurrentStageTimeoutWarmupRuntime.last_instance
+    assert runtime is not None
+    assert runtime.ready_started.is_set()
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    error_event = next(event for event in events if event.get('type') == 'error')
+    assert error_event['registered'] is False
+    assert error_event['warm_load_state'] == 'failed'
+    assert error_event['last_error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+    assert error_event['message'] == 'llama_cpp_gpu_probe_timeout after 0.01s'

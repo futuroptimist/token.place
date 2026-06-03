@@ -1092,22 +1092,60 @@ def test_get_llm_instance_records_bounded_runtime_discovery_timeout(standalone_m
 
 
 def test_desktop_runtime_probe_is_reused_for_compute_plan(standalone_model_manager):
+    module_path = '/opt/python/site-packages/llama_cpp/__init__.py'
     standalone_model_manager.desktop_runtime_probe = {
         'runtime_action': 'already_supported',
         'selected_backend': 'cuda',
         'detected_device': 'cuda',
         'gpu_offload_supported': True,
-        'interpreter': r'C:\\Python311\\python.exe',
-        'llama_module_path': r'C:\\Python311\\Lib\\site-packages\\llama_cpp\\__init__.py',
+        'interpreter': '/opt/python/bin/python',
+        'llama_module_path': module_path,
     }
 
-    with patch('utils.llm.model_manager.detect_llama_runtime_capabilities') as detect:
+    with patch(
+        'utils.llm.model_manager.detect_llama_runtime_capabilities',
+        return_value={
+            'backend': 'cpu',
+            'gpu_offload_supported': False,
+            'detected_device': 'cpu',
+            'llama_module_path': module_path,
+            'error': None,
+        },
+    ) as detect:
         plan = standalone_model_manager._resolve_compute_plan()
 
-    detect.assert_not_called()
+    assert detect.call_count == 2
     assert plan['backend_available'] == 'cuda'
     assert plan['backend_selected'] == 'cuda'
     assert plan['n_gpu_layers'] == -1
+
+
+def test_desktop_runtime_probe_mismatch_falls_back_to_imported_runtime(standalone_model_manager):
+    standalone_model_manager.desktop_runtime_probe = {
+        'runtime_action': 'already_supported',
+        'selected_backend': 'cuda',
+        'detected_device': 'cuda',
+        'gpu_offload_supported': True,
+        'interpreter': '/opt/python/bin/python',
+        'llama_module_path': '/old/site-packages/llama_cpp/__init__.py',
+    }
+
+    with patch(
+        'utils.llm.model_manager.detect_llama_runtime_capabilities',
+        return_value={
+            'backend': 'cpu',
+            'gpu_offload_supported': False,
+            'detected_device': 'cpu',
+            'llama_module_path': '/new/site-packages/llama_cpp/__init__.py',
+            'error': None,
+        },
+    ):
+        plan = standalone_model_manager._resolve_compute_plan()
+
+    assert plan['effective_mode'] == 'cpu_fallback'
+    assert plan['backend_available'] == 'cpu'
+    assert plan['backend_used'] == 'cpu'
+    assert plan['n_gpu_layers'] == 0
 
 
 def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
@@ -1125,6 +1163,11 @@ def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
 def test_llama_cpp_import_watchdog_timeout_uses_subprocess(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
+    original_sys_path = list(sys.path)
+    original_module = sys.modules.get('llama_cpp')
+    sentinel = object()
+    sys.modules['llama_cpp'] = sentinel
+
     def _timeout_run(*_args, **kwargs):
         raise model_manager_module.subprocess.TimeoutExpired(
             cmd=kwargs.get('args', ['python']),
@@ -1133,11 +1176,20 @@ def test_llama_cpp_import_watchdog_timeout_uses_subprocess(monkeypatch):
 
     monkeypatch.setattr(model_manager_module.subprocess, 'run', _timeout_run)
 
-    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
-        model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=0.01)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+            model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=0.01)
+    finally:
+        if original_module is None:
+            sys.modules.pop('llama_cpp', None)
+        else:
+            sys.modules['llama_cpp'] = original_module
+        sys.path[:] = original_sys_path
 
     assert exc_info.value.stage == 'llama_cpp_import'
     assert 'llama_cpp_import after 0.01s' in str(exc_info.value)
+    assert sys.path == original_sys_path
+    assert sys.modules.get('llama_cpp') is original_module if original_module is not None else 'llama_cpp' not in sys.modules
 
 
 def test_sanitize_llama_cpp_import_paths_reports_deprioritized_entries(tmp_path, monkeypatch):
@@ -1160,3 +1212,63 @@ def test_sanitize_llama_cpp_import_paths_reports_deprioritized_entries(tmp_path,
     assert diagnostics['deprioritized_entries'] == [str(tmp_path)]
     assert 'removed_entries' not in diagnostics
     assert diagnostics['sys_path_count'] == 3
+
+
+def test_llama_cpp_runtime_discovery_timeout_does_not_mutate_parent_import_state(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    original_sys_path = list(sys.path)
+    original_module = sys.modules.get('llama_cpp')
+    sentinel = object()
+    sys.modules['llama_cpp'] = sentinel
+
+    def _timeout_run(*_args, **kwargs):
+        raise model_manager_module.subprocess.TimeoutExpired(
+            cmd=kwargs.get('args', ['python']),
+            timeout=kwargs.get('timeout'),
+        )
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', _timeout_run)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+            model_manager_module._find_llama_cpp_spec_in_subprocess(timeout_seconds=0.01)
+    finally:
+        if original_module is None:
+            sys.modules.pop('llama_cpp', None)
+        else:
+            sys.modules['llama_cpp'] = original_module
+        sys.path[:] = original_sys_path
+
+    assert exc_info.value.stage == 'llama_cpp_runtime_discovery'
+    assert sys.path == original_sys_path
+    assert sys.modules.get('llama_cpp') is original_module if original_module is not None else 'llama_cpp' not in sys.modules
+
+
+def test_llama_cpp_gpu_probe_timeout_does_not_mutate_parent_import_state(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    original_sys_path = list(sys.path)
+    original_module = sys.modules.get('llama_cpp')
+    sentinel = object()
+    sys.modules['llama_cpp'] = sentinel
+
+    def _timeout_run(*_args, **kwargs):
+        raise model_manager_module.subprocess.TimeoutExpired(
+            cmd=kwargs.get('args', ['python']),
+            timeout=kwargs.get('timeout'),
+        )
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', _timeout_run)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+            model_manager_module._probe_llama_cpp_capabilities_in_subprocess(timeout_seconds=0.01)
+    finally:
+        if original_module is None:
+            sys.modules.pop('llama_cpp', None)
+        else:
+            sys.modules['llama_cpp'] = original_module
+        sys.path[:] = original_sys_path
+
+    assert exc_info.value.stage == 'llama_cpp_gpu_probe'
+    assert sys.path == original_sys_path
+    assert sys.modules.get('llama_cpp') is original_module if original_module is not None else 'llama_cpp' not in sys.modules

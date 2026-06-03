@@ -936,8 +936,12 @@ def run(args: argparse.Namespace) -> int:
             remaining_seconds = warm_load_deadline_seconds - elapsed_seconds
             if remaining_seconds <= 0:
                 warm_load_state = "failed"
+                current_runtime_error = getattr(
+                    runtime.model_manager, 'last_runtime_init_error', None
+                )
                 warm_load_failed = (
-                    "API v1 relay runtime warm-load timed out after "
+                    current_runtime_error
+                    or "API v1 relay runtime warm-load timed out after "
                     f"{warm_load_deadline_seconds:g}s"
                 )
                 warm_load_duration_ms = int((time.perf_counter() - warm_load_started_at) * 1000)

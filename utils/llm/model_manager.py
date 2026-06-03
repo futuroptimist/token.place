@@ -389,14 +389,16 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
 def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
     """Import llama_cpp in this process with bounded recoverability safeguards.
 
-    On Windows and other platforms without SIGALRM/ITIMER_REAL there is no
-    recoverable in-process way to interrupt a first native extension import that
-    hangs while holding the GIL.  Starting a daemon Python worker there can leave
-    the bridge stuck before it can report a warm-load failure, so the no-SIGALRM
-    path fails closed unless ``llama_cpp`` is already imported.  POSIX main-thread
-    imports use SIGALRM.  POSIX non-main imports retain the short Python-thread
-    guard used by warm-load tests, but Windows never relies on that non-recoverable
-    fallback for first import.
+    The caller runs a killable subprocess discovery/import watchdog before this
+    helper.  On Windows and other platforms without SIGALRM/ITIMER_REAL there is
+    no recoverable in-process way to interrupt a first native extension import
+    that hangs while holding the GIL, but failing before import would reject every
+    valid first Windows warm-load after the watchdog has already proved the
+    installed runtime is importable.  Therefore the no-SIGALRM path performs the
+    real parent import directly after the subprocess guard instead of starting an
+    unsafe daemon-thread first import.  POSIX main-thread imports use SIGALRM.
+    POSIX non-main imports retain the short Python-thread guard used by warm-load
+    tests.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -410,14 +412,19 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
         and hasattr(signal, 'setitimer')
     )
     if not signal_guard_available:
-        logger.error(
-            "llama_cpp parent import guard unavailable; failing closed "
+        logger.info(
+            "llama_cpp parent import using no-SIGALRM direct path after subprocess watchdog "
             "timeout_seconds=%s interpreter=%s thread=%s",
             f"{timeout:g}",
             sys.executable,
             getattr(threading.current_thread(), 'name', 'unknown'),
         )
-        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+        try:
+            return importlib.import_module('llama_cpp')
+        except TimeoutError as exc:
+            if isinstance(exc, LlamaCppRuntimeStageTimeout):
+                raise
+            raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout) from exc
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)

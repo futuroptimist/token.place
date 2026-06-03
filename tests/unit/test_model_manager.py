@@ -1885,7 +1885,22 @@ def test_parent_import_guard_returns_already_imported_module_without_reimport(mo
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
 
 
-def test_parent_import_guard_fails_closed_when_signal_guard_unavailable(monkeypatch):
+def test_parent_import_guard_imports_when_signal_guard_unavailable(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    sys.modules.pop('llama_cpp', None)
+    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda name: fake_runtime if name == 'llama_cpp' else None,
+    )
+
+    assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
+
+
+def test_parent_import_guard_no_signal_wraps_timeout_error(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
@@ -1893,7 +1908,7 @@ def test_parent_import_guard_fails_closed_when_signal_guard_unavailable(monkeypa
     monkeypatch.setattr(
         model_manager_module.importlib,
         'import_module',
-        lambda _name: (_ for _ in ()).throw(AssertionError('unsafe parent import attempted')),
+        lambda _name: (_ for _ in ()).throw(TimeoutError('native import timeout')),
     )
 
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:

@@ -1367,3 +1367,159 @@ def test_llama_cpp_gpu_probe_timeout_does_not_mutate_parent_import_state(monkeyp
     assert exc_info.value.stage == 'llama_cpp_gpu_probe'
     assert sys.path == original_sys_path
     assert sys.modules.get('llama_cpp') is original_module if original_module is not None else 'llama_cpp' not in sys.modules
+
+
+def test_runtime_stage_timeout_seconds_handles_env_overrides(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.delenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', raising=False)
+    assert model_manager_module._runtime_stage_timeout_seconds() == (
+        model_manager_module.DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS
+    )
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '2.5')
+    assert model_manager_module._runtime_stage_timeout_seconds() == 2.5
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', 'invalid')
+    assert model_manager_module._runtime_stage_timeout_seconds() == (
+        model_manager_module.DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS
+    )
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '0')
+    assert model_manager_module._runtime_stage_timeout_seconds() == (
+        model_manager_module.DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS
+    )
+
+
+def test_canonical_path_for_compare_handles_empty_and_fallback(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._canonical_path_for_compare('') is None
+
+    original_abspath = model_manager_module.os.path.abspath
+
+    def _abspath_raises(path):
+        if str(path) == 'fallback/path':
+            raise OSError('slow or unavailable path')
+        return original_abspath(path)
+
+    monkeypatch.setattr(model_manager_module.os.path, 'abspath', _abspath_raises)
+
+    assert model_manager_module._canonical_path_for_compare('fallback/path') == (
+        model_manager_module.os.path.normcase(
+            model_manager_module.os.path.normpath('fallback/path')
+        )
+    )
+
+
+def test_run_llama_cpp_python_probe_handles_nonzero_and_malformed_json(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    completed = SimpleNamespace(returncode=1, stderr='native import failed', stdout='')
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(ImportError) as exc_info:
+        model_manager_module._find_llama_cpp_spec_in_subprocess(timeout_seconds=1)
+    assert 'llama_cpp_runtime_discovery failed returncode=1' in str(exc_info.value)
+
+    completed = SimpleNamespace(returncode=0, stderr='', stdout='not json\n')
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', lambda *_args, **_kwargs: completed)
+
+    assert model_manager_module._find_llama_cpp_spec_in_subprocess(timeout_seconds=1) == {}
+
+
+def test_run_llama_cpp_import_watchdog_handles_nonzero_and_malformed_json(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    completed = SimpleNamespace(returncode=1, stderr='import failed', stdout='')
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(ImportError) as exc_info:
+        model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=1)
+    assert 'llama_cpp import watchdog failed returncode=1' in str(exc_info.value)
+
+    completed = SimpleNamespace(returncode=0, stderr='', stdout='not json\n')
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', lambda *_args, **_kwargs: completed)
+
+    assert model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=1) == {}
+
+
+def test_import_llama_cpp_runtime_success_records_sanitized_parent_import(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+    calls = []
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 1},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: {'module_path': fake_runtime.__file__},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_run_llama_cpp_import_watchdog',
+        lambda **_kwargs: calls.append('watchdog') or {'module_path': fake_runtime.__file__},
+    )
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda name: calls.append(name) or fake_runtime,
+    )
+    monkeypatch.setattr(model_manager_module, '_is_repo_llama_cpp_shim', lambda _path: False)
+
+    assert model_manager_module._import_llama_cpp_runtime() is fake_runtime
+    assert calls == ['watchdog', 'llama_cpp']
+
+
+def test_import_llama_cpp_runtime_rejects_shim_from_discovery_before_parent_import(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(
+        model_manager_module,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 1},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: {'module_path': str(model_manager_module.REPO_LLAMA_CPP_SHIM)},
+    )
+    monkeypatch.setattr(model_manager_module, '_run_llama_cpp_import_watchdog', MagicMock())
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', MagicMock())
+
+    with pytest.raises(ImportError, match='repository-local llama_cpp.py shim'):
+        model_manager_module._import_llama_cpp_runtime()
+
+    model_manager_module._run_llama_cpp_import_watchdog.assert_not_called()
+    model_manager_module.importlib.import_module.assert_not_called()
+
+
+def test_import_llama_cpp_runtime_rejects_shim_from_parent_import(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_runtime = SimpleNamespace(__file__=str(model_manager_module.REPO_LLAMA_CPP_SHIM))
+    monkeypatch.setattr(
+        model_manager_module,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 1},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+    monkeypatch.setattr(model_manager_module, '_run_llama_cpp_import_watchdog', lambda **_kwargs: {})
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+    sys.modules['llama_cpp'] = fake_runtime
+
+    try:
+        with pytest.raises(ImportError, match='repository-local llama_cpp.py shim'):
+            model_manager_module._import_llama_cpp_runtime()
+        assert 'llama_cpp' not in sys.modules
+    finally:
+        sys.modules.pop('llama_cpp', None)

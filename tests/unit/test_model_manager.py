@@ -1561,6 +1561,43 @@ def test_import_llama_cpp_runtime_reports_parent_import_timeout(monkeypatch):
     )
 
 
+def test_import_llama_cpp_runtime_no_signal_fails_closed_after_child_watchdog(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    sys.modules.pop('llama_cpp', None)
+    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_ALLOW_UNBOUNDED_LLAMA_CPP_PARENT_IMPORT', raising=False)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 1},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_run_llama_cpp_import_watchdog',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('would hang if parent import started')),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+        model_manager_module._import_llama_cpp_runtime(timeout_seconds=0.01)
+
+    assert exc_info.value.stage == 'llama_cpp_import'
+    assert model_manager_module._format_runtime_stage_timeout(exc_info.value) == (
+        'llama_cpp_import_timeout after 0.01s'
+    )
+    assert 'llama_cpp' not in sys.modules
+
+
 def test_detect_llama_runtime_capabilities_preserves_gpu_probe_timeout(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -1885,28 +1922,12 @@ def test_parent_import_guard_returns_already_imported_module_without_reimport(mo
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
 
 
-def test_parent_import_guard_imports_when_signal_guard_unavailable_by_default(monkeypatch):
-    from utils.llm import model_manager as model_manager_module
-
-    sys.modules.pop('llama_cpp', None)
-    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.delenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', raising=False)
-    monkeypatch.setattr(
-        model_manager_module.importlib,
-        'import_module',
-        lambda name: fake_runtime if name == 'llama_cpp' else None,
-    )
-
-    assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
-
-
-def test_parent_import_guard_no_signal_fails_closed_with_operator_env(monkeypatch):
+def test_parent_import_guard_no_signal_fails_closed_by_default(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.setenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', '1')
+    monkeypatch.delenv('TOKEN_PLACE_ALLOW_UNBOUNDED_LLAMA_CPP_PARENT_IMPORT', raising=False)
     monkeypatch.setattr(
         model_manager_module.importlib,
         'import_module',
@@ -1920,12 +1941,28 @@ def test_parent_import_guard_no_signal_fails_closed_with_operator_env(monkeypatc
     assert exc_info.value.timeout_seconds == 0.01
 
 
-def test_parent_import_guard_no_signal_wraps_timeout_error_by_default(monkeypatch):
+def test_parent_import_guard_no_signal_imports_with_explicit_unbounded_opt_in(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    sys.modules.pop('llama_cpp', None)
+    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
+    monkeypatch.setenv('TOKEN_PLACE_ALLOW_UNBOUNDED_LLAMA_CPP_PARENT_IMPORT', '1')
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda name: fake_runtime if name == 'llama_cpp' else None,
+    )
+
+    assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
+
+
+def test_parent_import_guard_no_signal_wraps_timeout_error_with_unbounded_opt_in(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.delenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', raising=False)
+    monkeypatch.setenv('TOKEN_PLACE_ALLOW_UNBOUNDED_LLAMA_CPP_PARENT_IMPORT', '1')
     monkeypatch.setattr(
         model_manager_module.importlib,
         'import_module',

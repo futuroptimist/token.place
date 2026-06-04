@@ -983,7 +983,7 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
 
     assert probe.backend == 'cuda'
     assert 'ensure_runtime_import_paths' in desktop_runtime_setup._PROBE_SNIPPET
-    assert "Path(entry or \".\").resolve()" in desktop_runtime_setup._PROBE_SNIPPET
+    assert "_safe_resolve_path(entry or \".\")" in desktop_runtime_setup._PROBE_SNIPPET
     assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
     assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
@@ -1467,3 +1467,12 @@ def test_resolve_desktop_dependency_target_uses_home_only_when_runtime_probe_fai
     assert error is None
     assert target == home_dir / '.token_place_desktop_site'
     assert probes == [runtime_root / '.token_place_desktop_site', target]
+
+
+def test_runtime_setup_strips_windows_extended_prefix_for_packaged_resource_paths():
+    assert desktop_runtime_setup._strip_windows_extended_path_prefix(
+        r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    ) == r'C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    assert desktop_runtime_setup._strip_windows_extended_path_prefix(
+        r'\\?\UNC\server\share\TokenPlace.app\Contents\Resources\python\compute_node_bridge.py'
+    ) == r'\\server\share\TokenPlace.app\Contents\Resources\python\compute_node_bridge.py'

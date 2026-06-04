@@ -8,14 +8,26 @@ import sys
 from pathlib import Path
 
 
+def _strip_windows_extended_path_prefix(path_text: str) -> str:
+    if path_text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path_text[8:]
+    if path_text.startswith("\\\\?\\"):
+        return path_text[4:]
+    return path_text
+
+
+def _safe_resolve_path(path_text: str | Path) -> Path:
+    return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+
 def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
-    script_path = Path(script_file).resolve()
+    script_path = _safe_resolve_path(script_file)
     script_root = script_path.parent.parent
     explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
     candidates = [
-        Path(explicit_import_root) if explicit_import_root else None,
+        _safe_resolve_path(explicit_import_root) if explicit_import_root else None,
         script_root,  # bundled resources root in packaged apps
         script_root / "resources",  # no-bundle/debug layout when script is under <exe>/python
         script_root / "Resources",  # macOS-style resources casing
@@ -48,22 +60,22 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
     if os.environ.get("PYTHONNOUSERSITE") == "1":
         user_site = getattr(site, "USER_SITE", None)
         if user_site:
-            user_site_path = Path(user_site).resolve()
+            user_site_path = _safe_resolve_path(user_site)
             sys.path[:] = [
                 entry
                 for entry in sys.path
-                if Path(entry or ".").resolve() != user_site_path
+                if _safe_resolve_path(entry or ".") != user_site_path
             ]
 
     if not avoid_llama_cpp_shadowing:
         return
 
-    cwd = Path.cwd().resolve()
+    cwd = _safe_resolve_path(Path.cwd())
     if (cwd / "llama_cpp.py").is_file():
         sys.path[:] = [
             entry
             for entry in sys.path
-            if entry != "" and Path(entry).resolve() != cwd
+            if entry != "" and _safe_resolve_path(entry) != cwd
         ]
 
     # Keep repo roots importable for `utils.*` / `config` while avoiding local
@@ -73,8 +85,8 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
         if not (candidate / "llama_cpp.py").is_file():
             continue
 
-        cwd = str(Path.cwd().resolve())
-        if candidate.resolve() == Path.cwd().resolve():
+        cwd = str(_safe_resolve_path(Path.cwd()))
+        if _safe_resolve_path(candidate) == _safe_resolve_path(Path.cwd()):
             while "" in sys.path:
                 sys.path.remove("")
             while cwd in sys.path:

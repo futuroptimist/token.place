@@ -24,6 +24,18 @@ from desktop_gpu_packaging import (
 )
 
 
+def _strip_windows_extended_path_prefix(path_text: str) -> str:
+    if path_text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path_text[8:]
+    if path_text.startswith("\\\\?\\"):
+        return path_text[4:]
+    return path_text
+
+
+def _safe_resolve_path(path_text: str | Path) -> Path:
+    return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+
 @dataclass(frozen=True)
 class RuntimeBootstrapPolicy:
     platform: str
@@ -88,6 +100,16 @@ import os
 import sys
 from pathlib import Path
 
+def _strip_windows_extended_path_prefix(path_text):
+    if path_text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path_text[8:]
+    if path_text.startswith("\\\\?\\"):
+        return path_text[4:]
+    return path_text
+
+def _safe_resolve_path(path_text):
+    return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
 python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
 if python_root and python_root not in sys.path:
     sys.path.insert(0, python_root)
@@ -98,12 +120,12 @@ if bootstrap_script:
 
     ensure_runtime_import_paths(bootstrap_script, avoid_llama_cpp_shadowing=True)
 
-repo_root = Path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd())).resolve()
+repo_root = _safe_resolve_path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd()))
 
-repo_root_resolved = str(repo_root.resolve())
+repo_root_resolved = str(_safe_resolve_path(repo_root))
 sanitized = []
 for entry in sys.path:
-    resolved_entry = str(Path(entry or ".").resolve())
+    resolved_entry = str(_safe_resolve_path(entry or "."))
     if resolved_entry == repo_root_resolved:
         continue
     sanitized.append(entry)
@@ -112,8 +134,8 @@ sys.path[:] = sanitized
 try:
     llama_spec = importlib.util.find_spec("llama_cpp")
     llama_module_path = getattr(llama_spec, "origin", None)
-    repo_shim = str((repo_root / "llama_cpp.py").resolve())
-    if llama_module_path and str(Path(llama_module_path).resolve()) == repo_shim:
+    repo_shim = str(_safe_resolve_path(repo_root / "llama_cpp.py"))
+    if llama_module_path and str(_safe_resolve_path(llama_module_path)) == repo_shim:
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."
@@ -121,7 +143,7 @@ try:
 
     llama_cpp = importlib.import_module("llama_cpp")
     llama_module_path = getattr(llama_cpp, "__file__", llama_module_path or "unknown")
-    if llama_module_path and str(Path(llama_module_path).resolve()) == repo_shim:
+    if llama_module_path and str(_safe_resolve_path(llama_module_path)) == repo_shim:
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."
@@ -174,11 +196,11 @@ print(json.dumps(payload))
 
 def _resolve_runtime_root(*, repo_root: Optional[Path] = None) -> Path:
     if repo_root is not None:
-        return repo_root.resolve()
+        return _safe_resolve_path(repo_root)
 
     explicit_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
     if explicit_root:
-        candidate = Path(explicit_root).resolve()
+        candidate = _safe_resolve_path(explicit_root)
         if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
             return candidate
         print(
@@ -187,7 +209,7 @@ def _resolve_runtime_root(*, repo_root: Optional[Path] = None) -> Path:
             file=sys.stderr,
         )
 
-    script_path = Path(__file__).resolve()
+    script_path = _safe_resolve_path(__file__)
     for candidate in script_path.parents:
         if (candidate / "utils").is_dir() or (candidate / "config.py").is_file():
             return candidate
@@ -201,8 +223,8 @@ def _resolve_runtime_root(*, repo_root: Optional[Path] = None) -> Path:
 
 
 def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe:
-    repo_root = _resolve_runtime_root(repo_root=runtime_root)
-    python_root = Path(__file__).resolve().parent
+    repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
+    python_root = _safe_resolve_path(__file__).parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
@@ -211,7 +233,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
-    env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(Path(__file__).resolve())
+    env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(_safe_resolve_path(__file__))
     env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
     try:
         result = subprocess.run(

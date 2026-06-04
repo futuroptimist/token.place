@@ -411,12 +411,15 @@ def _signal_guard_available() -> bool:
 
 
 def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp in this process when Python can recoverably time it out.
+    """Import llama_cpp in the active bridge process.
 
-    No-SIGALRM platforms (notably Windows) cannot interrupt a first native
-    extension import in the current interpreter.  Those platforms are handled by
-    a subprocess-backed module facade in ``_import_llama_cpp_runtime`` so the
-    real import can either succeed in a child process or be killed cleanly.
+    Windows and non-main-thread imports cannot be interrupted safely without
+    moving the import into a second process.  The packaged desktop regression
+    showed that the second process could have a different native-extension/DLL
+    environment from the real bridge and become an accidental startup blocker.
+    Keep direct import as the source of truth; the surrounding desktop warm-load
+    gate remains bounded and reports failure if model initialization does not
+    become ready.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -425,7 +428,11 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
         return already_imported
 
     if not _signal_guard_available():
-        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+        logger.info(
+            "llama_cpp direct parent import without signal watchdog interpreter=%s",
+            sys.executable,
+        )
+        return importlib.import_module('llama_cpp')
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
@@ -447,43 +454,11 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
             if previous_timer[0] > 0:
                 signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
-    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
-
-    def _target() -> None:
-        try:
-            result_queue.put(('ok', importlib.import_module('llama_cpp')))
-        except LlamaCppRuntimeStageTimeout as exc:
-            result_queue.put(('timeout', exc))
-        except TimeoutError:
-            result_queue.put(('timeout', LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)))
-        except Exception as exc:
-            result_queue.put(('error', exc))
-
-    worker = threading.Thread(
-        target=_target,
-        name='llama_cpp_parent_import_guard',
-        daemon=True,
+    logger.info(
+        "llama_cpp direct parent import from non-main thread interpreter=%s",
+        sys.executable,
     )
-    worker.start()
-    worker.join(timeout)
-    if worker.is_alive():
-        logger.error(
-            "llama_cpp parent import timeout timeout_seconds=%s interpreter=%s",
-            f"{timeout:g}",
-            sys.executable,
-        )
-        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
-
-    try:
-        status, value = result_queue.get_nowait()
-    except queue.Empty as exc:
-        raise ImportError('llama_cpp parent import completed without result') from exc
-
-    if status == 'ok':
-        return value
-    if status == 'timeout':
-        raise value
-    raise value
+    return importlib.import_module('llama_cpp')
 
 
 def _read_llama_subprocess_message(
@@ -649,8 +624,29 @@ except Exception as exc:
 """
 
 
-def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp while guarding against the repo-local test shim with bounded stages."""
+def _probe_module_path_from_desktop_runtime_probe(probe: Any) -> Optional[str]:
+    coerced = _coerce_desktop_runtime_probe(probe)
+    if coerced is None or coerced.get('error'):
+        return None
+    module_path = str(coerced.get('llama_module_path') or '').strip()
+    if not module_path or module_path in {'missing', 'unknown'}:
+        return None
+    return module_path
+
+
+def _import_llama_cpp_runtime(
+    *,
+    require_real_runtime: bool = True,
+    timeout_seconds: Optional[float] = None,
+    desktop_runtime_probe: Any = None,
+):
+    """Import llama_cpp while guarding against the repo-local test shim.
+
+    Packaged desktop runtime setup already imports/probes llama_cpp in the
+    selected interpreter to verify CUDA/Metal support.  Reuse that module-path
+    diagnostic when present and avoid a second pre-import child watchdog whose
+    environment can diverge from the real bridge process.
+    """
     path_diagnostics = _sanitize_llama_cpp_import_paths()
     logger.info(
         "llama_cpp import path sanitized import_root=%s deprioritized_entries=%s sys_path_count=%s",
@@ -659,13 +655,22 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
         path_diagnostics.get('sys_path_count'),
     )
 
-    spec_diagnostics = _find_llama_cpp_spec_in_subprocess(timeout_seconds=timeout_seconds)
-    llama_module_path = spec_diagnostics.get('module_path')
-    logger.info(
-        "llama_cpp runtime discovery complete module_path=%s interpreter=%s",
-        llama_module_path or 'missing',
-        sys.executable,
-    )
+    expected_module_path = _probe_module_path_from_desktop_runtime_probe(desktop_runtime_probe)
+    if expected_module_path:
+        llama_module_path = expected_module_path
+        logger.info(
+            "llama_cpp runtime discovery reused desktop probe module_path=%s interpreter=%s",
+            llama_module_path,
+            sys.executable,
+        )
+    else:
+        spec_diagnostics = _find_llama_cpp_spec_in_subprocess(timeout_seconds=timeout_seconds)
+        llama_module_path = spec_diagnostics.get('module_path')
+        logger.info(
+            "llama_cpp runtime discovery complete module_path=%s interpreter=%s",
+            llama_module_path or 'missing',
+            sys.executable,
+        )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
         sys.modules.pop('llama_cpp', None)
@@ -674,18 +679,26 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
             "install llama-cpp-python and ensure site-packages wins import priority."
         )
 
-    _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    if not _signal_guard_available() and sys.modules.get('llama_cpp') is None:
-        logger.warning(
-            "llama_cpp parent import delegated to bounded subprocess runtime on no-SIGALRM platform "
-            "module_path=%s interpreter=%s",
-            llama_module_path or 'unknown',
-            sys.executable,
+    logger.info(
+        "llama_cpp direct import start module_path_hint=%s interpreter=%s",
+        llama_module_path or 'unknown',
+        sys.executable,
+    )
+    llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
+    imported_module_path = getattr(llama_cpp, '__file__', None)
+    if (
+        require_real_runtime
+        and expected_module_path
+        and imported_module_path
+        and _canonical_path_for_compare(expected_module_path)
+        != _canonical_path_for_compare(imported_module_path)
+    ):
+        sys.modules.pop('llama_cpp', None)
+        raise ImportError(
+            "Desktop runtime probe module path mismatch; refusing mismatched llama_cpp runtime "
+            f"desktop_probe_path={expected_module_path} imported_path={imported_module_path}"
         )
-        llama_cpp = _SubprocessLlamaCppModule(llama_module_path, timeout_seconds=timeout_seconds)
-    else:
-        llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
-    llama_module_path = getattr(llama_cpp, '__file__', None)
+    llama_module_path = imported_module_path
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",
         llama_module_path or 'unknown',
@@ -1237,7 +1250,10 @@ class ModelManager:
                             self.last_runtime_init_error = None
                             # Dynamically import Llama only when needed
                             self.log_info("Locating llama_cpp runtime for model initialization...")
-                            llama_cpp = _import_llama_cpp_runtime(require_real_runtime=True)
+                            llama_cpp = _import_llama_cpp_runtime(
+                                require_real_runtime=True,
+                                desktop_runtime_probe=getattr(self, 'desktop_runtime_probe', None),
+                            )
                             self._imported_llama_cpp_module_path = getattr(llama_cpp, '__file__', None)
                             self.log_info(
                                 "llama_cpp runtime located "

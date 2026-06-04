@@ -269,3 +269,12 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
             sys.modules.pop('llama_cpp', None)
         else:
             sys.modules['llama_cpp'] = original_llama_module
+
+
+def test_strip_windows_extended_prefix_for_packaged_resource_paths(path_bootstrap):
+    assert path_bootstrap._strip_windows_extended_path_prefix(
+        r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    ) == r'C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    assert path_bootstrap._strip_windows_extended_path_prefix(
+        r'\\?\UNC\server\share\token.place desktop\python\compute_node_bridge.py'
+    ) == r'\\server\share\token.place desktop\python\compute_node_bridge.py'

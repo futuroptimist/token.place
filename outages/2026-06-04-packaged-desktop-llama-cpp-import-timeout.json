@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-04",
+  "slug": "packaged-desktop-llama-cpp-import-timeout",
+  "summary": "Packaged desktop compute-node startup timed out in a child llama_cpp import watchdog after runtime setup had already found a supported CUDA runtime, preventing Registered: yes.",
+  "impact": "Windows packaged operators could fail/stopped before relay registration, and the shared packaged import seam also risked macOS Metal parity.",
+  "fix": "Removed the startup-critical child import watchdog, reused desktop runtime setup probe diagnostics, imported llama_cpp in the real bridge process, normalized packaged paths, and skipped unregister before successful registration.",
+  "lessons": "Packaged e2e must prove registered=true for the full desktop + relay lifecycle and must exercise shared runtime/bootstrap code instead of only inspect or mock paths. Native-extension import probes must not run in a divergent child environment unless that environment is proven equivalent."
+}

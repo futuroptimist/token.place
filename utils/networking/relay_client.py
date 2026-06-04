@@ -837,16 +837,17 @@ class RelayClient:
         relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
         self._api_v1_relay_wait_hints = relay_wait_hints
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
+        if not registered_relays:
+            log_info("Compute node was not registered with an API v1 relay; skipping unregister")
+            self._unregister_complete = True
+            return True
 
         ordered_relay_urls = [
             self._relay_urls[(self._active_relay_index + offset) % len(self._relay_urls)]
             for offset in range(len(self._relay_urls))
         ]
-        if registered_relays:
-            target_urls = [url for url in ordered_relay_urls if url in registered_relays]
-            target_urls.extend(sorted(url for url in registered_relays if url not in set(target_urls)))
-        else:
-            target_urls = ordered_relay_urls
+        target_urls = [url for url in ordered_relay_urls if url in registered_relays]
+        target_urls.extend(sorted(url for url in registered_relays if url not in set(target_urls)))
 
         relay_index_by_url = {url: index for index, url in enumerate(self._relay_urls)}
 

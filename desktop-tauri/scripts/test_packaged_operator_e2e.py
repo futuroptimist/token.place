@@ -327,6 +327,73 @@ def run_unified_root_import_policy_probe(
     assert payload["cwd_present"] is False, combined
     assert payload["llama_shim_before_site"] is False, combined
 
+
+def run_llama_cpp_watchdog_regression_probe(
+    tmp_root: Path, *, resources_root: Path | None = None, layout_label: str = "standard resources"
+) -> None:
+    """Assert packaged model warm-load does not pre-import llama_cpp in a divergent child."""
+
+    resources_root = resources_root or (tmp_root / "resources")
+    fake_site = tmp_root / f"fake site-packages {layout_label.replace('/', '_')}"
+    fake_pkg = fake_site / "llama_cpp"
+    fake_pkg.mkdir(parents=True, exist_ok=True)
+    fake_init = fake_pkg / "__init__.py"
+    fake_init.write_text(
+        "import os, time\n"
+        "if os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n"
+        "    time.sleep(60)\n"
+        "__file__ = __file__\n"
+        "GGML_USE_CUDA = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n"
+        "class Llama:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    env = _packaged_env(
+        tmp_root,
+        resources_root,
+        extra_env={
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
+            "PYTHONPATH": os.pathsep.join(
+                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, sys; "
+                f"sys.path.insert(0, {str(fake_site)!r}); "
+                f"sys.path.insert(0, {str(resources_root)!r}); "
+                "from utils.llm import model_manager; "
+                "module_path = pathlib.Path(sys.path[1], 'llama_cpp', '__init__.py'); "
+                "llama_cpp = model_manager._import_llama_cpp_runtime("
+                "require_real_runtime=True, "
+                "desktop_runtime_probe={"
+                "'selected_backend': 'cuda', 'gpu_offload_supported': True, "
+                "'detected_device': 'cuda', 'interpreter': sys.executable, "
+                "'prefix': sys.prefix, 'llama_module_path': str(module_path), "
+                "'fallback_reason': ''}); "
+                "print(json.dumps({'module_path': getattr(llama_cpp, '__file__', None)}))"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert Path(payload["module_path"]).resolve() == fake_init.resolve(), combined
+    assert "llama_cpp_import_timeout" not in combined, combined
+    assert "llama_cpp import watchdog start" not in combined, combined
+
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
     if not hasattr(stdout, "readline"):
         return
@@ -485,6 +552,7 @@ def main() -> int:
         run_unified_root_import_policy_probe(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
+        run_llama_cpp_watchdog_regression_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
@@ -492,6 +560,9 @@ def main() -> int:
         run_unified_root_import_policy_probe(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
+        run_llama_cpp_watchdog_regression_probe(
+            tmp_path, resources_root=mac_resources_root, layout_label="macOS Contents/Resources"
+        )
 
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0

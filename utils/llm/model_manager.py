@@ -386,19 +386,21 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     return diagnostics
 
 
-def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp in this process with bounded recoverability safeguards.
+def _signal_guard_available() -> bool:
+    return (
+        hasattr(signal, 'SIGALRM')
+        and hasattr(signal, 'ITIMER_REAL')
+        and hasattr(signal, 'setitimer')
+    )
 
-    The caller runs killable subprocess discovery/import watchdogs before this
-    helper.  On Windows and other platforms without SIGALRM/ITIMER_REAL, Python
-    does not provide a recoverable in-process timer for a first native extension
-    import.  After the child watchdog proves the packaged runtime imports, the
-    default no-SIGALRM behavior must still attempt the real parent import so
-    valid Windows runtimes can initialize.  Operators who prefer fail-closed
-    behavior over first-import availability can set
-    TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT=1.  POSIX main-thread
-    imports use SIGALRM.  POSIX non-main imports retain the short Python-thread
-    guard used by warm-load tests.
+
+def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
+    """Import llama_cpp in this process when Python can recoverably time it out.
+
+    No-SIGALRM platforms (notably Windows) cannot interrupt a first native
+    extension import in the current interpreter.  Those platforms are handled by
+    a subprocess-backed module facade in ``_import_llama_cpp_runtime`` so the
+    real import can either succeed in a child process or be killed cleanly.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -406,38 +408,8 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
     if already_imported is not None:
         return already_imported
 
-    signal_guard_available = (
-        hasattr(signal, 'SIGALRM')
-        and hasattr(signal, 'ITIMER_REAL')
-        and hasattr(signal, 'setitimer')
-    )
-    if not signal_guard_available:
-        fail_closed_parent_import = (
-            os.getenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', '').strip() == '1'
-        )
-        if fail_closed_parent_import:
-            logger.error(
-                "llama_cpp parent import refused by no-SIGALRM fail-closed override after subprocess watchdog "
-                "timeout_seconds=%s interpreter=%s thread=%s",
-                f"{timeout:g}",
-                sys.executable,
-                getattr(threading.current_thread(), 'name', 'unknown'),
-            )
-            raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
-
-        logger.warning(
-            "llama_cpp parent import proceeding on no-SIGALRM platform after subprocess watchdog "
-            "timeout_seconds=%s interpreter=%s thread=%s",
-            f"{timeout:g}",
-            sys.executable,
-            getattr(threading.current_thread(), 'name', 'unknown'),
-        )
-        try:
-            return importlib.import_module('llama_cpp')
-        except TimeoutError as exc:
-            if isinstance(exc, LlamaCppRuntimeStageTimeout):
-                raise
-            raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout) from exc
+    if not _signal_guard_available():
+        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
@@ -466,7 +438,7 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
             result_queue.put(('ok', importlib.import_module('llama_cpp')))
         except LlamaCppRuntimeStageTimeout as exc:
             result_queue.put(('timeout', exc))
-        except TimeoutError as exc:
+        except TimeoutError:
             result_queue.put(('timeout', LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)))
         except Exception as exc:
             result_queue.put(('error', exc))
@@ -498,6 +470,132 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
     raise value
 
 
+def _read_llama_subprocess_message(
+    process: subprocess.Popen,
+    *,
+    timeout_seconds: float,
+    stage: str,
+) -> Dict[str, Any]:
+    result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if line.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
+                result_queue.put(line.split(':', 1)[1].strip())
+                return
+
+    reader = threading.Thread(target=_reader, name=f'{stage}_stdout_reader', daemon=True)
+    reader.start()
+    try:
+        raw_message = result_queue.get(timeout=timeout_seconds)
+    except queue.Empty as exc:
+        try:
+            process.terminate()
+            process.wait(timeout=1)
+        except Exception:
+            process.kill()
+        raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds) from exc
+    try:
+        message = json.loads(raw_message)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f'{stage} returned malformed JSON') from exc
+    if not isinstance(message, dict):
+        raise RuntimeError(f'{stage} returned non-object JSON')
+    if message.get('status') == 'error':
+        raise RuntimeError(str(message.get('error') or f'{stage} failed'))
+    return message
+
+
+class _SubprocessLlamaProxy:
+    """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
+
+    def __init__(self, *args, timeout_seconds: Optional[float] = None, **kwargs) -> None:
+        self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+        self._lock = Lock()
+        self._process = subprocess.Popen(
+            [sys.executable, '-u', '-c', _llama_cpp_probe_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=_llama_cpp_probe_env(),
+            cwd=_llama_cpp_probe_subprocess_cwd(),
+            bufsize=1,
+        )
+        self._send({'method': '__init__', 'args': args, 'kwargs': kwargs})
+        _read_llama_subprocess_message(
+            self._process,
+            timeout_seconds=self._timeout_seconds,
+            stage='llama_cpp_import',
+        )
+
+    def _send(self, payload: Dict[str, Any]) -> None:
+        if self._process.stdin is None:
+            raise RuntimeError('llama_cpp subprocess stdin is unavailable')
+        self._process.stdin.write(json.dumps(payload) + '\n')
+        self._process.stdin.flush()
+
+    def create_chat_completion(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
+            message = _read_llama_subprocess_message(
+                self._process,
+                timeout_seconds=self._timeout_seconds,
+                stage='llama_cpp_inference',
+            )
+        return message.get('result')
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._process.terminate()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _SubprocessLlamaCppModule:
+    def __init__(self, module_path: Any, *, timeout_seconds: Optional[float] = None) -> None:
+        self.__file__ = module_path
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def Llama(self):
+        timeout_seconds = self._timeout_seconds
+
+        class _ConfiguredSubprocessLlama(_SubprocessLlamaProxy):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, timeout_seconds=timeout_seconds, **kwargs)
+
+        return _ConfiguredSubprocessLlama
+
+
+_LLAMA_CPP_RUNTIME_WORKER_CODE = """
+import importlib, json, sys, traceback
+
+def _emit(payload):
+    print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(payload), flush=True)
+
+init_payload = json.loads(sys.stdin.readline())
+llama_cpp = importlib.import_module('llama_cpp')
+try:
+    llama = llama_cpp.Llama(*init_payload.get('args', []), **init_payload.get('kwargs', {}))
+    _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
+    for line in sys.stdin:
+        request = json.loads(line)
+        if request.get('method') == 'create_chat_completion':
+            result = llama.create_chat_completion(*request.get('args', []), **request.get('kwargs', {}))
+            _emit({'status': 'ok', 'result': result})
+        else:
+            _emit({'status': 'error', 'error': 'unsupported llama_cpp subprocess method'})
+except Exception as exc:
+    _emit({'status': 'error', 'error': str(exc), 'traceback': traceback.format_exc()})
+"""
+
+
 def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seconds: Optional[float] = None):
     """Import llama_cpp while guarding against the repo-local test shim with bounded stages."""
     path_diagnostics = _sanitize_llama_cpp_import_paths()
@@ -524,7 +622,16 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
         )
 
     _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
+    if not _signal_guard_available() and sys.modules.get('llama_cpp') is None:
+        logger.warning(
+            "llama_cpp parent import delegated to bounded subprocess runtime on no-SIGALRM platform "
+            "module_path=%s interpreter=%s",
+            llama_module_path or 'unknown',
+            sys.executable,
+        )
+        llama_cpp = _SubprocessLlamaCppModule(llama_module_path, timeout_seconds=timeout_seconds)
+    else:
+        llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",

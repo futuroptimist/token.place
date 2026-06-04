@@ -1561,13 +1561,11 @@ def test_import_llama_cpp_runtime_reports_parent_import_timeout(monkeypatch):
     )
 
 
-def test_import_llama_cpp_runtime_no_signal_imports_after_child_watchdog(monkeypatch):
+def test_import_llama_cpp_runtime_no_signal_uses_subprocess_facade(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
-    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.delenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', raising=False)
     monkeypatch.setattr(
         model_manager_module,
         '_sanitize_llama_cpp_import_paths',
@@ -1586,10 +1584,96 @@ def test_import_llama_cpp_runtime_no_signal_imports_after_child_watchdog(monkeyp
     monkeypatch.setattr(
         model_manager_module.importlib,
         'import_module',
-        lambda name: fake_runtime if name == 'llama_cpp' else None,
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import must not run')),
     )
 
-    assert model_manager_module._import_llama_cpp_runtime(timeout_seconds=0.01) is fake_runtime
+    runtime = model_manager_module._import_llama_cpp_runtime(timeout_seconds=0.01)
+
+    assert isinstance(runtime, model_manager_module._SubprocessLlamaCppModule)
+    assert runtime.__file__ == '/site-packages/llama_cpp/__init__.py'
+
+
+def test_no_signal_warm_load_reports_subprocess_import_timeout(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model_file = tmp_path / 'test_model.gguf'
+    model_file.write_bytes(b'fake model data')
+    config = MagicMock()
+    config.is_production = False
+    config.get.side_effect = lambda key, default=None: {
+        'model.filename': 'test_model.gguf',
+        'model.url': 'https://example.com/model.gguf',
+        'model.download_chunk_size_mb': 1,
+        'paths.models_dir': str(tmp_path),
+        'model.use_mock': False,
+        'model.context_size': 2048,
+        'model.chat_format': 'llama-3',
+        'model.n_gpu_layers': -1,
+        'model.gpu_memory_headroom_percent': 0.1,
+        'model.enforce_gpu_memory_headroom': False,
+    }.get(key, default)
+
+    class HangingStdout:
+        def __iter__(self):
+            while True:
+                time.sleep(1)
+                yield ''
+
+    class FakeStdin:
+        def write(self, _text):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = HangingStdout()
+            self.stderr = None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise TimeoutError('still hung')
+
+        def kill(self):
+            return None
+
+        def poll(self):
+            return None
+
+    sys.modules.pop('llama_cpp', None)
+    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '0.01')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 1},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_run_llama_cpp_import_watchdog',
+        lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
+    )
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', FakeProcess)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import must not run')),
+    )
+
+    manager = ModelManager(config)
+    manager.requested_compute_mode = 'cpu'
+
+    assert manager.get_llm_instance() is None
+    assert manager.last_runtime_init_error == 'llama_cpp_import_timeout after 0.01s'
 
 
 def test_detect_llama_runtime_capabilities_preserves_gpu_probe_timeout(monkeypatch):
@@ -1916,32 +2000,15 @@ def test_parent_import_guard_returns_already_imported_module_without_reimport(mo
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
 
 
-def test_parent_import_guard_no_signal_imports_by_default(monkeypatch):
-    from utils.llm import model_manager as model_manager_module
-
-    sys.modules.pop('llama_cpp', None)
-    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.delenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', raising=False)
-    monkeypatch.setattr(
-        model_manager_module.importlib,
-        'import_module',
-        lambda name: fake_runtime if name == 'llama_cpp' else None,
-    )
-
-    assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
-
-
-def test_parent_import_guard_no_signal_fails_closed_with_explicit_override(monkeypatch):
+def test_parent_import_guard_no_signal_fails_closed_without_parent_import(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.setenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', '1')
     monkeypatch.setattr(
         model_manager_module.importlib,
         'import_module',
-        lambda _name: (_ for _ in ()).throw(AssertionError('must not import with fail-closed override')),
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import must not run')),
     )
 
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
@@ -1951,23 +2018,56 @@ def test_parent_import_guard_no_signal_fails_closed_with_explicit_override(monke
     assert exc_info.value.timeout_seconds == 0.01
 
 
-def test_parent_import_guard_no_signal_wraps_timeout_error(monkeypatch):
+def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
-    sys.modules.pop('llama_cpp', None)
-    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    monkeypatch.delenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', raising=False)
-    monkeypatch.setattr(
-        model_manager_module.importlib,
-        'import_module',
-        lambda _name: (_ for _ in ()).throw(TimeoutError('native import timeout')),
-    )
+    class HangingStdout:
+        def __iter__(self):
+            while True:
+                time.sleep(1)
+                yield ''
+
+    class FakeStdin:
+        def write(self, _text):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = HangingStdout()
+            self.stderr = None
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            raise TimeoutError('still hung')
+
+        def kill(self):
+            self.killed = True
+
+        def poll(self):
+            return None
+
+    created = []
+
+    def _fake_popen(*args, **kwargs):
+        process = FakeProcess(*args, **kwargs)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
 
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
-        model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 
     assert exc_info.value.stage == 'llama_cpp_import'
-    assert exc_info.value.timeout_seconds == 0.01
+    assert created and created[0].terminated and created[0].killed
 
 
 def test_detect_llama_runtime_capabilities_preserves_import_timeout(monkeypatch):

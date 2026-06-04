@@ -2137,3 +2137,108 @@ def test_production_log_helper_suppresses_logger_call(standalone_model_manager):
         standalone_model_manager.log_info('hidden in production')
 
     log.assert_not_called()
+
+
+def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdout:
+        def __init__(self):
+            self._lines = iter([
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","chunk":{"choices":[{"delta":{"content":"Hi"}}]},"done":false}\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","chunk":{"choices":[{"delta":{"content":"lo"}}]},"done":false}\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","done":true}\n',
+            ])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._lines)
+
+    class FakeStdin:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, text):
+            self.writes.append(json.loads(text))
+
+        def flush(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    created = []
+
+    def _fake_popen(*args, **kwargs):
+        process = FakeProcess(*args, **kwargs)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
+    chunks = list(proxy.create_chat_completion(messages=[], stream=True))
+
+    assert [chunk['choices'][0]['delta']['content'] for chunk in chunks] == ['Hi', 'lo']
+    assert created[0].stdin.writes[1]['kwargs']['stream'] is True
+
+
+def test_subprocess_llama_proxy_inference_does_not_use_runtime_stage_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '0.01')
+    monkeypatch.delenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', raising=False)
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._process = SimpleNamespace(stdin=MagicMock())
+    proxy._send = MagicMock()
+    captured_timeouts = []
+
+    def _fake_read(_process, *, timeout_seconds, stage):
+        captured_timeouts.append((stage, timeout_seconds))
+        return {'status': 'ok', 'result': {'choices': [{'message': {'content': 'ok'}}]}}
+
+    monkeypatch.setattr(model_manager_module, '_read_llama_subprocess_message', _fake_read)
+
+    result = proxy.create_chat_completion(messages=[], stream=False)
+
+    assert result['choices'][0]['message']['content'] == 'ok'
+    assert captured_timeouts == [('llama_cpp_inference', None)]
+
+
+def test_subprocess_llama_proxy_uses_explicit_inference_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '7.5')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._process = SimpleNamespace(stdin=MagicMock())
+    proxy._send = MagicMock()
+    captured_timeouts = []
+
+    def _fake_read(_process, *, timeout_seconds, stage):
+        captured_timeouts.append((stage, timeout_seconds))
+        if len(captured_timeouts) == 1:
+            return {'status': 'ok', 'chunk': {'choices': [{'delta': {'content': 'ok'}}]}, 'done': False}
+        return {'status': 'ok', 'done': True}
+
+    monkeypatch.setattr(model_manager_module, '_read_llama_subprocess_message', _fake_read)
+
+    assert list(proxy.create_chat_completion(messages=[], stream=True)) == [
+        {'choices': [{'delta': {'content': 'ok'}}]},
+    ]
+    assert captured_timeouts == [('llama_cpp_inference', 7.5), ('llama_cpp_inference', 7.5)]

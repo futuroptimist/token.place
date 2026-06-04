@@ -386,6 +386,22 @@ def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -
     return diagnostics
 
 
+def _llama_cpp_subprocess_inference_timeout_seconds() -> Optional[float]:
+    """Return an optional timeout for subprocess-backed inference calls."""
+
+    raw = os.getenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS')
+    if raw is None or raw.strip() == '':
+        # Runtime-stage timeouts bound discovery/import/probe work only.  Inference
+        # can legitimately run longer, and API/relay callers already have their
+        # own request deadlines, so do not apply the import-stage timeout here.
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _signal_guard_available() -> bool:
     return (
         hasattr(signal, 'SIGALRM')
@@ -473,7 +489,7 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
 def _read_llama_subprocess_message(
     process: subprocess.Popen,
     *,
-    timeout_seconds: float,
+    timeout_seconds: Optional[float],
     stage: str,
 ) -> Dict[str, Any]:
     result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
@@ -484,11 +500,15 @@ def _read_llama_subprocess_message(
             if line.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
                 result_queue.put(line.split(':', 1)[1].strip())
                 return
+        result_queue.put(json.dumps({'status': 'error', 'error': f'{stage} subprocess ended'}))
 
     reader = threading.Thread(target=_reader, name=f'{stage}_stdout_reader', daemon=True)
     reader.start()
     try:
-        raw_message = result_queue.get(timeout=timeout_seconds)
+        if timeout_seconds is None:
+            raw_message = result_queue.get()
+        else:
+            raw_message = result_queue.get(timeout=timeout_seconds)
     except queue.Empty as exc:
         try:
             process.terminate()
@@ -537,14 +557,30 @@ class _SubprocessLlamaProxy:
         self._process.stdin.flush()
 
     def create_chat_completion(self, *args, **kwargs):
+        stream = bool(kwargs.get('stream', False))
+        if stream:
+            return self._stream_chat_completion(*args, **kwargs)
         with self._lock:
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
             message = _read_llama_subprocess_message(
                 self._process,
-                timeout_seconds=self._timeout_seconds,
+                timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                 stage='llama_cpp_inference',
             )
         return message.get('result')
+
+    def _stream_chat_completion(self, *args, **kwargs):
+        with self._lock:
+            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
+            while True:
+                message = _read_llama_subprocess_message(
+                    self._process,
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                )
+                if message.get('done'):
+                    return
+                yield message.get('chunk')
 
     def close(self) -> None:
         if self._process.poll() is None:
@@ -576,8 +612,19 @@ class _SubprocessLlamaCppModule:
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
 import importlib, json, sys, traceback
 
+def _jsonable(value):
+    if hasattr(value, 'model_dump'):
+        return value.model_dump()
+    if hasattr(value, 'dict'):
+        return value.dict()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
 def _emit(payload):
-    print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(payload), flush=True)
+    print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
 init_payload = json.loads(sys.stdin.readline())
 llama_cpp = importlib.import_module('llama_cpp')
@@ -587,8 +634,14 @@ try:
     for line in sys.stdin:
         request = json.loads(line)
         if request.get('method') == 'create_chat_completion':
-            result = llama.create_chat_completion(*request.get('args', []), **request.get('kwargs', {}))
-            _emit({'status': 'ok', 'result': result})
+            kwargs = request.get('kwargs', {})
+            result = llama.create_chat_completion(*request.get('args', []), **kwargs)
+            if kwargs.get('stream'):
+                for chunk in result:
+                    _emit({'status': 'ok', 'chunk': chunk, 'done': False})
+                _emit({'status': 'ok', 'done': True})
+            else:
+                _emit({'status': 'ok', 'result': result})
         else:
             _emit({'status': 'error', 'error': 'unsupported llama_cpp subprocess method'})
 except Exception as exc:

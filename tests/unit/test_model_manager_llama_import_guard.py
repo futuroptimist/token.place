@@ -6,8 +6,11 @@ from utils.llm import model_manager
 
 
 def test_import_guard_rejects_repo_local_shim_before_import(monkeypatch):
-    fake_spec = types.SimpleNamespace(origin=str(model_manager.REPO_LLAMA_CPP_SHIM))
-    monkeypatch.setattr(model_manager.importlib.util, "find_spec", lambda _name: fake_spec)
+    monkeypatch.setattr(
+        model_manager,
+        "_find_llama_cpp_spec_in_subprocess",
+        lambda **_kwargs: {"module_path": str(model_manager.REPO_LLAMA_CPP_SHIM)},
+    )
     monkeypatch.setitem(model_manager.sys.modules, "llama_cpp", object())
 
     import_attempted = False

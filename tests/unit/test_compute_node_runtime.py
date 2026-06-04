@@ -765,3 +765,37 @@ def test_compute_node_runtime_stop_continues_when_unregister_raises():
         call.stop(),
         call.unregister_from_relay(),
     ]
+
+
+def test_compute_node_runtime_replaces_stale_error_on_preflight_failure():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = False
+    model_manager.last_runtime_init_error = 'llama_cpp_import_timeout after 0.01s'
+    model_manager.download_model_if_needed.return_value = False
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error == 'model_file_preflight_failed'
+
+
+def test_compute_node_runtime_replaces_stale_error_on_runtime_shape_failure():
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+    model_manager.last_runtime_init_error = 'llama_cpp_import_timeout after 0.01s'
+    model_manager.get_llm_instance.return_value = object()
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=model_manager,
+        relay_client=MagicMock(),
+        crypto_manager=MagicMock(),
+    )
+
+    assert runtime.ensure_api_v1_runtime_ready() is False
+    assert model_manager.last_runtime_init_error == 'runtime_missing_create_chat_completion'

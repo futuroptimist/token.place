@@ -301,11 +301,22 @@ class ComputeNodeRuntime:
     def ensure_api_v1_runtime_ready(self) -> bool:
         """Warm and validate API v1 non-streaming runtime before polling."""
 
+        setattr(self.model_manager, 'last_runtime_init_error', None)
         if not self.ensure_model_ready():
+            setattr(
+                self.model_manager,
+                'last_runtime_init_error',
+                'model_file_preflight_failed',
+            )
             return False
 
         get_llm_instance = getattr(self.model_manager, "get_llm_instance", None)
         if not callable(get_llm_instance):
+            setattr(
+                self.model_manager,
+                'last_runtime_init_error',
+                'model_manager_missing_get_llm_instance',
+            )
             _log_error("Model manager missing get_llm_instance required for API v1 warmup")
             return False
 
@@ -313,16 +324,32 @@ class ComputeNodeRuntime:
         _log_info(f"API v1 runtime warmup about to instantiate model: {model_path}")
         try:
             llm_runtime = get_llm_instance()
-        except Exception:
+        except Exception as exc:
+            setattr(self.model_manager, 'last_runtime_init_error', str(exc))
             _log_error("Failed to initialize API v1 runtime for compute node", exc_info=True)
             return False
 
         if llm_runtime is None:
-            _log_error("API v1 runtime warmup failed: get_llm_instance returned None")
+            detail = getattr(self.model_manager, 'last_runtime_init_error', None)
+            message = "API v1 runtime warmup failed: get_llm_instance returned None"
+            if detail:
+                message = f"{message} ({detail})"
+            else:
+                setattr(
+                    self.model_manager,
+                    'last_runtime_init_error',
+                    'get_llm_instance_returned_none',
+                )
+            _log_error(message)
             return False
 
         create_chat_completion = getattr(llm_runtime, "create_chat_completion", None)
         if not callable(create_chat_completion):
+            setattr(
+                self.model_manager,
+                'last_runtime_init_error',
+                'runtime_missing_create_chat_completion',
+            )
             _log_error(
                 "API v1 runtime warmup failed: runtime missing callable create_chat_completion"
             )
@@ -335,6 +362,7 @@ class ComputeNodeRuntime:
             diagnostics["api_v1_runtime_ready"] = True
             self.model_manager.last_compute_diagnostics = diagnostics
 
+        setattr(self.model_manager, 'last_runtime_init_error', None)
         return True
 
     def start_relay_polling(self) -> threading.Thread:

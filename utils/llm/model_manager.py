@@ -390,16 +390,13 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
     """Import llama_cpp in this process with bounded recoverability safeguards.
 
     The caller runs killable subprocess discovery/import watchdogs before this
-    helper.  On Windows and other platforms without SIGALRM/ITIMER_REAL there is
-    no recoverable in-process way to interrupt a first native extension import
-    that hangs while holding the GIL.  Because this path runs before relay
-    registration, the safe default is to fail closed with the same runtime-stage
-    timeout that a watchdog timeout would surface; this leaves the node
-    unregistered and lets Stop/Start spawn a clean bridge retry rather than
-    leaving the current interpreter stuck in ``warming``.  Operators who have
-    validated their packaged runtime and accept the native-import risk can opt in
-    to the unbounded direct import with
-    TOKEN_PLACE_ALLOW_UNBOUNDED_LLAMA_CPP_PARENT_IMPORT=1.  POSIX main-thread
+    helper.  On Windows and other platforms without SIGALRM/ITIMER_REAL, Python
+    does not provide a recoverable in-process timer for a first native extension
+    import.  After the child watchdog proves the packaged runtime imports, the
+    default no-SIGALRM behavior must still attempt the real parent import so
+    valid Windows runtimes can initialize.  Operators who prefer fail-closed
+    behavior over first-import availability can set
+    TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT=1.  POSIX main-thread
     imports use SIGALRM.  POSIX non-main imports retain the short Python-thread
     guard used by warm-load tests.
     """
@@ -415,13 +412,13 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
         and hasattr(signal, 'setitimer')
     )
     if not signal_guard_available:
-        allow_unbounded_parent_import = (
-            os.getenv('TOKEN_PLACE_ALLOW_UNBOUNDED_LLAMA_CPP_PARENT_IMPORT', '').strip() == '1'
+        fail_closed_parent_import = (
+            os.getenv('TOKEN_PLACE_FAIL_CLOSED_LLAMA_CPP_PARENT_IMPORT', '').strip() == '1'
         )
-        if not allow_unbounded_parent_import:
+        if fail_closed_parent_import:
             logger.error(
-                "llama_cpp parent import refused on no-SIGALRM platform after subprocess watchdog "
-                "timeout_seconds=%s interpreter=%s thread=%s reason=no_recoverable_parent_import_guard",
+                "llama_cpp parent import refused by no-SIGALRM fail-closed override after subprocess watchdog "
+                "timeout_seconds=%s interpreter=%s thread=%s",
                 f"{timeout:g}",
                 sys.executable,
                 getattr(threading.current_thread(), 'name', 'unknown'),
@@ -429,7 +426,7 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
             raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
 
         logger.warning(
-            "llama_cpp parent import using explicit no-SIGALRM unbounded opt-in after subprocess watchdog "
+            "llama_cpp parent import proceeding on no-SIGALRM platform after subprocess watchdog "
             "timeout_seconds=%s interpreter=%s thread=%s",
             f"{timeout:g}",
             sys.executable,

@@ -411,12 +411,16 @@ def _signal_guard_available() -> bool:
 
 
 def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp in this process when Python can recoverably time it out.
+    """Import llama_cpp in the bridge process.
 
-    No-SIGALRM platforms (notably Windows) cannot interrupt a first native
-    extension import in the current interpreter.  Those platforms are handled by
-    a subprocess-backed module facade in ``_import_llama_cpp_runtime`` so the
-    real import can either succeed in a child process or be killed cleanly.
+    Packaged desktop startup must exercise the same interpreter, sys.path, cwd,
+    DLL/search-path state, and native-extension environment that model
+    initialization will actually use.  A previous killable child-process
+    pre-import watchdog could diverge from that environment on Windows/macOS and
+    block otherwise valid CUDA/Metal runtimes before the real bridge process had
+    a chance to import them.  Keep a SIGALRM guard where Python supports one,
+    but on no-SIGALRM platforms rely on the outer warm-load/session deadline
+    instead of a second subprocess import.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -425,7 +429,12 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
         return already_imported
 
     if not _signal_guard_available():
-        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+        logger.info(
+            "llama_cpp direct parent import without SIGALRM guard timeout_seconds=%s interpreter=%s",
+            f"{timeout:g}",
+            sys.executable,
+        )
+        return importlib.import_module('llama_cpp')
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
@@ -674,17 +683,12 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
             "install llama-cpp-python and ensure site-packages wins import priority."
         )
 
-    _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    if not _signal_guard_available() and sys.modules.get('llama_cpp') is None:
-        logger.warning(
-            "llama_cpp parent import delegated to bounded subprocess runtime on no-SIGALRM platform "
-            "module_path=%s interpreter=%s",
-            llama_module_path or 'unknown',
-            sys.executable,
-        )
-        llama_cpp = _SubprocessLlamaCppModule(llama_module_path, timeout_seconds=timeout_seconds)
-    else:
-        llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
+    logger.info(
+        "llama_cpp runtime located module_path=%s interpreter=%s import_strategy=direct_parent",
+        llama_module_path or 'unknown',
+        sys.executable,
+    )
+    llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",

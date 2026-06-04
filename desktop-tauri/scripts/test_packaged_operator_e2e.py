@@ -262,6 +262,71 @@ def run_compute_bridge_import_probe(tmp_root: Path, *, resources_root: Path | No
         assert marker not in combined, combined
 
 
+
+def run_llama_cpp_direct_import_regression_probe(
+    tmp_root: Path,
+    *,
+    resources_root: Path | None = None,
+    layout_label: str = "standard resources",
+) -> None:
+    """Ensure packaged warm-load does not block on a child import watchdog."""
+
+    resources_root = resources_root or (tmp_root / "resources")
+    fake_site = tmp_root / f"fake site-packages {layout_label.replace('/', ' ')}"
+    fake_llama = fake_site / "llama_cpp"
+    fake_llama.mkdir(parents=True, exist_ok=True)
+    (fake_llama / "__init__.py").write_text(
+        "import os, time\n"
+        "if os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n"
+        "    time.sleep(5)\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.args = args\n"
+        "        self.kwargs = kwargs\n"
+        "GGML_USE_CUDA = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    env = _packaged_env(
+        tmp_root,
+        resources_root,
+        extra_env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+            ),
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "0.2",
+        },
+    )
+    probe = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                f"sys.path.insert(0, {str(fake_site)!r}); "
+                f"sys.path.insert(1, {str(resources_root / 'python')!r}); "
+                f"sys.path.insert(2, {str(resources_root)!r}); "
+                "from path_bootstrap import ensure_runtime_import_paths; "
+                f"ensure_runtime_import_paths({str(resources_root / 'python' / 'compute_node_bridge.py')!r}); "
+                "from utils.llm import model_manager; "
+                "runtime = model_manager._import_llama_cpp_runtime(require_real_runtime=True, timeout_seconds=0.2); "
+                "print(json.dumps({'module_path': getattr(runtime, '__file__', None)}))"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    combined = f"{probe.stdout}\n{probe.stderr}"
+    assert probe.returncode == 0, f"[{layout_label}] llama_cpp direct import probe failed: {combined}"
+    assert "llama_cpp import watchdog start" not in combined, combined
+    payload = json.loads(probe.stdout.strip().splitlines()[-1])
+    assert Path(payload["module_path"]).parent == fake_llama, combined
+
 def run_unified_root_import_policy_probe(
     tmp_root: Path, *, resources_root: Path | None = None
 ) -> None:
@@ -485,6 +550,7 @@ def main() -> int:
         run_unified_root_import_policy_probe(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
+        run_llama_cpp_direct_import_regression_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
@@ -492,6 +558,11 @@ def main() -> int:
         run_unified_root_import_policy_probe(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
+        run_llama_cpp_direct_import_regression_probe(
+            tmp_path,
+            resources_root=mac_resources_root,
+            layout_label="macOS Contents/Resources",
+        )
 
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0

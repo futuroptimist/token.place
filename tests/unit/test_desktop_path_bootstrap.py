@@ -269,3 +269,46 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
             sys.modules.pop('llama_cpp', None)
         else:
             sys.modules['llama_cpp'] = original_llama_module
+
+
+def test_bootstrap_normalizes_windows_extended_import_root_with_spaces(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    script = tmp_path / 'token.place desktop' / 'resources' / 'python' / 'compute_node_bridge.py'
+    explicit_root = tmp_path / 'token.place desktop' / '_up_' / '_up_'
+    (explicit_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    extended_root = '\\\\?\\' + str(explicit_root)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', extended_root)
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert str(explicit_root.resolve()) in sys.path
+        assert extended_root not in sys.path
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_bootstrap_supports_macos_app_contents_resources_with_spaces(tmp_path, path_bootstrap):
+    script = (
+        tmp_path
+        / 'Token Place.app'
+        / 'Contents'
+        / 'Resources'
+        / 'python'
+        / 'compute_node_bridge.py'
+    )
+    resources_root = script.parents[1]
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script))
+        assert str(resources_root) in sys.path
+        assert sys.path.index(str(resources_root)) == 0
+    finally:
+        sys.path[:] = original_sys_path

@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-04",
+  "slug": "packaged-desktop-llama-cpp-import-timeout",
+  "summary": "Packaged desktop compute-node startup could fail before relay registration because a child-process llama_cpp import watchdog timed out despite desktop runtime setup finding a valid CUDA runtime.",
+  "impact": "Windows packaged operators with a known-good CUDA llama-cpp-python runtime could remain Registered: no and never serve relay traffic; macOS packaged runtimes shared the same fragile import seam.",
+  "fix": "Removed the startup-critical child-process llama_cpp pre-import watchdog, kept direct bridge-process import semantics, normalized packaged import roots, and skipped unregister before fresh registration exists.",
+  "lessons": "Packaged runtime probes must not diverge from the actual bridge/model initialization environment, and e2e coverage must require registered=true rather than only process startup or mock/inspect success."
+}

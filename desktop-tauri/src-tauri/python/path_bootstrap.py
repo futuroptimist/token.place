@@ -8,14 +8,34 @@ import sys
 from pathlib import Path
 
 
+def _strip_windows_extended_path_prefix(path_text: str) -> str:
+    """Return a normal path string for import-root comparisons.
+
+    Tauri can log Windows resource paths with the ``\\\\?\\`` extended-length
+    prefix.  Python imports and environment propagation are less surprising with
+    the normal spelling, while subprocess launch sites can still use their
+    original executable/script paths.
+    """
+
+    if path_text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path_text[8:]
+    if path_text.startswith("\\\\?\\"):
+        return path_text[4:]
+    return path_text
+
+
+def _runtime_path(path_text: str) -> Path:
+    return Path(_strip_windows_extended_path_prefix(path_text)).resolve()
+
+
 def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
     """Add likely import roots for development and packaged desktop layouts."""
 
-    script_path = Path(script_file).resolve()
+    script_path = _runtime_path(script_file)
     script_root = script_path.parent.parent
     explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
     candidates = [
-        Path(explicit_import_root) if explicit_import_root else None,
+        _runtime_path(explicit_import_root) if explicit_import_root else None,
         script_root,  # bundled resources root in packaged apps
         script_root / "resources",  # no-bundle/debug layout when script is under <exe>/python
         script_root / "Resources",  # macOS-style resources casing

@@ -799,3 +799,34 @@ def test_compute_node_runtime_replaces_stale_error_on_runtime_shape_failure():
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     assert model_manager.last_runtime_init_error == 'runtime_missing_create_chat_completion'
+
+
+def test_compute_node_runtime_stop_skips_unregister_before_fresh_registration():
+    class RelayClient:
+        def __init__(self):
+            self.stop_calls = 0
+            self.unregister_calls = 0
+            self._api_v1_registered_relays = set()
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def api_v1_registration_fresh(self):
+            return False
+
+        def unregister_from_relay(self):
+            self.unregister_calls += 1
+            return True
+
+    relay_client = RelayClient()
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url="https://token.place", relay_port=None),
+        model_manager=MagicMock(),
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    runtime.stop()
+
+    assert relay_client.stop_calls == 1
+    assert relay_client.unregister_calls == 0

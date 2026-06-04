@@ -426,7 +426,9 @@ class ComputeNodeRuntime:
         try:
             self.relay_client.stop()
             unregister_fn = getattr(self.relay_client, "unregister_from_relay", None)
-            if callable(unregister_fn):
+            registered_relays = getattr(self.relay_client, "_api_v1_registered_relays", None)
+            should_unregister = not (isinstance(registered_relays, set) and not registered_relays)
+            if callable(unregister_fn) and should_unregister:
                 if not unregister_fn():
                     _log_warning("Relay unregister request failed during shutdown")
         except Exception:

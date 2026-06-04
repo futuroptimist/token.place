@@ -1032,6 +1032,15 @@ def run(args: argparse.Namespace) -> int:
                 )
         unregister = getattr(relay_client, "unregister_from_relay", None)
         if callable(unregister):
+            if not _registration_fresh(relay_client, active_relay_url):
+                print(
+                    "desktop.compute_node_bridge.unregister.skipped "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    "reason=not_registered",
+                    file=sys.stderr,
+                )
+                return
             print(
                 "desktop.compute_node_bridge.unregister.attempted "
                 f"relay={_sanitize_relay_target(active_relay_url)} "

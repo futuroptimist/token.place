@@ -3070,3 +3070,66 @@ def test_pre_registration_warmup_timeout_reports_current_runtime_stage(capsys, m
     assert error_event['warm_load_state'] == 'failed'
     assert error_event['last_error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
     assert error_event['message'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+
+
+class NeverRegisteredRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.stop_calls = 0
+        self.unregister_calls = 0
+
+    def api_v1_registration_fresh(self, _relay_url=None):
+        return False
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        return True
+
+
+class NeverRegisteredCancelRuntime(FakeRuntime):
+    last_instance = None
+
+    def __init__(self, _config):
+        NeverRegisteredCancelRuntime.last_instance = self
+        self.model_manager = FakeModelManager()
+        self.relay_client = NeverRegisteredRelayClient()
+        self.stop_calls = 0
+        self._processed = []
+
+    def register_and_poll_once(self):
+        return {'next_ping_in_x_seconds': 60}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+def test_run_skips_unregister_when_poll_cancel_happens_before_fresh_registration(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=NeverRegisteredCancelRuntime)
+    stop_calls = {'count': 0}
+
+    def fake_stop_requested():
+        stop_calls['count'] += 1
+        return stop_calls['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '0')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    runtime = NeverRegisteredCancelRuntime.last_instance
+    assert runtime.relay_client.stop_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.unregister.skipped' in output.err
+    assert 'reason=not_registered' in output.err

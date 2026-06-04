@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-04",
+  "slug": "packaged-desktop-llama-cpp-import-timeout",
+  "summary": "Packaged desktop operator startup could fail before relay registration because model warm-load repeated llama_cpp import in a divergent watchdog subprocess even after runtime setup had proven the CUDA/Metal runtime.",
+  "impact": "Windows CUDA packaged operators could remain Running: yes / Registered: no or fail with llama_cpp_import_timeout after 30s; macOS packaged runtime paths shared the same risk.",
+  "fix": "Reuse desktop runtime probe diagnostics, remove the startup-critical llama_cpp import watchdog from warm-load, import directly in the bridge process with shared path sanitization, normalize extended Windows paths, and require registered=true in packaged e2e coverage.",
+  "lessons": "Packaged desktop e2e must assert the operator reaches Registered: yes, and runtime setup/model warm-load must not use divergent native-extension import environments."
+}

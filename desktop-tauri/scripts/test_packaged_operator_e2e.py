@@ -373,6 +373,8 @@ def run_compute_bridge_startup_probe(
     bridge_output = ""
     saw_started = False
     saw_registered = False
+    saw_registered_ready = False
+    last_running_unregistered: dict[str, object] | None = None
     try:
         assert bridge.stdout is not None
         assert bridge.stdin is not None
@@ -417,9 +419,13 @@ def run_compute_bridge_startup_probe(
                     raise RuntimeError(f"bridge emitted error event: {payload}")
                 if payload.get("type") == "started" and payload.get("running") is True:
                     saw_started = True
+                if payload.get("running") is True and payload.get("registered") is False:
+                    last_running_unregistered = payload
                 if payload.get("registered") is True:
                     saw_registered = True
-                if saw_started and saw_registered:
+                    if payload.get("relay_runtime_state") == "ready":
+                        saw_registered_ready = True
+                if saw_started and saw_registered_ready:
                     bridge.stdin.write(b'{"type":"cancel"}\n')
                     bridge.stdin.flush()
                     cancel_deadline = time.time() + 5
@@ -429,7 +435,7 @@ def run_compute_bridge_startup_probe(
                         except queue.Empty:
                             pass
                     break
-            if saw_started and saw_registered:
+            if saw_started and saw_registered_ready:
                 break
 
         if not saw_started:
@@ -437,10 +443,11 @@ def run_compute_bridge_startup_probe(
                 f"[{layout_label}] bridge did not emit started/running event; output="
                 f"{bridge_output[-4000:]}"
             )
-        if not saw_registered:
+        if not saw_registered_ready:
             raise RuntimeError(
-                f"[{layout_label}] bridge never reported registered=true "
-                f"(relay connection missing); output={bridge_output[-4000:]}"
+                f"[{layout_label}] bridge never reported registered=true with "
+                f"relay_runtime_state=ready (last running/unregistered={last_running_unregistered}); "
+                f"output={bridge_output[-4000:]}"
             )
 
         try:
@@ -465,6 +472,8 @@ def run_compute_bridge_startup_probe(
             "ImportError",
             "compute-node bridge exited before emitting a startup event",
             "desktop_runtime_setup module missing",
+            "llama_cpp_import_timeout",
+            "Running: yes / Registered: no",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output

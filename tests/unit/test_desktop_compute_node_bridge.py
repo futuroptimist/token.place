@@ -3070,3 +3070,55 @@ def test_pre_registration_warmup_timeout_reports_current_runtime_stage(capsys, m
     assert error_event['warm_load_state'] == 'failed'
     assert error_event['last_error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
     assert error_event['message'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+
+
+def test_pre_registration_failure_does_not_attempt_unregister_before_register(capsys, monkeypatch):
+    _reset_cancel_queue()
+
+    class PreRegistrationFailureRelayClient(FakeRelayClient):
+        def __init__(self):
+            self.stop_calls = 0
+            self.unregister_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def unregister_from_relay(self):
+            self.unregister_calls += 1
+            return True
+
+    class PreRegistrationFailureRuntime(FakeRuntime):
+        last_instance = None
+
+        def __init__(self, _config):
+            PreRegistrationFailureRuntime.last_instance = self
+            self.model_manager = FakeModelManager()
+            self.relay_client = PreRegistrationFailureRelayClient()
+            self._processed = []
+
+        def ensure_api_v1_runtime_ready(self):
+            self.model_manager.last_runtime_init_error = 'llama_cpp_import_failed'
+            return False
+
+        def register_and_poll_once(self):
+            raise AssertionError('registration should not be attempted')
+
+        def stop(self):
+            return None
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=PreRegistrationFailureRuntime)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '1')
+    args = SimpleNamespace(
+        model='/tmp/model.gguf',
+        mode='cpu',
+        relay_url='https://token.place',
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 1
+
+    runtime = PreRegistrationFailureRuntime.last_instance
+    assert runtime.relay_client.stop_calls == 1
+    assert runtime.relay_client.unregister_calls == 0
+    output = capsys.readouterr()
+    assert 'desktop.compute_node_bridge.unregister.attempted' not in output.err

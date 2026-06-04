@@ -269,3 +269,20 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
             sys.modules.pop('llama_cpp', None)
         else:
             sys.modules['llama_cpp'] = original_llama_module
+
+
+def test_strip_windows_extended_path_prefix_preserves_spaces(path_bootstrap):
+    extended = r"\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py"
+
+    stripped = path_bootstrap._strip_windows_extended_path_prefix(extended)
+
+    assert stripped == r"C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py"
+    assert "token.place desktop" in stripped
+
+
+def test_strip_windows_extended_unc_path_prefix(path_bootstrap):
+    extended = r"\\?\UNC\server\share\token.place desktop\python\compute_node_bridge.py"
+
+    assert path_bootstrap._strip_windows_extended_path_prefix(extended) == (
+        r"\\server\share\token.place desktop\python\compute_node_bridge.py"
+    )

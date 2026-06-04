@@ -660,6 +660,7 @@ def run(args: argparse.Namespace) -> int:
     warm_load_fatal = False
     warm_load_future: Optional[_DaemonWarmLoadFuture] = None
     poll_worker = _CancelablePollWorker(operator_session_id=bridge_session_id)
+    registration_succeeded = False
     def build_status_payload(
         *,
         event_type: str,
@@ -1031,7 +1032,7 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
         unregister = getattr(relay_client, "unregister_from_relay", None)
-        if callable(unregister):
+        if callable(unregister) and registration_succeeded:
             print(
                 "desktop.compute_node_bridge.unregister.attempted "
                 f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1140,6 +1141,9 @@ def run(args: argparse.Namespace) -> int:
                     f"request_id={request_id} wait={wait_seconds} summary={summary}",
                     file=sys.stderr,
                 )
+
+                if registered:
+                    registration_succeeded = True
 
                 if not registered:
                     if relay_error is not None:

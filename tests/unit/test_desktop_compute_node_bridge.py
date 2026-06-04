@@ -1939,6 +1939,7 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     ]
     assert len(warming_status_events) == 1
     assert "registration.gate_wait_timeout" in captured.err
+    assert "desktop.compute_node_bridge.unregister.attempted" not in captured.err
     assert "api_v1_e2ee.runtime_wait.start" not in captured.err
     assert "api_v1_e2ee.runtime_wait.timeout" not in captured.err
 

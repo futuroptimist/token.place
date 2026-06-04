@@ -376,6 +376,8 @@ class TestRelayClient:
     def test_unregister_from_relay_success(self, mock_post, relay_client):
         """Unregister should post to /unregister and return True on success."""
 
+        relay_client._api_v1_registered_relays.add('http://localhost:5000')
+        relay_client._api_v1_last_heartbeat_at['http://localhost:5000'] = 1.0
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -414,6 +416,10 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
+        client._api_v1_registered_relays.update({
+            'http://primary-relay:5000',
+            'http://backup-relay:6000',
+        })
         success_response = MagicMock()
         success_response.status_code = 200
         failure_response = MagicMock()
@@ -434,6 +440,7 @@ class TestRelayClient:
     def test_unregister_from_relay_retries_after_transient_failure(self, mock_post, relay_client):
         """A failed unregister attempt should not make later attempts no-ops."""
 
+        relay_client._api_v1_registered_relays.add('http://localhost:5000')
         failure_response = MagicMock()
         failure_response.status_code = 503
         success_response = MagicMock()
@@ -535,6 +542,7 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
+        client._api_v1_registered_relays.add('http://localhost:5000')
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -3286,6 +3294,16 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}
     assert client._api_v1_relay_wait_hints == {}
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_skips_network_when_never_registered(mock_post):
+    client = _standalone_relay_client()
+
+    assert client.unregister_from_relay() is True
+
+    mock_post.assert_not_called()
+    assert client._unregister_complete is True
 
 
 @patch('utils.networking.relay_client.requests.post')

@@ -87,7 +87,9 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
     """Keep app imports available while preventing repo-local llama_cpp shim precedence."""
 
     with _LLAMA_CPP_IMPORT_PATH_LOCK:
-        import_root = os.environ.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '').strip() or str(REPO_ROOT)
+        import_root = _strip_windows_extended_path_prefix(
+            os.environ.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '').strip() or str(REPO_ROOT)
+        )
         moved: list[str] = []
         repo_root_compare = _canonical_path_for_compare(REPO_ROOT)
         cwd_compare = _canonical_path_for_compare(Path.cwd())
@@ -323,7 +325,12 @@ def _probe_llama_cpp_capabilities_in_subprocess(*, timeout_seconds: Optional[flo
     )
 
 def _run_llama_cpp_import_watchdog(*, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
-    """Validate llama_cpp import in a killable subprocess before parent import."""
+    """Legacy diagnostic helper for isolated llama_cpp import probes.
+
+    Packaged desktop startup intentionally does not call this helper anymore: the
+    runtime setup probe already imports llama_cpp, and a second pre-import child
+    process can diverge from the real bridge process on native CUDA/Metal builds.
+    """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
     env = _llama_cpp_probe_env()
@@ -414,9 +421,10 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
     """Import llama_cpp in this process when Python can recoverably time it out.
 
     No-SIGALRM platforms (notably Windows) cannot interrupt a first native
-    extension import in the current interpreter.  Those platforms are handled by
-    a subprocess-backed module facade in ``_import_llama_cpp_runtime`` so the
-    real import can either succeed in a child process or be killed cleanly.
+    extension import in the current interpreter.  Packaged desktop warm-load runs
+    on a daemon thread with an outer registration deadline, so those platforms
+    use the same direct parent import path as runtime setup instead of a divergent
+    pre-import child process.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -425,7 +433,13 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
         return already_imported
 
     if not _signal_guard_available():
-        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout)
+        logger.info(
+            "llama_cpp parent import using uninterruptible platform path bounded by caller warm-load deadline "
+            "timeout_seconds=%s interpreter=%s",
+            f"{timeout:g}",
+            sys.executable,
+        )
+        return importlib.import_module('llama_cpp')
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
@@ -674,17 +688,12 @@ def _import_llama_cpp_runtime(*, require_real_runtime: bool = True, timeout_seco
             "install llama-cpp-python and ensure site-packages wins import priority."
         )
 
-    _run_llama_cpp_import_watchdog(timeout_seconds=timeout_seconds)
-    if not _signal_guard_available() and sys.modules.get('llama_cpp') is None:
-        logger.warning(
-            "llama_cpp parent import delegated to bounded subprocess runtime on no-SIGALRM platform "
-            "module_path=%s interpreter=%s",
-            llama_module_path or 'unknown',
-            sys.executable,
-        )
-        llama_cpp = _SubprocessLlamaCppModule(llama_module_path, timeout_seconds=timeout_seconds)
-    else:
-        llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
+    logger.info(
+        "llama_cpp direct import start module_path=%s interpreter=%s",
+        llama_module_path or 'unknown',
+        sys.executable,
+    )
+    llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
     llama_module_path = getattr(llama_cpp, '__file__', None)
     logger.info(
         "llama_cpp import complete module_path=%s interpreter=%s",

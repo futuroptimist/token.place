@@ -269,3 +269,25 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
             sys.modules.pop('llama_cpp', None)
         else:
             sys.modules['llama_cpp'] = original_llama_module
+
+
+def test_bootstrap_normalizes_windows_extended_import_root_with_spaces(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    resources_root = tmp_path / 'token.place desktop' / 'resources'
+    script = resources_root / 'python' / 'compute_node_bridge.py'
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    extended_root = '\\\\?\\' + str(resources_root)
+    extended_script = '\\\\?\\' + str(script)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', extended_root)
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(extended_script)
+        assert str(resources_root) in sys.path
+        assert extended_root not in sys.path
+        assert sys.path.index(str(resources_root)) == 0
+    finally:
+        sys.path[:] = original_sys_path

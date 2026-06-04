@@ -838,6 +838,11 @@ class RelayClient:
         self._api_v1_relay_wait_hints = relay_wait_hints
         registered_relays = getattr(self, "_api_v1_registered_relays", set())
 
+        if not registered_relays:
+            log_info("Compute node was never registered; skipping unregister request")
+            self._unregister_complete = True
+            return True
+
         ordered_relay_urls = [
             self._relay_urls[(self._active_relay_index + offset) % len(self._relay_urls)]
             for offset in range(len(self._relay_urls))

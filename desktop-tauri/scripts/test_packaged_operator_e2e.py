@@ -107,6 +107,18 @@ def create_macos_bundle_layout(tmp_root: Path) -> Path:
     return create_packaged_layout(resources_tmp_root, resources_dir_name="Resources")
 
 
+def create_fake_llama_cpp_site_packages(tmp_root: Path) -> Path:
+    site_packages = tmp_root / "fake runtime site-packages"
+    package_dir = site_packages / "llama_cpp"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text(
+        """\
+import os\nimport time\n\nGGML_USE_CUDA = os.environ.get('TOKEN_PLACE_FAKE_LLAMA_BACKEND') == 'cuda'\nGGML_USE_METAL = os.environ.get('TOKEN_PLACE_FAKE_LLAMA_BACKEND') == 'metal'\n\ndef llama_supports_gpu_offload():\n    return GGML_USE_CUDA or GGML_USE_METAL\n\n# Regression sentinel: the removed model-manager import watchdog used this env\n# contract for child probes. If startup reintroduces that child import, this fake\n# runtime stalls long enough for the packaged e2e registration guard to fail.\nif os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n    time.sleep(float(os.environ.get('TOKEN_PLACE_FAKE_LLAMA_CHILD_IMPORT_SLEEP_SECONDS', '120')))\n\nclass Llama:\n    def __init__(self, **kwargs):\n        self.kwargs = kwargs\n\n    def create_chat_completion(self, **_kwargs):\n        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake packaged runtime ok'}}]}\n""",
+        encoding="utf-8",
+    )
+    return site_packages
+
+
 def _packaged_env(
     tmp_root: Path,
     resources_root: Path | None = None,
@@ -346,20 +358,37 @@ def run_compute_bridge_startup_probe(
     relay_port: int,
     resources_root: Path | None = None,
     layout_label: str = "standard resources",
+    use_mock_llm: bool = True,
+    fake_site_packages: Path | None = None,
 ) -> None:
-    env = _packaged_env(tmp_root, resources_root, extra_env={"USE_MOCK_LLM": "1"})
+    extra_env = {"USE_MOCK_LLM": "1" if use_mock_llm else "0"}
+    if fake_site_packages is not None:
+        extra_env.update({
+            "PYTHONPATH": os.pathsep.join([
+                str(fake_site_packages),
+                str((resources_root or (tmp_root / "resources")) / "python"),
+            ]),
+            "TOKEN_PLACE_FAKE_LLAMA_BACKEND": "cuda" if os.name == "nt" else "metal",
+            "TOKEN_PLACE_FAKE_LLAMA_CHILD_IMPORT_SLEEP_SECONDS": "120",
+        })
+    env = _packaged_env(tmp_root, resources_root, extra_env=extra_env)
     log_dir = REPO_ROOT / ".desktop-e2e-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_layout_label = layout_label.replace(" ", "_").replace("/", "_")
+    model_path = tmp_root / (
+        "mock.gguf" if use_mock_llm else f"fake-{safe_layout_label}.gguf"
+    )
+    if not use_mock_llm:
+        model_path.write_bytes(b"fake gguf")
     log_file = log_dir / f"packaged-bridge-startup-{safe_layout_label}.log"
     bridge = subprocess.Popen(  # noqa: S603
         [
             sys.executable,
             str(bridge_script),
             "--model",
-            "mock.gguf",
+            str(model_path),
             "--mode",
-            "cpu",
+            "cpu" if use_mock_llm else "auto",
             "--relay-url",
             f"http://127.0.0.1:{relay_port}",
         ],
@@ -538,6 +567,18 @@ def main() -> int:
                     relay_port=relay_port,
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
+                )
+                fake_site_packages = create_fake_llama_cpp_site_packages(
+                    tmp_path / f"fake-runtime-{relay_log_label}"
+                )
+                run_compute_bridge_startup_probe(
+                    tmp_path,
+                    probe_script,
+                    relay_port=relay_port,
+                    resources_root=probe_resources_root,
+                    layout_label=f"{layout_label} fake llama_cpp runtime",
+                    use_mock_llm=False,
+                    fake_site_packages=fake_site_packages,
                 )
             finally:
                 if relay.poll() is None:

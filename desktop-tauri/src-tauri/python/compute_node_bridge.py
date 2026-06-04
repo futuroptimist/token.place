@@ -1005,6 +1005,7 @@ def run(args: argparse.Namespace) -> int:
         return ready
 
     poll_cancel_requested = False
+    relay_registered_once = False
 
     def request_poll_cancel(active_relay_url: str) -> None:
         nonlocal poll_cancel_requested
@@ -1032,6 +1033,15 @@ def run(args: argparse.Namespace) -> int:
                 )
         unregister = getattr(relay_client, "unregister_from_relay", None)
         if callable(unregister):
+            if not relay_registered_once:
+                print(
+                    "desktop.compute_node_bridge.unregister.skipped "
+                    f"relay={_sanitize_relay_target(active_relay_url)} "
+                    f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                    "reason=never_registered",
+                    file=sys.stderr,
+                )
+                return
             print(
                 "desktop.compute_node_bridge.unregister.attempted "
                 f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1140,6 +1150,9 @@ def run(args: argparse.Namespace) -> int:
                     f"request_id={request_id} wait={wait_seconds} summary={summary}",
                     file=sys.stderr,
                 )
+
+                if registered:
+                    relay_registered_once = True
 
                 if not registered:
                     if relay_error is not None:

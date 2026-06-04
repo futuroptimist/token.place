@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-04",
+  "slug": "packaged-desktop-llama-cpp-import-timeout",
+  "summary": "Packaged desktop compute-node warm-load could fail before relay registration because model initialization ran a duplicate llama_cpp child-process import watchdog that diverged from the successful desktop runtime setup probe.",
+  "impact": "Windows CUDA packaged operators could remain Running: yes / Registered: no and never serve relay API v1 work; macOS packaged operators shared the same bootstrap seam and needed parity protection.",
+  "fix": "Removed the startup-critical child import watchdog, kept direct llama_cpp import in the bridge process under the existing warm-load deadline, normalized packaged import roots, reused desktop runtime setup diagnostics, suppressed unregister before successful registration, and added registered=true packaged e2e guards including a fake non-mock llama_cpp regression path.",
+  "lessons": "Mock/import-only packaged checks are not sufficient for desktop operator readiness; CI must require the packaged bridge plus relay lifecycle to reach registered=true and must exercise shared runtime import/bootstrap code without divergent child import environments."
+}

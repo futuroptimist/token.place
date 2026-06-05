@@ -3309,6 +3309,25 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
 
 
 @patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(mock_post):
+    client = _standalone_relay_client()
+    client._unregister_attempted = True
+    client._unregister_complete = True
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    mock_post.return_value = MagicMock(status_code=200)
+
+    assert client.unregister_from_relay() is True
+
+    mock_post.assert_called_once_with(
+        'http://localhost:5000/unregister',
+        json={'server_public_key': 'mock_public_key_b64'},
+        timeout=15,
+    )
+    assert client._api_v1_registered_relays == set()
+
+
+@patch('utils.networking.relay_client.requests.post')
 def test_start_after_unregister_clears_stale_registration_and_polls_cleanly(mock_post):
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')

@@ -821,9 +821,15 @@ class RelayClient:
     def unregister_from_relay(self) -> bool:
         """Best-effort unregister call for graceful compute-node shutdown."""
 
+        registered_relays = getattr(self, "_api_v1_registered_relays", set())
+        if not isinstance(registered_relays, set):
+            registered_relays = set()
+            self._api_v1_registered_relays = registered_relays
+
         if (
             getattr(self, "_unregister_attempted", False)
             and getattr(self, "_unregister_complete", False)
+            and not registered_relays
         ):
             log_info("Compute node unregister already completed; skipping duplicate request")
             return True
@@ -836,7 +842,6 @@ class RelayClient:
 
         relay_wait_hints = getattr(self, "_api_v1_relay_wait_hints", {})
         self._api_v1_relay_wait_hints = relay_wait_hints
-        registered_relays = getattr(self, "_api_v1_registered_relays", set())
         if not registered_relays:
             log_info("Compute node was not registered with an API v1 relay; skipping unregister")
             self._unregister_complete = True

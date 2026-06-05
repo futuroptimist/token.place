@@ -893,3 +893,41 @@ def test_compute_node_runtime_stop_skips_unregister_before_api_v1_registration()
 
     relay_client.stop.assert_called_once_with()
     relay_client.unregister_from_relay.assert_not_called()
+
+
+def test_compute_node_runtime_stop_skips_unregister_when_registration_state_missing():
+    relay_client = MagicMock()
+    del relay_client._api_v1_registered_relays
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url='https://token.place', relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    runtime.stop()
+
+    relay_client.stop.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_not_called()
+
+
+def test_compute_node_runtime_stop_skips_unregister_for_non_set_registration_state():
+    relay_client = MagicMock()
+    relay_client._api_v1_registered_relays = ['https://token.place']
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url='https://token.place', relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    runtime.stop()
+
+    relay_client.stop.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_not_called()

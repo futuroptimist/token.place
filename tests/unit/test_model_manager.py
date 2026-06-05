@@ -2,6 +2,8 @@
 Unit tests for the model manager module.
 """
 import os
+import queue
+import threading
 import pytest
 import shutil
 import time
@@ -1956,7 +1958,7 @@ def test_parent_import_guard_returns_already_imported_module_without_reimport(mo
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
 
 
-def test_parent_import_guard_no_signal_imports_directly(monkeypatch):
+def test_parent_import_guard_no_signal_imports_with_thread_timeout(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
@@ -1965,6 +1967,60 @@ def test_parent_import_guard_no_signal_imports_directly(monkeypatch):
     monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
 
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
+
+
+def test_parent_import_guard_no_signal_times_out_hung_import(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    release_import = threading.Event()
+    sys.modules.pop('llama_cpp', None)
+    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
+
+    def _hung_import(_name):
+        release_import.wait(timeout=1)
+        return SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', _hung_import)
+    try:
+        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
+            model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+    finally:
+        release_import.set()
+        sys.modules.pop('llama_cpp', None)
+
+    assert exc_info.value.stage == 'llama_cpp_import'
+
+
+def test_parent_import_guard_non_main_thread_times_out_hung_import(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    release_import = threading.Event()
+    result_queue = queue.Queue()
+    sys.modules.pop('llama_cpp', None)
+
+    def _hung_import(_name):
+        release_import.wait(timeout=1)
+        return SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
+
+    monkeypatch.setattr(model_manager_module.importlib, 'import_module', _hung_import)
+
+    def _call_from_worker():
+        try:
+            model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
+        except BaseException as exc:
+            result_queue.put(exc)
+
+    worker = threading.Thread(target=_call_from_worker, name='desktop-warm-load-test')
+    worker.start()
+    worker.join(timeout=1)
+    try:
+        assert not worker.is_alive()
+        exc = result_queue.get_nowait()
+        assert isinstance(exc, model_manager_module.LlamaCppRuntimeStageTimeout)
+        assert exc.stage == 'llama_cpp_import'
+    finally:
+        release_import.set()
+        sys.modules.pop('llama_cpp', None)
 
 
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):

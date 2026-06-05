@@ -410,16 +410,56 @@ def _signal_guard_available() -> bool:
     )
 
 
-def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp in the active bridge process.
+def _import_llama_cpp_with_thread_timeout(*, timeout_seconds: float):
+    """Import llama_cpp in-process while preserving a bounded caller deadline.
 
-    Windows and non-main-thread imports cannot be interrupted safely without
-    moving the import into a second process.  The packaged desktop regression
-    showed that the second process could have a different native-extension/DLL
-    environment from the real bridge and become an accidental startup blocker.
-    Keep direct import as the source of truth; the surrounding desktop warm-load
-    gate remains bounded and reports failure if model initialization does not
-    become ready.
+    SIGALRM is unavailable on Windows and unsafe from non-main threads.  In
+    those cases keep the import in the active bridge process (so it observes the
+    real packaged DLL/native-extension environment) but run it on a daemon worker
+    and bound the caller with ``join(timeout)``.  A native import that wedges may
+    still leave that daemon worker blocked, but the startup/warm-load path now
+    fails closed with ``LlamaCppRuntimeStageTimeout`` instead of waiting forever.
+    """
+
+    result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_queue.put(('ok', importlib.import_module('llama_cpp')))
+        except BaseException as exc:  # propagate import failures unchanged
+            result_queue.put(('error', exc))
+
+    worker = threading.Thread(
+        target=_worker,
+        name='llama_cpp_parent_import_guard',
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        sys.modules.pop('llama_cpp', None)
+        logger.error(
+            "llama_cpp parent import timeout timeout_seconds=%s interpreter=%s thread=%s",
+            f"{timeout_seconds:g}",
+            sys.executable,
+            threading.current_thread().name,
+        )
+        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout_seconds)
+
+    status, payload = result_queue.get_nowait()
+    if status == 'ok':
+        return payload
+    raise payload
+
+
+def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
+    """Import llama_cpp in the active bridge process with a bounded stage timeout.
+
+    Prefer a SIGALRM guard on the main thread when available because it leaves no
+    extra worker behind.  Windows and desktop warm-load background threads cannot
+    use SIGALRM, so they use an in-process daemon worker with a join timeout
+    rather than the removed subprocess watchdog whose environment could diverge
+    from the real bridge process.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -429,10 +469,10 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
 
     if not _signal_guard_available():
         logger.info(
-            "llama_cpp direct parent import without signal watchdog interpreter=%s",
+            "llama_cpp parent import using thread timeout without signal watchdog interpreter=%s",
             sys.executable,
         )
-        return importlib.import_module('llama_cpp')
+        return _import_llama_cpp_with_thread_timeout(timeout_seconds=timeout)
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
@@ -455,10 +495,11 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
                 signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
     logger.info(
-        "llama_cpp direct parent import from non-main thread interpreter=%s",
+        "llama_cpp parent import using non-main-thread timeout interpreter=%s thread=%s",
         sys.executable,
+        threading.current_thread().name,
     )
-    return importlib.import_module('llama_cpp')
+    return _import_llama_cpp_with_thread_timeout(timeout_seconds=timeout)
 
 
 def _read_llama_subprocess_message(

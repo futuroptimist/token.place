@@ -12,6 +12,31 @@ The architectural source of truth is [Desktop operator parity contract](architec
 - Keep relay-blind API v1 E2EE invariant: relay-owned state, logs, diagnostics, and payloads may contain ciphertext and safe routing metadata only. Do not add plaintext prompt, response, tool argument, or model-output logging while debugging desktop parity.
 - API v1 relay inference is non-streaming. Do not add streaming or legacy `/sink`, `/faucet`, `/source`, `/retrieve`, or `/next_server` fallbacks to make desktop parity pass.
 
+
+## macOS packaged debug log capture
+
+Packaged Tauri operator sessions persist a per-session log under the app data log directory. On macOS this is typically:
+
+```text
+~/Library/Application Support/<app identifier>/logs/operator-session-<operator_session_id>-<timestamp>.log
+```
+
+The Compute node operator panel shows the active **Debug log** path and provides opt-in buttons to reveal the file, copy its path, or open Terminal.app tailing the current log. For scripted/manual validation, launch the packaged app with:
+
+```bash
+TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1 open /Applications/TokenPlace.app
+```
+
+When **Start operator** fails on macOS, capture the Debug log path and include the following safe diagnostics from the log:
+
+- `desktop.compute_node.log.start` and `desktop.compute_node.session.start` lines, including `operator_session_id`, sanitized relay URL, bridge path, interpreter, resource root, layout, import root, and log path.
+- `desktop.runtime_setup ...` probe/provision lines, including selected action and interpreter/prefix/module path diagnostics.
+- `desktop.compute_node.stderr line=...` lines from `compute_node_bridge.py`.
+- Warm-load and model-manager lines such as `desktop.compute_node_bridge.model_init.ready` or setup failures before registration.
+- API v1 registration/poll/request/response metadata and Stop/cancel/unregister/cleanup lines when the session gets that far.
+
+Do not include private keys, plaintext prompts/responses, tool arguments, or decrypted payloads in captured logs. The relay-blind E2EE invariant still applies: relay-owned logs/diagnostics must remain ciphertext-only plus safe routing metadata.
+
 ## Required parity checklist
 
 | Area | Windows CUDA expectation | macOS Metal expectation | CPU fallback expectation | Evidence to capture |

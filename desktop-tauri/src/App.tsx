@@ -40,6 +40,7 @@ interface ComputeNodeStatus {
   operator_session_id: string | null;
   sequence: number | null;
   updated_at_ms: number | null;
+  operator_log_path: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -81,6 +82,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   operator_session_id: null,
   sequence: null,
   updated_at_ms: null,
+  operator_log_path: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -189,6 +191,8 @@ function mergeComputeStatusEvent(
     sequence: payloadSequence ?? prev.sequence,
     updated_at_ms:
       typeof payload.updated_at_ms === 'number' ? payload.updated_at_ms : prev.updated_at_ms,
+    operator_log_path:
+      typeof payload.operator_log_path === 'string' ? payload.operator_log_path : prev.operator_log_path,
     last_error:
       payload.last_error === null
         ? null
@@ -471,6 +475,31 @@ export function App() {
     }
   };
 
+  const revealOperatorDebugLog = async () => {
+    try {
+      await invoke('reveal_operator_debug_log');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const openOperatorDebugTerminal = async () => {
+    try {
+      await invoke('open_operator_debug_terminal');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const copyOperatorLogPath = async () => {
+    if (!computeStatus.operator_log_path) return;
+    try {
+      await navigator.clipboard.writeText(computeStatus.operator_log_path);
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
   const forwardEncrypted = async () => {
     try {
       setIsForwarding(true);
@@ -551,13 +580,34 @@ export function App() {
 
       <section style={{ marginTop: 14, border: '1px solid #ddd', padding: 12 }}>
         <h2 style={{ marginTop: 0 }}>Compute node operator</h2>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
             disabled={!computeStatus.running}
             onClick={stopComputeNode}
           >
             Stop operator
+          </button>
+          <button
+            type="button"
+            disabled={!computeStatus.operator_log_path}
+            onClick={revealOperatorDebugLog}
+          >
+            Reveal debug log
+          </button>
+          <button
+            type="button"
+            disabled={!computeStatus.operator_log_path}
+            onClick={openOperatorDebugTerminal}
+          >
+            Open debug terminal
+          </button>
+          <button
+            type="button"
+            disabled={!computeStatus.operator_log_path}
+            onClick={copyOperatorLogPath}
+          >
+            Copy log path
           </button>
         </div>
         <p style={{ marginBottom: 0 }}>Running: <strong>{computeStatus.running ? 'yes' : 'no'}</strong></p>
@@ -573,6 +623,7 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
+        <p style={{ marginBottom: 0 }}>Debug log: <code>{computeStatus.operator_log_path || 'not available yet'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
       </section>
 

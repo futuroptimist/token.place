@@ -13,7 +13,10 @@ use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};
 use config::{config_path, DesktopConfig};
 use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -102,7 +105,7 @@ fn configure_runtime_pythonpath(
     )
 }
 
-fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
+fn run_model_bridge(action: &str, log_path: Option<PathBuf>) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path(Some(&launcher.program))?;
@@ -117,8 +120,8 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
         manifest_dir,
         None,
     );
-    eprintln!(
-        "desktop.model_bridge.start action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+    let start_line = format!(
+        "desktop.model_bridge.start action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} log_path={}",
         action,
         bridge_script.display(),
         bridge_command.get_program().to_string_lossy(),
@@ -127,8 +130,14 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
         import_root
             .as_deref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<unresolved>".into())
+            .unwrap_or_else(|| "<unresolved>".into()),
+        log_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unavailable>".into())
     );
+    eprintln!("{start_line}");
+    append_desktop_log_line(log_path.as_deref(), &start_line);
     let output = bridge_command
         .arg(action)
         .output()
@@ -136,6 +145,18 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        append_desktop_log_line(
+            log_path.as_deref(),
+            &format!("desktop.model_bridge.stdout line={line}"),
+        );
+    }
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        append_desktop_log_line(
+            log_path.as_deref(),
+            &format!("desktop.model_bridge.stderr line={line}"),
+        );
+    }
     let json_line = stdout
         .lines()
         .rev()
@@ -178,6 +199,111 @@ fn resolve_config_dir(app: &tauri::AppHandle, state: &AppState) -> anyhow::Resul
     fs::create_dir_all(&dir)?;
     *state.config_dir.blocking_lock() = Some(dir.clone());
     Ok(dir)
+}
+
+fn desktop_logs_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!("app data path error: {e}"))?
+        .join("logs");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn append_desktop_log_line(path: Option<&Path>, line: &str) {
+    if let Some(path) = path {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tail_script(log_path: &Path) -> String {
+    format!(
+        "tail -n 200 -f {}",
+        shell_single_quote(&log_path.to_string_lossy())
+    )
+}
+
+#[cfg(test)]
+fn macos_tail_script_for_test(log_path: &Path) -> String {
+    format!(
+        "tail -n 200 -f {}",
+        shell_single_quote(&log_path.to_string_lossy())
+    )
+}
+
+fn require_current_operator_log_path(status: &ComputeNodeStatus) -> Result<PathBuf, String> {
+    let raw = status
+        .operator_log_path
+        .as_deref()
+        .ok_or_else(|| "operator debug log is not available yet".to_string())?;
+    let path = PathBuf::from(raw);
+    if !path.is_file() {
+        return Err(format!(
+            "operator debug log does not exist: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn reveal_log_file(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("unable to reveal operator debug log: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let select_arg = format!("/select,{}", path.display());
+        std::process::Command::new("explorer")
+            .arg(OsString::from(select_arg))
+            .spawn()
+            .map_err(|e| format!("unable to reveal operator debug log: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let parent = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("unable to reveal operator debug log directory: {e}"))?;
+        Ok(())
+    }
+}
+
+fn open_log_terminal(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = macos_tail_script(path);
+        std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"Terminal\" to activate",
+                "-e",
+                &format!("tell application \"Terminal\" to do script {:?}", script),
+            ])
+            .spawn()
+            .map_err(|e| format!("unable to open macOS debug terminal: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("debug terminal tailing is currently implemented for macOS packaged validation; use Reveal log file on this platform".into())
+    }
 }
 
 #[tauri::command]
@@ -275,6 +401,20 @@ async fn encrypt_and_forward(relay_base_url: String, final_output: String) -> Re
 }
 
 #[tauri::command]
+async fn reveal_operator_debug_log(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let status = state.compute_node.status.lock().await.clone();
+    let path = require_current_operator_log_path(&status)?;
+    reveal_log_file(&path)
+}
+
+#[tauri::command]
+async fn open_operator_debug_terminal(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let status = state.compute_node.status.lock().await.clone();
+    let path = require_current_operator_log_path(&status)?;
+    open_log_terminal(&path)
+}
+
+#[tauri::command]
 async fn start_compute_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -286,12 +426,16 @@ async fn start_compute_node(
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            {
+            let (operator_log_path, operator_session_id) = {
                 let mut status = compute_state.status.lock().await;
                 status.running = false;
                 status.registered = false;
                 status.last_error = Some(err.to_string());
-            }
+                (
+                    status.operator_log_path.clone(),
+                    status.operator_session_id.clone(),
+                )
+            };
             let _ = app.emit(
                 "compute_node_event",
                 serde_json::json!({
@@ -300,6 +444,8 @@ async fn start_compute_node(
                     "registered": false,
                     "last_error": err.to_string(),
                     "message": err.to_string(),
+                    "operator_session_id": operator_session_id,
+                    "operator_log_path": operator_log_path,
                 }),
             );
         }
@@ -322,13 +468,19 @@ async fn get_compute_node_status(
 }
 
 #[tauri::command]
-fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
-    run_model_bridge("inspect")
+fn inspect_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    let log_path = desktop_logs_dir(&app)
+        .ok()
+        .map(|dir| dir.join("model-bridge.log"));
+    run_model_bridge("inspect", log_path)
 }
 
 #[tauri::command]
-async fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
-    tokio::task::spawn_blocking(|| run_model_bridge("download"))
+async fn download_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    let log_path = desktop_logs_dir(&app)
+        .ok()
+        .map(|dir| dir.join("model-bridge.log"));
+    tokio::task::spawn_blocking(move || run_model_bridge("download", log_path))
         .await
         .map_err(|e| format!("download bridge task failed: {e}"))?
 }
@@ -347,6 +499,8 @@ pub fn run() {
             start_compute_node,
             stop_compute_node,
             get_compute_node_status,
+            reveal_operator_debug_log,
+            open_operator_debug_terminal,
             encrypt_and_forward,
             inspect_model_artifact,
             download_model_artifact
@@ -370,6 +524,48 @@ mod tests {
             .find_map(|(env_key, value)| (env_key == key).then_some(value))
             .flatten()
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn macos_tail_script_quotes_paths_with_spaces_and_single_quotes() {
+        let path = PathBuf::from("/Users/example/Token Place/operator's log.log");
+        let script = macos_tail_script_for_test(&path);
+
+        assert_eq!(
+            script,
+            "tail -n 200 -f '/Users/example/Token Place/operator'\\''s log.log'"
+        );
+        assert!(!script.contains('\n'));
+    }
+
+    #[test]
+    fn require_current_operator_log_path_requires_existing_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("operator session.log");
+        std::fs::write(&log_path, "desktop.compute_node.stderr line=diagnostic\n")
+            .expect("write log");
+        let status = ComputeNodeStatus {
+            operator_log_path: Some(log_path.to_string_lossy().into_owned()),
+            ..ComputeNodeStatus::default()
+        };
+
+        assert_eq!(
+            require_current_operator_log_path(&status).expect("log path"),
+            log_path
+        );
+
+        let missing_status = ComputeNodeStatus {
+            operator_log_path: Some(
+                temp.path()
+                    .join("missing.log")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..ComputeNodeStatus::default()
+        };
+        assert!(require_current_operator_log_path(&missing_status)
+            .expect_err("missing log should fail")
+            .contains("does not exist"));
     }
 
     #[test]

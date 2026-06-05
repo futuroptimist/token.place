@@ -1234,4 +1234,31 @@ describe('desktop app start failure handling', () => {
     );
     expect(screen.getByText(/Error:/).textContent).toContain('event failure path');
   });
+
+  it('renders debug log affordances when an operator log path is available', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      model_path: '/tmp/model.gguf',
+      warm_load_state: 'warming',
+      operator_log_path: '/Users/example/Library/Application Support/place.token.desktop/logs/operator session.log',
+    });
+
+    render(<App />);
+
+    const revealButton = (await screen.findByText('Reveal debug log')) as HTMLButtonElement;
+    const terminalButton = screen.getByText('Open debug terminal') as HTMLButtonElement;
+    const copyButton = screen.getByText('Copy log path') as HTMLButtonElement;
+    await waitFor(() => expect(revealButton.disabled).toBe(false));
+    expect(terminalButton.disabled).toBe(false);
+    expect(copyButton.disabled).toBe(false);
+    expect(screen.getByText(/Debug log:/).textContent).toContain('operator session.log');
+
+    fireEvent.click(revealButton);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === 'reveal_operator_debug_log')).toBe(true)
+    );
+  });
+
 });

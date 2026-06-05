@@ -8,9 +8,11 @@ use crate::python_runtime::{
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +50,25 @@ pub struct ComputeNodeStatus {
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
+    pub operator_log_path: Option<String>,
+}
+
+#[derive(Clone)]
+struct OperatorLogHandle {
+    path: PathBuf,
+    file: Arc<Mutex<File>>,
+}
+
+impl OperatorLogHandle {
+    async fn append_line(&self, line: impl AsRef<str>) {
+        let mut file = self.file.lock().await;
+        let _ = writeln!(file, "{}", line.as_ref());
+        let _ = file.flush();
+    }
+
+    fn path_string(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -202,7 +223,12 @@ fn event_session_id(payload: &Value) -> Option<&str> {
     payload.get("operator_session_id").and_then(Value::as_str)
 }
 
-fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
+fn startup_failure_status(
+    request: &ComputeNodeRequest,
+    last_error: String,
+    operator_session_id: Option<String>,
+    operator_log_path: Option<String>,
+) -> ComputeNodeStatus {
     ComputeNodeStatus {
         running: false,
         registered: false,
@@ -221,9 +247,10 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
-        operator_session_id: None,
+        operator_session_id,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
+        operator_log_path,
     }
 }
 
@@ -334,6 +361,99 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     true
 }
 
+fn should_auto_open_debug_terminal() -> bool {
+    std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn maybe_open_debug_terminal(log_path: Option<&str>) {
+    if !should_auto_open_debug_terminal() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(log_path) = log_path {
+        let tail_command = format!("tail -n 200 -f {}", shell_single_quote(log_path));
+        if let Err(err) = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"Terminal\" to activate",
+                "-e",
+                &format!(
+                    "tell application \"Terminal\" to do script {:?}",
+                    tail_command
+                ),
+            ])
+            .spawn()
+        {
+            eprintln!("desktop.compute_node.debug_terminal_open_failed error={err}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = log_path;
+    }
+}
+
+fn operator_logs_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!("app data path error: {e}"))?;
+    let dir = base.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn create_operator_log_in_dir(
+    dir: &Path,
+    session_id: &str,
+    relay_url: &str,
+) -> anyhow::Result<OperatorLogHandle> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!(
+        "operator-session-{}-{}.log",
+        session_id,
+        current_time_ms()
+    ));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)?;
+    writeln!(
+        file,
+        "desktop.compute_node.log.start operator_session_id={} relay={} log_path={}",
+        session_id,
+        sanitize_relay_target(relay_url),
+        path.display()
+    )?;
+    Ok(OperatorLogHandle {
+        path,
+        file: Arc::new(Mutex::new(file)),
+    })
+}
+
+fn create_operator_log(
+    app: &AppHandle,
+    session_id: &str,
+    relay_url: &str,
+) -> anyhow::Result<OperatorLogHandle> {
+    create_operator_log_in_dir(&operator_logs_dir(app)?, session_id, relay_url)
+}
+
+async fn log_and_stderr(log: Option<&OperatorLogHandle>, line: String) {
+    eprintln!("{line}");
+    if let Some(log) = log {
+        log.append_line(line).await;
+    }
+}
+
 fn bridge_exit_status_label(exit_status: std::process::ExitStatus) -> String {
     if let Some(code) = exit_status.code() {
         return code.to_string();
@@ -417,12 +537,17 @@ fn finalize_bridge_exit(
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
+    operator_log: Option<OperatorLogHandle>,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
         if filter.should_emit(&line) {
-            eprintln!("desktop.compute_node.stderr line={line}");
+            log_and_stderr(
+                operator_log.as_ref(),
+                format!("desktop.compute_node.stderr line={line}"),
+            )
+            .await;
         }
     }
     Ok(())
@@ -434,6 +559,22 @@ pub async fn start_compute_node(
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let session_id = {
+        let mut next_session_id = state.next_session_id.lock().await;
+        *next_session_id += 1;
+        next_session_id.to_string()
+    };
+    let operator_log = match create_operator_log(&app, &session_id, &request.relay_base_url) {
+        Ok(log) => Some(log),
+        Err(err) => {
+            eprintln!(
+                "desktop.compute_node.log_create_failed operator_session_id={} error={}",
+                session_id, err
+            );
+            None
+        }
+    };
+    let operator_log_path = operator_log.as_ref().map(OperatorLogHandle::path_string);
 
     {
         let _lifecycle_lock = state.lifecycle_lock.lock().await;
@@ -453,7 +594,12 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = startup_failure_status(&request, err.clone());
+                *status = startup_failure_status(
+                    &request,
+                    err.clone(),
+                    Some(session_id.clone()),
+                    operator_log_path.clone(),
+                );
             }
             return Err(anyhow::anyhow!(err));
         }
@@ -467,7 +613,12 @@ pub async fn start_compute_node(
                 Err(err) => {
                     {
                         let mut status = state.status.lock().await;
-                        *status = startup_failure_status(&request, err.to_string());
+                        *status = startup_failure_status(
+                            &request,
+                            err.to_string(),
+                            Some(session_id.clone()),
+                            operator_log_path.clone(),
+                        );
                     }
                     return Err(err);
                 }
@@ -476,7 +627,12 @@ pub async fn start_compute_node(
                 let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
                 {
                     let mut status = state.status.lock().await;
-                    *status = startup_failure_status(&request, err.to_string());
+                    *status = startup_failure_status(
+                        &request,
+                        err.to_string(),
+                        Some(session_id.clone()),
+                        operator_log_path.clone(),
+                    );
                 }
                 return Err(err);
             }
@@ -490,15 +646,15 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = startup_failure_status(&request, err.to_string());
+                *status = startup_failure_status(
+                    &request,
+                    err.to_string(),
+                    Some(session_id.clone()),
+                    operator_log_path.clone(),
+                );
             }
             return Err(err);
         }
-    };
-    let session_id = {
-        let mut next_session_id = state.next_session_id.lock().await;
-        *next_session_id += 1;
-        next_session_id.to_string()
     };
     let exe_path = std::env::current_exe().ok();
     let resource_dir = app.path().resource_dir().ok();
@@ -515,16 +671,18 @@ pub async fn start_compute_node(
         .get_program()
         .to_string_lossy()
         .into_owned();
-    eprintln!(
-        "desktop.compute_node.session.start operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} cancellation_token_reset=true",
+    let session_start_line = format!(
+        "desktop.compute_node.session.start operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} cancellation_token_reset=true log_path={}",
         session_id,
         sanitize_relay_target(&request.relay_base_url),
         bridge_script,
         interpreter,
         selected_resource_root.display(),
         selected_layout,
-        import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
+        import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into()),
+        operator_log_path.as_deref().unwrap_or("<unavailable>")
     );
+    log_and_stderr(operator_log.as_ref(), session_start_line).await;
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
 
@@ -549,6 +707,8 @@ pub async fn start_compute_node(
                 *status = startup_failure_status(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
+                    Some(session_id.clone()),
+                    operator_log_path.clone(),
                 );
                 *state.child.lock().await = None;
                 *state.stdin.lock().await = None;
@@ -581,11 +741,15 @@ pub async fn start_compute_node(
         {
             false
         } else {
-            eprintln!(
-                "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
-                session_id,
-                sanitize_relay_target(&request.relay_base_url)
-            );
+            log_and_stderr(
+                operator_log.as_ref(),
+                format!(
+                    "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
+                    session_id,
+                    sanitize_relay_target(&request.relay_base_url)
+                ),
+            )
+            .await;
             *child_slot = pending_child.take();
             let mut stdin_slot = state.stdin.lock().await;
             *stdin_slot = pending_stdin.take();
@@ -611,7 +775,9 @@ pub async fn start_compute_node(
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
+                operator_log_path: operator_log_path.clone(),
             };
+            maybe_open_debug_terminal(operator_log_path.as_deref());
             true
         }
     };
@@ -629,9 +795,14 @@ pub async fn start_compute_node(
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
+    let stderr_log = operator_log.clone();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_compute_node_stderr(stderr, log_policy).await {
-            eprintln!("desktop.compute_node.stderr_error error={err}");
+        if let Err(err) = drain_compute_node_stderr(stderr, log_policy, stderr_log.clone()).await {
+            log_and_stderr(
+                stderr_log.as_ref(),
+                format!("desktop.compute_node.stderr_error error={err}"),
+            )
+            .await;
         }
     });
 
@@ -639,6 +810,10 @@ pub async fn start_compute_node(
     let mut saw_error_event = false;
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
+        if let Some(log) = operator_log.as_ref() {
+            log.append_line(format!("desktop.compute_node.stdout line={line}"))
+                .await;
+        }
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
@@ -658,16 +833,24 @@ pub async fn start_compute_node(
                 app.emit("compute_node_event", payload)?;
             }
             Err(err) => {
-                eprintln!(
-                    "desktop.compute_node.stdout_parse_error error={} line={}",
-                    err, line
-                );
+                log_and_stderr(
+                    operator_log.as_ref(),
+                    format!(
+                        "desktop.compute_node.stdout_parse_error error={} line={}",
+                        err, line
+                    ),
+                )
+                .await;
             }
         }
     }
 
     if let Err(err) = stderr_task.await {
-        eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
+        log_and_stderr(
+            operator_log.as_ref(),
+            format!("desktop.compute_node.stderr_task_join_error error={err}"),
+        )
+        .await;
     }
 
     let running_child = {
@@ -710,6 +893,15 @@ pub async fn start_compute_node(
         if current_session.as_deref() == Some(session_id.as_str()) {
             *state.stdin.lock().await = None;
         }
+    }
+
+    if let Some(log) = operator_log.as_ref() {
+        log.append_line(format!(
+            "desktop.compute_node.session.end operator_session_id={} relay={}",
+            session_id,
+            sanitize_relay_target(&request.relay_base_url)
+        ))
+        .await;
     }
 
     Ok(())
@@ -904,6 +1096,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_log_file_records_start_and_stderr_lines_with_spaces_in_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let log_dir = temp
+            .path()
+            .join("Application Support")
+            .join("token.place logs");
+        let log = create_operator_log_in_dir(
+            &log_dir,
+            "session 1",
+            "https://user:secret@relay.example/path?token=secret",
+        )
+        .expect("create operator log");
+
+        log.append_line("desktop.compute_node.stderr line=bridge diagnostic")
+            .await;
+        let raw = std::fs::read_to_string(log.path).expect("read operator log");
+
+        assert!(raw.contains("desktop.compute_node.log.start operator_session_id=session 1"));
+        assert!(raw.contains("relay=https://relay.example"));
+        assert!(!raw.contains("user:secret"));
+        assert!(!raw.contains("token=secret"));
+        assert!(raw.contains("desktop.compute_node.stderr line=bridge diagnostic"));
+    }
+
+    #[tokio::test]
     async fn drain_compute_node_stderr_reads_all_lines() {
         let mut child = {
             #[cfg(windows)]
@@ -924,7 +1141,7 @@ mod tests {
         .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
-        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
+        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true }, None)
             .await
             .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
@@ -1213,6 +1430,8 @@ mod tests {
         let status = startup_failure_status(
             &request,
             "no usable Python 3 interpreter found for desktop Python subprocess".into(),
+            Some("session-1".into()),
+            Some("/tmp/operator.log".into()),
         );
 
         assert!(!status.running);
@@ -1390,6 +1609,8 @@ mod tests {
         let status = startup_failure_status(
             &request,
             "unable to locate desktop Python bridge script 'compute_node_bridge.py'".into(),
+            None,
+            None,
         );
 
         assert!(!status.running);

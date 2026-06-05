@@ -61,6 +61,25 @@ After a successful repair, the sidecar automatically re-execs once so the active
 - CPU fallback mode is available in both cases, with explicit fallback details surfaced in `desktop.runtime_setup ... fallback_reason=...` and `compute_runtime ... fallback_reason=...`. Missing `llama_cpp` is a dependency failure, not silent CPU fallback.
 - `backend_available` reports runtime capability, `backend_selected` reports policy selection, and `backend_used` reports the initialized relay-processing runtime. GPU release claims depend on `backend_used`.
 
+
+## Operator debug logs
+
+Packaged desktop operator sessions persist bridge diagnostics to an app-data log file and expose the current path in the Compute node operator panel. The log mirrors the bridge lifecycle lines that are otherwise easy to miss on macOS packaged launches: model/compute bridge start details, selected interpreter/resource/import roots, `desktop.runtime_setup` probe/provision output, compute-node bridge stdout/stderr, warm-load, registration, polling, request/response metadata, Stop/cancel, unregister, and cleanup lines.
+
+Use the operator panel buttons to:
+
+- **Reveal debug log**: open Finder/Explorer/file-manager at the current log file.
+- **Open debug terminal**: on macOS, open Terminal.app with a read-only `tail -n 200 -f` of the current log file.
+- **Copy log path**: copy the current log path for issue reports.
+
+macOS logs live under the app data directory, for example:
+
+```text
+~/Library/Application Support/<app identifier>/logs/operator-session-<id>-<timestamp>.log
+```
+
+For manual macOS validation, set `TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1` before launching the packaged app to auto-open the debug terminal after an operator session starts. Normal packaged launches do not pop up Terminal.app unless this env var or the explicit UI button is used. Logs intentionally avoid private keys and plaintext prompts/responses; keep captures to lifecycle/runtime diagnostics when reporting Start operator failures.
+
 ## Privacy defaults
 
 - Prompt/response plaintext stays in-memory by default.

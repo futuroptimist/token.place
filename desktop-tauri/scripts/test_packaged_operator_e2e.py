@@ -558,6 +558,7 @@ def run_compute_bridge_startup_probe(
             "compute-node bridge exited before emitting a startup event",
             "desktop_runtime_setup module missing",
             "llama_cpp_import_timeout",
+            "llama_cpp_import subprocess ended",
             "llama_cpp import watchdog start",
             "Running: yes / Registered: no",
         )

@@ -24,6 +24,7 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
     """Add likely import roots for development and packaged desktop layouts."""
 
     script_path = _safe_resolve_path(script_file)
+    os.environ.setdefault("TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT", str(script_path))
     script_root = script_path.parent.parent
     explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
     candidates = [

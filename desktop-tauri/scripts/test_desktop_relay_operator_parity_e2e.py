@@ -240,6 +240,12 @@ def _wait_for_registered(bridge: BridgeProcess, relay_url: str, *, layout_label:
                 f"bridge exited before registration for {layout_label}: "
                 f"code={bridge.process.returncode} log={bridge.log_path}"
             )
+        for line in list(bridge.output_lines):
+            if "llama_cpp_import subprocess ended" in line or "Running: yes / Registered: no" in line:
+                raise RuntimeError(
+                    f"bridge emitted pre-registration regression marker for {layout_label}: "
+                    f"log={bridge.log_path} line={line}"
+                )
         for event in list(bridge.events):
             last_event = event
             if event.get("type") == "error":

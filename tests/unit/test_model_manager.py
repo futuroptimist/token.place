@@ -2371,6 +2371,70 @@ def test_runtime_worker_env_omits_probe_sys_path_marker(monkeypatch):
     assert env.get('PYTHONPATH')
 
 
+
+def test_runtime_worker_env_normalizes_windows_extended_desktop_paths(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_llama_cpp_probe_sys_path_entries',
+        lambda: [r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_'],
+    )
+
+    env = model_manager_module._llama_cpp_runtime_worker_env()
+
+    assert env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] == r'C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_'
+    assert env['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'] == r'C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    assert env['PYTHONPATH'] == r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_'
+
+
+def test_read_llama_subprocess_message_early_exit_includes_actionable_diagnostics():
+    from utils.llm import model_manager as model_manager_module
+
+    class EmptyStdout:
+        def __iter__(self):
+            return iter(())
+
+    class FakeProcess:
+        args = ['python', '-u', '-c', '<worker>']
+        stdout = EmptyStdout()
+
+        def wait(self, timeout=None):
+            return 2
+
+        def poll(self):
+            return 2
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            FakeProcess(),
+            timeout_seconds=1,
+            stage='llama_cpp_import',
+            stdout_tail=['worker booted'],
+            stderr_tail=['Traceback line', 'ImportError: DLL load failed'],
+            command=['python', '-u', '-c'],
+            cwd=r'C:\Users\danie\AppData\Local\Programs\Python\Python311',
+            module_path_hint=r'C:\Users\danie\AppData\Local\Programs\Python\Python311\Lib\site-packages\llama_cpp\__init__.py',
+        )
+
+    message = str(exc_info.value)
+    assert 'llama_cpp_import subprocess ended' in message
+    assert 'exit_code=2' in message
+    assert 'stderr_tail=' in message
+    assert 'ImportError: DLL load failed' in message
+    assert 'stdout_tail=' in message
+    assert 'worker booted' in message
+    assert 'module_path_hint=' in message
+    assert 'Python311' in message
+
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

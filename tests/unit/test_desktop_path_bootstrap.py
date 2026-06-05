@@ -92,6 +92,23 @@ def test_bootstrap_prefers_explicit_env_import_root(tmp_path, path_bootstrap, mo
         sys.path[:] = original_sys_path
 
 
+def test_bootstrap_records_normalized_env_for_facade_children(tmp_path, path_bootstrap, monkeypatch):
+    script = tmp_path / 'token.place desktop' / 'python' / 'compute_node_bridge.py'
+    import_root = tmp_path / 'token.place desktop' / '_up_' / '_up_'
+    (import_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    monkeypatch.delenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', raising=False)
+    monkeypatch.delenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', raising=False)
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths('\\\\?\\' + str(script))
+        assert os.environ['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'] == str(script.resolve())
+        assert str(import_root.resolve()) in sys.path
+    finally:
+        sys.path[:] = original_sys_path
+
 def test_bootstrap_keeps_repo_root_importable_without_shadowing_llama_cpp(
     tmp_path, path_bootstrap, monkeypatch
 ):

@@ -278,3 +278,34 @@ def test_strip_windows_extended_prefix_for_packaged_resource_paths(path_bootstra
     assert path_bootstrap._strip_windows_extended_path_prefix(
         r'\\?\UNC\server\share\token.place desktop\python\compute_node_bridge.py'
     ) == r'\\server\share\token.place desktop\python\compute_node_bridge.py'
+
+
+def test_bootstrap_keeps_stdlib_before_polluted_site_packages_pathlib(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    resources_root = tmp_path / 'token.place desktop' / 'resources'
+    script = resources_root / 'python' / 'compute_node_bridge.py'
+    polluted_site = tmp_path / 'Python311' / 'Lib' / 'site-packages'
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    polluted_site.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    (polluted_site / 'pathlib.py').write_text(
+        'from collections import Sequence\n', encoding='utf-8'
+    )
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [str(polluted_site)] + original_sys_path
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        import importlib.util
+
+        spec = importlib.util.find_spec('pathlib')
+        assert spec is not None
+        assert spec.origin is not None
+        assert Path(spec.origin).resolve() != (polluted_site / 'pathlib.py').resolve()
+        assert sys.path.index(str(polluted_site)) > next(
+            index for index, entry in enumerate(sys.path) if 'python' in entry.lower()
+        )
+    finally:
+        sys.path[:] = original_sys_path

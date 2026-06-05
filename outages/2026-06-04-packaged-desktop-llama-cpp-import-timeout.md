@@ -75,3 +75,55 @@ packaged roots.
   success.
 - Packaged standard and macOS `Contents/Resources` lifecycle checks continue to fail unless the
   bridge reports `registered=true` and `relay_runtime_state=ready`.
+
+## 2026-06-05 update: stdlib shadowing root cause
+A later Windows 11 packaged run proved the facade was not failing because CUDA discovery or relay
+registration logic was wrong. Runtime setup successfully found the user's Python 3.11
+`llama-cpp-python` CUDA install and the model manager selected `backend_selected=cuda`, but the
+runtime facade child imported `llama_cpp` with `site-packages` ahead of Python 3.11's standard
+library. That let a stale PyPI `pathlib.py` backport from
+`C:\Users\danie\AppData\Local\Programs\Python\Python311\Lib\site-packages\pathlib.py` shadow the
+stdlib `pathlib`. The backport executes `from collections import Sequence`, which fails on modern
+Python, so warm-load failed before `model_init.ready`, `server.registered`, and UI
+`Registered: yes`.
+
+### Why the earlier fixes still missed this
+- `PYTHONNOUSERSITE=1` only removes the per-user site directory; it does not remove packages in the
+  selected interpreter's system `site-packages`.
+- The subprocess facade and probe bootstrap passed explicit import paths into child processes and
+  could reorder those paths ahead of stdlib entries, recreating the user's polluted interpreter
+  ordering even after runtime setup succeeded.
+- CI simulated missing modules, import timeouts, and early child exits, but it did not include a
+  stale stdlib-backport module in a `site-packages`-like directory that would only fail when
+  `llama_cpp` imported stdlib `pathlib`.
+
+### Additional remediation
+- Harden packaged bridge/model runtime path bootstrap so Python stdlib entries remain ahead of
+  `site-packages`/`dist-packages` while packaged application roots and legitimate dependencies such
+  as `llama_cpp`, `requests`, `cryptography`, and `psutil` stay importable.
+- Add guarded diagnostics for critical stdlib modules (`collections`, `typing`, `ctypes`,
+  `subprocess`, `json`, `importlib`, and `pathlib`) that fail with a clear message such as
+  `stdlib module pathlib shadowed by .../site-packages/pathlib.py` if repair is impossible.
+- Apply the same import ordering to runtime probe children and the no-SIGALRM subprocess facade so
+  the child that imports/uses `llama_cpp` cannot put stale third-party backports ahead of stdlib.
+- Keep repo-local `llama_cpp.py` shim rejection intact while avoiding Windows `\\?\` extended path
+  strings in subprocess env/sys.path state.
+- Strengthen packaged operator e2e coverage so it launches real `relay.py`, fails unless bridge
+  status reaches `registered=true`/`relay_runtime_state=ready`, verifies relay diagnostics contain a
+  registered node, and exercises standard Windows-like resources plus macOS `.app/Contents/Resources`
+  layouts with polluted `site-packages/pathlib.py` fixtures.
+
+### Manual hardware validation checklist
+1. Build and install a new Windows desktop release from HEAD.
+2. Start the operator against `https://staging.token.place` with the Windows CUDA GGUF model and
+   mode `auto`.
+3. Confirm logs show `Selected compute plan ... backend_selected=cuda`, `Llama init completed
+   successfully`, `model_init.ready`, and `server.registered`.
+4. Confirm no import path references the stale `site-packages\pathlib.py` backport and no
+   `cannot import name 'Sequence' from 'collections'` appears.
+5. Confirm UI shows `Running: yes`, `Registered: yes`, CUDA backend fields, and no last error.
+6. Confirm staging `/relay/diagnostics` shows one registered node with `queue_depth=0`.
+7. Send a browser chat request, stop the operator, wait for unregister/TTL expiry, start again, and
+   confirm `Registered: yes` returns.
+8. Repeat packaged macOS operator validation against staging; it should reach `Registered: yes` or
+   fail closed with bounded actionable runtime diagnostics.

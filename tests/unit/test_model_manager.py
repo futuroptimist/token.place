@@ -1354,7 +1354,20 @@ def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp
     )
 
     assert llama_cpp.MARKER == 'right'
-    assert Path(sys.path[0]).resolve() == right_site.resolve()
+    right_index = next(
+        index for index, entry in enumerate(sys.path)
+        if Path(entry or '.').resolve() == right_site.resolve()
+    )
+    wrong_index = next(
+        index for index, entry in enumerate(sys.path)
+        if Path(entry or '.').resolve() == wrong_site.resolve()
+    )
+    stdlib_indices = [
+        index for index, entry in enumerate(sys.path[:right_index])
+        if 'site-packages' not in entry and f'python{sys.version_info.major}.{sys.version_info.minor}' in entry
+    ]
+    assert stdlib_indices
+    assert right_index < wrong_index
 
 
 def test_desktop_runtime_probe_windows_extended_path_with_spaces_prioritized(monkeypatch, tmp_path):
@@ -1406,7 +1419,15 @@ def test_desktop_runtime_probe_macos_app_resources_path_prioritized(monkeypatch,
     )
 
     assert llama_cpp.MARKER == 'macos-app'
-    assert Path(sys.path[0]).resolve() == resources_site.resolve()
+    resources_index = next(
+        index for index, entry in enumerate(sys.path)
+        if Path(entry or '.').resolve() == resources_site.resolve()
+    )
+    stdlib_indices = [
+        index for index, entry in enumerate(sys.path[:resources_index])
+        if 'site-packages' not in entry and f'python{sys.version_info.major}.{sys.version_info.minor}' in entry
+    ]
+    assert stdlib_indices
 
 
 def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():

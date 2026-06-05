@@ -246,6 +246,13 @@ def _wait_for_registered(bridge: BridgeProcess, relay_url: str, *, layout_label:
                 raise RuntimeError(f"bridge error before registration for {layout_label}: {event}")
             if event.get("registered") is True and event.get("relay_runtime_state") == "ready":
                 _assert_ready_runtime_fields(event, layout_label=layout_label)
+                last_diag = _redacted_diagnostics(relay_url)
+                nodes = last_diag.get("registered_compute_nodes", []) or []
+                if not nodes:
+                    raise RuntimeError(
+                        f"{layout_label} emitted registered=true but real relay.py "
+                        f"diagnostics has no registered nodes: {last_diag}"
+                    )
                 return event
         with contextlib.suppress(Exception):
             last_diag = _redacted_diagnostics(relay_url)
@@ -373,6 +380,9 @@ def _assert_no_facade_early_exit_regression(*paths: Path) -> None:
     combined = "\n".join(_read_file(path) for path in paths)
     assert "llama_cpp_import subprocess ended" not in combined, combined[-4000:]
     assert "Running: yes / Registered: no" not in combined, combined[-4000:]
+    assert "cannot import name 'Sequence' from 'collections'" not in combined, combined[-4000:]
+    assert "site-packages/pathlib.py" not in combined, combined[-4000:]
+    assert "site-packages\\pathlib.py" not in combined, combined[-4000:]
 
 
 def _assert_relay_observed_api_v1_success(relay_stdout: Path, stdout_handle: Any, *, min_turns: int) -> None:

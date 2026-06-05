@@ -330,11 +330,21 @@ def run_unified_root_import_policy_probe(
 
 
 def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path, Path]:
-    fake_site = tmp_root / f"fake site-packages {layout_label.replace('/', '_')}"
+    fake_site = (
+        tmp_root
+        / f"fake-python-{layout_label.replace('/', '_')}"
+        / "Lib"
+        / "site-packages"
+    )
     fake_pkg = fake_site / "llama_cpp"
     fake_pkg.mkdir(parents=True, exist_ok=True)
+    (fake_site / "pathlib.py").write_text(
+        "from collections import Sequence\n", encoding="utf-8"
+    )
     fake_init = fake_pkg / "__init__.py"
     fake_init.write_text(
+        "import pathlib\n"
+        "PATHLIB_ORIGIN = pathlib.__file__\n"
         "import os, time\n"
         "if os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n"
         "    time.sleep(60)\n"
@@ -365,8 +375,9 @@ def run_llama_cpp_watchdog_regression_probe(
         extra_env={
             "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
             "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+                [str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKEN_PLACE_DESKTOP_EXTRA_SITE_PACKAGES": str(fake_site),
         },
     )
     result = subprocess.run(  # noqa: S603
@@ -374,11 +385,13 @@ def run_llama_cpp_watchdog_regression_probe(
             sys.executable,
             "-c",
             (
-                "import json, pathlib, sys; "
-                f"sys.path.insert(0, {str(fake_site)!r}); "
+                "import json, os, sys; "
+                f"sys.path.insert(0, {str(resources_root / 'python')!r}); "
+                "from path_bootstrap import ensure_runtime_import_paths; "
+                f"ensure_runtime_import_paths({str(resources_root / 'python' / 'compute_node_bridge.py')!r}); "
                 f"sys.path.insert(0, {str(resources_root)!r}); "
                 "from utils.llm import model_manager; "
-                "module_path = pathlib.Path(sys.path[1], 'llama_cpp', '__init__.py'); "
+                f"module_path = {str(fake_init)!r}; "
                 "llama_cpp = model_manager._import_llama_cpp_runtime("
                 "require_real_runtime=True, "
                 "desktop_runtime_probe={"
@@ -560,6 +573,9 @@ def run_compute_bridge_startup_probe(
             "llama_cpp_import_timeout",
             "llama_cpp import watchdog start",
             "Running: yes / Registered: no",
+            "cannot import name 'Sequence' from 'collections'",
+            "site-packages/pathlib.py",
+            "site-packages\\pathlib.py",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
@@ -576,7 +592,12 @@ def run_llama_cpp_facade_early_exit_diagnostics_probe(
     """Assert a runtime facade child that exits before handshake is actionable."""
 
     resources_root = resources_root or (tmp_root / "resources")
-    fake_site = tmp_root / f"fake crashing site-packages {layout_label.replace('/', '_')}"
+    fake_site = (
+        tmp_root
+        / f"fake-crashing-python-{layout_label.replace('/', '_')}"
+        / "Lib"
+        / "site-packages"
+    )
     fake_pkg = fake_site / "llama_cpp"
     fake_pkg.mkdir(parents=True, exist_ok=True)
     fake_init = fake_pkg / "__init__.py"
@@ -593,8 +614,9 @@ def run_llama_cpp_facade_early_exit_diagnostics_probe(
         extra_env={
             "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "5",
             "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+                [str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKEN_PLACE_DESKTOP_EXTRA_SITE_PACKAGES": str(fake_site),
         },
     )
     result = subprocess.run(  # noqa: S603
@@ -655,8 +677,9 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
         extra_env={
             "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
             "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+                [str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKEN_PLACE_DESKTOP_EXTRA_SITE_PACKAGES": str(fake_site),
         },
     )
     assert str(fake_init) in output, output

@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import call, MagicMock
 
 import pytest
@@ -931,3 +932,27 @@ def test_compute_node_runtime_stop_skips_unregister_for_non_set_registration_sta
 
     relay_client.stop.assert_called_once_with()
     relay_client.unregister_from_relay.assert_not_called()
+
+
+def test_llama_cpp_subprocess_probe_keeps_stdlib_before_polluted_site_pathlib(tmp_path, monkeypatch):
+    from utils.llm import model_manager
+
+    polluted_site = tmp_path / 'Python311' / 'Lib' / 'site-packages'
+    fake_pkg = polluted_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (polluted_site / 'pathlib.py').write_text('from collections import Sequence\n', encoding='utf-8')
+    (fake_pkg / '__init__.py').write_text(
+        'import pathlib\n'
+        'PATHLIB_ORIGIN = pathlib.__file__\n'
+        'GGML_USE_CUDA = True\n',
+        encoding='utf-8',
+    )
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [str(polluted_site)] + original_sys_path
+        diagnostics = model_manager._probe_llama_cpp_capabilities_in_subprocess(timeout_seconds=5)
+    finally:
+        sys.path[:] = original_sys_path
+
+    assert diagnostics['backend'] == 'cuda'
+    assert diagnostics['llama_module_path'] == str(fake_pkg / '__init__.py')

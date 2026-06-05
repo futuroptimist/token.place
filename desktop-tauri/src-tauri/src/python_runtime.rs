@@ -357,18 +357,30 @@ where
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
 }
 
+fn strip_windows_extended_path_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = text.strip_prefix("\\\\?\\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 pub fn configure_python_subprocess_env<C>(command: &mut C, import_root: &Path)
 where
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
-    command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
-    let python_dir = import_root.join("python");
+    let safe_import_root = strip_windows_extended_path_prefix(import_root);
+    command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", safe_import_root.as_os_str());
+    let python_dir = safe_import_root.join("python");
     let pythonpath = if python_dir.is_dir() {
-        std::env::join_paths([import_root, python_dir.as_path()])
-            .unwrap_or_else(|_| import_root.as_os_str().to_owned())
+        std::env::join_paths([safe_import_root.as_path(), python_dir.as_path()])
+            .unwrap_or_else(|_| safe_import_root.as_os_str().to_owned())
     } else {
-        import_root.as_os_str().to_owned()
+        safe_import_root.as_os_str().to_owned()
     };
     command.set_env("PYTHONPATH", pythonpath);
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import site
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -18,6 +19,128 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+_STDLIB_GUARD_MODULES = (
+    "collections",
+    "typing",
+    "ctypes",
+    "subprocess",
+    "json",
+    "importlib",
+    "pathlib",
+)
+
+
+def _normalize_for_compare(path_text: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(_strip_windows_extended_path_prefix(str(path_text)))))
+
+
+def _looks_like_site_packages(path_text: str | Path | None) -> bool:
+    if path_text is None:
+        return False
+    normalized = str(path_text).replace("\\", "/").lower()
+    return "site-packages" in normalized or "dist-packages" in normalized
+
+
+def _stdlib_roots() -> list[Path]:
+    roots: list[Path] = []
+    for key in ("stdlib", "platstdlib"):
+        value = sysconfig.get_paths().get(key)
+        if value:
+            with suppress_path_errors():
+                roots.append(_safe_resolve_path(value))
+    return _dedupe_paths(roots)
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = _normalize_for_compare(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+class suppress_path_errors:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc, _tb) -> bool:
+        return exc_type in (OSError, ValueError, TypeError)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    with suppress_path_errors():
+        path.resolve().relative_to(root.resolve())
+        return True
+    return False
+
+
+def _is_stdlib_path(path_text: str | Path | None, stdlib_roots: list[Path]) -> bool:
+    if path_text in (None, "", "."):
+        return False
+    if _looks_like_site_packages(path_text):
+        return False
+    with suppress_path_errors():
+        path = _safe_resolve_path(path_text)
+        return any(path == root or _is_under(path, root) for root in stdlib_roots)
+    return False
+
+
+def _entry_compare(entry: str) -> str | None:
+    with suppress_path_errors():
+        return _normalize_for_compare(entry or Path.cwd())
+    return None
+
+
+def _reorder_import_paths_for_stdlib(runtime_roots: list[str]) -> None:
+    """Keep packaged roots importable while ensuring stdlib precedes site-packages."""
+
+    stdlib_roots = _stdlib_roots()
+    runtime_compares = {_entry_compare(root) for root in runtime_roots}
+    runtime_compares.discard(None)
+
+    runtime_entries: list[str] = []
+    stdlib_entries: list[str] = []
+    other_entries: list[str] = []
+    site_entries: list[str] = []
+    seen: set[str] = set()
+
+    for entry in sys.path:
+        if not isinstance(entry, str):
+            other_entries.append(entry)
+            continue
+        compare = _entry_compare(entry)
+        dedupe_key = compare or entry
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        if compare in runtime_compares:
+            runtime_entries.append(entry)
+        elif _is_stdlib_path(entry, stdlib_roots):
+            stdlib_entries.append(entry)
+        elif _looks_like_site_packages(entry):
+            site_entries.append(entry)
+        else:
+            other_entries.append(entry)
+
+    sys.path[:] = runtime_entries + stdlib_entries + other_entries + site_entries
+
+
+def verify_stdlib_not_shadowed(module_names: tuple[str, ...] = _STDLIB_GUARD_MODULES) -> None:
+    """Raise an actionable error if a guarded stdlib module resolves from site-packages."""
+
+    import importlib.util
+
+    for module_name in module_names:
+        spec = importlib.util.find_spec(module_name)
+        origin = getattr(spec, "origin", None) if spec else None
+        if origin and _looks_like_site_packages(origin):
+            raise ImportError(f"stdlib module {module_name} shadowed by {origin}")
+
 
 
 def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
@@ -57,6 +180,8 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             sys.path.remove(candidate_str)
         sys.path.insert(0, candidate_str)
 
+    _reorder_import_paths_for_stdlib(valid_candidates)
+
     if os.environ.get("PYTHONNOUSERSITE") == "1":
         user_site = getattr(site, "USER_SITE", None)
         if user_site:
@@ -66,6 +191,24 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
                 for entry in sys.path
                 if _safe_resolve_path(entry or ".") != user_site_path
             ]
+
+    extra_site_paths = os.environ.get("TOKEN_PLACE_DESKTOP_EXTRA_SITE_PACKAGES", "").strip()
+    if extra_site_paths:
+        for extra_site_path in extra_site_paths.split(os.pathsep):
+            extra_site_path = extra_site_path.strip()
+            if not extra_site_path:
+                continue
+            extra_site = str(_safe_resolve_path(extra_site_path))
+            if extra_site not in sys.path:
+                insert_at = len(sys.path)
+                for index, entry in enumerate(sys.path):
+                    if _looks_like_site_packages(entry):
+                        insert_at = index
+                        break
+                sys.path.insert(insert_at, extra_site)
+        _reorder_import_paths_for_stdlib(valid_candidates)
+
+    verify_stdlib_not_shadowed()
 
     if not avoid_llama_cpp_shadowing:
         return
@@ -101,3 +244,5 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             if "site-packages" in normalized or "dist-packages" in normalized:
                 preferred_index = idx + 1
         sys.path.insert(preferred_index, candidate_str)
+
+    verify_stdlib_not_shadowed()

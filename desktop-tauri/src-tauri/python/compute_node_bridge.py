@@ -1005,6 +1005,7 @@ def run(args: argparse.Namespace) -> int:
         return ready
 
     poll_cancel_requested = False
+    registration_succeeded = False
 
     def request_poll_cancel(active_relay_url: str) -> None:
         nonlocal poll_cancel_requested
@@ -1031,7 +1032,11 @@ def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
         unregister = getattr(relay_client, "unregister_from_relay", None)
-        if callable(unregister):
+        registered_relays = getattr(relay_client, "_api_v1_registered_relays", None)
+        should_unregister = registration_succeeded or (
+            isinstance(registered_relays, set) and bool(registered_relays)
+        )
+        if callable(unregister) and should_unregister:
             print(
                 "desktop.compute_node_bridge.unregister.attempted "
                 f"relay={_sanitize_relay_target(active_relay_url)} "
@@ -1061,6 +1066,14 @@ def run(args: argparse.Namespace) -> int:
                     f"success={unregistered}",
                     file=sys.stderr,
                 )
+        elif callable(unregister):
+            print(
+                "desktop.compute_node_bridge.unregister.skipped "
+                f"relay={_sanitize_relay_target(active_relay_url)} "
+                f"key_fingerprint={_relay_key_fingerprint(relay_client)} "
+                "reason=not_registered",
+                file=sys.stderr,
+            )
 
     try:
         if warm_runtime_before_registration():
@@ -1097,6 +1110,8 @@ def run(args: argparse.Namespace) -> int:
                     and (has_heartbeat or api_v1_payload)
                     and _registration_fresh(runtime.relay_client, active_relay_url)
                 )
+                if registered:
+                    registration_succeeded = True
                 wait_seconds = _safe_poll_wait_seconds(
                     relay_response, getattr(runtime.relay_client, "_request_timeout", 1)
                 )

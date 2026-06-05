@@ -3070,3 +3070,44 @@ def test_pre_registration_warmup_timeout_reports_current_runtime_stage(capsys, m
     assert error_event['warm_load_state'] == 'failed'
     assert error_event['last_error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
     assert error_event['message'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+
+
+class PreRegistrationUnregisterRelayClient(FakeRelayClient):
+    def __init__(self):
+        self.stop_calls = 0
+        self.unregister_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def unregister_from_relay(self):
+        self.unregister_calls += 1
+        return True
+
+
+class PreRegistrationCancelRuntime(WarmingThenApiV1Runtime):
+    last_instance = None
+
+    def __init__(self, config):
+        super().__init__(config)
+        PreRegistrationCancelRuntime.last_instance = self
+        self.relay_client = PreRegistrationUnregisterRelayClient()
+
+
+def test_run_logs_unregister_skip_when_cancelled_before_registration(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch, runtime_cls=PreRegistrationCancelRuntime)
+
+    def fake_stop_requested():
+        instance = PreRegistrationCancelRuntime.last_instance
+        return bool(instance is not None and instance.ready_started.is_set())
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_WARM_LOAD', '1')
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+
+    runtime = PreRegistrationCancelRuntime.last_instance
+    assert runtime.relay_client.unregister_calls == 0
+    assert 'desktop.compute_node_bridge.unregister.skipped' in capsys.readouterr().err

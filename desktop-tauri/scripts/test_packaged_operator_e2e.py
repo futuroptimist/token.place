@@ -327,6 +327,82 @@ def run_unified_root_import_policy_probe(
     assert payload["cwd_present"] is False, combined
     assert payload["llama_shim_before_site"] is False, combined
 
+
+
+def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path, Path]:
+    fake_site = tmp_root / f"fake site-packages {layout_label.replace('/', '_')}"
+    fake_pkg = fake_site / "llama_cpp"
+    fake_pkg.mkdir(parents=True, exist_ok=True)
+    fake_init = fake_pkg / "__init__.py"
+    fake_init.write_text(
+        "import os, time\n"
+        "if os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n"
+        "    time.sleep(60)\n"
+        "__file__ = __file__\n"
+        "GGML_USE_CUDA = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.args = args\n"
+        "        self.kwargs = kwargs\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake llama ok'}}]}\n",
+        encoding="utf-8",
+    )
+    return fake_site, fake_init
+
+def run_llama_cpp_watchdog_regression_probe(
+    tmp_root: Path, *, resources_root: Path | None = None, layout_label: str = "standard resources"
+) -> None:
+    """Assert packaged model warm-load does not pre-import llama_cpp in a divergent child."""
+
+    resources_root = resources_root or (tmp_root / "resources")
+    fake_site, fake_init = create_fake_llama_cpp_site(tmp_root, layout_label)
+    env = _packaged_env(
+        tmp_root,
+        resources_root,
+        extra_env={
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
+            "PYTHONPATH": os.pathsep.join(
+                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, sys; "
+                f"sys.path.insert(0, {str(fake_site)!r}); "
+                f"sys.path.insert(0, {str(resources_root)!r}); "
+                "from utils.llm import model_manager; "
+                "module_path = pathlib.Path(sys.path[1], 'llama_cpp', '__init__.py'); "
+                "llama_cpp = model_manager._import_llama_cpp_runtime("
+                "require_real_runtime=True, "
+                "desktop_runtime_probe={"
+                "'selected_backend': 'cuda', 'gpu_offload_supported': True, "
+                "'detected_device': 'cuda', 'interpreter': sys.executable, "
+                "'prefix': sys.prefix, 'llama_module_path': str(module_path), "
+                "'fallback_reason': ''}); "
+                "print(json.dumps({'module_path': getattr(llama_cpp, '__file__', None)}))"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, combined
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert Path(payload["module_path"]).resolve() == fake_init.resolve(), combined
+    assert "llama_cpp_import_timeout" not in combined, combined
+    assert "llama_cpp import watchdog start" not in combined, combined
+
 def enqueue_bridge_stdout(stdout: object, output_queue: queue.Queue[bytes]) -> None:
     if not hasattr(stdout, "readline"):
         return
@@ -346,8 +422,16 @@ def run_compute_bridge_startup_probe(
     relay_port: int,
     resources_root: Path | None = None,
     layout_label: str = "standard resources",
-) -> None:
-    env = _packaged_env(tmp_root, resources_root, extra_env={"USE_MOCK_LLM": "1"})
+    use_mock_llm: str = "1",
+    mode: str = "cpu",
+    model_path: Path | str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> str:
+    packaged_extra_env = {"USE_MOCK_LLM": use_mock_llm}
+    if extra_env:
+        packaged_extra_env.update(extra_env)
+    env = _packaged_env(tmp_root, resources_root, extra_env=packaged_extra_env)
+    model_arg = str(model_path or "mock.gguf")
     log_dir = REPO_ROOT / ".desktop-e2e-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_layout_label = layout_label.replace(" ", "_").replace("/", "_")
@@ -357,9 +441,9 @@ def run_compute_bridge_startup_probe(
             sys.executable,
             str(bridge_script),
             "--model",
-            "mock.gguf",
+            model_arg,
             "--mode",
-            "cpu",
+            mode,
             "--relay-url",
             f"http://127.0.0.1:{relay_port}",
         ],
@@ -372,7 +456,8 @@ def run_compute_bridge_startup_probe(
     )
     bridge_output = ""
     saw_started = False
-    saw_registered = False
+    saw_ready_registered = False
+    last_running_unregistered_payload: dict[str, object] | None = None
     try:
         assert bridge.stdout is not None
         assert bridge.stdin is not None
@@ -417,9 +502,14 @@ def run_compute_bridge_startup_probe(
                     raise RuntimeError(f"bridge emitted error event: {payload}")
                 if payload.get("type") == "started" and payload.get("running") is True:
                     saw_started = True
-                if payload.get("registered") is True:
-                    saw_registered = True
-                if saw_started and saw_registered:
+                if payload.get("running") is True and payload.get("registered") is not True:
+                    last_running_unregistered_payload = payload
+                if (
+                    payload.get("registered") is True
+                    and payload.get("relay_runtime_state") == "ready"
+                ):
+                    saw_ready_registered = True
+                if saw_started and saw_ready_registered:
                     bridge.stdin.write(b'{"type":"cancel"}\n')
                     bridge.stdin.flush()
                     cancel_deadline = time.time() + 5
@@ -429,7 +519,7 @@ def run_compute_bridge_startup_probe(
                         except queue.Empty:
                             pass
                     break
-            if saw_started and saw_registered:
+            if saw_started and saw_ready_registered:
                 break
 
         if not saw_started:
@@ -437,10 +527,12 @@ def run_compute_bridge_startup_probe(
                 f"[{layout_label}] bridge did not emit started/running event; output="
                 f"{bridge_output[-4000:]}"
             )
-        if not saw_registered:
+        if not saw_ready_registered:
             raise RuntimeError(
-                f"[{layout_label}] bridge never reported registered=true "
-                f"(relay connection missing); output={bridge_output[-4000:]}"
+                f"[{layout_label}] bridge never reported registered=true with "
+                f"relay_runtime_state=ready (relay connection/runtime missing); "
+                f"last_running_unregistered_payload={last_running_unregistered_payload}; "
+                f"output={bridge_output[-4000:]}"
             )
 
         try:
@@ -465,13 +557,49 @@ def run_compute_bridge_startup_probe(
             "ImportError",
             "compute-node bridge exited before emitting a startup event",
             "desktop_runtime_setup module missing",
+            "llama_cpp_import_timeout",
+            "llama_cpp import watchdog start",
+            "Running: yes / Registered: no",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
+        return bridge_output
     finally:
         log_file.write_text(bridge_output, encoding="utf-8")
         if bridge.poll() is None:
             bridge.kill()
+
+
+def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
+    tmp_root: Path,
+    bridge_script: Path,
+    *,
+    relay_port: int,
+    resources_root: Path | None = None,
+    layout_label: str = "standard resources",
+) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    fake_site, fake_init = create_fake_llama_cpp_site(tmp_root, f"lifecycle {layout_label}")
+    fake_model = tmp_root / f"fake model {layout_label.replace('/', '_')}.gguf"
+    fake_model.write_bytes(b"GGUF fake packaged bridge regression model")
+    output = run_compute_bridge_startup_probe(
+        tmp_root,
+        bridge_script,
+        relay_port=relay_port,
+        resources_root=resources_root,
+        layout_label=f"{layout_label} fake llama_cpp lifecycle",
+        use_mock_llm="0",
+        mode="auto",
+        model_path=fake_model,
+        extra_env={
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
+            "PYTHONPATH": os.pathsep.join(
+                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    assert str(fake_init) in output, output
+
 
 
 def main() -> int:
@@ -485,6 +613,7 @@ def main() -> int:
         run_unified_root_import_policy_probe(tmp_path)
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
+        run_llama_cpp_watchdog_regression_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
@@ -492,6 +621,9 @@ def main() -> int:
         run_unified_root_import_policy_probe(tmp_path, resources_root=mac_resources_root)
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
+        run_llama_cpp_watchdog_regression_probe(
+            tmp_path, resources_root=mac_resources_root, layout_label="macOS Contents/Resources"
+        )
 
         if os.environ.get("TOKEN_PLACE_INSPECT_ONLY") == "1":
             return 0
@@ -533,6 +665,13 @@ def main() -> int:
                     stderr_path=relay_stderr,
                 )
                 run_compute_bridge_startup_probe(
+                    tmp_path,
+                    probe_script,
+                    relay_port=relay_port,
+                    resources_root=probe_resources_root,
+                    layout_label=layout_label,
+                )
+                run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
                     tmp_path,
                     probe_script,
                     relay_port=relay_port,

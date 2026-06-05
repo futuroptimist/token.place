@@ -723,6 +723,7 @@ def test_compute_node_runtime_default_path_is_api_v1_only():
 
 def test_compute_node_runtime_stop_delegates_to_relay_client():
     relay_client = MagicMock()
+    relay_client._api_v1_registered_relays = {"https://token.place"}
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
     crypto_manager = MagicMock()
@@ -745,6 +746,7 @@ def test_compute_node_runtime_stop_delegates_to_relay_client():
 
 def test_compute_node_runtime_stop_continues_when_unregister_raises():
     relay_client = MagicMock()
+    relay_client._api_v1_registered_relays = {"https://token.place"}
     relay_client.unregister_from_relay.side_effect = RuntimeError("network down")
     model_manager = MagicMock()
     model_manager.use_mock_llm = True
@@ -799,3 +801,133 @@ def test_compute_node_runtime_replaces_stale_error_on_runtime_shape_failure():
 
     assert runtime.ensure_api_v1_runtime_ready() is False
     assert model_manager.last_runtime_init_error == 'runtime_missing_create_chat_completion'
+
+
+def test_llama_cpp_runtime_reuses_desktop_probe_and_skips_child_import_watchdog(monkeypatch):
+    import types
+    from utils.llm import model_manager as llama_model_manager
+
+    fake_module = types.SimpleNamespace(__file__='/opt/site-packages/llama_cpp/__init__.py', Llama=object)
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 3},
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: pytest.fail('desktop runtime probe should avoid child discovery'),
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_run_llama_cpp_import_watchdog',
+        lambda **_kwargs: pytest.fail('startup-critical child import watchdog must not run'),
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_import_llama_cpp_in_parent_with_timeout',
+        lambda **_kwargs: fake_module,
+    )
+
+    imported = llama_model_manager._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'interpreter': '/python',
+            'prefix': '/prefix',
+            'llama_module_path': '/opt/site-packages/llama_cpp/__init__.py',
+            'fallback_reason': '',
+        },
+    )
+
+    assert imported is fake_module
+
+
+def test_llama_cpp_runtime_rejects_desktop_probe_import_mismatch(monkeypatch):
+    import types
+    from utils.llm import model_manager as llama_model_manager
+
+    fake_module = types.SimpleNamespace(__file__='/other/site-packages/llama_cpp/__init__.py', Llama=object)
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_sanitize_llama_cpp_import_paths',
+        lambda: {'import_root': '/app', 'deprioritized_entries': [], 'sys_path_count': 3},
+    )
+    monkeypatch.setattr(
+        llama_model_manager,
+        '_import_llama_cpp_in_parent_with_timeout',
+        lambda **_kwargs: fake_module,
+    )
+
+    with pytest.raises(ImportError, match='Desktop runtime probe module path mismatch'):
+        llama_model_manager._import_llama_cpp_runtime(
+            require_real_runtime=True,
+            desktop_runtime_probe={
+                'selected_backend': 'metal',
+                'gpu_offload_supported': True,
+                'detected_device': 'metal',
+                'interpreter': '/python',
+                'prefix': '/prefix',
+                'llama_module_path': '/opt/site-packages/llama_cpp/__init__.py',
+                'fallback_reason': '',
+            },
+        )
+
+
+def test_compute_node_runtime_stop_skips_unregister_before_api_v1_registration():
+    relay_client = MagicMock()
+    relay_client._api_v1_registered_relays = set()
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url='https://token.place', relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    runtime.stop()
+
+    relay_client.stop.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_not_called()
+
+
+def test_compute_node_runtime_stop_skips_unregister_when_registration_state_missing():
+    relay_client = MagicMock()
+    del relay_client._api_v1_registered_relays
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url='https://token.place', relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    runtime.stop()
+
+    relay_client.stop.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_not_called()
+
+
+def test_compute_node_runtime_stop_skips_unregister_for_non_set_registration_state():
+    relay_client = MagicMock()
+    relay_client._api_v1_registered_relays = ['https://token.place']
+    model_manager = MagicMock()
+    model_manager.use_mock_llm = True
+
+    runtime = ComputeNodeRuntime(
+        ComputeNodeRuntimeConfig(relay_url='https://token.place', relay_port=None),
+        model_manager=model_manager,
+        relay_client=relay_client,
+        crypto_manager=MagicMock(),
+    )
+
+    runtime.stop()
+
+    relay_client.stop.assert_called_once_with()
+    relay_client.unregister_from_relay.assert_not_called()

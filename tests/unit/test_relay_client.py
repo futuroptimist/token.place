@@ -374,8 +374,10 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_success(self, mock_post, relay_client):
-        """Unregister should post to /unregister and return True on success."""
+        """Unregister should post to /unregister and return True on success after registration."""
 
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -388,6 +390,14 @@ class TestRelayClient:
             json={'server_public_key': 'mock_public_key_b64'},
             timeout=relay_client._request_timeout,
         )
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_skips_when_never_registered(self, mock_post, relay_client):
+        """Unregister should be a local no-op before API v1 registration succeeds."""
+
+        assert relay_client.unregister_from_relay() is True
+        mock_post.assert_not_called()
+        assert relay_client._unregister_complete is True
 
     def test_unregister_from_relay_attempts_all_configured_relays(
         self,
@@ -414,6 +424,9 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
+        client._api_v1_registered_relays.update(client._relay_urls)
+        for relay_url in client._relay_urls:
+            client._api_v1_last_heartbeat_at[relay_url] = 1.0
         success_response = MagicMock()
         success_response.status_code = 200
         failure_response = MagicMock()
@@ -434,6 +447,8 @@ class TestRelayClient:
     def test_unregister_from_relay_retries_after_transient_failure(self, mock_post, relay_client):
         """A failed unregister attempt should not make later attempts no-ops."""
 
+        relay_client._api_v1_registered_relays.add(relay_client.relay_url)
+        relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
         failure_response = MagicMock()
         failure_response.status_code = 503
         success_response = MagicMock()
@@ -535,6 +550,8 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
+        client._api_v1_registered_relays.add(client.relay_url)
+        client._api_v1_last_heartbeat_at[client.relay_url] = 1.0
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_post.return_value = mock_response
@@ -648,6 +665,9 @@ class TestRelayClient:
                 model_manager=mock_model_manager,
             )
 
+        client._api_v1_registered_relays.update(client._relay_urls)
+        for relay_url in client._relay_urls:
+            client._api_v1_last_heartbeat_at[relay_url] = 1.0
         success_response = MagicMock()
         success_response.status_code = 200
         success_response.json.return_value = TEST_NO_REQUEST_RESPONSE
@@ -3286,6 +3306,25 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}
     assert client._api_v1_relay_wait_hints == {}
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(mock_post):
+    client = _standalone_relay_client()
+    client._unregister_attempted = True
+    client._unregister_complete = True
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    mock_post.return_value = MagicMock(status_code=200)
+
+    assert client.unregister_from_relay() is True
+
+    mock_post.assert_called_once_with(
+        'http://localhost:5000/unregister',
+        json={'server_public_key': 'mock_public_key_b64'},
+        timeout=15,
+    )
+    assert client._api_v1_registered_relays == set()
 
 
 @patch('utils.networking.relay_client.requests.post')

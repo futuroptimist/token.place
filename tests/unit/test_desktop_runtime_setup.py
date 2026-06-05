@@ -67,6 +67,9 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('cpu')
     assert result['runtime_action'] == 'skipped'
     assert result['selected_backend'] == 'cpu'
+    recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+    assert recorded['runtime_action'] == 'skipped'
+    assert recorded['llama_module_path'] == result['llama_module_path']
 
 
 def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):
@@ -983,7 +986,7 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
 
     assert probe.backend == 'cuda'
     assert 'ensure_runtime_import_paths' in desktop_runtime_setup._PROBE_SNIPPET
-    assert "Path(entry or \".\").resolve()" in desktop_runtime_setup._PROBE_SNIPPET
+    assert "_safe_resolve_path(entry or \".\")" in desktop_runtime_setup._PROBE_SNIPPET
     assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
     assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
@@ -1467,3 +1470,25 @@ def test_resolve_desktop_dependency_target_uses_home_only_when_runtime_probe_fai
     assert error is None
     assert target == home_dir / '.token_place_desktop_site'
     assert probes == [runtime_root / '.token_place_desktop_site', target]
+
+
+def test_runtime_setup_strips_windows_extended_prefix_for_packaged_resource_paths():
+    assert desktop_runtime_setup._strip_windows_extended_path_prefix(
+        r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    ) == r'C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    assert desktop_runtime_setup._strip_windows_extended_path_prefix(
+        r'\\?\UNC\server\share\TokenPlace.app\Contents\Resources\python\compute_node_bridge.py'
+    ) == r'\\server\share\TokenPlace.app\Contents\Resources\python\compute_node_bridge.py'
+
+
+def test_record_desktop_runtime_probe_clears_env_when_payload_is_not_serializable(monkeypatch):
+    monkeypatch.setenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, '{"stale": true}')
+    monkeypatch.setattr(
+        desktop_runtime_setup.json,
+        'dumps',
+        lambda _payload: (_ for _ in ()).throw(TypeError('not serializable')),
+    )
+    result = {'runtime_action': object()}
+
+    assert desktop_runtime_setup._record_desktop_runtime_probe(result) is result
+    assert desktop_runtime_setup.RUNTIME_PROBE_ENV not in os.environ

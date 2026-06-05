@@ -1,4 +1,5 @@
 use crate::backend::ComputeMode;
+use crate::operator_logs::OperatorLogSink;
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
@@ -48,6 +49,7 @@ pub struct ComputeNodeStatus {
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
+    pub log_file_path: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -202,7 +204,12 @@ fn event_session_id(payload: &Value) -> Option<&str> {
     payload.get("operator_session_id").and_then(Value::as_str)
 }
 
-fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
+fn startup_failure_status(
+    request: &ComputeNodeRequest,
+    last_error: String,
+    operator_session_id: Option<String>,
+    log_file_path: Option<String>,
+) -> ComputeNodeStatus {
     ComputeNodeStatus {
         running: false,
         registered: false,
@@ -221,9 +228,10 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
-        operator_session_id: None,
+        operator_session_id,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
+        log_file_path,
     }
 }
 
@@ -324,6 +332,9 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     } else {
         status.updated_at_ms = Some(current_time_ms());
     }
+    if let Some(log_file_path) = payload.get("log_file_path").and_then(Value::as_str) {
+        status.log_file_path = Some(log_file_path.into());
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -417,10 +428,12 @@ fn finalize_bridge_exit(
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
+    log_sink: OperatorLogSink,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
+        log_sink.append_line("desktop.compute_node.stderr", &line);
         if filter.should_emit(&line) {
             eprintln!("desktop.compute_node.stderr line={line}");
         }
@@ -448,12 +461,47 @@ pub async fn start_compute_node(
         *state.stdin.lock().await = None;
     }
 
+    let session_id = {
+        let mut next_session_id = state.next_session_id.lock().await;
+        *next_session_id += 1;
+        next_session_id.to_string()
+    };
+    let log_sink = OperatorLogSink::create(&app, &session_id)?;
+    let log_file_path = log_sink.path().to_string_lossy().into_owned();
+    log_sink.append_line(
+        "desktop.compute_node.session.start",
+        &format!(
+            "operator_session_id={} relay={} model_path={} requested_mode={}",
+            session_id,
+            sanitize_relay_target(&request.relay_base_url),
+            request.model_path,
+            format!("{:?}", request.mode).to_lowercase()
+        ),
+    );
+    if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        if let Err(err) = crate::operator_logs::open_debug_terminal(log_sink.path()) {
+            log_sink.append_line(
+                "desktop.compute_node.debug_terminal_error",
+                &format!("open failed: {err}"),
+            );
+        }
+    }
+
     let bridge_script = match resolve_bridge_script(&app) {
         Ok(bridge_script) => bridge_script,
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = startup_failure_status(&request, err.clone());
+                *status = startup_failure_status(
+                    &request,
+                    err.clone(),
+                    Some(session_id.clone()),
+                    Some(log_file_path.clone()),
+                );
             }
             return Err(anyhow::anyhow!(err));
         }
@@ -467,7 +515,12 @@ pub async fn start_compute_node(
                 Err(err) => {
                     {
                         let mut status = state.status.lock().await;
-                        *status = startup_failure_status(&request, err.to_string());
+                        *status = startup_failure_status(
+                            &request,
+                            err.to_string(),
+                            Some(session_id.clone()),
+                            Some(log_file_path.clone()),
+                        );
                     }
                     return Err(err);
                 }
@@ -476,7 +529,12 @@ pub async fn start_compute_node(
                 let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
                 {
                     let mut status = state.status.lock().await;
-                    *status = startup_failure_status(&request, err.to_string());
+                    *status = startup_failure_status(
+                        &request,
+                        err.to_string(),
+                        Some(session_id.clone()),
+                        Some(log_file_path.clone()),
+                    );
                 }
                 return Err(err);
             }
@@ -490,15 +548,15 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = startup_failure_status(&request, err.to_string());
+                *status = startup_failure_status(
+                    &request,
+                    err.to_string(),
+                    Some(session_id.clone()),
+                    Some(log_file_path.clone()),
+                );
             }
             return Err(err);
         }
-    };
-    let session_id = {
-        let mut next_session_id = state.next_session_id.lock().await;
-        *next_session_id += 1;
-        next_session_id.to_string()
     };
     let exe_path = std::env::current_exe().ok();
     let resource_dir = app.path().resource_dir().ok();
@@ -525,6 +583,19 @@ pub async fn start_compute_node(
         selected_layout,
         import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
     );
+    log_sink.append_line(
+        "desktop.compute_node.session.layout",
+        &format!(
+            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+            session_id,
+            sanitize_relay_target(&request.relay_base_url),
+            bridge_script,
+            interpreter,
+            selected_resource_root.display(),
+            selected_layout,
+            import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
+        ),
+    );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
 
@@ -549,6 +620,8 @@ pub async fn start_compute_node(
                 *status = startup_failure_status(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
+                    Some(session_id.clone()),
+                    Some(log_file_path.clone()),
                 );
                 *state.child.lock().await = None;
                 *state.stdin.lock().await = None;
@@ -611,6 +684,7 @@ pub async fn start_compute_node(
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
+                log_file_path: Some(log_file_path.clone()),
             };
             true
         }
@@ -629,8 +703,9 @@ pub async fn start_compute_node(
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
+    let stderr_log_sink = log_sink.clone();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_compute_node_stderr(stderr, log_policy).await {
+        if let Err(err) = drain_compute_node_stderr(stderr, log_policy, stderr_log_sink).await {
             eprintln!("desktop.compute_node.stderr_error error={err}");
         }
     });
@@ -639,6 +714,7 @@ pub async fn start_compute_node(
     let mut saw_error_event = false;
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
+        log_sink.append_line("desktop.compute_node.stdout", &line);
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
@@ -924,9 +1000,23 @@ mod tests {
         .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
-        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("stderr.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("log file");
+        let log_sink = OperatorLogSink {
+            path: log_path.clone(),
+            file: std::sync::Arc::new(std::sync::Mutex::new(file)),
+        };
+        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true }, log_sink)
             .await
             .expect("drain stderr");
+        assert!(std::fs::read_to_string(log_path)
+            .expect("log")
+            .contains("bridge-failure"));
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
     }
@@ -1213,6 +1303,8 @@ mod tests {
         let status = startup_failure_status(
             &request,
             "no usable Python 3 interpreter found for desktop Python subprocess".into(),
+            Some("session-1".into()),
+            Some("/tmp/operator.log".into()),
         );
 
         assert!(!status.running);
@@ -1390,6 +1482,8 @@ mod tests {
         let status = startup_failure_status(
             &request,
             "unable to locate desktop Python bridge script 'compute_node_bridge.py'".into(),
+            None,
+            None,
         );
 
         assert!(!status.running);

@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -85,16 +87,53 @@ def relay_diagnostics(relay_port: int) -> dict[str, object]:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def assert_relay_has_registered_compute_node(relay_port: int, *, layout_label: str) -> dict[str, object]:
+def relay_public_key_fingerprint(public_key: object) -> str:
+    if not isinstance(public_key, str) or not public_key:
+        return "unknown"
+    return hashlib.sha256(public_key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def extract_bridge_key_fingerprints(output: str) -> set[str]:
+    return {
+        match.group(1)
+        for match in re.finditer(r"\bkey_fingerprint=([0-9a-f]{12})\b", output)
+    }
+
+
+def registered_compute_node_fingerprints(payload: dict[str, object]) -> set[str]:
+    nodes = payload.get("registered_compute_nodes")
+    if not isinstance(nodes, list):
+        return set()
+    fingerprints: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        fingerprint = relay_public_key_fingerprint(node.get("server_public_key"))
+        if fingerprint != "unknown":
+            fingerprints.add(fingerprint)
+    return fingerprints
+
+
+def assert_relay_has_current_registered_compute_node(
+    relay_port: int, *, layout_label: str, bridge_output: str
+) -> dict[str, object]:
+    expected_fingerprints = extract_bridge_key_fingerprints(bridge_output)
+    if not expected_fingerprints:
+        raise RuntimeError(
+            f"[{layout_label}] bridge reported registered=true but emitted no "
+            "key_fingerprint marker to match against relay diagnostics"
+        )
+
     deadline = time.time() + 5
     last_payload: dict[str, object] | None = None
     last_error: Exception | None = None
+    last_node_fingerprints: set[str] = set()
     while time.time() < deadline:
         try:
             payload = relay_diagnostics(relay_port)
             last_payload = payload
-            nodes = payload.get("registered_compute_nodes")
-            if isinstance(nodes, list) and nodes:
+            last_node_fingerprints = registered_compute_node_fingerprints(payload)
+            if expected_fingerprints & last_node_fingerprints:
                 return payload
         except Exception as exc:  # pragma: no cover - retry loop
             last_error = exc
@@ -102,8 +141,10 @@ def assert_relay_has_registered_compute_node(relay_port: int, *, layout_label: s
 
     raise RuntimeError(
         f"[{layout_label}] bridge reported registered=true but relay diagnostics "
-        f"showed no registered_compute_nodes; last_payload={last_payload}; "
-        f"last_error={last_error}"
+        "did not include a registered_compute_nodes entry for the current bridge; "
+        f"expected_key_fingerprints={sorted(expected_fingerprints)}; "
+        f"observed_key_fingerprints={sorted(last_node_fingerprints)}; "
+        f"last_payload={last_payload}; last_error={last_error}"
     )
 
 
@@ -556,8 +597,8 @@ def run_compute_bridge_startup_probe(
                 ):
                     saw_ready_registered = True
                 if saw_started and saw_ready_registered:
-                    assert_relay_has_registered_compute_node(
-                        relay_port, layout_label=layout_label
+                    assert_relay_has_current_registered_compute_node(
+                        relay_port, layout_label=layout_label, bridge_output=bridge_output
                     )
                     bridge.stdin.write(b'{"type":"cancel"}\n')
                     bridge.stdin.flush()

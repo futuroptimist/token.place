@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-05",
+  "slug": "packaged-desktop-stdlib-shadowing",
+  "summary": "Windows packaged desktop CUDA startup failed before Registered: yes because a stale system site-packages pathlib.py backport shadowed Python 3.11 stdlib pathlib inside the llama_cpp subprocess facade.",
+  "impact": "Packaged Windows compute nodes could warm-load CUDA far enough to select a compute plan but fail before relay registration, preventing staging round-robin validation; the same import-order seam also affected macOS packaged runtime paths.",
+  "fix": "Kept stdlib paths ahead of site-packages when packaged bootstrap, runtime probes, and llama_cpp facade children mutate sys.path; added stdlib shadowing diagnostics; stopped passing ambient PYTHONPATH into runtime probes; and extended real-relay packaged e2e coverage with polluted site-packages fixtures for standard and macOS Contents/Resources layouts.",
+  "lessons": "PYTHONNOUSERSITE is not enough for packaged desktop runtime isolation because system site-packages can contain stale stdlib backports. E2E coverage must launch the real relay and fail unless the packaged runtime-backed bridge reaches registered=true, not merely Running: yes."
+}

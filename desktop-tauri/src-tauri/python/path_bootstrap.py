@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import importlib.util
 import site
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -18,6 +20,111 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
 
 def _safe_resolve_path(path_text: str | Path) -> Path:
     return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+
+
+_STDLIB_GUARD_MODULES = (
+    "collections",
+    "typing",
+    "ctypes",
+    "subprocess",
+    "json",
+    "importlib",
+    "pathlib",
+)
+
+
+def _is_site_package_entry(path_text: str) -> bool:
+    normalized = path_text.replace("\\", "/").lower()
+    return "site-packages" in normalized or "dist-packages" in normalized
+
+
+def _stdlib_roots() -> list[str]:
+    roots: list[str] = []
+    for key in ("stdlib", "platstdlib"):
+        value = sysconfig.get_path(key)
+        if not value:
+            continue
+        try:
+            root = str(_safe_resolve_path(value))
+        except (OSError, RuntimeError):
+            root = _strip_windows_extended_path_prefix(str(value))
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _is_stdlib_entry(path_text: str, stdlib_roots: list[str] | None = None) -> bool:
+    if not path_text or _is_site_package_entry(path_text):
+        return False
+    roots = stdlib_roots if stdlib_roots is not None else _stdlib_roots()
+    if not roots:
+        return False
+    try:
+        candidate = str(_safe_resolve_path(path_text))
+    except (OSError, RuntimeError):
+        candidate = _strip_windows_extended_path_prefix(str(path_text))
+    for root in roots:
+        try:
+            if candidate == root or Path(candidate).is_relative_to(Path(root)):
+                return True
+        except (ValueError, OSError):
+            if candidate.startswith(root.rstrip("/\\") + os.sep):
+                return True
+    return False
+
+
+def _move_site_packages_after_stdlib() -> None:
+    """Keep stdlib import locations ahead of third-party site-package paths."""
+
+    stdlib_roots = _stdlib_roots()
+    if not stdlib_roots:
+        return
+    has_stdlib_after_site = False
+    seen_site = False
+    for entry in sys.path:
+        entry_text = str(entry or ".")
+        if _is_site_package_entry(entry_text):
+            seen_site = True
+        elif seen_site and _is_stdlib_entry(entry_text, stdlib_roots):
+            has_stdlib_after_site = True
+            break
+    if not has_stdlib_after_site:
+        return
+
+    deferred_sites: list[str] = []
+    retained: list[str] = []
+    entries = list(sys.path)
+    for idx, entry in enumerate(entries):
+        entry_text = str(entry or ".")
+        if _is_site_package_entry(entry_text):
+            later_stdlib = any(
+                _is_stdlib_entry(str(later or "."), stdlib_roots)
+                for later in entries[idx + 1 :]
+            )
+            if later_stdlib:
+                deferred_sites.append(entry)
+                continue
+        retained.append(entry)
+
+    insert_at = 0
+    for idx, entry in enumerate(retained):
+        if _is_stdlib_entry(str(entry or "."), stdlib_roots):
+            insert_at = idx + 1
+    sys.path[:] = retained[:insert_at] + deferred_sites + retained[insert_at:]
+
+
+def verify_stdlib_not_shadowed(module_names: tuple[str, ...] = _STDLIB_GUARD_MODULES) -> None:
+    """Fail clearly if a critical stdlib module resolves to site-packages."""
+
+    _move_site_packages_after_stdlib()
+    for module_name in module_names:
+        spec = importlib.util.find_spec(module_name)
+        origin = getattr(spec, "origin", None) if spec else None
+        if not origin or origin in {"built-in", "frozen"}:
+            continue
+        origin_text = _strip_windows_extended_path_prefix(str(origin))
+        if _is_site_package_entry(origin_text):
+            raise ImportError(f"stdlib module {module_name} shadowed by {origin_text}")
 
 
 def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: bool = True) -> None:
@@ -67,7 +174,10 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
                 if _safe_resolve_path(entry or ".") != user_site_path
             ]
 
+    _move_site_packages_after_stdlib()
+
     if not avoid_llama_cpp_shadowing:
+        verify_stdlib_not_shadowed()
         return
 
     cwd = _safe_resolve_path(Path.cwd())
@@ -101,3 +211,6 @@ def ensure_runtime_import_paths(script_file: str, *, avoid_llama_cpp_shadowing: 
             if "site-packages" in normalized or "dist-packages" in normalized:
                 preferred_index = idx + 1
         sys.path.insert(preferred_index, candidate_str)
+
+    _move_site_packages_after_stdlib()
+    verify_stdlib_not_shadowed()

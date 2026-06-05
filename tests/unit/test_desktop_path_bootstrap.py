@@ -278,3 +278,26 @@ def test_strip_windows_extended_prefix_for_packaged_resource_paths(path_bootstra
     assert path_bootstrap._strip_windows_extended_path_prefix(
         r'\\?\UNC\server\share\token.place desktop\python\compute_node_bridge.py'
     ) == r'\\server\share\token.place desktop\python\compute_node_bridge.py'
+
+
+def test_bootstrap_moves_polluted_site_packages_after_stdlib(tmp_path, path_bootstrap):
+    resources_root = tmp_path / 'token.place desktop' / 'resources'
+    script = resources_root / 'python' / 'compute_node_bridge.py'
+    polluted_site = tmp_path / 'Python311' / 'Lib' / 'site-packages'
+    stdlib = Path(path_bootstrap.sysconfig.get_path('stdlib'))
+
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    polluted_site.mkdir(parents=True)
+    (polluted_site / 'pathlib.py').write_text('from collections import Sequence\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [str(polluted_site), str(stdlib)]
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+
+        assert sys.path.index(str(stdlib)) < sys.path.index(str(polluted_site))
+        path_bootstrap.verify_stdlib_not_shadowed(('pathlib',))
+    finally:
+        sys.path[:] = original_sys_path

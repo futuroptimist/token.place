@@ -1354,7 +1354,8 @@ def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp
     )
 
     assert llama_cpp.MARKER == 'right'
-    assert Path(sys.path[0]).resolve() == right_site.resolve()
+    assert str(right_site) in sys.path
+    assert sys.path.index(str(right_site)) < sys.path.index(str(wrong_site))
 
 
 def test_desktop_runtime_probe_windows_extended_path_with_spaces_prioritized(monkeypatch, tmp_path):
@@ -1406,7 +1407,10 @@ def test_desktop_runtime_probe_macos_app_resources_path_prioritized(monkeypatch,
     )
 
     assert llama_cpp.MARKER == 'macos-app'
-    assert Path(sys.path[0]).resolve() == resources_site.resolve()
+    assert str(resources_site) in sys.path
+    stdlib = model_manager_module.sysconfig.get_path('stdlib')
+    if stdlib in sys.path:
+        assert sys.path.index(stdlib) < sys.path.index(str(resources_site))
 
 
 def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
@@ -2747,6 +2751,64 @@ def test_prepare_llama_cpp_import_from_probe_handles_empty_and_unusable_paths(mo
     finally:
         sys.path[:] = original_sys_path
 
+
+def test_prepare_llama_cpp_import_from_probe_keeps_stdlib_before_site_packages(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    stdlib = Path(model_manager_module.sysconfig.get_path('stdlib'))
+    fake_site = tmp_path / 'Lib' / 'site-packages'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    fake_init = fake_pkg / '__init__.py'
+    fake_init.write_text('# fake llama\n', encoding='utf-8')
+    (fake_site / 'pathlib.py').write_text('from collections import Sequence\n', encoding='utf-8')
+    app_root = tmp_path / 'token.place desktop'
+    app_root.mkdir()
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [str(app_root), str(stdlib), str(tmp_path / 'other-site-packages')]
+        model_manager_module._prepare_llama_cpp_import_from_probe(str(fake_init))
+
+        assert sys.path.index(str(stdlib)) < sys.path.index(str(fake_site))
+        model_manager_module._verify_stdlib_not_shadowed(('pathlib',))
+        spec = model_manager_module.importlib.util.find_spec('pathlib')
+        assert spec and spec.origin
+        assert 'site-packages' not in spec.origin.replace('\\\\', '/').lower()
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_llama_runtime_worker_bootstrap_repairs_polluted_site_packages(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    stdlib = Path(model_manager_module.sysconfig.get_path('stdlib'))
+    fake_site = tmp_path / 'polluted site-packages'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    fake_init = fake_pkg / '__init__.py'
+    fake_init.write_text(
+        'import pathlib\n'
+        'GGML_USE_CUDA = True\n'
+        'def llama_supports_gpu_offload(): return True\n'
+        'class Llama:\n'
+        '    def __init__(self, *args, **kwargs): pass\n'
+        '    def create_chat_completion(self, *args, **kwargs): return {"ok": True}\n',
+        encoding='utf-8',
+    )
+    (fake_site / 'pathlib.py').write_text('from collections import Sequence\n', encoding='utf-8')
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [str(fake_site), str(stdlib)]
+        module = model_manager_module._SubprocessLlamaCppModule(
+            str(fake_init), timeout_seconds=5, desktop_runtime_probe={'selected_backend': 'cuda'}
+        )
+        llama = module.Llama(model_path='fake.gguf')
+        assert llama.create_chat_completion(messages=[]) == {'ok': True}
+        llama.close()
+    finally:
+        sys.path[:] = original_sys_path
 
 def test_desktop_runtime_probe_env_rejects_invalid_json(monkeypatch, caplog):
     from utils.llm import model_manager as model_manager_module

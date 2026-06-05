@@ -9,6 +9,7 @@ import json
 import sys
 import importlib
 import subprocess
+import sysconfig
 import queue
 import signal
 import threading
@@ -109,6 +110,98 @@ def _runtime_stage_timeout_seconds() -> float:
     return value if value > 0 else DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS
 
 
+_STDLIB_GUARD_MODULES = (
+    'collections',
+    'typing',
+    'ctypes',
+    'subprocess',
+    'json',
+    'importlib',
+    'pathlib',
+)
+
+
+def _is_site_package_entry(path_text: Any) -> bool:
+    normalized = str(path_text).replace('\\', '/').lower()
+    return 'site-packages' in normalized or 'dist-packages' in normalized
+
+
+def _stdlib_roots() -> list[str]:
+    roots: list[str] = []
+    for key in ('stdlib', 'platstdlib'):
+        value = sysconfig.get_path(key)
+        if not value:
+            continue
+        compare = _canonical_path_for_compare(value)
+        if compare and compare not in roots:
+            roots.append(compare)
+    return roots
+
+
+def _is_stdlib_entry(entry: Any, stdlib_roots: Optional[list[str]] = None) -> bool:
+    if not entry or _is_site_package_entry(entry):
+        return False
+    compare = _canonical_path_for_compare(entry)
+    if compare is None:
+        return False
+    roots = stdlib_roots if stdlib_roots is not None else _stdlib_roots()
+    for root in roots:
+        if compare == root or compare.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def _move_site_packages_after_stdlib() -> None:
+    """Keep stdlib locations ahead of site-packages on mutated runtime paths."""
+
+    roots = _stdlib_roots()
+    if not roots:
+        return
+    retained: list[Any] = []
+    deferred: list[Any] = []
+    entries = list(sys.path)
+    for idx, entry in enumerate(entries):
+        if _is_site_package_entry(entry):
+            if any(_is_stdlib_entry(later, roots) for later in entries[idx + 1:]):
+                deferred.append(entry)
+                continue
+        retained.append(entry)
+    if not deferred:
+        return
+    insert_at = 0
+    for idx, entry in enumerate(retained):
+        if _is_stdlib_entry(entry, roots):
+            insert_at = idx + 1
+    sys.path[:] = retained[:insert_at] + deferred + retained[insert_at:]
+
+
+def _runtime_package_insert_index(entries: Optional[list[Any]] = None) -> int:
+    path_entries = list(sys.path if entries is None else entries)
+    roots = _stdlib_roots()
+    insert_at = 0
+    for idx, entry in enumerate(path_entries):
+        if _is_stdlib_entry(entry, roots):
+            insert_at = idx + 1
+    if insert_at:
+        return insert_at
+    for idx, entry in enumerate(path_entries):
+        if _is_site_package_entry(entry):
+            return idx
+    return len(path_entries)
+
+
+def _verify_stdlib_not_shadowed(module_names: tuple[str, ...] = _STDLIB_GUARD_MODULES) -> None:
+    _move_site_packages_after_stdlib()
+    for module_name in module_names:
+        spec = importlib.util.find_spec(module_name)
+        origin = getattr(spec, 'origin', None) if spec else None
+        if not origin or origin in {'built-in', 'frozen'}:
+            continue
+        origin_text = _strip_windows_extended_path_prefix(str(origin))
+        if _is_site_package_entry(origin_text):
+            raise ImportError(f"stdlib module {module_name} shadowed by {origin_text}")
+
+
 def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
     """Keep app imports available while preventing repo-local llama_cpp shim precedence."""
 
@@ -138,10 +231,10 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
                 continue
             preserved_entries.append(entry)
 
+        _move_site_packages_after_stdlib()
         preferred_index = len(preserved_entries)
         for idx, entry in enumerate(preserved_entries):
-            normalized = str(entry).replace('\\', '/').lower()
-            if 'site-packages' in normalized or 'dist-packages' in normalized:
+            if _is_site_package_entry(entry):
                 preferred_index = idx + 1
 
         sys.path[:] = (
@@ -194,7 +287,7 @@ def _llama_cpp_path_prefixed_code(user_code: str, path_source: str) -> str:
     """Prefix code so cwd/sys.path[0] cannot shadow the runtime."""
 
     return (
-        "import json as _token_place_json, os as _token_place_os, sys as _token_place_sys\n"
+        "import importlib.util as _token_place_importlib_util, json as _token_place_json, os as _token_place_os, sys as _token_place_sys, sysconfig as _token_place_sysconfig\n"
         f"_token_place_probe_path = _token_place_json.loads({path_source})\n"
         "_token_place_cwd = _token_place_os.path.normcase("
         "_token_place_os.path.normpath(_token_place_os.getcwd()))\n"
@@ -222,8 +315,41 @@ def _llama_cpp_path_prefixed_code(user_code: str, path_source: str) -> str:
         "    _token_place_sys.path[:] = _token_place_explicit + ["
         "_token_place_entry for _token_place_compare, _token_place_entry in _token_place_existing "
         "if _token_place_compare not in _token_place_seen]\n"
-        "del _token_place_json, _token_place_os, _token_place_probe_path\n"
-        "del _token_place_cwd, _token_place_existing, _token_place_seen\n"
+        "_token_place_stdlib_roots = []\n"
+        "for _token_place_key in ('stdlib', 'platstdlib'):\n"
+        "    _token_place_root = _token_place_sysconfig.get_path(_token_place_key)\n"
+        "    if _token_place_root:\n"
+        "        _token_place_stdlib_roots.append(_token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_token_place_root))))\n"
+        "def _token_place_is_site(_token_place_entry):\n"
+        "    _token_place_norm = str(_token_place_entry).replace('\\\\', '/').lower()\n"
+        "    return 'site-packages' in _token_place_norm or 'dist-packages' in _token_place_norm\n"
+        "def _token_place_is_stdlib(_token_place_entry):\n"
+        "    if not _token_place_entry or _token_place_is_site(_token_place_entry):\n"
+        "        return False\n"
+        "    _token_place_compare = _token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_token_place_entry)))\n"
+        "    return any(_token_place_compare == _token_place_root or _token_place_compare.startswith(_token_place_root.rstrip('\\\\/') + _token_place_os.sep) for _token_place_root in _token_place_stdlib_roots)\n"
+        "_token_place_retained = []\n"
+        "_token_place_deferred = []\n"
+        "for _token_place_idx, _token_place_entry in enumerate(list(_token_place_sys.path)):\n"
+        "    if _token_place_is_site(_token_place_entry) and any(_token_place_is_stdlib(_token_place_later) for _token_place_later in list(_token_place_sys.path)[_token_place_idx + 1:]):\n"
+        "        _token_place_deferred.append(_token_place_entry)\n"
+        "    else:\n"
+        "        _token_place_retained.append(_token_place_entry)\n"
+        "if _token_place_deferred:\n"
+        "    _token_place_insert_at = 0\n"
+        "    for _token_place_idx, _token_place_entry in enumerate(_token_place_retained):\n"
+        "        if _token_place_is_stdlib(_token_place_entry):\n"
+        "            _token_place_insert_at = _token_place_idx + 1\n"
+        "    _token_place_sys.path[:] = _token_place_retained[:_token_place_insert_at] + _token_place_deferred + _token_place_retained[_token_place_insert_at:]\n"
+        "for _token_place_name in ('collections', 'typing', 'ctypes', 'subprocess', 'json', 'importlib', 'pathlib'):\n"
+        "    _token_place_spec = _token_place_importlib_util.find_spec(_token_place_name)\n"
+        "    _token_place_origin = getattr(_token_place_spec, 'origin', None) if _token_place_spec else None\n"
+        "    if _token_place_origin and _token_place_origin not in {'built-in', 'frozen'} and _token_place_is_site(_token_place_origin):\n"
+        "        raise ImportError(f'stdlib module {_token_place_name} shadowed by {_token_place_origin}')\n"
+        "del _token_place_json, _token_place_os, _token_place_probe_path, _token_place_sysconfig\n"
+        "del _token_place_cwd, _token_place_existing, _token_place_seen, _token_place_importlib_util\n"
+        "del _token_place_stdlib_roots, _token_place_retained, _token_place_deferred\n"
+        "del _token_place_is_site, _token_place_is_stdlib\n"
         + user_code
     )
 
@@ -888,7 +1014,9 @@ def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
             if entry_compare == package_parent_compare:
                 continue
             retained.append(entry)
-        sys.path[:] = [package_parent] + retained
+        insert_at = _runtime_package_insert_index(retained)
+        sys.path[:] = retained[:insert_at] + [package_parent] + retained[insert_at:]
+        _verify_stdlib_not_shadowed()
 
 
 def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:
@@ -934,6 +1062,7 @@ def _import_llama_cpp_runtime(
     environment can diverge from the real bridge process.
     """
     path_diagnostics = _sanitize_llama_cpp_import_paths()
+    _verify_stdlib_not_shadowed()
     logger.info(
         "llama_cpp import path sanitized import_root=%s deprioritized_entries=%s sys_path_count=%s",
         path_diagnostics.get('import_root'),

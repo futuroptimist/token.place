@@ -132,6 +132,40 @@ for entry in sys.path:
     sanitized.append(entry)
 sys.path[:] = sanitized
 
+def _is_site_package_entry(path_text):
+    normalized = str(path_text).replace("\\", "/").lower()
+    return "site-packages" in normalized or "dist-packages" in normalized
+
+def _stdlib_insert_index():
+    roots = []
+    try:
+        import sysconfig
+        for key in ("stdlib", "platstdlib"):
+            root = sysconfig.get_path(key)
+            if root:
+                roots.append(str(_safe_resolve_path(root)))
+    except Exception:
+        roots = []
+    insert_at = 0
+    for idx, entry in enumerate(sys.path):
+        if not entry or _is_site_package_entry(entry):
+            continue
+        try:
+            resolved = str(_safe_resolve_path(entry))
+        except Exception:
+            continue
+        if any(resolved == root or resolved.startswith(root.rstrip("/\\") + os.sep) for root in roots):
+            insert_at = idx + 1
+    return insert_at
+
+extra_runtime_paths = [
+    item for item in os.environ.get("TOKEN_PLACE_LLAMA_CPP_EXTRA_RUNTIME_PATHS", "").split(os.pathsep) if item
+]
+for extra_path in reversed(extra_runtime_paths):
+    while extra_path in sys.path:
+        sys.path.remove(extra_path)
+    sys.path.insert(_stdlib_insert_index(), extra_path)
+
 try:
     llama_spec = importlib.util.find_spec("llama_cpp")
     llama_module_path = getattr(llama_spec, "origin", None)
@@ -228,10 +262,12 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
     python_root = _safe_resolve_path(__file__).parent
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
+    # Do not pass through ambient PYTHONPATH here: Python places PYTHONPATH
+    # before stdlib during interpreter startup, so stale backports such as
+    # site-packages/pathlib.py can crash the probe before path_bootstrap can
+    # repair sys.path. System site-packages remain available through the
+    # interpreter default path after stdlib.
     pythonpath_entries = [str(python_root), str(repo_root)]
-    if existing_pythonpath:
-        pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(_safe_resolve_path(__file__))

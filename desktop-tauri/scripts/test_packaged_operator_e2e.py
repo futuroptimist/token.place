@@ -335,7 +335,7 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
     fake_pkg.mkdir(parents=True, exist_ok=True)
     fake_init = fake_pkg / "__init__.py"
     fake_init.write_text(
-        "import os, time\n"
+        "import os, pathlib, time\n"
         "if os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n"
         "    time.sleep(60)\n"
         "__file__ = __file__\n"
@@ -350,6 +350,7 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
         "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake llama ok'}}]}\n",
         encoding="utf-8",
     )
+    (fake_site / 'pathlib.py').write_text('from collections import Sequence\n', encoding='utf-8')
     return fake_site, fake_init
 
 def run_llama_cpp_watchdog_regression_probe(
@@ -364,9 +365,7 @@ def run_llama_cpp_watchdog_regression_probe(
         resources_root,
         extra_env={
             "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
-            "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
-            ),
+            "TOKEN_PLACE_LLAMA_CPP_EXTRA_RUNTIME_PATHS": str(fake_site),
         },
     )
     result = subprocess.run(  # noqa: S603
@@ -375,10 +374,9 @@ def run_llama_cpp_watchdog_regression_probe(
             "-c",
             (
                 "import json, pathlib, sys; "
-                f"sys.path.insert(0, {str(fake_site)!r}); "
                 f"sys.path.insert(0, {str(resources_root)!r}); "
                 "from utils.llm import model_manager; "
-                "module_path = pathlib.Path(sys.path[1], 'llama_cpp', '__init__.py'); "
+                f"module_path = pathlib.Path({str(fake_init)!r}); "
                 "llama_cpp = model_manager._import_llama_cpp_runtime("
                 "require_real_runtime=True, "
                 "desktop_runtime_probe={"
@@ -560,6 +558,9 @@ def run_compute_bridge_startup_probe(
             "llama_cpp_import_timeout",
             "llama_cpp import watchdog start",
             "Running: yes / Registered: no",
+            "cannot import name 'Sequence' from 'collections'",
+            "site-packages/pathlib.py",
+            "site-packages\\pathlib.py",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
@@ -654,12 +655,12 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
         model_path=fake_model,
         extra_env={
             "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
-            "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
-            ),
+            "TOKEN_PLACE_LLAMA_CPP_EXTRA_RUNTIME_PATHS": str(fake_site),
         },
     )
     assert str(fake_init) in output, output
+    assert "cannot import name 'Sequence' from 'collections'" not in output, output
+    assert "site-packages/pathlib.py" not in output.replace("\\", "/"), output
 
 
 

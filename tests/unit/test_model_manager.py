@@ -1638,7 +1638,11 @@ def test_import_llama_cpp_runtime_rejects_shim_from_parent_import(monkeypatch):
         lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
     )
     monkeypatch.setattr(model_manager_module, '_run_llama_cpp_import_watchdog', lambda **_kwargs: {})
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import should not run')),
+    )
     sys.modules['llama_cpp'] = fake_runtime
 
     try:
@@ -1677,7 +1681,7 @@ def test_import_llama_cpp_runtime_reports_parent_import_timeout(monkeypatch):
     )
 
 
-def test_import_llama_cpp_runtime_no_signal_imports_in_parent_process(monkeypatch):
+def test_import_llama_cpp_runtime_no_signal_uses_subprocess_facade(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
@@ -1692,15 +1696,19 @@ def test_import_llama_cpp_runtime_no_signal_imports_in_parent_process(monkeypatc
         '_find_llama_cpp_spec_in_subprocess',
         lambda **_kwargs: {'module_path': '/site-packages/llama_cpp/__init__.py'},
     )
-    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import should not run')),
+    )
 
     runtime = model_manager_module._import_llama_cpp_runtime(timeout_seconds=0.01)
 
-    assert runtime is fake_runtime
+    assert isinstance(runtime, model_manager_module._SubprocessLlamaCppModule)
+    assert runtime.__file__ == '/site-packages/llama_cpp/__init__.py'
 
 
-def test_no_signal_warm_load_uses_direct_parent_import(monkeypatch, tmp_path):
+def test_no_signal_warm_load_uses_subprocess_facade(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 
     model_file = tmp_path / 'test_model.gguf'
@@ -1727,10 +1735,7 @@ def test_no_signal_warm_load_uses_direct_parent_import(monkeypatch, tmp_path):
         def create_chat_completion(self, **_kwargs):
             return {'choices': [{'message': {'content': 'ok'}}]}
 
-    fake_runtime = SimpleNamespace(
-        __file__='/site-packages/llama_cpp/__init__.py',
-        Llama=FakeLlama,
-    )
+    fake_runtime_path = '/site-packages/llama_cpp/__init__.py'
 
     sys.modules.pop('llama_cpp', None)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
@@ -1742,16 +1747,47 @@ def test_no_signal_warm_load_uses_direct_parent_import(monkeypatch, tmp_path):
     monkeypatch.setattr(
         model_manager_module,
         '_find_llama_cpp_spec_in_subprocess',
-        lambda **_kwargs: {'module_path': fake_runtime.__file__},
+        lambda **_kwargs: {'module_path': fake_runtime_path},
     )
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import should not run')),
+    )
+    monkeypatch.setattr(model_manager_module, '_SubprocessLlamaProxy', FakeLlama)
 
     manager = ModelManager(config)
     manager.requested_compute_mode = 'cpu'
 
     assert manager.get_llm_instance() is not None
     assert manager.last_runtime_init_error is None
-    assert manager._imported_llama_cpp_module_path == fake_runtime.__file__
+    assert manager._imported_llama_cpp_module_path == fake_runtime_path
+
+
+def test_detect_llama_runtime_capabilities_uses_subprocess_facade_probe_attrs(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site-packages/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'metal',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/site-packages/llama_cpp/__init__.py',
+        },
+    )
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_runtime', lambda **_kwargs: facade)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('facade should not re-probe')),
+    )
+
+    capabilities = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert capabilities['backend'] == 'metal'
+    assert capabilities['gpu_offload_supported'] is True
+    assert capabilities['llama_module_path'] == '/site-packages/llama_cpp/__init__.py'
 
 
 def test_detect_llama_runtime_capabilities_preserves_gpu_probe_timeout(monkeypatch):
@@ -2078,69 +2114,72 @@ def test_parent_import_guard_returns_already_imported_module_without_reimport(mo
     assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
 
 
-def test_parent_import_guard_no_signal_imports_with_thread_timeout(monkeypatch):
+def test_parent_import_guard_no_signal_uses_subprocess_facade_without_parent_import(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
     sys.modules.pop('llama_cpp', None)
     monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-    fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', lambda _name: fake_runtime)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import should not run')),
+    )
 
-    assert model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01) is fake_runtime
+    facade = model_manager_module._import_llama_cpp_in_parent_with_timeout(
+        timeout_seconds=0.01,
+        module_path_hint='/site-packages/llama_cpp/__init__.py',
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': '/site-packages/llama_cpp/__init__.py',
+        },
+    )
+
+    assert isinstance(facade, model_manager_module._SubprocessLlamaCppModule)
+    assert facade.__file__ == '/site-packages/llama_cpp/__init__.py'
+    assert facade.GGML_USE_CUDA is True
+    assert facade.llama_supports_gpu_offload() is True
 
 
-def test_parent_import_guard_no_signal_times_out_hung_import(monkeypatch):
+def test_parent_import_guard_non_main_thread_uses_subprocess_facade_without_wedging(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
-    release_import = threading.Event()
-    sys.modules.pop('llama_cpp', None)
-    monkeypatch.delattr(model_manager_module.signal, 'SIGALRM', raising=False)
-
-    def _hung_import(_name):
-        release_import.wait(timeout=1)
-        return SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', _hung_import)
-    try:
-        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
-            model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
-    finally:
-        release_import.set()
-        sys.modules.pop('llama_cpp', None)
-
-    assert exc_info.value.stage == 'llama_cpp_import'
-
-
-def test_parent_import_guard_non_main_thread_times_out_hung_import(monkeypatch):
-    from utils.llm import model_manager as model_manager_module
-
-    release_import = threading.Event()
     result_queue = queue.Queue()
     sys.modules.pop('llama_cpp', None)
-
-    def _hung_import(_name):
-        release_import.wait(timeout=1)
-        return SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
-
-    monkeypatch.setattr(model_manager_module.importlib, 'import_module', _hung_import)
+    monkeypatch.setattr(
+        model_manager_module.importlib,
+        'import_module',
+        lambda _name: (_ for _ in ()).throw(AssertionError('parent import should not run')),
+    )
 
     def _call_from_worker():
-        try:
-            model_manager_module._import_llama_cpp_in_parent_with_timeout(timeout_seconds=0.01)
-        except BaseException as exc:
-            result_queue.put(exc)
+        result_queue.put(
+            model_manager_module._import_llama_cpp_in_parent_with_timeout(
+                timeout_seconds=0.01,
+                module_path_hint='/site-packages/llama_cpp/__init__.py',
+            )
+        )
 
     worker = threading.Thread(target=_call_from_worker, name='desktop-warm-load-test')
     worker.start()
     worker.join(timeout=1)
-    try:
-        assert not worker.is_alive()
-        exc = result_queue.get_nowait()
-        assert isinstance(exc, model_manager_module.LlamaCppRuntimeStageTimeout)
-        assert exc.stage == 'llama_cpp_import'
-    finally:
-        release_import.set()
-        sys.modules.pop('llama_cpp', None)
+
+    assert not worker.is_alive()
+    facade = result_queue.get_nowait()
+    assert isinstance(facade, model_manager_module._SubprocessLlamaCppModule)
+    assert facade.__file__ == '/site-packages/llama_cpp/__init__.py'
+
+
+def test_runtime_worker_env_omits_probe_sys_path_marker(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', '["stale"]')
+
+    env = model_manager_module._llama_cpp_runtime_worker_env()
+
+    assert 'TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH' not in env
+    assert env.get('PYTHONPATH')
 
 
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):

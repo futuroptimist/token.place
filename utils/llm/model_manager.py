@@ -165,13 +165,12 @@ def _llama_cpp_probe_env() -> Dict[str, str]:
     return env
 
 
-def _llama_cpp_probe_code(user_code: str) -> str:
-    """Prefix probe code so cwd/sys.path[0] cannot shadow the runtime."""
+def _llama_cpp_path_prefixed_code(user_code: str, path_source: str) -> str:
+    """Prefix code so cwd/sys.path[0] cannot shadow the runtime."""
 
     return (
         "import json as _token_place_json, os as _token_place_os, sys as _token_place_sys\n"
-        "_token_place_probe_path = _token_place_json.loads("
-        "_token_place_os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', '[]'))\n"
+        f"_token_place_probe_path = _token_place_json.loads({path_source})\n"
         "_token_place_cwd = _token_place_os.path.normcase("
         "_token_place_os.path.normpath(_token_place_os.getcwd()))\n"
         "_token_place_existing = []\n"
@@ -201,6 +200,41 @@ def _llama_cpp_probe_code(user_code: str) -> str:
         "del _token_place_json, _token_place_os, _token_place_probe_path\n"
         "del _token_place_cwd, _token_place_existing, _token_place_seen\n"
         + user_code
+    )
+
+
+def _llama_cpp_probe_code(user_code: str) -> str:
+    """Prefix probe code using the probe sys.path environment contract."""
+
+    return _llama_cpp_path_prefixed_code(
+        user_code,
+        "_token_place_os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', '[]')",
+    )
+
+
+def _llama_cpp_runtime_worker_env() -> Dict[str, str]:
+    """Return subprocess env for killable runtime workers.
+
+    Runtime workers intentionally do not set TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH:
+    that variable belongs to discovery/probe subprocesses and historically
+    triggered the removed import-watchdog failure mode in packaged desktop
+    builds.  The worker still receives the same sanitized import path via an
+    embedded JSON literal in its bootstrap code.
+    """
+
+    pythonpath_entries = _llama_cpp_probe_sys_path_entries()
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
+    env.pop('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', None)
+    return env
+
+
+def _llama_cpp_runtime_worker_code(user_code: str) -> str:
+    """Prefix runtime-worker code with a literal sanitized import path."""
+
+    return _llama_cpp_path_prefixed_code(
+        user_code,
+        repr(json.dumps(_llama_cpp_probe_sys_path_entries())),
     )
 
 
@@ -410,56 +444,49 @@ def _signal_guard_available() -> bool:
     )
 
 
-def _import_llama_cpp_with_thread_timeout(*, timeout_seconds: float):
-    """Import llama_cpp in-process while preserving a bounded caller deadline.
+def _import_llama_cpp_subprocess_module(
+    *,
+    module_path_hint: Any = None,
+    timeout_seconds: Optional[float] = None,
+    desktop_runtime_probe: Any = None,
+):
+    """Return a killable subprocess-backed llama_cpp module facade.
 
-    SIGALRM is unavailable on Windows and unsafe from non-main threads.  In
-    those cases keep the import in the active bridge process (so it observes the
-    real packaged DLL/native-extension environment) but run it on a daemon worker
-    and bound the caller with ``join(timeout)``.  A native import that wedges may
-    still leave that daemon worker blocked, but the startup/warm-load path now
-    fails closed with ``LlamaCppRuntimeStageTimeout`` instead of waiting forever.
+    Python's import machinery uses per-module locks.  If a daemon thread wedges
+    inside a native ``llama_cpp`` import, later retries in the same bridge
+    process can block behind that stuck import lock.  On Windows and desktop
+    warm-load background threads, where SIGALRM cannot safely bound the active
+    thread, avoid importing ``llama_cpp`` in-process at all and move the native
+    import into a subprocess worker that can be terminated on timeout.
     """
 
-    result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
-
-    def _worker() -> None:
-        try:
-            result_queue.put(('ok', importlib.import_module('llama_cpp')))
-        except BaseException as exc:  # propagate import failures unchanged
-            result_queue.put(('error', exc))
-
-    worker = threading.Thread(
-        target=_worker,
-        name='llama_cpp_parent_import_guard',
-        daemon=True,
+    logger.info(
+        "llama_cpp parent import skipped; using subprocess runtime facade "
+        "module_path_hint=%s interpreter=%s thread=%s",
+        module_path_hint or 'unknown',
+        sys.executable,
+        threading.current_thread().name,
     )
-    worker.start()
-    worker.join(timeout_seconds)
-    if worker.is_alive():
-        sys.modules.pop('llama_cpp', None)
-        logger.error(
-            "llama_cpp parent import timeout timeout_seconds=%s interpreter=%s thread=%s",
-            f"{timeout_seconds:g}",
-            sys.executable,
-            threading.current_thread().name,
-        )
-        raise LlamaCppRuntimeStageTimeout('llama_cpp_import', timeout_seconds)
-
-    status, payload = result_queue.get_nowait()
-    if status == 'ok':
-        return payload
-    raise payload
+    return _SubprocessLlamaCppModule(
+        module_path_hint,
+        timeout_seconds=timeout_seconds,
+        desktop_runtime_probe=desktop_runtime_probe,
+    )
 
 
-def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float] = None):
-    """Import llama_cpp in the active bridge process with a bounded stage timeout.
+def _import_llama_cpp_in_parent_with_timeout(
+    *,
+    timeout_seconds: Optional[float] = None,
+    module_path_hint: Any = None,
+    desktop_runtime_probe: Any = None,
+):
+    """Import llama_cpp in-process only when the active thread can be bounded.
 
     Prefer a SIGALRM guard on the main thread when available because it leaves no
     extra worker behind.  Windows and desktop warm-load background threads cannot
-    use SIGALRM, so they use an in-process daemon worker with a join timeout
-    rather than the removed subprocess watchdog whose environment could diverge
-    from the real bridge process.
+    use SIGALRM; spawning an in-process import thread is not recoverable if the
+    native import wedges, so those paths return a subprocess-backed facade whose
+    worker can be killed and retried without poisoning the bridge process.
     """
 
     timeout = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
@@ -468,11 +495,11 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
         return already_imported
 
     if not _signal_guard_available():
-        logger.info(
-            "llama_cpp parent import using thread timeout without signal watchdog interpreter=%s",
-            sys.executable,
+        return _import_llama_cpp_subprocess_module(
+            module_path_hint=module_path_hint,
+            timeout_seconds=timeout,
+            desktop_runtime_probe=desktop_runtime_probe,
         )
-        return _import_llama_cpp_with_thread_timeout(timeout_seconds=timeout)
 
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.getsignal(signal.SIGALRM)
@@ -494,13 +521,11 @@ def _import_llama_cpp_in_parent_with_timeout(*, timeout_seconds: Optional[float]
             if previous_timer[0] > 0:
                 signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
-    logger.info(
-        "llama_cpp parent import using non-main-thread timeout interpreter=%s thread=%s",
-        sys.executable,
-        threading.current_thread().name,
+    return _import_llama_cpp_subprocess_module(
+        module_path_hint=module_path_hint,
+        timeout_seconds=timeout,
+        desktop_runtime_probe=desktop_runtime_probe,
     )
-    return _import_llama_cpp_with_thread_timeout(timeout_seconds=timeout)
-
 
 def _read_llama_subprocess_message(
     process: subprocess.Popen,
@@ -550,12 +575,12 @@ class _SubprocessLlamaProxy:
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
         self._lock = Lock()
         self._process = subprocess.Popen(
-            [sys.executable, '-u', '-c', _llama_cpp_probe_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)],
+            [sys.executable, '-u', '-c', _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            env=_llama_cpp_probe_env(),
+            env=_llama_cpp_runtime_worker_env(),
             cwd=_llama_cpp_probe_subprocess_cwd(),
             bufsize=1,
         )
@@ -610,9 +635,23 @@ class _SubprocessLlamaProxy:
 
 
 class _SubprocessLlamaCppModule:
-    def __init__(self, module_path: Any, *, timeout_seconds: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        module_path: Any,
+        *,
+        timeout_seconds: Optional[float] = None,
+        desktop_runtime_probe: Any = None,
+    ) -> None:
         self.__file__ = module_path
         self._timeout_seconds = timeout_seconds
+        self.__token_place_subprocess_facade__ = True
+        probe = _coerce_desktop_runtime_probe(desktop_runtime_probe)
+        backend = str((probe or {}).get('backend') or '').lower()
+        self.GGML_USE_CUDA = backend == 'cuda'
+        self.GGML_USE_METAL = backend == 'metal'
+
+    def llama_supports_gpu_offload(self) -> bool:
+        return bool(self.GGML_USE_CUDA or self.GGML_USE_METAL)
 
     @property
     def Llama(self):
@@ -779,7 +818,11 @@ def _import_llama_cpp_runtime(
         llama_module_path or 'unknown',
         sys.executable,
     )
-    llama_cpp = _import_llama_cpp_in_parent_with_timeout(timeout_seconds=timeout_seconds)
+    llama_cpp = _import_llama_cpp_in_parent_with_timeout(
+        timeout_seconds=timeout_seconds,
+        module_path_hint=llama_module_path,
+        desktop_runtime_probe=desktop_runtime_probe,
+    )
     imported_module_path = getattr(llama_cpp, '__file__', None)
     if (
         require_real_runtime
@@ -827,6 +870,20 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
             'gpu_offload_supported': False,
             'detected_device': 'none',
             'error': str(exc),
+        }
+
+    if getattr(llama_cpp, '__token_place_subprocess_facade__', False):
+        facade_backend = 'cuda' if getattr(llama_cpp, 'GGML_USE_CUDA', False) else (
+            'metal' if getattr(llama_cpp, 'GGML_USE_METAL', False) else 'cpu'
+        )
+        return {
+            'backend': facade_backend,
+            'gpu_offload_supported': facade_backend in {'cuda', 'metal'},
+            'detected_device': facade_backend if facade_backend in {'cuda', 'metal'} else 'cpu',
+            'interpreter': sys.executable,
+            'prefix': sys.prefix,
+            'llama_module_path': getattr(llama_cpp, '__file__', None) or 'unknown',
+            'error': None,
         }
 
     backend = 'cpu'

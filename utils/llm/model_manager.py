@@ -753,14 +753,18 @@ def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
         name == 'llama_cpp' or name.startswith('llama_cpp.')
         for name in sys.modules
     )
-    if cached_llama_modules and expected_compare and loaded_compare != expected_compare:
-        logger.info(
-            "llama_cpp clearing stale imported module before desktop probe reuse "
-            "loaded_path=%s expected_path=%s",
-            loaded_path or 'unknown',
-            module_path,
+    if cached_llama_modules and expected_compare:
+        stale_cached_namespace = loaded_compare != expected_compare or any(
+            name.startswith('llama_cpp.') for name in sys.modules
         )
-        _clear_llama_cpp_module_namespace('desktop_probe_path_mismatch', expected_path=module_path)
+        if stale_cached_namespace:
+            logger.info(
+                "llama_cpp clearing stale imported module before desktop probe reuse "
+                "loaded_path=%s expected_path=%s",
+                loaded_path or 'unknown',
+                module_path,
+            )
+            _clear_llama_cpp_module_namespace('desktop_probe_path_mismatch', expected_path=module_path)
 
     package_parent = _llama_cpp_package_parent_from_module_path(module_path)
     if not package_parent:
@@ -899,10 +903,47 @@ def detect_llama_runtime_capabilities() -> Dict[str, Any]:
         facade_backend = 'cuda' if getattr(llama_cpp, 'GGML_USE_CUDA', False) else (
             'metal' if getattr(llama_cpp, 'GGML_USE_METAL', False) else 'cpu'
         )
+        if facade_backend == 'cpu':
+            try:
+                probe = _probe_llama_cpp_capabilities_in_subprocess()
+                facade_backend = str(probe.get('backend') or facade_backend)
+                return {
+                    'backend': facade_backend,
+                    'gpu_offload_supported': bool(probe.get('gpu_offload_supported', False)),
+                    'detected_device': str(probe.get('detected_device') or 'cpu'),
+                    'interpreter': str(probe.get('interpreter') or sys.executable),
+                    'prefix': str(probe.get('prefix') or sys.prefix),
+                    'llama_module_path': str(
+                        probe.get('llama_module_path')
+                        or getattr(llama_cpp, '__file__', None)
+                        or 'unknown'
+                    ),
+                    'error': probe.get('error'),
+                }
+            except LlamaCppRuntimeStageTimeout as exc:
+                return {
+                    'backend': 'missing',
+                    'gpu_offload_supported': False,
+                    'detected_device': 'none',
+                    'interpreter': sys.executable,
+                    'prefix': sys.prefix,
+                    'llama_module_path': getattr(llama_cpp, '__file__', None) or 'unknown',
+                    'error': _format_runtime_stage_timeout(exc),
+                }
+            except Exception as exc:
+                return {
+                    'backend': 'missing',
+                    'gpu_offload_supported': False,
+                    'detected_device': 'none',
+                    'interpreter': sys.executable,
+                    'prefix': sys.prefix,
+                    'llama_module_path': getattr(llama_cpp, '__file__', None) or 'unknown',
+                    'error': str(exc),
+                }
         return {
             'backend': facade_backend,
-            'gpu_offload_supported': facade_backend in {'cuda', 'metal'},
-            'detected_device': facade_backend if facade_backend in {'cuda', 'metal'} else 'cpu',
+            'gpu_offload_supported': True,
+            'detected_device': facade_backend,
             'interpreter': sys.executable,
             'prefix': sys.prefix,
             'llama_module_path': getattr(llama_cpp, '__file__', None) or 'unknown',

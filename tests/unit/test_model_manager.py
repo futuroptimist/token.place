@@ -1251,6 +1251,47 @@ def test_desktop_runtime_probe_clears_stale_llama_cpp_submodules(monkeypatch, tm
     assert getattr(sys.modules.get('llama_cpp._native'), '__file__', None) == str(native_file)
 
 
+def test_desktop_runtime_probe_clears_matching_top_level_with_stale_submodule(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    right_site = tmp_path / 'right site-packages'
+    package_dir = right_site / 'llama_cpp'
+    package_dir.mkdir(parents=True)
+    native_file = package_dir / '_native.py'
+    native_file.write_text("MARKER = 'right-native'\n", encoding='utf-8')
+    init_file = package_dir / '__init__.py'
+    init_file.write_text(
+        "from . import _native\n"
+        "MARKER = _native.MARKER\n"
+        "GGML_USE_CUDA = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n"
+        "class Llama:\n"
+        "    pass\n",
+        encoding='utf-8',
+    )
+    stale_native = SimpleNamespace(
+        __file__=str(tmp_path / 'old site-packages' / 'llama_cpp' / '_native.py'),
+        MARKER='stale-native',
+    )
+    monkeypatch.setitem(sys.modules, 'llama_cpp', SimpleNamespace(__file__=str(init_file)))
+    monkeypatch.setitem(sys.modules, 'llama_cpp._native', stale_native)
+    monkeypatch.setattr(sys, 'path', [str(right_site), *sys.path])
+
+    llama_cpp = model_manager_module._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': str(init_file),
+        },
+    )
+
+    assert llama_cpp.MARKER == 'right-native'
+    assert getattr(sys.modules.get('llama_cpp._native'), '__file__', None) == str(native_file)
+
+
 def test_desktop_runtime_probe_clears_orphaned_llama_cpp_submodules(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 
@@ -1867,6 +1908,36 @@ def test_detect_llama_runtime_capabilities_uses_subprocess_facade_probe_attrs(mo
 
     assert capabilities['backend'] == 'metal'
     assert capabilities['gpu_offload_supported'] is True
+    assert capabilities['llama_module_path'] == '/site-packages/llama_cpp/__init__.py'
+
+
+def test_detect_llama_runtime_capabilities_probes_cpu_subprocess_facade(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule(
+        '/site-packages/llama_cpp/__init__.py',
+        desktop_runtime_probe=None,
+    )
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_runtime', lambda **_kwargs: facade)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda: {
+            'backend': 'cuda',
+            'gpu_offload_supported': True,
+            'detected_device': 'cuda',
+            'interpreter': '/usr/bin/python',
+            'prefix': '/usr',
+            'llama_module_path': '/site-packages/llama_cpp/__init__.py',
+            'error': None,
+        },
+    )
+
+    capabilities = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert capabilities['backend'] == 'cuda'
+    assert capabilities['gpu_offload_supported'] is True
+    assert capabilities['detected_device'] == 'cuda'
     assert capabilities['llama_module_path'] == '/site-packages/llama_cpp/__init__.py'
 
 

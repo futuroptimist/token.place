@@ -90,6 +90,7 @@ INSTALL_ERROR_SUMMARY_MAX_LEN = 512
 REEXEC_GUARD_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_REEXECED"
 DISABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP"
 ENABLE_BOOTSTRAP_ENV = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP"
+RUNTIME_PROBE_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON"
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 
 _PROBE_SNIPPET = r"""
@@ -614,7 +615,7 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
-def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
+def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
     selected_mode = (mode or "auto").strip().lower()
@@ -838,7 +839,22 @@ def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None)
     }
 
 
+def _record_desktop_runtime_probe(result: Dict[str, str]) -> Dict[str, str]:
+    """Expose the successful setup probe to later diagnostics in this process."""
 
+    try:
+        os.environ[RUNTIME_PROBE_ENV] = json.dumps(result)
+    except (TypeError, ValueError):
+        os.environ.pop(RUNTIME_PROBE_ENV, None)
+    return result
+
+
+def ensure_desktop_llama_runtime(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
+    """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
+
+    return _record_desktop_runtime_probe(
+        _ensure_desktop_llama_runtime_impl(mode, repo_root=repo_root)
+    )
 
 
 def _resolve_desktop_requirements_path(repo_root: Path) -> Path:

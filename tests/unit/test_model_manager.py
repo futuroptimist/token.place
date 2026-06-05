@@ -2088,6 +2088,44 @@ def test_detect_llama_runtime_capabilities_uses_subprocess_probe_for_imported_mo
     assert payload['llama_module_path'] == fake_llama_cpp.__file__
 
 
+def test_detect_llama_runtime_capabilities_reuses_recorded_desktop_probe_without_child_probe(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    module_path = 'C:/Program Files/Token Place/python/Lib/site-packages/llama_cpp/__init__.py'
+    monkeypatch.setenv(
+        model_manager_module.DESKTOP_RUNTIME_PROBE_ENV,
+        json.dumps({
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'detected_device': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': module_path,
+            'interpreter': 'C:/Program Files/Token Place/python/python.exe',
+            'prefix': 'C:/Program Files/Token Place/python',
+        }),
+    )
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: False)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_find_llama_cpp_spec_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('divergent discovery probe should not run')),
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('divergent capability probe should not run')),
+    )
+    monkeypatch.delitem(sys.modules, 'llama_cpp', raising=False)
+
+    payload = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert payload['backend'] == 'cuda'
+    assert payload['gpu_offload_supported'] is True
+    assert payload['detected_device'] == 'cuda'
+    assert payload['llama_module_path'] == module_path
+    assert payload['error'] is None
+
+
 def test_desktop_runtime_probe_coercion_rejects_failed_or_error_actions():
     from utils.llm import model_manager as model_manager_module
 

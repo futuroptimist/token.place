@@ -67,6 +67,9 @@ def test_skip_runtime_bootstrap_for_cpu_mode(monkeypatch):
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('cpu')
     assert result['runtime_action'] == 'skipped'
     assert result['selected_backend'] == 'cpu'
+    recorded = json.loads(os.environ[desktop_runtime_setup.RUNTIME_PROBE_ENV])
+    assert recorded['runtime_action'] == 'skipped'
+    assert recorded['llama_module_path'] == result['llama_module_path']
 
 
 def test_windows_runtime_bootstrap_auto_repairs_and_requests_reexec(monkeypatch):

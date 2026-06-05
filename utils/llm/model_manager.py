@@ -24,6 +24,7 @@ logger = logging.getLogger('model_manager')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
+DESKTOP_RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
 _LLAMA_CPP_IMPORT_PATH_LOCK = Lock()
 
 
@@ -782,8 +783,27 @@ def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
         sys.path[:] = [package_parent] + retained
 
 
+def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:
+    raw_probe = os.getenv(DESKTOP_RUNTIME_PROBE_ENV, '').strip()
+    if not raw_probe:
+        return None
+    try:
+        parsed = json.loads(raw_probe)
+    except json.JSONDecodeError:
+        logger.warning(
+            "Ignoring invalid desktop runtime probe environment payload env=%s",
+            DESKTOP_RUNTIME_PROBE_ENV,
+        )
+        return None
+    return _coerce_desktop_runtime_probe(parsed)
+
+
+def _effective_desktop_runtime_probe(probe: Any) -> Optional[Dict[str, Any]]:
+    return _coerce_desktop_runtime_probe(probe) or _desktop_runtime_probe_from_env()
+
+
 def _probe_module_path_from_desktop_runtime_probe(probe: Any) -> Optional[str]:
-    coerced = _coerce_desktop_runtime_probe(probe)
+    coerced = _effective_desktop_runtime_probe(probe)
     if coerced is None or coerced.get('error'):
         return None
     module_path = str(coerced.get('llama_module_path') or '').strip()
@@ -813,6 +833,7 @@ def _import_llama_cpp_runtime(
         path_diagnostics.get('sys_path_count'),
     )
 
+    desktop_runtime_probe = _effective_desktop_runtime_probe(desktop_runtime_probe)
     expected_module_path = _probe_module_path_from_desktop_runtime_probe(desktop_runtime_probe)
     if expected_module_path:
         llama_module_path = expected_module_path

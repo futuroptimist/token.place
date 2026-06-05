@@ -51,6 +51,22 @@ def _strip_windows_extended_path_prefix(path_text: str) -> str:
     return path_text
 
 
+def _normalize_runtime_path_text(path_value: Any) -> str:
+    """Return a Python/env friendly path string without Windows extended prefixes."""
+
+    return _strip_windows_extended_path_prefix(str(path_value))
+
+
+def _normalize_runtime_path_list(path_value: str) -> str:
+    if not path_value:
+        return path_value
+    return os.pathsep.join(
+        _normalize_runtime_path_text(entry)
+        for entry in path_value.split(os.pathsep)
+        if entry
+    )
+
+
 def _canonical_path_for_compare(module_path: Any) -> Optional[str]:
     if not module_path:
         return None
@@ -220,13 +236,50 @@ def _llama_cpp_runtime_worker_env() -> Dict[str, str]:
     that variable belongs to discovery/probe subprocesses and historically
     triggered the removed import-watchdog failure mode in packaged desktop
     builds.  The worker still receives the same sanitized import path via an
-    embedded JSON literal in its bootstrap code.
+    embedded JSON literal in its bootstrap code.  Keep the remaining desktop
+    bootstrap contract aligned with ``desktop_runtime_setup`` and avoid passing
+    Windows extended-length path prefixes through env/PYTHONPATH because the
+    packaged bridge can be launched with extended paths while child Python
+    imports and DLL lookup are more reliable with normal path strings.
     """
 
-    pythonpath_entries = _llama_cpp_probe_sys_path_entries()
+    pythonpath_entries = [
+        _normalize_runtime_path_text(entry)
+        for entry in _llama_cpp_probe_sys_path_entries()
+    ]
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join(pythonpath_entries)
     env.pop('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', None)
+    for key in (
+        'TOKEN_PLACE_PYTHON_IMPORT_ROOT',
+        'TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT',
+        'TOKEN_PLACE_DESKTOP_PYTHON_ROOT',
+        'TOKEN_PLACE_PROBE_REPO_ROOT',
+    ):
+        if env.get(key):
+            env[key] = _normalize_runtime_path_text(env[key])
+    if env.get('PATH'):
+        env['PATH'] = _normalize_runtime_path_list(env['PATH'])
+    if 'PYTHONNOUSERSITE' not in env:
+        env['PYTHONNOUSERSITE'] = '1'
+    bootstrap_script = env.get('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT')
+    if not bootstrap_script:
+        try:
+            import path_bootstrap  # type: ignore[import-not-found]
+            bootstrap_script = getattr(path_bootstrap, '__file__', '')
+        except Exception:
+            bootstrap_script = ''
+        if bootstrap_script:
+            env['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'] = _normalize_runtime_path_text(
+                bootstrap_script
+            )
+    if not env.get('TOKEN_PLACE_DESKTOP_PYTHON_ROOT') and bootstrap_script:
+        env['TOKEN_PLACE_DESKTOP_PYTHON_ROOT'] = _normalize_runtime_path_text(
+            Path(bootstrap_script).parent
+        )
+    import_root = env.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT') or str(REPO_ROOT)
+    env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] = _normalize_runtime_path_text(import_root)
+    env.setdefault('TOKEN_PLACE_PROBE_REPO_ROOT', env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'])
     return env
 
 
@@ -235,7 +288,10 @@ def _llama_cpp_runtime_worker_code(user_code: str) -> str:
 
     return _llama_cpp_path_prefixed_code(
         user_code,
-        repr(json.dumps(_llama_cpp_probe_sys_path_entries())),
+        repr(json.dumps([
+            _normalize_runtime_path_text(entry)
+            for entry in _llama_cpp_probe_sys_path_entries()
+        ])),
     )
 
 
@@ -528,29 +584,85 @@ def _import_llama_cpp_in_parent_with_timeout(
         desktop_runtime_probe=desktop_runtime_probe,
     )
 
+def _tail_for_diagnostics(text: Any, *, max_chars: int = 2000) -> str:
+    value = str(text or '').strip()
+    return value[-max_chars:]
+
+
+def _llama_subprocess_launch_diagnostics(process: subprocess.Popen, *, stage: str) -> Dict[str, Any]:
+    stderr_text = ''
+    if getattr(process, 'stderr', None) is not None:
+        try:
+            stderr_text = process.stderr.read()  # type: ignore[union-attr]
+        except Exception:
+            stderr_text = ''
+    return {
+        'stage': stage,
+        'exit_code': process.poll(),
+        'stderr_tail': _tail_for_diagnostics(stderr_text),
+        'command': getattr(process, '_token_place_command', None),
+        'program': getattr(process, '_token_place_program', sys.executable),
+        'cwd': getattr(process, '_token_place_cwd', None),
+        'import_root': getattr(process, '_token_place_import_root', None),
+        'module_path_hint': getattr(process, '_token_place_module_path_hint', None),
+    }
+
+
+def _format_llama_subprocess_early_exit_error(
+    *,
+    stage: str,
+    stdout_tail: str,
+    diagnostics: Dict[str, Any],
+) -> str:
+    return (
+        f"{stage} subprocess exited before JSON handshake "
+        f"exit_code={diagnostics.get('exit_code')} "
+        f"program={diagnostics.get('program')} "
+        f"cwd={diagnostics.get('cwd')} "
+        f"import_root={diagnostics.get('import_root')} "
+        f"module_path_hint={diagnostics.get('module_path_hint')} "
+        f"stdout_tail={stdout_tail!r} "
+        f"stderr_tail={diagnostics.get('stderr_tail')!r}"
+    )
+
+
 def _read_llama_subprocess_message(
     process: subprocess.Popen,
     *,
     timeout_seconds: Optional[float],
     stage: str,
 ) -> Dict[str, Any]:
-    result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+    result_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
 
     def _reader() -> None:
         assert process.stdout is not None
+        stdout_tail = ''
         for line in process.stdout:
+            stdout_tail = _tail_for_diagnostics(stdout_tail + str(line))
             if line.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
-                result_queue.put(line.split(':', 1)[1].strip())
+                result_queue.put({'raw_message': line.split(':', 1)[1].strip()})
                 return
-        result_queue.put(json.dumps({'status': 'error', 'error': f'{stage} subprocess ended'}))
+        diagnostics = _llama_subprocess_launch_diagnostics(process, stage=stage)
+        result_queue.put({
+            'raw_message': json.dumps({
+                'status': 'error',
+                'error': _format_llama_subprocess_early_exit_error(
+                    stage=stage,
+                    stdout_tail=stdout_tail,
+                    diagnostics=diagnostics,
+                ),
+                **diagnostics,
+                'stdout_tail': stdout_tail,
+            })
+        })
 
     reader = threading.Thread(target=_reader, name=f'{stage}_stdout_reader', daemon=True)
     reader.start()
     try:
         if timeout_seconds is None:
-            raw_message = result_queue.get()
+            queued = result_queue.get()
         else:
-            raw_message = result_queue.get(timeout=timeout_seconds)
+            queued = result_queue.get(timeout=timeout_seconds)
     except queue.Empty as exc:
         try:
             process.terminate()
@@ -558,6 +670,7 @@ def _read_llama_subprocess_message(
         except Exception:
             process.kill()
         raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds) from exc
+    raw_message = str(queued.get('raw_message') or '')
     try:
         message = json.loads(raw_message)
     except json.JSONDecodeError as exc:
@@ -565,7 +678,11 @@ def _read_llama_subprocess_message(
     if not isinstance(message, dict):
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'error':
-        raise RuntimeError(str(message.get('error') or f'{stage} failed'))
+        error = str(message.get('error') or f'{stage} failed')
+        traceback_text = _tail_for_diagnostics(message.get('traceback'))
+        if traceback_text:
+            error = f'{error} traceback_tail={traceback_text!r}'
+        raise RuntimeError(error)
     return message
 
 
@@ -573,17 +690,40 @@ class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
 
     def __init__(self, *args, timeout_seconds: Optional[float] = None, **kwargs) -> None:
-        self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+        self._timeout_seconds = (
+            timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
+        )
         self._lock = Lock()
+        command = [
+            sys.executable,
+            '-u',
+            '-c',
+            _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE),
+        ]
+        env = _llama_cpp_runtime_worker_env()
+        cwd = _normalize_runtime_path_text(_llama_cpp_probe_subprocess_cwd())
         self._process = subprocess.Popen(
-            [sys.executable, '-u', '-c', _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            env=_llama_cpp_runtime_worker_env(),
-            cwd=_llama_cpp_probe_subprocess_cwd(),
+            env=env,
+            cwd=cwd,
             bufsize=1,
+        )
+        self._process._token_place_command = [
+            command[0],
+            '-u',
+            '-c',
+            '<llama_cpp_runtime_worker>',
+        ]
+        self._process._token_place_program = command[0]
+        self._process._token_place_cwd = cwd
+        self._process._token_place_import_root = env.get('TOKEN_PLACE_PYTHON_IMPORT_ROOT')
+        self._process._token_place_module_path_hint = kwargs.pop(
+            '_token_place_module_path_hint',
+            None,
         )
         self._send({'method': '__init__', 'args': args, 'kwargs': kwargs})
         _read_llama_subprocess_message(
@@ -657,10 +797,16 @@ class _SubprocessLlamaCppModule:
     @property
     def Llama(self):
         timeout_seconds = self._timeout_seconds
+        module_path_hint = self.__file__
 
         class _ConfiguredSubprocessLlama(_SubprocessLlamaProxy):
             def __init__(self, *args, **kwargs):
-                super().__init__(*args, timeout_seconds=timeout_seconds, **kwargs)
+                super().__init__(
+                    *args,
+                    timeout_seconds=timeout_seconds,
+                    _token_place_module_path_hint=module_path_hint,
+                    **kwargs,
+                )
 
         return _ConfiguredSubprocessLlama
 
@@ -682,9 +828,9 @@ def _jsonable(value):
 def _emit(payload):
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
-init_payload = json.loads(sys.stdin.readline())
-llama_cpp = importlib.import_module('llama_cpp')
 try:
+    init_payload = json.loads(sys.stdin.readline())
+    llama_cpp = importlib.import_module('llama_cpp')
     llama = llama_cpp.Llama(*init_payload.get('args', []), **init_payload.get('kwargs', {}))
     _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
     for line in sys.stdin:

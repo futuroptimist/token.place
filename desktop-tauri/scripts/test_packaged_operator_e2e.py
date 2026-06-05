@@ -599,6 +599,25 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
         },
     )
     assert str(fake_init) in output, output
+    required_markers = (
+        "API v1 runtime warmup model instantiated",
+        "desktop.compute_node_bridge.model_init.ready",
+        "desktop.compute_node_bridge.registration.succeeded",
+        '"registered": true',
+        '"relay_runtime_state": "ready"',
+    )
+    for marker in required_markers:
+        assert marker in output, output
+    forbidden_markers = (
+        "llama_cpp_import_timeout",
+        "llama_cpp_import subprocess ended",
+        "desktop.compute_node_bridge.model_init.failed",
+        '"registered": true',
+    )
+    failure_prefix = output.split("desktop.compute_node_bridge.model_init.ready", 1)[0]
+    for marker in forbidden_markers[:-1]:
+        assert marker not in output, output
+    assert forbidden_markers[-1] not in failure_prefix, output
 
 
 

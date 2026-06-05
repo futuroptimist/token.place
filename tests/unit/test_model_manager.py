@@ -2732,3 +2732,104 @@ def test_detect_llama_runtime_capabilities_cpu_facade_reports_probe_exception(mo
     assert diagnostics['detected_device'] == 'none'
     assert diagnostics['llama_module_path'] == '/site/llama_cpp/__init__.py'
     assert diagnostics['error'] == 'probe crashed'
+
+
+def test_subprocess_llama_proxy_early_exit_surfaces_child_diagnostics(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def write(self, _text):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeStdout:
+        def __iter__(self):
+            return iter(['worker booted before failure\n'])
+
+    class FakeStderr:
+        def read(self):
+            return 'Traceback: No module named llama_cpp\nchild stderr detail'
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+
+        def poll(self):
+            return 7
+
+        def terminate(self):
+            return None
+
+    def _fake_popen(*_args, **_kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_')
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
+
+    message = str(exc_info.value)
+    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
+    assert 'exit_code=7' in message
+    assert 'stdout_tail=' in message and 'worker booted before failure' in message
+    assert 'stderr_tail=' in message and 'No module named llama_cpp' in message
+    assert '\\\\?\\' not in message
+    assert 'token.place desktop' in message
+
+
+def test_runtime_worker_env_matches_desktop_probe_bootstrap_and_normalizes_extended_paths(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', '["stale"]')
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_PYTHON_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python')
+    monkeypatch.setenv('TOKEN_PLACE_PROBE_REPO_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_')
+    monkeypatch.setenv('PATH', os.pathsep.join([r'\\?\C:\CUDA\bin', r'C:\Windows\System32']))
+    monkeypatch.setattr(
+        model_manager_module,
+        '_llama_cpp_probe_sys_path_entries',
+        lambda: [
+            r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python',
+            r'\\?\C:\Users\danie\AppData\Local\Programs\Python\Python311\Lib\site-packages',
+        ],
+    )
+
+    env = model_manager_module._llama_cpp_runtime_worker_env()
+
+    assert 'TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH' not in env
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] == r'C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_'
+    assert env['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'] == r'C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'
+    assert env['TOKEN_PLACE_DESKTOP_PYTHON_ROOT'] == r'C:\Users\danie\AppData\Local\token.place desktop\python'
+    assert env['TOKEN_PLACE_PROBE_REPO_ROOT'] == r'C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_'
+    assert '\\\\?\\' not in env['PYTHONPATH']
+    assert 'token.place desktop' in env['PYTHONPATH']
+    assert '\\\\?\\' not in env['PATH']
+
+
+def test_read_llama_subprocess_message_surfaces_worker_error_traceback():
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdout:
+        def __iter__(self):
+            return iter([
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"error","error":"import failed","traceback":"Traceback detail"}\n'
+            ])
+
+    process = SimpleNamespace(stdout=FakeStdout(), stderr=None, poll=lambda: None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._read_llama_subprocess_message(
+            process,
+            timeout_seconds=0.01,
+            stage='llama_cpp_import',
+        )
+
+    assert 'import failed' in str(exc_info.value)
+    assert 'Traceback detail' in str(exc_info.value)

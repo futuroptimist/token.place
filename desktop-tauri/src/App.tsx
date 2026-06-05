@@ -40,6 +40,7 @@ interface ComputeNodeStatus {
   operator_session_id: string | null;
   sequence: number | null;
   updated_at_ms: number | null;
+  log_file_path: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -81,6 +82,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   operator_session_id: null,
   sequence: null,
   updated_at_ms: null,
+  log_file_path: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -189,6 +191,8 @@ function mergeComputeStatusEvent(
     sequence: payloadSequence ?? prev.sequence,
     updated_at_ms:
       typeof payload.updated_at_ms === 'number' ? payload.updated_at_ms : prev.updated_at_ms,
+    log_file_path:
+      typeof payload.log_file_path === 'string' ? payload.log_file_path : prev.log_file_path,
     last_error:
       payload.last_error === null
         ? null
@@ -227,6 +231,8 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const [operatorLogTail, setOperatorLogTail] = useState('');
+  const [isDebugConsoleOpen, setIsDebugConsoleOpen] = useState(false);
   const relayRuntimeState = computeStatus.relay_runtime_state || computeStatus.warm_load_state || 'idle';
   const relayRuntimeReady =
     computeStatus.warm_load_enabled === false ||
@@ -437,6 +443,7 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
+        log_file_path: computeStatusRef.current.log_file_path,
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -466,6 +473,43 @@ export function App() {
   const stopComputeNode = async () => {
     try {
       await invoke('stop_compute_node');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const revealOperatorDebugLog = async () => {
+    try {
+      await invoke('reveal_operator_debug_log');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const openOperatorDebugTerminal = async () => {
+    try {
+      await invoke('open_operator_debug_terminal');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const refreshOperatorDebugLog = async () => {
+    try {
+      const tail = await invoke<string>('read_operator_debug_log_tail');
+      setOperatorLogTail(tail);
+      setIsDebugConsoleOpen(true);
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const copyOperatorDebugLog = async () => {
+    try {
+      const tail = operatorLogTail || (await invoke<string>('read_operator_debug_log_tail'));
+      setOperatorLogTail(tail);
+      setIsDebugConsoleOpen(true);
+      await navigator.clipboard.writeText(tail);
     } catch (e) {
       setError(formatErrorMessage(e));
     }
@@ -573,6 +617,36 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
+        <p style={{ marginBottom: 0 }}>Debug log: <code>{computeStatus.log_file_path || 'not created yet'}</code></p>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={refreshOperatorDebugLog}>
+            Open debug log
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={revealOperatorDebugLog}>
+            Reveal log file
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={openOperatorDebugTerminal}>
+            Open debug terminal
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={copyOperatorDebugLog}>
+            Copy log tail
+          </button>
+        </div>
+        <p style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
+          macOS packaged builds keep Terminal hidden unless you click Open debug terminal or set
+          <code> TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1</code> before launch.
+        </p>
+        {isDebugConsoleOpen && (
+          <section aria-label="Operator debug log" style={{ marginTop: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <strong>Operator debug log tail</strong>
+              <button type="button" onClick={refreshOperatorDebugLog}>Refresh</button>
+            </div>
+            <pre style={{ whiteSpace: 'pre-wrap', maxHeight: 280, overflow: 'auto', padding: 12, border: '1px solid #ddd' }}>
+              {operatorLogTail || 'No log lines loaded yet.'}
+            </pre>
+          </section>
+        )}
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
       </section>
 

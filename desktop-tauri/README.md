@@ -121,6 +121,33 @@ You can also run the workflow manually with `workflow_dispatch` and provide
 The local prompt panel still uses `src-tauri/python/inference_sidecar.py` as a smoke test for local model setup.
 
 
+
+## macOS packaged operator debug logs
+
+Packaged desktop launches persist operator diagnostics so macOS users do not need a developer terminal to capture the same bridge/runtime detail that Windows console launches expose.
+
+- Compute-node operator sessions write one log per session under the app log directory, in the `operators/` subdirectory. On macOS this is typically `~/Library/Logs/<bundle identifier>/operators/compute-node-<operator_session_id>.log`; use the exact **Debug log** path shown in the desktop UI because the bundle identifier can vary between preview/dev/release builds.
+- Model bridge inspect/download diagnostics are appended to `model-bridge.log` in the same `operators/` log directory.
+- The compute-node log mirrors safe bridge diagnostics: session start, selected bridge path, interpreter, resource root, import root/layout, `desktop_runtime_setup` probe/provision lines, compute-node stdout events, stderr from `compute_node_bridge.py`, runtime warm-load/model-manager lines, registration/poll/request/response metadata, and stop/cancel/unregister/cleanup lines.
+- Logs must remain relay-blind: capture ciphertext/routing metadata and runtime diagnostics only; do not add plaintext prompt/response/tool/model-output logging.
+
+Debug access is opt-in:
+
+1. Start the operator, or reproduce a Start operator failure.
+2. In the desktop **Compute node operator** panel, copy the **Debug log** path or use one of the debug buttons:
+   - **Open debug log** opens the in-app read-only tail that can be refreshed.
+   - **Reveal log file** opens Finder/Explorer/file manager at the current log file.
+   - **Open debug terminal** opens Terminal.app on macOS and tails the current log file; paths with spaces are quoted by the Rust command path and are not executed from user input.
+   - **Copy log tail** copies the in-app tail to the clipboard.
+3. For validation sessions where a terminal should open automatically after the operator process is installed, launch the app with `TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1`.
+
+When Start operator fails on macOS, include these lines in the bug report or release-validation note:
+
+- `desktop.compute_node.session.start ... interpreter=... resource_root=... layout=... import_root=... log_file_path=...`
+- `desktop.runtime_setup ... action=... interpreter=... prefix=... llama_module_path=... fallback_reason=...`
+- Any `desktop.compute_node.stderr line=...` traceback/import/provisioning lines around `llama_cpp` or Metal.
+- `desktop.compute_node_bridge.model_init.*`, `desktop.compute_node_bridge.registration.*`, and `desktop.compute_node_bridge.stop_requested` / unregister / cleanup lines if the bridge gets that far.
+
 ## Desktop logging defaults
 
 Desktop subprocess logs now default to high-signal output:

@@ -1,6 +1,7 @@
 mod backend;
 mod compute_node;
 mod config;
+mod debug_logs;
 pub mod forward;
 pub mod keygen;
 mod logging;
@@ -14,6 +15,7 @@ use config::{config_path, DesktopConfig};
 use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -102,7 +104,26 @@ fn configure_runtime_pythonpath(
     )
 }
 
-fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
+fn append_model_bridge_log(app: Option<&tauri::AppHandle>, line: &str) {
+    if let Some(app) = app {
+        if let Ok(log_dir) = debug_logs::app_operator_log_dir(app) {
+            if fs::create_dir_all(&log_dir).is_ok() {
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_dir.join("model-bridge.log"))
+                {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+        }
+    }
+}
+
+fn run_model_bridge(
+    action: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path(Some(&launcher.program))?;
@@ -117,7 +138,7 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
         manifest_dir,
         None,
     );
-    eprintln!(
+    let model_start_line = format!(
         "desktop.model_bridge.start action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
         action,
         bridge_script.display(),
@@ -129,6 +150,8 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unresolved>".into())
     );
+    eprintln!("{model_start_line}");
+    append_model_bridge_log(app, &model_start_line);
     let output = bridge_command
         .arg(action)
         .output()
@@ -136,6 +159,12 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        append_model_bridge_log(app, &format!("desktop.model_bridge.stdout line={line}"));
+    }
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        append_model_bridge_log(app, &format!("desktop.model_bridge.stderr line={line}"));
+    }
     let json_line = stdout
         .lines()
         .rev()
@@ -286,12 +315,16 @@ async fn start_compute_node(
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            {
+            let (operator_session_id, log_file_path) = {
                 let mut status = compute_state.status.lock().await;
                 status.running = false;
                 status.registered = false;
                 status.last_error = Some(err.to_string());
-            }
+                (
+                    status.operator_session_id.clone(),
+                    status.log_file_path.clone(),
+                )
+            };
             let _ = app.emit(
                 "compute_node_event",
                 serde_json::json!({
@@ -300,6 +333,8 @@ async fn start_compute_node(
                     "registered": false,
                     "last_error": err.to_string(),
                     "message": err.to_string(),
+                    "operator_session_id": operator_session_id,
+                    "log_file_path": log_file_path,
                 }),
             );
         }
@@ -321,14 +356,38 @@ async fn get_compute_node_status(
     Ok(state.compute_node.status.lock().await.clone())
 }
 
+#[allow(dead_code)]
 #[tauri::command]
-fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
-    run_model_bridge("inspect")
+async fn reveal_operator_debug_log(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    compute_node::reveal_current_operator_log(state.compute_node.clone())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[allow(dead_code)]
+#[tauri::command]
+async fn open_operator_debug_terminal(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    compute_node::open_current_operator_debug_terminal(state.compute_node.clone())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[allow(dead_code)]
+#[tauri::command]
+async fn read_operator_debug_log_tail(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    compute_node::read_current_operator_log_tail(state.compute_node.clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
-    tokio::task::spawn_blocking(|| run_model_bridge("download"))
+fn inspect_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    run_model_bridge("inspect", Some(&app))
+}
+
+#[tauri::command]
+async fn download_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    tokio::task::spawn_blocking(move || run_model_bridge("download", Some(&app)))
         .await
         .map_err(|e| format!("download bridge task failed: {e}"))?
 }
@@ -347,6 +406,9 @@ pub fn run() {
             start_compute_node,
             stop_compute_node,
             get_compute_node_status,
+            reveal_operator_debug_log,
+            open_operator_debug_terminal,
+            read_operator_debug_log_tail,
             encrypt_and_forward,
             inspect_model_artifact,
             download_model_artifact

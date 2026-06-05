@@ -1118,6 +1118,82 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+  it('shows operator debug log controls and opens the in-app log tail after an error', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      relay_runtime_state: 'failed',
+      active_relay_url: 'https://token.place',
+      last_error: 'metal install failed',
+      log_file_path: '/Users/example/Library/Logs/token.place/operators/compute-node-1.log',
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'read_operator_debug_log_tail') {
+        return Promise.resolve('desktop.compute_node.stderr line=Metal runtime install failed');
+      }
+      if (command === 'detect_backend') {
+        return Promise.resolve({
+          platform_label: 'macos',
+          preferred_mode: 'auto',
+          available_backend: 'metal',
+          availability_label: 'Metal-capable platform (Apple Silicon)',
+        });
+      }
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: 'https://token.place',
+          preferred_mode: 'auto',
+        });
+      }
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          active_relay_url: 'https://token.place',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'metal',
+          backend_selected: 'metal',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '/tmp/model.gguf',
+          last_error: 'metal install failed',
+          relay_runtime_state: 'failed',
+          log_file_path: '/Users/example/Library/Logs/token.place/operators/compute-node-1.log',
+        });
+      }
+      if (command === 'inspect_model_artifact') {
+        return Promise.resolve({
+          canonical_family_url: 'https://example.test/models',
+          filename: 'model.gguf',
+          url: 'https://example.test/model.gguf',
+          models_dir: '/tmp',
+          resolved_model_path: '/tmp/model.gguf',
+          exists: true,
+          size_bytes: 1,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<App />);
+    const openDebugLog = (await screen.findByText('Open debug log')) as HTMLButtonElement;
+    await waitFor(() => expect(openDebugLog.disabled).toBe(false));
+    expect(screen.getByText(/Debug log:/).textContent).toContain('compute-node-1.log');
+    expect(screen.getByText('Reveal log file')).toBeTruthy();
+    expect(screen.getByText('Open debug terminal')).toBeTruthy();
+
+    fireEvent.click(openDebugLog);
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Operator debug log').textContent).toContain(
+        'Metal runtime install failed'
+      )
+    );
+    expect(invokeMock.mock.calls.some(([command]) => command === 'read_operator_debug_log_tail')).toBe(true);
+  });
+
   it('surfaces fresh restart errors from a new operator session', async () => {
     mockInitialComputeStatus({
       running: false,

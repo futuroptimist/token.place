@@ -10,22 +10,24 @@ import queue
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Tuple
 
 if __package__ in (None, ""):
-    script_dir = str(Path(__file__).resolve().parent)
+    # Use os.path here so a polluted PYTHONPATH cannot make a third-party
+    # pathlib backport crash before path_bootstrap repairs sys.path.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
 
 from path_bootstrap import ensure_runtime_import_paths
+
+ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
+from pathlib import Path
 from desktop_runtime_setup import (
     desktop_gpu_runtime_failure_message,
     ensure_desktop_llama_runtime,
     maybe_reexec_for_runtime_refresh,
 )
-
-ensure_runtime_import_paths(__file__)
 
 _stdin_lines: queue.Queue[str] = queue.Queue()
 _stdin_reader_started = False

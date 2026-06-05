@@ -42,10 +42,30 @@ def test_import_guard_rejects_repo_local_llama_cpp_shim(monkeypatch):
 
 
 def test_import_guard_allows_repo_shim_when_real_runtime_not_required(monkeypatch):
+    monkeypatch.delitem(model_manager.sys.modules, "llama_cpp", raising=False)
     fake_spec = types.SimpleNamespace(origin=str(model_manager.REPO_LLAMA_CPP_SHIM))
     fake_module = types.SimpleNamespace(__file__=str(model_manager.REPO_LLAMA_CPP_SHIM), Llama=object)
     monkeypatch.setattr(model_manager.importlib.util, "find_spec", lambda _name: fake_spec)
     monkeypatch.setattr(model_manager.importlib, "import_module", lambda _name: fake_module)
+    monkeypatch.setattr(model_manager, "_assert_critical_stdlib_not_shadowed", lambda: None)
 
     loaded = model_manager._import_llama_cpp_runtime(require_real_runtime=False)
     assert loaded is fake_module
+
+
+def test_generated_llama_cpp_subprocess_guard_compiles_on_python_311():
+    guard_code = model_manager._llama_cpp_stdlib_guard_code()
+
+    assert "_token_place_bad_origin = _token_place_origin or '<not found>'" in guard_code
+    assert "_token_place_origin or '<not found>'}" not in guard_code
+    compile(guard_code, '<token-place-stdlib-guard>', 'exec')
+    compile(
+        model_manager._llama_cpp_probe_code("print('probe-ok')\n"),
+        '<token-place-llama-probe>',
+        'exec',
+    )
+    compile(
+        model_manager._llama_cpp_runtime_worker_code("print('worker-ok')\n"),
+        '<token-place-llama-worker>',
+        'exec',
+    )

@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+import os
 import queue
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -20,6 +22,39 @@ SPEC = importlib.util.spec_from_file_location('desktop_inference_sidecar', MODUL
 inference_sidecar = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(inference_sidecar)
+
+
+def test_inference_sidecar_repairs_path_before_pathlib_import(tmp_path):
+    polluted_site = tmp_path / 'site-packages'
+    polluted_site.mkdir()
+    (polluted_site / 'pathlib.py').write_text(
+        "raise RuntimeError('polluted pathlib imported before bootstrap')\n",
+        encoding='utf-8',
+    )
+
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(polluted_site)
+    env['TOKEN_PLACE_INFERENCE_SIDECAR_PATH'] = str(MODULE_PATH)
+    code = (
+        "import importlib.util, os\n"
+        "path = os.environ['TOKEN_PLACE_INFERENCE_SIDECAR_PATH']\n"
+        "spec = importlib.util.spec_from_file_location('desktop_inference_sidecar_polluted', path)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "print(module.Path.__module__)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, '-c', code],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert 'polluted pathlib imported before bootstrap' not in completed.stderr
+    assert completed.stdout.strip() == 'pathlib'
 
 
 class FakeConfig:

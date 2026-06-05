@@ -7,18 +7,20 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
 from typing import Any, Dict
 
 
 if __package__ in (None, ""):
-    script_dir = str(Path(__file__).resolve().parent)
+    # Use os.path here so a polluted PYTHONPATH cannot make a third-party
+    # pathlib backport crash before path_bootstrap repairs sys.path.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
 
 from path_bootstrap import ensure_runtime_import_paths
 
 ensure_runtime_import_paths(__file__)
+from pathlib import Path
 
 try:
     from desktop_runtime_setup import ensure_desktop_python_dependencies

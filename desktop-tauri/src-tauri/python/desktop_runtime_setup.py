@@ -99,17 +99,18 @@ import importlib.util
 import json
 import os
 import sys
-from pathlib import Path
 
 def _strip_windows_extended_path_prefix(path_text):
-    if path_text.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + path_text[8:]
-    if path_text.startswith("\\\\?\\"):
+    prefix = chr(92) + chr(92) + "?" + chr(92)
+    unc_prefix = prefix + "UNC" + chr(92)
+    if path_text.startswith(unc_prefix):
+        return chr(92) + chr(92) + path_text[8:]
+    if path_text.startswith(prefix):
         return path_text[4:]
     return path_text
 
-def _safe_resolve_path(path_text):
-    return Path(_strip_windows_extended_path_prefix(str(path_text))).resolve()
+def _safe_resolve_path_text(path_text):
+    return os.path.realpath(os.path.abspath(_strip_windows_extended_path_prefix(str(path_text))))
 
 python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
 if python_root and python_root not in sys.path:
@@ -121,12 +122,14 @@ if bootstrap_script:
 
     ensure_runtime_import_paths(bootstrap_script, avoid_llama_cpp_shadowing=True)
 
-repo_root = _safe_resolve_path(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", Path.cwd()))
+from pathlib import Path
 
-repo_root_resolved = str(_safe_resolve_path(repo_root))
+repo_root = Path(_safe_resolve_path_text(os.environ.get("TOKEN_PLACE_PROBE_REPO_ROOT", os.getcwd())))
+
+repo_root_resolved = _safe_resolve_path_text(repo_root)
 sanitized = []
 for entry in sys.path:
-    resolved_entry = str(_safe_resolve_path(entry or "."))
+    resolved_entry = _safe_resolve_path_text(entry or ".")
     if resolved_entry == repo_root_resolved:
         continue
     sanitized.append(entry)
@@ -135,8 +138,8 @@ sys.path[:] = sanitized
 try:
     llama_spec = importlib.util.find_spec("llama_cpp")
     llama_module_path = getattr(llama_spec, "origin", None)
-    repo_shim = str(_safe_resolve_path(repo_root / "llama_cpp.py"))
-    if llama_module_path and str(_safe_resolve_path(llama_module_path)) == repo_shim:
+    repo_shim = str(_safe_resolve_path_text(repo_root / "llama_cpp.py"))
+    if llama_module_path and str(_safe_resolve_path_text(llama_module_path)) == repo_shim:
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."
@@ -144,7 +147,7 @@ try:
 
     llama_cpp = importlib.import_module("llama_cpp")
     llama_module_path = getattr(llama_cpp, "__file__", llama_module_path or "unknown")
-    if llama_module_path and str(_safe_resolve_path(llama_module_path)) == repo_shim:
+    if llama_module_path and str(_safe_resolve_path_text(llama_module_path)) == repo_shim:
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."

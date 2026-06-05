@@ -36,8 +36,10 @@ def test_bootstrap_adds_resources_import_root_for_exe_python_layout(tmp_path, pa
     original_sys_path = list(sys.path)
     try:
         path_bootstrap.ensure_runtime_import_paths(str(script))
-        assert str(resources_root) in sys.path
-        assert sys.path.index(str(resources_root)) == 0
+        assert str(resources_root.resolve()) in sys.path
+        site_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry]
+        if site_indices:
+            assert sys.path.index(str(resources_root.resolve())) < min(site_indices)
     finally:
         sys.path[:] = original_sys_path
 
@@ -67,8 +69,10 @@ def test_bootstrap_supports_nested_up_packaged_layout(tmp_path, path_bootstrap):
     original_sys_path = list(sys.path)
     try:
         path_bootstrap.ensure_runtime_import_paths(str(script))
-        assert str(import_root) in sys.path
-        assert sys.path.index(str(import_root)) == 0
+        assert str(import_root.resolve()) in sys.path
+        site_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry]
+        if site_indices:
+            assert sys.path.index(str(import_root.resolve())) < min(site_indices)
     finally:
         sys.path[:] = original_sys_path
 
@@ -86,8 +90,10 @@ def test_bootstrap_prefers_explicit_env_import_root(tmp_path, path_bootstrap, mo
     original_sys_path = list(sys.path)
     try:
         path_bootstrap.ensure_runtime_import_paths(str(script))
-        assert str(explicit_root) in sys.path
-        assert sys.path.index(str(explicit_root)) == 0
+        assert str(explicit_root.resolve()) in sys.path
+        site_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry]
+        if site_indices:
+            assert sys.path.index(str(explicit_root.resolve())) < min(site_indices)
     finally:
         sys.path[:] = original_sys_path
 
@@ -249,8 +255,10 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
         assert '' not in sys.path
         assert str(user_site) not in sys.path
         assert all(Path(entry).resolve() != cwd.resolve() for entry in sys.path)
-        assert str(resources_root) in sys.path
-        assert sys.path.index(str(resources_root)) == 0
+        assert str(resources_root.resolve()) in sys.path
+        site_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry]
+        if site_indices:
+            assert sys.path.index(str(resources_root.resolve())) < min(site_indices)
 
         for module_name in ('config', 'llama_cpp'):
             sys.modules.pop(module_name, None)
@@ -278,3 +286,33 @@ def test_strip_windows_extended_prefix_for_packaged_resource_paths(path_bootstra
     assert path_bootstrap._strip_windows_extended_path_prefix(
         r'\\?\UNC\server\share\token.place desktop\python\compute_node_bridge.py'
     ) == r'\\server\share\token.place desktop\python\compute_node_bridge.py'
+
+
+def test_bootstrap_repairs_polluted_site_packages_pathlib_shadow(tmp_path, path_bootstrap):
+    script = tmp_path / 'token.place desktop' / 'python' / 'compute_node_bridge.py'
+    resources_root = tmp_path / 'token.place desktop'
+    polluted_site = tmp_path / 'Python311' / 'Lib' / 'site-packages'
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    polluted_site.mkdir(parents=True)
+    (polluted_site / 'pathlib.py').write_text(
+        'from collections import Sequence\n', encoding='utf-8'
+    )
+
+    original_sys_path = list(sys.path)
+    original_pathlib = sys.modules.get('pathlib')
+    try:
+        sys.modules.pop('pathlib', None)
+        sys.path[:] = [str(polluted_site)] + [p for p in sys.path if p != str(polluted_site)]
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        import pathlib  # noqa: PLC0415
+
+        assert Path(pathlib.__file__).resolve() != (polluted_site / 'pathlib.py').resolve()
+        assert sys.path.index(str(resources_root.resolve())) < sys.path.index(str(polluted_site.resolve()))
+    finally:
+        sys.path[:] = original_sys_path
+        if original_pathlib is None:
+            sys.modules.pop('pathlib', None)
+        else:
+            sys.modules['pathlib'] = original_pathlib

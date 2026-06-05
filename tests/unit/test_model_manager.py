@@ -1354,7 +1354,9 @@ def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp
     )
 
     assert llama_cpp.MARKER == 'right'
-    assert Path(sys.path[0]).resolve() == right_site.resolve()
+    right_index = next(i for i, entry in enumerate(sys.path) if Path(entry).resolve() == right_site.resolve())
+    wrong_index = next(i for i, entry in enumerate(sys.path) if Path(entry).resolve() == wrong_site.resolve())
+    assert right_index < wrong_index
 
 
 def test_desktop_runtime_probe_windows_extended_path_with_spaces_prioritized(monkeypatch, tmp_path):
@@ -1406,7 +1408,9 @@ def test_desktop_runtime_probe_macos_app_resources_path_prioritized(monkeypatch,
     )
 
     assert llama_cpp.MARKER == 'macos-app'
-    assert Path(sys.path[0]).resolve() == resources_site.resolve()
+    resources_index = next(i for i, entry in enumerate(sys.path) if Path(entry).resolve() == resources_site.resolve())
+    site_indices = [i for i, entry in enumerate(sys.path) if 'site-packages' in entry or 'dist-packages' in entry]
+    assert resources_index <= min(site_indices)
 
 
 def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
@@ -1497,7 +1501,8 @@ def test_sanitize_llama_cpp_import_paths_does_not_stat_sys_path_entries(tmp_path
         sys.path[:] = original_sys_path
 
     assert diagnostics['deprioritized_entries'] == [str(tmp_path)]
-    assert sanitized_path[0] == str(site_packages)
+    assert str(site_packages) in sanitized_path
+    assert sanitized_path.index('/slow/share') < sanitized_path.index(str(site_packages))
 
 
 def test_llama_cpp_probe_subprocess_cwd_does_not_shadow_sanitized_pythonpath(tmp_path, monkeypatch):

@@ -12,6 +12,7 @@ import subprocess
 import queue
 import signal
 import threading
+import sysconfig
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
@@ -24,6 +25,98 @@ logger = logging.getLogger('model_manager')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_LLAMA_CPP_SHIM = (REPO_ROOT / 'llama_cpp.py').resolve()
 DEFAULT_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS = 30.0
+
+CRITICAL_STDLIB_IMPORT_MODULES = (
+    'collections',
+    'typing',
+    'ctypes',
+    'subprocess',
+    'json',
+    'importlib',
+    'pathlib',
+)
+
+
+def _is_site_packages_path(path_text: Any) -> bool:
+    normalized = str(path_text).replace('\\', '/').lower()
+    return 'site-packages' in normalized or 'dist-packages' in normalized
+
+
+def _stdlib_roots_for_import_order() -> list[str]:
+    roots: list[str] = []
+    for key in ('stdlib', 'platstdlib'):
+        value = sysconfig.get_paths().get(key)
+        if value:
+            roots.append(_subprocess_safe_path_text(value))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        compare = _canonical_path_for_compare(root)
+        if compare and compare not in seen:
+            seen.add(compare)
+            deduped.append(root)
+    return deduped
+
+
+def _is_stdlib_path(path_text: Any) -> bool:
+    if _is_site_packages_path(path_text):
+        return False
+    path_compare = _canonical_path_for_compare(path_text)
+    if path_compare is None:
+        return False
+    for root in _stdlib_roots_for_import_order():
+        root_compare = _canonical_path_for_compare(root)
+        if not root_compare:
+            continue
+        try:
+            if os.path.commonpath([path_compare, root_compare]) == root_compare:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _stdlib_shadow_error(module_name: str, origin: Any) -> Optional[str]:
+    if origin in (None, 'built-in', 'frozen'):
+        return None
+    if _is_site_packages_path(origin) or not _is_stdlib_path(origin):
+        return f"stdlib module {module_name} shadowed by {origin or '<not found>'}"
+    return None
+
+
+def _assert_critical_stdlib_not_shadowed() -> None:
+    importlib.invalidate_caches()
+    for module_name in CRITICAL_STDLIB_IMPORT_MODULES:
+        spec = importlib.util.find_spec(module_name)
+        origin = getattr(spec, 'origin', None) if spec is not None else None
+        error = _stdlib_shadow_error(module_name, origin) if spec is not None else (
+            f"stdlib module {module_name} shadowed by <not found>"
+        )
+        if error:
+            raise ImportError(error)
+
+
+def _stdlib_safe_path_order(entries: Iterable[str]) -> list[str]:
+    stdlib_entries: list[str] = []
+    app_entries: list[str] = []
+    site_entries: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, str) or not entry:
+            continue
+        safe_entry = _subprocess_safe_path_text(entry)
+        compare = _canonical_path_for_compare(safe_entry)
+        if compare is None or compare in seen:
+            continue
+        seen.add(compare)
+        if _is_stdlib_path(safe_entry):
+            stdlib_entries.append(safe_entry)
+        elif _is_site_packages_path(safe_entry):
+            site_entries.append(safe_entry)
+        else:
+            app_entries.append(safe_entry)
+    return stdlib_entries + app_entries + site_entries
+
 DESKTOP_RUNTIME_PROBE_ENV = 'TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON'
 _LLAMA_CPP_IMPORT_PATH_LOCK = Lock()
 
@@ -138,6 +231,7 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
                 continue
             preserved_entries.append(entry)
 
+        preserved_entries = _stdlib_safe_path_order(preserved_entries)
         preferred_index = len(preserved_entries)
         for idx, entry in enumerate(preserved_entries):
             normalized = str(entry).replace('\\', '/').lower()
@@ -178,7 +272,7 @@ def _llama_cpp_probe_sys_path_entries() -> list[str]:
             continue
         entries.append(_subprocess_safe_path_text(entry))
         seen.add(dedupe_key)
-    return entries
+    return _stdlib_safe_path_order(entries)
 
 
 def _llama_cpp_probe_env() -> Dict[str, str]:
@@ -228,11 +322,41 @@ def _llama_cpp_path_prefixed_code(user_code: str, path_source: str) -> str:
     )
 
 
+
+def _llama_cpp_stdlib_guard_code() -> str:
+    return (
+        "import importlib.util as _token_place_importlib_util, sysconfig as _token_place_sysconfig, "
+        "os as _token_place_os\n"
+        "_token_place_stdlib_roots = [_token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_p))) "
+        "for _p in (_token_place_sysconfig.get_paths().get('stdlib'), _token_place_sysconfig.get_paths().get('platstdlib')) if _p]\n"
+        "def _token_place_is_site(_p):\n"
+        "    return 'site-packages' in str(_p).replace('\\\\', '/').lower() or 'dist-packages' in str(_p).replace('\\\\', '/').lower()\n"
+        "def _token_place_is_stdlib(_p):\n"
+        "    if not _p or _p in ('built-in', 'frozen'):\n"
+        "        return True\n"
+        "    if _token_place_is_site(_p):\n"
+        "        return False\n"
+        "    _candidate = _token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_p)))\n"
+        "    for _root in _token_place_stdlib_roots:\n"
+        "        try:\n"
+        "            if _token_place_os.path.commonpath([_candidate, _root]) == _root:\n"
+        "                return True\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    return False\n"
+        "for _token_place_module in ('collections','typing','ctypes','subprocess','json','importlib','pathlib'):\n"
+        "    _token_place_spec = _token_place_importlib_util.find_spec(_token_place_module)\n"
+        "    _token_place_origin = getattr(_token_place_spec, 'origin', None) if _token_place_spec else None\n"
+        "    if _token_place_spec is None or not _token_place_is_stdlib(_token_place_origin):\n"
+        "        raise ImportError(f'stdlib module {_token_place_module} shadowed by {_token_place_origin or '<not found>'}')\n"
+        "del _token_place_importlib_util, _token_place_sysconfig, _token_place_os\n"
+    )
+
 def _llama_cpp_probe_code(user_code: str) -> str:
     """Prefix probe code using the probe sys.path environment contract."""
 
     return _llama_cpp_path_prefixed_code(
-        user_code,
+        _llama_cpp_stdlib_guard_code() + user_code,
         "_token_place_os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH', '[]')",
     )
 
@@ -257,7 +381,7 @@ def _llama_cpp_runtime_worker_code(user_code: str) -> str:
     """Prefix runtime-worker code with a literal sanitized import path."""
 
     return _llama_cpp_path_prefixed_code(
-        user_code,
+        _llama_cpp_stdlib_guard_code() + user_code,
         repr(json.dumps(_llama_cpp_probe_sys_path_entries())),
     )
 
@@ -534,6 +658,7 @@ def _import_llama_cpp_in_parent_with_timeout(
 
         signal.signal(signal.SIGALRM, _handle_timeout)
         try:
+            _assert_critical_stdlib_not_shadowed()
             return importlib.import_module('llama_cpp')
         except TimeoutError as exc:
             if isinstance(exc, LlamaCppRuntimeStageTimeout):
@@ -888,7 +1013,13 @@ def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
             if entry_compare == package_parent_compare:
                 continue
             retained.append(entry)
-        sys.path[:] = [package_parent] + retained
+        retained = _stdlib_safe_path_order(retained)
+        insert_index = 0
+        if _is_site_packages_path(package_parent):
+            for idx, entry in enumerate(retained):
+                if _is_stdlib_path(entry):
+                    insert_index = idx + 1
+        sys.path[:] = retained[:insert_index] + [package_parent] + retained[insert_index:]
 
 
 def _desktop_runtime_probe_from_env() -> Optional[Dict[str, Any]]:

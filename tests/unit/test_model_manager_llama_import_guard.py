@@ -42,10 +42,12 @@ def test_import_guard_rejects_repo_local_llama_cpp_shim(monkeypatch):
 
 
 def test_import_guard_allows_repo_shim_when_real_runtime_not_required(monkeypatch):
+    monkeypatch.delitem(model_manager.sys.modules, "llama_cpp", raising=False)
     fake_spec = types.SimpleNamespace(origin=str(model_manager.REPO_LLAMA_CPP_SHIM))
     fake_module = types.SimpleNamespace(__file__=str(model_manager.REPO_LLAMA_CPP_SHIM), Llama=object)
     monkeypatch.setattr(model_manager.importlib.util, "find_spec", lambda _name: fake_spec)
     monkeypatch.setattr(model_manager.importlib, "import_module", lambda _name: fake_module)
+    monkeypatch.setattr(model_manager, "_assert_critical_stdlib_not_shadowed", lambda: None)
 
     loaded = model_manager._import_llama_cpp_runtime(require_real_runtime=False)
     assert loaded is fake_module

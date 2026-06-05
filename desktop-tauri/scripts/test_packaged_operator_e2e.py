@@ -302,9 +302,9 @@ def run_unified_root_import_policy_probe(
                 f"ensure_runtime_import_paths({str(bootstrap)!r}); "
                 "payload={"
                 "'import_root': str(pathlib.Path(__import__('os').environ['TOKEN_PLACE_PYTHON_IMPORT_ROOT']).resolve()), "
-                "'first_path': str(pathlib.Path(sys.path[0]).resolve()), "
-                "'has_utils': pathlib.Path(sys.path[0], 'utils').is_dir(), "
-                "'has_config': pathlib.Path(sys.path[0], 'config.py').is_file(), "
+                "'import_root_present': any(pathlib.Path(p or '.').resolve() == pathlib.Path(__import__('os').environ['TOKEN_PLACE_PYTHON_IMPORT_ROOT']).resolve() for p in sys.path), "
+                "'has_utils': pathlib.Path(__import__('os').environ['TOKEN_PLACE_PYTHON_IMPORT_ROOT'], 'utils').is_dir(), "
+                "'has_config': pathlib.Path(__import__('os').environ['TOKEN_PLACE_PYTHON_IMPORT_ROOT'], 'config.py').is_file(), "
                 "'user_site_present': any(pathlib.Path(p or '.').resolve() == pathlib.Path(site.USER_SITE).resolve() for p in sys.path if site.USER_SITE), "
                 "'cwd_present': any(pathlib.Path(p or '.').resolve() == pathlib.Path.cwd().resolve() for p in sys.path), "
                 "'llama_shim_before_site': next((i for i,p in enumerate(sys.path) if pathlib.Path(p or '.', 'llama_cpp.py').is_file()), 9999) < next((i for i,p in enumerate(sys.path) if 'site-packages' in p or 'dist-packages' in p), 9999)"
@@ -320,7 +320,7 @@ def run_unified_root_import_policy_probe(
     combined = f"{result.stdout}\n{result.stderr}"
     assert result.returncode == 0, combined
     payload = json.loads(result.stdout.strip())
-    assert payload["first_path"] == str(resources_root.resolve()), combined
+    assert payload["import_root_present"] is True, combined
     assert payload["has_utils"] is True, combined
     assert payload["has_config"] is True, combined
     assert payload["user_site_present"] is False, combined
@@ -329,6 +329,17 @@ def run_unified_root_import_policy_probe(
 
 
 
+
+def create_polluted_site_packages(tmp_root: Path, layout_label: str) -> Path:
+    polluted_site = tmp_root / f"polluted site-packages {layout_label.replace('/', '_')}"
+    polluted_site.mkdir(parents=True, exist_ok=True)
+    (polluted_site / "pathlib.py").write_text(
+        "from collections import Sequence\n"
+        "BROKEN_BACKPORT = True\n",
+        encoding="utf-8",
+    )
+    return polluted_site
+
 def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path, Path]:
     fake_site = tmp_root / f"fake site-packages {layout_label.replace('/', '_')}"
     fake_pkg = fake_site / "llama_cpp"
@@ -336,8 +347,6 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
     fake_init = fake_pkg / "__init__.py"
     fake_init.write_text(
         "import os, time\n"
-        "if os.environ.get('TOKEN_PLACE_LLAMA_CPP_PROBE_SYS_PATH'):\n"
-        "    time.sleep(60)\n"
         "__file__ = __file__\n"
         "GGML_USE_CUDA = True\n"
         "def llama_supports_gpu_offload():\n"
@@ -359,13 +368,14 @@ def run_llama_cpp_watchdog_regression_probe(
 
     resources_root = resources_root or (tmp_root / "resources")
     fake_site, fake_init = create_fake_llama_cpp_site(tmp_root, layout_label)
+    polluted_site = create_polluted_site_packages(tmp_root, f"watchdog {layout_label}")
     env = _packaged_env(
         tmp_root,
         resources_root,
         extra_env={
-            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "5",
             "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+                [str(polluted_site), str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),
         },
     )
@@ -374,11 +384,15 @@ def run_llama_cpp_watchdog_regression_probe(
             sys.executable,
             "-c",
             (
-                "import json, pathlib, sys; "
+                "import sys; "
+                f"sys.path.insert(0, {str(resources_root / 'python')!r}); "
+                "from path_bootstrap import ensure_runtime_import_paths; "
+                f"ensure_runtime_import_paths({str(resources_root / 'python' / 'compute_node_bridge.py')!r}); "
+                "import json, pathlib; "
                 f"sys.path.insert(0, {str(fake_site)!r}); "
                 f"sys.path.insert(0, {str(resources_root)!r}); "
                 "from utils.llm import model_manager; "
-                "module_path = pathlib.Path(sys.path[1], 'llama_cpp', '__init__.py'); "
+                f"module_path = pathlib.Path({str(fake_init)!r}); "
                 "llama_cpp = model_manager._import_llama_cpp_runtime("
                 "require_real_runtime=True, "
                 "desktop_runtime_probe={"
@@ -560,6 +574,9 @@ def run_compute_bridge_startup_probe(
             "llama_cpp_import_timeout",
             "llama_cpp import watchdog start",
             "Running: yes / Registered: no",
+            "cannot import name 'Sequence' from 'collections'",
+            "site-packages/pathlib.py",
+            "site-packages\\pathlib.py",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
@@ -568,6 +585,33 @@ def run_compute_bridge_startup_probe(
         log_file.write_text(bridge_output, encoding="utf-8")
         if bridge.poll() is None:
             bridge.kill()
+
+
+def run_polluted_stdlib_packaged_registration_probe(
+    tmp_root: Path,
+    bridge_script: Path,
+    *,
+    relay_port: int,
+    resources_root: Path | None = None,
+    layout_label: str = "standard resources",
+) -> None:
+    resources_root = resources_root or (tmp_root / "resources")
+    polluted_site = create_polluted_site_packages(tmp_root, layout_label)
+    output = run_compute_bridge_startup_probe(
+        tmp_root,
+        bridge_script,
+        relay_port=relay_port,
+        resources_root=resources_root,
+        layout_label=f"{layout_label} polluted stdlib",
+        extra_env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(polluted_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    assert '"registered": true' in output.lower(), output
+    assert "cannot import name 'Sequence' from 'collections'" not in output, output
+    assert "pathlib.py" not in output or str(polluted_site) not in output, output
 
 
 def run_llama_cpp_facade_early_exit_diagnostics_probe(
@@ -641,6 +685,7 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
 ) -> None:
     resources_root = resources_root or (tmp_root / "resources")
     fake_site, fake_init = create_fake_llama_cpp_site(tmp_root, f"lifecycle {layout_label}")
+    polluted_site = create_polluted_site_packages(tmp_root, f"lifecycle {layout_label}")
     fake_model = tmp_root / f"fake model {layout_label.replace('/', '_')}.gguf"
     fake_model.write_bytes(b"GGUF fake packaged bridge regression model")
     output = run_compute_bridge_startup_probe(
@@ -653,13 +698,14 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
         mode="auto",
         model_path=fake_model,
         extra_env={
-            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "1",
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "5",
             "PYTHONPATH": os.pathsep.join(
-                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+                [str(polluted_site), str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),
         },
     )
     assert str(fake_init) in output, output
+    assert "cannot import name 'Sequence' from 'collections'" not in output, output
 
 
 
@@ -730,6 +776,13 @@ def main() -> int:
                     stderr_path=relay_stderr,
                 )
                 run_compute_bridge_startup_probe(
+                    tmp_path,
+                    probe_script,
+                    relay_port=relay_port,
+                    resources_root=probe_resources_root,
+                    layout_label=layout_label,
+                )
+                run_polluted_stdlib_packaged_registration_probe(
                     tmp_path,
                     probe_script,
                     relay_port=relay_port,

@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::operator_logs::OperatorLogSink;
+use crate::operator_logs::{append_line_to_path, OperatorLogSink};
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
@@ -332,8 +332,11 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     } else {
         status.updated_at_ms = Some(current_time_ms());
     }
-    if let Some(log_file_path) = payload.get("log_file_path").and_then(Value::as_str) {
-        status.log_file_path = Some(log_file_path.into());
+    if payload.get("log_file_path").is_some() {
+        status.log_file_path = payload
+            .get("log_file_path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
     }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
@@ -428,17 +431,60 @@ fn finalize_bridge_exit(
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
-    log_sink: OperatorLogSink,
+    log_sink: Option<OperatorLogSink>,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
-        log_sink.append_line("desktop.compute_node.stderr", &line);
+        append_operator_log_line(&log_sink, "desktop.compute_node.stderr", &line);
         if filter.should_emit(&line) {
             eprintln!("desktop.compute_node.stderr line={line}");
         }
     }
     Ok(())
+}
+
+fn append_operator_log_line(log_sink: &Option<OperatorLogSink>, source: &str, line: &str) {
+    if let Some(log_sink) = log_sink {
+        log_sink.append_line(source, line);
+    }
+}
+
+fn append_operator_log_path_line(log_file_path: Option<&str>, source: &str, line: &str) {
+    if let Some(log_file_path) = log_file_path {
+        let _ = append_line_to_path(Path::new(log_file_path), source, line);
+    }
+}
+
+fn redact_bridge_stdout_line(line: &str) -> String {
+    let Ok(mut payload) = serde_json::from_str::<Value>(line) else {
+        return line.to_owned();
+    };
+    redact_sensitive_bridge_fields(&mut payload);
+    serde_json::to_string(&payload).unwrap_or_else(|_| line.to_owned())
+}
+
+fn redact_sensitive_bridge_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "model_path" | "active_relay_url" | "relay_base_url" | "relay_url"
+                ) {
+                    *value = Value::String("<redacted>".into());
+                } else {
+                    redact_sensitive_bridge_fields(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_bridge_fields(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub async fn start_compute_node(
@@ -466,15 +512,32 @@ pub async fn start_compute_node(
         *next_session_id += 1;
         next_session_id.to_string()
     };
-    let log_sink = OperatorLogSink::create(&app, &session_id)?;
-    let log_file_path = log_sink.path().to_string_lossy().into_owned();
-    log_sink.append_line(
+    {
+        let mut status = state.status.lock().await;
+        status.operator_session_id = Some(session_id.clone());
+        status.log_file_path = None;
+        status.last_error = None;
+        status.updated_at_ms = Some(current_time_ms());
+    }
+    let log_sink = match OperatorLogSink::create(&app, &session_id) {
+        Ok(log_sink) => Some(log_sink),
+        Err(err) => {
+            eprintln!(
+                "desktop.compute_node.operator_log_create_error operator_session_id={} error={}",
+                session_id, err
+            );
+            None
+        }
+    };
+    let log_file_path = log_sink
+        .as_ref()
+        .map(|log_sink| log_sink.path().to_string_lossy().into_owned());
+    append_operator_log_line(
+        &log_sink,
         "desktop.compute_node.session.start",
         &format!(
-            "operator_session_id={} relay={} model_path={} requested_mode={}",
+            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={}",
             session_id,
-            sanitize_relay_target(&request.relay_base_url),
-            request.model_path,
             format!("{:?}", request.mode).to_lowercase()
         ),
     );
@@ -483,11 +546,13 @@ pub async fn start_compute_node(
         .as_deref()
         == Some("1")
     {
-        if let Err(err) = crate::operator_logs::open_debug_terminal(log_sink.path()) {
-            log_sink.append_line(
-                "desktop.compute_node.debug_terminal_error",
-                &format!("open failed: {err}"),
-            );
+        if let Some(log_sink) = &log_sink {
+            if let Err(err) = crate::operator_logs::open_debug_terminal(log_sink.path()) {
+                log_sink.append_line(
+                    "desktop.compute_node.debug_terminal_error",
+                    &format!("open failed: {err}"),
+                );
+            }
         }
     }
 
@@ -500,7 +565,7 @@ pub async fn start_compute_node(
                     &request,
                     err.clone(),
                     Some(session_id.clone()),
-                    Some(log_file_path.clone()),
+                    log_file_path.clone(),
                 );
             }
             return Err(anyhow::anyhow!(err));
@@ -519,7 +584,7 @@ pub async fn start_compute_node(
                             &request,
                             err.to_string(),
                             Some(session_id.clone()),
-                            Some(log_file_path.clone()),
+                            log_file_path.clone(),
                         );
                     }
                     return Err(err);
@@ -533,7 +598,7 @@ pub async fn start_compute_node(
                         &request,
                         err.to_string(),
                         Some(session_id.clone()),
-                        Some(log_file_path.clone()),
+                        log_file_path.clone(),
                     );
                 }
                 return Err(err);
@@ -552,7 +617,7 @@ pub async fn start_compute_node(
                     &request,
                     err.to_string(),
                     Some(session_id.clone()),
-                    Some(log_file_path.clone()),
+                    log_file_path.clone(),
                 );
             }
             return Err(err);
@@ -583,17 +648,14 @@ pub async fn start_compute_node(
         selected_layout,
         import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
     );
-    log_sink.append_line(
+    append_operator_log_line(
+        &log_sink,
         "desktop.compute_node.session.layout",
         &format!(
-            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+            "operator_session_id={} relay=<redacted> bridge=<redacted> interpreter=<redacted> resource_root=<redacted> layout={:?} import_root={}",
             session_id,
-            sanitize_relay_target(&request.relay_base_url),
-            bridge_script,
-            interpreter,
-            selected_resource_root.display(),
             selected_layout,
-            import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
+            import_root.as_ref().map(|_| "<redacted>").unwrap_or("<unresolved>")
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
@@ -621,7 +683,7 @@ pub async fn start_compute_node(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
                     Some(session_id.clone()),
-                    Some(log_file_path.clone()),
+                    log_file_path.clone(),
                 );
                 *state.child.lock().await = None;
                 *state.stdin.lock().await = None;
@@ -684,7 +746,7 @@ pub async fn start_compute_node(
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
-                log_file_path: Some(log_file_path.clone()),
+                log_file_path: log_file_path.clone(),
             };
             true
         }
@@ -714,7 +776,11 @@ pub async fn start_compute_node(
     let mut saw_error_event = false;
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
-        log_sink.append_line("desktop.compute_node.stdout", &line);
+        append_operator_log_line(
+            &log_sink,
+            "desktop.compute_node.stdout",
+            &redact_bridge_stdout_line(&line),
+        );
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
@@ -770,6 +836,16 @@ pub async fn start_compute_node(
             )
         };
 
+        append_operator_log_line(
+            &log_sink,
+            "desktop.compute_node.bridge_process_exited",
+            &format!(
+                "operator_session_id={} status={}",
+                session_id,
+                bridge_exit_status_label(exit_status)
+            ),
+        );
+
         if let Some(payload) = exit_payload {
             app.emit("compute_node_event", payload)?;
         }
@@ -792,10 +868,24 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let stop_session_id = state.status.lock().await.operator_session_id.clone();
+    let (stop_session_id, stop_log_file_path) = {
+        let status = state.status.lock().await;
+        (
+            status.operator_session_id.clone(),
+            status.log_file_path.clone(),
+        )
+    };
     eprintln!(
         "desktop.compute_node.stop_requested operator_session_id={}",
         stop_session_id.as_deref().unwrap_or("unknown")
+    );
+    append_operator_log_path_line(
+        stop_log_file_path.as_deref(),
+        "desktop.compute_node.stop_requested",
+        &format!(
+            "operator_session_id={}",
+            stop_session_id.as_deref().unwrap_or("unknown")
+        ),
     );
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
@@ -805,6 +895,14 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         eprintln!(
             "desktop.compute_node.cancel_requested operator_session_id={}",
             stop_session_id.as_deref().unwrap_or("unknown")
+        );
+        append_operator_log_path_line(
+            stop_log_file_path.as_deref(),
+            "desktop.compute_node.cancel_requested",
+            &format!(
+                "operator_session_id={}",
+                stop_session_id.as_deref().unwrap_or("unknown")
+            ),
         );
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
@@ -834,16 +932,40 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                 "desktop.compute_node.bridge_kill_requested operator_session_id={}",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.bridge_kill_requested",
+                &format!(
+                    "operator_session_id={}",
+                    stop_session_id.as_deref().unwrap_or("unknown")
+                ),
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.bridge_process_exited",
+                &format!(
+                    "operator_session_id={} killed=true",
+                    stop_session_id.as_deref().unwrap_or("unknown")
+                ),
+            );
         } else {
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=false",
                 stop_session_id.as_deref().unwrap_or("unknown")
+            );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.bridge_process_exited",
+                &format!(
+                    "operator_session_id={} killed=false",
+                    stop_session_id.as_deref().unwrap_or("unknown")
+                ),
             );
         }
     }
@@ -915,6 +1037,37 @@ mod tests {
             sanitize_relay_target("https://user:pass@example.com/path?token=secret#frag"),
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn redacts_sensitive_bridge_stdout_fields_before_operator_logging() {
+        let line = serde_json::json!({
+            "type": "status",
+            "model_path": "/Users/Example User/models/model.gguf",
+            "active_relay_url": "https://relay.internal.example/path?token=secret",
+            "nested": {"relay_url": "https://nested.example"},
+        })
+        .to_string();
+
+        let redacted = redact_bridge_stdout_line(&line);
+
+        assert!(redacted.contains("\"model_path\":\"<redacted>\""));
+        assert!(redacted.contains("\"active_relay_url\":\"<redacted>\""));
+        assert!(redacted.contains("\"relay_url\":\"<redacted>\""));
+        assert!(!redacted.contains("Example User"));
+        assert!(!redacted.contains("relay.internal.example"));
+    }
+
+    #[test]
+    fn update_status_from_event_clears_log_file_path_on_null() {
+        let mut status = ComputeNodeStatus {
+            log_file_path: Some("/tmp/stale.log".into()),
+            ..ComputeNodeStatus::default()
+        };
+        let payload = serde_json::json!({"type": "status", "log_file_path": null});
+
+        assert!(update_status_from_event(&mut status, &payload));
+        assert_eq!(status.log_file_path, None);
     }
 
     #[test]
@@ -1011,14 +1164,37 @@ mod tests {
             path: log_path.clone(),
             file: std::sync::Arc::new(std::sync::Mutex::new(file)),
         };
-        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true }, log_sink)
-            .await
-            .expect("drain stderr");
+        drain_compute_node_stderr(
+            stderr,
+            SubprocessLogPolicy { verbose_raw: true },
+            Some(log_sink),
+        )
+        .await
+        .expect("drain stderr");
         assert!(std::fs::read_to_string(log_path)
             .expect("log")
             .contains("bridge-failure"));
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_appends_lifecycle_line_to_operator_log() {
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("operator.log");
+        std::fs::write(&log_path, "").expect("create log");
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("session-1".into());
+            status.log_file_path = Some(log_path.to_string_lossy().into_owned());
+        }
+
+        stop_compute_node(state).await.expect("stop compute node");
+
+        let log = std::fs::read_to_string(log_path).expect("operator log");
+        assert!(log.contains("desktop.compute_node.stop_requested"));
+        assert!(log.contains("operator_session_id=session-1"));
     }
 
     #[tokio::test]

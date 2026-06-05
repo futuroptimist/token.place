@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -16,8 +16,7 @@ impl OperatorLogSink {
     pub fn create(app: &AppHandle, session_id: &str) -> anyhow::Result<Self> {
         let dir = operator_log_dir(app)?;
         fs::create_dir_all(&dir)?;
-        let path = compute_operator_log_path(&dir, session_id);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let (path, file) = create_unique_operator_log_file(&dir, session_id)?;
         Ok(Self {
             path,
             file: Arc::new(Mutex::new(file)),
@@ -49,6 +48,45 @@ pub fn operator_log_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
 pub fn compute_operator_log_path(dir: &Path, session_id: &str) -> PathBuf {
     let safe_session_id = sanitize_filename_component(session_id);
     dir.join(format!("compute-node-{safe_session_id}.log"))
+}
+
+fn create_unique_operator_log_file(
+    dir: &Path,
+    session_id: &str,
+) -> anyhow::Result<(PathBuf, File)> {
+    let safe_session_id = sanitize_filename_component(session_id);
+    for attempt in 0..100 {
+        let timestamp = current_time_ms();
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let path = dir.join(format!(
+            "compute-node-{safe_session_id}-{timestamp}{suffix}.log"
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyhow::bail!("failed to create a unique operator log file after 100 attempts")
+}
+
+pub fn append_line_to_path(log_path: &Path, source: &str, line: &str) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(
+        file,
+        "{} {} {}",
+        current_time_ms(),
+        source,
+        sanitize_log_line(line)
+    )?;
+    Ok(())
 }
 
 pub fn append_model_bridge_log(
@@ -148,9 +186,13 @@ pub fn reveal_log_file(log_path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn read_log_tail(log_path: &Path, max_bytes: usize) -> anyhow::Result<String> {
-    let bytes = fs::read(log_path)?;
-    let start = bytes.len().saturating_sub(max_bytes);
-    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+    let mut file = File::open(log_path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn current_time_ms() -> u64 {
@@ -213,12 +255,43 @@ mod tests {
 
     #[test]
     fn posix_tail_script_quotes_paths_with_spaces_and_quotes() {
-        let path = Path::new("/Users/Daniel Smith/Library/Logs/token.place/compute node's.log");
+        let path = Path::new("/Users/Example User/Library/Logs/token.place/compute node's.log");
         let script = tail_terminal_script(path);
         assert!(script
-            .contains("'/Users/Daniel Smith/Library/Logs/token.place/compute node'\\''s.log'"));
+            .contains("'/Users/Example User/Library/Logs/token.place/compute node'\\''s.log'"));
         assert!(script.contains("tail -n 200 -F"));
         assert!(!script.contains("; rm -rf"));
+    }
+
+    #[test]
+    fn create_uses_unique_non_appended_session_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let (first_path, mut first_file) =
+            create_unique_operator_log_file(temp.path(), "1").expect("first log");
+        writeln!(first_file, "stale").expect("write first");
+        let (second_path, _second_file) =
+            create_unique_operator_log_file(temp.path(), "1").expect("second log");
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .starts_with("compute-node-1-"));
+        assert_eq!(
+            fs::read_to_string(second_path).expect("second contents"),
+            ""
+        );
+    }
+
+    #[test]
+    fn read_log_tail_reads_only_requested_suffix() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("operator.log");
+        fs::write(&path, "0123456789abcdef").expect("write log");
+
+        assert_eq!(read_log_tail(&path, 6).expect("tail"), "abcdef");
+        assert_eq!(read_log_tail(&path, 64).expect("tail"), "0123456789abcdef");
     }
 
     #[test]

@@ -192,7 +192,11 @@ function mergeComputeStatusEvent(
     updated_at_ms:
       typeof payload.updated_at_ms === 'number' ? payload.updated_at_ms : prev.updated_at_ms,
     log_file_path:
-      typeof payload.log_file_path === 'string' ? payload.log_file_path : prev.log_file_path,
+      payload.log_file_path === null
+        ? null
+        : typeof payload.log_file_path === 'string'
+          ? payload.log_file_path
+          : prev.log_file_path,
     last_error:
       payload.last_error === null
         ? null
@@ -624,7 +628,19 @@ export function App() {
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <strong>Operator debug console</strong>
               <button type="button" onClick={refreshOperatorLog}>Refresh</button>
-              <button type="button" onClick={() => navigator.clipboard?.writeText(operatorLogText)}>
+              <button
+                type="button"
+                onClick={() => {
+                  const writeText = navigator.clipboard?.writeText;
+                  if (!writeText) {
+                    setError('Clipboard API is unavailable in this webview.');
+                    return;
+                  }
+                  writeText.call(navigator.clipboard, operatorLogText).catch((err) =>
+                    setError(formatErrorMessage(err))
+                  );
+                }}
+              >
                 Copy log
               </button>
               <button type="button" onClick={() => setIsDebugConsoleOpen(false)}>Close</button>

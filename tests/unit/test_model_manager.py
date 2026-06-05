@@ -2595,3 +2595,140 @@ def test_subprocess_llama_proxy_uses_explicit_inference_timeout(monkeypatch):
         {'choices': [{'delta': {'content': 'ok'}}]},
     ]
     assert captured_timeouts == [('llama_cpp_inference', 7.5), ('llama_cpp_inference', 7.5)]
+
+
+def test_llama_cpp_package_parent_edge_cases(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._llama_cpp_package_parent_from_module_path(None) is None
+    assert (
+        model_manager_module._llama_cpp_package_parent_from_module_path('/opt/site/llama_cpp.py')
+        == '/opt/site'
+    )
+    assert model_manager_module._llama_cpp_package_parent_from_module_path('/opt/site/not_llama.py') is None
+
+    class RaisingPath:
+        def __init__(self, *_args, **_kwargs):
+            raise OSError('bad path')
+
+    monkeypatch.setattr(model_manager_module, 'Path', RaisingPath)
+    assert model_manager_module._llama_cpp_package_parent_from_module_path('/bad/path') is None
+
+
+def test_prepare_llama_cpp_import_from_probe_handles_empty_and_unusable_paths(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    original_sys_path = list(sys.path)
+    try:
+        model_manager_module._prepare_llama_cpp_import_from_probe(None)
+        assert sys.path == original_sys_path
+
+        model_manager_module._prepare_llama_cpp_import_from_probe('/opt/site/not_llama.txt')
+        assert sys.path == original_sys_path
+
+        monkeypatch.setattr(
+            model_manager_module,
+            '_llama_cpp_package_parent_from_module_path',
+            lambda _module_path: '/opt/site',
+        )
+        monkeypatch.setattr(model_manager_module, '_canonical_path_for_compare', lambda _path: None)
+        model_manager_module._prepare_llama_cpp_import_from_probe('/opt/site/llama_cpp/__init__.py')
+        assert sys.path == original_sys_path
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_desktop_runtime_probe_env_rejects_invalid_json(monkeypatch, caplog):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv(model_manager_module.DESKTOP_RUNTIME_PROBE_ENV, '{not-json')
+
+    assert model_manager_module._desktop_runtime_probe_from_env() is None
+    assert 'Ignoring invalid desktop runtime probe environment payload' in caplog.text
+
+
+def test_probe_module_path_from_desktop_runtime_probe_ignores_missing_values(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.delenv(model_manager_module.DESKTOP_RUNTIME_PROBE_ENV, raising=False)
+
+    for module_path in ('', 'missing', 'unknown'):
+        assert model_manager_module._probe_module_path_from_desktop_runtime_probe({
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': module_path,
+        }) is None
+
+
+def test_import_llama_cpp_runtime_clears_namespace_on_post_import_probe_mismatch(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    expected = tmp_path / 'selected' / 'llama_cpp' / '__init__.py'
+    imported = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    expected.parent.mkdir(parents=True)
+    imported.parent.mkdir(parents=True)
+    expected.write_text('', encoding='utf-8')
+    imported.write_text('', encoding='utf-8')
+    sys.modules['llama_cpp'] = SimpleNamespace(__file__=str(imported))
+    sys.modules['llama_cpp._native'] = SimpleNamespace()
+    monkeypatch.setattr(
+        model_manager_module,
+        '_import_llama_cpp_in_parent_with_timeout',
+        lambda **_kwargs: SimpleNamespace(__file__=str(imported)),
+    )
+
+    with pytest.raises(ImportError, match='Desktop runtime probe module path mismatch'):
+        model_manager_module._import_llama_cpp_runtime(
+            require_real_runtime=True,
+            desktop_runtime_probe={
+                'runtime_action': 'already_supported',
+                'selected_backend': 'cuda',
+                'gpu_offload_supported': True,
+                'llama_module_path': str(expected),
+            },
+        )
+
+    assert 'llama_cpp' not in sys.modules
+    assert 'llama_cpp._native' not in sys.modules
+
+
+def test_detect_llama_runtime_capabilities_cpu_facade_reports_probe_timeout(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_runtime', lambda **_kwargs: facade)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda: (_ for _ in ()).throw(
+            model_manager_module.LlamaCppRuntimeStageTimeout('llama_cpp_gpu_probe', 0.01)
+        ),
+    )
+
+    diagnostics = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert diagnostics['backend'] == 'missing'
+    assert diagnostics['gpu_offload_supported'] is False
+    assert diagnostics['llama_module_path'] == '/site/llama_cpp/__init__.py'
+    assert diagnostics['error'] == 'llama_cpp_gpu_probe_timeout after 0.01s'
+
+
+def test_detect_llama_runtime_capabilities_cpu_facade_reports_probe_exception(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    facade = model_manager_module._SubprocessLlamaCppModule('/site/llama_cpp/__init__.py')
+    monkeypatch.setattr(model_manager_module, '_import_llama_cpp_runtime', lambda **_kwargs: facade)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_probe_llama_cpp_capabilities_in_subprocess',
+        lambda: (_ for _ in ()).throw(RuntimeError('probe crashed')),
+    )
+
+    diagnostics = model_manager_module.detect_llama_runtime_capabilities()
+
+    assert diagnostics['backend'] == 'missing'
+    assert diagnostics['gpu_offload_supported'] is False
+    assert diagnostics['detected_device'] == 'none'
+    assert diagnostics['llama_module_path'] == '/site/llama_cpp/__init__.py'
+    assert diagnostics['error'] == 'probe crashed'

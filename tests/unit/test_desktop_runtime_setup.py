@@ -1479,3 +1479,16 @@ def test_runtime_setup_strips_windows_extended_prefix_for_packaged_resource_path
     assert desktop_runtime_setup._strip_windows_extended_path_prefix(
         r'\\?\UNC\server\share\TokenPlace.app\Contents\Resources\python\compute_node_bridge.py'
     ) == r'\\server\share\TokenPlace.app\Contents\Resources\python\compute_node_bridge.py'
+
+
+def test_record_desktop_runtime_probe_clears_env_when_payload_is_not_serializable(monkeypatch):
+    monkeypatch.setenv(desktop_runtime_setup.RUNTIME_PROBE_ENV, '{"stale": true}')
+    monkeypatch.setattr(
+        desktop_runtime_setup.json,
+        'dumps',
+        lambda _payload: (_ for _ in ()).throw(TypeError('not serializable')),
+    )
+    result = {'runtime_action': object()}
+
+    assert desktop_runtime_setup._record_desktop_runtime_probe(result) is result
+    assert desktop_runtime_setup.RUNTIME_PROBE_ENV not in os.environ

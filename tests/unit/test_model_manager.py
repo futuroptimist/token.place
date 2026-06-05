@@ -2371,6 +2371,87 @@ def test_runtime_worker_env_omits_probe_sys_path_marker(monkeypatch):
     assert env.get('PYTHONPATH')
 
 
+def test_subprocess_llama_proxy_early_exit_surfaces_child_diagnostics(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakePipe:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def __iter__(self):
+            return iter(self._lines)
+
+    class FakeStdin:
+        def write(self, _text):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.stdin = FakeStdin()
+            self.stdout = FakePipe(['child boot log\n'])
+            self.stderr = FakePipe(['Traceback: import failed\n'])
+            self.returncode = 17
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\_up_\_up_')
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', FakeProcess)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(
+            model_path='model.gguf',
+            timeout_seconds=1,
+            module_path_hint=r'C:\Python311\Lib\site-packages\llama_cpp\__init__.py',
+            desktop_runtime_probe={
+                'selected_backend': 'cuda',
+                'gpu_offload_supported': True,
+                'llama_module_path': r'C:\Python311\Lib\site-packages\llama_cpp\__init__.py',
+            },
+        )
+
+    message = str(exc_info.value)
+    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
+    assert 'exit_code=17' in message
+    assert 'Traceback: import failed' in message
+    assert 'child boot log' in message
+    assert 'token.place desktop' in message
+    assert "\\\\?\\" not in message
+    assert 'module_path_hint=' in message
+
+
+def test_llama_cpp_runtime_worker_env_strips_extended_windows_paths(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', r'\\?\C:\token.place desktop\_up_\_up_')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', r'\\?\C:\token.place desktop\python\desktop_runtime_setup.py')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_llama_cpp_probe_sys_path_entries',
+        lambda: [r'\\?\C:\Python311\Lib\site-packages', r'C:\token.place desktop'],
+    )
+
+    env = model_manager_module._llama_cpp_runtime_worker_env()
+
+    assert env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] == r'C:\token.place desktop\_up_\_up_'
+    assert env['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'] == r'C:\token.place desktop\python\desktop_runtime_setup.py'
+    assert "\\\\?\\" not in env['PYTHONPATH']
+    assert 'token.place desktop' in env['PYTHONPATH']
+
+
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -2560,7 +2641,7 @@ def test_subprocess_llama_proxy_inference_does_not_use_runtime_stage_timeout(mon
     proxy._send = MagicMock()
     captured_timeouts = []
 
-    def _fake_read(_process, *, timeout_seconds, stage):
+    def _fake_read(_process, *, timeout_seconds, stage, **_kwargs):
         captured_timeouts.append((stage, timeout_seconds))
         return {'status': 'ok', 'result': {'choices': [{'message': {'content': 'ok'}}]}}
 
@@ -2583,7 +2664,7 @@ def test_subprocess_llama_proxy_uses_explicit_inference_timeout(monkeypatch):
     proxy._send = MagicMock()
     captured_timeouts = []
 
-    def _fake_read(_process, *, timeout_seconds, stage):
+    def _fake_read(_process, *, timeout_seconds, stage, **_kwargs):
         captured_timeouts.append((stage, timeout_seconds))
         if len(captured_timeouts) == 1:
             return {'status': 'ok', 'chunk': {'choices': [{'delta': {'content': 'ok'}}]}, 'done': False}

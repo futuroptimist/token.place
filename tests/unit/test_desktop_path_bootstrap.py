@@ -316,3 +316,25 @@ def test_bootstrap_repairs_polluted_site_packages_pathlib_shadow(tmp_path, path_
             sys.modules.pop('pathlib', None)
         else:
             sys.modules['pathlib'] = original_pathlib
+
+
+def test_bootstrap_adds_desktop_dependency_target_before_repo_root(
+    tmp_path, path_bootstrap, monkeypatch
+):
+    repo_root = tmp_path / 'repo'
+    script = repo_root / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    dependency_target = tmp_path / 'Application Support' / 'token.place' / 'python site'
+    (repo_root / 'utils').mkdir(parents=True)
+    dependency_target.mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(dependency_target))
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        dependency_index = sys.path.index(str(dependency_target.resolve()))
+        repo_index = sys.path.index(str(repo_root.resolve()))
+        assert dependency_index < repo_index
+    finally:
+        sys.path[:] = original_sys_path

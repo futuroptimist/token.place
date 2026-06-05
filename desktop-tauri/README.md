@@ -180,3 +180,20 @@ It prints:
   Pass means desktop-side diagnostics and `compute_node_bridge.py` `started` events both report
   CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
   startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.
+
+### macOS packaged Metal runtime provisioning
+
+Packaged macOS operator startup may use Apple Command Line Tools Python (for
+example `/Library/Developer/CommandLineTools/usr/bin/python3`). The desktop
+runtime bootstrap treats that interpreter as an execution host only: it installs
+`llama-cpp-python` into a writable desktop dependency target, adds that target to
+`PYTHONPATH`, and verifies `import llama_cpp` from the same path before relay
+registration.
+
+The `desktop.runtime_setup` log line includes the selected interpreter, Python
+version, prefix/base_prefix, dependency target, pip availability, module path,
+install action, and fallback reason. Metal source builds set
+`CMAKE_ARGS="-DGGML_METAL=on -DGGML_NATIVE=off"` and `FORCE_CMAKE=1`. In `gpu`
+mode, Metal provisioning failure is fatal; in `auto`/`hybrid`, a successful CPU
+runtime install/import is reported as `metal_cpu_fallback` and can still reach
+`Registered: yes`.

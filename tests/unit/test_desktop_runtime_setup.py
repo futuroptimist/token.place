@@ -163,6 +163,7 @@ def test_macos_missing_metal_runtime_bootstrap_attempts_metal_plan(monkeypatch):
 
     assert result['selected_backend'] == 'metal'
     assert result['runtime_action'] == 'installed_metal_reexec'
+    assert '--target' in captured['cmd']
     assert captured['env']['CMAKE_ARGS'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
     assert captured['env']['FORCE_CMAKE'] == '1'
     assert captured['timeout'] == desktop_runtime_setup.PIP_SOURCE_BUILD_TIMEOUT_SECONDS
@@ -253,12 +254,54 @@ def test_macos_metal_source_install_clean_cpu_probe_fails_explicit_gpu_before_re
     assert message and 'metal_install_failed' in message
 
 
-def test_macos_metal_install_unsatisfied_cpu_probe_fails_before_cpu_fallback(monkeypatch):
+def test_macos_metal_install_unsatisfied_cpu_probe_falls_back_to_cpu_in_auto(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
     probes = iter([
         _probe(backend='cpu', gpu=False, device='cpu', error='Metal runtime missing'),
         _probe(backend='cpu', gpu=False, device='cpu', error='Metal still unavailable'),
+        _probe(backend='cpu', gpu=False, device='cpu', error=None),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+            cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+            index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+        ),
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin', backend='cpu', package_spec='llama-cpp-python',
+            cmake_args=None, force_cmake=False, index_url='https://pypi.org/simple',
+            only_binary=False, no_binary=False,
+        ),
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    monkeypatch.setattr(desktop_runtime_setup, 'backend_probe_satisfies_install_plan', lambda *_: False)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+
+    assert result['selected_backend'] == 'cpu'
+    assert result['runtime_action'] == 'metal_cpu_fallback'
+    assert 'follow-up probe reported backend=cpu' in result['fallback_reason']
+    assert 'using CPU runtime' in result['fallback_reason']
+    assert desktop_runtime_setup.desktop_gpu_runtime_failure_message('auto', result) is None
+
+
+def test_macos_runtime_install_uses_writable_dependency_target(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents' / 'Resources'
+    runtime_root.mkdir(parents=True)
+    dependency_target = tmp_path / 'Application Support' / 'token.place' / 'python site'
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (dependency_target, None),
+    )
+    probes = iter([
+        _probe(backend='missing', gpu=False, device='none', error="No module named 'llama_cpp'"),
+        _probe(backend='metal', gpu=True, device='metal'),
     ])
     monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
     plan = desktop_runtime_setup.LlamaCppInstallPlan(
@@ -267,16 +310,74 @@ def test_macos_metal_install_unsatisfied_cpu_probe_fails_before_cpu_fallback(mon
         index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
     )
     monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
-    monkeypatch.setattr(desktop_runtime_setup, 'backend_probe_satisfies_install_plan', lambda *_: False)
-    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', lambda *_args, **_kwargs: (True, 'ok'))
+    captured = {}
 
-    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=REPO_ROOT)
+    def _capture_install(cmd, env, **kwargs):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        return True, 'ok'
 
-    assert result['selected_backend'] == 'cpu'
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture_install)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=runtime_root)
+
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert '--target' in captured['cmd']
+    assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
+    assert str(dependency_target) in captured['env']['PYTHONPATH']
+    assert captured['env']['CMAKE_ARGS'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
+
+
+def test_macos_clt_python_missing_llama_cpp_reports_actionable_diagnostics(monkeypatch, tmp_path):
+    class _CltSysStub(_PlatformStub):
+        executable = '/Library/Developer/CommandLineTools/usr/bin/python3'
+        prefix = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9'
+        base_prefix = prefix
+        argv = [str(MODULE_PATH)]
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _CltSysStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    dependency_target = tmp_path / 'token place deps'
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (dependency_target, None),
+    )
+    before = desktop_runtime_setup.RuntimeProbe(
+        backend='missing',
+        gpu_offload_supported=False,
+        detected_device='none',
+        interpreter=_CltSysStub.executable,
+        prefix=_CltSysStub.prefix,
+        base_prefix=_CltSysStub.base_prefix,
+        python_version='3.9.6',
+        dependency_target=str(dependency_target),
+        pip_version='pip unavailable (ensurepip missing)',
+        llama_module_path='missing',
+        error="No module named 'llama_cpp'",
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: before)
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='darwin', backend='metal', package_spec='llama-cpp-python',
+            cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+            index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+        )
+    ])
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'stderr_tail=cmake: command not found'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=tmp_path)
+
     assert result['runtime_action'] == 'metal_install_failed'
-    assert 'follow-up probe did not report Metal GPU offload' in result['fallback_reason']
-    assert 'backend=cpu' in result['fallback_reason']
-
+    assert '/Library/Developer/CommandLineTools/usr/bin/python3' in result['fallback_reason']
+    assert 'python_version=3.9.6' in result['fallback_reason']
+    assert f'dependency_target={dependency_target}' in result['fallback_reason']
+    assert 'pip unavailable' in result['fallback_reason']
+    assert 'stderr_tail=cmake: command not found' in result['fallback_reason']
 
 def test_macos_bootstrap_disabled_reports_metal_probe_only(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
@@ -990,10 +1091,10 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
     assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
-    assert captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)[:2] == [
-        str(PYTHON_MODULE_DIR),
-        str(Path(__file__).resolve().parents[2]),
-    ]
+    pythonpath_entries = captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)
+    assert pythonpath_entries[0] == str(PYTHON_MODULE_DIR)
+    assert pythonpath_entries[1].endswith('.token_place_desktop_site')
+    assert str(Path(__file__).resolve().parents[2]) in pythonpath_entries
     assert captured['env']['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith(
         'desktop_runtime_setup.py'
     )
@@ -1064,7 +1165,8 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
     assert ok is True
-    assert output == 'ok output'
+    assert 'returncode=0' in output
+    assert 'stdout_tail=ok output' in output
 
     class _FailResult:
         returncode = 1
@@ -1074,7 +1176,9 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
     assert ok is False
-    assert output == 'real stderr'
+    assert 'returncode=1' in output
+    assert 'stdout_tail=fallback stdout' in output
+    assert 'stderr_tail=real stderr' in output
 
     def _timeout(*_args, **_kwargs):
         raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
@@ -1082,7 +1186,9 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
     assert ok is False
-    assert output == 'pip install timed out after 12s'
+    assert 'pip install timed out after 12s' in output
+    assert 'stdout_tail=empty' in output
+    assert 'stderr_tail=empty' in output
 
 
 def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):
@@ -1202,7 +1308,15 @@ def test_windows_wheel_install_path_force_reinstalls_existing_same_version(monke
 
     desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
-    assert captured['cmd'][:5] == [sys.executable, '-m', 'pip', 'install', '--force-reinstall']
+    assert captured['cmd'][:6] == [
+        sys.executable,
+        '-m',
+        'pip',
+        'install',
+        '--disable-pip-version-check',
+        '--force-reinstall',
+    ]
+    assert '--target' in captured['cmd']
 
 
 def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):

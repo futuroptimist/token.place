@@ -174,3 +174,41 @@ Before release sign-off or production round-robin messaging, record:
 6. Two-node staging participation evidence for both Windows and macOS release candidates.
 
 If any item is unavailable because CI, staging, GPU hardware, signing, or network access is missing, mark it as a release blocker or an explicitly accepted preview limitation. Do not silently downgrade platform parity expectations.
+
+## macOS packaged Metal runtime validation
+
+For packaged `.app` builds, the bridge may launch with Apple Command Line Tools
+Python (for example `/Library/Developer/CommandLineTools/usr/bin/python3`) when
+that is the interpreter discovered by the launcher. The runtime setup must not
+install `llama-cpp-python` into that protected prefix. Instead, it installs into a
+writable desktop dependency target and adds that target to the same import path
+used by the follow-up `llama_cpp` probe and the model runtime.
+
+Manual validation on Apple Silicon:
+
+1. Build and install the macOS desktop release from the commit under test.
+2. Enable debug logging from the desktop debug menu/Prompt 1 logging flow, or
+   launch with `TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS=1` for full bridge stderr.
+3. Start the operator with `mode=auto`, staging relay URL, and a local GGUF model.
+4. In bridge logs, find `desktop.runtime_setup` and confirm it includes:
+   - `interpreter`, `python_version`, `prefix`, and `base_prefix`
+   - `dependency_target` pointing to a writable app/user-specific directory
+   - `pip=` availability details
+   - `llama_module_path` under the dependency target or another real
+     `llama-cpp-python` package path, never the repo-local `llama_cpp.py` shim
+   - `selected_backend=metal` with `action=metal_already_supported` or
+     `installed_metal_reexec`, or `selected_backend=cpu` with
+     `action=metal_cpu_fallback` and an explicit Metal failure reason
+5. Confirm `model_init.ready` appears before `server.registered` / API v1
+   registration, then verify the UI shows `Registered: yes`.
+6. Send one encrypted browser chat request, stop the operator, verify relay
+   diagnostics drop to zero or TTL-expire, then start again and confirm
+   registration succeeds a second time.
+
+If Metal provisioning fails, inspect the `desktop.runtime_setup` line and the
+startup error for the pip/cmake tail. Common prerequisite fixes are installing or
+repairing Command Line Tools (`xcode-select --install`), ensuring `python3 -m pip
+--version` works for the selected interpreter, and allowing the app to write its
+desktop dependency target. In `gpu` mode, Metal provisioning failure remains
+fatal. In `auto` and `hybrid`, a successful CPU `llama-cpp-python` install/import
+is an explicit `metal_cpu_fallback`, not a silent GPU success.

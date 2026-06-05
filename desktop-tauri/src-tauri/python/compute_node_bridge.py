@@ -563,6 +563,11 @@ def run(args: argparse.Namespace) -> int:
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
+        f"python_version={runtime_setup.get('python_version', 'unknown')} "
+        f"prefix={runtime_setup.get('prefix', runtime_setup.get('interpreter_prefix', 'unknown'))} "
+        f"base_prefix={runtime_setup.get('base_prefix', 'unknown')} "
+        f"dependency_target={runtime_setup.get('dependency_target', 'unknown')} "
+        f"pip={runtime_setup.get('pip_version', 'unknown')} "
         f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
@@ -697,6 +702,8 @@ def run(args: argparse.Namespace) -> int:
             "fallback_reason": diagnostics.get("fallback_reason"),
             "interpreter": runtime_setup.get("interpreter", sys.executable),
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
+            "dependency_target": runtime_setup.get("dependency_target", "unknown"),
+            "python_version": runtime_setup.get("python_version", "unknown"),
             "model_path": args.model,
             "last_error": current_last_error,
             "warm_load_state": warm_load_state,

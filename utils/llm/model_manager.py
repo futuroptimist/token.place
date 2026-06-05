@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
-from typing import Dict, List, Any, Optional, Union, Iterable
+from typing import Dict, List, Any, Optional, Iterable
 
 from utils.system import resource_monitor
 
@@ -665,6 +665,57 @@ except Exception as exc:
 """
 
 
+
+def _llama_cpp_package_parent_from_module_path(module_path: Any) -> Optional[str]:
+    """Return the import parent for a probed llama_cpp module path."""
+
+    if not module_path:
+        return None
+    try:
+        module_file = Path(_strip_windows_extended_path_prefix(str(module_path)))
+    except (TypeError, ValueError, OSError):
+        return None
+    if module_file.name == '__init__.py' and module_file.parent.name == 'llama_cpp':
+        return str(module_file.parent.parent)
+    if module_file.name == 'llama_cpp.py':
+        return str(module_file.parent)
+    return None
+
+
+def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
+    """Make a successful desktop probe durable for the real in-process import."""
+
+    if not module_path:
+        return
+    loaded = sys.modules.get('llama_cpp')
+    loaded_path = getattr(loaded, '__file__', None) if loaded is not None else None
+    expected_compare = _canonical_path_for_compare(module_path)
+    loaded_compare = _canonical_path_for_compare(loaded_path)
+    if loaded is not None and expected_compare and loaded_compare != expected_compare:
+        logger.info(
+            "llama_cpp clearing stale imported module before desktop probe reuse "
+            "loaded_path=%s expected_path=%s",
+            loaded_path or 'unknown',
+            module_path,
+        )
+        sys.modules.pop('llama_cpp', None)
+
+    package_parent = _llama_cpp_package_parent_from_module_path(module_path)
+    if not package_parent:
+        return
+    package_parent_compare = _canonical_path_for_compare(package_parent)
+    if package_parent_compare is None:
+        return
+    with _LLAMA_CPP_IMPORT_PATH_LOCK:
+        retained = []
+        for entry in sys.path:
+            entry_compare = _canonical_path_for_compare(entry or os.getcwd())
+            if entry_compare == package_parent_compare:
+                continue
+            retained.append(entry)
+        sys.path[:] = [package_parent] + retained
+
+
 def _probe_module_path_from_desktop_runtime_probe(probe: Any) -> Optional[str]:
     coerced = _coerce_desktop_runtime_probe(probe)
     if coerced is None or coerced.get('error'):
@@ -719,6 +770,9 @@ def _import_llama_cpp_runtime(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."
         )
+
+    if expected_module_path:
+        _prepare_llama_cpp_import_from_probe(expected_module_path)
 
     logger.info(
         "llama_cpp direct import start module_path_hint=%s interpreter=%s",

@@ -1168,6 +1168,126 @@ def test_desktop_runtime_probe_mismatch_falls_back_to_imported_runtime(standalon
     assert plan['fallback_reason'] == 'llama_cpp_runtime_probe_mismatch'
 
 
+def _write_fake_llama_cpp_package(site_dir: Path, marker: str) -> Path:
+    package_dir = site_dir / 'llama_cpp'
+    package_dir.mkdir(parents=True, exist_ok=True)
+    init_file = package_dir / '__init__.py'
+    init_file.write_text(
+        f"MARKER = {marker!r}\n"
+        "GGML_USE_CUDA = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n"
+        "class Llama:\n"
+        "    pass\n",
+        encoding='utf-8',
+    )
+    return init_file
+
+
+def test_desktop_runtime_probe_clears_stale_loaded_llama_cpp(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    stale_path = tmp_path / 'old site-packages' / 'llama_cpp' / '__init__.py'
+    right_site = tmp_path / 'right site-packages'
+    right_init = _write_fake_llama_cpp_package(right_site, 'right')
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: True)
+    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: model_manager_module.threading.main_thread())
+    monkeypatch.setattr(model_manager_module.signal, 'setitimer', lambda *_args: (0, 0))
+    monkeypatch.setattr(model_manager_module.signal, 'getsignal', lambda *_args: None)
+    monkeypatch.setattr(model_manager_module.signal, 'signal', lambda *_args: None)
+    monkeypatch.setattr(sys, 'path', [str(right_site), *sys.path])
+    monkeypatch.setitem(sys.modules, 'llama_cpp', SimpleNamespace(__file__=str(stale_path)))
+
+    llama_cpp = model_manager_module._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': str(right_init),
+        },
+    )
+
+    assert llama_cpp.MARKER == 'right'
+    assert Path(llama_cpp.__file__).resolve() == right_init.resolve()
+
+
+def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    wrong_site = tmp_path / 'wrong site-packages'
+    right_site = tmp_path / 'right site-packages'
+    _write_fake_llama_cpp_package(wrong_site, 'wrong')
+    right_init = _write_fake_llama_cpp_package(right_site, 'right')
+    monkeypatch.delitem(sys.modules, 'llama_cpp', raising=False)
+    monkeypatch.setattr(sys, 'path', [str(wrong_site), str(right_site), *sys.path])
+
+    llama_cpp = model_manager_module._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': str(right_init),
+        },
+    )
+
+    assert llama_cpp.MARKER == 'right'
+    assert Path(sys.path[0]).resolve() == right_site.resolve()
+
+
+def test_desktop_runtime_probe_windows_extended_path_with_spaces_prioritized(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    site = tmp_path / 'Windows Python Runtime' / 'Lib' / 'site-packages with spaces'
+    init_file = _write_fake_llama_cpp_package(site, 'windows-spaces')
+    extended_init = '\\\\?\\' + str(init_file)
+    monkeypatch.delitem(sys.modules, 'llama_cpp', raising=False)
+    monkeypatch.setattr(sys, 'path', [str(tmp_path / 'other'), *sys.path])
+
+    llama_cpp = model_manager_module._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': extended_init,
+        },
+    )
+
+    assert llama_cpp.MARKER == 'windows-spaces'
+    assert Path(llama_cpp.__file__).resolve() == init_file.resolve()
+
+
+def test_desktop_runtime_probe_macos_app_resources_path_prioritized(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    resources_site = (
+        tmp_path
+        / 'TokenPlace.app'
+        / 'Contents'
+        / 'Resources'
+        / 'python'
+        / 'site-packages'
+    )
+    init_file = _write_fake_llama_cpp_package(resources_site, 'macos-app')
+    monkeypatch.delitem(sys.modules, 'llama_cpp', raising=False)
+    monkeypatch.setattr(sys, 'path', [str(tmp_path / 'repo-like-cwd'), *sys.path])
+
+    llama_cpp = model_manager_module._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'metal',
+            'gpu_offload_supported': True,
+            'llama_module_path': str(init_file),
+        },
+    )
+
+    assert llama_cpp.MARKER == 'macos-app'
+    assert Path(sys.path[0]).resolve() == resources_site.resolve()
+
+
 def test_repo_local_llama_cpp_shim_detection_handles_windows_extended_paths():
     from utils.llm import model_manager as model_manager_module
 

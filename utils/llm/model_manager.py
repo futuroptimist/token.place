@@ -749,7 +749,11 @@ def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
     loaded_path = getattr(loaded, '__file__', None) if loaded is not None else None
     expected_compare = _canonical_path_for_compare(module_path)
     loaded_compare = _canonical_path_for_compare(loaded_path)
-    if loaded is not None and expected_compare and loaded_compare != expected_compare:
+    cached_llama_modules = any(
+        name == 'llama_cpp' or name.startswith('llama_cpp.')
+        for name in sys.modules
+    )
+    if cached_llama_modules and expected_compare and loaded_compare != expected_compare:
         logger.info(
             "llama_cpp clearing stale imported module before desktop probe reuse "
             "loaded_path=%s expected_path=%s",

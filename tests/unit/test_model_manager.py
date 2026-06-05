@@ -1251,6 +1251,47 @@ def test_desktop_runtime_probe_clears_stale_llama_cpp_submodules(monkeypatch, tm
     assert getattr(sys.modules.get('llama_cpp._native'), '__file__', None) == str(native_file)
 
 
+def test_desktop_runtime_probe_clears_orphaned_llama_cpp_submodules(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    right_site = tmp_path / 'right site-packages'
+    package_dir = right_site / 'llama_cpp'
+    package_dir.mkdir(parents=True)
+    native_file = package_dir / '_native.py'
+    native_file.write_text("MARKER = 'right-native'\n", encoding='utf-8')
+    init_file = package_dir / '__init__.py'
+    init_file.write_text(
+        "from . import _native\n"
+        "MARKER = _native.MARKER\n"
+        "GGML_USE_CUDA = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n"
+        "class Llama:\n"
+        "    pass\n",
+        encoding='utf-8',
+    )
+    stale_native = SimpleNamespace(
+        __file__=str(tmp_path / 'old site-packages' / 'llama_cpp' / '_native.py'),
+        MARKER='stale-native',
+    )
+    monkeypatch.delitem(sys.modules, 'llama_cpp', raising=False)
+    monkeypatch.setitem(sys.modules, 'llama_cpp._native', stale_native)
+    monkeypatch.setattr(sys, 'path', [str(right_site), *sys.path])
+
+    llama_cpp = model_manager_module._import_llama_cpp_runtime(
+        require_real_runtime=True,
+        desktop_runtime_probe={
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+            'gpu_offload_supported': True,
+            'llama_module_path': str(init_file),
+        },
+    )
+
+    assert llama_cpp.MARKER == 'right-native'
+    assert getattr(sys.modules.get('llama_cpp._native'), '__file__', None) == str(native_file)
+
+
 def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 

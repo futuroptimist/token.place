@@ -570,6 +570,67 @@ def run_compute_bridge_startup_probe(
             bridge.kill()
 
 
+def run_llama_cpp_facade_early_exit_diagnostics_probe(
+    tmp_root: Path, *, resources_root: Path | None = None, layout_label: str = "standard resources"
+) -> None:
+    """Assert a runtime facade child that exits before handshake is actionable."""
+
+    resources_root = resources_root or (tmp_root / "resources")
+    fake_site = tmp_root / f"fake crashing site-packages {layout_label.replace('/', '_')}"
+    fake_pkg = fake_site / "llama_cpp"
+    fake_pkg.mkdir(parents=True, exist_ok=True)
+    fake_init = fake_pkg / "__init__.py"
+    fake_init.write_text(
+        "import sys\n"
+        "print('facade stdout clue before exit')\n"
+        "print('facade stderr clue before exit', file=sys.stderr)\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+    env = _packaged_env(
+        tmp_root,
+        resources_root,
+        extra_env={
+            "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS": "5",
+            "PYTHONPATH": os.pathsep.join(
+                [str(fake_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib, sys; "
+                f"sys.path.insert(0, {str(fake_site)!r}); "
+                f"sys.path.insert(0, {str(resources_root)!r}); "
+                "from utils.llm import model_manager; "
+                "module = model_manager._SubprocessLlamaCppModule("
+                f"{str(fake_init)!r}, timeout_seconds=5, "
+                "desktop_runtime_probe={'selected_backend': 'cuda'}); "
+                "module.Llama(model_path='fake.gguf')"
+            ),
+        ],
+        cwd=tmp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, combined
+    assert "llama_cpp_import subprocess exited before JSON handshake" in combined, combined
+    assert "llama_cpp_import subprocess ended" not in combined, combined
+    assert "registered=true" not in combined, combined
+    assert "exit_code=7" in combined, combined
+    assert "facade stdout clue before exit" in combined, combined
+    assert "facade stderr clue before exit" in combined, combined
+    assert "import_root=" in combined, combined
+    assert str(fake_init) in combined, combined
+
+
 def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
     tmp_root: Path,
     bridge_script: Path,
@@ -614,6 +675,7 @@ def main() -> int:
         run_model_bridge_inspect_probe(tmp_path)
         run_compute_bridge_import_probe(tmp_path)
         run_llama_cpp_watchdog_regression_probe(tmp_path)
+        run_llama_cpp_facade_early_exit_diagnostics_probe(tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
@@ -622,6 +684,9 @@ def main() -> int:
         run_model_bridge_inspect_probe(tmp_path, resources_root=mac_resources_root)
         run_compute_bridge_import_probe(tmp_path, resources_root=mac_resources_root)
         run_llama_cpp_watchdog_regression_probe(
+            tmp_path, resources_root=mac_resources_root, layout_label="macOS Contents/Resources"
+        )
+        run_llama_cpp_facade_early_exit_diagnostics_probe(
             tmp_path, resources_root=mac_resources_root, layout_label="macOS Contents/Resources"
         )
 

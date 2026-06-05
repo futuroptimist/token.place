@@ -2371,6 +2371,116 @@ def test_runtime_worker_env_omits_probe_sys_path_marker(monkeypatch):
     assert env.get('PYTHONPATH')
 
 
+def test_runtime_worker_env_strips_windows_extended_path_prefix(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.delenv('PYTHONNOUSERSITE', raising=False)
+
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '\\\\?\\C:\\Users\\danie\\AppData\\Local\\token.place desktop\\_up_\\_up_')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT', '\\\\?\\C:\\Users\\danie\\AppData\\Local\\token.place desktop\\python\\path_bootstrap.py')
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_PYTHON_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python')
+    monkeypatch.setenv('TOKEN_PLACE_PROBE_REPO_ROOT', r'\\?\C:\Users\danie\AppData\Local\token.place desktop\repo root')
+    monkeypatch.setattr(
+        model_manager_module,
+        '_llama_cpp_probe_sys_path_entries',
+        lambda: ['\\\\?\\C:\\Users\\danie\\AppData\\Local\\token.place desktop\\_up_\\_up_'],
+    )
+
+    env = model_manager_module._llama_cpp_runtime_worker_env()
+
+    assert env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] == 'C:\\Users\\danie\\AppData\\Local\\token.place desktop\\_up_\\_up_'
+    assert env['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith('token.place desktop\\python\\path_bootstrap.py')
+    assert env['TOKEN_PLACE_DESKTOP_PYTHON_ROOT'] == 'C:\\Users\\danie\\AppData\\Local\\token.place desktop\\python'
+    assert env['TOKEN_PLACE_PROBE_REPO_ROOT'] == 'C:\\Users\\danie\\AppData\\Local\\token.place desktop\\repo root'
+    assert env['PYTHONNOUSERSITE'] == '1'
+    assert '\\\\?\\' not in env['PYTHONPATH']
+
+
+def test_subprocess_llama_proxy_early_exit_reports_process_diagnostics(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    fake_site = tmp_path / 'fake site-packages with spaces'
+    fake_pkg = fake_site / 'llama_cpp'
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / '__init__.py').write_text(
+        "import sys\n"
+        "print('stdout clue before exit')\n"
+        "print('stderr clue before exit', file=sys.stderr)\n"
+        "sys.exit(7)\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(fake_site))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '\\\\?\\C:\\Users\\danie\\AppData\\Local\\token.place desktop\\_up_\\_up_')
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=5)
+
+    message = str(exc_info.value)
+    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
+    assert 'llama_cpp_import subprocess ended' not in message
+    assert 'exit_code=7' in message
+    assert 'stdout clue before exit' in message
+    assert 'stderr clue before exit' in message
+    assert 'import_root=C:' in message
+    assert 'token.place desktop' in message
+
+
+def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FailingStdin:
+        def write(self, _text):
+            raise BrokenPipeError('child already exited')
+
+        def flush(self):
+            return None
+
+    class EmptyStream:
+        def __iter__(self):
+            return iter(())
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FailingStdin()
+            self.stdout = EmptyStream()
+            self.stderr = EmptyStream()
+            self._token_place_stdout_tail = [
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","prompt":"secret prompt","chunk":"generated text"}\n',
+                'native loader clue\n',
+            ]
+            self._token_place_stderr_tail = ['stderr clue\n']
+
+        def poll(self):
+            return 9
+
+    created = []
+
+    def _fake_popen(*args, **kwargs):
+        process = FakeProcess(*args, **kwargs)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
+
+    message = str(exc_info.value)
+    assert 'llama_cpp_import subprocess exited before JSON handshake' in message
+    assert 'llama_cpp_import subprocess ended' not in message
+    assert 'exit_code=9' in message
+    assert 'program=' in message
+    assert 'command=' in message
+    assert 'cwd=' in message
+    assert 'import_root=' in message
+    assert 'module_path_hint=' in message
+    assert 'stage=llama_cpp_import' in message
+    assert 'TOKEN_PLACE_LLAMA_CPP_JSON' not in message
+    assert 'secret prompt' not in message
+    assert 'generated text' not in message
+    assert created
+
+
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

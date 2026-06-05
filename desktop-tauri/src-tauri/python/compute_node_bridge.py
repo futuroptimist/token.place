@@ -563,8 +563,16 @@ def run(args: argparse.Namespace) -> int:
         f"device={runtime_setup.get('detected_device', 'cpu')} "
         f"action={runtime_setup.get('runtime_action', 'none')} "
         f"interpreter={runtime_setup.get('interpreter', sys.executable)} "
+        f"python_version={runtime_setup.get('python_version', 'unknown')} "
+        f"prefix={runtime_setup.get('prefix', sys.prefix)} "
+        f"base_prefix={runtime_setup.get('base_prefix', runtime_setup.get('prefix', sys.prefix))} "
+        f"dependency_target={runtime_setup.get('dependency_target', '') or 'none'} "
+        f"pip_version={runtime_setup.get('pip_version', '') or 'unknown'} "
+        f"install_command={runtime_setup.get('install_command', '') or 'none'} "
+        f"cmake_args={runtime_setup.get('cmake_args', '') or 'none'} "
         f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
-        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
+        f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'} "
+        f"install_log_tail={runtime_setup.get('install_log_tail', '') or 'none'}",
         file=sys.stderr,
     )
     dependency_setup = ensure_desktop_python_dependencies()

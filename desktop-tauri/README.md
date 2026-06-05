@@ -46,13 +46,14 @@ During normal startup, desktop sidecars probe the active sidecar interpreter and
 
 Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable runtime bootstrap and keep startup in probe-only mode (useful for packaging/troubleshooting while preserving fallback diagnostics).
 
-When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) and applies the repo-pinned `llama-cpp-python` source-build recipe with the platform flag:
+When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) and applies the repo-pinned `llama-cpp-python` recipe with the platform flag:
 
 - Windows CUDA: `CMAKE_ARGS=-DGGML_CUDA=on`
-- macOS Metal: `CMAKE_ARGS=-DGGML_METAL=on`
-- Both: `FORCE_CMAKE=1` and `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+- macOS Metal source fallback: `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`
+- Both source-build paths: `FORCE_CMAKE=1` and `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+- macOS packaged apps install `llama-cpp-python` into a writable app-managed target (`.token_place_desktop_site`, or `~/.token_place_desktop_site` if the packaged resources are not writable) with `pip --target` instead of writing into `/Library/Developer/CommandLineTools` or another system prefix.
 
-After a successful repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required).
+After a successful repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required). In `auto`/`hybrid`, macOS can explicitly fall back to an importable CPU `llama-cpp-python` wheel if Metal provisioning fails; in explicit `gpu`, Metal failure remains fatal and includes the install command, target, pip/CMake details, and stderr tail in debug logs.
 
 ### Platform runtime expectations
 
@@ -153,10 +154,14 @@ example `.../site-packages/llama_cpp/__init__.py`).
 When this shadowing is detected, the stable runtime action is
 `shadowed_repo_llama_cpp` in both verifier and smoke-test diagnostics.
 
+For packaged macOS failures that mention `/Library/Developer/CommandLineTools/usr/bin/python3`, use the debug-log toggles above and look for the `desktop.runtime_setup` line. It should show the interpreter, Python version, `prefix`/`base_prefix`, writable `dependency_target`, `pip_version`, quoted `install_command`, Metal `cmake_args`, `install_log_tail`, and final `llama_module_path`. If CLT Python lacks pip or build tooling, install Xcode Command Line Tools plus pip/build prerequisites, or set `TOKEN_PLACE_SIDECAR_PYTHON=/path/to/python3` to a Python 3 interpreter with working pip; Start operator retries provisioning on the next launch and does not require reinstalling the app.
+
 It prints:
 
 - Shared runtime probe fields (`backend`, `gpu_offload_supported`,
-  `detected_device`, `interpreter`, `prefix`, `llama_module_path`)
+  `detected_device`, `interpreter`, `python_version`, `prefix`, `base_prefix`,
+  `dependency_target`, `pip_version`, `install_command`, `cmake_args`,
+  `install_log_tail`, `llama_module_path`)
 - `compute_runtime_*` summaries using stable fields
   (`requested`, `effective`, `backend_available`, `backend_used`,
   `device_backend`, `device_name`, `offloaded_layers`, `kv_cache`,

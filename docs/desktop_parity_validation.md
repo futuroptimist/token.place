@@ -102,10 +102,14 @@ python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --mode
 
 ```bash
 # macOS shell on Metal-capable hardware.
-CMAKE_ARGS=-DGGML_METAL=on FORCE_CMAKE=1 python -m pip install --force-reinstall --no-cache-dir llama-cpp-python
+CMAKE_ARGS="-DGGML_METAL=on -DGGML_NATIVE=off" FORCE_CMAKE=1 python -m pip install --force-reinstall --no-cache-dir --no-binary llama-cpp-python llama-cpp-python
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
 python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
 ```
+
+For packaged `.app` validation, open the Prompt-1 debug logs (`TOKEN_PLACE_VERBOSE_SUBPROCESS_LOGS=1` or `TOKEN_PLACE_VERBOSE_LLM_LOGS=1`) before clicking **Start operator**. The macOS `desktop.runtime_setup` line must include `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `install_command`, `cmake_args`, `install_log_tail`, `llama_module_path`, `selected_backend`, and `fallback_reason`. If the interpreter is `/Library/Developer/CommandLineTools/usr/bin/python3`, confirm the app installs into the writable `dependency_target` with `pip --target` and does not attempt to write into the CLT prefix. If CLT Python reports missing pip/build tooling, install/repair Xcode Command Line Tools and pip or launch with `TOKEN_PLACE_SIDECAR_PYTHON=/path/to/python3`; then click **Start operator** again to retry provisioning.
+
+Acceptance on a real Mac is either Metal (`model_init.ready`, `server.registered`, UI `Registered: yes`, and Metal/GPU offload diagnostics) or an explicit `auto`/`hybrid` CPU fallback with `runtime_action=metal_cpu_fallback`, `selected_backend=cpu`, a Metal `fallback_reason`, and `Registered: yes`. Explicit `gpu` must fail closed if Metal cannot be imported/provisioned.
 
 ```bash
 # Explicit CPU fallback check on either platform.

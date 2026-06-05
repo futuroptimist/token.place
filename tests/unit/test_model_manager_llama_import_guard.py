@@ -51,3 +51,21 @@ def test_import_guard_allows_repo_shim_when_real_runtime_not_required(monkeypatc
 
     loaded = model_manager._import_llama_cpp_runtime(require_real_runtime=False)
     assert loaded is fake_module
+
+
+def test_generated_llama_cpp_subprocess_guard_compiles_on_python_311():
+    guard_code = model_manager._llama_cpp_stdlib_guard_code()
+
+    assert "_token_place_bad_origin = _token_place_origin or '<not found>'" in guard_code
+    assert "_token_place_origin or '<not found>'}" not in guard_code
+    compile(guard_code, '<token-place-stdlib-guard>', 'exec')
+    compile(
+        model_manager._llama_cpp_probe_code("print('probe-ok')\n"),
+        '<token-place-llama-probe>',
+        'exec',
+    )
+    compile(
+        model_manager._llama_cpp_runtime_worker_code("print('worker-ok')\n"),
+        '<token-place-llama-worker>',
+        'exec',
+    )

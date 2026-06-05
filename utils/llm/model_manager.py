@@ -348,8 +348,13 @@ def _llama_cpp_stdlib_guard_code() -> str:
         "    _token_place_spec = _token_place_importlib_util.find_spec(_token_place_module)\n"
         "    _token_place_origin = getattr(_token_place_spec, 'origin', None) if _token_place_spec else None\n"
         "    if _token_place_spec is None or not _token_place_is_stdlib(_token_place_origin):\n"
-        "        raise ImportError(f'stdlib module {_token_place_module} shadowed by {_token_place_origin or '<not found>'}')\n"
+        "        _token_place_bad_origin = _token_place_origin or '<not found>'\n"
+        "        raise ImportError(f'stdlib module {_token_place_module} shadowed by {_token_place_bad_origin}')\n"
         "del _token_place_importlib_util, _token_place_sysconfig, _token_place_os\n"
+        "try:\n"
+        "    del _token_place_bad_origin\n"
+        "except NameError:\n"
+        "    pass\n"
     )
 
 def _llama_cpp_probe_code(user_code: str) -> str:

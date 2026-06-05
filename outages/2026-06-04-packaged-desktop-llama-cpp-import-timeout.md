@@ -11,7 +11,7 @@ The operator moved from warm-load to failed/stopped and never reached `Registere
   timed out with `llama_cpp_import_timeout after 30s`.
 - Second failed fix: warm-load reused the desktop probe and selected CUDA, but the no-SIGALRM
   subprocess runtime facade exited before its first import/model-init handshake. The parent only
-  reported the generic `llama_cpp_import subprocess ended`, then `model_init.failed`, with no
+  reported the legacy generic `llama_cpp_import subprocess ended`, then `model_init.failed`, with no
   `server.registered` event and no UI `Registered: yes`.
 
 ## Timeline
@@ -61,14 +61,15 @@ packaged roots.
   child subprocess environments while preserving spaces in paths such as `token.place desktop`.
 - Keep repo-local `llama_cpp.py` shim protection and the desktop probe/import path consistency check.
 - Move facade import/model initialization inside the child JSON error-reporting block.
-- Capture and surface facade early-exit diagnostics: exit code, stdout tail, stderr tail, command,
-  cwd, import root, module-path hint, and stage.
+- Replace the legacy generic EOF marker with the actionable `llama_cpp_import subprocess exited before JSON handshake` diagnostic including exit code, stdout tail, stderr tail, command, cwd, import root, module-path hint, and stage.
+- Intentionally keep `TOKEN_PLACE_LLAMA_CPP_JSON` protocol stdout payloads out of diagnostic tails so prompts, completion chunks, and generated text are not logged by the parent.
 - Keep relay unregister skipped unless API v1 registration succeeded.
 
 ## Prevention tests added
 - Unit coverage for stripping Windows extended path prefixes from runtime-worker env state.
 - Unit coverage for facade child early exit including exit code, stdout tail, stderr tail, import
-  root, module-path hint, and paths with spaces.
+  root, module-path hint, paths with spaces, initial stdin write failures, and protocol stdout
+  redaction.
 - Packaged e2e regression coverage that simulates successful runtime setup plus a facade child that
   exits before its handshake and asserts the failure is actionable rather than a false lifecycle
   success.

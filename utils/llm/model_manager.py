@@ -63,10 +63,16 @@ def _sanitize_subprocess_path_env(env: Dict[str, str], pythonpath_entries: list[
     sanitized = dict(env)
     sanitized_entries = [_subprocess_safe_path_text(entry) for entry in pythonpath_entries]
     sanitized['PYTHONPATH'] = os.pathsep.join(sanitized_entries)
-    for name in ('TOKEN_PLACE_PYTHON_IMPORT_ROOT', 'TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'):
+    for name in (
+        'TOKEN_PLACE_PYTHON_IMPORT_ROOT',
+        'TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT',
+        'TOKEN_PLACE_DESKTOP_PYTHON_ROOT',
+        'TOKEN_PLACE_PROBE_REPO_ROOT',
+    ):
         value = sanitized.get(name)
         if value:
             sanitized[name] = _subprocess_safe_path_text(value)
+    sanitized.setdefault('PYTHONNOUSERSITE', '1')
     return sanitized
 
 
@@ -545,6 +551,35 @@ def _import_llama_cpp_in_parent_with_timeout(
         desktop_runtime_probe=desktop_runtime_probe,
     )
 
+def _llama_subprocess_tail(process: subprocess.Popen, name: str) -> str:
+    value = getattr(process, name, '')
+    if isinstance(value, list):
+        text = ''.join(
+            line for line in value
+            if not str(line).startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
+        )
+    else:
+        text = str(value or '')
+    return text[-2000:].strip()
+
+
+def _format_llama_subprocess_early_exit_detail(process: subprocess.Popen, *, stage: str) -> str:
+    poll = getattr(process, 'poll', None)
+    exit_code = poll() if callable(poll) else None
+    command = getattr(process, '_token_place_command', None)
+    cwd = getattr(process, '_token_place_cwd', None)
+    import_root = getattr(process, '_token_place_import_root', None)
+    module_path_hint = getattr(process, '_token_place_module_path_hint', None)
+    return (
+        f"{stage} subprocess exited before JSON handshake; "
+        f"exit_code={exit_code if exit_code is not None else 'running'} "
+        f"program={sys.executable} command={command or 'unknown'} cwd={cwd or 'unknown'} "
+        f"import_root={import_root or 'unknown'} module_path_hint={module_path_hint or 'unknown'} "
+        f"stage={stage} stdout_tail={_llama_subprocess_tail(process, '_token_place_stdout_tail') or '<empty>'} "
+        f"stderr_tail={_llama_subprocess_tail(process, '_token_place_stderr_tail') or '<empty>'}"
+    )
+
+
 def _read_llama_subprocess_message(
     process: subprocess.Popen,
     *,
@@ -552,27 +587,6 @@ def _read_llama_subprocess_message(
     stage: str,
 ) -> Dict[str, Any]:
     result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
-
-    def _tail(name: str) -> str:
-        value = getattr(process, name, '')
-        if isinstance(value, list):
-            return ''.join(value)[-2000:].strip()
-        return str(value or '')[-2000:].strip()
-
-    def _failure_detail(error: str) -> str:
-        poll = getattr(process, 'poll', None)
-        exit_code = poll() if callable(poll) else None
-        command = getattr(process, '_token_place_command', None)
-        cwd = getattr(process, '_token_place_cwd', None)
-        import_root = getattr(process, '_token_place_import_root', None)
-        module_path_hint = getattr(process, '_token_place_module_path_hint', None)
-        return (
-            f"{error}; exit_code={exit_code if exit_code is not None else 'running'} "
-            f"program={sys.executable} command={command or 'unknown'} cwd={cwd or 'unknown'} "
-            f"import_root={import_root or 'unknown'} module_path_hint={module_path_hint or 'unknown'} "
-            f"stage={stage} stdout_tail={_tail('_token_place_stdout_tail') or '<empty>'} "
-            f"stderr_tail={_tail('_token_place_stderr_tail') or '<empty>'}"
-        )
 
     def _reader() -> None:
         assert process.stdout is not None
@@ -589,7 +603,7 @@ def _read_llama_subprocess_message(
         except Exception:
             pass
         time.sleep(0.05)
-        result_queue.put(json.dumps({'status': 'error', 'error': _failure_detail(f'{stage} subprocess ended')}))
+        result_queue.put(json.dumps({'status': 'error', 'error': _format_llama_subprocess_early_exit_detail(process, stage=stage)}))
 
     reader = threading.Thread(target=_reader, name=f'{stage}_stdout_reader', daemon=True)
     reader.start()
@@ -652,7 +666,12 @@ class _SubprocessLlamaProxy:
         self._process._token_place_stdout_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_tail = []  # type: ignore[attr-defined]
         self._start_stderr_tail_reader()
-        self._send({'method': '__init__', 'args': args, 'kwargs': kwargs})
+        try:
+            self._send({'method': '__init__', 'args': args, 'kwargs': kwargs})
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(
+                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_import')
+            ) from exc
         _read_llama_subprocess_message(
             self._process,
             timeout_seconds=self._timeout_seconds,

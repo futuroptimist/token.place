@@ -621,7 +621,9 @@ def run_llama_cpp_facade_early_exit_diagnostics_probe(
     )
     combined = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0, combined
-    assert "llama_cpp_import subprocess ended" in combined, combined
+    assert "llama_cpp_import subprocess exited before JSON handshake" in combined, combined
+    assert "llama_cpp_import subprocess ended" not in combined, combined
+    assert "registered=true" not in combined, combined
     assert "exit_code=7" in combined, combined
     assert "facade stdout clue before exit" in combined, combined
     assert "facade stderr clue before exit" in combined, combined

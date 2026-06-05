@@ -369,6 +369,12 @@ def _read_file(path: Path) -> str:
         return ""
 
 
+def _assert_no_facade_early_exit_regression(*paths: Path) -> None:
+    combined = "\n".join(_read_file(path) for path in paths)
+    assert "llama_cpp_import subprocess ended" not in combined, combined[-4000:]
+    assert "Running: yes / Registered: no" not in combined, combined[-4000:]
+
+
 def _assert_relay_observed_api_v1_success(relay_stdout: Path, stdout_handle: Any, *, min_turns: int) -> None:
     stdout_handle.flush()
     logs = _read_file(relay_stdout)
@@ -450,6 +456,7 @@ def _run_layout_parity(
     assert restarted.process.returncode == 0, f"bridge restart exited {restarted.process.returncode}: {restarted.log_path}"
     _wait_for_no_registered_nodes(relay_url, layout_label=layout_label)
     _assert_relay_observed_api_v1_success(relay_stdout, relay_stdout_handle, min_turns=4)
+    _assert_no_facade_early_exit_regression(relay_stdout, bridge.log_path, restarted.log_path)
 
 
 def _start_relay(relay_port: int, stdout_path: Path, stderr_path: Path) -> tuple[subprocess.Popen[str], Any, Any]:

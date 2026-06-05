@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-05",
+  "slug": "packaged-desktop-stdlib-shadowing",
+  "summary": "Packaged Windows desktop compute-node startup failed before Registered: yes when stale site-packages pathlib.py shadowed Python 3.11 stdlib pathlib during llama_cpp facade import.",
+  "impact": "Windows CUDA packaged operators could warm-load far enough to select CUDA but fail before relay registration; the shared packaged import path also posed macOS .app parity risk.",
+  "fix": "Kept stdlib roots ahead of site-packages/dist-packages in desktop bootstrap, llama_cpp probes, and subprocess workers; added guarded stdlib shadowing diagnostics; normalized extended Windows paths; and extended packaged e2e to inject polluted pathlib.py while requiring registered=true against a real relay.py for Windows-like and macOS packaged layouts.",
+  "lessons": "PYTHONNOUSERSITE does not protect against stale packages installed in system site-packages. Packaged e2e must emulate polluted interpreter environments and fail unless the real desktop bridge and real relay lifecycle reaches registered=true / Registered: yes."
+}

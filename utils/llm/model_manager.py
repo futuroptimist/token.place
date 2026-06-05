@@ -10,6 +10,7 @@ import sys
 import importlib
 import subprocess
 import queue
+import sysconfig
 import signal
 import threading
 from pathlib import Path
@@ -98,6 +99,96 @@ def _is_repo_llama_cpp_shim(module_path: Any) -> bool:
     return bool(module_compare and shim_compare and module_compare == shim_compare)
 
 
+GUARDED_STDLIB_MODULES = (
+    'collections', 'typing', 'ctypes', 'subprocess', 'json', 'importlib', 'pathlib',
+)
+
+
+def _stdlib_roots_for_import_order() -> list[str]:
+    roots: list[str] = []
+    for key in ('stdlib', 'platstdlib'):
+        value = sysconfig.get_paths().get(key)
+        if not value:
+            continue
+        compare = _canonical_path_for_compare(value)
+        if compare and compare not in roots:
+            roots.append(compare)
+    return roots
+
+
+def _path_is_within_roots(path_text: Any, roots: Iterable[str]) -> bool:
+    compare = _canonical_path_for_compare(path_text)
+    return bool(compare and any(compare == root or compare.startswith(root + os.sep) for root in roots))
+
+
+def _path_mentions_site_packages(path_text: Any) -> bool:
+    normalized = str(path_text or '').replace('\\', '/').lower()
+    return 'site-packages' in normalized or 'dist-packages' in normalized
+
+
+def _harden_stdlib_before_site_packages(*, app_roots: Optional[Iterable[Any]] = None) -> Dict[str, Any]:
+    """Ensure stdlib sys.path entries stay before third-party site-packages entries."""
+    stdlib_roots = _stdlib_roots_for_import_order()
+    app_root_compares = {
+        compare
+        for compare in (_canonical_path_for_compare(root) for root in (app_roots or ()))
+        if compare
+    }
+    app_entries: list[str] = []
+    stdlib_entries: list[str] = []
+    other_entries: list[str] = []
+    site_entries: list[str] = []
+    extended_prefix_entries: list[str] = []
+    seen: set[str] = set()
+
+    def append_once(target: list[str], entry: str) -> None:
+        compare = _canonical_path_for_compare(entry or os.getcwd()) or str(entry)
+        if compare in seen:
+            return
+        target.append(entry)
+        seen.add(compare)
+
+    for raw_entry in sys.path:
+        entry = raw_entry
+        if isinstance(entry, str) and entry.startswith('\\\\?\\'):
+            extended_prefix_entries.append(entry)
+            entry = _strip_windows_extended_path_prefix(entry)
+        if not isinstance(entry, str):
+            append_once(other_entries, str(entry))
+            continue
+        compare = _canonical_path_for_compare(entry or os.getcwd())
+        if compare in app_root_compares:
+            append_once(app_entries, entry)
+        elif _path_mentions_site_packages(entry):
+            append_once(site_entries, entry)
+        elif _path_is_within_roots(entry or os.getcwd(), stdlib_roots):
+            append_once(stdlib_entries, entry)
+        else:
+            append_once(other_entries, entry)
+
+    sys.path[:] = app_entries + stdlib_entries + other_entries + site_entries
+    return {
+        'stdlib_roots': stdlib_roots,
+        'site_entries_moved_after_stdlib': len(site_entries),
+        'extended_prefix_entries_normalized': extended_prefix_entries,
+        'sys_path_count': len(sys.path),
+    }
+
+
+def _verify_stdlib_modules_not_shadowed(modules: Iterable[str] = GUARDED_STDLIB_MODULES) -> Dict[str, str]:
+    origins: Dict[str, str] = {}
+    stdlib_roots = _stdlib_roots_for_import_order()
+    for module_name in modules:
+        spec = importlib.util.find_spec(module_name)
+        origin = str(getattr(spec, 'origin', '') or '')
+        origins[module_name] = origin
+        if not origin or origin in {'built-in', 'frozen'}:
+            continue
+        if _path_mentions_site_packages(origin) and not _path_is_within_roots(origin, stdlib_roots):
+            raise ImportError(f"stdlib module {module_name} shadowed by {origin}")
+    return origins
+
+
 def _runtime_stage_timeout_seconds() -> float:
     raw_value = os.getenv('TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS', '').strip()
     if not raw_value:
@@ -149,9 +240,15 @@ def _sanitize_llama_cpp_import_paths() -> Dict[str, Any]:
             + shim_entries
             + preserved_entries[preferred_index:]
         )
+        harden_diagnostics = _harden_stdlib_before_site_packages(
+            app_roots=[] if (Path(import_root) / 'llama_cpp.py').is_file() else [import_root]
+        )
+        stdlib_origins = _verify_stdlib_modules_not_shadowed()
         return {
             'import_root': import_root,
             'deprioritized_entries': moved,
+            'stdlib_hardened': harden_diagnostics,
+            'stdlib_origins': stdlib_origins,
             'sys_path_count': len(sys.path),
         }
 
@@ -162,7 +259,12 @@ def _llama_cpp_probe_sys_path_entries() -> list[str]:
     cwd_compare = _canonical_path_for_compare(Path.cwd())
     entries: list[str] = []
     seen: set[str] = set()
-    for entry in sys.path:
+    extra_import_paths = os.environ.get('TOKEN_PLACE_LLAMA_CPP_EXTRA_IMPORT_PATHS', '').strip()
+    source_entries = []
+    if extra_import_paths:
+        source_entries.extend(entry for entry in extra_import_paths.split(os.pathsep) if entry.strip())
+    source_entries.extend(sys.path)
+    for entry in source_entries:
         if not isinstance(entry, str):
             continue
         if entry == '':
@@ -191,39 +293,74 @@ def _llama_cpp_probe_env() -> Dict[str, str]:
 
 
 def _llama_cpp_path_prefixed_code(user_code: str, path_source: str) -> str:
-    """Prefix code so cwd/sys.path[0] cannot shadow the runtime."""
+    """Prefix code so cwd/sys.path[0] cannot shadow stdlib or the runtime."""
 
     return (
-        "import json as _token_place_json, os as _token_place_os, sys as _token_place_sys\n"
+        "import importlib.util as _token_place_importlib_util, json as _token_place_json, "
+        "os as _token_place_os, sys as _token_place_sys, sysconfig as _token_place_sysconfig\n"
         f"_token_place_probe_path = _token_place_json.loads({path_source})\n"
-        "_token_place_cwd = _token_place_os.path.normcase("
-        "_token_place_os.path.normpath(_token_place_os.getcwd()))\n"
-        "_token_place_existing = []\n"
-        "for _token_place_entry in _token_place_sys.path:\n"
+        "def _token_place_strip_extended(_token_place_value):\n"
+        "    _token_place_text = str(_token_place_value)\n"
+        "    if _token_place_text.startswith(r'\\\\?\\UNC'):\n"
+        "        return '\\\\' + _token_place_text[8:]\n"
+        "    if _token_place_text.startswith(r'\\\\?' + '\\\\'):\n"
+        "        return _token_place_text[4:]\n"
+        "    return _token_place_text\n"
+        "def _token_place_compare(_token_place_value):\n"
+        "    return _token_place_os.path.normcase(_token_place_os.path.normpath("
+        "_token_place_os.path.abspath(_token_place_strip_extended(_token_place_value))))\n"
+        "def _token_place_is_site(_token_place_value):\n"
+        "    _token_place_lower = str(_token_place_value or '').replace('\\\\', '/').lower()\n"
+        "    return 'site-packages' in _token_place_lower or 'dist-packages' in _token_place_lower\n"
+        "_token_place_stdlib_roots = []\n"
+        "for _token_place_key in ('stdlib', 'platstdlib'):\n"
+        "    _token_place_root = _token_place_sysconfig.get_paths().get(_token_place_key)\n"
+        "    if _token_place_root:\n"
+        "        _token_place_root_compare = _token_place_compare(_token_place_root)\n"
+        "        if _token_place_root_compare not in _token_place_stdlib_roots:\n"
+        "            _token_place_stdlib_roots.append(_token_place_root_compare)\n"
+        "def _token_place_is_stdlib(_token_place_value):\n"
+        "    _token_place_path_compare = _token_place_compare(_token_place_value)\n"
+        "    return any(_token_place_path_compare == _token_place_root or "
+        "_token_place_path_compare.startswith(_token_place_root + _token_place_os.sep) "
+        "for _token_place_root in _token_place_stdlib_roots)\n"
+        "_token_place_cwd = _token_place_compare(_token_place_os.getcwd())\n"
+        "_token_place_entries = []\n"
+        "_token_place_seen = set()\n"
+        "def _token_place_add(_token_place_entry):\n"
         "    if not isinstance(_token_place_entry, str) or not _token_place_entry:\n"
-        "        continue\n"
-        "    _token_place_compare = _token_place_os.path.normcase("
-        "_token_place_os.path.normpath(_token_place_os.path.abspath(_token_place_entry)))\n"
-        "    if _token_place_compare == _token_place_cwd:\n"
-        "        continue\n"
-        "    _token_place_existing.append((_token_place_compare, _token_place_entry))\n"
+        "        return\n"
+        "    _token_place_entry = _token_place_strip_extended(_token_place_entry)\n"
+        "    _token_place_entry_compare = _token_place_compare(_token_place_entry)\n"
+        "    if _token_place_entry_compare == _token_place_cwd or _token_place_entry_compare in _token_place_seen:\n"
+        "        return\n"
+        "    _token_place_entries.append(_token_place_entry)\n"
+        "    _token_place_seen.add(_token_place_entry_compare)\n"
         "if isinstance(_token_place_probe_path, list):\n"
-        "    _token_place_explicit = []\n"
-        "    _token_place_seen = set()\n"
         "    for _token_place_entry in _token_place_probe_path:\n"
-        "        if not isinstance(_token_place_entry, str) or not _token_place_entry:\n"
-        "            continue\n"
-        "        _token_place_compare = _token_place_os.path.normcase("
-        "_token_place_os.path.normpath(_token_place_os.path.abspath(_token_place_entry)))\n"
-        "        if _token_place_compare == _token_place_cwd or _token_place_compare in _token_place_seen:\n"
-        "            continue\n"
-        "        _token_place_explicit.append(_token_place_entry)\n"
-        "        _token_place_seen.add(_token_place_compare)\n"
-        "    _token_place_sys.path[:] = _token_place_explicit + ["
-        "_token_place_entry for _token_place_compare, _token_place_entry in _token_place_existing "
-        "if _token_place_compare not in _token_place_seen]\n"
-        "del _token_place_json, _token_place_os, _token_place_probe_path\n"
-        "del _token_place_cwd, _token_place_existing, _token_place_seen\n"
+        "        _token_place_add(_token_place_entry)\n"
+        "for _token_place_entry in _token_place_sys.path:\n"
+        "    _token_place_add(_token_place_entry)\n"
+        "_token_place_stdlib = []\n"
+        "_token_place_other = []\n"
+        "_token_place_site = []\n"
+        "for _token_place_entry in _token_place_entries:\n"
+        "    if _token_place_is_site(_token_place_entry):\n"
+        "        _token_place_site.append(_token_place_entry)\n"
+        "    elif _token_place_is_stdlib(_token_place_entry):\n"
+        "        _token_place_stdlib.append(_token_place_entry)\n"
+        "    else:\n"
+        "        _token_place_other.append(_token_place_entry)\n"
+        "_token_place_sys.path[:] = _token_place_other + _token_place_stdlib + _token_place_site\n"
+        "for _token_place_module in ('collections', 'typing', 'ctypes', 'subprocess', 'json', 'importlib', 'pathlib'):\n"
+        "    _token_place_spec = _token_place_importlib_util.find_spec(_token_place_module)\n"
+        "    _token_place_origin = str(getattr(_token_place_spec, 'origin', '') or '')\n"
+        "    if _token_place_origin and _token_place_origin not in {'built-in', 'frozen'} and "
+        "_token_place_is_site(_token_place_origin) and not _token_place_is_stdlib(_token_place_origin):\n"
+        "        raise ImportError(f'stdlib module {_token_place_module} shadowed by {_token_place_origin}')\n"
+        "del _token_place_json, _token_place_os, _token_place_probe_path, _token_place_cwd\n"
+        "del _token_place_entries, _token_place_seen, _token_place_stdlib\n"
+        "del _token_place_other, _token_place_site, _token_place_stdlib_roots\n"
         + user_code
     )
 

@@ -352,6 +352,18 @@ def create_fake_llama_cpp_site(tmp_root: Path, layout_label: str) -> tuple[Path,
     )
     return fake_site, fake_init
 
+
+def create_polluted_pathlib_site(tmp_root: Path, layout_label: str) -> tuple[Path, Path]:
+    polluted_site = tmp_root / f"polluted site-packages {layout_label.replace('/', '_')}"
+    polluted_site.mkdir(parents=True, exist_ok=True)
+    pathlib_backport = polluted_site / "pathlib.py"
+    pathlib_backport.write_text(
+        "from collections import Sequence\n",
+        encoding="utf-8",
+    )
+    return polluted_site, pathlib_backport
+
+
 def run_llama_cpp_watchdog_regression_probe(
     tmp_root: Path, *, resources_root: Path | None = None, layout_label: str = "standard resources"
 ) -> None:
@@ -359,6 +371,7 @@ def run_llama_cpp_watchdog_regression_probe(
 
     resources_root = resources_root or (tmp_root / "resources")
     fake_site, fake_init = create_fake_llama_cpp_site(tmp_root, layout_label)
+    polluted_site, polluted_pathlib = create_polluted_pathlib_site(tmp_root, layout_label)
     env = _packaged_env(
         tmp_root,
         resources_root,
@@ -367,6 +380,7 @@ def run_llama_cpp_watchdog_regression_probe(
             "PYTHONPATH": os.pathsep.join(
                 [str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKEN_PLACE_LLAMA_CPP_EXTRA_IMPORT_PATHS": str(polluted_site),
         },
     )
     result = subprocess.run(  # noqa: S603
@@ -400,6 +414,8 @@ def run_llama_cpp_watchdog_regression_probe(
     assert result.returncode == 0, combined
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert Path(payload["module_path"]).resolve() == fake_init.resolve(), combined
+    assert "cannot import name 'Sequence' from 'collections'" not in combined, combined
+    assert str(polluted_pathlib) not in combined, combined
     assert "llama_cpp_import_timeout" not in combined, combined
     assert "llama_cpp import watchdog start" not in combined, combined
 
@@ -560,6 +576,9 @@ def run_compute_bridge_startup_probe(
             "llama_cpp_import_timeout",
             "llama_cpp import watchdog start",
             "Running: yes / Registered: no",
+            "cannot import name 'Sequence' from 'collections'",
+            "site-packages/pathlib.py",
+            "site-packages\\pathlib.py",
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
@@ -595,6 +614,7 @@ def run_llama_cpp_facade_early_exit_diagnostics_probe(
             "PYTHONPATH": os.pathsep.join(
                 [str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKEN_PLACE_LLAMA_CPP_EXTRA_IMPORT_PATHS": str(fake_site),
         },
     )
     result = subprocess.run(  # noqa: S603
@@ -641,6 +661,7 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
 ) -> None:
     resources_root = resources_root or (tmp_root / "resources")
     fake_site, fake_init = create_fake_llama_cpp_site(tmp_root, f"lifecycle {layout_label}")
+    polluted_site, polluted_pathlib = create_polluted_pathlib_site(tmp_root, f"lifecycle {layout_label}")
     fake_model = tmp_root / f"fake model {layout_label.replace('/', '_')}.gguf"
     fake_model.write_bytes(b"GGUF fake packaged bridge regression model")
     output = run_compute_bridge_startup_probe(
@@ -657,9 +678,12 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
             "PYTHONPATH": os.pathsep.join(
                 [str(fake_site), str(resources_root / "python"), str(resources_root)]
             ),
+            "TOKEN_PLACE_LLAMA_CPP_EXTRA_IMPORT_PATHS": str(polluted_site),
         },
     )
     assert str(fake_init) in output, output
+    assert "cannot import name 'Sequence' from 'collections'" not in output, output
+    assert str(polluted_pathlib) not in output, output
 
 
 

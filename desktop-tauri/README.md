@@ -46,13 +46,13 @@ During normal startup, desktop sidecars probe the active sidecar interpreter and
 
 Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable runtime bootstrap and keep startup in probe-only mode (useful for packaging/troubleshooting while preserving fallback diagnostics).
 
-When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) and applies the repo-pinned `llama-cpp-python` source-build recipe with the platform flag:
+When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) and applies the repo-pinned `llama-cpp-python` source-build recipe with the platform flag. Packaged macOS builds install into a writable app-managed dependency target (`.app/Contents/Resources/.token_place_desktop_site`, falling back to `~/.token_place_desktop_site`) instead of trying to write into protected CLT/system Python prefixes.
 
 - Windows CUDA: `CMAKE_ARGS=-DGGML_CUDA=on`
 - macOS Metal: `CMAKE_ARGS=-DGGML_METAL=on`
-- Both: `FORCE_CMAKE=1` and `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+- Both: `FORCE_CMAKE=1` and `pip install --target <desktop-dependency-target> llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose` where applicable
 
-After a successful repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required).
+After a successful GPU repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required). In `auto`/`hybrid`, macOS may explicitly fall back to an importable CPU `llama-cpp-python` runtime if Metal provisioning fails; explicit `gpu` mode keeps Metal failure fatal. Debug logs include interpreter, Python version, prefix/base prefix, dependency target, pip version, install command/CMake flags, output tails, selected backend, fallback reason, and `llama_module_path`.
 
 ### Platform runtime expectations
 

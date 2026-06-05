@@ -53,7 +53,9 @@ Do not make production two-node or round-robin claims until both Windows and mac
 
 - Apple Silicon Mac or another Mac that can run a Metal-capable llama.cpp backend.
 - Xcode Command Line Tools available for local source builds when a wheel is not sufficient.
-- Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
+- Packaged `.app` launches may use the interpreter selected by macOS/Tauri (for example `/Library/Developer/CommandLineTools/usr/bin/python3`). The runtime bootstrap must never install into that protected prefix directly; it installs `llama-cpp-python` into a writable desktop dependency target such as `.app/Contents/Resources/.token_place_desktop_site`, or `~/.token_place_desktop_site` when the packaged resources directory is not writable.
+- Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version. The debug log should include the interpreter, Python version, prefix/base prefix, dependency target, pip version, install command summary, CMake flags, pip/CMake output tail, and resulting `llama_module_path`.
+- In `auto` and `hybrid`, failed Metal provisioning may fall back to an importable CPU `llama-cpp-python` runtime and still register; `backend_selected=cpu`/`fallback_reason` must make the fallback explicit. In explicit `gpu` mode, Metal provisioning failure remains fatal and the operator must stay unregistered/idle so Start can be retried after prerequisites are fixed.
 - Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds.
 
 ### Backend field meanings
@@ -102,10 +104,16 @@ python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --mode
 
 ```bash
 # macOS shell on Metal-capable hardware.
+# First validate the same interpreter that packaged desktop will use. If it is
+# CLT Python and pip/build tooling is missing, install Xcode Command Line Tools
+# (`xcode-select --install`) or use the app-managed dependency target fallback.
+/Library/Developer/CommandLineTools/usr/bin/python3 -m pip --version || true
 CMAKE_ARGS=-DGGML_METAL=on FORCE_CMAKE=1 python -m pip install --force-reinstall --no-cache-dir llama-cpp-python
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
 python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
 ```
+
+For packaged-app hardware validation, open the debug log/console added for packaged desktop launches, start the operator in `auto`, and confirm either `desktop.runtime_setup ... runtime_action=installed_metal_reexec` followed by `model_init.ready`/`server.registered`, or an explicit CPU fallback (`runtime_action=metal_cpu_fallback`, `backend_selected=cpu`) followed by registration. If the log mentions CLT Python without pip/build tooling, fix Xcode Command Line Tools or pip availability and press Start again; no reinstall should be required.
 
 ```bash
 # Explicit CPU fallback check on either platform.

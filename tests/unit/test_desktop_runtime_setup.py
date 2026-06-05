@@ -417,6 +417,98 @@ def test_macos_metal_install_failure_is_fatal_for_gpu(monkeypatch):
     assert message and 'Metal' in message
 
 
+
+def test_macos_packaged_runtime_installs_llama_cpp_into_writable_target_with_spaces(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents' / 'Resources'
+    runtime_root.mkdir(parents=True)
+    probes = iter([
+        _probe(backend='missing', gpu=False, device='none', error="No module named 'llama_cpp'"),
+        _probe(backend='metal', gpu=True, device='metal'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    captured = {}
+
+    def _install(cmd, env, **kwargs):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _install)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=runtime_root)
+
+    target = runtime_root / '.token_place_desktop_site'
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert '--target' in captured['cmd']
+    assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(target)
+    assert 'Token Place.app' in captured['cmd'][captured['cmd'].index('--target') + 1]
+    assert captured['env']['PYTHONPATH'].split(os.pathsep)[0] == str(target)
+
+
+def test_macos_clt_python_missing_llama_cpp_reports_actionable_diagnostics(monkeypatch, tmp_path):
+    class _CltPythonStub(_PlatformStub):
+        executable = '/Library/Developer/CommandLineTools/usr/bin/python3'
+        prefix = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9'
+        base_prefix = prefix
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _CltPythonStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents' / 'Resources'
+    runtime_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: desktop_runtime_setup.RuntimeProbe(
+            backend='missing',
+            gpu_offload_supported=False,
+            detected_device='none',
+            interpreter=_CltPythonStub.executable,
+            prefix=_CltPythonStub.prefix,
+            llama_module_path='missing',
+            error="No module named 'llama_cpp'",
+        ),
+    )
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_python_runtime_diagnostics',
+        lambda dependency_target=None: {
+            'interpreter': _CltPythonStub.executable,
+            'python_version': '3.9.6 (CLT)',
+            'prefix': _CltPythonStub.prefix,
+            'base_prefix': _CltPythonStub.base_prefix,
+            'dependency_target': str(dependency_target or ''),
+            'pip_version': 'pip unavailable: No module named pip',
+        },
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'clang: error: Metal toolchain missing'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=runtime_root)
+
+    assert result['runtime_action'] == 'metal_install_failed'
+    assert '/Library/Developer/CommandLineTools/usr/bin/python3' in result['fallback_reason']
+    assert 'python_version=3.9.6 (CLT)' in result['fallback_reason']
+    assert 'dependency_target=' in result['fallback_reason']
+    assert 'pip=pip unavailable' in result['fallback_reason']
+    assert 'llama_module_path=missing' in result['fallback_reason']
+
 def test_runtime_root_prefers_token_place_python_import_root(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'resources'
     (runtime_root / 'utils').mkdir(parents=True)
@@ -426,6 +518,98 @@ def test_runtime_root_prefers_token_place_python_import_root(monkeypatch, tmp_pa
 
     assert resolved == runtime_root.resolve()
 
+
+
+def test_macos_packaged_runtime_installs_llama_cpp_into_writable_target_with_spaces(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents' / 'Resources'
+    runtime_root.mkdir(parents=True)
+    probes = iter([
+        _probe(backend='missing', gpu=False, device='none', error="No module named 'llama_cpp'"),
+        _probe(backend='metal', gpu=True, device='metal'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    captured = {}
+
+    def _install(cmd, env, **kwargs):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        return True, 'ok'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _install)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=runtime_root)
+
+    target = runtime_root / '.token_place_desktop_site'
+    assert result['runtime_action'] == 'installed_metal_reexec'
+    assert '--target' in captured['cmd']
+    assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(target)
+    assert 'Token Place.app' in captured['cmd'][captured['cmd'].index('--target') + 1]
+    assert captured['env']['PYTHONPATH'].split(os.pathsep)[0] == str(target)
+
+
+def test_macos_clt_python_missing_llama_cpp_reports_actionable_diagnostics(monkeypatch, tmp_path):
+    class _CltPythonStub(_PlatformStub):
+        executable = '/Library/Developer/CommandLineTools/usr/bin/python3'
+        prefix = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9'
+        base_prefix = prefix
+
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _CltPythonStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents' / 'Resources'
+    runtime_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: desktop_runtime_setup.RuntimeProbe(
+            backend='missing',
+            gpu_offload_supported=False,
+            detected_device='none',
+            interpreter=_CltPythonStub.executable,
+            prefix=_CltPythonStub.prefix,
+            llama_module_path='missing',
+            error="No module named 'llama_cpp'",
+        ),
+    )
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_python_runtime_diagnostics',
+        lambda dependency_target=None: {
+            'interpreter': _CltPythonStub.executable,
+            'python_version': '3.9.6 (CLT)',
+            'prefix': _CltPythonStub.prefix,
+            'base_prefix': _CltPythonStub.base_prefix,
+            'dependency_target': str(dependency_target or ''),
+            'pip_version': 'pip unavailable: No module named pip',
+        },
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: (False, 'clang: error: Metal toolchain missing'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('gpu', repo_root=runtime_root)
+
+    assert result['runtime_action'] == 'metal_install_failed'
+    assert '/Library/Developer/CommandLineTools/usr/bin/python3' in result['fallback_reason']
+    assert 'python_version=3.9.6 (CLT)' in result['fallback_reason']
+    assert 'dependency_target=' in result['fallback_reason']
+    assert 'pip=pip unavailable' in result['fallback_reason']
+    assert 'llama_module_path=missing' in result['fallback_reason']
 
 def test_runtime_root_prefers_token_place_python_import_root_with_config_py(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'token-place-root'
@@ -990,10 +1174,9 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
     assert 'utils.llm.model_manager' not in desktop_runtime_setup._PROBE_SNIPPET
     assert 'importlib.import_module("llama_cpp")' in desktop_runtime_setup._PROBE_SNIPPET
     assert captured['cmd'][:2] == [sys.executable, '-c']
-    assert captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)[:2] == [
-        str(PYTHON_MODULE_DIR),
-        str(Path(__file__).resolve().parents[2]),
-    ]
+    pythonpath_entries = captured['env']['PYTHONPATH'].split(desktop_runtime_setup.os.pathsep)
+    assert str(PYTHON_MODULE_DIR) in pythonpath_entries[:3]
+    assert str(Path(__file__).resolve().parents[2]) in pythonpath_entries[:3]
     assert captured['env']['TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT'].endswith(
         'desktop_runtime_setup.py'
     )
@@ -1064,7 +1247,8 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _OkResult())
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
     assert ok is True
-    assert output == 'ok output'
+    assert 'command=python' in output
+    assert 'output_tail=ok output' in output
 
     class _FailResult:
         returncode = 1
@@ -1074,7 +1258,8 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
     assert ok is False
-    assert output == 'real stderr'
+    assert 'returncode=1' in output
+    assert 'real stderr' in output
 
     def _timeout(*_args, **_kwargs):
         raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)
@@ -1082,7 +1267,8 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', _timeout)
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {}, timeout_seconds=12)
     assert ok is False
-    assert output == 'pip install timed out after 12s'
+    assert 'timed out after 12s' in output
+    assert 'command=python' in output
 
 
 def test_runtime_state_tracks_and_clears_source_repair_failures(monkeypatch, tmp_path):

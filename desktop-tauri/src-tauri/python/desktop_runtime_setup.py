@@ -9,6 +9,8 @@ import platform as platform_module
 import subprocess
 import sys
 import time
+
+_REAL_SYS = sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -233,6 +235,8 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
     pythonpath_entries = [str(python_root), str(repo_root)]
+    for dependency_target in _existing_desktop_dependency_targets(repo_root):
+        pythonpath_entries.insert(0, str(dependency_target))
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
@@ -309,6 +313,17 @@ def _probe_runtime(runtime_root: Path) -> RuntimeProbe:
         raise
 
 
+def _command_summary(cmd: list[str]) -> str:
+    return " ".join(str(part) for part in cmd)
+
+
+def _tail_lines(text: str, *, max_lines: int = 40) -> str:
+    lines = (text or "").strip().splitlines()
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
 def _run_pip_install(
     cmd: list[str],
     env: dict[str, str],
@@ -325,12 +340,23 @@ def _run_pip_install(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-        return False, f"pip install timed out after {timeout_seconds}s"
+        return False, (
+            f"command={_command_summary(cmd)} timed out after {timeout_seconds}s; "
+            f"CMAKE_ARGS={env.get('CMAKE_ARGS', '')}; FORCE_CMAKE={env.get('FORCE_CMAKE', '')}"
+        )
 
+    combined = "\n".join(
+        part for part in [(install.stdout or "").strip(), (install.stderr or "").strip()] if part
+    )
+    detail = (
+        f"command={_command_summary(cmd)}; returncode={install.returncode}; "
+        f"CMAKE_ARGS={env.get('CMAKE_ARGS', '')}; FORCE_CMAKE={env.get('FORCE_CMAKE', '')}; "
+        f"output_tail={_tail_lines(combined)}"
+    )
     if install.returncode == 0:
-        return True, (install.stdout or "").strip()
+        return True, detail
 
-    return False, (install.stderr or install.stdout or "").strip()
+    return False, detail
 
 
 def _source_build_repair(requirements_path: Path, backend: str) -> tuple[bool, str]:
@@ -618,6 +644,57 @@ def _resolve_requirements_path(target_root: Path) -> Path:
     return candidates[0]
 
 
+def _existing_desktop_dependency_targets(runtime_root: Path) -> list[Path]:
+    candidates = [
+        _desktop_dependency_target(runtime_root),
+        Path.home() / ".token_place_desktop_site",
+    ]
+    existing: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved)).casefold()
+        if key in seen or not resolved.is_dir():
+            continue
+        seen.add(key)
+        existing.append(resolved)
+    return existing
+
+
+def _python_runtime_diagnostics(dependency_target: Optional[Path] = None) -> Dict[str, str]:
+    diagnostics = {
+        "interpreter": sys.executable,
+        "python_version": _REAL_SYS.version.replace("\n", " "),
+        "prefix": sys.prefix,
+        "base_prefix": getattr(sys, "base_prefix", sys.prefix),
+        "dependency_target": str(dependency_target) if dependency_target else "",
+    }
+    try:
+        pip = subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        diagnostics["pip_version"] = (pip.stdout or pip.stderr or "").strip()
+        diagnostics["pip_returncode"] = str(pip.returncode)
+    except Exception as exc:
+        diagnostics["pip_version"] = "unavailable"
+        diagnostics["pip_returncode"] = "error"
+        diagnostics["pip_error"] = str(exc)
+    return diagnostics
+
+
+def _install_target_args(target_dir: Optional[Path]) -> list[str]:
+    if target_dir is None:
+        return []
+    return ["--target", str(target_dir)]
+
+
 def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] = None) -> Dict[str, str]:
     """Ensure the sidecar interpreter has a GPU-capable runtime when mode prefers GPU."""
 
@@ -704,7 +781,25 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         }
 
     requirements_path = _resolve_requirements_path(target_root)
+    dependency_target, dependency_target_error = _resolve_desktop_dependency_target(target_root)
+    runtime_diagnostics = _python_runtime_diagnostics(dependency_target)
+    if dependency_target is not None:
+        dependency_target_str = str(dependency_target)
+        if dependency_target_str not in _REAL_SYS.path:
+            _REAL_SYS.path.insert(0, dependency_target_str)
+        os.environ["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = dependency_target_str
     last_error = ""
+
+    if dependency_target is None:
+        last_error = (
+            "desktop runtime dependency target unavailable; "
+            f"detail={dependency_target_error or 'no writable target'}; "
+            f"interpreter={runtime_diagnostics['interpreter']}; "
+            f"python_version={runtime_diagnostics['python_version']}; "
+            f"prefix={runtime_diagnostics['prefix']}; "
+            f"base_prefix={runtime_diagnostics['base_prefix']}; "
+            f"pip={runtime_diagnostics.get('pip_version', 'unavailable')}"
+        )
 
     if expected_backend == "cuda":
         should_repair, repair_skip_reason = _should_attempt_source_repair()
@@ -747,12 +842,18 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             continue
         env = os.environ.copy()
         env.update(plan.pip_env())
+        if dependency_target is not None:
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join(
+                part for part in [str(dependency_target), existing_pythonpath] if part
+            )
         cmd = [
             sys.executable,
             "-m",
             "pip",
             "install",
             "--force-reinstall",
+            *_install_target_args(dependency_target),
             *plan.pip_install_args(),
             plan.package_spec,
         ]
@@ -804,17 +905,22 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 f"backend={after.backend} gpu_offload_supported={after.gpu_offload_supported}"
             )
             if plan.backend == "metal":
-                return {
-                    "selected_backend": "cpu",
-                    "fallback_reason": (
-                        f"Metal runtime install completed but follow-up probe did not report "
-                        f"Metal GPU offload; backend={after.backend} "
-                        f"gpu_offload_supported={after.gpu_offload_supported}; "
-                        f"llama_module_path={after.llama_module_path}"
-                    ),
-                    "runtime_action": _install_failure_action(expected_backend),
-                    **_probe_result_payload(after),
-                }
+                last_error = (
+                    f"Metal runtime install completed but follow-up probe did not report "
+                    f"Metal GPU offload; backend={after.backend} "
+                    f"gpu_offload_supported={after.gpu_offload_supported}; "
+                    f"llama_module_path={after.llama_module_path}; "
+                    f"dependency_target={dependency_target or 'unavailable'}; "
+                    f"pip={runtime_diagnostics.get('pip_version', 'unavailable')}"
+                )
+                if selected_mode == "gpu":
+                    return {
+                        "selected_backend": "cpu",
+                        "fallback_reason": last_error,
+                        "runtime_action": _install_failure_action(expected_backend),
+                        **_probe_result_payload(after),
+                    }
+                continue
 
         if plan.backend == "cpu":
             reason = (
@@ -828,11 +934,15 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 **_probe_result_payload(after),
             }
 
-    reason = before.error or last_error or "unable to install a GPU-capable runtime"
+    reason = last_error or before.error or "unable to install a GPU-capable runtime"
     if expected_backend == "metal":
         reason = (
             f"Metal runtime install failed ({reason}); interpreter={before.interpreter}; "
-            f"prefix={before.prefix}; llama_module_path={before.llama_module_path}"
+            f"python_version={runtime_diagnostics.get('python_version', _REAL_SYS.version).replace(chr(10), ' ')}; "
+            f"prefix={before.prefix}; base_prefix={runtime_diagnostics.get('base_prefix', '')}; "
+            f"dependency_target={runtime_diagnostics.get('dependency_target', '') or 'unavailable'}; "
+            f"pip={runtime_diagnostics.get('pip_version', 'unavailable')}; "
+            f"llama_module_path={before.llama_module_path}"
         )
     return {
         "selected_backend": "cpu",

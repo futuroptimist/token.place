@@ -202,6 +202,12 @@ def ensure_runtime_import_paths(
     script_dir = os.path.dirname(script_path)
     script_root = _parent(script_dir)
     explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    explicit_dependency_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
+    dependency_candidates = [
+        _safe_resolve_path_text(explicit_dependency_target) if explicit_dependency_target else None,
+        _join(script_root, ".token_place_desktop_site"),
+        _join(os.path.expanduser("~"), ".token_place_desktop_site"),
+    ]
     candidates = [
         _safe_resolve_path_text(explicit_import_root) if explicit_import_root else None,
         script_root,  # bundled resources root in packaged apps
@@ -217,6 +223,14 @@ def ensure_runtime_import_paths(
         _parent(script_dir, 3),  # repo root in development tree
     ]
 
+    valid_dependency_targets: list[str] = []
+    for candidate in dependency_candidates:
+        if candidate is None or not _is_dir(candidate):
+            continue
+        candidate_str = _safe_resolve_path_text(candidate)
+        if candidate_str not in valid_dependency_targets:
+            valid_dependency_targets.append(candidate_str)
+
     valid_candidates: list[str] = []
     for candidate in candidates:
         if candidate is None or not _path_exists(candidate):
@@ -229,7 +243,7 @@ def ensure_runtime_import_paths(
             if candidate_str not in valid_candidates:
                 valid_candidates.append(candidate_str)
 
-    sys.path[:] = _ordered_sys_path_with_stdlib_first(valid_candidates)
+    sys.path[:] = _ordered_sys_path_with_stdlib_first(valid_dependency_targets + valid_candidates)
 
     if os.environ.get("PYTHONNOUSERSITE") == "1":
         user_site = getattr(site, "USER_SITE", None)

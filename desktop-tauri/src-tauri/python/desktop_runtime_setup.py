@@ -274,7 +274,8 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
     dependency_target, _dependency_target_error = _resolve_desktop_dependency_target(repo_root)
-    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
+    dependency_target_env = str(dependency_target) if dependency_target is not None else ""
+    dependency_target_text = dependency_target_env or "unknown"
     pip_version = _pip_version_summary()
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
@@ -288,7 +289,10 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None) -> RuntimeProbe
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     env["TOKEN_PLACE_DESKTOP_PYTHON_ROOT"] = str(python_root)
     env["TOKEN_PLACE_DESKTOP_BOOTSTRAP_SCRIPT"] = str(_safe_resolve_path(__file__))
-    env["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = dependency_target_text
+    if dependency_target_env:
+        env["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = dependency_target_env
+    else:
+        env.pop("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", None)
     env["TOKEN_PLACE_DESKTOP_PIP_VERSION"] = pip_version
     env["TOKEN_PLACE_PROBE_REPO_ROOT"] = str(repo_root)
     try:
@@ -420,7 +424,9 @@ def _run_pip_install(
     return False, detail
 
 
-def _source_build_repair(requirements_path: Path, backend: str) -> tuple[bool, str]:
+def _source_build_repair(
+    requirements_path: Path, backend: str, dependency_target: Optional[Path] = None
+) -> tuple[bool, str]:
     env = os.environ.copy()
     backend_label = backend.upper()
     if backend == "cuda":
@@ -449,13 +455,23 @@ def _source_build_repair(requirements_path: Path, backend: str) -> tuple[bool, s
         "-m",
         "pip",
         "install",
+        "--disable-pip-version-check",
         "--force-reinstall",
         "--no-cache-dir",
+    ]
+    if dependency_target is not None:
+        dependency_target_text = str(dependency_target)
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            [dependency_target_text, existing_pythonpath] if existing_pythonpath else [dependency_target_text]
+        )
+        cmd.extend(["--target", dependency_target_text])
+    cmd.extend([
         "--no-binary",
         "llama-cpp-python",
         "--verbose",
         package_spec,
-    ]
+    ])
     ok, output = _run_pip_install(cmd, env, timeout_seconds=PIP_SOURCE_BUILD_TIMEOUT_SECONDS)
     if not metadata_warning:
         return ok, output
@@ -469,15 +485,74 @@ def _source_build_repair(requirements_path: Path, backend: str) -> tuple[bool, s
     return ok, "\n".join(lines)
 
 
-def _windows_cuda_source_repair(requirements_path: Path) -> tuple[bool, str]:
-    return _source_build_repair(requirements_path, "cuda")
+def _windows_cuda_source_repair(
+    requirements_path: Path, dependency_target: Optional[Path] = None
+) -> tuple[bool, str]:
+    return _source_build_repair(requirements_path, "cuda", dependency_target)
+
+
+def _run_windows_cuda_source_repair(
+    requirements_path: Path, dependency_target: Optional[Path]
+) -> tuple[bool, str]:
+    try:
+        return _windows_cuda_source_repair(requirements_path, dependency_target)
+    except TypeError as exc:
+        message = str(exc)
+        if "positional" in message or "argument" in message:
+            # Backward-compatible path for tests that monkeypatch
+            # _windows_cuda_source_repair with callables that only accept the
+            # historical requirements_path argument.
+            return _windows_cuda_source_repair(requirements_path)
+        raise
+
+
+def _bounded_error_field(value: str) -> str:
+    text = (value or "").strip()
+    if len(text) <= INSTALL_ERROR_SUMMARY_MAX_LEN:
+        return text
+    return "..." + text[-(INSTALL_ERROR_SUMMARY_MAX_LEN - 3):]
+
+
+def _extract_install_detail(raw: str, field: str) -> str:
+    marker = f"{field}="
+    start = raw.find(marker)
+    if start < 0:
+        return ""
+    start += len(marker)
+    next_field = raw.find("; ", start)
+    value = raw[start:] if next_field < 0 else raw[start:next_field]
+    value = value.strip()
+    if not value or value == "empty":
+        return ""
+    return f"{field}={_bounded_error_field(value)}"
 
 
 def _summarize_install_error(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return "install failed"
-    return text.splitlines()[-1][:INSTALL_ERROR_SUMMARY_MAX_LEN]
+    for field in ("stderr_tail", "stdout_tail"):
+        detail = _extract_install_detail(text, field)
+        if detail:
+            return detail
+    line = text.splitlines()[-1].strip()
+    if len(line) <= INSTALL_ERROR_SUMMARY_MAX_LEN:
+        return line
+    return "..." + line[-(INSTALL_ERROR_SUMMARY_MAX_LEN - 3):]
+
+
+def _runtime_probe_is_importable(probe: RuntimeProbe) -> bool:
+    return probe.backend != "missing" and not probe.error
+
+
+def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional[Path], Optional[str]]:
+    dependency_target, dependency_target_error = _resolve_desktop_dependency_target(runtime_root)
+    if dependency_target is not None:
+        dependency_target_text = str(dependency_target)
+        active_sys_path = getattr(sys, "path", _PROCESS_SYS_PATH)
+        if dependency_target_text not in active_sys_path:
+            active_sys_path.insert(0, dependency_target_text)
+    return dependency_target, dependency_target_error
 
 
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, str]:
@@ -715,6 +790,8 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
     selected_mode = (mode or "auto").strip().lower()
     target_root = _resolve_runtime_root(repo_root=repo_root)
     before = _probe_runtime(target_root)
+    dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
+    dependency_target_text = str(dependency_target) if dependency_target is not None else "unknown"
     if _is_repo_local_llama_module(before.llama_module_path, target_root):
         return {
             "selected_backend": "cpu",
@@ -795,20 +872,12 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         }
 
     requirements_path = _resolve_requirements_path(target_root)
-    dependency_target, dependency_target_error = _resolve_desktop_dependency_target(target_root)
-    if dependency_target is not None:
-        dependency_target_text = str(dependency_target)
-        active_sys_path = getattr(sys, "path", _PROCESS_SYS_PATH)
-        if dependency_target_text not in active_sys_path:
-            active_sys_path.insert(0, dependency_target_text)
-    else:
-        dependency_target_text = "unknown"
     last_error = ""
 
     if expected_backend == "cuda":
         should_repair, repair_skip_reason = _should_attempt_source_repair()
         if should_repair:
-            source_ok, source_log = _windows_cuda_source_repair(requirements_path)
+            source_ok, source_log = _run_windows_cuda_source_repair(requirements_path, dependency_target)
             if source_ok:
                 _clear_source_repair_failure()
                 after = _probe_runtime(target_root)
@@ -934,6 +1003,14 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 continue
 
         if plan.backend == "cpu":
+            if not _runtime_probe_is_importable(after):
+                last_error = (
+                    "CPU runtime install completed but follow-up probe could not import llama_cpp; "
+                    f"backend={after.backend}; error={after.error or 'unknown'}; "
+                    f"llama_module_path={after.llama_module_path}; "
+                    f"dependency_target={dependency_target_text}; pip={after.pip_version}"
+                )
+                continue
             reason = (
                 f"{(expected_backend or 'GPU').upper()} runtime unavailable after bootstrap"
                 f" ({last_error or before.error or 'probe did not report GPU offload'}); using CPU runtime; "

@@ -568,6 +568,11 @@ def run(args: argparse.Namespace) -> int:
         f"base_prefix={runtime_setup.get('base_prefix', 'unknown')} "
         f"dependency_target={runtime_setup.get('dependency_target', 'unknown')} "
         f"pip={runtime_setup.get('pip_version', 'unknown')} "
+        f"install_command={runtime_setup.get('install_command_summary', 'none')} "
+        f"install_backend={runtime_setup.get('install_backend', 'none')} "
+        f"cmake_args={runtime_setup.get('cmake_args', 'none')} "
+        f"pip_stdout_tail={runtime_setup.get('pip_stdout_tail', 'none')} "
+        f"pip_stderr_tail={runtime_setup.get('pip_stderr_tail', 'none')} "
         f"llama_module_path={runtime_setup.get('llama_module_path', 'missing')} "
         f"fallback_reason={runtime_setup.get('fallback_reason') or 'none'}",
         file=sys.stderr,
@@ -704,6 +709,16 @@ def run(args: argparse.Namespace) -> int:
             "llama_module_path": runtime_setup.get("llama_module_path", "missing"),
             "dependency_target": runtime_setup.get("dependency_target", "unknown"),
             "python_version": runtime_setup.get("python_version", "unknown"),
+            "prefix": runtime_setup.get("prefix", runtime_setup.get("interpreter_prefix", "unknown")),
+            "base_prefix": runtime_setup.get("base_prefix", "unknown"),
+            "pip_version": runtime_setup.get("pip_version", "unknown"),
+            "runtime_action": runtime_setup.get("runtime_action", "none"),
+            "runtime_selected_backend": runtime_setup.get("selected_backend", "cpu"),
+            "install_command_summary": runtime_setup.get("install_command_summary"),
+            "install_backend": runtime_setup.get("install_backend"),
+            "cmake_args": runtime_setup.get("cmake_args"),
+            "pip_stdout_tail": runtime_setup.get("pip_stdout_tail"),
+            "pip_stderr_tail": runtime_setup.get("pip_stderr_tail"),
             "model_path": args.model,
             "last_error": current_last_error,
             "warm_load_state": warm_load_state,

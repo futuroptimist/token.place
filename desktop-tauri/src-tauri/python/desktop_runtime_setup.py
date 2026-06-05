@@ -513,7 +513,7 @@ def _bounded_error_field(value: str) -> str:
     return "..." + text[-(INSTALL_ERROR_SUMMARY_MAX_LEN - 3):]
 
 
-def _extract_install_detail(raw: str, field: str) -> str:
+def _extract_install_detail_value(raw: str, field: str) -> str:
     marker = f"{field}="
     start = raw.find(marker)
     if start < 0:
@@ -524,7 +524,35 @@ def _extract_install_detail(raw: str, field: str) -> str:
     value = value.strip()
     if not value or value == "empty":
         return ""
+    return value
+
+
+def _extract_install_detail(raw: str, field: str) -> str:
+    value = _extract_install_detail_value(raw, field)
+    if not value:
+        return ""
     return f"{field}={_bounded_error_field(value)}"
+
+
+def _install_diagnostics_payload(
+    raw: str, *, backend: str = "", cmake_args: str = ""
+) -> Dict[str, str]:
+    text = (raw or "").strip()
+    payload: Dict[str, str] = {}
+    command = _extract_install_detail_value(text, "command")
+    stdout_tail = _extract_install_detail_value(text, "stdout_tail")
+    stderr_tail = _extract_install_detail_value(text, "stderr_tail")
+    if command:
+        payload["install_command_summary"] = _bounded_error_field(command)
+    if stdout_tail:
+        payload["pip_stdout_tail"] = _bounded_error_field(stdout_tail)
+    if stderr_tail:
+        payload["pip_stderr_tail"] = _bounded_error_field(stderr_tail)
+    if backend:
+        payload["install_backend"] = backend
+    if cmake_args:
+        payload["cmake_args"] = cmake_args
+    return payload
 
 
 def _summarize_install_error(raw: str) -> str:
@@ -873,6 +901,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
 
     requirements_path = _resolve_requirements_path(target_root)
     last_error = ""
+    install_diagnostics: Dict[str, str] = {}
 
     if expected_backend == "cuda":
         should_repair, repair_skip_reason = _should_attempt_source_repair()
@@ -880,6 +909,9 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             source_ok, source_log = _run_windows_cuda_source_repair(requirements_path, dependency_target)
             if source_ok:
                 _clear_source_repair_failure()
+                install_diagnostics = _install_diagnostics_payload(
+                    source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
+                )
                 after = _probe_runtime(target_root)
                 if after.gpu_offload_supported and after.backend == "cuda":
                     return {
@@ -887,6 +919,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                         "fallback_reason": "installed CUDA runtime; re-executing sidecar",
                         "runtime_action": "installed_cuda_reexec",
                         **_probe_result_payload(after),
+                        **install_diagnostics,
                     }
                 source_detail = _summarize_install_error(source_log)
                 last_error = (
@@ -897,6 +930,9 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                     last_error = f"{last_error}; source repair detail: {source_detail}"
                 _record_source_repair_failure(last_error)
             else:
+                install_diagnostics = _install_diagnostics_payload(
+                    source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
+                )
                 last_error = _summarize_install_error(source_log)
                 _record_source_repair_failure(last_error)
         else:
@@ -941,6 +977,9 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
             PIP_SOURCE_BUILD_TIMEOUT_SECONDS if plan.no_binary else PIP_INSTALL_TIMEOUT_SECONDS
         )
         ok, log_output = _run_pip_install(cmd, env, timeout_seconds=timeout_seconds)
+        install_diagnostics = _install_diagnostics_payload(
+            log_output, backend=plan.backend, cmake_args=plan.cmake_args or ""
+        )
         if not ok:
             last_error = _summarize_install_error(log_output)
             continue
@@ -971,12 +1010,14 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                         "fallback_reason": reason,
                         "runtime_action": _install_failure_action(expected_backend),
                         **_probe_result_payload(after),
+                        **install_diagnostics,
                     }
             return {
                 "selected_backend": selected_backend,
                 "fallback_reason": reason,
                 "runtime_action": _installed_reexec_action(plan.backend),
                 **_probe_result_payload(after),
+                **install_diagnostics,
             }
 
         if plan.backend in {"cuda", "metal"}:
@@ -998,6 +1039,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                     ),
                     "runtime_action": _install_failure_action(expected_backend),
                     **_probe_result_payload(after),
+                    **install_diagnostics,
                 }
             if plan.backend == "metal":
                 continue
@@ -1022,6 +1064,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
                 "fallback_reason": reason,
                 "runtime_action": _cpu_fallback_action(expected_backend),
                 **_probe_result_payload(after),
+                **install_diagnostics,
             }
 
     reason = last_error or before.error or "unable to install a GPU-capable runtime"
@@ -1037,6 +1080,7 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
         "fallback_reason": reason,
         "runtime_action": _install_failure_action(expected_backend),
         **_probe_result_payload(before),
+        **install_diagnostics,
     }
 
 

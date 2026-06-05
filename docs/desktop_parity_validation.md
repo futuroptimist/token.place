@@ -53,8 +53,10 @@ Do not make production two-node or round-robin claims until both Windows and mac
 
 - Apple Silicon Mac or another Mac that can run a Metal-capable llama.cpp backend.
 - Xcode Command Line Tools available for local source builds when a wheel is not sufficient.
-- Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
-- Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds.
+- Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on -DGGML_NATIVE=off`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
+- Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds. The local packaged e2e covers a fake `.app/Contents/Resources` layout with mock Metal registration and a bounded `gpu` failure path; release sign-off still requires manual Apple Silicon validation with a real Metal-capable runtime.
+- Capture packaged debug logs from app stdout/stderr and preserve `desktop.runtime_setup` plus bridge registration lines. The runtime setup/status payload should show `interpreter`, `python_version`, `prefix`, `base_prefix`, `dependency_target`, `pip_version`, `llama_module_path`, `runtime_action`, and any pip/CMake tails from provisioning.
+- If Apple CLT Python lacks pip or build tooling, install/repair pip for that interpreter or install Xcode Command Line Tools, then rerun the packaged app. The app-managed dependency target is `.token_place_desktop_site`; validation should not require writing packages into the CLT Python prefix.
 
 ### Backend field meanings
 

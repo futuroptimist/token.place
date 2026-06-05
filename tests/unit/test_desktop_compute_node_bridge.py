@@ -3111,3 +3111,67 @@ def test_run_logs_unregister_skip_when_cancelled_before_registration(capsys, mon
     runtime = PreRegistrationCancelRuntime.last_instance
     assert runtime.relay_client.unregister_calls == 0
     assert 'desktop.compute_node_bridge.unregister.skipped' in capsys.readouterr().err
+
+
+def test_runtime_setup_diagnostics_are_logged_and_in_status_without_noisy_last_error(capsys, monkeypatch):
+    _reset_cancel_queue()
+    _install_fake_runtime_module(monkeypatch)
+    runtime_setup = {
+        'selected_backend': 'cpu',
+        'detected_device': 'cpu',
+        'runtime_action': 'metal_cpu_fallback',
+        'interpreter': '/Applications/TokenPlace.app/Contents/Resources/python/bin/python',
+        'python_version': '3.12.4',
+        'prefix': '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
+        'base_prefix': '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
+        'dependency_target': '/Users/alice/Library/Application Support/token.place/.token_place_desktop_site',
+        'pip_version': 'pip 24.0',
+        'install_command_summary': 'python -m pip install --target /deps llama-cpp-python',
+        'install_backend': 'metal',
+        'cmake_args': '-DGGML_METAL=on -DGGML_NATIVE=off',
+        'pip_stdout_tail': 'building wheel',
+        'pip_stderr_tail': 'Metal headers missing',
+        'llama_module_path': '/deps/llama_cpp/__init__.py',
+        'fallback_reason': 'Metal failed; using CPU runtime',
+    }
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_llama_runtime', lambda _mode: runtime_setup)
+    monkeypatch.setattr(compute_node_bridge, 'desktop_gpu_runtime_failure_message', lambda _mode, _setup: None)
+    stop_counter = {'count': 0}
+
+    def fake_stop_requested():
+        stop_counter['count'] += 1
+        return stop_counter['count'] > 2
+
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', fake_stop_requested)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='auto', relay_url='https://token.place', relay_port=None)
+
+    assert compute_node_bridge.run(args) == 0
+
+    output = capsys.readouterr()
+    stderr = output.err
+    assert 'desktop.runtime_setup ' in stderr
+    for marker in (
+        'interpreter=/Applications/TokenPlace.app/Contents/Resources/python/bin/python',
+        'python_version=3.12.4',
+        'prefix=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
+        'base_prefix=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework',
+        'dependency_target=/Users/alice/Library/Application Support/token.place/.token_place_desktop_site',
+        'pip=pip 24.0',
+        'install_command=python -m pip install --target /deps llama-cpp-python',
+        'install_backend=metal',
+        'cmake_args=-DGGML_METAL=on -DGGML_NATIVE=off',
+        'pip_stdout_tail=building wheel',
+        'pip_stderr_tail=Metal headers missing',
+        'llama_module_path=/deps/llama_cpp/__init__.py',
+        'fallback_reason=Metal failed; using CPU runtime',
+    ):
+        assert marker in stderr
+    events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    started = events[0]
+    assert started['last_error'] is None
+    assert started['runtime_action'] == 'metal_cpu_fallback'
+    assert started['base_prefix'].startswith('/Library/Developer')
+    assert started['pip_version'] == 'pip 24.0'
+    assert started['install_command_summary'].startswith('python -m pip install')
+    assert started['cmake_args'] == '-DGGML_METAL=on -DGGML_NATIVE=off'
+    assert started['pip_stderr_tail'] == 'Metal headers missing'

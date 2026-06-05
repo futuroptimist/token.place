@@ -1740,3 +1740,71 @@ def test_record_desktop_runtime_probe_clears_env_when_payload_is_not_serializabl
 
     assert desktop_runtime_setup._record_desktop_runtime_probe(result) is result
     assert desktop_runtime_setup.RUNTIME_PROBE_ENV not in os.environ
+
+
+def test_windows_cuda_already_supported_preserves_runtime_action(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (tmp_path / 'desktop-site', None),
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='cuda', gpu=True, device='cuda'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
+
+    assert result['runtime_action'] == 'already_supported'
+    assert result['selected_backend'] == 'cuda'
+
+
+def test_windows_cuda_bootstrap_uses_cuda_target_without_macos_metal_branch(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (False, 'cooldown'))
+    dependency_target = tmp_path / 'desktop-site'
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (dependency_target, None),
+    )
+    probes = iter([
+        _probe(backend='missing', gpu=False, device='none', error="No module named 'llama_cpp'"),
+        _probe(backend='cuda', gpu=True, device='cuda'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plans = [
+        desktop_runtime_setup.LlamaCppInstallPlan(
+            platform='win32',
+            backend='cuda',
+            package_spec='llama-cpp-python',
+            cmake_args='-DGGML_CUDA=on',
+            force_cmake=True,
+            index_url='https://example.invalid/cuda',
+            only_binary=False,
+            no_binary=True,
+        )
+    ]
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: plans)
+    captured = {}
+
+    def _run(cmd, env, timeout_seconds):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        captured['timeout_seconds'] = timeout_seconds
+        return True, 'command=python -m pip install --target target; returncode=0; stdout_tail=ok; stderr_tail=empty'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _run)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
+
+    assert result['runtime_action'] == 'installed_cuda_reexec'
+    assert result['cmake_args'] == '-DGGML_CUDA=on'
+    assert captured['env']['CMAKE_ARGS'] == '-DGGML_CUDA=on'
+    assert '-DGGML_METAL=on' not in ' '.join(captured['cmd'])
+    assert '--target' in captured['cmd']
+    assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
+    assert result['install_command_summary'].startswith('python -m pip install')

@@ -1,5 +1,13 @@
 name: Desktop operator app e2e
 
+# Cargo occasionally fails on GitHub-hosted runners with curl HTTP/2
+# framing errors while downloading crates during Tauri builds. Disable HTTP
+# multiplexing for this workflow and allow extra retries so transient registry
+# transport failures do not fail the desktop operator e2e job.
+env:
+  CARGO_HTTP_MULTIPLEXING: 'false'
+  CARGO_NET_RETRY: '10'
+
 on:
   pull_request:
     paths:

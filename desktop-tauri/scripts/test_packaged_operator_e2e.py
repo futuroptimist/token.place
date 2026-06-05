@@ -75,6 +75,38 @@ def wait_for_livez(
     )
 
 
+def relay_diagnostics(relay_port: int) -> dict[str, object]:
+    with urlopen(  # noqa: S310
+        f"http://127.0.0.1:{relay_port}/relay/diagnostics",
+        timeout=RELAY_LIVEZ_REQUEST_TIMEOUT_SECONDS,
+    ) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"relay diagnostics returned HTTP {resp.status}")
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def assert_relay_has_registered_compute_node(relay_port: int, *, layout_label: str) -> dict[str, object]:
+    deadline = time.time() + 5
+    last_payload: dict[str, object] | None = None
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            payload = relay_diagnostics(relay_port)
+            last_payload = payload
+            nodes = payload.get("registered_compute_nodes")
+            if isinstance(nodes, list) and nodes:
+                return payload
+        except Exception as exc:  # pragma: no cover - retry loop
+            last_error = exc
+        time.sleep(0.2)
+
+    raise RuntimeError(
+        f"[{layout_label}] bridge reported registered=true but relay diagnostics "
+        f"showed no registered_compute_nodes; last_payload={last_payload}; "
+        f"last_error={last_error}"
+    )
+
+
 def create_packaged_layout(tmp_root: Path, *, resources_dir_name: str = "resources") -> Path:
     resources_root = tmp_root / resources_dir_name
     python_dir = resources_root / "python"
@@ -524,6 +556,9 @@ def run_compute_bridge_startup_probe(
                 ):
                     saw_ready_registered = True
                 if saw_started and saw_ready_registered:
+                    assert_relay_has_registered_compute_node(
+                        relay_port, layout_label=layout_label
+                    )
                     bridge.stdin.write(b'{"type":"cancel"}\n')
                     bridge.stdin.flush()
                     cancel_deadline = time.time() + 5

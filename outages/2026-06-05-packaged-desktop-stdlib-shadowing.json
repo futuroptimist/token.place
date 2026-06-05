@@ -1,0 +1,8 @@
+{
+  "date": "2026-06-05",
+  "slug": "packaged-desktop-stdlib-shadowing",
+  "summary": "Packaged desktop compute-node startup could fail before Registered: yes when a stale third-party pathlib.py in interpreter site-packages shadowed Python 3.11 stdlib pathlib during llama_cpp runtime import.",
+  "impact": "Windows packaged CUDA operators could reach compute-plan selection and Llama init startup but fail warm-load before relay registration, leaving the desktop UI effectively Running: yes / Registered: no; macOS .app packaged resources had the same stdlib-shadowing risk.",
+  "fix": "Repaired packaged desktop runtime import ordering so stdlib paths precede packaged app roots and site-packages, delayed pathlib imports in desktop bridge entrypoints until after path_bootstrap runs, added critical stdlib shadow checks before llama_cpp imports, simulated polluted site-packages in packaged e2e, and required the bridge to reach registered=true against a real relay.py lifecycle.",
+  "lessons": "Packaged desktop e2e must emulate polluted interpreter site-packages and prove relay-observed registration, not just bridge-local status. Startup entrypoints and native-runtime subprocesses must avoid importing shadowable stdlib modules until the shared stdlib-first bootstrap has repaired sys.path."
+}

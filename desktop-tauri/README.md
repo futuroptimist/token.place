@@ -40,19 +40,19 @@ npm run tauri dev
 
 During normal startup, desktop sidecars probe the active sidecar interpreter and, in GPU-capable modes, use platform-specific runtime bootstrap/repair where supported (Windows CUDA and macOS Metal) while preserving shared bridge lifecycle behavior. They emit:
 
-- `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
+- `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason, interpreter, Python version, dependency target, pip/CMake install summary on repair failures)
 - `compute_runtime ...` after `Llama(...)` init (backend actually used, offloaded
   layers, KV cache placement, and fallback reason)
 
 Set `TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP=1` to explicitly disable runtime bootstrap and keep startup in probe-only mode (useful for packaging/troubleshooting while preserving fallback diagnostics).
 
-When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) and applies the repo-pinned `llama-cpp-python` source-build recipe with the platform flag:
+When GPU runtime repair is needed, desktop uses the same interpreter binary that launches the sidecar process (`sys.executable`) but installs into an app-managed writable dependency target (`.token_place_desktop_site`, with a home-directory fallback) instead of the interpreter prefix. This prevents packaged macOS launches from trying to write into `/Library/Developer/CommandLineTools/...` when the sidecar is running under Command Line Tools Python. The repair path applies the repo-pinned `llama-cpp-python` recipe with the platform flag:
 
 - Windows CUDA: `CMAKE_ARGS=-DGGML_CUDA=on`
 - macOS Metal: `CMAKE_ARGS=-DGGML_METAL=on`
-- Both: `FORCE_CMAKE=1` and `pip install llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
+- Both: `FORCE_CMAKE=1` and `python -m pip install --target <app-managed-site> llama-cpp-python==<repo-pinned-version> --force-reinstall --no-cache-dir --verbose`
 
-After a successful repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required).
+After a successful repair, the sidecar automatically re-execs once so the active process immediately uses the repaired runtime (no manual restart/environment flag required). In `auto`/`hybrid`, macOS may fall back to a verified CPU `llama_cpp` install when Metal provisioning fails; in explicit `gpu`, Metal provisioning remains fatal and includes pip/CMake stderr tails and install metadata in debug logs.
 
 ### Platform runtime expectations
 

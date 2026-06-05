@@ -53,8 +53,9 @@ Do not make production two-node or round-robin claims until both Windows and mac
 
 - Apple Silicon Mac or another Mac that can run a Metal-capable llama.cpp backend.
 - Xcode Command Line Tools available for local source builds when a wheel is not sufficient.
-- Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version.
+- Metal-enabled install/repair uses `CMAKE_ARGS=-DGGML_METAL=on`, `FORCE_CMAKE=1`, and the repo-pinned `llama-cpp-python` version. The packaged app installs into the app-managed dependency target reported in `desktop.runtime_setup` (`.token_place_desktop_site` or the home fallback), not into `/Library/Developer/CommandLineTools/...` or another protected interpreter prefix.
 - Validate the packaged `.app` path as well as the development path so `.app/Contents/Resources` uses the same bridge/runtime code as Windows packaged builds.
+- If Command Line Tools Python is selected, confirm `python -m pip --version` works for that interpreter. If pip/build tooling is missing, install Xcode Command Line Tools/Homebrew CMake or use CPU mode until the debug log shows a writable dependency target and successful `import llama_cpp` from that target.
 
 ### Backend field meanings
 
@@ -102,6 +103,7 @@ python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode auto --mode
 
 ```bash
 # macOS shell on Metal-capable hardware.
+python -m pip --version
 CMAKE_ARGS=-DGGML_METAL=on FORCE_CMAKE=1 python -m pip install --force-reinstall --no-cache-dir llama-cpp-python
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model /path/to/model.gguf
 python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
@@ -111,6 +113,15 @@ python desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py
 # Explicit CPU fallback check on either platform.
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode cpu --model /path/to/model.gguf
 ```
+
+### Packaged macOS Start operator validation
+
+1. Build/install the macOS desktop release candidate and start it from Finder so it exercises the packaged `.app/Contents/Resources` layout.
+2. Open the debug log window/log file added for packaged macOS troubleshooting and click **Start operator** with mode `auto`.
+3. Confirm `desktop.runtime_setup` reports the active interpreter, Python version, `prefix`, `base_prefix`, writable `dependency_target`, pip version, install command summary, CMake flags, and resulting `llama_module_path`.
+4. On valid Metal hardware, confirm `model_init.ready`, `server.registered`, and UI `Registered: yes`. If Metal provisioning fails in `auto`, confirm the fallback is explicit (`backend_selected=cpu`/`metal_cpu_fallback`) and registration still reaches `Registered: yes` only after CPU `llama_cpp` imports successfully.
+5. In explicit `gpu`, confirm Metal provisioning failure stays fatal, returns the app to a clean idle/failed state, does not register with the relay, and the log includes the pip/CMake stderr tail plus install target.
+6. Stop the operator, confirm relay diagnostics drops the node or TTL-expires it, then Start again to verify provisioning is retried without reinstalling the app.
 
 ### Staging-only relay validation
 

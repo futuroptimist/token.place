@@ -279,6 +279,26 @@ def test_bootstrap_removes_user_site_and_cwd_shim_while_preserving_packaged_impo
             sys.modules['llama_cpp'] = original_llama_module
 
 
+
+def test_bootstrap_adds_app_managed_dependency_target_before_resource_root(tmp_path, path_bootstrap, monkeypatch):
+    resources_root = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources'
+    script = resources_root / 'python' / 'compute_node_bridge.py'
+    dependency_target = tmp_path / 'Application Support' / 'token.place' / 'python site'
+    (resources_root / 'utils').mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    script.write_text('# bridge\n', encoding='utf-8')
+    dependency_target.mkdir(parents=True)
+    monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', str(dependency_target))
+
+    original_sys_path = list(sys.path)
+    try:
+        path_bootstrap.ensure_runtime_import_paths(str(script), avoid_llama_cpp_shadowing=True)
+        assert str(dependency_target.resolve()) in sys.path
+        assert str(resources_root.resolve()) in sys.path
+        assert sys.path.index(str(dependency_target.resolve())) < sys.path.index(str(resources_root.resolve()))
+    finally:
+        sys.path[:] = original_sys_path
+
 def test_strip_windows_extended_prefix_for_packaged_resource_paths(path_bootstrap):
     assert path_bootstrap._strip_windows_extended_path_prefix(
         r'\\?\C:\Users\danie\AppData\Local\token.place desktop\python\compute_node_bridge.py'

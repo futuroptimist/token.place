@@ -417,6 +417,67 @@ def test_macos_metal_install_failure_is_fatal_for_gpu(monkeypatch):
     assert message and 'Metal' in message
 
 
+
+def test_macos_dependency_target_with_spaces_is_quoted_by_argv_and_pythonpath(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _PlatformStub('darwin'))
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    runtime_root = tmp_path / 'Token Place.app' / 'Contents' / 'Resources'
+    (runtime_root / 'utils').mkdir(parents=True)
+    probes = iter([
+        _probe(backend='cpu', gpu=False, device='cpu', error="No module named 'llama_cpp'"),
+        _probe(backend='metal', gpu=True, device='metal'),
+    ])
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: next(probes))
+    plan = desktop_runtime_setup.LlamaCppInstallPlan(
+        platform='darwin', backend='metal', package_spec='llama-cpp-python==0.3.16',
+        cmake_args='-DGGML_METAL=on -DGGML_NATIVE=off', force_cmake=True,
+        index_url='https://pypi.org/simple', only_binary=False, no_binary=True,
+    )
+    monkeypatch.setattr(desktop_runtime_setup, 'llama_cpp_install_plan_fallbacks', lambda **_kwargs: [plan])
+    captured = {}
+
+    def _capture(cmd, env, **kwargs):
+        captured['cmd'] = cmd
+        captured['env'] = env
+        return True, 'Successfully installed llama-cpp-python'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _capture)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=runtime_root)
+
+    dependency_target = runtime_root / '.token_place_desktop_site'
+    assert result['selected_backend'] == 'metal'
+    assert captured['cmd'][captured['cmd'].index('--target') + 1] == str(dependency_target)
+    assert str(dependency_target) in captured['env']['PYTHONPATH'].split(os.pathsep)
+    assert captured['env']['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == str(dependency_target)
+
+
+def test_windows_cuda_already_supported_does_not_enter_macos_install_paths(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_probe_llama_runtime',
+        lambda **_: _probe(backend='cuda', gpu=True, device='cuda'),
+    )
+    invoked = {'plans': False, 'pip': False}
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        'llama_cpp_install_plan_fallbacks',
+        lambda **_kwargs: invoked.update(plans=True) or [],
+    )
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_run_pip_install',
+        lambda *_args, **_kwargs: invoked.update(pip=True) or (False, 'unexpected'),
+    )
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto')
+
+    assert result['selected_backend'] == 'cuda'
+    assert result['runtime_action'] == 'already_supported'
+    assert invoked == {'plans': False, 'pip': False}
+
 def test_runtime_root_prefers_token_place_python_import_root(monkeypatch, tmp_path):
     runtime_root = tmp_path / 'resources'
     (runtime_root / 'utils').mkdir(parents=True)
@@ -569,8 +630,8 @@ def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stay
     result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=Path.cwd())
 
     assert result['runtime_action'] == 'failed'
-    assert 'source repair detail: final pip status (metadata warning)' in result['fallback_reason']
-    assert 'source repair detail: final pip status (metadata warning)' in captured['reason']
+    assert 'source repair detail: line one | final pip status (metadata warning)' in result['fallback_reason']
+    assert 'source repair detail: line one | final pip status (metadata warning)' in captured['reason']
 
 
 def test_runtime_bootstrap_noop_when_gpu_runtime_is_already_present(monkeypatch):
@@ -1074,7 +1135,7 @@ def test_run_pip_install_success_failure_and_timeout(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'run', lambda *args, **kwargs: _FailResult())
     ok, output = desktop_runtime_setup._run_pip_install(['python'], {})
     assert ok is False
-    assert output == 'real stderr'
+    assert output == 'fallback stdout\nreal stderr'
 
     def _timeout(*_args, **_kwargs):
         raise desktop_runtime_setup.subprocess.TimeoutExpired(cmd='pip', timeout=12)

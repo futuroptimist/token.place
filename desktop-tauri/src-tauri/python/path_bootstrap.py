@@ -202,7 +202,9 @@ def ensure_runtime_import_paths(
     script_dir = os.path.dirname(script_path)
     script_root = _parent(script_dir)
     explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    dependency_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
     candidates = [
+        _safe_resolve_path_text(dependency_target) if dependency_target else None,
         _safe_resolve_path_text(explicit_import_root) if explicit_import_root else None,
         script_root,  # bundled resources root in packaged apps
         _join(
@@ -221,8 +223,10 @@ def ensure_runtime_import_paths(
     for candidate in candidates:
         if candidate is None or not _path_exists(candidate):
             continue
-        has_runtime_modules = _is_dir(_join(candidate, "utils")) or _is_file(
-            _join(candidate, "config.py")
+        has_runtime_modules = (
+            _is_dir(_join(candidate, "utils"))
+            or _is_file(_join(candidate, "config.py"))
+            or candidate == dependency_target
         )
         if has_runtime_modules:
             candidate_str = _safe_resolve_path_text(candidate)

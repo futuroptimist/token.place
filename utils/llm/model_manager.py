@@ -721,6 +721,25 @@ def _llama_cpp_package_parent_from_module_path(module_path: Any) -> Optional[str
     return None
 
 
+def _clear_llama_cpp_module_namespace(reason: str, *, expected_path: Any = None) -> None:
+    """Remove cached llama_cpp modules so a runtime switch cannot reuse stale bindings."""
+
+    stale_names = [
+        name for name in sys.modules
+        if name == 'llama_cpp' or name.startswith('llama_cpp.')
+    ]
+    if not stale_names:
+        return
+    logger.info(
+        "llama_cpp clearing cached module namespace reason=%s expected_path=%s module_count=%s",
+        reason,
+        expected_path or 'unknown',
+        len(stale_names),
+    )
+    for name in stale_names:
+        sys.modules.pop(name, None)
+
+
 def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
     """Make a successful desktop probe durable for the real in-process import."""
 
@@ -737,7 +756,7 @@ def _prepare_llama_cpp_import_from_probe(module_path: Any) -> None:
             loaded_path or 'unknown',
             module_path,
         )
-        sys.modules.pop('llama_cpp', None)
+        _clear_llama_cpp_module_namespace('desktop_probe_path_mismatch', expected_path=module_path)
 
     package_parent = _llama_cpp_package_parent_from_module_path(module_path)
     if not package_parent:
@@ -804,7 +823,7 @@ def _import_llama_cpp_runtime(
         )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
-        sys.modules.pop('llama_cpp', None)
+        _clear_llama_cpp_module_namespace('repo_local_shim_rejected', expected_path=llama_module_path)
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."
@@ -831,7 +850,7 @@ def _import_llama_cpp_runtime(
         and _canonical_path_for_compare(expected_module_path)
         != _canonical_path_for_compare(imported_module_path)
     ):
-        sys.modules.pop('llama_cpp', None)
+        _clear_llama_cpp_module_namespace('desktop_probe_import_mismatch', expected_path=expected_module_path)
         raise ImportError(
             "Desktop runtime probe module path mismatch; refusing mismatched llama_cpp runtime "
             f"desktop_probe_path={expected_module_path} imported_path={imported_module_path}"
@@ -844,7 +863,7 @@ def _import_llama_cpp_runtime(
     )
 
     if require_real_runtime and _is_repo_llama_cpp_shim(llama_module_path):
-        sys.modules.pop('llama_cpp', None)
+        _clear_llama_cpp_module_namespace('repo_local_shim_rejected', expected_path=llama_module_path)
         raise ImportError(
             "Refusing to use repository-local llama_cpp.py shim for runtime inference; "
             "install llama-cpp-python and ensure site-packages wins import priority."

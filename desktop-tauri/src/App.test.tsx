@@ -1189,6 +1189,42 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Relay runtime state:/).textContent).toContain('stopped');
   });
 
+
+  it('renders operator debug log affordances and streams live log lines', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      relay_runtime_state: 'starting',
+      debug_log_path: '/Users/example/Library/Logs/token.place/operator/compute node.log',
+      last_error: 'runtime setup failed',
+    });
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/Debug log:/).textContent).toContain('compute node.log')
+    );
+    expect((screen.getByText('Open debug log') as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByText('Reveal log file') as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByText('Open debug terminal') as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByText('Copy log path') as HTMLButtonElement).disabled).toBe(false);
+
+    const logHandler = eventHandlers.get('compute_node_log');
+    expect(logHandler).toBeTruthy();
+    logHandler?.({
+      payload: {
+        path: '/Users/example/Library/Logs/token.place/operator/compute node.log',
+        line: 'desktop.compute_node.stderr line=desktop_runtime_setup probe failed',
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Operator debug console').textContent).toContain(
+        'desktop_runtime_setup probe failed'
+      )
+    );
+  });
+
   it('marks local inference as failed on emitted error events after start invoke resolves', async () => {
     render(<App />);
     const promptArea = (await screen.findByText('Prompt'))

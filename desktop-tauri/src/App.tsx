@@ -40,6 +40,7 @@ interface ComputeNodeStatus {
   operator_session_id: string | null;
   sequence: number | null;
   updated_at_ms: number | null;
+  debug_log_path: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -81,6 +82,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   operator_session_id: null,
   sequence: null,
   updated_at_ms: null,
+  debug_log_path: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -226,6 +228,7 @@ export function App() {
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
+  const [debugLogLines, setDebugLogLines] = useState<string[]>([]);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const relayRuntimeState = computeStatus.relay_runtime_state || computeStatus.warm_load_state || 'idle';
   const relayRuntimeReady =
@@ -283,6 +286,17 @@ export function App() {
         setStatus('failed');
         setError(payload.message ?? payload.code ?? 'unknown error');
       }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<Record<string, unknown>>('compute_node_log', (evt) => {
+      const line = typeof evt.payload.line === 'string' ? evt.payload.line : null;
+      if (!line) return;
+      setDebugLogLines((prev) => [...prev.slice(-199), line]);
     });
     return () => {
       unlisten.then((f) => f());
@@ -421,6 +435,7 @@ export function App() {
   const startComputeNode = async () => {
     try {
       setIsStartingComputeNode(true);
+      setDebugLogLines([]);
       setError('');
       const optimisticStatus = {
         ...computeStatusRef.current,
@@ -466,6 +481,39 @@ export function App() {
   const stopComputeNode = async () => {
     try {
       await invoke('stop_compute_node');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const openOperatorLog = async () => {
+    try {
+      await invoke('open_operator_log');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const revealOperatorLog = async () => {
+    try {
+      await invoke('reveal_operator_log');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const openOperatorDebugTerminal = async () => {
+    try {
+      await invoke('open_operator_debug_terminal');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const copyDebugLogPath = async () => {
+    if (!computeStatus.debug_log_path) return;
+    try {
+      await navigator.clipboard.writeText(computeStatus.debug_log_path);
     } catch (e) {
       setError(formatErrorMessage(e));
     }
@@ -574,6 +622,19 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
+        <p style={{ marginBottom: 0 }}>Debug log: <code>{computeStatus.debug_log_path || 'not created yet'}</code></p>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+          <button type="button" disabled={!computeStatus.debug_log_path} onClick={openOperatorLog}>Open debug log</button>
+          <button type="button" disabled={!computeStatus.debug_log_path} onClick={revealOperatorLog}>Reveal log file</button>
+          <button type="button" disabled={!computeStatus.debug_log_path} onClick={openOperatorDebugTerminal}>Open debug terminal</button>
+          <button type="button" disabled={!computeStatus.debug_log_path} onClick={copyDebugLogPath}>Copy log path</button>
+        </div>
+        <details style={{ marginTop: 8 }} open={debugLogLines.length > 0}>
+          <summary>Operator debug console</summary>
+          <pre aria-label="Operator debug console" style={{ whiteSpace: 'pre-wrap', maxHeight: 220, overflow: 'auto', padding: 8, border: '1px solid #ddd' }}>
+            {debugLogLines.length > 0 ? debugLogLines.join('\n') : 'No live log lines yet. Use Open debug log after starting the operator to view the persisted log file.'}
+          </pre>
+        </details>
       </section>
 
       <section style={{ marginTop: 14, borderTop: '1px solid #ddd', paddingTop: 12 }}>

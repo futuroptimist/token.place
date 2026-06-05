@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
@@ -41,6 +42,66 @@ struct BridgeResponse {
     ok: bool,
     payload: Option<ModelArtifactInfo>,
     error: Option<String>,
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn macos_terminal_tail_script(log_path: &Path) -> String {
+    let quoted_path = shell_single_quote(&log_path.to_string_lossy());
+    format!(
+        "printf '%s\n' 'token.place operator debug log: {quoted_path}'; tail -n +1 -F {quoted_path}"
+    )
+}
+
+fn current_operator_log_path(state: &AppState) -> Result<PathBuf, String> {
+    let status = state.compute_node.status.blocking_lock();
+    status
+        .debug_log_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "operator debug log is not available yet".to_string())
+}
+
+fn open_path_with_platform(path: &Path, reveal: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        if reveal {
+            command.arg("-R");
+        }
+        command.arg(path);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        if reveal {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        command
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(if reveal {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        });
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("unable to open operator debug log: {err}"))
 }
 
 fn model_bridge_script_candidates(exe_path: Option<&Path>, manifest_dir: &Path) -> Vec<PathBuf> {
@@ -322,6 +383,40 @@ async fn get_compute_node_status(
 }
 
 #[tauri::command]
+fn open_operator_log(state: tauri::State<AppState>) -> Result<(), String> {
+    let path = current_operator_log_path(&state)?;
+    open_path_with_platform(&path, false)
+}
+
+#[tauri::command]
+fn reveal_operator_log(state: tauri::State<AppState>) -> Result<(), String> {
+    let path = current_operator_log_path(&state)?;
+    open_path_with_platform(&path, true)
+}
+
+#[tauri::command]
+fn open_operator_debug_terminal(state: tauri::State<AppState>) -> Result<(), String> {
+    let path = current_operator_log_path(&state)?;
+    #[cfg(target_os = "macos")]
+    {
+        let script = macos_terminal_tail_script(&path);
+        return Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "tell application \"Terminal\" to do script {:?}",
+                script
+            ))
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("unable to open macOS debug terminal: {err}"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        open_path_with_platform(&path, false)
+    }
+}
+
+#[tauri::command]
 fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
     run_model_bridge("inspect")
 }
@@ -347,6 +442,9 @@ pub fn run() {
             start_compute_node,
             stop_compute_node,
             get_compute_node_status,
+            open_operator_log,
+            reveal_operator_log,
+            open_operator_debug_terminal,
             encrypt_and_forward,
             inspect_model_artifact,
             download_model_artifact
@@ -370,6 +468,25 @@ mod tests {
             .find_map(|(env_key, value)| (env_key == key).then_some(value))
             .flatten()
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn shell_single_quote_handles_spaces_and_single_quotes() {
+        assert_eq!(
+            shell_single_quote("/Users/Daniel Smith/Logs/operator's log.txt"),
+            "'/Users/Daniel Smith/Logs/operator'\\''s log.txt'"
+        );
+    }
+
+    #[test]
+    fn macos_terminal_tail_script_quotes_log_paths_with_spaces() {
+        let script = macos_terminal_tail_script(Path::new(
+            "/Users/Daniel Smith/Library/Logs/token.place/operator/current log.txt",
+        ));
+        assert!(script.contains(
+            "tail -n +1 -F '/Users/Daniel Smith/Library/Logs/token.place/operator/current log.txt'"
+        ));
+        assert!(!script.contains("; rm"));
     }
 
     #[test]

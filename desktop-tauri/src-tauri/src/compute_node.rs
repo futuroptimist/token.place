@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
@@ -48,6 +49,7 @@ pub struct ComputeNodeStatus {
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
+    pub debug_log_path: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -58,6 +60,115 @@ pub struct ComputeNodeState {
     pub lifecycle_lock: Arc<Mutex<()>>,
     pub next_session_id: Arc<Mutex<u64>>,
 }
+
+#[derive(Clone)]
+struct OperatorLogFile {
+    path: PathBuf,
+    file: Arc<Mutex<tokio::fs::File>>,
+}
+
+impl OperatorLogFile {
+    async fn create(app: &AppHandle, session_id: &str) -> anyhow::Result<Self> {
+        let log_dir = operator_log_dir(app)?;
+        tokio::fs::create_dir_all(&log_dir).await?;
+        let path = log_dir.join(format!("compute-node-operator-{session_id}.log"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        Ok(Self {
+            path,
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn path_string(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
+    async fn append_line(&self, line: impl AsRef<str>) {
+        let mut file = self.file.lock().await;
+        let _ = file.write_all(line.as_ref().as_bytes()).await;
+        let _ = file.write_all(b"\n").await;
+        let _ = file.flush().await;
+    }
+}
+
+fn operator_log_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    match app.path().app_log_dir() {
+        Ok(path) => Ok(path.join("operator")),
+        Err(_) => Ok(app
+            .path()
+            .app_data_dir()
+            .map_err(|e| anyhow::anyhow!("app data path error: {e}"))?
+            .join("logs")
+            .join("operator")),
+    }
+}
+
+async fn append_operator_log_path(path: Option<String>, line: impl AsRef<str>) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        let _ = file.write_all(line.as_ref().as_bytes()).await;
+        let _ = file.write_all(b"\n").await;
+        let _ = file.flush().await;
+    }
+}
+
+fn emit_operator_log_event(app: &AppHandle, log: &OperatorLogFile, line: &str) {
+    let _ = app.emit(
+        "compute_node_log",
+        serde_json::json!({
+            "path": log.path_string(),
+            "line": line,
+        }),
+    );
+}
+
+async fn write_operator_log_line(app: &AppHandle, log: &OperatorLogFile, line: impl AsRef<str>) {
+    let line = line.as_ref();
+    log.append_line(line).await;
+    emit_operator_log_event(app, log, line);
+}
+
+#[cfg(target_os = "macos")]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_open_debug_terminal_from_env(log_path: &Path) {
+    if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let quoted_path = shell_single_quote(&log_path.to_string_lossy());
+    let script = format!(
+        "printf '%s\n' 'token.place operator debug log: {quoted_path}'; tail -n +1 -F {quoted_path}"
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            "tell application \"Terminal\" to do script {:?}",
+            script
+        ))
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn maybe_open_debug_terminal_from_env(_log_path: &Path) {}
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str::<Value>(line)
@@ -224,6 +335,7 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         operator_session_id: None,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
+        debug_log_path: None,
     }
 }
 
@@ -315,6 +427,9 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     }
     if let Some(operator_session_id) = payload.get("operator_session_id").and_then(Value::as_str) {
         status.operator_session_id = Some(operator_session_id.into());
+    }
+    if let Some(debug_log_path) = payload.get("debug_log_path").and_then(Value::as_str) {
+        status.debug_log_path = Some(debug_log_path.into());
     }
     if let Some(sequence) = payload.get("sequence").and_then(Value::as_u64) {
         status.sequence = Some(sequence);
@@ -410,6 +525,7 @@ fn finalize_bridge_exit(
             "operator_session_id": expected_session_id,
             "sequence": sequence,
             "updated_at_ms": updated_at_ms,
+            "debug_log_path": status.debug_log_path.clone(),
         })
     })
 }
@@ -417,12 +533,18 @@ fn finalize_bridge_exit(
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
+    app: Option<AppHandle>,
+    log: Option<OperatorLogFile>,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
+        let log_line = format!("desktop.compute_node.stderr line={line}");
+        if let (Some(app), Some(log)) = (app.as_ref(), log.as_ref()) {
+            write_operator_log_line(app, log, &log_line).await;
+        }
         if filter.should_emit(&line) {
-            eprintln!("desktop.compute_node.stderr line={line}");
+            eprintln!("{log_line}");
         }
     }
     Ok(())
@@ -500,6 +622,9 @@ pub async fn start_compute_node(
         *next_session_id += 1;
         next_session_id.to_string()
     };
+    let operator_log = OperatorLogFile::create(&app, &session_id)
+        .await
+        .map_err(|err| anyhow::anyhow!("unable to create operator debug log: {err}"))?;
     let exe_path = std::env::current_exe().ok();
     let resource_dir = app.path().resource_dir().ok();
     let (selected_resource_root, selected_layout) = describe_resource_layout(
@@ -515,16 +640,20 @@ pub async fn start_compute_node(
         .get_program()
         .to_string_lossy()
         .into_owned();
-    eprintln!(
-        "desktop.compute_node.session.start operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} cancellation_token_reset=true",
+    let session_start_line = format!(
+        "desktop.compute_node.session.start operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={} debug_log_path={} cancellation_token_reset=true",
         session_id,
         sanitize_relay_target(&request.relay_base_url),
         bridge_script,
         interpreter,
         selected_resource_root.display(),
         selected_layout,
-        import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
+        import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into()),
+        operator_log.path.display()
     );
+    eprintln!("{session_start_line}");
+    write_operator_log_line(&app, &operator_log, session_start_line).await;
+    maybe_open_debug_terminal_from_env(&operator_log.path);
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
 
@@ -550,9 +679,20 @@ pub async fn start_compute_node(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
                 );
+                status.operator_session_id = Some(session_id.clone());
+                status.debug_log_path = Some(operator_log.path_string());
                 *state.child.lock().await = None;
                 *state.stdin.lock().await = None;
             }
+            write_operator_log_line(
+                &app,
+                &operator_log,
+                format!(
+                    "desktop.compute_node.spawn_failure operator_session_id={} error={err}",
+                    session_id
+                ),
+            )
+            .await;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
     };
@@ -581,11 +721,12 @@ pub async fn start_compute_node(
         {
             false
         } else {
-            eprintln!(
+            let spawned_line = format!(
                 "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
                 session_id,
                 sanitize_relay_target(&request.relay_base_url)
             );
+            eprintln!("{spawned_line}");
             *child_slot = pending_child.take();
             let mut stdin_slot = state.stdin.lock().await;
             *stdin_slot = pending_stdin.take();
@@ -611,10 +752,24 @@ pub async fn start_compute_node(
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
+                debug_log_path: Some(operator_log.path_string()),
             };
             true
         }
     };
+
+    if installed {
+        write_operator_log_line(
+            &app,
+            &operator_log,
+            format!(
+                "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
+                session_id,
+                sanitize_relay_target(&request.relay_base_url)
+            ),
+        )
+        .await;
+    }
 
     if !installed {
         if let Some(mut abandoned_stdin) = pending_stdin.take() {
@@ -629,9 +784,20 @@ pub async fn start_compute_node(
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
+    let stderr_app = app.clone();
+    let stderr_log = operator_log.clone();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_compute_node_stderr(stderr, log_policy).await {
-            eprintln!("desktop.compute_node.stderr_error error={err}");
+        if let Err(err) = drain_compute_node_stderr(
+            stderr,
+            log_policy,
+            Some(stderr_app.clone()),
+            Some(stderr_log.clone()),
+        )
+        .await
+        {
+            let line = format!("desktop.compute_node.stderr_error error={err}");
+            eprintln!("{line}");
+            write_operator_log_line(&stderr_app, &stderr_log, line).await;
         }
     });
 
@@ -639,8 +805,20 @@ pub async fn start_compute_node(
     let mut saw_error_event = false;
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
+        write_operator_log_line(
+            &app,
+            &operator_log,
+            format!("desktop.compute_node.stdout line={line}"),
+        )
+        .await;
         match parse_compute_node_event_line(&line) {
-            Ok(payload) => {
+            Ok(mut payload) => {
+                if let Some(payload_object) = payload.as_object_mut() {
+                    payload_object.insert(
+                        "debug_log_path".into(),
+                        Value::String(operator_log.path_string()),
+                    );
+                }
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
                     if event_type == "error" {
                         saw_error_event = true;
@@ -658,16 +836,20 @@ pub async fn start_compute_node(
                 app.emit("compute_node_event", payload)?;
             }
             Err(err) => {
-                eprintln!(
+                let parse_line = format!(
                     "desktop.compute_node.stdout_parse_error error={} line={}",
                     err, line
                 );
+                eprintln!("{parse_line}");
+                write_operator_log_line(&app, &operator_log, parse_line).await;
             }
         }
     }
 
     if let Err(err) = stderr_task.await {
-        eprintln!("desktop.compute_node.stderr_task_join_error error={err}");
+        let line = format!("desktop.compute_node.stderr_task_join_error error={err}");
+        eprintln!("{line}");
+        write_operator_log_line(&app, &operator_log, line).await;
     }
 
     let running_child = {
@@ -683,6 +865,16 @@ pub async fn start_compute_node(
 
     if let Some(mut running_child) = running_child {
         let exit_status = running_child.wait().await?;
+        write_operator_log_line(
+            &app,
+            &operator_log,
+            format!(
+                "desktop.compute_node.bridge_process_exited operator_session_id={} status={}",
+                session_id,
+                bridge_exit_status_label(exit_status)
+            ),
+        )
+        .await;
         let exit_payload = {
             let mut status = state.status.lock().await;
             finalize_bridge_exit(
@@ -716,20 +908,30 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let stop_session_id = state.status.lock().await.operator_session_id.clone();
-    eprintln!(
+    let (stop_session_id, stop_log_path) = {
+        let status = state.status.lock().await;
+        (
+            status.operator_session_id.clone(),
+            status.debug_log_path.clone(),
+        )
+    };
+    let stop_line = format!(
         "desktop.compute_node.stop_requested operator_session_id={}",
         stop_session_id.as_deref().unwrap_or("unknown")
     );
+    eprintln!("{stop_line}");
+    append_operator_log_path(stop_log_path.clone(), stop_line).await;
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
         stdin_lock.take()
     };
     if let Some(stdin) = stdin_handle.as_mut() {
-        eprintln!(
+        let cancel_line = format!(
             "desktop.compute_node.cancel_requested operator_session_id={}",
             stop_session_id.as_deref().unwrap_or("unknown")
         );
+        eprintln!("{cancel_line}");
+        append_operator_log_path(stop_log_path.clone(), cancel_line).await;
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
     }
@@ -754,21 +956,27 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         }
 
         if !exited {
-            eprintln!(
+            let kill_line = format!(
                 "desktop.compute_node.bridge_kill_requested operator_session_id={}",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            eprintln!("{kill_line}");
+            append_operator_log_path(stop_log_path.clone(), kill_line).await;
             let _ = child.kill().await;
             let _ = child.wait().await;
-            eprintln!(
+            let exited_line = format!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            eprintln!("{exited_line}");
+            append_operator_log_path(stop_log_path.clone(), exited_line).await;
         } else {
-            eprintln!(
+            let exited_line = format!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=false",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            eprintln!("{exited_line}");
+            append_operator_log_path(stop_log_path.clone(), exited_line).await;
         }
     }
 
@@ -924,9 +1132,14 @@ mod tests {
         .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
-        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
-            .await
-            .expect("drain stderr");
+        drain_compute_node_stderr(
+            stderr,
+            SubprocessLogPolicy { verbose_raw: true },
+            None,
+            None,
+        )
+        .await
+        .expect("drain stderr");
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
     }

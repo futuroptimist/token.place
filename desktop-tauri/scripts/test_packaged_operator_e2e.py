@@ -656,6 +656,18 @@ def run_compute_bridge_startup_probe(
         )
         for marker in forbidden_output:
             assert marker not in bridge_output, bridge_output
+        log_file.write_text(bridge_output, encoding="utf-8")
+        assert log_file.exists(), f"[{layout_label}] packaged operator log was not written: {log_file}"
+        persisted_log = log_file.read_text(encoding="utf-8")
+        expected_log_markers = (
+            "desktop.compute_node_bridge",
+            "desktop.runtime_setup",
+            "desktop.inference.summary",
+        )
+        assert any(marker in persisted_log for marker in expected_log_markers), (
+            f"[{layout_label}] packaged operator log did not contain expected bridge stderr "
+            f"diagnostic markers; log_file={log_file}; output={persisted_log[-4000:]}"
+        )
         return bridge_output
     finally:
         log_file.write_text(bridge_output, encoding="utf-8")

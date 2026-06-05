@@ -180,3 +180,38 @@ It prints:
   Pass means desktop-side diagnostics and `compute_node_bridge.py` `started` events both report
   CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
   startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.
+
+## macOS packaged operator debug logs
+
+Packaged desktop operator sessions persist a per-session debug log in the app log directory. On macOS this is under:
+
+```text
+~/Library/Logs/place.token.desktop/operator/compute-node-operator-<operator_session_id>.log
+```
+
+The exact path is shown in the desktop UI as **Debug log** after an operator start creates the session. The log mirrors the operator bridge lines that are otherwise visible in a developer terminal on Windows, including:
+
+- `desktop.compute_node.session.start` with the sanitized relay target, `operator_session_id`, selected bridge, interpreter, resource root, layout, import root, and debug log path.
+- `desktop.compute_node.stderr line=...` output from `compute_node_bridge.py`, including `desktop_runtime_setup` probe/provision diagnostics.
+- `desktop.compute_node.stdout line=...` bridge status events for warm-load, registration, polling, request/response lifecycle metadata, cancel, unregister, and cleanup.
+- `desktop.compute_node.bridge_process_exited` and stop/cancel/kill diagnostics.
+
+The log is intended for safe operational metadata. Do not add plaintext prompts, model responses, tool arguments, private keys, or decrypted relay payloads to these logs. Public key fingerprints and sanitized relay hostnames are acceptable.
+
+### Opening the log on macOS
+
+Use one of the opt-in desktop controls in the **Compute node operator** panel:
+
+- **Open debug log** opens the current persisted log file.
+- **Reveal log file** shows it in Finder.
+- **Open debug terminal** opens Terminal.app tailing the current log with a read-only `tail -n +1 -F` command.
+- **Copy log path** copies the exact path for bug reports.
+- **Operator debug console** shows live in-app log lines for users who do not want Terminal.app to open.
+
+For manual validation of packaged macOS builds, launch the app with this environment variable to automatically open the debug terminal when the operator session starts:
+
+```bash
+TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1 open -a "token.place desktop"
+```
+
+If **Start operator** fails, capture the **Last error** field plus the debug log lines around `desktop.compute_node.session.start`, `desktop_runtime_setup`, `llama_module_path`, `interpreter`, `prefix`, `registration`, and `bridge_process_exited`. Stop the operator before collecting final logs so cancel/unregister/cleanup lines are included.

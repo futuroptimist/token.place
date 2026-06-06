@@ -132,6 +132,12 @@ def _relay_server_token_is_valid() -> bool:
     return any(secrets.compare_digest(candidate, token) for token in tokens)
 
 
+def _relay_server_token_boundary_has_configured_token() -> bool:
+    """Return True only when this request matched an explicit relay token."""
+
+    return bool(_load_relay_server_registration_tokens()) and _relay_server_token_is_valid()
+
+
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     """Return True when a route should not consume the public API quota."""
 
@@ -190,22 +196,20 @@ def _control_plane_limits_from_env() -> dict[str, dict[str, Any]]:
 
 
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
-    if isinstance(data, dict):
-        if path in {
-            "/api/v1/relay/servers/register",
-            "/api/v1/relay/servers/unregister",
-            "/api/v1/relay/servers/poll",
-        }:
-            server_public_key = data.get("server_public_key")
-            if isinstance(server_public_key, str) and server_public_key.strip():
-                return "server_public_key", server_public_key.strip()
-        if path == "/api/v1/relay/responses":
-            client_public_key = data.get("client_public_key")
-            request_id = data.get("request_id")
-            if isinstance(client_public_key, str) and client_public_key.strip():
-                return "client_public_key", client_public_key.strip()
-            if isinstance(request_id, str) and request_id.strip():
-                return "request_id", request_id.strip()
+    if path == "/api/v1/relay/responses":
+        # Response envelopes are validated by relay.py after this before_request hook.
+        # Keep response budgeting IP-only here so malformed JSON cannot spoof-limit
+        # a victim client_public_key/request_id before envelope validation runs.
+        return "client_ip", get_remote_address()
+
+    if isinstance(data, dict) and path in {
+        "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/servers/poll",
+    }:
+        server_public_key = data.get("server_public_key")
+        if isinstance(server_public_key, str) and server_public_key.strip():
+            return "server_public_key", server_public_key.strip()
     return "client_ip", get_remote_address()
 
 
@@ -344,9 +348,10 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         ]
 
         # Only charge high-cardinality identity buckets after passing the same
-        # token boundary as relay.py. Invalid token attempts stay keyed to client
-        # IP so callers cannot spoof a victim server/client bucket.
-        if _relay_server_token_is_valid():
+        # configured-token boundary as relay.py. Invalid-token and tokenless
+        # anonymous requests stay keyed to client IP so callers cannot spoof a
+        # victim server/client bucket before relay.py validates the request.
+        if _relay_server_token_boundary_has_configured_token():
             data = request.get_json(silent=True)
             identity_kind, identity_value = _control_plane_identity_for_request(
                 route, data

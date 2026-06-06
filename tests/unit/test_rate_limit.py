@@ -5,7 +5,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from flask import Flask
+from flask import Flask, request as flask_request
 
 from api import (
     _check_control_plane_limits,
@@ -373,8 +373,13 @@ def test_api_v1_relay_client_read_routes_do_not_inherit_public_quota():
     },
     clear=True,
 )
-def test_control_plane_routes_use_server_key_bucket_not_public_quota():
+def test_control_plane_routes_use_server_key_bucket_not_public_quota(monkeypatch):
     """Compute nodes behind one IP should not collide in the user API bucket."""
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["relay-token"]),
+    )
     app = Flask(__name__)
     init_app(app)
 
@@ -544,7 +549,7 @@ def test_invalid_relay_tokens_do_not_burn_server_identity_quota(monkeypatch):
         "API_RATE_LIMIT": "100/hour",
         "API_DAILY_QUOTA": "1000/day",
         "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT": "2/hour",
-        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "100/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "2/hour",
         "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
     },
     clear=True,
@@ -570,6 +575,7 @@ def test_invalid_relay_response_tokens_do_not_burn_client_identity_quota(monkeyp
                 "/api/v1/relay/responses",
                 json=payload,
                 headers={"X-Relay-Server-Token": "wrong-token"},
+                environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
             )
             for _ in range(2)
         ]
@@ -578,11 +584,65 @@ def test_invalid_relay_response_tokens_do_not_burn_client_identity_quota(monkeyp
                 "/api/v1/relay/responses",
                 json=payload,
                 headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": "192.0.2.11"},
             )
             for _ in range(3)
         ]
 
     assert [response.status_code for response in invalid_attempts] == [200, 200]
+    assert [response.status_code for response in valid_attempts] == [200, 200, 429]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "100/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT": "2/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "2/hour",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
+    },
+    clear=True,
+)
+def test_malformed_relay_responses_do_not_burn_victim_response_bucket(monkeypatch):
+    """Malformed response bodies cannot spoof-limit a victim client/request id."""
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["relay-token"]),
+    )
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/responses")
+    def relay_responses():
+        data = flask_request.get_json(silent=True) or {}
+        if "ciphertext" not in data:
+            return {"error": "malformed encrypted response envelope"}, 400
+        return {"status": "queued"}
+
+    victim_fields = {"client_public_key": "client-a", "request_id": "request-a"}
+    with app.test_client() as client:
+        malformed_attempts = [
+            client.post(
+                "/api/v1/relay/responses",
+                json=victim_fields,
+                headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+            )
+            for _ in range(2)
+        ]
+        valid_attempts = [
+            client.post(
+                "/api/v1/relay/responses",
+                json={**victim_fields, "ciphertext": f"sealed-{index}"},
+                headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": "192.0.2.11"},
+            )
+            for index in range(3)
+        ]
+
+    assert [response.status_code for response in malformed_attempts] == [400, 400]
     assert [response.status_code for response in valid_attempts] == [200, 200, 429]
 
 
@@ -683,8 +743,13 @@ def test_control_plane_identity_race_does_not_hit_aggregate_ip_bucket():
     },
     clear=True,
 )
-def test_identity_limited_rejections_do_not_burn_ip_quota():
+def test_identity_limited_rejections_do_not_burn_ip_quota(monkeypatch):
     """Identity-bucket 429s should roll back any aggregate-IP hit."""
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["relay-token"]),
+    )
     app = Flask(__name__)
     init_app(app)
 
@@ -749,11 +814,16 @@ def test_control_plane_limiter_only_applies_to_post_methods():
 
 @patch.dict(
     os.environ,
-    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "1000/day"},
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT": "100/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "2/hour",
+    },
     clear=True,
 )
-def test_tokenless_control_plane_mutations_do_not_use_public_quota():
-    """Tokenless relay deployments keep the separate control-plane budget."""
+def test_tokenless_control_plane_mutations_use_ip_only_control_budget():
+    """Tokenless relay deployments stay off public quota without spoofable keys."""
     app = Flask(__name__)
     init_app(app)
 
@@ -765,12 +835,12 @@ def test_tokenless_control_plane_mutations_do_not_use_public_quota():
         responses = [
             client.post(
                 "/api/v1/relay/servers/register",
-                json={"server_public_key": "server-1"},
+                json={"server_public_key": f"spoofable-server-{index}"},
             )
-            for _ in range(3)
+            for index in range(3)
         ]
 
-    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert [response.status_code for response in responses] == [200, 200, 429]
 
 
 @patch.dict(

@@ -3414,6 +3414,38 @@ def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(m
 
 
 @patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_logs_control_plane_429_diagnostic(mock_post, caplog):
+    client = _standalone_relay_client()
+    client._registration_token = 'super-secret-token'
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+
+    response = MagicMock(status_code=429)
+    response.headers = {
+        'content-type': 'application/json',
+        'retry-after': '41',
+    }
+    response.json.return_value = {
+        'error': {
+            'code': 'rate_limit_exceeded',
+            'message': 'Rate limit exceeded. Try again in 41 seconds.',
+            'type': 'rate_limit_error',
+        }
+    }
+    mock_post.return_value = response
+
+    with caplog.at_level('ERROR', logger='relay_client'):
+        result = client.unregister_from_relay()
+
+    assert result is False
+    assert client._unregister_complete is False
+    assert 'relay_control_plane_rate_limited' in caplog.text
+    assert 'path=/api/v1/relay/servers/unregister' in caplog.text
+    assert 'retry_after=41' in caplog.text
+    assert 'super-secret-token' not in caplog.text
+
+
+@patch('utils.networking.relay_client.requests.post')
 def test_start_after_unregister_clears_stale_registration_and_polls_cleanly(mock_post):
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')

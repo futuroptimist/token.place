@@ -893,7 +893,13 @@ class RelayClient:
                     continue
 
                 failed_relays.add(candidate_url)
-                last_error = f"HTTP {response.status_code}"
+                diagnostic = self._api_v1_non_200_diagnostic(
+                    response,
+                    method="POST",
+                    url=unregister_url,
+                    token_sent=bool(headers),
+                )
+                last_error = f"HTTP {diagnostic['status_code']}"
                 log_error(
                     "Failed to unregister compute node from {}: {}",
                     candidate_url,
@@ -1087,6 +1093,7 @@ class RelayClient:
         retry_after = headers.get("retry-after")
         control_plane_paths = {
             "/api/v1/relay/servers/register",
+            "/api/v1/relay/servers/unregister",
             "/api/v1/relay/servers/poll",
             "/api/v1/relay/responses",
         }

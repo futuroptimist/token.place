@@ -177,6 +177,49 @@ Before release sign-off or production round-robin messaging, record:
 
 If any item is unavailable because CI, staging, GPU hardware, signing, or network access is missing, mark it as a release blocker or an explicitly accepted preview limitation. Do not silently downgrade platform parity expectations.
 
+## macOS packaged operator debug logs
+
+Packaged macOS launches do not attach to a developer terminal by default, so the
+compute-node operator persists each Start session to an app-local debug log. The
+Tauri status includes `log_file_path`, and the desktop UI exposes opt-in buttons
+for:
+
+- **Open debug log**: opens an in-app read-only console showing the current log
+  tail with a copy button.
+- **Copy log path**: copies the current session log path for support notes or shell commands.
+- **Reveal log file**: reveals the log in Finder (or the equivalent file manager
+  on other platforms).
+- **Open debug terminal**: opens a terminal tailing the current log. On macOS the
+  app uses Terminal.app with a read-only `tail -n 200 -F` command and quotes the
+  log path so spaces in `~/Library/Logs/...` work.
+
+The macOS log is created under the app log directory in an `operator/` subfolder,
+with timestamped per-session names like `compute-node-<operator_session_id>-<timestamp>.log`. The log starts with the
+operator session id, sanitized relay target, requested mode, bridge path,
+interpreter, resource root, packaged layout, and import root. It then mirrors
+bridge stdout/stderr, `desktop_runtime_setup` probe/provision output,
+`model_manager` warm-load output, registration/poll/request/response lifecycle
+lines, and stop/cancel/unregister cleanup lines.
+
+For manual validation, set `TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1` before
+launching the packaged app if you want the terminal tail to open automatically
+when Start operator creates a session log. Normal packaged launches keep terminal
+access opt-in through the UI.
+
+When Start operator fails on macOS, capture:
+
+1. The UI **Last error** field.
+2. The **Operator debug log** path shown in the UI.
+3. The first `desktop.compute_node.session.start` and
+   `desktop.compute_node.session.layout` lines.
+4. Any `desktop_runtime_setup`, `llama_module_path`, `interpreter`, `prefix`,
+   `metal`, `llama_cpp`, `model_init`, registration, unregister, cancel, or
+   bridge stderr lines from the log.
+
+Debug logs must remain operator diagnostics only. Do not add plaintext prompts,
+responses, tool arguments, model-output text, private keys, or decrypted relay
+payloads to persisted logs.
+
 ## macOS packaged Metal runtime validation
 
 For packaged `.app` builds, the bridge may launch with Apple Command Line Tools

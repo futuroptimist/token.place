@@ -78,6 +78,51 @@ describe('desktop app start failure handling', () => {
     });
   });
 
+  const mockInitialCommand = (command: string) => {
+    if (command === 'detect_backend') {
+      return Promise.resolve({
+        platform_label: 'macos',
+        preferred_mode: 'auto',
+        available_backend: 'metal',
+        availability_label: 'Metal-capable platform (Apple Silicon)',
+      });
+    }
+    if (command === 'load_config') {
+      return Promise.resolve({
+        model_path: '/tmp/model.gguf',
+        relay_base_url: 'https://token.place',
+        preferred_mode: 'auto',
+      });
+    }
+    if (command === 'get_compute_node_status') {
+      return Promise.resolve({
+        running: false,
+        registered: false,
+        active_relay_url: '',
+        requested_mode: 'auto',
+        effective_mode: 'cpu',
+        backend_available: 'unknown',
+        backend_selected: 'cpu',
+        backend_used: 'cpu',
+        fallback_reason: null,
+        model_path: '',
+        last_error: null,
+        log_file_path: null,
+      });
+    }
+    if (command === 'inspect_model_artifact') {
+      return Promise.resolve({
+        canonical_family_url: 'https://example.test/models',
+        filename: 'model.gguf',
+        url: 'https://example.test/model.gguf',
+        models_dir: '/tmp',
+        resolved_model_path: '/tmp/model.gguf',
+        exists: true,
+        size_bytes: 1,
+      });
+    }
+    return Promise.resolve(undefined);
+  };
 
   const mockInitialComputeStatus = (statusOverrides: Record<string, unknown>) => {
     invokeMock.mockImplementation((command: string) => {
@@ -586,6 +631,155 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
   });
 
+
+
+  it('renders operator debug log affordances from live events and opens in-app log text', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'read_operator_log') {
+        return Promise.resolve('desktop.compute_node.stderr bridge stderr line');
+      }
+      if (command === 'reveal_operator_log' || command === 'open_operator_debug_terminal') {
+        return Promise.resolve(undefined);
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+
+    const openLogButton = (await screen.findByText('Open debug log')) as HTMLButtonElement;
+    expect(openLogButton.disabled).toBe(true);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        active_relay_url: 'https://token.place',
+        relay_runtime_state: 'starting',
+        log_file_path: '/Users/Example User/Library/Logs/token.place/operator/compute-node-1.log',
+        operator_session_id: 'session-1',
+        sequence: 1,
+      },
+    });
+
+    await waitFor(() => expect(openLogButton.disabled).toBe(false));
+    expect(screen.getByText('Reveal log file')).toBeTruthy();
+    expect(screen.getByText('Copy log path')).toBeTruthy();
+    expect(screen.getByText('Open debug terminal')).toBeTruthy();
+
+    fireEvent.click(openLogButton);
+
+    await screen.findByLabelText('Operator debug console');
+    expect(screen.getByDisplayValue(/bridge stderr line/)).toBeTruthy();
+  });
+
+
+  it('clears stale operator log path when backend emits null', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      log_file_path: '/Users/Example User/Library/Logs/token.place/operator/compute-node-old.log',
+      operator_session_id: 'session-1',
+      sequence: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByText(/Operator debug log:/).textContent).toContain('compute-node-old.log')
+    );
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'error',
+        running: false,
+        registered: false,
+        log_file_path: null,
+        message: 'operator log unavailable',
+        operator_session_id: 'session-1',
+        sequence: 2,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Operator debug log:/).textContent).toContain('not created yet')
+    );
+    expect((screen.getByText('Open debug log') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+
+  it('copies operator log path and surfaces path copy failures', async () => {
+    const originalClipboard = navigator.clipboard;
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    mockInitialComputeStatus({
+      running: true,
+      registered: false,
+      active_relay_url: 'https://token.place',
+      log_file_path: '/Users/Example User/Library/Logs/token.place/operator/compute-node-1.log',
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('Copy log path'));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        '/Users/Example User/Library/Logs/token.place/operator/compute-node-1.log'
+      )
+    );
+
+    writeText.mockRejectedValueOnce(new Error('path clipboard denied'));
+    fireEvent.click(screen.getByText('Copy log path'));
+
+    await waitFor(() => expect(screen.getByText(/path clipboard denied/)).toBeTruthy());
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: originalClipboard });
+  });
+
+  it('surfaces clipboard copy failures in the operator debug console', async () => {
+    const originalClipboard = navigator.clipboard;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn(() => Promise.reject(new Error('clipboard denied'))) },
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          active_relay_url: 'https://token.place',
+          requested_mode: 'auto',
+          effective_mode: 'cpu',
+          backend_available: 'unknown',
+          backend_selected: 'cpu',
+          backend_used: 'cpu',
+          fallback_reason: null,
+          model_path: '/tmp/model.gguf',
+          last_error: null,
+          relay_runtime_state: 'starting',
+          log_file_path: '/Users/Example User/Library/Logs/token.place/operator/compute-node-1.log',
+        });
+      }
+      if (command === 'read_operator_log') {
+        return Promise.resolve('desktop.compute_node.stderr bridge stderr line');
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('Open debug log'));
+    await screen.findByLabelText('Operator debug console');
+    fireEvent.click(screen.getByText('Copy log'));
+
+    await waitFor(() => expect(screen.getByText(/clipboard denied/)).toBeTruthy());
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: originalClipboard });
+  });
 
   it('invokes backend stop and reflects stopped operator event', async () => {
     mockInitialComputeStatus({

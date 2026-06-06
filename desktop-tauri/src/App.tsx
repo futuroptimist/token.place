@@ -40,6 +40,7 @@ interface ComputeNodeStatus {
   operator_session_id: string | null;
   sequence: number | null;
   updated_at_ms: number | null;
+  log_file_path: string | null;
 }
 
 interface ModelArtifactInfo {
@@ -81,6 +82,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
   operator_session_id: null,
   sequence: null,
   updated_at_ms: null,
+  log_file_path: null,
 };
 
 function formatErrorMessage(error: unknown): string {
@@ -189,6 +191,12 @@ function mergeComputeStatusEvent(
     sequence: payloadSequence ?? prev.sequence,
     updated_at_ms:
       typeof payload.updated_at_ms === 'number' ? payload.updated_at_ms : prev.updated_at_ms,
+    log_file_path:
+      payload.log_file_path === null
+        ? null
+        : typeof payload.log_file_path === 'string'
+          ? payload.log_file_path
+          : prev.log_file_path,
     last_error:
       payload.last_error === null
         ? null
@@ -227,6 +235,8 @@ export function App() {
   const [error, setError] = useState('');
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
+  const [operatorLogText, setOperatorLogText] = useState('');
+  const [isDebugConsoleOpen, setIsDebugConsoleOpen] = useState(false);
   const relayRuntimeState = computeStatus.relay_runtime_state || computeStatus.warm_load_state || 'idle';
   const relayRuntimeReady =
     computeStatus.warm_load_enabled === false ||
@@ -437,6 +447,7 @@ export function App() {
         fallback_reason: null,
         model_path: config.model_path,
         last_error: null,
+        log_file_path: null,
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
@@ -466,6 +477,48 @@ export function App() {
   const stopComputeNode = async () => {
     try {
       await invoke('stop_compute_node');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+
+  const refreshOperatorLog = async () => {
+    try {
+      const logText = await invoke<string>('read_operator_log');
+      setOperatorLogText(logText);
+      setIsDebugConsoleOpen(true);
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const revealOperatorLog = async () => {
+    try {
+      await invoke('reveal_operator_log');
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const copyOperatorLogPath = async () => {
+    try {
+      const logPath = computeStatus.log_file_path;
+      if (!logPath) return;
+      const writeText = navigator.clipboard?.writeText;
+      if (!writeText) {
+        setError('Clipboard API is unavailable in this webview.');
+        return;
+      }
+      await writeText.call(navigator.clipboard, logPath);
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
+  const openOperatorDebugTerminal = async () => {
+    try {
+      await invoke('open_operator_debug_terminal');
     } catch (e) {
       setError(formatErrorMessage(e));
     }
@@ -573,6 +626,51 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Backend used: <code>{displayStatusValue(computeStatus.backend_used, 'pending')}</code></p>
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
+        <p style={{ marginBottom: 0 }}>Operator debug log: <code>{computeStatus.log_file_path || 'not created yet'}</code></p>
+        <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={refreshOperatorLog}>
+            Open debug log
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={revealOperatorLog}>
+            Reveal log file
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={copyOperatorLogPath}>
+            Copy log path
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={openOperatorDebugTerminal}>
+            Open debug terminal
+          </button>
+        </div>
+        {isDebugConsoleOpen && (
+          <section aria-label="Operator debug console" style={{ marginTop: 10 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <strong>Operator debug console</strong>
+              <button type="button" onClick={refreshOperatorLog}>Refresh</button>
+              <button
+                type="button"
+                onClick={() => {
+                  const writeText = navigator.clipboard?.writeText;
+                  if (!writeText) {
+                    setError('Clipboard API is unavailable in this webview.');
+                    return;
+                  }
+                  writeText.call(navigator.clipboard, operatorLogText).catch((err) =>
+                    setError(formatErrorMessage(err))
+                  );
+                }}
+              >
+                Copy log
+              </button>
+              <button type="button" onClick={() => setIsDebugConsoleOpen(false)}>Close</button>
+            </div>
+            <textarea
+              readOnly
+              rows={12}
+              value={operatorLogText}
+              style={{ width: '100%', marginTop: 8, fontFamily: 'monospace' }}
+            />
+          </section>
+        )}
         <p style={{ marginBottom: 0 }}>Last error: <code>{computeStatus.last_error || 'none'}</code></p>
       </section>
 

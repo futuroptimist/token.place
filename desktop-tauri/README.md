@@ -181,6 +181,37 @@ It prints:
   CUDA availability/usage with GPU offload and non-CPU KV cache. If the bridge exits before
   startup, errors will use the phrase `compute-node bridge exited before emitting a startup event`.
 
+## Packaged operator debug logs
+
+The packaged desktop app writes compute-node operator diagnostics to a per-session
+log file in the app log directory. On macOS this is typically under the user's
+Library logs area in an `operator/` subdirectory, for example:
+
+```text
+~/Library/Logs/<tauri app identifier>/operator/compute-node-<operator_session_id>-<timestamp>.log
+```
+
+The Compute node operator panel shows the current `Operator debug log` path after
+Start operator creates a session. Use **Open debug log** for an in-app read-only
+console with copy support, **Copy log path** to copy the current session path,
+**Reveal log file** to open the containing location, or **Open debug terminal** to tail the log. macOS terminal tailing uses
+Terminal.app and a quoted `tail -n 200 -F` command so paths with spaces work.
+
+For validation runs that should open the terminal automatically when the operator
+starts, launch the app with:
+
+```bash
+TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL=1
+```
+
+Capture the debug log when Start operator fails. Important startup details include
+`desktop.compute_node.session.start`, `desktop.compute_node.session.layout`, the
+selected interpreter/resource/import roots, `desktop_runtime_setup` probe and
+provision lines, bridge stdout/stderr, model warm-load diagnostics,
+registration/poll/request/response lifecycle lines, and stop/cancel/unregister
+cleanup lines. Logs intentionally avoid plaintext prompts, responses, private
+keys, and decrypted relay payloads.
+
 ### macOS packaged Metal runtime provisioning
 
 Packaged macOS operator startup may use Apple Command Line Tools Python (for

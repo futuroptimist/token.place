@@ -1,4 +1,8 @@
 use crate::backend::ComputeMode;
+use crate::operator_logs::{
+    append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
+    OperatorLogSink,
+};
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
@@ -48,6 +52,7 @@ pub struct ComputeNodeStatus {
     pub operator_session_id: Option<String>,
     pub sequence: Option<u64>,
     pub updated_at_ms: Option<u64>,
+    pub log_file_path: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -202,7 +207,12 @@ fn event_session_id(payload: &Value) -> Option<&str> {
     payload.get("operator_session_id").and_then(Value::as_str)
 }
 
-fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> ComputeNodeStatus {
+fn startup_failure_status(
+    request: &ComputeNodeRequest,
+    last_error: String,
+    operator_session_id: Option<String>,
+    log_file_path: Option<String>,
+) -> ComputeNodeStatus {
     ComputeNodeStatus {
         running: false,
         registered: false,
@@ -221,9 +231,10 @@ fn startup_failure_status(request: &ComputeNodeRequest, last_error: String) -> C
         warm_load_duration_ms: None,
         runtime_path: Some("bridge".into()),
         relay_runtime_path: Some("bridge".into()),
-        operator_session_id: None,
+        operator_session_id,
         sequence: None,
         updated_at_ms: Some(current_time_ms()),
+        log_file_path,
     }
 }
 
@@ -324,6 +335,12 @@ fn update_status_from_event(status: &mut ComputeNodeStatus, payload: &Value) -> 
     } else {
         status.updated_at_ms = Some(current_time_ms());
     }
+    if payload.get("log_file_path").is_some() {
+        status.log_file_path = payload
+            .get("log_file_path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
     if payload.get("type").and_then(Value::as_str) == Some("error") {
         status.last_error = payload
             .get("message")
@@ -417,15 +434,139 @@ fn finalize_bridge_exit(
 async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     policy: SubprocessLogPolicy,
+    log_sink: Option<OperatorLogSink>,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
+        append_operator_log_line(
+            &log_sink,
+            "desktop.compute_node.stderr",
+            &sanitize_operator_diagnostic_line(&line),
+        );
         if filter.should_emit(&line) {
             eprintln!("desktop.compute_node.stderr line={line}");
         }
     }
     Ok(())
+}
+
+fn append_operator_log_line(log_sink: &Option<OperatorLogSink>, source: &str, line: &str) {
+    if let Some(log_sink) = log_sink {
+        log_sink.append_line(source, line);
+    }
+}
+
+fn append_operator_log_path_line(log_file_path: Option<&str>, source: &str, line: &str) {
+    if let Some(log_file_path) = log_file_path {
+        let _ = append_line_to_path(Path::new(log_file_path), source, line);
+    }
+}
+
+fn redact_bridge_stdout_line(line: &str) -> String {
+    let Ok(payload) = serde_json::from_str::<Value>(line) else {
+        return sanitize_freeform_bridge_log_line(line);
+    };
+    summarize_bridge_stdout_payload(&payload)
+}
+
+fn summarize_bridge_stdout_payload(payload: &Value) -> String {
+    let mut summary = serde_json::Map::new();
+    let Some(map) = payload.as_object() else {
+        return "{\"type\":\"non_object_bridge_event\"}".into();
+    };
+
+    for key in [
+        "type",
+        "operator_session_id",
+        "sequence",
+        "updated_at_ms",
+        "running",
+        "registered",
+        "relay_runtime_state",
+        "warm_load_state",
+        "warm_load_enabled",
+        "warm_load_duration_ms",
+        "requested_mode",
+        "effective_mode",
+        "backend_available",
+        "backend_selected",
+        "backend_used",
+        "fallback_reason",
+        "runtime_path",
+        "relay_runtime_path",
+        "interpreter",
+        "llama_module_path",
+        "runtime_action",
+        "runtime_setup_message",
+        "code",
+        "message",
+        "last_error",
+    ] {
+        if let Some(value) = map.get(key) {
+            summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));
+        }
+    }
+
+    for key in ["active_relay_url", "relay_base_url", "relay_url"] {
+        if let Some(value) = map.get(key).and_then(Value::as_str) {
+            summary.insert(key.to_string(), Value::String(sanitize_relay_target(value)));
+        }
+    }
+
+    serde_json::to_string(&Value::Object(summary))
+        .unwrap_or_else(|_| "{\"type\":\"bridge_event_summary_error\"}".into())
+}
+
+fn sanitize_bridge_log_value(key: &str, value: &Value) -> Value {
+    if is_sensitive_bridge_log_key(key) {
+        return Value::String("<redacted>".into());
+    }
+    match value {
+        Value::String(text) => Value::String(sanitize_freeform_bridge_log_line(text)),
+        Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(8)
+                .map(|item| sanitize_bridge_log_value(key, item))
+                .collect(),
+        ),
+        Value::Object(_) => Value::String("<object omitted>".into()),
+    }
+}
+
+fn is_sensitive_bridge_log_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("prompt")
+        || normalized.contains("response")
+        || normalized.contains("tool")
+        || normalized.contains("private_key")
+        || normalized.contains("decrypted")
+        || normalized.contains("payload")
+        || normalized == "model_path"
+}
+
+fn sanitize_freeform_bridge_log_line(line: &str) -> String {
+    sanitize_operator_diagnostic_line(line)
+}
+
+fn sanitize_path_for_operator_log(path: &Path) -> String {
+    sanitize_operator_path_display(path)
+}
+
+fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value {
+    if let Value::Object(map) = &mut payload {
+        match log_file_path {
+            Some(path) => {
+                map.insert("log_file_path".into(), Value::String(path.to_string()));
+            }
+            None => {
+                map.insert("log_file_path".into(), Value::Null);
+            }
+        }
+    }
+    payload
 }
 
 pub async fn start_compute_node(
@@ -448,12 +589,66 @@ pub async fn start_compute_node(
         *state.stdin.lock().await = None;
     }
 
+    let session_id = {
+        let mut next_session_id = state.next_session_id.lock().await;
+        *next_session_id += 1;
+        next_session_id.to_string()
+    };
+    {
+        let mut status = state.status.lock().await;
+        status.operator_session_id = Some(session_id.clone());
+        status.log_file_path = None;
+        status.last_error = None;
+        status.updated_at_ms = Some(current_time_ms());
+    }
+    let log_sink = match OperatorLogSink::create(&app, &session_id) {
+        Ok(log_sink) => Some(log_sink),
+        Err(err) => {
+            eprintln!(
+                "desktop.compute_node.operator_log_create_error operator_session_id={} error={}",
+                session_id, err
+            );
+            None
+        }
+    };
+    let log_file_path = log_sink
+        .as_ref()
+        .map(|log_sink| log_sink.path().to_string_lossy().into_owned());
+    append_operator_log_line(
+        &log_sink,
+        "desktop.compute_node.session.start",
+        &format!(
+            "operator_session_id={} relay=<redacted> model_path=<redacted> requested_mode={}",
+            session_id,
+            format!("{:?}", request.mode).to_lowercase()
+        ),
+    );
+    if std::env::var("TOKEN_PLACE_DESKTOP_OPEN_DEBUG_TERMINAL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        if let Some(log_sink) = &log_sink {
+            if let Err(err) = crate::operator_logs::open_debug_terminal(log_sink.path()) {
+                log_sink.append_line(
+                    "desktop.compute_node.debug_terminal_error",
+                    &format!("open failed: {err}"),
+                );
+            }
+        }
+    }
+
     let bridge_script = match resolve_bridge_script(&app) {
         Ok(bridge_script) => bridge_script,
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = startup_failure_status(&request, err.clone());
+                *status = startup_failure_status(
+                    &request,
+                    err.clone(),
+                    Some(session_id.clone()),
+                    log_file_path.clone(),
+                );
             }
             return Err(anyhow::anyhow!(err));
         }
@@ -467,7 +662,12 @@ pub async fn start_compute_node(
                 Err(err) => {
                     {
                         let mut status = state.status.lock().await;
-                        *status = startup_failure_status(&request, err.to_string());
+                        *status = startup_failure_status(
+                            &request,
+                            err.to_string(),
+                            Some(session_id.clone()),
+                            log_file_path.clone(),
+                        );
                     }
                     return Err(err);
                 }
@@ -476,7 +676,12 @@ pub async fn start_compute_node(
                 let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
                 {
                     let mut status = state.status.lock().await;
-                    *status = startup_failure_status(&request, err.to_string());
+                    *status = startup_failure_status(
+                        &request,
+                        err.to_string(),
+                        Some(session_id.clone()),
+                        log_file_path.clone(),
+                    );
                 }
                 return Err(err);
             }
@@ -490,15 +695,15 @@ pub async fn start_compute_node(
         Err(err) => {
             {
                 let mut status = state.status.lock().await;
-                *status = startup_failure_status(&request, err.to_string());
+                *status = startup_failure_status(
+                    &request,
+                    err.to_string(),
+                    Some(session_id.clone()),
+                    log_file_path.clone(),
+                );
             }
             return Err(err);
         }
-    };
-    let session_id = {
-        let mut next_session_id = state.next_session_id.lock().await;
-        *next_session_id += 1;
-        next_session_id.to_string()
     };
     let exe_path = std::env::current_exe().ok();
     let resource_dir = app.path().resource_dir().ok();
@@ -525,6 +730,23 @@ pub async fn start_compute_node(
         selected_layout,
         import_root.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".into())
     );
+    append_operator_log_line(
+        &log_sink,
+        "desktop.compute_node.session.layout",
+        &format!(
+            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+            session_id,
+            sanitize_relay_target(&request.relay_base_url),
+            sanitize_path_for_operator_log(Path::new(&bridge_script)),
+            sanitize_freeform_bridge_log_line(&interpreter),
+            sanitize_path_for_operator_log(&selected_resource_root),
+            selected_layout,
+            import_root
+                .as_ref()
+                .map(|path| sanitize_path_for_operator_log(path))
+                .unwrap_or_else(|| "<unresolved>".into())
+        ),
+    );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     bridge_command.env("TOKENPLACE_COMPUTE_NODE_SESSION_ID", &session_id);
 
@@ -549,6 +771,8 @@ pub async fn start_compute_node(
                 *status = startup_failure_status(
                     &request,
                     format!("failed to start compute-node bridge: {err}"),
+                    Some(session_id.clone()),
+                    log_file_path.clone(),
                 );
                 *state.child.lock().await = None;
                 *state.stdin.lock().await = None;
@@ -611,6 +835,7 @@ pub async fn start_compute_node(
                 operator_session_id: Some(session_id.clone()),
                 sequence: Some(0),
                 updated_at_ms: Some(current_time_ms()),
+                log_file_path: log_file_path.clone(),
             };
             true
         }
@@ -629,8 +854,9 @@ pub async fn start_compute_node(
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
+    let stderr_log_sink = log_sink.clone();
     let stderr_task = tokio::spawn(async move {
-        if let Err(err) = drain_compute_node_stderr(stderr, log_policy).await {
+        if let Err(err) = drain_compute_node_stderr(stderr, log_policy, stderr_log_sink).await {
             eprintln!("desktop.compute_node.stderr_error error={err}");
         }
     });
@@ -639,8 +865,14 @@ pub async fn start_compute_node(
     let mut saw_error_event = false;
     let mut saw_startup_event = false;
     while let Some(line) = lines.next_line().await? {
+        append_operator_log_line(
+            &log_sink,
+            "desktop.compute_node.stdout",
+            &redact_bridge_stdout_line(&line),
+        );
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
+                let payload = with_log_file_path(payload, log_file_path.as_deref());
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
                     if event_type == "error" {
                         saw_error_event = true;
@@ -694,6 +926,16 @@ pub async fn start_compute_node(
             )
         };
 
+        append_operator_log_line(
+            &log_sink,
+            "desktop.compute_node.bridge_process_exited",
+            &format!(
+                "operator_session_id={} status={}",
+                session_id,
+                bridge_exit_status_label(exit_status)
+            ),
+        );
+
         if let Some(payload) = exit_payload {
             app.emit("compute_node_event", payload)?;
         }
@@ -716,10 +958,24 @@ pub async fn start_compute_node(
 }
 
 pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
-    let stop_session_id = state.status.lock().await.operator_session_id.clone();
+    let (stop_session_id, stop_log_file_path) = {
+        let status = state.status.lock().await;
+        (
+            status.operator_session_id.clone(),
+            status.log_file_path.clone(),
+        )
+    };
     eprintln!(
         "desktop.compute_node.stop_requested operator_session_id={}",
         stop_session_id.as_deref().unwrap_or("unknown")
+    );
+    append_operator_log_path_line(
+        stop_log_file_path.as_deref(),
+        "desktop.compute_node.stop_requested",
+        &format!(
+            "operator_session_id={}",
+            stop_session_id.as_deref().unwrap_or("unknown")
+        ),
     );
     let mut stdin_handle = {
         let mut stdin_lock = state.stdin.lock().await;
@@ -729,6 +985,14 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
         eprintln!(
             "desktop.compute_node.cancel_requested operator_session_id={}",
             stop_session_id.as_deref().unwrap_or("unknown")
+        );
+        append_operator_log_path_line(
+            stop_log_file_path.as_deref(),
+            "desktop.compute_node.cancel_requested",
+            &format!(
+                "operator_session_id={}",
+                stop_session_id.as_deref().unwrap_or("unknown")
+            ),
         );
         let _ = stdin.write_all(b"{\"type\":\"cancel\"}\n").await;
         let _ = stdin.flush().await;
@@ -758,16 +1022,40 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
                 "desktop.compute_node.bridge_kill_requested operator_session_id={}",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.bridge_kill_requested",
+                &format!(
+                    "operator_session_id={}",
+                    stop_session_id.as_deref().unwrap_or("unknown")
+                ),
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=true",
                 stop_session_id.as_deref().unwrap_or("unknown")
             );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.bridge_process_exited",
+                &format!(
+                    "operator_session_id={} killed=true",
+                    stop_session_id.as_deref().unwrap_or("unknown")
+                ),
+            );
         } else {
             eprintln!(
                 "desktop.compute_node.bridge_process_exited operator_session_id={} killed=false",
                 stop_session_id.as_deref().unwrap_or("unknown")
+            );
+            append_operator_log_path_line(
+                stop_log_file_path.as_deref(),
+                "desktop.compute_node.bridge_process_exited",
+                &format!(
+                    "operator_session_id={} killed=false",
+                    stop_session_id.as_deref().unwrap_or("unknown")
+                ),
             );
         }
     }
@@ -839,6 +1127,88 @@ mod tests {
             sanitize_relay_target("https://user:pass@example.com/path?token=secret#frag"),
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn redacts_sensitive_bridge_stdout_fields_before_operator_logging() {
+        let line = serde_json::json!({
+            "type": "status",
+            "operator_session_id": "1",
+            "sequence": 7,
+            "model_path": "/Users/Example User/models/model.gguf",
+            "active_relay_url": "https://relay.internal.example/path?token=secret",
+            "prompt": "plaintext prompt",
+            "tool_args": {"private_key": "secret"},
+            "backend_selected": "cpu",
+            "relay_runtime_state": "ready"
+        })
+        .to_string();
+
+        let redacted = redact_bridge_stdout_line(&line);
+        let payload: Value = serde_json::from_str(&redacted).expect("summary json");
+
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("status"));
+        assert_eq!(
+            payload.get("operator_session_id").and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(payload.get("sequence").and_then(Value::as_u64), Some(7));
+        assert_eq!(
+            payload.get("backend_selected").and_then(Value::as_str),
+            Some("cpu")
+        );
+        assert_eq!(
+            payload.get("active_relay_url").and_then(Value::as_str),
+            Some("https://relay.internal.example")
+        );
+        assert!(payload.get("model_path").is_none());
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("tool_args").is_none());
+        assert!(!redacted.contains("Example User"));
+        assert!(!redacted.contains("plaintext prompt"));
+        assert!(!redacted.contains("token=secret"));
+    }
+
+    #[test]
+    fn compute_node_event_payload_gets_current_log_file_path() {
+        let payload = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "log_file_path": "/etc/passwd"
+        });
+        let payload = with_log_file_path(payload, Some("/tmp/operator.log"));
+
+        assert_eq!(
+            payload.get("log_file_path").and_then(Value::as_str),
+            Some("/tmp/operator.log")
+        );
+    }
+
+    #[test]
+    fn redacts_compute_node_stderr_paths_before_operator_logging() {
+        let line = sanitize_freeform_bridge_log_line(
+            "desktop.runtime_setup llama_module_path=/Users/Example User/project/.venv/lib/llama_cpp/__init__.py interpreter=/Users/Example User/.venv/bin/python3 relay=https://user:pass@relay.example/path?token=secret",
+        );
+
+        assert!(line.contains("llama_module_path=<path>"));
+        assert!(line.contains("interpreter=<path>"));
+        assert!(line.contains("<path:python3>"));
+        assert!(line.contains("relay=https://relay.example"));
+        assert!(!line.contains("/Users/Example User"));
+        assert!(!line.contains("token=secret"));
+        assert!(!line.contains("user:pass"));
+    }
+
+    #[test]
+    fn update_status_from_event_clears_log_file_path_on_null() {
+        let mut status = ComputeNodeStatus {
+            log_file_path: Some("/tmp/stale.log".into()),
+            ..ComputeNodeStatus::default()
+        };
+        let payload = serde_json::json!({"type": "status", "log_file_path": null});
+
+        assert!(update_status_from_event(&mut status, &payload));
+        assert_eq!(status.log_file_path, None);
     }
 
     #[test]
@@ -924,11 +1294,48 @@ mod tests {
         .expect("spawn stderr script");
 
         let stderr = child.stderr.take().expect("stderr");
-        drain_compute_node_stderr(stderr, SubprocessLogPolicy { verbose_raw: true })
-            .await
-            .expect("drain stderr");
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("stderr.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("log file");
+        let log_sink = OperatorLogSink {
+            path: log_path.clone(),
+            file: std::sync::Arc::new(std::sync::Mutex::new(file)),
+        };
+        drain_compute_node_stderr(
+            stderr,
+            SubprocessLogPolicy { verbose_raw: true },
+            Some(log_sink),
+        )
+        .await
+        .expect("drain stderr");
+        assert!(std::fs::read_to_string(log_path)
+            .expect("log")
+            .contains("bridge-failure"));
         let status = child.wait().await.expect("wait child");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stop_compute_node_appends_lifecycle_line_to_operator_log() {
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("operator.log");
+        std::fs::write(&log_path, "").expect("create log");
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("session-1".into());
+            status.log_file_path = Some(log_path.to_string_lossy().into_owned());
+        }
+
+        stop_compute_node(state).await.expect("stop compute node");
+
+        let log = std::fs::read_to_string(log_path).expect("operator log");
+        assert!(log.contains("desktop.compute_node.stop_requested"));
+        assert!(log.contains("operator_session_id=session-1"));
     }
 
     #[tokio::test]
@@ -1213,6 +1620,8 @@ mod tests {
         let status = startup_failure_status(
             &request,
             "no usable Python 3 interpreter found for desktop Python subprocess".into(),
+            Some("session-1".into()),
+            Some("/tmp/operator.log".into()),
         );
 
         assert!(!status.running);
@@ -1390,6 +1799,8 @@ mod tests {
         let status = startup_failure_status(
             &request,
             "unable to locate desktop Python bridge script 'compute_node_bridge.py'".into(),
+            None,
+            None,
         );
 
         assert!(!status.running);

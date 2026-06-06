@@ -4,6 +4,7 @@ mod config;
 pub mod forward;
 pub mod keygen;
 mod logging;
+mod operator_logs;
 mod python_runtime;
 mod sidecar;
 mod subprocess_logging;
@@ -12,6 +13,7 @@ use backend::{detect_backend_for, BackendInfo};
 use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};
 use config::{config_path, DesktopConfig};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,7 +104,64 @@ fn configure_runtime_pythonpath(
     )
 }
 
-fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
+fn summarize_model_bridge_output_line(line: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return operator_logs::sanitize_operator_diagnostic_line(line);
+    };
+    let mut summary = serde_json::Map::new();
+    if let Some(ok) = value.get("ok").and_then(Value::as_bool) {
+        summary.insert("ok".into(), Value::Bool(ok));
+    }
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        summary.insert(
+            "error".into(),
+            Value::String(operator_logs::sanitize_operator_diagnostic_line(error)),
+        );
+    }
+    if let Some(payload) = value.get("payload").and_then(Value::as_object) {
+        let mut payload_summary = serde_json::Map::new();
+        for key in [
+            "canonical_family_url",
+            "filename",
+            "url",
+            "exists",
+            "size_bytes",
+        ] {
+            if let Some(payload_value) = payload.get(key) {
+                payload_summary.insert(
+                    key.into(),
+                    sanitize_model_bridge_payload_field(key, payload_value),
+                );
+            }
+        }
+        for key in ["models_dir", "resolved_model_path"] {
+            if payload.get(key).is_some() {
+                payload_summary.insert(key.into(), Value::String("<redacted>".into()));
+            }
+        }
+        summary.insert("payload".into(), Value::Object(payload_summary));
+    }
+    if summary.is_empty() {
+        return "{\"type\":\"model_bridge_event_summary_unavailable\"}".into();
+    }
+    serde_json::to_string(&Value::Object(summary))
+        .unwrap_or_else(|_| "{\"type\":\"model_bridge_event_summary_error\"}".into())
+}
+
+fn sanitize_model_bridge_payload_field(key: &str, value: &Value) -> Value {
+    match value {
+        Value::String(text) if key == "url" || key == "canonical_family_url" => {
+            Value::String(operator_logs::sanitize_operator_diagnostic_line(text))
+        }
+        Value::String(text) => {
+            Value::String(operator_logs::sanitize_operator_diagnostic_line(text))
+        }
+        Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
+        Value::Array(_) | Value::Object(_) => Value::String("<omitted>".into()),
+    }
+}
+
+fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
     let bridge_script = resolve_model_bridge_script_path(Some(&launcher.program))?;
@@ -117,25 +176,47 @@ fn run_model_bridge(action: &str) -> Result<ModelArtifactInfo, String> {
         manifest_dir,
         None,
     );
-    eprintln!(
-        "desktop.model_bridge.start action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
+    let start_line = format!(
+        "action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
         action,
-        bridge_script.display(),
-        bridge_command.get_program().to_string_lossy(),
-        selected_resource_root.display(),
+        operator_logs::sanitize_operator_path_display(&bridge_script),
+        operator_logs::sanitize_operator_diagnostic_line(
+            &bridge_command.get_program().to_string_lossy(),
+        ),
+        operator_logs::sanitize_operator_path_display(&selected_resource_root),
         selected_layout,
         import_root
             .as_deref()
-            .map(|path| path.display().to_string())
+            .map(operator_logs::sanitize_operator_path_display)
             .unwrap_or_else(|| "<unresolved>".into())
     );
-    let output = bridge_command
-        .arg(action)
-        .output()
-        .map_err(|e| format!("unable to run model bridge: {e}"))?;
+    eprintln!("desktop.model_bridge.start {start_line}");
+    let _ = operator_logs::append_model_bridge_log(app, action, &format!("start {start_line}"));
+    let output = bridge_command.arg(action).output().map_err(|e| {
+        let message = format!("unable to run model bridge: {e}");
+        let _ = operator_logs::append_model_bridge_log(app, action, &message);
+        message
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = operator_logs::append_model_bridge_log(
+            app,
+            action,
+            &format!("stdout {}", summarize_model_bridge_output_line(line)),
+        );
+    }
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = operator_logs::append_model_bridge_log(
+            app,
+            action,
+            &format!(
+                "stderr {}",
+                operator_logs::sanitize_operator_diagnostic_line(line)
+            ),
+        );
+    }
     let json_line = stdout
         .lines()
         .rev()
@@ -286,12 +367,13 @@ async fn start_compute_node(
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            {
+            let log_file_path = {
                 let mut status = compute_state.status.lock().await;
                 status.running = false;
                 status.registered = false;
                 status.last_error = Some(err.to_string());
-            }
+                status.log_file_path.clone()
+            };
             let _ = app.emit(
                 "compute_node_event",
                 serde_json::json!({
@@ -300,6 +382,7 @@ async fn start_compute_node(
                     "registered": false,
                     "last_error": err.to_string(),
                     "message": err.to_string(),
+                    "log_file_path": log_file_path,
                 }),
             );
         }
@@ -322,15 +405,47 @@ async fn get_compute_node_status(
 }
 
 #[tauri::command]
-fn inspect_model_artifact() -> Result<ModelArtifactInfo, String> {
-    run_model_bridge("inspect")
+fn inspect_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    run_model_bridge(&app, "inspect")
 }
 
 #[tauri::command]
-async fn download_model_artifact() -> Result<ModelArtifactInfo, String> {
-    tokio::task::spawn_blocking(|| run_model_bridge("download"))
+async fn download_model_artifact(app: tauri::AppHandle) -> Result<ModelArtifactInfo, String> {
+    tokio::task::spawn_blocking(move || run_model_bridge(&app, "download"))
         .await
         .map_err(|e| format!("download bridge task failed: {e}"))?
+}
+
+fn current_operator_log_path(status: &ComputeNodeStatus) -> Result<PathBuf, String> {
+    status
+        .log_file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "no operator debug log is available yet; start the operator first".to_string()
+        })
+}
+
+#[tauri::command]
+async fn read_operator_log(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let status = state.compute_node.status.lock().await.clone();
+    let path = current_operator_log_path(&status)?;
+    operator_logs::read_log_tail(&path, 256 * 1024).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn reveal_operator_log(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let status = state.compute_node.status.lock().await.clone();
+    let path = current_operator_log_path(&status)?;
+    operator_logs::reveal_log_file(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_operator_debug_terminal(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let status = state.compute_node.status.lock().await.clone();
+    let path = current_operator_log_path(&status)?;
+    operator_logs::open_debug_terminal(&path).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -349,7 +464,10 @@ pub fn run() {
             get_compute_node_status,
             encrypt_and_forward,
             inspect_model_artifact,
-            download_model_artifact
+            download_model_artifact,
+            read_operator_log,
+            reveal_operator_log,
+            open_operator_debug_terminal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -370,6 +488,44 @@ mod tests {
             .find_map(|(env_key, value)| (env_key == key).then_some(value))
             .flatten()
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn model_bridge_log_summary_redacts_local_paths() {
+        let line = serde_json::json!({
+            "ok": true,
+            "payload": {
+                "canonical_family_url": "https://example.com/models?token=secret",
+                "filename": "model.gguf",
+                "url": "https://example.com/model.gguf?token=secret",
+                "models_dir": "/Users/Example User/Library/Application Support/token.place/models",
+                "resolved_model_path": "/Users/Example User/Library/Application Support/token.place/models/model.gguf",
+                "exists": true,
+                "size_bytes": 42
+            }
+        })
+        .to_string();
+
+        let summary = summarize_model_bridge_output_line(&line);
+        let payload: Value = serde_json::from_str(&summary).expect("summary json");
+
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload
+                .get("payload")
+                .and_then(|payload| payload.get("models_dir"))
+                .and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload
+                .get("payload")
+                .and_then(|payload| payload.get("resolved_model_path"))
+                .and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert!(!summary.contains("Example User"));
+        assert!(!summary.contains("token=secret"));
     }
 
     #[test]

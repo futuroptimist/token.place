@@ -186,8 +186,8 @@ E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For d
 Symptom:
 - A desktop/Tauri compute node logs `desktop.compute_node_bridge.api_v1_e2ee.register`
   followed by `error=HTTP 403`, while a synthetic register/poll probe succeeds and relay pod logs
-  do not show corresponding `POST /api/v1/relay/servers/register` or
-  `POST /api/v1/relay/servers/poll` requests.
+  do not show corresponding `POST /api/v1/relay/servers/register`,
+  `POST /api/v1/relay/servers/unregister`, or `POST /api/v1/relay/servers/poll` requests.
 
 Why this matters:
 - The relay registration-token guard returns JSON `401` responses for invalid tokens. A non-JSON
@@ -231,7 +231,7 @@ PY
 
 # 5. Compare relay app logs with desktop diagnostics for the same UTC window.
 kubectl -n tokenplace logs deploy/tokenplace --since=30m | \
-  grep -E 'POST /api/v1/relay/servers/(register|poll)|api_v1|relay/servers'
+  grep -E 'POST /api/v1/relay/servers/(register|unregister|poll)|api_v1|relay/servers'
 ```
 
 Decision points:
@@ -243,11 +243,16 @@ Decision points:
   tunnel, and upstream proxy logs before changing relay application code.
 
 Operational note: `/healthz`, `/livez`, `/metrics`, `/relay/diagnostics`, and API v1 compute-node
-heartbeat/control-plane routes are intentionally exempt from the public API rate-limit quota. A
+heartbeat/control-plane routes, including `/api/v1/relay/servers/unregister`, are intentionally
+exempt from the public API rate-limit quota when authenticated. A
 Kubernetes readiness probe that calls `/healthz` every 10 seconds must not exhaust the default
 `API_RATE_LIMIT=60/hour`; before this exemption, staging could return 429 to kube-probe and become
 externally unhealthy even while the relay process was running. User-facing chat/completion routes
 remain rate-limited.
+
+If Cloudflare/WAF skip or allow rules enumerate API v1 compute-node control paths, include
+`POST /api/v1/relay/servers/unregister` alongside register and poll so Stop operator shutdown can
+reach `relay.py` immediately instead of waiting for heartbeat lease expiry.
 
 ## v0.1.0 staging failure modes and operator runbook
 

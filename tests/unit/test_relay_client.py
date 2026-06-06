@@ -374,7 +374,7 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_success(self, mock_post, relay_client):
-        """Unregister should post to /unregister and return True on success after registration."""
+        """Unregister should post to /api/v1/relay/servers/unregister and return True on success after registration."""
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
@@ -386,7 +386,7 @@ class TestRelayClient:
 
         assert result is True
         mock_post.assert_called_once_with(
-            'http://localhost:5000/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
             json={'server_public_key': 'mock_public_key_b64'},
             timeout=relay_client._request_timeout,
         )
@@ -439,8 +439,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/unregister',
-            'http://backup-relay:6000/unregister',
+            'http://primary-relay:5000/api/v1/relay/servers/unregister',
+            'http://backup-relay:6000/api/v1/relay/servers/unregister',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -460,8 +460,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://localhost:5000/unregister',
-            'http://localhost:5000/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -515,9 +515,9 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            f'{primary}/unregister',
-            f'{backup}/unregister',
-            f'{backup}/unregister',
+            f'{primary}/api/v1/relay/servers/unregister',
+            f'{backup}/api/v1/relay/servers/unregister',
+            f'{backup}/api/v1/relay/servers/unregister',
         ]
         assert client._api_v1_registered_relays == set()
         assert client._api_v1_last_heartbeat_at == {}
@@ -3299,7 +3299,7 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
-        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/unregister',
         json={'server_public_key': 'mock_public_key_b64'},
         timeout=15,
     )
@@ -3320,7 +3320,7 @@ def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(m
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
-        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/unregister',
         json={'server_public_key': 'mock_public_key_b64'},
         timeout=15,
     )
@@ -3390,7 +3390,7 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
         if url.endswith('/relay/servers/register'):
             client.stop()
             return register_response
-        if url.endswith('/unregister'):
+        if url.endswith('/api/v1/relay/servers/unregister'):
             return unregister_response
         raise AssertionError(f'Unexpected relay request: {url}')
 
@@ -3406,7 +3406,7 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
         'http://localhost:5000/api/v1/relay/servers/register',
-        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/unregister',
     ]
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}

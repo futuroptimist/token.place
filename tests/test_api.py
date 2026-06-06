@@ -483,7 +483,7 @@ def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monke
         def json(self):
             return {
                 "error": {
-                    "message": "No registered compute nodes are available on this relay.",
+                    "message": "No LLM servers are available right now.",
                     "code": "no_registered_compute_nodes",
                 }
             }
@@ -513,7 +513,7 @@ def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monke
     assert data["error"]["code"] == "no_registered_compute_nodes"
     assert (
         data["error"]["message"]
-        == "No registered compute nodes are available on this relay."
+        == "No LLM servers are available right now."
     )
 
 

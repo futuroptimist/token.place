@@ -604,7 +604,8 @@ def _evict_stale_servers() -> list[str]:
             stale_after = max(float(stale_after), 1.0)
             if _server_ping_age_seconds(payload.get("last_ping")) <= stale_after:
                 continue
-            if _unregister_server(server_public_key):
+            removed, _cancelled = _unregister_server(server_public_key)
+            if removed:
                 evicted.append(server_public_key)
     return evicted
 
@@ -660,15 +661,31 @@ def _remove_known_server(server_public_key: str) -> bool:
         return True
 
 
-def _unregister_server(server_public_key: str) -> bool:
-    """Remove a compute node and associated per-server queue/session state."""
+def _unregister_server(server_public_key: str) -> tuple[bool, int]:
+    """Remove a compute node and wake clients queued on its API v1 work."""
 
-    removed = _remove_known_server(server_public_key)
     dropped_requests = []
+    in_flight_requests = []
+    with server_round_robin_lock:
+        server_payload = known_servers.get(server_public_key)
+        if isinstance(server_payload, dict):
+            with api_v1_in_flight_requests_lock:
+                in_flight = server_payload.get("api_v1_in_flight_requests")
+                if isinstance(in_flight, dict):
+                    in_flight_requests = [
+                        {
+                            "client_public_key": entry.get("client_public_key"),
+                            "request_id": request_id,
+                        }
+                        for request_id, entry in in_flight.items()
+                        if isinstance(entry, dict)
+                    ]
+        removed = _remove_known_server(server_public_key)
+
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
         client_inference_requests_changed.notify_all()
-    _clear_pending_requests_for_queued_items(dropped_requests)
+    cancelled_count = _mark_relay_items_terminal(dropped_requests + in_flight_requests)
 
     with stream_lock:
         stale_session_ids = [
@@ -686,7 +703,38 @@ def _unregister_server(server_public_key: str) -> bool:
                 if mapped_session_id == session_id:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
-    return removed
+    return removed, cancelled_count
+
+
+def _handle_unregister_request():
+    """Shared compute-node unregister handler for API v1 and legacy routes."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not isinstance(public_key, str) or not public_key.strip():
+        return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
+
+    removed, cancelled_queue_depth = _unregister_server(public_key)
+    LOGGER.info(
+        "server.unregistered",
+        extra={
+            "server_fingerprint": _safe_key_fingerprint(public_key),
+            "removed": removed,
+            "cancelled_queue_depth": cancelled_queue_depth,
+        },
+    )
+    return jsonify({
+        'message': 'Server unregistered',
+        'removed': removed,
+        'cancelled_queue_depth': cancelled_queue_depth,
+    }), 200
 
 
 def _can_resolve_gpu_host(hostname: str) -> bool:
@@ -1139,6 +1187,7 @@ _ALLOWED_API_V1_TERMINAL_REASONS = {
     "requester_gave_up",
     "provider_timeout",
     "pending_request_ttl_exceeded",
+    "server_unregistered",
 }
 
 
@@ -1347,6 +1396,29 @@ def _clear_pending_requests_for_queued_items(queued_items):
         _clear_pending_request(item.get("client_public_key"), item.get("request_id"))
 
 
+def _mark_relay_items_terminal(items, *, status="expired", reason="server_unregistered") -> int:
+    """Wake client waiters for queued or in-flight relay items without exposing payloads."""
+
+    count = 0
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        client_public_key = item.get("client_public_key")
+        request_id = item.get("request_id")
+        if not client_public_key or not request_id:
+            continue
+        _remove_client_responses_for_request(client_public_key, request_id)
+        _clear_pending_request(client_public_key, request_id)
+        _mark_request_terminal(
+            client_public_key,
+            request_id,
+            status=_sanitize_terminal_status(status),
+            reason=_sanitize_terminal_reason(reason, status),
+        )
+        count += 1
+    return count
+
+
 def _pending_request_entry_is_expired(pending_entry, *, now=None):
     if PENDING_REQUEST_TTL_SECONDS <= 0:
         return False
@@ -1483,6 +1555,13 @@ def _pop_client_response(client_public_key, request_id=None):
         response = client_responses.pop(client_public_key)
         _clear_pending_request(client_public_key, response.get('request_id'))
         return response
+
+
+@app.route('/api/v1/relay/servers/unregister', methods=['POST'])
+def api_v1_relay_servers_unregister():
+    """Explicitly unregister an API v1 compute node from relay selection."""
+
+    return _handle_unregister_request()
 
 
 @app.route('/api/v1/relay/servers/register', methods=['POST'])
@@ -2044,20 +2123,7 @@ def sink():
 def unregister():
     """Explicitly unregister a compute node and clear relay queue/session state."""
 
-    auth_error = _validate_server_registration()
-    if auth_error:
-        return auth_error
-
-    data = request.get_json()
-    if not isinstance(data, dict):
-        return jsonify({'error': 'Invalid request data'}), 400
-
-    public_key = data.get('server_public_key')
-    if not isinstance(public_key, str) or not public_key.strip():
-        return jsonify({'error': 'Invalid public key'}), 400
-
-    removed = _unregister_server(public_key)
-    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
+    return _handle_unregister_request()
 
 @app.route('/source', methods=['POST'])
 def source():

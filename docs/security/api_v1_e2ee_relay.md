@@ -8,10 +8,15 @@ Distributed relay traffic is relay-blind E2EE: relay-owned state and logs contai
 
 - `POST /api/v1/relay/servers/register`
 - `POST /api/v1/relay/servers/poll`
+- `POST /api/v1/relay/servers/unregister`
 - `GET /api/v1/relay/servers/next`
 - `POST /api/v1/relay/requests`
 - `POST /api/v1/relay/responses`
 - `POST /api/v1/relay/responses/retrieve`
+
+## Cloudflare/WAF route coverage
+
+If Cloudflare/WAF skip rules or API route allowlists are used for staging or production, include the full `/api/v1/relay/` prefix, including `POST /api/v1/relay/servers/unregister`, so Stop operator shutdown can clear relay selection immediately.
 
 ## Deprecated legacy routes
 

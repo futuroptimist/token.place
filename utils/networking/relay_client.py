@@ -866,7 +866,7 @@ class RelayClient:
                     request_kwargs['headers'] = headers
 
                 response = requests.post(
-                    f'{candidate_url}/unregister',
+                    f'{candidate_url}/api/v1/relay/servers/unregister',
                     timeout=self._request_timeout,
                     **request_kwargs,
                 )

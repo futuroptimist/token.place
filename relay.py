@@ -1176,25 +1176,28 @@ def _safe_key_fingerprint(value: Any) -> str:
 _ALLOWED_API_V1_TERMINAL_STATUSES = {"cancelled", "expired"}
 _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS = 300.0
 api_v1_recently_unregistered_servers: dict[str, float] = {}
+api_v1_recently_unregistered_servers_lock = threading.Lock()
 
 
 def _record_api_v1_server_unregistered(server_public_key: str) -> None:
     if isinstance(server_public_key, str) and server_public_key:
-        api_v1_recently_unregistered_servers[server_public_key] = time.monotonic()
+        with api_v1_recently_unregistered_servers_lock:
+            api_v1_recently_unregistered_servers[server_public_key] = time.monotonic()
 
 
 def _api_v1_server_was_recently_unregistered(server_public_key: str) -> bool:
     if not isinstance(server_public_key, str) or not server_public_key:
         return False
     now = time.monotonic()
-    expired_keys = [
-        key
-        for key, removed_at in api_v1_recently_unregistered_servers.items()
-        if now - removed_at > _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS
-    ]
-    for key in expired_keys:
-        api_v1_recently_unregistered_servers.pop(key, None)
-    return server_public_key in api_v1_recently_unregistered_servers
+    with api_v1_recently_unregistered_servers_lock:
+        expired_keys = [
+            key
+            for key, removed_at in api_v1_recently_unregistered_servers.items()
+            if now - removed_at > _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            api_v1_recently_unregistered_servers.pop(key, None)
+        return server_public_key in api_v1_recently_unregistered_servers
 
 
 _ALLOWED_API_V1_TERMINAL_REASONS = {

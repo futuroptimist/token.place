@@ -1,5 +1,8 @@
 use crate::backend::ComputeMode;
-use crate::operator_logs::{append_line_to_path, OperatorLogSink};
+use crate::operator_logs::{
+    append_line_to_path, sanitize_operator_diagnostic_line, sanitize_operator_path_display,
+    OperatorLogSink,
+};
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, configure_python_subprocess_env,
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
@@ -436,7 +439,11 @@ async fn drain_compute_node_stderr<R: tokio::io::AsyncRead + Unpin>(
     let mut lines = BufReader::new(reader).lines();
     let mut filter = SubprocessLogFilter::new("compute_node", policy);
     while let Some(line) = lines.next_line().await? {
-        append_operator_log_line(&log_sink, "desktop.compute_node.stderr", &line);
+        append_operator_log_line(
+            &log_sink,
+            "desktop.compute_node.stderr",
+            &sanitize_operator_diagnostic_line(&line),
+        );
         if filter.should_emit(&line) {
             eprintln!("desktop.compute_node.stderr line={line}");
         }
@@ -541,32 +548,21 @@ fn is_sensitive_bridge_log_key(key: &str) -> bool {
 }
 
 fn sanitize_freeform_bridge_log_line(line: &str) -> String {
-    line.chars()
-        .filter(|ch| !matches!(ch, '\n' | '\r' | '\t'))
-        .take(4096)
-        .collect()
+    sanitize_operator_diagnostic_line(line)
 }
 
 fn sanitize_path_for_operator_log(path: &Path) -> String {
-    let mut value = path.display().to_string();
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && value.starts_with(&home) {
-            value = format!("~{}", &value[home.len()..]);
-        }
-    }
-    sanitize_freeform_bridge_log_line(&value)
+    sanitize_operator_path_display(path)
 }
 
 fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value {
     if let Value::Object(map) = &mut payload {
-        if !map.contains_key("log_file_path") {
-            match log_file_path {
-                Some(path) => {
-                    map.insert("log_file_path".into(), Value::String(path.to_string()));
-                }
-                None => {
-                    map.insert("log_file_path".into(), Value::Null);
-                }
+        match log_file_path {
+            Some(path) => {
+                map.insert("log_file_path".into(), Value::String(path.to_string()));
+            }
+            None => {
+                map.insert("log_file_path".into(), Value::Null);
             }
         }
     }
@@ -1175,13 +1171,32 @@ mod tests {
 
     #[test]
     fn compute_node_event_payload_gets_current_log_file_path() {
-        let payload = serde_json::json!({"type": "started", "running": true});
+        let payload = serde_json::json!({
+            "type": "started",
+            "running": true,
+            "log_file_path": "/etc/passwd"
+        });
         let payload = with_log_file_path(payload, Some("/tmp/operator.log"));
 
         assert_eq!(
             payload.get("log_file_path").and_then(Value::as_str),
             Some("/tmp/operator.log")
         );
+    }
+
+    #[test]
+    fn redacts_compute_node_stderr_paths_before_operator_logging() {
+        let line = sanitize_freeform_bridge_log_line(
+            "desktop.runtime_setup llama_module_path=/Users/Example User/project/.venv/lib/llama_cpp/__init__.py interpreter=/Users/Example User/.venv/bin/python3 relay=https://user:pass@relay.example/path?token=secret",
+        );
+
+        assert!(line.contains("llama_module_path=<path>"));
+        assert!(line.contains("interpreter=<path>"));
+        assert!(line.contains("<path:python3>"));
+        assert!(line.contains("relay=https://relay.example"));
+        assert!(!line.contains("/Users/Example User"));
+        assert!(!line.contains("token=secret"));
+        assert!(!line.contains("user:pass"));
     }
 
     #[test]

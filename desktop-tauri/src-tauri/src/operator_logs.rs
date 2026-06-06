@@ -28,7 +28,7 @@ impl OperatorLogSink {
     }
 
     pub fn append_line(&self, source: &str, line: &str) {
-        let sanitized = sanitize_log_line(line);
+        let sanitized = sanitize_operator_diagnostic_line(line);
         if let Ok(mut file) = self.file.lock() {
             let _ = writeln!(file, "{} {} {}", current_time_ms(), source, sanitized);
             let _ = file.flush();
@@ -84,7 +84,7 @@ pub fn append_line_to_path(log_path: &Path, source: &str, line: &str) -> anyhow:
         "{} {} {}",
         current_time_ms(),
         source,
-        sanitize_log_line(line)
+        sanitize_operator_diagnostic_line(line)
     )?;
     Ok(())
 }
@@ -103,7 +103,7 @@ pub fn append_model_bridge_log(
         "{} desktop.model_bridge.{} {}",
         current_time_ms(),
         sanitize_filename_component(action),
-        sanitize_log_line(line)
+        sanitize_operator_diagnostic_line(line)
     )?;
     Ok(path)
 }
@@ -193,6 +193,89 @@ pub fn read_log_tail(log_path: &Path, max_bytes: usize) -> anyhow::Result<String
     let mut bytes = Vec::with_capacity((len - start) as usize);
     file.read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn sanitize_operator_diagnostic_line(line: &str) -> String {
+    let line = sanitize_log_line(line);
+    line.split_whitespace()
+        .map(sanitize_operator_diagnostic_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn sanitize_operator_path_display(path: &Path) -> String {
+    sanitize_path_display(&path.display().to_string())
+}
+
+fn sanitize_operator_diagnostic_token(token: &str) -> String {
+    if token.starts_with('{') || token.starts_with('[') {
+        return token.chars().take(4096).collect();
+    }
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return sanitize_url_display(token);
+    }
+
+    for separator in ['=', ':'] {
+        if let Some((key, value)) = token.split_once(separator) {
+            if value.starts_with("http://") || value.starts_with("https://") {
+                return format!("{key}{separator}{}", sanitize_url_display(value));
+            }
+            if is_path_like(value) {
+                return format!("{key}{separator}{}", sanitize_path_display(value));
+            }
+        }
+    }
+
+    if is_path_like(token) {
+        return sanitize_path_display(token);
+    }
+
+    token.chars().take(4096).collect()
+}
+
+fn sanitize_url_display(value: &str) -> String {
+    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    if let Some((scheme, rest)) = without_query.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let safe_authority = authority.rsplit('@').next().unwrap_or(authority);
+        if !scheme.is_empty() && !safe_authority.is_empty() {
+            return format!("{scheme}://{safe_authority}");
+        }
+    }
+    "<url>".into()
+}
+
+fn sanitize_path_display(value: &str) -> String {
+    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    let path = Path::new(trimmed);
+    if trimmed.starts_with('/') && trimmed.split('/').filter(|part| !part.is_empty()).count() <= 2 {
+        return "<path>".into();
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty());
+    match file_name {
+        Some(name) => format!("<path:{name}>"),
+        None => "<path>".into(),
+    }
+}
+
+fn is_path_like(value: &str) -> bool {
+    let trimmed = value.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | ')' | '('));
+    trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("file://")
+        || trimmed.contains('/')
+        || (trimmed.len() > 2
+            && trimmed.as_bytes()[1] == b':'
+            && (trimmed.as_bytes()[2] == b'/' || trimmed.as_bytes()[2] == b'\\')
+            && trimmed.as_bytes()[0].is_ascii_alphabetic())
 }
 
 fn current_time_ms() -> u64 {

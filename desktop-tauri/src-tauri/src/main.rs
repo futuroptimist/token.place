@@ -13,6 +13,7 @@ use backend::{detect_backend_for, BackendInfo};
 use compute_node::{ComputeNodeRequest, ComputeNodeState, ComputeNodeStatus};
 use config::{config_path, DesktopConfig};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sidecar::{InferenceRequest, SidecarState};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,63 @@ fn configure_runtime_pythonpath(
     )
 }
 
+fn summarize_model_bridge_output_line(line: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return operator_logs::sanitize_operator_diagnostic_line(line);
+    };
+    let mut summary = serde_json::Map::new();
+    if let Some(ok) = value.get("ok").and_then(Value::as_bool) {
+        summary.insert("ok".into(), Value::Bool(ok));
+    }
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        summary.insert(
+            "error".into(),
+            Value::String(operator_logs::sanitize_operator_diagnostic_line(error)),
+        );
+    }
+    if let Some(payload) = value.get("payload").and_then(Value::as_object) {
+        let mut payload_summary = serde_json::Map::new();
+        for key in [
+            "canonical_family_url",
+            "filename",
+            "url",
+            "exists",
+            "size_bytes",
+        ] {
+            if let Some(payload_value) = payload.get(key) {
+                payload_summary.insert(
+                    key.into(),
+                    sanitize_model_bridge_payload_field(key, payload_value),
+                );
+            }
+        }
+        for key in ["models_dir", "resolved_model_path"] {
+            if payload.get(key).is_some() {
+                payload_summary.insert(key.into(), Value::String("<redacted>".into()));
+            }
+        }
+        summary.insert("payload".into(), Value::Object(payload_summary));
+    }
+    if summary.is_empty() {
+        return "{\"type\":\"model_bridge_event_summary_unavailable\"}".into();
+    }
+    serde_json::to_string(&Value::Object(summary))
+        .unwrap_or_else(|_| "{\"type\":\"model_bridge_event_summary_error\"}".into())
+}
+
+fn sanitize_model_bridge_payload_field(key: &str, value: &Value) -> Value {
+    match value {
+        Value::String(text) if key == "url" || key == "canonical_family_url" => {
+            Value::String(operator_logs::sanitize_operator_diagnostic_line(text))
+        }
+        Value::String(text) => {
+            Value::String(operator_logs::sanitize_operator_diagnostic_line(text))
+        }
+        Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
+        Value::Array(_) | Value::Object(_) => Value::String("<omitted>".into()),
+    }
+}
+
 fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifactInfo, String> {
     let launcher = python_runtime::resolve_python_launcher("TOKEN_PLACE_PYTHON")
         .map_err(|e| format!("unable to resolve Python launcher for model bridge: {e}"))?;
@@ -121,13 +179,15 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
     let start_line = format!(
         "action={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
         action,
-        bridge_script.display(),
-        bridge_command.get_program().to_string_lossy(),
-        selected_resource_root.display(),
+        operator_logs::sanitize_operator_path_display(&bridge_script),
+        operator_logs::sanitize_operator_diagnostic_line(
+            &bridge_command.get_program().to_string_lossy(),
+        ),
+        operator_logs::sanitize_operator_path_display(&selected_resource_root),
         selected_layout,
         import_root
             .as_deref()
-            .map(|path| path.display().to_string())
+            .map(operator_logs::sanitize_operator_path_display)
             .unwrap_or_else(|| "<unresolved>".into())
     );
     eprintln!("desktop.model_bridge.start {start_line}");
@@ -141,10 +201,21 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        let _ = operator_logs::append_model_bridge_log(app, action, &format!("stdout {line}"));
+        let _ = operator_logs::append_model_bridge_log(
+            app,
+            action,
+            &format!("stdout {}", summarize_model_bridge_output_line(line)),
+        );
     }
     for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
-        let _ = operator_logs::append_model_bridge_log(app, action, &format!("stderr {line}"));
+        let _ = operator_logs::append_model_bridge_log(
+            app,
+            action,
+            &format!(
+                "stderr {}",
+                operator_logs::sanitize_operator_diagnostic_line(line)
+            ),
+        );
     }
     let json_line = stdout
         .lines()
@@ -417,6 +488,44 @@ mod tests {
             .find_map(|(env_key, value)| (env_key == key).then_some(value))
             .flatten()
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn model_bridge_log_summary_redacts_local_paths() {
+        let line = serde_json::json!({
+            "ok": true,
+            "payload": {
+                "canonical_family_url": "https://example.com/models?token=secret",
+                "filename": "model.gguf",
+                "url": "https://example.com/model.gguf?token=secret",
+                "models_dir": "/Users/Example User/Library/Application Support/token.place/models",
+                "resolved_model_path": "/Users/Example User/Library/Application Support/token.place/models/model.gguf",
+                "exists": true,
+                "size_bytes": 42
+            }
+        })
+        .to_string();
+
+        let summary = summarize_model_bridge_output_line(&line);
+        let payload: Value = serde_json::from_str(&summary).expect("summary json");
+
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload
+                .get("payload")
+                .and_then(|payload| payload.get("models_dir"))
+                .and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload
+                .get("payload")
+                .and_then(|payload| payload.get("resolved_model_path"))
+                .and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert!(!summary.contains("Example User"));
+        assert!(!summary.contains("token=secret"));
     }
 
     #[test]

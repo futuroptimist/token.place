@@ -568,7 +568,13 @@ def test_invalid_relay_response_tokens_do_not_burn_client_identity_quota(monkeyp
     def relay_responses():
         return {"status": "queued"}
 
-    payload = {"client_public_key": "client-a", "request_id": "request-a"}
+    payload = {
+        "client_public_key": "client-a",
+        "request_id": "request-a",
+        "ciphertext": "sealed-response",
+        "cipherkey": "sealed-key",
+        "iv": "sealed-iv",
+    }
     with app.test_client() as client:
         invalid_attempts = [
             client.post(
@@ -635,7 +641,12 @@ def test_malformed_relay_responses_do_not_burn_victim_response_bucket(monkeypatc
         valid_attempts = [
             client.post(
                 "/api/v1/relay/responses",
-                json={**victim_fields, "ciphertext": f"sealed-{index}"},
+                json={
+                    **victim_fields,
+                    "ciphertext": f"sealed-{index}",
+                    "cipherkey": f"sealed-key-{index}",
+                    "iv": f"sealed-iv-{index}",
+                },
                 headers={"X-Relay-Server-Token": "relay-token"},
                 environ_overrides={"REMOTE_ADDR": "192.0.2.11"},
             )
@@ -644,6 +655,51 @@ def test_malformed_relay_responses_do_not_burn_victim_response_bucket(monkeypatc
 
     assert [response.status_code for response in malformed_attempts] == [400, 400]
     assert [response.status_code for response in valid_attempts] == [200, 200, 429]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "100/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT": "2/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "100/hour",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
+    },
+    clear=True,
+)
+def test_authenticated_relay_responses_use_response_identity_budget(monkeypatch):
+    """Valid response envelopes consume the response-specific client budget."""
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(SERVER_REGISTRATION_TOKENS=["relay-token"]),
+    )
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/responses")
+    def relay_responses():
+        return {"status": "queued"}
+
+    with app.test_client() as client:
+        responses = [
+            client.post(
+                "/api/v1/relay/responses",
+                json={
+                    "client_public_key": "client-a",
+                    "request_id": f"request-{index}",
+                    "ciphertext": f"sealed-{index}",
+                    "cipherkey": f"sealed-key-{index}",
+                    "iv": f"sealed-iv-{index}",
+                },
+                headers={"X-Relay-Server-Token": "relay-token"},
+                environ_overrides={"REMOTE_ADDR": f"192.0.2.{10 + index}"},
+            )
+            for index in range(3)
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200, 429]
 
 
 @patch.dict(

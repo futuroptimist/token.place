@@ -195,11 +195,59 @@ def _control_plane_limits_from_env() -> dict[str, dict[str, Any]]:
     return route_limits
 
 
+def _response_envelope_identity_for_rate_limit(data: Any) -> tuple[str, str] | None:
+    """Return a response identity only after minimal ciphertext-envelope checks.
+
+    relay.py performs the authoritative response validation after this
+    before_request hook. Keep this preflight intentionally narrow: it only allows
+    the response route-specific budget to use client metadata once the payload has
+    the expected ciphertext-envelope shape, so malformed requests cannot burn a
+    spoofed victim client bucket before relay.py rejects them.
+    """
+
+    if not isinstance(data, dict):
+        return None
+
+    forbidden_plaintext_fields = {
+        "messages",
+        "prompt",
+        "input",
+        "content",
+        "response",
+        "text",
+    }
+    if any(field in data for field in forbidden_plaintext_fields):
+        return None
+
+    allowed_fields = {
+        "client_public_key",
+        "ciphertext",
+        "chat_history",
+        "cipherkey",
+        "iv",
+        "request_id",
+        "protocol",
+        "version",
+        "cancel_token",
+    }
+    if any(field not in allowed_fields for field in data):
+        return None
+    if not ("ciphertext" in data or "chat_history" in data):
+        return None
+    if "cipherkey" not in data or "iv" not in data:
+        return None
+
+    client_public_key = data.get("client_public_key")
+    if isinstance(client_public_key, str) and client_public_key.strip():
+        return "client_public_key", client_public_key.strip()
+    return None
+
+
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
     if path == "/api/v1/relay/responses":
-        # Response envelopes are validated by relay.py after this before_request hook.
-        # Keep response budgeting IP-only here so malformed JSON cannot spoof-limit
-        # a victim client_public_key/request_id before envelope validation runs.
+        identity = _response_envelope_identity_for_rate_limit(data)
+        if identity is not None:
+            return identity
         return "client_ip", get_remote_address()
 
     if isinstance(data, dict) and path in {

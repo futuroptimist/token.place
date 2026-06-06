@@ -77,7 +77,7 @@ class ComputeProviderError(Exception):
 _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
     "no_registered_compute_nodes": {
         "error_type": "service_unavailable_error",
-        "public_message": "No registered compute nodes are available on this relay.",
+        "public_message": "No LLM servers are available right now.",
         "status_code": 503,
     },
     "compute_node_timeout": {

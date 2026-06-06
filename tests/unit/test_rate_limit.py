@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 
 from flask import Flask
 
-from api import _load_relay_server_registration_tokens, init_app
+from api import (
+    _check_control_plane_limits,
+    _load_relay_server_registration_tokens,
+    init_app,
+)
 
 
 @patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"})
@@ -626,6 +630,46 @@ def test_ip_limited_rejections_do_not_burn_identity_quota():
 
     assert [response.status_code for response in first_ip] == [200, 429]
     assert [response.status_code for response in second_ip] == [200, 429]
+
+
+def test_control_plane_identity_race_does_not_hit_aggregate_ip_bucket():
+    """A concurrent identity rejection should fail before charging client IP."""
+
+    class FakeLimit:
+        def __init__(self, name: str):
+            self.name = name
+
+        def key_for(self, *identifiers):
+            return f"{self.name}:{':'.join(identifiers)}"
+
+    class FakeRateLimiter:
+        def __init__(self):
+            self.hit_calls = []
+            self.storage = MagicMock()
+
+        def test(self, limit_item, *identifiers):
+            return True
+
+        def hit(self, limit_item, *identifiers):
+            self.hit_calls.append((limit_item.name, identifiers))
+            return limit_item.name != "identity"
+
+        def get_window_stats(self, limit_item, *identifiers):
+            return SimpleNamespace(reset_time=9999999999)
+
+    fake_limiter = FakeRateLimiter()
+    allowed, _, bucket_kind, _, _ = _check_control_plane_limits(
+        fake_limiter,
+        [
+            ("client_ip", "192.0.2.10", FakeLimit("ip")),
+            ("server_public_key", "server-a", FakeLimit("identity")),
+        ],
+        route="/api/v1/relay/servers/register",
+    )
+
+    assert allowed is False
+    assert bucket_kind == "server_public_key"
+    assert [name for name, _ in fake_limiter.hit_calls] == ["identity"]
 
 
 @patch.dict(

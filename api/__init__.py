@@ -281,8 +281,17 @@ def _check_control_plane_limits(
             return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
         planned_hits.append((bucket_kind, identifiers, limit_item))
 
+    # Record identity buckets before the aggregate client-IP bucket. The limits
+    # backend records each hit separately, so a concurrent over-limit identity
+    # race must fail before it can consume the NAT-wide IP budget shared by
+    # other valid compute nodes. If a later bucket still rejects, the
+    # compensating rollback below removes the earlier per-request hit.
+    ordered_hits = sorted(
+        planned_hits, key=lambda planned_hit: planned_hit[0] == "client_ip"
+    )
+
     recorded_hits: list[tuple[tuple[str, str, str], Any]] = []
-    for bucket_kind, identifiers, limit_item in planned_hits:
+    for bucket_kind, identifiers, limit_item in ordered_hits:
         if rate_limiter.hit(limit_item, *identifiers):
             recorded_hits.append((identifiers, limit_item))
             continue

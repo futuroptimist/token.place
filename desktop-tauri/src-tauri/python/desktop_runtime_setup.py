@@ -906,35 +906,41 @@ def _ensure_desktop_llama_runtime_impl(mode: str, *, repo_root: Optional[Path] =
     if expected_backend == "cuda":
         should_repair, repair_skip_reason = _should_attempt_source_repair()
         if should_repair:
-            source_ok, source_log = _run_windows_cuda_source_repair(requirements_path, dependency_target)
-            if source_ok:
-                _clear_source_repair_failure()
-                install_diagnostics = _install_diagnostics_payload(
-                    source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
-                )
-                after = _probe_runtime(target_root)
-                if after.gpu_offload_supported and after.backend == "cuda":
-                    return {
-                        "selected_backend": "cuda",
-                        "fallback_reason": "installed CUDA runtime; re-executing sidecar",
-                        "runtime_action": "installed_cuda_reexec",
-                        **_probe_result_payload(after),
-                        **install_diagnostics,
-                    }
-                source_detail = _summarize_install_error(source_log)
+            if dependency_target is None:
                 last_error = (
-                    "CUDA source reinstall completed but runtime still CPU-only; "
-                    "check CUDA toolkit/build tools"
+                    "desktop dependency target unavailable; cannot install llama-cpp-python "
+                    f"without writing to interpreter prefix; detail={dependency_target_error or 'unknown'}"
                 )
-                if source_detail and source_detail != "install failed":
-                    last_error = f"{last_error}; source repair detail: {source_detail}"
-                _record_source_repair_failure(last_error)
             else:
-                install_diagnostics = _install_diagnostics_payload(
-                    source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
-                )
-                last_error = _summarize_install_error(source_log)
-                _record_source_repair_failure(last_error)
+                source_ok, source_log = _run_windows_cuda_source_repair(requirements_path, dependency_target)
+                if source_ok:
+                    _clear_source_repair_failure()
+                    install_diagnostics = _install_diagnostics_payload(
+                        source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
+                    )
+                    after = _probe_runtime(target_root)
+                    if after.gpu_offload_supported and after.backend == "cuda":
+                        return {
+                            "selected_backend": "cuda",
+                            "fallback_reason": "installed CUDA runtime; re-executing sidecar",
+                            "runtime_action": "installed_cuda_reexec",
+                            **_probe_result_payload(after),
+                            **install_diagnostics,
+                        }
+                    source_detail = _summarize_install_error(source_log)
+                    last_error = (
+                        "CUDA source reinstall completed but runtime still CPU-only; "
+                        "check CUDA toolkit/build tools"
+                    )
+                    if source_detail and source_detail != "install failed":
+                        last_error = f"{last_error}; source repair detail: {source_detail}"
+                    _record_source_repair_failure(last_error)
+                else:
+                    install_diagnostics = _install_diagnostics_payload(
+                        source_log, backend="cuda", cmake_args="-DGGML_CUDA=on"
+                    )
+                    last_error = _summarize_install_error(source_log)
+                    _record_source_repair_failure(last_error)
         else:
             last_error = repair_skip_reason
 

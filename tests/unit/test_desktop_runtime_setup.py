@@ -731,6 +731,39 @@ def test_windows_runtime_bootstrap_surfaces_source_repair_detail_when_probe_stay
     assert 'source repair detail: final pip status (metadata warning)' in captured['reason']
 
 
+def test_windows_cuda_source_repair_fails_closed_without_dependency_target(monkeypatch, tmp_path):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
+    monkeypatch.setattr(desktop_runtime_setup, '_should_attempt_source_repair', lambda: (True, ''))
+    monkeypatch.setattr(desktop_runtime_setup, '_record_source_repair_failure', lambda _reason: None)
+    monkeypatch.setattr(desktop_runtime_setup, '_clear_source_repair_failure', lambda: None)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_resolve_desktop_dependency_target',
+        lambda _root: (None, 'runtime_root not writable; home_fallback not writable'),
+    )
+    monkeypatch.setattr(desktop_runtime_setup, '_probe_llama_runtime', lambda **_: _probe())
+    invoked = {'source_repair': False, 'pip': False}
+
+    def _source_repair(_requirements_path, _dependency_target=None):
+        invoked['source_repair'] = True
+        return True, 'unexpected source repair call'
+
+    def _pip_install(*_args, **_kwargs):
+        invoked['pip'] = True
+        return True, 'unexpected pip install call'
+
+    monkeypatch.setattr(desktop_runtime_setup, '_windows_cuda_source_repair', _source_repair)
+    monkeypatch.setattr(desktop_runtime_setup, '_run_pip_install', _pip_install)
+
+    result = desktop_runtime_setup.ensure_desktop_llama_runtime('auto', repo_root=tmp_path)
+
+    assert result['runtime_action'] == 'failed'
+    assert 'desktop dependency target unavailable' in result['fallback_reason']
+    assert 'runtime_root not writable; home_fallback not writable' in result['fallback_reason']
+    assert invoked == {'source_repair': False, 'pip': False}
+
+
 def test_runtime_bootstrap_noop_when_gpu_runtime_is_already_present(monkeypatch):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setattr(

@@ -46,6 +46,7 @@ CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
 AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS = frozenset(
     {
         "/api/v1/relay/servers/register",
+        "/api/v1/relay/servers/unregister",
         "/api/v1/relay/servers/poll",
         "/api/v1/relay/responses",
     }

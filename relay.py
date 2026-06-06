@@ -663,12 +663,46 @@ def _remove_known_server(server_public_key: str) -> bool:
 def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
+    _record_api_v1_server_unregistered(server_public_key)
+    in_flight_requests = {}
+    with server_round_robin_lock:
+        server_payload = known_servers.get(server_public_key)
+        if isinstance(server_payload, dict):
+            with api_v1_in_flight_requests_lock:
+                raw_in_flight = server_payload.get("api_v1_in_flight_requests")
+                if isinstance(raw_in_flight, dict):
+                    in_flight_requests = dict(raw_in_flight)
+
     removed = _remove_known_server(server_public_key)
     dropped_requests = []
     with client_inference_requests_changed:
         dropped_requests = list(client_inference_requests.pop(server_public_key, []) or [])
         client_inference_requests_changed.notify_all()
-    _clear_pending_requests_for_queued_items(dropped_requests)
+
+    cancelled_queue_depth = 0
+    for item in dropped_requests:
+        if not isinstance(item, dict) or not bool(item.get("e2ee_v1")):
+            continue
+        _cancel_api_v1_request(
+            item.get("client_public_key"),
+            item.get("request_id"),
+            status="cancelled",
+            reason="server_unregistered",
+        )
+        cancelled_queue_depth += 1
+
+    for request_id, entry in in_flight_requests.items():
+        if not isinstance(request_id, str) or not request_id:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        _cancel_api_v1_request(
+            entry.get("client_public_key"),
+            request_id,
+            status="cancelled",
+            reason="server_unregistered",
+        )
+        cancelled_queue_depth += 1
 
     with stream_lock:
         stale_session_ids = [
@@ -686,6 +720,14 @@ def _unregister_server(server_public_key: str) -> bool:
                 if mapped_session_id == session_id:
                     streaming_sessions_by_client.pop(client_public_key, None)
 
+    LOGGER.info(
+        "server.unregistered",
+        extra={
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
+            "removed": removed,
+            "cancelled_queue_depth": cancelled_queue_depth,
+        },
+    )
     return removed
 
 
@@ -1132,6 +1174,32 @@ def _safe_key_fingerprint(value: Any) -> str:
 
 
 _ALLOWED_API_V1_TERMINAL_STATUSES = {"cancelled", "expired"}
+_API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS = 300.0
+api_v1_recently_unregistered_servers: dict[str, float] = {}
+api_v1_recently_unregistered_servers_lock = threading.Lock()
+
+
+def _record_api_v1_server_unregistered(server_public_key: str) -> None:
+    if isinstance(server_public_key, str) and server_public_key:
+        with api_v1_recently_unregistered_servers_lock:
+            api_v1_recently_unregistered_servers[server_public_key] = time.monotonic()
+
+
+def _api_v1_server_was_recently_unregistered(server_public_key: str) -> bool:
+    if not isinstance(server_public_key, str) or not server_public_key:
+        return False
+    now = time.monotonic()
+    with api_v1_recently_unregistered_servers_lock:
+        expired_keys = [
+            key
+            for key, removed_at in api_v1_recently_unregistered_servers.items()
+            if now - removed_at > _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            api_v1_recently_unregistered_servers.pop(key, None)
+        return server_public_key in api_v1_recently_unregistered_servers
+
+
 _ALLOWED_API_V1_TERMINAL_REASONS = {
     "cancelled",
     "expired",
@@ -1139,6 +1207,7 @@ _ALLOWED_API_V1_TERMINAL_REASONS = {
     "requester_gave_up",
     "provider_timeout",
     "pending_request_ttl_exceeded",
+    "server_unregistered",
 }
 
 
@@ -1533,6 +1602,36 @@ def api_v1_relay_servers_register():
     }), 200
 
 
+def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
+    """Handle idempotent compute-node unregister requests for relay routes."""
+
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        if invalid_error_shape == "legacy":
+            return jsonify({'error': 'Invalid request data'}), 400
+        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+
+    public_key = data.get('server_public_key')
+    if not isinstance(public_key, str) or not public_key.strip():
+        if invalid_error_shape == "legacy":
+            return jsonify({'error': 'Invalid public key'}), 400
+        return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
+
+    removed = _unregister_server(public_key)
+    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
+
+
+@app.route('/api/v1/relay/servers/unregister', methods=['POST'])
+def api_v1_relay_servers_unregister():
+    """Explicitly unregister an API v1 compute node and cancel its queued work."""
+
+    return _handle_server_unregister_request()
+
+
 @app.route('/api/v1/relay/servers/poll', methods=['POST'])
 def api_v1_relay_servers_poll():
     """Claim the next queued encrypted workload for a registered compute node."""
@@ -1564,11 +1663,12 @@ def api_v1_relay_servers_poll():
         if not isinstance(claimed_request, dict):
             return
         if bool(claimed_request.get('e2ee_v1')):
+            was_unregistered = _api_v1_server_was_recently_unregistered(public_key)
             _cancel_api_v1_request(
                 claimed_request.get('client_public_key'),
                 claimed_request.get('request_id'),
-                status='expired',
-                reason='provider_timeout',
+                status='cancelled' if was_unregistered else 'expired',
+                reason='server_unregistered' if was_unregistered else 'provider_timeout',
             )
 
     def _server_not_found_response(claimed_request=None):
@@ -2043,21 +2143,7 @@ def sink():
 @app.route('/unregister', methods=['POST'])
 def unregister():
     """Explicitly unregister a compute node and clear relay queue/session state."""
-
-    auth_error = _validate_server_registration()
-    if auth_error:
-        return auth_error
-
-    data = request.get_json()
-    if not isinstance(data, dict):
-        return jsonify({'error': 'Invalid request data'}), 400
-
-    public_key = data.get('server_public_key')
-    if not isinstance(public_key, str) or not public_key.strip():
-        return jsonify({'error': 'Invalid public key'}), 400
-
-    removed = _unregister_server(public_key)
-    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
+    return _handle_server_unregister_request(invalid_error_shape="legacy")
 
 @app.route('/source', methods=['POST'])
 def source():

@@ -31,11 +31,13 @@ CONTROL_PLANE_DEFAULT_LIMIT_ENV = "API_RELAY_CONTROL_PLANE_RATE_LIMIT"
 CONTROL_PLANE_IP_LIMIT_ENV = "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT"
 CONTROL_PLANE_ROUTE_LIMIT_ENVS = {
     "/api/v1/relay/servers/register": "API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT",
+    "/api/v1/relay/servers/unregister": "API_RELAY_CONTROL_PLANE_UNREGISTER_RATE_LIMIT",
     "/api/v1/relay/servers/poll": "API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT",
     "/api/v1/relay/responses": "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT",
 }
 CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/register": "240/hour",
+    "/api/v1/relay/servers/unregister": "240/hour",
     "/api/v1/relay/servers/poll": "1200/hour",
     "/api/v1/relay/responses": "1200/hour",
 }
@@ -189,7 +191,11 @@ def _control_plane_limits_from_env() -> dict[str, dict[str, Any]]:
 
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
     if isinstance(data, dict):
-        if path in {"/api/v1/relay/servers/register", "/api/v1/relay/servers/poll"}:
+        if path in {
+            "/api/v1/relay/servers/register",
+            "/api/v1/relay/servers/unregister",
+            "/api/v1/relay/servers/poll",
+        }:
             server_public_key = data.get("server_public_key")
             if isinstance(server_public_key, str) and server_public_key.strip():
                 return "server_public_key", server_public_key.strip()
@@ -221,17 +227,44 @@ def _control_plane_retry_after(
     return max(int(window.reset_time - time.time()), 1)
 
 
+def _control_plane_storage_decr(
+    rate_limiter: Any, limit_item: Any, identifiers: tuple[str, str, str]
+) -> None:
+    """Best-effort rollback for a control-plane bucket hit."""
+
+    storage = getattr(rate_limiter, "storage", None)
+    decr = getattr(storage, "decr", None)
+    if decr is None:
+        LOGGER.warning(
+            "rate_limit.control_plane_rollback_unavailable",
+            extra={"limiter_bucket_fingerprint": _fingerprint(":".join(identifiers))},
+        )
+        return
+    decr(limit_item.key_for(*identifiers))
+
+
+def _rollback_control_plane_hits(
+    rate_limiter: Any,
+    recorded_hits: list[tuple[tuple[str, str, str], Any]],
+) -> None:
+    """Remove hits recorded for a request that ultimately did not pass all buckets."""
+
+    for identifiers, limit_item in reversed(recorded_hits):
+        _control_plane_storage_decr(rate_limiter, limit_item, identifiers)
+
+
 def _check_control_plane_limits(
     rate_limiter: Any,
     checks: list[tuple[str, str, Any]],
     *,
     route: str,
 ) -> tuple[bool, int, str, str, Any]:
-    """Atomically enough test all buckets before charging any bucket.
+    """Test all buckets and roll back partial accounting on later rejection.
 
     The limits backend gives shared storage and TTL for individual buckets. Testing
-    every bucket before recording hits avoids burning an identity quota for a
-    request that is already rejected by the aggregate IP budget.
+    every bucket before recording hits avoids charging obviously rejected requests,
+    and compensating rollback prevents a later failed bucket from leaving earlier
+    buckets charged for a request that returned 429.
     """
 
     planned_hits: list[tuple[str, tuple[str, str, str], Any]] = []
@@ -248,12 +281,16 @@ def _check_control_plane_limits(
             return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
         planned_hits.append((bucket_kind, identifiers, limit_item))
 
+    recorded_hits: list[tuple[tuple[str, str, str], Any]] = []
     for bucket_kind, identifiers, limit_item in planned_hits:
-        if not rate_limiter.hit(limit_item, *identifiers):
-            retry_after = _control_plane_retry_after(
-                rate_limiter, limit_item, identifiers
-            )
-            return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
+        if rate_limiter.hit(limit_item, *identifiers):
+            recorded_hits.append((identifiers, limit_item))
+            continue
+
+        recorded_hits.append((identifiers, limit_item))
+        retry_after = _control_plane_retry_after(rate_limiter, limit_item, identifiers)
+        _rollback_control_plane_hits(rate_limiter, recorded_hits)
+        return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
 
     return True, 0, "", "", None
 

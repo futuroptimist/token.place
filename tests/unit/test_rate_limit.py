@@ -634,6 +634,49 @@ def test_ip_limited_rejections_do_not_burn_identity_quota():
         "API_RATE_LIMIT": "100/hour",
         "API_DAILY_QUOTA": "1000/day",
         "API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT": "1/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "2/hour",
+        "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
+    },
+    clear=True,
+)
+def test_identity_limited_rejections_do_not_burn_ip_quota():
+    """Identity-bucket 429s should roll back any aggregate-IP hit."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/register")
+    def relay_servers_register():
+        return {"status": "registered"}
+
+    headers = {"X-Relay-Server-Token": "relay-token"}
+    with app.test_client() as client:
+        responses = [
+            client.post(
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": "server-a"},
+                headers=headers,
+            ),
+            client.post(
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": "server-a"},
+                headers=headers,
+            ),
+            client.post(
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": "server-b"},
+                headers=headers,
+            ),
+        ]
+
+    assert [response.status_code for response in responses] == [200, 429, 200]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "100/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT": "1/hour",
         "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "1/hour",
         "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
     },

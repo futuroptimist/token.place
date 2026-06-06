@@ -106,6 +106,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for user-facing API requests; API v1 compute-node control-plane routes use separate budgets |
 | API_RELAY_CONTROL_PLANE_RATE_LIMIT | route default | Shared fallback for compute-node control-plane route budgets when a route-specific override is unset |
 | API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT | 240/hour | Per-server-public-key budget for authenticated compute-node register/lease refresh traffic |
+| API_RELAY_CONTROL_PLANE_UNREGISTER_RATE_LIMIT | 240/hour | Per-server-public-key budget for authenticated compute-node unregister/shutdown traffic |
 | API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT | 1200/hour | Per-server-public-key budget for authenticated compute-node poll/heartbeat traffic |
 | API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT | 1200/hour | Per-client-public-key budget for authenticated encrypted compute-node response submissions |
 | API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT | 10000/hour | Aggregate per-IP abuse budget shared by compute-node control-plane routes |

@@ -901,6 +901,116 @@ def run_llama_cpp_watchdog_packaged_bridge_lifecycle_probe(
 
 
 
+def create_fake_metal_llama_cpp_site(tmp_root: Path, layout_label: str) -> Path:
+    fake_site = tmp_root / f"fake metal site-packages {layout_label.replace('/', '_')}"
+    fake_pkg = fake_site / "llama_cpp"
+    fake_pkg.mkdir(parents=True, exist_ok=True)
+    (fake_pkg / "__init__.py").write_text(
+        "GGML_USE_METAL = True\n"
+        "def llama_supports_gpu_offload():\n"
+        "    return True\n"
+        "class Llama:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        self.args = args\n"
+        "        self.kwargs = kwargs\n"
+        "    def create_chat_completion(self, *args, **kwargs):\n"
+        "        return {'choices': [{'message': {'role': 'assistant', 'content': 'fake metal ok'}}]}\n",
+        encoding="utf-8",
+    )
+    return fake_site
+
+
+def patch_packaged_runtime_setup_as_macos(resources_root: Path) -> None:
+    runtime_setup = resources_root / "python" / "desktop_runtime_setup.py"
+    runtime_setup.write_text(
+        runtime_setup.read_text(encoding="utf-8")
+        + "\n# Packaged e2e-only platform shim.\n"
+        + "_desktop_platform = lambda: 'darwin'\n"
+        + "_desktop_arch = lambda: 'arm64'\n",
+        encoding="utf-8",
+    )
+
+
+def run_macos_mock_metal_packaged_registration_probe(
+    tmp_root: Path,
+    bridge_script: Path,
+    *,
+    relay_port: int,
+    resources_root: Path,
+) -> None:
+    fake_metal_site = create_fake_metal_llama_cpp_site(tmp_root, "macOS mock Metal")
+    fake_model = tmp_root / "mock-metal.gguf"
+    fake_model.write_bytes(b"GGUF fake macOS Metal packaged bridge model")
+    output = run_compute_bridge_startup_probe(
+        tmp_root,
+        bridge_script,
+        relay_port=relay_port,
+        resources_root=resources_root,
+        layout_label="macOS Contents/Resources mock Metal registered",
+        use_mock_llm="0",
+        mode="auto",
+        model_path=fake_model,
+        extra_env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(fake_metal_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    assert '"registered": true' in output.lower(), output
+    assert "runtime_action=metal_already_supported" in output, output
+
+
+def run_macos_gpu_failure_blocks_registration_probe(
+    tmp_root: Path,
+    bridge_script: Path,
+    *,
+    relay_port: int,
+    resources_root: Path,
+) -> None:
+    patch_packaged_runtime_setup_as_macos(resources_root)
+    broken_site = tmp_root / "fake broken macos llama_cpp"
+    broken_pkg = broken_site / "llama_cpp"
+    broken_pkg.mkdir(parents=True, exist_ok=True)
+    (broken_pkg / "__init__.py").write_text(
+        "raise ImportError('mock Metal runtime unavailable')\n", encoding="utf-8"
+    )
+    env = _packaged_env(
+        tmp_root,
+        resources_root,
+        extra_env={
+            "USE_MOCK_LLM": "1",
+            "PYTHONPATH": os.pathsep.join(
+                [str(broken_site), str(resources_root / "python"), str(resources_root)]
+            ),
+        },
+    )
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(bridge_script),
+            "--model",
+            "mock.gguf",
+            "--mode",
+            "gpu",
+            "--relay-url",
+            f"http://127.0.0.1:{relay_port}",
+        ],
+        cwd=tmp_root,
+        env=env,
+        input='{"type":"cancel"}\n',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, combined
+    assert "GPU provisioning failed for desktop macOS launch" in combined, combined
+    assert "registered=true" not in combined, combined
+    assert '"registered": true' not in combined.lower(), combined
+    assert "desktop.compute_node_bridge.api_v1_e2ee.register" not in combined, combined
+
+
 def main() -> int:
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
@@ -999,6 +1109,19 @@ def main() -> int:
                     resources_root=probe_resources_root,
                     layout_label=layout_label,
                 )
+                if probe_resources_root == mac_resources_root:
+                    run_macos_mock_metal_packaged_registration_probe(
+                        tmp_path,
+                        probe_script,
+                        relay_port=relay_port,
+                        resources_root=mac_resources_root,
+                    )
+                    run_macos_gpu_failure_blocks_registration_probe(
+                        tmp_path,
+                        probe_script,
+                        relay_port=relay_port,
+                        resources_root=mac_resources_root,
+                    )
             finally:
                 if relay.poll() is None:
                     relay.terminate()

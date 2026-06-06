@@ -211,3 +211,32 @@ provision lines, bridge stdout/stderr, model warm-load diagnostics,
 registration/poll/request/response lifecycle lines, and stop/cancel/unregister
 cleanup lines. Logs intentionally avoid plaintext prompts, responses, private
 keys, and decrypted relay payloads.
+
+### macOS packaged Metal runtime provisioning
+
+Packaged macOS operator startup may use Apple Command Line Tools Python (for
+example `/Library/Developer/CommandLineTools/usr/bin/python3`). The desktop
+runtime bootstrap treats that interpreter as an execution host only: it installs
+`llama-cpp-python` into a writable desktop dependency target, adds that target to
+`PYTHONPATH`, and verifies `import llama_cpp` from the same path before relay
+registration.
+
+The `desktop.runtime_setup` log line includes the selected interpreter, Python
+version, prefix/base_prefix, dependency target, pip availability, module path,
+install action, fallback reason, and (when provisioning ran) the bounded pip
+command/stdout/stderr tails plus CMake flags. Status events expose the same
+runtime diagnostics, but `last_error` remains reserved for concise actionable
+startup/relay failures instead of verbose pip logs. Metal source builds set
+`CMAKE_ARGS="-DGGML_METAL=on -DGGML_NATIVE=off"` and `FORCE_CMAKE=1`. In `gpu`
+mode, Metal provisioning failure is fatal before relay registration; in
+`auto`/`hybrid`, a successful CPU runtime install/import is reported as
+`metal_cpu_fallback` and can still reach `Registered: yes`.
+
+To capture debug logs for a packaged app, launch the sidecar/bridge from a
+terminal or collect the packaged app stderr/stdout log and search for
+`desktop.runtime_setup`, `desktop.compute_node_bridge.model_init.*`, and
+`desktop.compute_node_bridge.registration.*`. If CLT Python lacks `pip` or build
+tooling, install/repair pip for that interpreter or install Xcode Command Line
+Tools, then rerun packaged startup; the app-managed dependency target remains
+under `.token_place_desktop_site` and should not require writing into the CLT
+Python prefix.

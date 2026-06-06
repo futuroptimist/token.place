@@ -1110,6 +1110,36 @@ class TestRelayClient:
             assert forbidden not in json.dumps(result, sort_keys=True)
 
     @patch('utils.networking.relay_client.requests.post')
+    def test_register_api_v1_compute_node_logs_control_plane_429(self, mock_post, relay_client, caplog):
+        response = MagicMock(status_code=429)
+        response.headers = {
+            'content-type': 'application/json',
+            'retry-after': '37',
+        }
+        response.json.return_value = {
+            'error': {
+                'code': 'rate_limit_exceeded',
+                'message': 'Rate limit exceeded: 2 per 1 hour. Try again in 37 seconds.',
+                'type': 'rate_limit_error',
+            }
+        }
+        mock_post.return_value = response
+
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.register_api_v1_compute_node('https://staging.token.place')
+
+        diagnostic = result['relay_http_diagnostic']
+        assert result['error'] == 'HTTP 429'
+        assert result['next_ping_in_x_seconds'] == relay_client._request_timeout
+        assert diagnostic['path'] == '/api/v1/relay/servers/register'
+        assert diagnostic['route_class'] == 'compute_node_control_plane'
+        assert diagnostic['retry_after'] == '37'
+        assert diagnostic['headers']['retry-after'] == '37'
+        assert 'relay_control_plane_rate_limited' in caplog.text
+        assert 'retry_after=37' in caplog.text
+
+
+    @patch('utils.networking.relay_client.requests.post')
     def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
         self, mock_post, relay_client, caplog
     ):

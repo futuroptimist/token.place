@@ -100,6 +100,51 @@ def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, m
     assert {response.status_code for response in poll_responses} == {200}
 
 
+def test_two_api_v1_nodes_poll_and_round_robin_without_control_plane_429(client, monkeypatch):
+    """Two nodes behind one source can poll while next-server rotation remains intact."""
+
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    server_a = _server_key("rate-node-a")
+    server_b = _server_key("rate-node-b")
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    for _ in range(65):
+        poll_a = client.post(
+            '/api/v1/relay/servers/poll', json={'server_public_key': server_a}
+        )
+        poll_b = client.post(
+            '/api/v1/relay/servers/poll', json={'server_public_key': server_b}
+        )
+        assert poll_a.status_code == 200
+        assert poll_b.status_code == 200
+
+    assert [_next_api_v1_server_key(client) for _ in range(4)] == [
+        server_a,
+        server_b,
+        server_a,
+        server_b,
+    ]
+    diagnostics = client.get('/relay/diagnostics')
+    assert diagnostics.status_code == 200
+    registered = diagnostics.get_json()['registered_compute_nodes']
+    assert {node['server_public_key'] for node in registered} == {server_a, server_b}
+
+
+def test_api_v1_response_submissions_do_not_use_public_quota(client):
+    """Encrypted response submissions have a higher control-plane budget."""
+
+    responses = [
+        client.post(
+            '/api/v1/relay/responses',
+            json=_api_v1_response_payload(f'rate-response-{index}'),
+        )
+        for index in range(65)
+    ]
+
+    assert {response.status_code for response in responses} == {200}
+
+
 def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(client):
     """Client discovery and response polling stay outside the public API quota."""
 

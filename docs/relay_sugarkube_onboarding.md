@@ -246,8 +246,12 @@ Operational note: `/healthz`, `/livez`, `/metrics`, `/relay/diagnostics`, and AP
 heartbeat/control-plane routes are intentionally exempt from the public API rate-limit quota. A
 Kubernetes readiness probe that calls `/healthz` every 10 seconds must not exhaust the default
 `API_RATE_LIMIT=60/hour`; before this exemption, staging could return 429 to kube-probe and become
-externally unhealthy even while the relay process was running. User-facing chat/completion routes
-remain rate-limited.
+externally unhealthy even while the relay process was running. Compute-node register, poll, and
+encrypted response submission traffic is instead protected by dedicated control-plane budgets
+(`API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT`, `API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT`,
+`API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT`, and aggregate `API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT`)
+so multiple desktop nodes behind one NAT can poll normally without consuming chat/user quota.
+User-facing chat/completion routes remain rate-limited.
 
 ## v0.1.0 staging failure modes and operator runbook
 

@@ -243,11 +243,12 @@ Decision points:
   tunnel, and upstream proxy logs before changing relay application code.
 
 Operational note: `/healthz`, `/livez`, `/metrics`, `/relay/diagnostics`, and API v1 compute-node
-heartbeat/control-plane routes are intentionally exempt from the public API rate-limit quota. A
-Kubernetes readiness probe that calls `/healthz` every 10 seconds must not exhaust the default
-`API_RATE_LIMIT=60/hour`; before this exemption, staging could return 429 to kube-probe and become
-externally unhealthy even while the relay process was running. User-facing chat/completion routes
-remain rate-limited.
+heartbeat/control-plane routes are intentionally outside the public API rate-limit quota.
+Compute-node register, poll, response submission, and unregister calls use the separate
+`TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT` budget (default `1200/hour`) so multiple desktop nodes
+behind one NAT can sustain healthy 10-30 second polling without consuming the default
+`API_RATE_LIMIT=60/hour`. Kubernetes readiness probes that call `/healthz` every 10 seconds also
+must not exhaust the public quota. User-facing chat/completion routes remain rate-limited.
 
 ## v0.1.0 staging failure modes and operator runbook
 

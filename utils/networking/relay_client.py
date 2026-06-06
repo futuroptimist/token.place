@@ -1093,6 +1093,19 @@ class RelayClient:
             diagnostic["headers"],
             diagnostic["body_snippet"],
         )
+        if status_code == 429 and path in {
+            "/api/v1/relay/servers/register",
+            "/api/v1/relay/servers/poll",
+            "/api/v1/relay/responses",
+        }:
+            retry_after = headers.get("retry-after", "unknown")
+            log_error(
+                "relay_control_plane_rate_limited route={} retry_after={} status={} error_kind={}",
+                path,
+                retry_after,
+                status_code,
+                error_kind,
+            )
         if probable_pre_app_rejection:
             log_error(
                 "api_v1.relay_pre_app_rejection method={} path={} status={} cf_ray={} server={} token_sent={}",

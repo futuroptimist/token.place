@@ -272,10 +272,8 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
     },
     clear=True,
 )
-def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota(
-    monkeypatch,
-):
-    """Authenticated compute-node heartbeats must not consume user API quota."""
+def test_compute_node_control_plane_routes_do_not_inherit_public_quota(monkeypatch):
+    """Compute-node control-plane traffic must not consume user API quota."""
     monkeypatch.setitem(
         sys.modules,
         "relay",
@@ -346,8 +344,10 @@ def test_api_v1_relay_client_read_routes_do_not_inherit_public_quota():
     },
     clear=True,
 )
-def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypatch):
-    """Limiter auth should not drift from relay.py's active token snapshot."""
+def test_control_plane_budget_does_not_depend_on_loaded_relay_token_snapshot(
+    monkeypatch,
+):
+    """The limiter should not put control-plane traffic in the public bucket."""
     monkeypatch.setitem(
         sys.modules,
         "relay",
@@ -378,7 +378,7 @@ def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypa
             for index in range(3)
         ]
 
-    assert [response.status_code for response in rotated_responses] == [200, 200, 429]
+    assert {response.status_code for response in rotated_responses} == {200}
     assert {response.status_code for response in active_responses} == {200}
 
 
@@ -391,8 +391,10 @@ def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypa
     },
     clear=True,
 )
-def test_relay_mutations_with_missing_token_header_keep_public_rate_limit(monkeypatch):
-    """Configured relay tokens should not exempt requests that omit the header."""
+def test_relay_mutations_with_missing_token_header_keep_control_plane_budget(
+    monkeypatch,
+):
+    """Missing auth headers should still avoid the low public chat bucket."""
 
     monkeypatch.setitem(
         sys.modules,
@@ -415,44 +417,112 @@ def test_relay_mutations_with_missing_token_header_keep_public_rate_limit(monkey
             for index in range(3)
         ]
 
-    assert [response.status_code for response in responses] == [200, 200, 429]
+    assert {response.status_code for response in responses} == {200}
 
 
 @patch.dict(
     os.environ,
-    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "1000/day"},
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "2/hour",
+    },
     clear=True,
 )
-def test_unauthenticated_api_v1_relay_mutations_keep_public_rate_limit():
-    """Anonymous relay mutations should retain quota protection when no token exists."""
+def test_control_plane_routes_use_separate_configurable_budget():
+    """Compute-node routes should be limited by their own bucket, not the chat budget."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/poll")
+    def relay_servers_poll():
+        return {"status": "polling"}
+
+    with app.test_client() as client:
+        responses = [
+            client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": "server-a"},
+            )
+            for _ in range(3)
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200, 429]
+    body = responses[-1].get_json()
+    assert body is not None
+    assert body["error"]["code"] == "rate_limit_exceeded"
+    assert "2 per 1 hour" in body["error"]["message"]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "2/hour",
+    },
+    clear=True,
+)
+def test_multiple_compute_nodes_from_same_ip_get_distinct_control_plane_buckets():
+    """Server public keys should prevent same-NAT desktop nodes from starving each other."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/poll")
+    def relay_servers_poll_distinct_keys():
+        return {"status": "polling"}
+
+    with app.test_client() as client:
+        statuses = []
+        for server_public_key in ("server-a", "server-b"):
+            statuses.extend(
+                client.post(
+                    "/api/v1/relay/servers/poll",
+                    json={"server_public_key": server_public_key},
+                ).status_code
+                for _ in range(2)
+            )
+
+    assert statuses == [200, 200, 200, 200]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "60/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "1200/hour",
+    },
+    clear=True,
+)
+def test_compute_node_register_poll_and_responses_allow_healthy_cadence():
+    """Healthy control-plane cadence above 60/hour should avoid public-route 429s."""
     app = Flask(__name__)
     init_app(app)
 
     @app.post("/api/v1/relay/servers/register")
-    def relay_servers_register():
+    def relay_servers_register_healthy():
         return {"status": "registered"}
 
-    with app.test_client() as client:
-        assert (
-            client.post(
-                "/api/v1/relay/servers/register", json={"server_public_key": "server-1"}
-            ).status_code
-            == 200
-        )
-        assert (
-            client.post(
-                "/api/v1/relay/servers/register", json={"server_public_key": "server-2"}
-            ).status_code
-            == 200
-        )
-        response = client.post(
-            "/api/v1/relay/servers/register", json={"server_public_key": "server-3"}
-        )
+    @app.post("/api/v1/relay/servers/poll")
+    def relay_servers_poll_healthy():
+        return {"status": "polling"}
 
-    assert response.status_code == 429
-    body = response.get_json()
-    assert body is not None
-    assert body["error"]["code"] == "rate_limit_exceeded"
+    @app.post("/api/v1/relay/responses")
+    def relay_responses_healthy():
+        return {"status": "stored"}
+
+    with app.test_client() as client:
+        for path in (
+            "/api/v1/relay/servers/register",
+            "/api/v1/relay/servers/poll",
+            "/api/v1/relay/responses",
+        ):
+            responses = [
+                client.post(path, json={"server_public_key": "server-a"})
+                for _ in range(65)
+            ]
+            assert {response.status_code for response in responses} == {200}
 
 
 @patch.dict(

@@ -119,6 +119,81 @@ def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(cli
     assert {response.status_code for response in retrieve_responses} == {202}
 
 
+def test_api_v1_registered_node_can_poll_many_times_without_public_429(client, monkeypatch):
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    server_key = _server_key("poll_many")
+    _register_api_v1_server(client, server_key)
+
+    poll_responses = [
+        client.post("/api/v1/relay/servers/poll", json={"server_public_key": server_key})
+        for _ in range(65)
+    ]
+    diagnostics = client.get("/relay/diagnostics")
+
+    assert {response.status_code for response in poll_responses} == {200}
+    assert diagnostics.status_code == 200
+    registered_keys = {
+        node["server_public_key"]
+        for node in diagnostics.get_json()["registered_compute_nodes"]
+    }
+    assert server_key in registered_keys
+
+
+def test_api_v1_two_nodes_poll_and_next_round_robin_without_public_429(client, monkeypatch):
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    server_a = _server_key("same_nat_a")
+    server_b = _server_key("same_nat_b")
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    poll_statuses = []
+    for _ in range(65):
+        poll_statuses.append(
+            client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": server_a},
+            ).status_code
+        )
+        poll_statuses.append(
+            client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": server_b},
+            ).status_code
+        )
+    next_responses = [client.get("/api/v1/relay/servers/next") for _ in range(4)]
+
+    assert set(poll_statuses) == {200}
+    assert [response.status_code for response in next_responses] == [200, 200, 200, 200]
+    assert [response.get_json()["server_public_key"] for response in next_responses] == [
+        server_a,
+        server_b,
+        server_a,
+        server_b,
+    ]
+
+
+def test_unregister_after_many_control_plane_calls_removes_node_without_429(client, monkeypatch):
+    monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
+    server_key = _server_key("unregister_after_many")
+    _register_api_v1_server(client, server_key)
+
+    for _ in range(65):
+        response = client.post(
+            "/api/v1/relay/servers/poll", json={"server_public_key": server_key}
+        )
+        assert response.status_code == 200
+
+    unregistered = client.post("/unregister", json={"server_public_key": server_key})
+    diagnostics = client.get("/relay/diagnostics")
+
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()["removed"] is True
+    assert server_key not in {
+        node["server_public_key"]
+        for node in diagnostics.get_json()["registered_compute_nodes"]
+    }
+
+
 def test_inference_endpoint_removed(client):
     """Ensure deprecated /inference endpoint is unavailable."""
     response = client.post("/inference", json={})

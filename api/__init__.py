@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
-import secrets
 import sys
 from flask import jsonify, request
 from flask_limiter import Limiter
@@ -16,6 +17,9 @@ from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+RELAY_CONTROL_PLANE_RATE_LIMIT_ENV = "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT"
+RELAY_CONTROL_PLANE_RATE_LIMIT_DEFAULT = "1200/hour"
+LOGGER = logging.getLogger("tokenplace.api")
 
 # Paths that support operations, health checking, metrics scraping, and
 # diagnostics must not consume the public user API quota. Kubernetes readiness
@@ -39,15 +43,15 @@ CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
     }
 )
 
-# API v1 compute-node control-plane routes should bypass the public user quota
-# only for authenticated compute-node traffic. When relay server tokens are not
-# configured, these mutation/long-poll routes remain rate-limited to prevent
-# anonymous callers from growing relay-owned state or occupying workers.
-AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS = frozenset(
+# API v1 compute-node control-plane routes bypass the public user quota and
+# receive a higher route-specific budget below. Route handlers still enforce
+# strict body validation and registration-token auth when configured.
+RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(
     {
         "/api/v1/relay/servers/register",
         "/api/v1/relay/servers/poll",
         "/api/v1/relay/responses",
+        "/unregister",
     }
 )
 
@@ -98,28 +102,6 @@ def _load_relay_server_registration_tokens() -> list[str]:
     return [token for token in normalized if token]
 
 
-def _is_authenticated_relay_control_plane_request(path: str) -> bool:
-    """Return True for compute-node control-plane requests with a valid token."""
-
-    if (
-        _normalized_path(path)
-        not in AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS
-    ):
-        return False
-
-    relay_server_tokens = _load_relay_server_registration_tokens()
-    if not relay_server_tokens:
-        return False
-
-    provided = request.headers.get("X-Relay-Server-Token", "").strip()
-    if not provided:
-        return False
-
-    return any(
-        secrets.compare_digest(provided, token) for token in relay_server_tokens
-    )
-
-
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     """Return True when a route should not consume the public API quota."""
 
@@ -127,8 +109,51 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     return (
         normalized_path in RATE_LIMIT_EXEMPT_PATHS
         or normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS
-        or _is_authenticated_relay_control_plane_request(normalized_path)
+        or normalized_path in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
     )
+
+
+def _safe_rate_limit_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _relay_control_plane_rate_limit_key() -> str:
+    """Return a route-aware safe rate-limit key for compute-node control traffic."""
+
+    normalized_path = _normalized_path(request.path)
+    data = request.get_json(silent=True)
+    server_public_key = None
+    if isinstance(data, dict):
+        candidate = data.get("server_public_key")
+        if isinstance(candidate, str) and candidate.strip():
+            server_public_key = candidate.strip()
+
+    if server_public_key:
+        principal = f"server:{_safe_rate_limit_fingerprint(server_public_key)}"
+    else:
+        token = request.headers.get("X-Relay-Server-Token", "").strip()
+        if token:
+            principal = f"token:{_safe_rate_limit_fingerprint(token)}"
+        else:
+            principal = f"ip:{get_remote_address()}"
+
+    key = f"compute_node_control_plane:{normalized_path}:{principal}"
+    request.environ["tokenplace.rate_limit_route_class"] = "compute_node_control_plane"
+    request.environ["tokenplace.rate_limit_bucket_fingerprint"] = (
+        _safe_rate_limit_fingerprint(key)
+    )
+    return key
+
+
+def _is_not_relay_control_plane_route() -> bool:
+    return _normalized_path(request.path) not in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
+
+
+def _retry_after_seconds(exc: RateLimitExceeded) -> int:
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is None:
+        retry_after = int(exc.limit.limit.get_expiry())
+    return int(retry_after)
 
 
 def _resolve_rate_limit_storage_uri() -> str | None:
@@ -141,10 +166,7 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     """Return an OpenAI-style JSON error response for rate limit breaches."""
 
     rate_limit_description = str(exc.limit.limit)
-    retry_after = getattr(exc, "retry_after", None)
-    if retry_after is None:
-        # Fall back to the configured window length when precise timing is unavailable.
-        retry_after = int(exc.limit.limit.get_expiry())
+    retry_after = _retry_after_seconds(exc)
 
     payload = {
         "error": {
@@ -185,8 +207,42 @@ def init_app(app):
         **limiter_kwargs,
     )
 
+    control_plane_limit_value = os.environ.get(
+        RELAY_CONTROL_PLANE_RATE_LIMIT_ENV,
+        RELAY_CONTROL_PLANE_RATE_LIMIT_DEFAULT,
+    ).strip()
+    if control_plane_limit_value:
+
+        @app.before_request
+        @limiter.limit(
+            control_plane_limit_value,
+            key_func=_relay_control_plane_rate_limit_key,
+            per_method=True,
+            methods=["POST"],
+            exempt_when=_is_not_relay_control_plane_route,
+            override_defaults=False,
+        )
+        def _enforce_relay_control_plane_rate_limit():
+            return None
+
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):
+        retry_after = _retry_after_seconds(exc)
+        route_class = request.environ.get(
+            "tokenplace.rate_limit_route_class", "public_api"
+        )
+        bucket_fingerprint = request.environ.get(
+            "tokenplace.rate_limit_bucket_fingerprint"
+        )
+        LOGGER.warning(
+            "api.rate_limit_exceeded",
+            extra={
+                "route": _normalized_path(request.path),
+                "route_class": route_class,
+                "limiter_bucket_fingerprint": bucket_fingerprint,
+                "retry_after": retry_after,
+            },
+        )
         return _build_rate_limit_response(exc)
 
     PrometheusMetrics(app)
@@ -198,6 +254,7 @@ def init_app(app):
     stream_limit_value = os.environ.get("API_STREAM_RATE_LIMIT", "30/minute").strip()
 
     if stream_limit_value:
+
         def _stream_limit_exempt() -> bool:
             data = request.get_json(silent=True)
             if not isinstance(data, dict):

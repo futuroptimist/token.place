@@ -194,7 +194,7 @@ for:
   log path so spaces in `~/Library/Logs/...` work.
 
 The macOS log is created under the app log directory in an `operator/` subfolder,
-with names like `compute-node-<operator_session_id>.log`. The log starts with the
+with timestamped per-session names like `compute-node-<operator_session_id>-<timestamp>.log`. The log starts with the
 operator session id, sanitized relay target, requested mode, bridge path,
 interpreter, resource root, packaged layout, and import root. It then mirrors
 bridge stdout/stderr, `desktop_runtime_setup` probe/provision output,

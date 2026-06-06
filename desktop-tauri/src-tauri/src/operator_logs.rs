@@ -65,7 +65,7 @@ fn create_unique_operator_log_file(
         let path = dir.join(format!(
             "compute-node-{safe_session_id}-{timestamp}{suffix}.log"
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match OpenOptions::new().append(true).create_new(true).open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.into()),
@@ -364,6 +364,41 @@ mod tests {
         assert_eq!(
             fs::read_to_string(second_path).expect("second contents"),
             ""
+        );
+    }
+
+    #[test]
+    fn log_sink_append_mode_preserves_interleaved_lifecycle_appends() {
+        let temp = TempDir::new().expect("tempdir");
+        let (path, file) = create_unique_operator_log_file(temp.path(), "interleave")
+            .expect("create operator log");
+        let sink = OperatorLogSink {
+            path: path.clone(),
+            file: Arc::new(Mutex::new(file)),
+        };
+
+        sink.append_line("desktop.compute_node.stdout", "first bridge line");
+        append_line_to_path(
+            &path,
+            "desktop.compute_node.stop_requested",
+            "operator_session_id=interleave",
+        )
+        .expect("append lifecycle line");
+        sink.append_line("desktop.compute_node.stdout", "second bridge line");
+
+        let raw = fs::read_to_string(path).expect("log contents");
+        assert!(raw.contains("desktop.compute_node.stdout first bridge line"));
+        assert!(raw.contains("desktop.compute_node.stop_requested operator_session_id=interleave"));
+        assert!(raw.contains("desktop.compute_node.stdout second bridge line"));
+        let lifecycle_index = raw
+            .find("desktop.compute_node.stop_requested")
+            .expect("lifecycle line index");
+        let second_sink_index = raw
+            .find("desktop.compute_node.stdout second bridge line")
+            .expect("second sink line index");
+        assert!(
+            lifecycle_index < second_sink_index,
+            "lifecycle append must not be overwritten by subsequent sink writes: {raw}"
         );
     }
 

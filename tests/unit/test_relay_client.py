@@ -374,7 +374,7 @@ class TestRelayClient:
 
     @patch('utils.networking.relay_client.requests.post')
     def test_unregister_from_relay_success(self, mock_post, relay_client):
-        """Unregister should post to /unregister and return True on success after registration."""
+        """Unregister should post to /api/v1/relay/servers/unregister and return True on success after registration."""
 
         relay_client._api_v1_registered_relays.add(relay_client.relay_url)
         relay_client._api_v1_last_heartbeat_at[relay_client.relay_url] = 1.0
@@ -386,7 +386,7 @@ class TestRelayClient:
 
         assert result is True
         mock_post.assert_called_once_with(
-            'http://localhost:5000/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
             json={'server_public_key': 'mock_public_key_b64'},
             timeout=relay_client._request_timeout,
         )
@@ -439,8 +439,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://primary-relay:5000/unregister',
-            'http://backup-relay:6000/unregister',
+            'http://primary-relay:5000/api/v1/relay/servers/unregister',
+            'http://backup-relay:6000/api/v1/relay/servers/unregister',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -460,8 +460,8 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            'http://localhost:5000/unregister',
-            'http://localhost:5000/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
+            'http://localhost:5000/api/v1/relay/servers/unregister',
         ]
 
     @patch('utils.networking.relay_client.requests.post')
@@ -515,9 +515,9 @@ class TestRelayClient:
 
         requested_urls = [call.args[0] for call in mock_post.call_args_list]
         assert requested_urls == [
-            f'{primary}/unregister',
-            f'{backup}/unregister',
-            f'{backup}/unregister',
+            f'{primary}/api/v1/relay/servers/unregister',
+            f'{backup}/api/v1/relay/servers/unregister',
+            f'{backup}/api/v1/relay/servers/unregister',
         ]
         assert client._api_v1_registered_relays == set()
         assert client._api_v1_last_heartbeat_at == {}
@@ -1275,6 +1275,23 @@ class TestRelayClient:
         assert RelayClient._build_api_v1_url(
             "https://relay.cloudflare.workers.dev/api/v1", "/relay/servers/register"
         ) == "https://relay.cloudflare.workers.dev/api/v1/relay/servers/register"
+
+    @patch('utils.networking.relay_client.requests.post')
+    def test_unregister_from_relay_uses_api_v1_url_builder_for_prefixed_relay(self, mock_post):
+        client = _standalone_relay_client()
+        prefixed_url = 'http://localhost:5000/api/v1'
+        client._relay_urls = [prefixed_url]
+        client._api_v1_registered_relays.add(prefixed_url)
+        client._api_v1_last_heartbeat_at[prefixed_url] = 1.0
+        mock_post.return_value = MagicMock(status_code=200)
+
+        assert client.unregister_from_relay() is True
+
+        mock_post.assert_called_once_with(
+            'http://localhost:5000/api/v1/relay/servers/unregister',
+            json={'server_public_key': 'mock_public_key_b64'},
+            timeout=15,
+        )
 
     @pytest.mark.parametrize(
         "expected_wait, expected_timeout",
@@ -3318,6 +3335,45 @@ def _standalone_relay_client():
 
 
 @patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_falls_back_to_legacy_unregister_on_404(mock_post):
+    client = _standalone_relay_client()
+    client._api_v1_registered_relays.add('http://localhost:5000')
+    client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
+    api_v1_missing = MagicMock(status_code=404)
+    legacy_success = MagicMock(status_code=200)
+    mock_post.side_effect = [api_v1_missing, legacy_success]
+
+    assert client.unregister_from_relay() is True
+
+    requested_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert requested_urls == [
+        'http://localhost:5000/api/v1/relay/servers/unregister',
+        'http://localhost:5000/unregister',
+    ]
+    assert client._api_v1_registered_relays == set()
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_unregister_from_relay_fallback_strips_api_v1_suffix_for_legacy_unregister(mock_post):
+    client = _standalone_relay_client()
+    prefixed_url = 'http://localhost:5000/api/v1'
+    client._relay_urls = [prefixed_url]
+    client._api_v1_registered_relays.add(prefixed_url)
+    client._api_v1_last_heartbeat_at[prefixed_url] = 123.0
+    api_v1_missing = MagicMock(status_code=404)
+    legacy_success = MagicMock(status_code=200)
+    mock_post.side_effect = [api_v1_missing, legacy_success]
+
+    assert client.unregister_from_relay() is True
+
+    requested_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert requested_urls == [
+        'http://localhost:5000/api/v1/relay/servers/unregister',
+        'http://localhost:5000/unregister',
+    ]
+
+
+@patch('utils.networking.relay_client.requests.post')
 def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock_post):
     client = _standalone_relay_client()
     client._api_v1_registered_relays.add('http://localhost:5000')
@@ -3329,7 +3385,7 @@ def test_unregister_from_relay_is_idempotent_and_clears_api_v1_registration(mock
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
-        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/unregister',
         json={'server_public_key': 'mock_public_key_b64'},
         timeout=15,
     )
@@ -3350,7 +3406,7 @@ def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(m
     assert client.unregister_from_relay() is True
 
     mock_post.assert_called_once_with(
-        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/unregister',
         json={'server_public_key': 'mock_public_key_b64'},
         timeout=15,
     )
@@ -3420,7 +3476,7 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
         if url.endswith('/relay/servers/register'):
             client.stop()
             return register_response
-        if url.endswith('/unregister'):
+        if url.endswith('/api/v1/relay/servers/unregister'):
             return unregister_response
         raise AssertionError(f'Unexpected relay request: {url}')
 
@@ -3436,7 +3492,7 @@ def test_poll_api_v1_encrypted_work_stop_after_register_retries_unregister(mock_
     requested_urls = [call.args[0] for call in mock_post.call_args_list]
     assert requested_urls == [
         'http://localhost:5000/api/v1/relay/servers/register',
-        'http://localhost:5000/unregister',
+        'http://localhost:5000/api/v1/relay/servers/unregister',
     ]
     assert client._api_v1_registered_relays == set()
     assert client._api_v1_last_heartbeat_at == {}

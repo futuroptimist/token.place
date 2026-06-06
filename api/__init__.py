@@ -63,8 +63,9 @@ CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
     }
 )
 
-# Authenticated API v1 compute-node control-plane POST routes bypass the low
-# public user quota and are protected by a separate, higher budget below. This
+# API v1 compute-node control-plane POST routes bypass the low public user
+# quota only after passing the relay-server token boundary used by relay.py.
+# They are protected by a separate, higher control-plane budget below, which
 # keeps healthy desktop nodes from being treated like user chat traffic while
 # preserving abuse limits.
 RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(CONTROL_PLANE_ROUTE_LIMIT_ENVS)

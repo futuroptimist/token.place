@@ -136,6 +136,53 @@ def test_unregister_requires_registration_token(relay_module) -> None:
     assert "client-1" not in relay_module.streaming_sessions_by_client
 
 
+def test_api_v1_unregister_requires_token_and_clears_registry(relay_module) -> None:
+    """API v1 unregister should require auth and remove nodes immediately."""
+
+    relay_module.known_servers.clear()
+    relay_module.client_inference_requests.clear()
+    relay_module.streaming_sessions.clear()
+    relay_module.streaming_sessions_by_client.clear()
+
+    client = relay_module.app.test_client()
+
+    register_response = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": "api-v1-node"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert register_response.status_code == 200
+    assert list(relay_module.known_servers) == ["api-v1-node"]
+
+    unauthorised = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={"server_public_key": "api-v1-node"},
+    )
+    assert unauthorised.status_code == 401
+    assert unauthorised.get_json() == {
+        "error": {
+            "code": 401,
+            "message": "Missing or invalid relay server token",
+        }
+    }
+    assert list(relay_module.known_servers) == ["api-v1-node"]
+
+    authorised = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={"server_public_key": "api-v1-node"},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert authorised.status_code == 200
+    assert authorised.get_json() == {"message": "Server unregistered", "removed": True}
+    assert relay_module.known_servers == {}
+
+    diagnostics = client.get("/relay/diagnostics")
+    assert diagnostics.status_code == 200
+    diagnostics_payload = diagnostics.get_json()
+    assert diagnostics_payload["total_registered_compute_nodes"] == 0
+    assert diagnostics_payload["registered_compute_nodes"] == []
+
+
 def test_unregister_removes_node_from_relay_diagnostics_immediately(relay_module) -> None:
     """Relay diagnostics should stop listing nodes as soon as unregister succeeds."""
 

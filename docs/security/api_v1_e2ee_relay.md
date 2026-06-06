@@ -7,6 +7,7 @@ Distributed relay traffic is relay-blind E2EE: relay-owned state and logs contai
 ## Active API v1 routes
 
 - `POST /api/v1/relay/servers/register`
+- `POST /api/v1/relay/servers/unregister`
 - `POST /api/v1/relay/servers/poll`
 - `GET /api/v1/relay/servers/next`
 - `POST /api/v1/relay/requests`

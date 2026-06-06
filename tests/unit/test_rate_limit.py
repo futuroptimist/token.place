@@ -305,8 +305,16 @@ def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota
     def relay_servers_poll():
         return {"status": "polling"}
 
+    @app.post("/api/v1/relay/servers/unregister")
+    def relay_servers_unregister():
+        return {"status": "unregistered"}
+
     with app.test_client() as client:
-        for path in ("/api/v1/relay/servers/register", "/api/v1/relay/servers/poll"):
+        for path in (
+            "/api/v1/relay/servers/register",
+            "/api/v1/relay/servers/poll",
+            "/api/v1/relay/servers/unregister",
+        ):
             responses = [
                 client.post(
                     path,

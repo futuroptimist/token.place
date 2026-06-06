@@ -115,34 +115,34 @@ Use the values files and version file that live in Sugarkube for your environmen
 
 Current app-specific staging deploy wrapper:
 
-```bash
+~~~bash
 just tokenplace-oci-deploy env=staging tag=main-REPLACE_SHORTSHA
-```
+~~~
 
 Future generic Sugarkube app wrapper, once P5 lands:
 
-```bash
+~~~bash
 just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
-```
+~~~
 
 Lower-level install pattern:
 
-```bash
+~~~bash
 just helm-oci-install release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA
-```
+~~~
 
 Existing release upgrade pattern:
 
-```bash
+~~~bash
 just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.io/futuroptimist/charts/tokenplace values=PATH/TO/tokenplace.values.dev.yaml,PATH/TO/tokenplace.values.staging.yaml version_file=PATH/TO/tokenplace.version default_tag=main-REPLACE_SHORTSHA
-```
+~~~
 
 Production pattern uses `PATH/TO/tokenplace.values.prod.yaml` with the same approved
 immutable tag.
 
 ## Validation (staging example)
 
-```bash
+~~~bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
@@ -158,11 +158,11 @@ curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/
-```
+~~~
 
 Production validation:
 
-```bash
+~~~bash
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
 helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version "$CHART_VERSION" --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.prod.yaml --set image.tag=v0.1.0 > /tmp/tokenplace-prod-render.yaml
 grep -n "tls:" -A6 /tmp/tokenplace-prod-render.yaml
@@ -176,7 +176,7 @@ curl -vI https://token.place/
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
-```
+~~~
 
 Optional note: true relay traffic validation requires a registered external compute node and an
 E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
@@ -186,8 +186,8 @@ E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For d
 Symptom:
 - A desktop/Tauri compute node logs `desktop.compute_node_bridge.api_v1_e2ee.register`
   followed by `error=HTTP 403`, while a synthetic register/poll probe succeeds and relay pod logs
-  do not show corresponding `POST /api/v1/relay/servers/register` or
-  `POST /api/v1/relay/servers/poll` requests.
+  do not show corresponding `POST /api/v1/relay/servers/register`,
+  `POST /api/v1/relay/servers/unregister`, or `POST /api/v1/relay/servers/poll` requests.
 
 Why this matters:
 - The relay registration-token guard returns JSON `401` responses for invalid tokens. A non-JSON
@@ -200,7 +200,7 @@ Why this matters:
 
 Operator steps:
 
-```bash
+~~~bash
 # 1. Capture the cf-ray from the desktop log event, if present.
 # Example event fields: status=403 server=cloudflare cf_ray=REPLACE_CF_RAY
 CF_RAY=REPLACE_CF_RAY
@@ -231,8 +231,8 @@ PY
 
 # 5. Compare relay app logs with desktop diagnostics for the same UTC window.
 kubectl -n tokenplace logs deploy/tokenplace --since=30m | \
-  grep -E 'POST /api/v1/relay/servers/(register|poll)|api_v1|relay/servers'
-```
+  grep -E 'POST /api/v1/relay/servers/(register|unregister|poll)|api_v1|relay/servers'
+~~~
 
 Decision points:
 - If desktop logs show `kind=cloudflare_pre_app_rejection`, `status=403`, and a `cf-ray`, but
@@ -260,6 +260,10 @@ quota. Configure `TOKENPLACE_RATE_LIMIT_STORAGE_URI` with a shared backend such 
 in multi-worker deployments so public and control-plane budgets are shared across workers. User-facing
 chat/completion routes remain rate-limited.
 
+If Cloudflare/WAF skip or allow rules enumerate API v1 compute-node control paths, include
+`POST /api/v1/relay/servers/unregister` alongside register and poll so Stop operator shutdown can
+reach `relay.py` immediately instead of waiting for heartbeat lease expiry.
+
 ## v0.1.0 staging failure modes and operator runbook
 
 The following failure modes were observed during v0.1.0 staging and should be treated as a
@@ -282,7 +286,7 @@ Decision rule for v0.1.0:
 
 Verification commands:
 
-```bash
+~~~bash
 # Compare local chart metadata with OCI package metadata.
 helm show chart ./charts/tokenplace
 helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1
@@ -295,7 +299,7 @@ IMAGE_TAG=main-REPLACE_SHORTSHA
 helm template tokenplace ./charts/tokenplace --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-local.yaml
 helm template tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1 --namespace tokenplace -f PATH/TO/tokenplace.values.dev.yaml -f PATH/TO/tokenplace.values.staging.yaml --set image.tag="$IMAGE_TAG" > /tmp/tokenplace-oci.yaml
 diff -u /tmp/tokenplace-local.yaml /tmp/tokenplace-oci.yaml | less
-```
+~~~
 
 ### 2) Missing `Recreate` strategy in deployed chart output
 
@@ -304,11 +308,11 @@ Symptom:
 
 Verification commands:
 
-```bash
+~~~bash
 grep -n "strategy:" -A4 /tmp/tokenplace-local.yaml
 grep -n "strategy:" -A4 /tmp/tokenplace-oci.yaml
 kubectl -n tokenplace get deploy tokenplace -o yaml | grep -n "strategy:" -A4
-```
+~~~
 
 Expected:
 - Deployment strategy shows `type: Recreate`.
@@ -326,10 +330,10 @@ Required fix:
 
 Verification commands:
 
-```bash
+~~~bash
 kubectl -n tokenplace get deploy tokenplace -o yaml | grep -n "XDG_CONFIG_HOME\\|XDG_CACHE_HOME\\|XDG_DATA_HOME\\|XDG_STATE_HOME" -A1 -B1
 kubectl -n tokenplace logs deploy/tokenplace --tail=200
-```
+~~~
 
 Expected:
 - `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME` are set under container env.
@@ -343,7 +347,7 @@ Symptom:
 
 Verification commands:
 
-```bash
+~~~bash
 grep -n "name: TOKENPLACE_" -A1 /tmp/tokenplace-oci.yaml
 python - <<'PY'
 import sys, yaml
@@ -362,7 +366,7 @@ for d in docs:
             print(f"{d.get('metadata', {}).get('name','<unknown>')}:{c.get('name','<unknown>')} duplicates: {', '.join(dupes)}")
 PY
 helm upgrade --install tokenplace oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1 --namespace tokenplace --dry-run=client
-```
+~~~
 
 Expected:
 - No duplicated env variable names in rendered manifest.
@@ -397,11 +401,11 @@ Run this in staging before production promotion:
 
 Example checks:
 
-```bash
+~~~bash
 curl -fsS https://staging.token.place/healthz
 curl -fsS https://staging.token.place/relay/diagnostics
 curl -fsS https://staging.token.place/metrics | head -n 40
-```
+~~~
 
 ### Image tag, chart version, and Git tag must be validated independently
 
@@ -414,14 +418,14 @@ For final v0.1.0 release readiness, verify all four identifiers explicitly (sepa
 
 Example image-tag existence checks:
 
-```bash
+~~~bash
 # Staging candidate validation (use the same candidate tag as IMAGE_TAG above).
 IMAGE_TAG=main-REPLACE_SHORTSHA
 docker manifest inspect "ghcr.io/futuroptimist/tokenplace-relay:${IMAGE_TAG}" >/dev/null
 
 # Final release-tag validation.
 docker manifest inspect ghcr.io/futuroptimist/tokenplace-relay:v0.1.0 >/dev/null
-```
+~~~
 
 ### Relay-only health output expectations (staging and production)
 
@@ -431,7 +435,7 @@ later.
 
 Before (misleading in relay-only mode):
 
-```json
+~~~json
 {
   "status": "ok",
   "publicBaseUrl": "https://staging.token.place",
@@ -439,11 +443,11 @@ Before (misleading in relay-only mode):
   "configuredUpstreamServers": ["https://token.place"],
   "upstream": "http://gpu-server:3000"
 }
-```
+~~~
 
 After (explicit relay-only semantics):
 
-```json
+~~~json
 {
   "status": "ok",
   "publicBaseUrl": "https://staging.token.place",
@@ -455,7 +459,7 @@ After (explicit relay-only semantics):
   "upstream": "http://gpu-server:3000",
   "details": {"knownServers": "empty"}
 }
-```
+~~~
 
 Interpretation:
 - `status: ok` reflects relay process readiness.

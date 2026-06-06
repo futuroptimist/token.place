@@ -114,6 +114,7 @@ _API_V1_DIAGNOSTIC_HEADER_NAMES = (
     "cf-cache-status",
     "content-type",
     "x-request-id",
+    "retry-after",
 )
 _API_V1_BODY_SNIPPET_LIMIT = 512
 _API_V1_REDACTED = "[redacted]"
@@ -1072,6 +1073,7 @@ class RelayClient:
         else:
             error_kind = "http_status_no_json_body"
 
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
         diagnostic = {
             "method": method.upper(),
             "path": path,
@@ -1082,6 +1084,7 @@ class RelayClient:
             "relay_error": relay_error,
             "error_kind": error_kind,
             "probable_pre_app_rejection": probable_pre_app_rejection,
+            "retry_after": retry_after,
         }
 
         log_error(
@@ -1093,6 +1096,18 @@ class RelayClient:
             diagnostic["headers"],
             diagnostic["body_snippet"],
         )
+        control_plane_paths = {
+            "/api/v1/relay/servers/register",
+            "/api/v1/relay/servers/poll",
+            "/api/v1/relay/responses",
+        }
+        if status_code == 429 and path in control_plane_paths:
+            log_error(
+                "relay_control_plane_rate_limited route={} retry_after={} relay_error={}",
+                path,
+                retry_after or "unknown",
+                relay_error or "none",
+            )
         if probable_pre_app_rejection:
             log_error(
                 "api_v1.relay_pre_app_rejection method={} path={} status={} cf_ray={} server={} token_sent={}",

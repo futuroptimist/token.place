@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import secrets
 import sys
+import threading
+import time
 from flask import jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
@@ -16,6 +20,8 @@ from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+LOGGER = logging.getLogger("tokenplace.relay")
+
 
 # Paths that support operations, health checking, metrics scraping, and
 # diagnostics must not consume the public user API quota. Kubernetes readiness
@@ -39,17 +45,26 @@ CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
     }
 )
 
-# API v1 compute-node control-plane routes should bypass the public user quota
-# only for authenticated compute-node traffic. When relay server tokens are not
-# configured, these mutation/long-poll routes remain rate-limited to prevent
-# anonymous callers from growing relay-owned state or occupying workers.
-AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS = frozenset(
+# API v1 compute-node control-plane routes bypass the public user quota and
+# receive a dedicated higher budget. Route handlers still enforce configured
+# registration tokens and validate request bodies before mutating relay state.
+RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(
     {
         "/api/v1/relay/servers/register",
         "/api/v1/relay/servers/poll",
         "/api/v1/relay/responses",
+        "/unregister",
     }
 )
+
+# API v1 compute-node control-plane traffic has its own higher budget so
+# healthy desktop nodes do not consume the low public chat/user request budget.
+# The default supports multiple nodes behind a NAT polling every 10 seconds,
+# lease refreshes, response submissions, retries, and start/stop loops.
+RELAY_CONTROL_PLANE_RATE_LIMIT_ENV = "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT"
+RELAY_CONTROL_PLANE_RATE_LIMIT_DEFAULT = "600/hour"
+_CONTROL_PLANE_RATE_LIMIT_STATE: dict[str, tuple[float, int]] = {}
+_CONTROL_PLANE_RATE_LIMIT_LOCK = threading.Lock()
 
 
 def _normalized_path(path: str) -> str:
@@ -98,26 +113,10 @@ def _load_relay_server_registration_tokens() -> list[str]:
     return [token for token in normalized if token]
 
 
-def _is_authenticated_relay_control_plane_request(path: str) -> bool:
-    """Return True for compute-node control-plane requests with a valid token."""
+def _is_relay_control_plane_path(path: str) -> bool:
+    """Return True for compute-node control-plane routes."""
 
-    if (
-        _normalized_path(path)
-        not in AUTHENTICATED_RELAY_CONTROL_PLANE_RATE_LIMIT_EXEMPT_PATHS
-    ):
-        return False
-
-    relay_server_tokens = _load_relay_server_registration_tokens()
-    if not relay_server_tokens:
-        return False
-
-    provided = request.headers.get("X-Relay-Server-Token", "").strip()
-    if not provided:
-        return False
-
-    return any(
-        secrets.compare_digest(provided, token) for token in relay_server_tokens
-    )
+    return _normalized_path(path) in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
 
 
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
@@ -127,8 +126,123 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     return (
         normalized_path in RATE_LIMIT_EXEMPT_PATHS
         or normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS
-        or _is_authenticated_relay_control_plane_request(normalized_path)
+        or _is_relay_control_plane_path(normalized_path)
     )
+
+
+def _parse_fixed_window_rate_limit(limit_value: str) -> tuple[int, int]:
+    """Parse simple Flask-Limiter-style fixed windows such as ``600/hour``."""
+
+    raw = (limit_value or RELAY_CONTROL_PLANE_RATE_LIMIT_DEFAULT).strip()
+    try:
+        amount_text, period_text = raw.split("/", 1)
+        amount = int(amount_text.strip())
+    except (TypeError, ValueError):
+        amount = 600
+        period_text = "hour"
+
+    period = period_text.strip().lower()
+    period_seconds = {
+        "second": 1,
+        "sec": 1,
+        "s": 1,
+        "minute": 60,
+        "min": 60,
+        "m": 60,
+        "hour": 3600,
+        "hr": 3600,
+        "h": 3600,
+        "day": 86400,
+        "d": 86400,
+    }.get(period.rstrip("s"), 3600)
+    return max(amount, 1), period_seconds
+
+
+def _safe_rate_limit_fingerprint(value: str) -> str:
+    """Return a short non-secret fingerprint for limiter diagnostics."""
+
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _control_plane_bucket_key(path: str) -> str:
+    """Build a route-specific control-plane key, preferring server public key."""
+
+    data = request.get_json(silent=True)
+    key_material = None
+    if isinstance(data, dict):
+        for field in ("server_public_key", "request_id", "client_public_key"):
+            candidate = data.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                key_material = f"{field}:{candidate.strip()}"
+                break
+    if key_material is None:
+        key_material = f"ip:{get_remote_address()}"
+    return f"{_normalized_path(path)}:{key_material}"
+
+
+def _build_control_plane_rate_limit_response(
+    *,
+    limit_value: str,
+    retry_after: int,
+    route: str,
+    bucket_key: str,
+):
+    payload = {
+        "error": {
+            "message": (
+                f"Rate limit exceeded: {limit_value}. Try again in {retry_after} seconds."
+            ),
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+            "param": None,
+        }
+    }
+    LOGGER.warning(
+        "relay.rate_limited",
+        extra={
+            "route": route,
+            "route_class": "compute_node_control_plane",
+            "bucket_fingerprint": _safe_rate_limit_fingerprint(bucket_key),
+            "retry_after": retry_after,
+        },
+    )
+    response = jsonify(payload)
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+def _enforce_relay_control_plane_rate_limit():
+    """Apply the dedicated compute-node control-plane fixed-window budget."""
+
+    route = _normalized_path(request.path)
+    if not _is_relay_control_plane_path(route):
+        return None
+
+    limit_value = (
+        os.environ.get(
+            RELAY_CONTROL_PLANE_RATE_LIMIT_ENV, RELAY_CONTROL_PLANE_RATE_LIMIT_DEFAULT
+        ).strip()
+        or RELAY_CONTROL_PLANE_RATE_LIMIT_DEFAULT
+    )
+    limit, window_seconds = _parse_fixed_window_rate_limit(limit_value)
+    bucket_key = _control_plane_bucket_key(route)
+    now = time.monotonic()
+    with _CONTROL_PLANE_RATE_LIMIT_LOCK:
+        reset_at, count = _CONTROL_PLANE_RATE_LIMIT_STATE.get(bucket_key, (0.0, 0))
+        if now >= reset_at:
+            reset_at = now + window_seconds
+            count = 0
+        if count >= limit:
+            retry_after = max(int(reset_at - now), 1)
+            return _build_control_plane_rate_limit_response(
+                limit_value=limit_value,
+                retry_after=retry_after,
+                route=route,
+                bucket_key=bucket_key,
+            )
+        _CONTROL_PLANE_RATE_LIMIT_STATE[bucket_key] = (reset_at, count + 1)
+    return None
 
 
 def _resolve_rate_limit_storage_uri() -> str | None:
@@ -189,6 +303,8 @@ def init_app(app):
     def _handle_rate_limit(exc: RateLimitExceeded):
         return _build_rate_limit_response(exc)
 
+    app.before_request(_enforce_relay_control_plane_rate_limit)
+
     PrometheusMetrics(app)
     app.register_blueprint(v1_routes.v1_bp)
     app.register_blueprint(v1_routes.openai_v1_bp)
@@ -198,6 +314,7 @@ def init_app(app):
     stream_limit_value = os.environ.get("API_STREAM_RATE_LIMIT", "30/minute").strip()
 
     if stream_limit_value:
+
         def _stream_limit_exempt() -> bool:
             data = request.get_json(silent=True)
             if not isinstance(data, dict):

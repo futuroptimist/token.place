@@ -5,9 +5,21 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from flask import Flask
 
-from api import _load_relay_server_registration_tokens, init_app
+from api import (
+    _CONTROL_PLANE_RATE_LIMIT_STATE,
+    _load_relay_server_registration_tokens,
+    init_app,
+)
+
+
+@pytest.fixture(autouse=True)
+def clear_control_plane_rate_limit_state():
+    _CONTROL_PLANE_RATE_LIMIT_STATE.clear()
+    yield
+    _CONTROL_PLANE_RATE_LIMIT_STATE.clear()
 
 
 @patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"})
@@ -272,10 +284,10 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
     },
     clear=True,
 )
-def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota(
+def test_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota(
     monkeypatch,
 ):
-    """Authenticated compute-node heartbeats must not consume user API quota."""
+    """Compute-node heartbeats must not consume the user API quota."""
     monkeypatch.setitem(
         sys.modules,
         "relay",
@@ -303,6 +315,80 @@ def test_authenticated_api_v1_relay_heartbeat_routes_do_not_inherit_public_quota
                 for _ in range(65)
             ]
             assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "60/hour", "API_DAILY_QUOTA": "1000/day"},
+    clear=True,
+)
+def test_api_v1_relay_response_submissions_do_not_inherit_public_quota():
+    """Compute-node response submissions use the control-plane budget."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/responses")
+    def relay_responses():
+        return {"status": "queued"}
+
+    with app.test_client() as client:
+        responses = [
+            client.post(
+                "/api/v1/relay/responses",
+                json={
+                    "client_public_key": "client",
+                    "request_id": f"request-{index}",
+                },
+            )
+            for index in range(65)
+        ]
+
+    assert {response.status_code for response in responses} == {200}
+
+
+@patch.dict(
+    os.environ,
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "4/hour",
+    },
+    clear=True,
+)
+def test_control_plane_budget_is_separate_and_keyed_by_server_public_key():
+    """Multiple nodes behind one source IP should get independent route buckets."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.post("/api/v1/relay/servers/poll")
+    def relay_servers_poll_separate_budget():
+        return {"status": "polling"}
+
+    with app.test_client() as client:
+        server_one = [
+            client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": "server-one"},
+            ).status_code
+            for _ in range(4)
+        ]
+        server_two = [
+            client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": "server-two"},
+            ).status_code
+            for _ in range(4)
+        ]
+        limited = client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": "server-one"},
+        )
+
+    assert server_one == [200, 200, 200, 200]
+    assert server_two == [200, 200, 200, 200]
+    assert limited.status_code == 429
+    assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+    assert limited.headers["Retry-After"].isdigit()
 
 
 @patch.dict(
@@ -342,12 +428,13 @@ def test_api_v1_relay_client_read_routes_do_not_inherit_public_quota():
     {
         "API_RATE_LIMIT": "2/hour",
         "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "2/hour",
         "TOKEN_PLACE_RELAY_SERVER_TOKEN": "rotated-token",
     },
     clear=True,
 )
-def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypatch):
-    """Limiter auth should not drift from relay.py's active token snapshot."""
+def test_control_plane_limit_is_independent_of_registration_token_header(monkeypatch):
+    """Registration-token presence should not send control traffic to user quota."""
     monkeypatch.setitem(
         sys.modules,
         "relay",
@@ -364,7 +451,7 @@ def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypa
         rotated_responses = [
             client.post(
                 "/api/v1/relay/servers/register",
-                json={"server_public_key": f"server-{index}"},
+                json={"server_public_key": "rotated-server"},
                 headers={"X-Relay-Server-Token": "rotated-token"},
             )
             for index in range(3)
@@ -387,12 +474,13 @@ def test_authenticated_relay_exemption_uses_loaded_relay_token_snapshot(monkeypa
     {
         "API_RATE_LIMIT": "2/hour",
         "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "2/hour",
         "TOKEN_PLACE_RELAY_SERVER_TOKEN": "relay-token",
     },
     clear=True,
 )
 def test_relay_mutations_with_missing_token_header_keep_public_rate_limit(monkeypatch):
-    """Configured relay tokens should not exempt requests that omit the header."""
+    """Missing auth headers should still receive the control-plane budget."""
 
     monkeypatch.setitem(
         sys.modules,
@@ -410,7 +498,7 @@ def test_relay_mutations_with_missing_token_header_keep_public_rate_limit(monkey
         responses = [
             client.post(
                 "/api/v1/relay/servers/register",
-                json={"server_public_key": f"server-{index}"},
+                json={"server_public_key": "server-without-header"},
             )
             for index in range(3)
         ]
@@ -420,11 +508,15 @@ def test_relay_mutations_with_missing_token_header_keep_public_rate_limit(monkey
 
 @patch.dict(
     os.environ,
-    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "1000/day"},
+    {
+        "API_RATE_LIMIT": "2/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT": "2/hour",
+    },
     clear=True,
 )
-def test_unauthenticated_api_v1_relay_mutations_keep_public_rate_limit():
-    """Anonymous relay mutations should retain quota protection when no token exists."""
+def test_unauthenticated_api_v1_relay_mutations_use_control_plane_rate_limit():
+    """Anonymous relay mutations should retain quota protection on a separate budget."""
     app = Flask(__name__)
     init_app(app)
 
@@ -435,18 +527,21 @@ def test_unauthenticated_api_v1_relay_mutations_keep_public_rate_limit():
     with app.test_client() as client:
         assert (
             client.post(
-                "/api/v1/relay/servers/register", json={"server_public_key": "server-1"}
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": "anonymous-server"},
             ).status_code
             == 200
         )
         assert (
             client.post(
-                "/api/v1/relay/servers/register", json={"server_public_key": "server-2"}
+                "/api/v1/relay/servers/register",
+                json={"server_public_key": "anonymous-server"},
             ).status_code
             == 200
         )
         response = client.post(
-            "/api/v1/relay/servers/register", json={"server_public_key": "server-3"}
+            "/api/v1/relay/servers/register",
+            json={"server_public_key": "anonymous-server"},
         )
 
     assert response.status_code == 429

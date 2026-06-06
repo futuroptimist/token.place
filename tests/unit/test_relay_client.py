@@ -1617,17 +1617,27 @@ class TestRelayClient:
         }
 
     @patch('utils.networking.relay_client.requests.post')
-    def test_poll_api_v1_encrypted_work_propagates_register_interval_on_poll_error(self, mock_post, relay_client):
+    def test_poll_api_v1_encrypted_work_logs_control_plane_rate_limit(
+        self, mock_post, relay_client, caplog
+    ):
         register_ok = MagicMock(status_code=200)
         register_ok.json.return_value = {'next_ping_in_x_seconds': 11}
         poll_fail = MagicMock(status_code=429)
+        poll_fail.headers = {'Retry-After': '37'}
+        poll_fail.text = '{"error":{"code":"rate_limit_exceeded"}}'
+        poll_fail.json.return_value = {'error': {'code': 'rate_limit_exceeded'}}
         mock_post.side_effect = [register_ok, poll_fail]
 
-        result = relay_client.poll_api_v1_encrypted_work()
+        with caplog.at_level('ERROR', logger='relay_client'):
+            result = relay_client.poll_api_v1_encrypted_work()
 
         assert result['error'] == 'HTTP 429'
         assert result['next_ping_in_x_seconds'] == 11
-        assert result['relay_error_kind'] == 'http_status_no_json_body'
+        assert result['relay_error_kind'] == 'relay_json_error'
+        assert result['relay_http_diagnostic']['retry_after'] == '37'
+        assert 'relay_control_plane_rate_limited' in caplog.text
+        assert 'route=/api/v1/relay/servers/poll' in caplog.text
+        assert 'retry_after=37' in caplog.text
 
     def test_process_client_request_missing_fields(self, relay_client):
         """Test processing a client request with missing fields."""

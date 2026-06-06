@@ -105,6 +105,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 |-----------------|--------------|--------------------------------------------------------------------|
 | API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for API requests                                |
 | API_STREAM_RATE_LIMIT | 30/minute   | Per-IP rate limit applied only to streaming chat completions          |
+| TOKENPLACE_RELAY_CONTROL_PLANE_RATE_LIMIT | 600/hour | Dedicated route/key budget for compute-node register, poll, response, and unregister control-plane traffic; separate from user chat quotas |
 | SERVICE_NAME    | token.place  | Service identifier returned by health endpoints (whitespace-only overrides
 |                 |              | fall back to `token.place`)                                             |
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |

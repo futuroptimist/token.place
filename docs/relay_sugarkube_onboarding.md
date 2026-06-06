@@ -242,16 +242,23 @@ Decision points:
 - If desktop logs show `kind=http_status_no_json_body` without Cloudflare headers, inspect ingress,
   tunnel, and upstream proxy logs before changing relay application code.
 
-Operational note: `/healthz`, `/livez`, `/metrics`, `/relay/diagnostics`, and API v1 compute-node
-heartbeat/control-plane routes are intentionally exempt from the public API rate-limit quota. A
-Kubernetes readiness probe that calls `/healthz` every 10 seconds must not exhaust the default
-`API_RATE_LIMIT=60/hour`; before this exemption, staging could return 429 to kube-probe and become
-externally unhealthy even while the relay process was running. Compute-node register, poll, and
-encrypted response submission traffic is instead protected by dedicated control-plane budgets
-(`API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT`, `API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT`,
+Operational note: `/healthz`, `/livez`, `/metrics`, and `/relay/diagnostics` are intentionally
+exempt from the public API rate-limit quota. API v1 compute-node heartbeat/control-plane POST
+routes are also exempt from the public quota after passing the relay token boundary: valid
+`X-Relay-Server-Token` when tokens are configured, or the documented tokenless behavior when no
+relay server tokens are configured. Invalid-token POSTs still consume the public quota and are only
+charged to the aggregate client-IP control-plane bucket, not to spoofable server/client identity
+buckets. A Kubernetes readiness probe that calls `/healthz` every 10 seconds must not exhaust the
+default `API_RATE_LIMIT=60/hour`; before this exemption, staging could return 429 to kube-probe and
+become externally unhealthy even while the relay process was running. Compute-node
+register, poll, and encrypted response submission traffic is instead protected by dedicated
+control-plane budgets (`API_RELAY_CONTROL_PLANE_RATE_LIMIT`,
+`API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT`, `API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT`,
 `API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT`, and aggregate `API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT`)
-so multiple desktop nodes behind one NAT can poll normally without consuming chat/user quota.
-User-facing chat/completion routes remain rate-limited.
+so multiple authenticated desktop nodes behind one NAT can poll normally without consuming chat/user
+quota. Configure `TOKENPLACE_RATE_LIMIT_STORAGE_URI` with a shared backend such as Redis or Memcached
+in multi-worker deployments so public and control-plane budgets are shared across workers. User-facing
+chat/completion routes remain rate-limited.
 
 ## v0.1.0 staging failure modes and operator runbook
 

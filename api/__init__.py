@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import secrets
 import sys
-import threading
 import time
 from typing import Any
 
@@ -14,6 +14,8 @@ from flask import jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
+from limits.storage import storage_from_string
+from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
 from prometheus_flask_exporter import PrometheusMetrics
 
@@ -37,7 +39,6 @@ CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/poll": "1200/hour",
     "/api/v1/relay/responses": "1200/hour",
 }
-CONTROL_PLANE_DEFAULT_LIMIT = "1200/hour"
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"
 
 # Paths that support operations, health checking, metrics scraping, and
@@ -62,9 +63,10 @@ CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS = frozenset(
     }
 )
 
-# API v1 compute-node control-plane routes bypass the low public user quota and
-# are protected by a separate, higher budget below. This keeps healthy desktop
-# nodes from being treated like user chat traffic while preserving abuse limits.
+# Authenticated API v1 compute-node control-plane POST routes bypass the low
+# public user quota and are protected by a separate, higher budget below. This
+# keeps healthy desktop nodes from being treated like user chat traffic while
+# preserving abuse limits.
 RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS = frozenset(CONTROL_PLANE_ROUTE_LIMIT_ENVS)
 
 
@@ -114,14 +116,31 @@ def _load_relay_server_registration_tokens() -> list[str]:
     return [token for token in normalized if token]
 
 
+def _relay_server_token_is_valid() -> bool:
+    """Return True when configured relay tokens are absent or matched."""
+
+    tokens = _load_relay_server_registration_tokens()
+    if not tokens:
+        return True
+
+    candidate = request.headers.get("X-Relay-Server-Token", "").strip()
+    if not candidate:
+        return False
+    return any(secrets.compare_digest(candidate, token) for token in tokens)
+
+
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
     """Return True when a route should not consume the public API quota."""
 
     normalized_path = _normalized_path(path)
+    if normalized_path in RATE_LIMIT_EXEMPT_PATHS:
+        return True
+    if normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS:
+        return True
     return (
-        normalized_path in RATE_LIMIT_EXEMPT_PATHS
-        or normalized_path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS
-        or normalized_path in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
+        request.method == "POST"
+        and normalized_path in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
+        and _relay_server_token_is_valid()
     )
 
 
@@ -132,7 +151,7 @@ def _resolve_rate_limit_storage_uri() -> str | None:
 
 
 def _fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _parse_rate_limit_item(raw_limit: str, fallback: str):
@@ -183,32 +202,59 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
     return "client_ip", get_remote_address()
 
 
-def _control_plane_window_seconds(limit_item: Any) -> int:
-    return int(limit_item.multiples * limit_item.GRANULARITY.seconds)
-
-
-def _check_control_plane_bucket(
-    buckets: dict[tuple[str, str, str], tuple[int, float]],
-    lock: threading.Lock,
+def _control_plane_bucket_identifier(
     *,
     route: str,
     bucket_kind: str,
     bucket_value: str,
-    limit_item: Any,
-    now: float,
-) -> tuple[bool, int, str]:
-    window_seconds = _control_plane_window_seconds(limit_item)
-    bucket_key = (route, bucket_kind, bucket_value)
-    with lock:
-        count, reset_at = buckets.get(bucket_key, (0, now + window_seconds))
-        if now >= reset_at:
-            count = 0
-            reset_at = now + window_seconds
-        if count >= int(limit_item.amount):
-            retry_after = max(int(reset_at - now), 1)
-            return False, retry_after, ":".join(bucket_key)
-        buckets[bucket_key] = (count + 1, reset_at)
-    return True, 0, ":".join(bucket_key)
+) -> tuple[str, str, str]:
+    """Return bounded, non-raw storage identifiers for a control-plane bucket."""
+
+    return (route, bucket_kind, _fingerprint(bucket_value))
+
+
+def _control_plane_retry_after(
+    rate_limiter: Any, limit_item: Any, identifiers: tuple[str, str, str]
+) -> int:
+    window = rate_limiter.get_window_stats(limit_item, *identifiers)
+    return max(int(window.reset_time - time.time()), 1)
+
+
+def _check_control_plane_limits(
+    rate_limiter: Any,
+    checks: list[tuple[str, str, Any]],
+    *,
+    route: str,
+) -> tuple[bool, int, str, str, Any]:
+    """Atomically enough test all buckets before charging any bucket.
+
+    The limits backend gives shared storage and TTL for individual buckets. Testing
+    every bucket before recording hits avoids burning an identity quota for a
+    request that is already rejected by the aggregate IP budget.
+    """
+
+    planned_hits: list[tuple[str, tuple[str, str, str], Any]] = []
+    for bucket_kind, bucket_value, limit_item in checks:
+        identifiers = _control_plane_bucket_identifier(
+            route=route,
+            bucket_kind=bucket_kind,
+            bucket_value=bucket_value,
+        )
+        if not rate_limiter.test(limit_item, *identifiers):
+            retry_after = _control_plane_retry_after(
+                rate_limiter, limit_item, identifiers
+            )
+            return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
+        planned_hits.append((bucket_kind, identifiers, limit_item))
+
+    for bucket_kind, identifiers, limit_item in planned_hits:
+        if not rate_limiter.hit(limit_item, *identifiers):
+            retry_after = _control_plane_retry_after(
+                rate_limiter, limit_item, identifiers
+            )
+            return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
+
+    return True, 0, "", "", None
 
 
 def _build_control_plane_rate_limit_response(limit_item: Any, retry_after: int):
@@ -230,52 +276,59 @@ def _build_control_plane_rate_limit_response(limit_item: Any, retry_after: int):
     return response
 
 
-def _install_control_plane_rate_limiter(app) -> None:
+def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
     route_limits = _control_plane_limits_from_env()
-    buckets: dict[tuple[str, str, str], tuple[int, float]] = {}
-    lock = threading.Lock()
-    app.config["relay_control_plane_rate_limit_buckets"] = buckets
-    app.config["relay_control_plane_rate_limit_lock"] = lock
+    control_plane_storage_uri = storage_uri or "memory://"
+    control_plane_storage = storage_from_string(control_plane_storage_uri)
+    control_plane_rate_limiter = FixedWindowRateLimiter(control_plane_storage)
+    app.config["relay_control_plane_rate_limit_storage_uri"] = control_plane_storage_uri
+    app.config["relay_control_plane_rate_limiter"] = control_plane_rate_limiter
 
     @app.before_request
     def _enforce_control_plane_rate_limit():
         route = _normalized_path(request.path)
         route_limit = route_limits.get(route)
-        if route_limit is None:
+        if route_limit is None or request.method != "POST":
             return None
 
-        data = request.get_json(silent=True)
-        identity_kind, identity_value = _control_plane_identity_for_request(route, data)
         remote_address = get_remote_address()
-        now = time.time()
-        checks = [(identity_kind, identity_value, route_limit["identity"])]
-        if identity_kind != "client_ip" or identity_value != remote_address:
-            checks.append(("client_ip", remote_address, route_limit["ip"]))
-        for bucket_kind, bucket_value, limit_item in checks:
-            allowed, retry_after, raw_bucket_key = _check_control_plane_bucket(
-                buckets,
-                lock,
+        checks: list[tuple[str, str, Any]] = [
+            ("client_ip", remote_address, route_limit["ip"])
+        ]
+
+        # Only charge high-cardinality identity buckets after passing the same
+        # token boundary as relay.py. Invalid token attempts stay keyed to client
+        # IP so callers cannot spoof a victim server/client bucket.
+        if _relay_server_token_is_valid():
+            data = request.get_json(silent=True)
+            identity_kind, identity_value = _control_plane_identity_for_request(
+                route, data
+            )
+            if identity_kind != "client_ip" or identity_value != remote_address:
+                checks.append((identity_kind, identity_value, route_limit["identity"]))
+
+        allowed, retry_after, bucket_kind, bucket_key, limit_item = (
+            _check_control_plane_limits(
+                control_plane_rate_limiter,
+                checks,
                 route=route,
-                bucket_kind=bucket_kind,
-                bucket_value=bucket_value,
-                limit_item=limit_item,
-                now=now,
             )
-            if allowed:
-                continue
-            bucket_fingerprint = _fingerprint(raw_bucket_key)
-            LOGGER.warning(
-                "relay_control_plane_rate_limited",
-                extra={
-                    "route": route,
-                    "route_class": CONTROL_PLANE_ROUTE_CLASS,
-                    "limiter_bucket_kind": bucket_kind,
-                    "limiter_bucket_fingerprint": bucket_fingerprint,
-                    "retry_after": retry_after,
-                },
-            )
-            return _build_control_plane_rate_limit_response(limit_item, retry_after)
-        return None
+        )
+        if allowed:
+            return None
+
+        bucket_fingerprint = _fingerprint(bucket_key)
+        LOGGER.warning(
+            "relay_control_plane_rate_limited",
+            extra={
+                "route": route,
+                "route_class": CONTROL_PLANE_ROUTE_CLASS,
+                "limiter_bucket_kind": bucket_kind,
+                "limiter_bucket_fingerprint": bucket_fingerprint,
+                "retry_after": retry_after,
+            },
+        )
+        return _build_control_plane_rate_limit_response(limit_item, retry_after)
 
 
 def _build_rate_limit_response(exc: RateLimitExceeded):
@@ -330,7 +383,7 @@ def init_app(app):
     def _handle_rate_limit(exc: RateLimitExceeded):
         return _build_rate_limit_response(exc)
 
-    _install_control_plane_rate_limiter(app)
+    _install_control_plane_rate_limiter(app, limiter_storage_uri)
 
     PrometheusMetrics(app)
     app.register_blueprint(v1_routes.v1_bp)

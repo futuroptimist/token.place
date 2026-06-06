@@ -457,34 +457,120 @@ fn append_operator_log_path_line(log_file_path: Option<&str>, source: &str, line
 }
 
 fn redact_bridge_stdout_line(line: &str) -> String {
-    let Ok(mut payload) = serde_json::from_str::<Value>(line) else {
-        return line.to_owned();
+    let Ok(payload) = serde_json::from_str::<Value>(line) else {
+        return sanitize_freeform_bridge_log_line(line);
     };
-    redact_sensitive_bridge_fields(&mut payload);
-    serde_json::to_string(&payload).unwrap_or_else(|_| line.to_owned())
+    summarize_bridge_stdout_payload(&payload)
 }
 
-fn redact_sensitive_bridge_fields(value: &mut Value) {
+fn summarize_bridge_stdout_payload(payload: &Value) -> String {
+    let mut summary = serde_json::Map::new();
+    let Some(map) = payload.as_object() else {
+        return "{\"type\":\"non_object_bridge_event\"}".into();
+    };
+
+    for key in [
+        "type",
+        "operator_session_id",
+        "sequence",
+        "updated_at_ms",
+        "running",
+        "registered",
+        "relay_runtime_state",
+        "warm_load_state",
+        "warm_load_enabled",
+        "warm_load_duration_ms",
+        "requested_mode",
+        "effective_mode",
+        "backend_available",
+        "backend_selected",
+        "backend_used",
+        "fallback_reason",
+        "runtime_path",
+        "relay_runtime_path",
+        "interpreter",
+        "llama_module_path",
+        "runtime_action",
+        "runtime_setup_message",
+        "code",
+        "message",
+        "last_error",
+    ] {
+        if let Some(value) = map.get(key) {
+            summary.insert(key.to_string(), sanitize_bridge_log_value(key, value));
+        }
+    }
+
+    for key in ["active_relay_url", "relay_base_url", "relay_url"] {
+        if let Some(value) = map.get(key).and_then(Value::as_str) {
+            summary.insert(key.to_string(), Value::String(sanitize_relay_target(value)));
+        }
+    }
+
+    serde_json::to_string(&Value::Object(summary))
+        .unwrap_or_else(|_| "{\"type\":\"bridge_event_summary_error\"}".into())
+}
+
+fn sanitize_bridge_log_value(key: &str, value: &Value) -> Value {
+    if is_sensitive_bridge_log_key(key) {
+        return Value::String("<redacted>".into());
+    }
     match value {
-        Value::Object(map) => {
-            for (key, value) in map.iter_mut() {
-                if matches!(
-                    key.as_str(),
-                    "model_path" | "active_relay_url" | "relay_base_url" | "relay_url"
-                ) {
-                    *value = Value::String("<redacted>".into());
-                } else {
-                    redact_sensitive_bridge_fields(value);
+        Value::String(text) => Value::String(sanitize_freeform_bridge_log_line(text)),
+        Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(8)
+                .map(|item| sanitize_bridge_log_value(key, item))
+                .collect(),
+        ),
+        Value::Object(_) => Value::String("<object omitted>".into()),
+    }
+}
+
+fn is_sensitive_bridge_log_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("prompt")
+        || normalized.contains("response")
+        || normalized.contains("tool")
+        || normalized.contains("private_key")
+        || normalized.contains("decrypted")
+        || normalized.contains("payload")
+        || normalized == "model_path"
+}
+
+fn sanitize_freeform_bridge_log_line(line: &str) -> String {
+    line.chars()
+        .filter(|ch| !matches!(ch, '\n' | '\r' | '\t'))
+        .take(4096)
+        .collect()
+}
+
+fn sanitize_path_for_operator_log(path: &Path) -> String {
+    let mut value = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && value.starts_with(&home) {
+            value = format!("~{}", &value[home.len()..]);
+        }
+    }
+    sanitize_freeform_bridge_log_line(&value)
+}
+
+fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value {
+    if let Value::Object(map) = &mut payload {
+        if !map.contains_key("log_file_path") {
+            match log_file_path {
+                Some(path) => {
+                    map.insert("log_file_path".into(), Value::String(path.to_string()));
+                }
+                None => {
+                    map.insert("log_file_path".into(), Value::Null);
                 }
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                redact_sensitive_bridge_fields(item);
-            }
-        }
-        _ => {}
     }
+    payload
 }
 
 pub async fn start_compute_node(
@@ -652,10 +738,17 @@ pub async fn start_compute_node(
         &log_sink,
         "desktop.compute_node.session.layout",
         &format!(
-            "operator_session_id={} relay=<redacted> bridge=<redacted> interpreter=<redacted> resource_root=<redacted> layout={:?} import_root={}",
+            "operator_session_id={} relay={} bridge={} interpreter={} resource_root={} layout={:?} import_root={}",
             session_id,
+            sanitize_relay_target(&request.relay_base_url),
+            sanitize_path_for_operator_log(Path::new(&bridge_script)),
+            sanitize_freeform_bridge_log_line(&interpreter),
+            sanitize_path_for_operator_log(&selected_resource_root),
             selected_layout,
-            import_root.as_ref().map(|_| "<redacted>").unwrap_or("<unresolved>")
+            import_root
+                .as_ref()
+                .map(|path| sanitize_path_for_operator_log(path))
+                .unwrap_or_else(|| "<unresolved>".into())
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
@@ -783,6 +876,7 @@ pub async fn start_compute_node(
         );
         match parse_compute_node_event_line(&line) {
             Ok(payload) => {
+                let payload = with_log_file_path(payload, log_file_path.as_deref());
                 if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
                     if event_type == "error" {
                         saw_error_event = true;
@@ -1043,19 +1137,51 @@ mod tests {
     fn redacts_sensitive_bridge_stdout_fields_before_operator_logging() {
         let line = serde_json::json!({
             "type": "status",
+            "operator_session_id": "1",
+            "sequence": 7,
             "model_path": "/Users/Example User/models/model.gguf",
             "active_relay_url": "https://relay.internal.example/path?token=secret",
-            "nested": {"relay_url": "https://nested.example"},
+            "prompt": "plaintext prompt",
+            "tool_args": {"private_key": "secret"},
+            "backend_selected": "cpu",
+            "relay_runtime_state": "ready"
         })
         .to_string();
 
         let redacted = redact_bridge_stdout_line(&line);
+        let payload: Value = serde_json::from_str(&redacted).expect("summary json");
 
-        assert!(redacted.contains("\"model_path\":\"<redacted>\""));
-        assert!(redacted.contains("\"active_relay_url\":\"<redacted>\""));
-        assert!(redacted.contains("\"relay_url\":\"<redacted>\""));
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("status"));
+        assert_eq!(
+            payload.get("operator_session_id").and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(payload.get("sequence").and_then(Value::as_u64), Some(7));
+        assert_eq!(
+            payload.get("backend_selected").and_then(Value::as_str),
+            Some("cpu")
+        );
+        assert_eq!(
+            payload.get("active_relay_url").and_then(Value::as_str),
+            Some("https://relay.internal.example")
+        );
+        assert!(payload.get("model_path").is_none());
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("tool_args").is_none());
         assert!(!redacted.contains("Example User"));
-        assert!(!redacted.contains("relay.internal.example"));
+        assert!(!redacted.contains("plaintext prompt"));
+        assert!(!redacted.contains("token=secret"));
+    }
+
+    #[test]
+    fn compute_node_event_payload_gets_current_log_file_path() {
+        let payload = serde_json::json!({"type": "started", "running": true});
+        let payload = with_log_file_path(payload, Some("/tmp/operator.log"));
+
+        assert_eq!(
+            payload.get("log_file_path").and_then(Value::as_str),
+            Some("/tmp/operator.log")
+        );
     }
 
     #[test]

@@ -188,13 +188,13 @@ log file in the app log directory. On macOS this is typically under the user's
 Library logs area in an `operator/` subdirectory, for example:
 
 ```text
-~/Library/Logs/<tauri app identifier>/operator/compute-node-<operator_session_id>.log
+~/Library/Logs/<tauri app identifier>/operator/compute-node-<operator_session_id>-<timestamp>.log
 ```
 
 The Compute node operator panel shows the current `Operator debug log` path after
 Start operator creates a session. Use **Open debug log** for an in-app read-only
-console with copy support, **Reveal log file** to open the containing location,
-or **Open debug terminal** to tail the log. macOS terminal tailing uses
+console with copy support, **Copy log path** to copy the current session path,
+**Reveal log file** to open the containing location, or **Open debug terminal** to tail the log. macOS terminal tailing uses
 Terminal.app and a quoted `tail -n 200 -F` command so paths with spaces work.
 
 For validation runs that should open the terminal automatically when the operator

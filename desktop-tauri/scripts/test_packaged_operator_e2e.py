@@ -663,6 +663,122 @@ def run_compute_bridge_startup_probe(
             bridge.kill()
 
 
+def enqueue_operator_stderr_log(stderr: object, log_path: Path) -> None:
+    """Mirror bridge stderr using the same source label the desktop app persists."""
+    if not hasattr(stderr, "readline"):
+        return
+
+    with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
+        while True:
+            chunk = stderr.readline()
+            if not chunk:
+                return
+            text = (
+                chunk.decode("utf-8", errors="replace")
+                if isinstance(chunk, bytes)
+                else str(chunk)
+            )
+            log_file.write(f"desktop.compute_node.stderr {text.rstrip()}\n")
+            log_file.flush()
+
+
+def run_operator_log_persistence_probe(
+    tmp_root: Path,
+    bridge_script: Path,
+    *,
+    relay_port: int,
+    resources_root: Path | None = None,
+    layout_label: str = "standard resources",
+) -> None:
+    """Assert packaged bridge diagnostics are persisted through the operator-log mirror."""
+    resources_root = resources_root or (tmp_root / "resources")
+    env = _packaged_env(tmp_root, resources_root, extra_env={"USE_MOCK_LLM": "1"})
+    log_dir = tmp_root / "operator logs with spaces"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    operator_log = log_dir / f"compute-node-{layout_label.replace('/', '_')}.log"
+    bridge = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            str(bridge_script),
+            "--model",
+            "mock.gguf",
+            "--mode",
+            "cpu",
+            "--relay-url",
+            f"http://127.0.0.1:{relay_port}",
+        ],
+        cwd=tmp_root,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    try:
+        assert bridge.stderr is not None
+        assert bridge.stdout is not None
+        assert bridge.stdin is not None
+        threading.Thread(
+            target=enqueue_operator_stderr_log,
+            args=(bridge.stderr, operator_log),
+            daemon=True,
+        ).start()
+        output_queue: queue.Queue[bytes] = queue.Queue()
+        threading.Thread(
+            target=enqueue_bridge_stdout,
+            args=(bridge.stdout, output_queue),
+            daemon=True,
+        ).start()
+
+        deadline = time.time() + 30
+        buffered = ""
+        saw_started = False
+        while time.time() < deadline:
+            if bridge.poll() is not None:
+                break
+            try:
+                chunk = output_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            buffered += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffered:
+                line, buffered = buffered.split("\n", 1)
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "started" and payload.get("running") is True:
+                    saw_started = True
+                    bridge.stdin.write(b'{"type":"cancel"}\n')
+                    bridge.stdin.flush()
+                    break
+            if saw_started:
+                break
+
+        if not saw_started:
+            raise RuntimeError(
+                f"[{layout_label}] bridge did not start while creating operator log; "
+                f"operator_log={_tail_text(operator_log)}"
+            )
+        try:
+            bridge.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            bridge.terminate()
+            bridge.wait(timeout=10)
+    finally:
+        if bridge.poll() is None:
+            bridge.kill()
+
+    assert operator_log.exists(), f"operator log was not created at {operator_log}"
+    log_text = operator_log.read_text(encoding="utf-8", errors="replace")
+    assert "desktop.compute_node.stderr" in log_text, log_text[-4000:]
+    assert (
+        "desktop.runtime_setup" in log_text
+        or "llama_module_path" in log_text
+        or "desktop.compute_node_bridge" in log_text
+    ), log_text[-4000:]
+
+
 def run_polluted_stdlib_packaged_registration_probe(
     tmp_root: Path,
     bridge_script: Path,
@@ -791,6 +907,8 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="token-place-packaged-e2e-") as tmpdir:
         tmp_path = Path(tmpdir)
+        spaced_tmp_path = tmp_path / "Packaged Layout With Spaces"
+        spaced_tmp_path.mkdir(parents=True, exist_ok=True)
         bridge_script = create_packaged_layout(tmp_path)
         run_desktop_dependency_preflight(tmp_path)
         run_unified_root_import_policy_probe(tmp_path)
@@ -798,6 +916,8 @@ def main() -> int:
         run_compute_bridge_import_probe(tmp_path)
         run_llama_cpp_watchdog_regression_probe(tmp_path)
         run_llama_cpp_facade_early_exit_diagnostics_probe(tmp_path)
+        create_packaged_layout(spaced_tmp_path)
+        run_compute_bridge_import_probe(spaced_tmp_path)
 
         mac_bridge_script = create_macos_bundle_layout(tmp_path)
         mac_resources_root = tmp_path / "TokenPlace.app" / "Contents" / "Resources"
@@ -852,6 +972,13 @@ def main() -> int:
                     stderr_path=relay_stderr,
                 )
                 run_compute_bridge_startup_probe(
+                    tmp_path,
+                    probe_script,
+                    relay_port=relay_port,
+                    resources_root=probe_resources_root,
+                    layout_label=layout_label,
+                )
+                run_operator_log_persistence_probe(
                     tmp_path,
                     probe_script,
                     relay_port=relay_port,

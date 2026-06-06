@@ -184,6 +184,7 @@ for:
 
 - **Open debug log**: opens an in-app read-only console showing the current log
   tail with a copy button.
+- **Copy log path**: copies the current session log path for support notes or shell commands.
 - **Reveal log file**: reveals the log in Finder (or the equivalent file manager
   on other platforms).
 - **Open debug terminal**: opens a terminal tailing the current log. On macOS the

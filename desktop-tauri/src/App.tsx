@@ -501,6 +501,21 @@ export function App() {
     }
   };
 
+  const copyOperatorLogPath = async () => {
+    try {
+      const logPath = computeStatus.log_file_path;
+      if (!logPath) return;
+      const writeText = navigator.clipboard?.writeText;
+      if (!writeText) {
+        setError('Clipboard API is unavailable in this webview.');
+        return;
+      }
+      await writeText.call(navigator.clipboard, logPath);
+    } catch (e) {
+      setError(formatErrorMessage(e));
+    }
+  };
+
   const openOperatorDebugTerminal = async () => {
     try {
       await invoke('open_operator_debug_terminal');
@@ -618,6 +633,9 @@ export function App() {
           </button>
           <button type="button" disabled={!computeStatus.log_file_path} onClick={revealOperatorLog}>
             Reveal log file
+          </button>
+          <button type="button" disabled={!computeStatus.log_file_path} onClick={copyOperatorLogPath}>
+            Copy log path
           </button>
           <button type="button" disabled={!computeStatus.log_file_path} onClick={openOperatorDebugTerminal}>
             Open debug terminal

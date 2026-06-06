@@ -1575,7 +1575,7 @@ def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(
     assert pending.get_json() == {'status': 'pending'}
 
 
-def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_queue(client):
+def test_api_v1_response_retrieve_returns_410_after_unregistered_server_cancels_queue(client):
     client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
     queued = client.post(
         '/api/v1/relay/requests',
@@ -1599,14 +1599,19 @@ def test_api_v1_response_retrieve_returns_404_after_unregistered_server_drops_qu
     assert pending.status_code == 202
     assert pending.get_json() == {'status': 'pending'}
 
-    unregistered = client.post('/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    unregistered = client.post(
+        '/api/v1/relay/servers/unregister',
+        json={'server_public_key': DUMMY_SERVER_PUB_KEY},
+    )
     assert unregistered.status_code == 200
+    assert unregistered.get_json()['cancelled_queue_depth'] == 1
 
     unknown = client.post(
         '/api/v1/relay/responses/retrieve',
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
     )
-    assert unknown.status_code == 404
+    assert unknown.status_code == 410
+    assert unknown.get_json()["error"]["reason"] == "server_unregistered"
 
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
@@ -2189,7 +2194,7 @@ def test_api_v1_round_robin_preserves_next_node_after_selected_server_unregister
 
     assert _next_api_v1_server_key(client) == server_a
 
-    unregistered = client.post('/unregister', json={'server_public_key': server_a})
+    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_a})
     assert unregistered.status_code == 200
     assert unregistered.get_json()['removed'] is True
 
@@ -2405,7 +2410,7 @@ def test_api_v1_request_enqueue_rejects_legacy_only_server_without_queue_entry(c
 def test_api_v1_request_enqueue_rejects_removed_server_without_queue_entry(client):
     server_key = _server_key('enqueue_removed')
     _register_api_v1_server(client, server_key)
-    assert client.post('/unregister', json={'server_public_key': server_key}).status_code == 200
+    assert client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_key}).status_code == 200
 
     response = client.post('/api/v1/relay/requests', json={
         'request_id': 'req-removed-server',
@@ -2466,7 +2471,7 @@ def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeyp
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [server_a, server_c, server_a, server_c]
     assert server_b not in known_servers
 
-    unregistered = client.post('/unregister', json={'server_public_key': server_a})
+    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_a})
     assert unregistered.status_code == 200
     assert unregistered.get_json()['removed'] is True
     assert [_next_api_v1_server_key(client) for _ in range(2)] == [server_c, server_c]
@@ -2480,7 +2485,7 @@ def test_api_v1_reregistered_round_robin_node_reenters_at_end(client):
     _register_api_v1_server(client, server_b)
     _register_api_v1_server(client, server_c)
 
-    assert client.post('/unregister', json={'server_public_key': server_b}).status_code == 200
+    assert client.post('/api/v1/relay/servers/unregister', json={'server_public_key': server_b}).status_code == 200
     _register_api_v1_server(client, server_b)
 
     assert [_next_api_v1_server_key(client) for _ in range(6)] == [
@@ -2632,7 +2637,7 @@ def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
     assert client.get('/api/v1/relay/servers/next').status_code == 200
 
-    unregistered = client.post('/unregister', json=server_payload)
+    unregistered = client.post('/api/v1/relay/servers/unregister', json=server_payload)
 
     assert unregistered.status_code == 200
     assert unregistered.get_json()['removed'] is True
@@ -2642,11 +2647,34 @@ def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):
     assert next_response.status_code == 503
 
 
+def test_api_v1_unregister_cancels_in_flight_request_promptly(client):
+    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
+    request_payload = _api_v1_request_payload('req-in-flight-unregister')
+    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    assert client.post('/api/v1/relay/requests', json=request_payload).status_code == 200
+
+    poll_response = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll_response.status_code == 200
+    assert poll_response.get_json()['request_id'] == 'req-in-flight-unregister'
+
+    unregistered = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+    assert unregistered.get_json()['cancelled_in_flight_depth'] == 1
+    retrieve = client.post(
+        '/api/v1/relay/responses/retrieve',
+        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-in-flight-unregister'},
+    )
+    assert retrieve.status_code == 410
+    assert retrieve.get_json()['error']['reason'] == 'server_unregistered'
+
+
 def test_api_v1_unregister_is_idempotent_when_server_already_gone(client):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
 
-    first = client.post('/unregister', json=server_payload)
-    second = client.post('/unregister', json=server_payload)
+    first = client.post('/api/v1/relay/servers/unregister', json=server_payload)
+    second = client.post('/api/v1/relay/servers/unregister', json=server_payload)
 
     assert first.status_code == 200
     assert second.status_code == 200

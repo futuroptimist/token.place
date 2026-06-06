@@ -93,7 +93,7 @@ def test_source_requires_registration_token(relay_module) -> None:
 
 
 def test_unregister_requires_registration_token(relay_module) -> None:
-    """/unregister should require auth parity with /sink and /source."""
+    """API v1 unregister should require auth parity with /sink and /source."""
 
     relay_module.known_servers.clear()
     relay_module.client_inference_requests.clear()
@@ -120,16 +120,19 @@ def test_unregister_requires_registration_token(relay_module) -> None:
     client = relay_module.app.test_client()
     payload = {"server_public_key": "abc"}
 
-    unauthorised = client.post("/unregister", json=payload)
+    unauthorised = client.post("/api/v1/relay/servers/unregister", json=payload)
     assert unauthorised.status_code == 401
 
     authorised = client.post(
-        "/unregister",
+        "/api/v1/relay/servers/unregister",
         json=payload,
         headers={"X-Relay-Server-Token": "unit-token"},
     )
     assert authorised.status_code == 200
-    assert authorised.get_json() == {"message": "Server unregistered", "removed": True}
+    authorised_payload = authorised.get_json()
+    assert authorised_payload["message"] == "Server unregistered"
+    assert authorised_payload["removed"] is True
+    assert authorised_payload["cancelled_queue_depth"] == 0
     assert "abc" not in relay_module.known_servers
     assert "abc" not in relay_module.client_inference_requests
     assert "session-1" not in relay_module.streaming_sessions
@@ -155,7 +158,7 @@ def test_unregister_removes_node_from_relay_diagnostics_immediately(relay_module
     assert before_payload["registered_compute_nodes"][0]["server_public_key"] == "abc"
 
     unregister_response = client.post(
-        "/unregister",
+        "/api/v1/relay/servers/unregister",
         json={"server_public_key": "abc"},
         headers={"X-Relay-Server-Token": "unit-token"},
     )

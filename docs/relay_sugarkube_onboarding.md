@@ -231,7 +231,7 @@ PY
 
 # 5. Compare relay app logs with desktop diagnostics for the same UTC window.
 kubectl -n tokenplace logs deploy/tokenplace --since=30m | \
-  grep -E 'POST /api/v1/relay/servers/(register|poll)|api_v1|relay/servers'
+  grep -E 'POST /api/v1/relay/servers/(register|poll|unregister)|api_v1|relay/servers'
 ```
 
 Decision points:

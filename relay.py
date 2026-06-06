@@ -663,6 +663,7 @@ def _remove_known_server(server_public_key: str) -> bool:
 def _unregister_server(server_public_key: str) -> bool:
     """Remove a compute node and associated per-server queue/session state."""
 
+    _record_api_v1_server_unregistered(server_public_key)
     in_flight_requests = {}
     with server_round_robin_lock:
         server_payload = known_servers.get(server_public_key)
@@ -685,7 +686,7 @@ def _unregister_server(server_public_key: str) -> bool:
         _cancel_api_v1_request(
             item.get("client_public_key"),
             item.get("request_id"),
-            status="expired",
+            status="cancelled",
             reason="server_unregistered",
         )
         cancelled_queue_depth += 1
@@ -698,7 +699,7 @@ def _unregister_server(server_public_key: str) -> bool:
         _cancel_api_v1_request(
             entry.get("client_public_key"),
             request_id,
-            status="expired",
+            status="cancelled",
             reason="server_unregistered",
         )
         cancelled_queue_depth += 1
@@ -1173,6 +1174,29 @@ def _safe_key_fingerprint(value: Any) -> str:
 
 
 _ALLOWED_API_V1_TERMINAL_STATUSES = {"cancelled", "expired"}
+_API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS = 300.0
+api_v1_recently_unregistered_servers: dict[str, float] = {}
+
+
+def _record_api_v1_server_unregistered(server_public_key: str) -> None:
+    if isinstance(server_public_key, str) and server_public_key:
+        api_v1_recently_unregistered_servers[server_public_key] = time.monotonic()
+
+
+def _api_v1_server_was_recently_unregistered(server_public_key: str) -> bool:
+    if not isinstance(server_public_key, str) or not server_public_key:
+        return False
+    now = time.monotonic()
+    expired_keys = [
+        key
+        for key, removed_at in api_v1_recently_unregistered_servers.items()
+        if now - removed_at > _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        api_v1_recently_unregistered_servers.pop(key, None)
+    return server_public_key in api_v1_recently_unregistered_servers
+
+
 _ALLOWED_API_V1_TERMINAL_REASONS = {
     "cancelled",
     "expired",
@@ -1636,11 +1660,12 @@ def api_v1_relay_servers_poll():
         if not isinstance(claimed_request, dict):
             return
         if bool(claimed_request.get('e2ee_v1')):
+            was_unregistered = _api_v1_server_was_recently_unregistered(public_key)
             _cancel_api_v1_request(
                 claimed_request.get('client_public_key'),
                 claimed_request.get('request_id'),
-                status='expired',
-                reason='provider_timeout',
+                status='cancelled' if was_unregistered else 'expired',
+                reason='server_unregistered' if was_unregistered else 'provider_timeout',
             )
 
     def _server_not_found_response(claimed_request=None):

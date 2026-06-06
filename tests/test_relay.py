@@ -48,6 +48,7 @@ def client():
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
+    relay_module.api_v1_recently_unregistered_servers.clear()
 
     with app.test_client() as client:
         yield client
@@ -65,6 +66,7 @@ def client():
     client_responses.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
+    relay_module.api_v1_recently_unregistered_servers.clear()
 
 
 def test_operational_endpoints_are_not_rate_limited_by_public_quota(client):
@@ -1607,6 +1609,7 @@ def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_dro
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
     )
     assert unknown.status_code == 410
+    assert unknown.get_json()['error']['status'] == 'cancelled'
     assert unknown.get_json()['error']['reason'] == 'server_unregistered'
 
 
@@ -1953,7 +1956,8 @@ def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(c
     def _pop_then_unregister(public_key):
         popped = original_pop(public_key)
         if popped is not None:
-            known_servers.pop(public_key, None)
+            relay_module._record_api_v1_server_unregistered(public_key)
+            relay_module._remove_known_server(public_key)
         return popped
 
     monkeypatch.setattr(relay_module, '_pop_next_api_v1_request', _pop_then_unregister)
@@ -1963,6 +1967,18 @@ def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(c
 
     assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-requeue-on-unregister-race',
+    })
+    assert retrieved.status_code == 410
+    assert retrieved.get_json()['error'] == {
+        'message': 'Request cancelled',
+        'code': 'cancelled',
+        'status': 'cancelled',
+        'reason': 'server_unregistered',
+    }
 
 
 def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
@@ -2679,6 +2695,7 @@ def test_api_v1_unregister_cancels_in_flight_request_promptly(client):
         'request_id': request_id,
     })
     assert retrieved.status_code == 410
+    assert retrieved.get_json()['error']['status'] == 'cancelled'
     assert retrieved.get_json()['error']['reason'] == 'server_unregistered'
 
 

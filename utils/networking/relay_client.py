@@ -865,11 +865,22 @@ class RelayClient:
                 if headers:
                     request_kwargs['headers'] = headers
 
+                unregister_url = self._build_api_v1_url(candidate_url, "/relay/servers/unregister")
                 response = requests.post(
-                    f'{candidate_url}/api/v1/relay/servers/unregister',
+                    unregister_url,
                     timeout=self._request_timeout,
                     **request_kwargs,
                 )
+                if response.status_code == 404:
+                    legacy_base_url = candidate_url.rstrip('/')
+                    if legacy_base_url.endswith('/api/v1'):
+                        legacy_base_url = legacy_base_url[: -len('/api/v1')]
+                    legacy_url = f"{legacy_base_url}/unregister"
+                    response = requests.post(
+                        legacy_url,
+                        timeout=self._request_timeout,
+                        **request_kwargs,
+                    )
                 if response.status_code == 200:
                     if candidate_url in relay_index_by_url:
                         self._active_relay_index = relay_index_by_url[candidate_url]

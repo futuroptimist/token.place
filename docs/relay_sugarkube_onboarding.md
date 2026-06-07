@@ -39,7 +39,7 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
-- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; current deployable chart package version is `0.1.1`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
@@ -95,7 +95,7 @@ Otherwise leave the chart defaults in place; staging should not require a manual
 ## Ingress TLS expectations for staging/prod
 
 Cloudflare Tunnel continues to route public hostnames to Traefik, while Helm values control only
-Kubernetes objects. Helm does not manage Cloudflare routes.
+Kubernetes objects. Helm does not manage Cloudflare routes, DNS, edge TLS policy, or WAF/bot rules.
 
 Staging/prod overlays must set `ingress.tls.enabled: true`; cert-manager annotation/secret names
 alone are not enough to render `spec.tls` in the chart. Operators must verify the rendered Ingress
@@ -178,8 +178,22 @@ curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
 ~~~
 
-Optional note: true relay traffic validation requires a registered external compute node and an
-E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
+Required gate: true relay traffic validation requires a registered external compute node and an
+encrypted API v1 relay/desktop-bridge E2EE client-flow probe (for example encrypted
+`/api/v1/chat/completions`). `app-status`, `app-verify`, `/livez`, `/healthz`, `/relay/diagnostics`,
+and `/` are necessary but insufficient by themselves. For desktop release candidates, use the shared
+[desktop parity validation checklist](desktop_parity_validation.md) before making staging,
+production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics,
+queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
+
+Staging promotion requires a real external compute/desktop node to register to
+`https://staging.token.place`, appear in `/healthz` and `/relay/diagnostics`, and complete one real
+encrypted request/response. Production post-promotion requires a separate real production
+compute-node registration and encrypted request/response against `https://token.place`. Archive the
+immutable image tag, chart version and digest where available, rendered or live Deployment YAML,
+health/diagnostics output after the compute test, and relay logs after the compute test. The exact
+compute-node command is operator/environment-specific; record the actual command and redacted config
+rather than inventing a universal command.
 
 ### Desktop compute-node HTTP 403 / pre-app rejection diagnostics
 
@@ -273,17 +287,20 @@ pre-launch runbook for future operators.
 ### 1) Stale OCI chart package (`0.1.0`) in GHCR
 
 Symptom:
-- Deployed manifests from OCI chart `0.1.0` do not include expected rollout safety defaults
+- Deployed manifests from a stale OCI chart pin such as `0.1.0` do not include expected rollout safety defaults
   (especially `strategy.type: Recreate`), even though local chart sources do.
 
 Why this matters:
 - For relay's in-memory queue/registration state, rollout behavior must stay single-pod-safe.
 - A stale chart can silently remove safety defaults and invalidate staging confidence.
 
-Decision rule for v0.1.0:
-- Because launch identifiers are intentionally pinned at `0.1.0`, pre-launch chart package
-  deletion/re-publish may be required when GHCR `0.1.0` content is stale or incorrect.
-- Keep this as a deliberate operator action with notes (who/when/why), not an automatic overwrite.
+Decision rule for the current chart:
+- Sugarkube should deploy chart package `0.1.1` for the current token.place chart defaults; a
+  `0.1.0` chart package pin is stale unless an operator explicitly records why that older package is
+  under validation.
+- Never overwrite an existing GHCR chart package automatically. If stale content is discovered, stop
+  and record the deliberate operator decision (who/when/why) before deleting/re-publishing or moving
+  to a new chart version.
 
 Verification commands:
 

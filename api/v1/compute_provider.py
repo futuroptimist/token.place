@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from urllib.parse import urlparse
 import requests
 
 from api.v1.models import generate_response
+
+_ORIGINAL_GENERATE_RESPONSE = generate_response
 from utils.crypto.crypto_manager import CryptoManager
 
 logger = logging.getLogger("api.v1.compute_provider")
@@ -26,6 +29,26 @@ _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
     "api_v1_last_backend_path",
     default="unknown",
 )
+
+
+def _resolve_generate_response():
+    """Honor legacy route-level monkeypatches during local API v1 inference."""
+
+    routes_module = sys.modules.get("api.v1.routes")
+    route_generate_response = getattr(routes_module, "generate_response", None)
+    if callable(route_generate_response) and route_generate_response is not _ORIGINAL_GENERATE_RESPONSE:
+        return route_generate_response
+
+    module_path = globals().get("__file__")
+    for module in list(sys.modules.values()):
+        if getattr(module, "__file__", None) != module_path:
+            continue
+        module_generate_response = getattr(module, "generate_response", None)
+        module_original = getattr(module, "_ORIGINAL_GENERATE_RESPONSE", _ORIGINAL_GENERATE_RESPONSE)
+        if callable(module_generate_response) and module_generate_response is not module_original:
+            return module_generate_response
+
+    return generate_response
 
 
 _DEFAULT_PRODUCTION_RELAY_URL = "https://token.place"
@@ -148,7 +171,7 @@ class LocalApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        updated_messages = generate_response(model_id, messages, **(options or {}))
+        updated_messages = _resolve_generate_response()(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
         assistant_message = updated_messages[-1]

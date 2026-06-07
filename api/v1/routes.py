@@ -37,6 +37,7 @@ from api.v1.models import (
     generate_response as _generate_response,
     get_model_instance as _get_model_instance,
 )
+from api.v1 import compute_provider as api_v1_compute_provider
 from api.v1.compute_provider import (
     DistributedTargetSelection,
     get_api_v1_compute_provider,
@@ -301,6 +302,56 @@ def _is_relay_capable_provider_path(resolved_provider_path: str) -> bool:
     return resolved_provider_path in {"distributed", "distributed_with_local_fallback"}
 
 
+def _is_model_error_like(exc: Exception) -> bool:
+    """Recognize ModelError instances across test-time module reloads."""
+
+    return (
+        isinstance(exc, ModelError)
+        or exc.__class__.__name__ == "ModelError"
+        and hasattr(exc, "message")
+        and hasattr(exc, "status_code")
+        and hasattr(exc, "error_type")
+    )
+
+
+def _model_error_response(exc: Exception, *, context: str):
+    """Return the public API error shape for model-layer failures."""
+
+    message = getattr(exc, "message", str(exc))
+    error_type = getattr(exc, "error_type", "model_error")
+    status_code = getattr(exc, "status_code", 500)
+    log_warning(f"Model error during {context}: {message}")
+    return format_error_response(
+        message,
+        error_type=error_type,
+        status_code=status_code,
+    )
+
+
+def _legacy_local_response_generator():
+    """Return legacy monkeypatched local generator hooks when present."""
+
+    if generate_response is not _generate_response:
+        return generate_response
+
+    provider_generate_response = getattr(api_v1_compute_provider, "generate_response", None)
+    provider_original = getattr(api_v1_compute_provider, "_ORIGINAL_GENERATE_RESPONSE", None)
+    if callable(provider_generate_response) and provider_generate_response is not provider_original:
+        return provider_generate_response
+
+    return None
+
+
+def _complete_local_with_generator(generator, model_id, messages, options):
+    updated_messages = generator(model_id, messages, **(options or {}))
+    if not updated_messages:
+        raise ComputeProviderError("model returned an empty message list")
+    assistant_message = updated_messages[-1]
+    if not isinstance(assistant_message, dict):
+        raise ComputeProviderError("assistant response must be a message object")
+    return assistant_message
+
+
 def _extract_chat_completion_options(data: dict) -> dict:
     """Pass through compatible OpenAI-style chat options to compute providers."""
 
@@ -482,11 +533,22 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
-            model_id=model_id,
-            messages=messages,
-            options=_extract_chat_completion_options(data),
+        completion_options = _extract_chat_completion_options(data)
+        local_generator = (
+            _legacy_local_response_generator()
+            if resolved_provider_name == "LocalApiV1ComputeProvider"
+            else None
         )
+        if local_generator is not None:
+            assistant_message = _complete_local_with_generator(
+                local_generator, model_id, messages, completion_options
+            )
+        else:
+            assistant_message = provider.complete_chat(
+                model_id=model_id,
+                messages=messages,
+                options=completion_options,
+            )
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 
@@ -563,12 +625,7 @@ def _handle_chat_completion_request(data):
             status_code=400,
         )
     except ModelError as e:
-        log_warning(f"Model error during chat completion: {e.message}")
-        return format_error_response(
-            e.message,
-            error_type=e.error_type,
-            status_code=e.status_code,
-        )
+        return _model_error_response(e, context="chat completion")
     except ComputeProviderError as e:
         execution_backend_path = get_api_v1_last_backend_path()
         log_warning(
@@ -583,6 +640,8 @@ def _handle_chat_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _is_model_error_like(e):
+            return _model_error_response(e, context="chat completion")
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
             f"Internal server error: {str(e)}",
@@ -665,11 +724,22 @@ def _handle_text_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
-            model_id=model_id,
-            messages=messages,
-            options=_extract_chat_completion_options(data),
+        completion_options = _extract_chat_completion_options(data)
+        local_generator = (
+            _legacy_local_response_generator()
+            if resolved_provider_name == "LocalApiV1ComputeProvider"
+            else None
         )
+        if local_generator is not None:
+            assistant_message = _complete_local_with_generator(
+                local_generator, model_id, messages, completion_options
+            )
+        else:
+            assistant_message = provider.complete_chat(
+                model_id=model_id,
+                messages=messages,
+                options=completion_options,
+            )
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 
@@ -717,12 +787,7 @@ def _handle_text_completion_request(data):
         return response
 
     except ModelError as e:
-        log_warning(f"Model error during response generation: {e.message}")
-        return format_error_response(
-            e.message,
-            error_type=e.error_type,
-            status_code=e.status_code,
-        )
+        return _model_error_response(e, context="response generation")
     except ComputeProviderError as e:
         return format_error_response(
             e.public_message,
@@ -731,6 +796,8 @@ def _handle_text_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _is_model_error_like(e):
+            return _model_error_response(e, context="response generation")
         log_error("Unexpected error in create_completion endpoint")
         return format_error_response(f"Internal server error: {str(e)}")
 

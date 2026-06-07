@@ -43,7 +43,8 @@ Use the values files and version file that live in Sugarkube for your environmen
 ## Ingress TLS + Cloudflare Tunnel contract
 
 - Cloudflare Tunnel still owns public DNS/Tunnel routing for `token.place` to Traefik.
-- Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes.
+- Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes, DNS, TLS edge policy, Access policy, or WAF/skip rules.
+- API v1 compute-node registration, poll, unregister, and encrypted response POST paths can be blocked before reaching `relay.py`; validate Cloudflare Security Events by `cf-ray` when desktop/compute nodes see pre-app 403s.
 - Production values must explicitly set `ingress.tls.enabled: true` or chart output omits `spec.tls`.
 - Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-production` exists.
 
@@ -94,10 +95,28 @@ curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
 ```
 
-Optional note: true relay traffic validation requires a registered external compute node plus an
-E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
-See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" and run
-the same external compute-node validation pattern against production hostnames before sign-off.
+## Promotion/sign-off gate
+
+The validation commands above (`app-status`, `app-verify`, rendered/live YAML checks, `/livez`,
+`/healthz`, `/relay/diagnostics`, and `/`) are necessary but insufficient. Do not sign off from
+generic HTTP checks alone.
+
+Required gate for `token.place`:
+
+1. Use only the canonical GHCR image and OCI Helm chart path (`ghcr.io/futuroptimist/tokenplace-relay`
+   plus `oci://ghcr.io/futuroptimist/charts/tokenplace`), with chart package `0.1.1` and immutable
+   image tag `v0.1.0` or another approved immutable tag.
+2. Confirm a real external desktop/compute node registers to `token.place` and appears in both `/healthz`
+   and `/relay/diagnostics`. The exact compute-node command is operator/environment-specific; use
+   the desktop or compute-node runbook for the hardware under test.
+3. Complete a real encrypted API v1 relay/desktop-bridge E2EE request/response through that
+   registered node. Plaintext relay-dispatched API v1 payloads remain intentionally fail-closed and
+   are not production-readiness evidence.
+4. Capture evidence after the compute test: immutable image tag, chart version/digest when
+   available, `/tmp/tokenplace-prod-render.yaml` or live Deployment YAML, `/healthz`, `/relay/diagnostics`, and relay logs.
+
+Cloudflare/TLS/WAF routing is outside Helm. If compute-node registration sees a non-JSON `403` or
+`cf-ray`, check Cloudflare Security Events for that Ray ID before changing the chart or relay code.
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 

@@ -95,7 +95,10 @@ Otherwise leave the chart defaults in place; staging should not require a manual
 ## Ingress TLS expectations for staging/prod
 
 Cloudflare Tunnel continues to route public hostnames to Traefik, while Helm values control only
-Kubernetes objects. Helm does not manage Cloudflare routes.
+Kubernetes objects. Helm does not manage Cloudflare routes, DNS, TLS edge policy, Access policy, or
+WAF/skip rules. Treat Cloudflare route/TLS/WAF validation as an external release gate, especially
+for API v1 compute-node registration, poll, unregister, and encrypted response POST paths that can
+be blocked before reaching `relay.py`.
 
 Staging/prod overlays must set `ingress.tls.enabled: true`; cert-manager annotation/secret names
 alone are not enough to render `spec.tls` in the chart. Operators must verify the rendered Ingress
@@ -178,8 +181,80 @@ curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
 ~~~
 
-Optional note: true relay traffic validation requires a registered external compute node and an
-E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
+## Cloudflare/TLS/WAF external gate
+
+Run these checks for both `staging.token.place` and `token.place` before signing off. They validate
+public routing to Traefik and help distinguish pre-app Cloudflare/WAF blocks from relay app errors
+without exposing secrets.
+
+~~~bash
+# Confirm public DNS/edge routing resolves before debugging Helm.
+dig +short staging.token.place
+dig +short token.place
+
+# Confirm HTTPS and app health over the public hostnames.
+for host in staging.token.place token.place; do
+  curl -vI "https://${host}/"
+  curl -fsS "https://${host}/livez"
+  curl -fsS "https://${host}/healthz"
+  curl -fsS "https://${host}/relay/diagnostics"
+done
+
+# Safely reproduce the API v1 compute-node registration request shape. This placeholder token
+# and diagnostic public key are not secrets; replace only in a controlled operator shell.
+HOST=staging.token.place
+curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
+  -H 'content-type: application/json' \
+  -H 'X-Relay-Server-Token: REPLACE_WITH_STAGING_TEST_TOKEN' \
+  --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+
+# If a desktop/compute node reports a pre-app 403, capture cf-ray and filter Cloudflare
+# Security > Events by that Ray ID for the matching zone.
+CF_RAY=REPLACE_CF_RAY
+printf 'Check Cloudflare Security > Events for Ray ID: %s\n' "$CF_RAY"
+~~~
+
+A relay JSON `401` indicates the request reached `relay.py` and failed the registration-token
+boundary. A non-JSON `403` with `server: cloudflare` or a `cf-ray` header indicates a Cloudflare,
+Access, WAF, bot, tunnel, or other pre-app routing problem; fix that external route before changing
+Helm or relay code.
+
+## Release gates: health checks are necessary but insufficient
+
+`app-status`, `app-verify`, `/`, `/livez`, `/healthz`, and `/relay/diagnostics` are required
+smoke checks, but they do **not** prove production readiness by themselves. Sign-off requires a
+real external desktop/compute node using the encrypted API v1 relay/desktop-bridge E2EE path; the
+exact node launch command is operator/environment-specific, so use the desktop or compute-node
+runbook for the hardware under test rather than inventing a universal command here.
+
+Staging promotion gate:
+
+1. Deploy the immutable image tag (`main-<shortsha>` or release `vX.Y.Z`) with chart package
+   version `0.1.1` from `oci://ghcr.io/futuroptimist/charts/tokenplace`.
+2. Confirm a real external compute node registers against `https://staging.token.place` and appears
+   in both `/healthz` and `/relay/diagnostics`.
+3. Send a real encrypted API v1 relay/desktop-bridge request through that registered node and verify
+   the encrypted response is returned to the client.
+4. Capture evidence after the compute test: immutable image tag, chart version/digest when
+   available, rendered or live Deployment YAML, `/healthz`, `/relay/diagnostics`, and relay logs.
+
+Production post-promotion gate:
+
+1. Promote only the staging-approved immutable image tag; if Sugarkube's
+   `docs/apps/tokenplace.prod.tag` is intentionally empty, the prod operator must provide an
+   explicit immutable tag at promotion time.
+2. Repeat a separate real compute-node registration against `https://token.place`; staging evidence
+   is not a substitute for production host/TLS/WAF validation.
+3. Repeat the real encrypted API v1 relay/desktop-bridge request/response through the production
+   registered node.
+4. Capture the same evidence after the production compute test: immutable image tag, chart
+   version/digest when available, rendered or live Deployment YAML, `/healthz`,
+   `/relay/diagnostics`, and relay logs.
+
+Plaintext relay-dispatched API v1 payloads remain intentionally fail-closed; production readiness
+claims must refer only to the encrypted API v1 relay/desktop-bridge E2EE flow.
+
+For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
 
 ### Desktop compute-node HTTP 403 / pre-app rejection diagnostics
 
@@ -280,10 +355,13 @@ Why this matters:
 - For relay's in-memory queue/registration state, rollout behavior must stay single-pod-safe.
 - A stale chart can silently remove safety defaults and invalidate staging confidence.
 
-Decision rule for v0.1.0:
-- Because launch identifiers are intentionally pinned at `0.1.0`, pre-launch chart package
-  deletion/re-publish may be required when GHCR `0.1.0` content is stale or incorrect.
-- Keep this as a deliberate operator action with notes (who/when/why), not an automatic overwrite.
+Decision rule for v0.1.0 runtime with chart package `0.1.1`:
+- Sugarkube must pin chart package `0.1.1` for the current deployable chart. Do not treat stale
+  GHCR chart package `0.1.0` content as the current deployable chart.
+- The runtime/app alignment remains `appVersion: "0.1.0"` and image tag `v0.1.0`; the chart
+  package version that carries the current rollout defaults is `0.1.1`.
+- If an already-published `0.1.1` package is stale or mismatched, stop and decide manually with
+  operator notes (who/when/why). Do not automatically overwrite an immutable chart artifact.
 
 Verification commands:
 

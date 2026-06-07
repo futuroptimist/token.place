@@ -54,3 +54,106 @@ def test_bundle_values_do_not_pin_redis_storage_backend():
     content = BUNDLE_VALUES_PATH.read_text()
     assert "redis://" not in content
     assert "TOKENPLACE_RATE_LIMIT_STORAGE_URI" not in content
+
+
+def test_sugarkube_chart_pin_matches_current_canonical_chart():
+    """Sugarkube version pin docs should match the canonical OCI chart package."""
+    chart = yaml.safe_load(Path("charts/tokenplace/Chart.yaml").read_text())
+    version_pin = Path("docs/apps/tokenplace.version").read_text().strip()
+
+    assert chart["version"] == "0.1.1"
+    assert chart["appVersion"] == "0.1.0"
+    assert version_pin == chart["version"]
+
+    onboarding = Path("docs/relay_sugarkube_onboarding.md").read_text()
+    assert "Sugarkube must pin chart package `0.1.1`" in onboarding
+    assert (
+        "Do not treat stale\n  GHCR chart package `0.1.0` content "
+        "as the current deployable chart"
+        in onboarding
+    )
+
+
+def test_sugarkube_runbooks_require_real_e2ee_compute_signoff():
+    """Runbooks must not equate generic HTTP health with production readiness."""
+    for runbook in (
+        Path("docs/k3s-sugarkube-staging.md"),
+        Path("docs/k3s-sugarkube-prod.md"),
+        Path("docs/relay_sugarkube_onboarding.md"),
+    ):
+        text = runbook.read_text()
+        assert "necessary but insufficient" in text
+        assert (
+            "generic HTTP checks alone" in text
+            or "do **not** prove production readiness" in text
+        )
+        assert "real external" in text
+        assert "encrypted API v1 relay/desktop-bridge E2EE" in text
+        assert "Plaintext relay-dispatched API v1" in text
+        assert "intentionally fail-closed" in text
+        assert "chart version/digest" in text
+        assert "/relay/diagnostics" in text
+        assert "relay logs" in text
+
+
+def test_sugarkube_runbooks_document_cloudflare_as_external_gate():
+    """Cloudflare route/TLS/WAF validation is outside Helm and must remain explicit."""
+    onboarding = Path("docs/relay_sugarkube_onboarding.md").read_text()
+    for expected in (
+        (
+            "Helm does not manage Cloudflare routes, DNS, TLS edge policy, "
+            "Access policy, or\nWAF/skip rules"
+        ),
+        "dig +short staging.token.place",
+        "dig +short token.place",
+        "curl -fsS \"https://${host}/relay/diagnostics\"",
+        "X-Relay-Server-Token: REPLACE_WITH_STAGING_TEST_TOKEN",
+        "diagnostic-public-key-placeholder",
+        "Cloudflare Security > Events",
+        "cf-ray",
+        "non-JSON `403`",
+    ):
+        assert expected in onboarding
+
+    for runbook in (
+        Path("docs/k3s-sugarkube-staging.md"),
+        Path("docs/k3s-sugarkube-prod.md"),
+    ):
+        text = runbook.read_text()
+        assert "Cloudflare/TLS/WAF routing is outside Helm" in text
+        assert "check Cloudflare Security Events for that Ray ID" in text
+
+
+def test_sugarkube_runbooks_preserve_single_pod_in_memory_scope():
+    """Production docs must keep the relay-only, non-HA state caveat visible."""
+    for runbook in (
+        Path("docs/k3s-sugarkube-staging.md"),
+        Path("docs/k3s-sugarkube-prod.md"),
+        Path("docs/relay_sugarkube_onboarding.md"),
+    ):
+        text = runbook.read_text()
+        assert "relay.py only" in text or "`relay.py` only" in text
+        assert "server.py" in text
+        assert "one pod" in text
+        assert "one Gunicorn worker" in text
+        assert "one replica" in text
+        assert "in-memory" in text
+        assert "State loss" in text or "accepted state loss" in text
+        assert "future work" in text
+
+
+def test_sugarkube_runbooks_keep_canonical_ghcr_oci_path_clear():
+    """Sugarkube production docs should not promote Compose or local charts."""
+    for runbook in (
+        Path("docs/k3s-sugarkube-staging.md"),
+        Path("docs/k3s-sugarkube-prod.md"),
+        Path("docs/relay_sugarkube_onboarding.md"),
+        Path("docs/ops/sugarkube-release.md"),
+    ):
+        text = runbook.read_text()
+        assert "ghcr.io/futuroptimist/tokenplace-relay" in text
+        assert "oci://ghcr.io/futuroptimist/charts/tokenplace" in text
+
+    release = Path("docs/ops/sugarkube-release.md").read_text()
+    assert "Use GitHub Actions and GHCR for deployable Sugarkube artifacts" in release
+    assert "not the staging or\nproduction release path" in release

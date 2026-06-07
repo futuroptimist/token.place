@@ -82,7 +82,7 @@ ensure_playwright_browsers() {
     if [ -z "$chromium_binary" ]; then
         echo "Installing Playwright Chromium browser binaries..."
 
-        # CI workflow already installs Playwright/browser deps in a dedicated step.
+        # CI workflow already installs Playwright browser and system deps in a dedicated step.
         if [ "${CI:-}" = "true" ]; then
             if ! playwright install chromium; then
                 echo "Warning: playwright browser installation failed"
@@ -108,7 +108,7 @@ ensure_playwright_browsers
 # landing-page desktop-bridge API v1 check can run in verification contexts
 # without requiring an extra export command.
 if [ -z "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f ".ci-models/stories15M-q4_0.gguf" ]; then
-    TOKENPLACE_REAL_E2E_MODEL_PATH=".ci-models/stories15M-q4_0.gguf"
+    TOKENPLACE_REAL_E2E_MODEL_PATH="$PWD/.ci-models/stories15M-q4_0.gguf"
 fi
 if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ]; then
     export TOKENPLACE_REAL_E2E_MODEL_PATH

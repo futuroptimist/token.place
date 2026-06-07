@@ -93,55 +93,80 @@ def test_sugarkube_chart_version_docs_track_canonical_chart_source():
     assert "should pin" in release_doc
 
 
-def test_sugarkube_environment_runbooks_require_external_e2ee_proof():
-    """Each environment runbook must keep real E2EE sign-off gates explicit."""
-    shared_required_phrases = (
-        "necessary but insufficient",
-        "encrypted API v1 relay/desktop-bridge E2EE request/response",
-        "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
-        "immutable image tag, chart version and digest where available",
-        "rendered or live deployment YAML",
-        "relay logs after the compute test",
-    )
-
-    for path in OPERATOR_ENVIRONMENT_RUNBOOKS:
-        _assert_contains_all(path, shared_required_phrases)
-
+def test_staging_runbook_requires_real_external_e2ee_evidence():
+    """Staging runbook must keep every staging sign-off gate explicit."""
     _assert_contains_all(
         Path("docs/k3s-sugarkube-staging.md"),
-        ("real external desktop/compute node registers",),
+        (
+            "necessary but insufficient",
+            "real external desktop/compute node registers",
+            "encrypted API v1 relay/desktop-bridge E2EE request/response",
+            "`/healthz` and `/relay/diagnostics` output after the compute test",
+            "relay logs after the compute test",
+            "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
+            "operator/environment-specific",
+        ),
     )
+
+
+def test_prod_runbook_requires_fresh_production_e2ee_evidence():
+    """Production runbook must not allow staging evidence reuse."""
     _assert_contains_all(
         Path("docs/k3s-sugarkube-prod.md"),
-        ("real production desktop/compute node registers", "instead of reusing staging evidence"),
+        (
+            "necessary but insufficient",
+            "real production desktop/compute node registers",
+            "instead of reusing staging evidence",
+            "encrypted API v1 relay/desktop-bridge E2EE request/response",
+            "`/healthz` and `/relay/diagnostics` output after the compute test",
+            "relay logs after the compute test",
+            "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
+            "operator/environment-specific",
+        ),
     )
 
 
-def test_sugarkube_onboarding_and_release_docs_require_external_e2ee_proof():
-    """Cross-environment docs must preserve staging and production proof details."""
-    release_phrases = (
-        "necessary but insufficient",
-        "real external desktop/compute node must register to staging",
-        "repeat the real external proof against production",
-        "encrypted API v1\nrelay/desktop-bridge E2EE request/response",
-        "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
-        "immutable image tag,\nchart version and digest where available",
-        "rendered or live deployment YAML",
-        "relay logs after the\ncompute test",
-    )
-    onboarding_phrases = (
-        "necessary but insufficient",
-        "real external relay-compute proof",
-        "real external desktop/compute node registers",
-        "encrypted API v1 relay/desktop-bridge E2EE request/response",
-        "paths are intentionally fail-closed",
-        "immutable image tag, chart version and digest where available",
-        "rendered\n  or live deployment YAML",
-        "relay logs after",
+def test_onboarding_doc_requires_cloudflare_probe_and_real_e2ee_gate():
+    """Onboarding doc must separate safe route probes from real E2EE gates."""
+    _assert_contains_all(
+        Path("docs/relay_sugarkube_onboarding.md"),
+        (
+            "Cloudflare route/TLS/WAF validation as an external release gate",
+            "dig +short staging.token.place",
+            "dig +short token.place",
+            "DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE",
+            '"server_public_key":""',
+            "intentionally non-mutating",
+            "JSON 400 or 401 means the request reached relay.py",
+            "non-JSON 403 with server: cloudflare or a cf-ray header",
+            "must not replace this pre-app route probe with a real accepted token",
+            "Real compute-node registration remains a separate sign-off gate",
+            "Cloudflare Security Events by that Ray ID",
+            "real external relay-compute proof",
+            "encrypted API v1 relay/desktop-bridge E2EE request/response",
+            "operator/environment-specific",
+        ),
     )
 
-    _assert_contains_all(Path("docs/ops/sugarkube-release.md"), release_phrases)
-    _assert_contains_all(Path("docs/relay_sugarkube_onboarding.md"), onboarding_phrases)
+
+def test_release_doc_requires_promotion_contract_and_external_e2ee_evidence():
+    """Release runbook must document token.place contracts without Sugarkube code."""
+    _assert_contains_all(
+        Path("docs/ops/sugarkube-release.md"),
+        (
+            "necessary but insufficient",
+            "real external desktop/compute node must register to staging",
+            "repeat the real external proof against production",
+            "encrypted API v1 relay/desktop-bridge E2EE request/response",
+            "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
+            "immutable image tag, chart version and digest where available",
+            "rendered or live deployment YAML",
+            "relay logs after the compute test",
+            "Cloudflare Tunnel/DNS/WAF routing is external to Helm",
+            "single-pod, one-worker, and in-memory",
+            "GHCR relay image, and the OCI Helm chart",
+        ),
+    )
 
 
 def test_sugarkube_docs_keep_cloudflare_gate_explicit_per_runbook():
@@ -160,7 +185,12 @@ def test_sugarkube_docs_keep_cloudflare_gate_explicit_per_runbook():
 
     _assert_contains_all(
         Path("docs/relay_sugarkube_onboarding.md"),
-        ("cf-ray", "intentionally invalid", "unregister the unique diagnostic key"),
+        (
+            "cf-ray",
+            "DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE",
+            '"server_public_key":""',
+            "intentionally non-mutating",
+        ),
     )
     _assert_contains_all(Path("docs/ops/sugarkube-release.md"), ("cf-ray",))
 

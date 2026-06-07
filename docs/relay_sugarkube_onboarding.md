@@ -114,7 +114,9 @@ Copy-pasteable external route checks:
 ~~~bash
 # Cloudflare Tunnel/DNS must point these public hosts at Traefik; inspect the
 # Cloudflare dashboard or your tunnel config for the exact tunnel name/UUID.
-# These HTTPS probes verify the route from the public edge to the app.
+# These DNS and HTTPS probes verify the route from the public edge to the app.
+dig +short staging.token.place
+dig +short token.place
 for host in staging.token.place token.place; do
   curl -vI "https://${host}/"
   curl -fsS "https://${host}/livez"
@@ -123,28 +125,34 @@ for host in staging.token.place token.place; do
 done
 
 # Safely reproduce the compute-node registration request shape without using
-# a real desktop token or payload. Keep the token intentionally invalid for
-# route-only checks; if a relay accepts the request anyway (for example a
-# tokenless test relay), immediately unregister the unique diagnostic key.
-# A non-JSON 403 with server: cloudflare or a cf-ray header means the request
-# may have been stopped before relay.py.
+# a real desktop token or payload. This pre-app route probe is intentionally
+# non-mutating: it uses a clearly fake token and an empty server_public_key so
+# it cannot register a fake compute node even against tokenless relays.
 HOST=staging.token.place
-DIAG_KEY="diagnostic-public-key-$(date +%s)-$$"
-DIAG_TOKEN="intentionally-invalid-diagnostic-token"
+DIAG_TOKEN="DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE"
 curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
   -H 'content-type: application/json' \
   -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
-  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")"
-curl -i -X POST "https://${HOST}/api/v1/relay/servers/unregister" \
-  -H 'content-type: application/json' \
-  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
-  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")" || true
+  --data '{"server_public_key":""}'
+
+# Interpret the route probe only as Cloudflare/DNS/TLS/WAF evidence:
+# - JSON 400 or 401 means the request reached relay.py and was rejected by the app.
+# - A non-JSON 403 with server: cloudflare or a cf-ray header means the request
+#   likely stopped in a pre-app Cloudflare/WAF/Access layer.
+# Operators must not replace this pre-app route probe with a real accepted
+# token or a non-empty public key. Real compute-node registration remains a
+# separate sign-off gate using the actual operator/environment-specific node
+# command.
 
 # If a desktop/compute node reports a pre-app 403, capture cf-ray from the
 # client log/response and filter Cloudflare Security Events by that Ray ID.
 CF_RAY=REPLACE_CF_RAY
 printf 'Check Cloudflare Security Events for Ray ID: %s\n' "$CF_RAY"
 ~~~
+
+The route probe is intentionally diagnostic-only: operators must not replace this pre-app route
+probe with a real accepted token or a non-empty public key. Real compute-node registration remains
+a separate sign-off gate using the actual operator/environment-specific node command.
 
 ## Sugarkube deployment command patterns
 
@@ -270,40 +278,36 @@ CF_RAY=REPLACE_CF_RAY
 # Check which WAF, bot, firewall, or access rule produced the 403.
 
 # 3. Reproduce the compute-node registration shape without exposing the real desktop token.
-# Keep the token intentionally invalid for route-only checks. If you must use a
-# relay-accepted staging token, keep DIAG_KEY unique and run the unregister call
-# immediately so the diagnostic node cannot be selected for real E2EE traffic.
-DIAG_KEY="diagnostic-public-key-$(date +%s)-$$"
-DIAG_TOKEN="intentionally-invalid-diagnostic-token"
+# This route-shape probe is intentionally non-mutating: it uses a clearly fake
+# token and an empty server_public_key so it cannot register a fake compute node
+# even if the relay is running in tokenless mode. Operators must not replace this
+# pre-app route probe with a real accepted token or a non-empty public key; real
+# compute-node registration remains a separate sign-off gate using the actual
+# operator/environment-specific node command.
+DIAG_TOKEN="DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE"
 curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
   -H 'content-type: application/json' \
   -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
-  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")"
-curl -i -X POST https://staging.token.place/api/v1/relay/servers/unregister \
-  -H 'content-type: application/json' \
-  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
-  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")" || true
+  --data '{"server_public_key":""}'
+
+# An app-level JSON 400 or 401 means the request reached relay.py. A non-JSON
+# 403 with server: cloudflare or a cf-ray header means Cloudflare/WAF/Access
+# likely blocked the request before relay.py.
 
 # 4. Reproduce with Python requests to compare headers/body with desktop behavior.
 python - <<'PY'
-import time
 import requests
 
 base_url = 'https://staging.token.place/api/v1/relay/servers'
 headers = {
     'content-type': 'application/json',
-    'X-Relay-Server-Token': 'intentionally-invalid-diagnostic-token',
+    'X-Relay-Server-Token': 'DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE',
 }
-payload = {'server_public_key': f'diagnostic-public-key-{int(time.time())}'}
+payload = {'server_public_key': ''}
 response = requests.post(f'{base_url}/register', headers=headers, json=payload, timeout=15)
 print('status', response.status_code)
 print('headers', {k: response.headers.get(k) for k in ['server', 'cf-ray', 'cf-cache-status', 'content-type', 'x-request-id']})
 print('body', response.text[:512])
-try:
-    cleanup = requests.post(f'{base_url}/unregister', headers=headers, json=payload, timeout=15)
-    print('cleanup_status', cleanup.status_code)
-except requests.RequestException as exc:
-    print('cleanup_error', exc)
 PY
 
 # 5. Compare relay app logs with desktop diagnostics for the same UTC window.

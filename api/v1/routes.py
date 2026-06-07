@@ -84,6 +84,44 @@ DEFAULT_SERVICE_NAME = 'token.place'
 SERVICE_NAME = os.getenv('SERVICE_NAME', DEFAULT_SERVICE_NAME)
 
 
+def _call_provider_complete_chat(provider, *, model_id, messages, options):
+    """Call a provider while honoring legacy route-level generate_response patches."""
+
+    from api.v1 import compute_provider as compute_provider_module
+
+    provider_generate_response = getattr(compute_provider_module, "generate_response", None)
+    should_bridge_legacy_patch = (
+        generate_response is not _generate_response
+        and provider_generate_response is _generate_response
+    )
+    if should_bridge_legacy_patch:
+        compute_provider_module.generate_response = generate_response
+    try:
+        return provider.complete_chat(
+            model_id=model_id,
+            messages=messages,
+            options=options,
+        )
+    finally:
+        if should_bridge_legacy_patch:
+            compute_provider_module.generate_response = provider_generate_response
+
+
+def _looks_like_model_error(exc: Exception) -> bool:
+    """Return True for ModelError instances, including reloaded module copies."""
+
+    return exc.__class__.__name__ == "ModelError" and hasattr(exc, "status_code")
+
+
+def _format_model_error_response(exc: Exception):
+    """Format model errors from the active or an equivalent reloaded module."""
+
+    return format_error_response(
+        getattr(exc, "message", str(exc)),
+        error_type=getattr(exc, "error_type", "invalid_request_error"),
+        status_code=getattr(exc, "status_code", 400),
+    )
+
 def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_request: bool) -> bool:
     """Allow desktop-bridge distributed override only for explicit API v1 E2EE intent."""
 
@@ -482,7 +520,8 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
+        assistant_message = _call_provider_complete_chat(
+            provider,
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
@@ -583,6 +622,9 @@ def _handle_chat_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _looks_like_model_error(e):
+            log_warning(f"Model error during chat completion: {getattr(e, 'message', str(e))}")
+            return _format_model_error_response(e)
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
             f"Internal server error: {str(e)}",
@@ -665,7 +707,8 @@ def _handle_text_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
+        assistant_message = _call_provider_complete_chat(
+            provider,
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
@@ -731,6 +774,9 @@ def _handle_text_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _looks_like_model_error(e):
+            log_warning(f"Model error during response generation: {getattr(e, 'message', str(e))}")
+            return _format_model_error_response(e)
         log_error("Unexpected error in create_completion endpoint")
         return format_error_response(f"Internal server error: {str(e)}")
 

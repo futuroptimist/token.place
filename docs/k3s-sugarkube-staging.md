@@ -30,6 +30,7 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
+- Chart package version for current deployments: `0.1.1` (read from Sugarkube `docs/apps/tokenplace.version`)
 - Preferred tag for validation/sign-off: immutable `main-<shortsha>`
 - Final release Git tags publish matching image tags (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only
@@ -76,6 +77,13 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 
 ## Validation checklist
 
+The HTTP checks below are required deployment checks, but they are **necessary and insufficient**
+for staging sign-off. Staging may be promoted only after a real external desktop/compute node
+registers to `https://staging.token.place`, appears in `/healthz` and `/relay/diagnostics`, and
+completes a real encrypted API v1 relay/desktop-bridge E2EE request/response through that
+registered node. The exact node command is operator/environment-specific; capture the command that
+was actually run instead of substituting a generic placeholder.
+
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
@@ -88,12 +96,22 @@ kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/relay/diagnostics
 curl -fsS https://staging.token.place/
 ```
 
-Optional note: true relay traffic validation requires a registered external compute node plus an
-E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
-See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" for
+Required staging promotion evidence after the external compute/E2EE test:
+
+- immutable image tag (`main-<shortsha>` or later `vX.Y.Z`) and chart version `0.1.1` plus OCI
+  chart digest when available from Helm/registry output
+- rendered or live Deployment/Ingress YAML showing `replicaCount: 1`, `strategy.type: Recreate`,
+  one Gunicorn worker, TLS, public relay URL, and internal relay URL
+- `/livez`, `/healthz`, and `/relay/diagnostics` output captured after the compute node test
+- relay logs from the same UTC window after the compute node test, with no plaintext prompt,
+  response, token, key, ciphertext, or model payload content copied into the evidence
+
+The required external compute-node gate above is the staging promotion gate; generic HTTP health
+checks alone must never be reported as relay production readiness. See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" for
 required checks covering stale OCI chart detection, Recreate strategy verification, XDG
 read-only-root safeguards, duplicate env detection, and external compute-node long-poll flow
 validation.
@@ -109,6 +127,7 @@ If operators use a non-default staging hostname, apply the same checks with that
 ## Notes
 
 - Keep API v1 relay-blind E2EE guardrails intact.
-- Do not depend on local chart path deployment (`./deploy/charts/tokenplace-relay`) for
-  Sugarkube steady-state operations.
+- Use only the GHCR image plus OCI Helm chart path for Sugarkube staging. Do not promote the
+  repository-root `docker-compose.yml`, local Compose variants, raw `k8s/` manifests, or local chart
+  path deployment (`./deploy/charts/tokenplace-relay`) into the production runbook.
 - Do not require `gpuExternalName` or `TOKENPLACE_RELAY_UPSTREAM_URL` for staging relay readiness.

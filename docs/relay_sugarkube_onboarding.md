@@ -39,8 +39,13 @@ operator workflow.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - OCI Helm chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
+- Current chart package version pin: `0.1.1` (Sugarkube `docs/apps/tokenplace.version`; chart
+  `appVersion` remains `"0.1.0"` for the v0.1.0 runtime)
 - Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
+- Production promotion: if Sugarkube `docs/apps/tokenplace.prod.tag` is empty, the operator must
+  pass an explicit immutable tag; mutable tags (`latest`, `main-latest`, `staging`, `prod`,
+  `production`) are invalid.
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
 - `main-latest` is convenience-only and not production sign-off material
 - Before publishing, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1`; if chart `0.1.1` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.1` does not exist, proceed with publishing chart package version `0.1.1`.
@@ -107,6 +112,51 @@ Assumption: cert-manager is installed and the configured ClusterIssuer (for exam
 - Staging: host `staging.token.place`, TLS secret `tokenplace-staging-tls`
 - Production: host `token.place`, TLS secret `tokenplace-prod-tls`
 
+
+## Cloudflare route, TLS, and WAF validation gate
+
+Cloudflare Tunnel, DNS, TLS edge behavior, Access/Bot/WAF policies, and Security Events are
+external to Helm. Helm can render an Ingress for Traefik, but it cannot prove that
+`staging.token.place` or `token.place` is routed through Cloudflare to Traefik or that
+compute-node control-plane requests are allowed through pre-app filtering.
+
+Copy-pasteable external gate checks (replace placeholders; do not paste real secrets into notes):
+
+~~~bash
+# Confirm Cloudflare/Tunnel routing resolves the public host and reaches the expected edge.
+# Then compare the Traefik/Ingress backend separately from Kubernetes output.
+dig +short staging.token.place
+dig +short token.place
+kubectl -n tokenplace get ingress tokenplace -o wide
+kubectl -n tokenplace get ingress tokenplace -o yaml
+
+# Verify public HTTPS routes that must reach the relay through Cloudflare -> Traefik.
+for host in staging.token.place token.place; do
+  curl -vI "https://${host}/"
+  curl -fsS "https://${host}/livez"
+  curl -fsS "https://${host}/healthz"
+  curl -fsS "https://${host}/relay/diagnostics"
+done
+
+# Safely reproduce the compute-node registration request shape without exposing a real token.
+# A 401 JSON response means the request reached relay.py with an invalid/placeholder token.
+# A non-JSON 403 with server=cloudflare/cf-ray means Cloudflare or another pre-app layer blocked it.
+HOST=staging.token.place
+curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
+  -H 'content-type: application/json' \
+  -H 'X-Relay-Server-Token: REPLACE_WITH_THROWAWAY_OR_REDACTED_TOKEN' \
+  --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+
+# If a desktop/compute node reports a pre-app 403, capture its cf-ray and inspect Cloudflare.
+# In Cloudflare: Security > Events, filter by Ray ID and the affected hostname/path.
+CF_RAY=REPLACE_CF_RAY
+printf 'Check Cloudflare Security Events for Ray ID: %s\n' "$CF_RAY"
+~~~
+
+Do not relax relay.py token handling to work around Cloudflare failures. If the relay logs have no
+matching `POST /api/v1/relay/servers/register`/`poll` line for the same UTC window, fix the
+Cloudflare/Tunnel/WAF route first.
+
 ## Sugarkube deployment command patterns
 
 > Run the following from a **Sugarkube checkout**, not from token.place.
@@ -141,6 +191,9 @@ Production pattern uses `PATH/TO/tokenplace.values.prod.yaml` with the same appr
 immutable tag.
 
 ## Validation (staging example)
+
+These HTTP checks are necessary deployment checks, but they are **insufficient** for staging
+promotion or production readiness.
 
 ~~~bash
 kubectl -n tokenplace get deploy,po,svc,ingress
@@ -178,8 +231,33 @@ curl -fsS https://token.place/healthz
 curl -fsS https://token.place/
 ~~~
 
-Optional note: true relay traffic validation requires a registered external compute node and an
-E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
+### Required relay-compute/E2EE release gates
+
+Staging promotion gate:
+
+1. A real external desktop/compute node registers to `https://staging.token.place`.
+2. `/healthz` and `/relay/diagnostics` show the registered node after registration.
+3. A real encrypted API v1 relay/desktop-bridge E2EE request/response succeeds through that node.
+4. Evidence includes immutable image tag, chart version `0.1.1` and digest where available, rendered
+   or live Deployment/Ingress YAML, health/diagnostics output after the compute test, and relay logs
+   after the compute test.
+
+Production post-promotion gate:
+
+1. A separate real production desktop/compute node registers to `https://token.place`.
+2. `/healthz` and `/relay/diagnostics` show the production registered node after registration.
+3. A real encrypted API v1 relay/desktop-bridge E2EE request/response succeeds through production.
+4. Evidence includes the immutable production image tag, chart version/digest where available,
+   rendered or live Deployment/Ingress YAML, health/diagnostics output after the production compute
+   test, and relay logs after the production compute test.
+
+The exact compute-node startup/probe command is operator/environment-specific; record what was
+actually used rather than inventing a universal command. Keep all evidence relay-blind: no plaintext
+prompts/responses/tool arguments/model output, private keys, relay tokens, or payload ciphertext.
+Plaintext relay-dispatched API v1 paths are intentionally fail-closed; readiness claims apply only
+to the encrypted API v1 relay/desktop-bridge E2EE flow. For desktop release candidates, use the
+shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging,
+production, two-node, or round-robin claims.
 
 ### Desktop compute-node HTTP 403 / pre-app rejection diagnostics
 
@@ -385,7 +463,7 @@ Verification focus:
 ### 6) Health checks green before true relay flow validation
 
 Warning:
-- `/livez`, `/healthz`, `/`, and `/metrics` are necessary checks but **not sufficient** for
+- `/livez`, `/healthz`, `/`, and `/metrics` are necessary checks but **insufficient** for
   production sign-off.
 - Sign-off requires successful encrypted relay flow with a real external compute node.
 
@@ -473,5 +551,6 @@ Interpretation:
 - Keep API v1 relay-blind E2EE invariants intact (ciphertext only + safe routing metadata).
 - Do not treat legacy relay endpoints as active production path.
 - Do not require `TOKENPLACE_RELAY_UPSTREAM_URL` for relay-only Sugarkube readiness.
-- Do not use local chart path deployment (`./deploy/charts/tokenplace-relay`) for Sugarkube
-  steady-state operations.
+- Sugarkube steady-state deployment is GHCR image + OCI Helm chart only. Do not use the
+  repository-root `docker-compose.yml`, local Compose files, raw `k8s/` manifests, or local chart
+  path deployment (`./deploy/charts/tokenplace-relay`) as the staging/prod runbook path.

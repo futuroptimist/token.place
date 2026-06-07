@@ -29,7 +29,11 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Chart: `oci://ghcr.io/futuroptimist/charts/tokenplace`
 - Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
-- Required sign-off tag style: immutable semver release tag `vX.Y.Z` (published from a signed-off main artifact)
+- Chart package version for current deployments: `0.1.1` (read from Sugarkube `docs/apps/tokenplace.version`)
+- Required sign-off tag style: immutable semver release tag `vX.Y.Z` (published from a signed-off main artifact).
+  If Sugarkube `docs/apps/tokenplace.prod.tag` is empty, promotion must pass an explicit immutable
+  tag; mutable tags such as `latest`, `main-latest`, `staging`, `prod`, or `production` are not
+  valid.
 - Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
 - `main-latest` is convenience-only and not production sign-off
 - Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1`; if chart `0.1.1` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.1` does not exist, proceed with publishing chart package version `0.1.1`.
@@ -79,6 +83,13 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 
 ## Validation checklist
 
+The HTTP checks below are required post-promotion checks, but they are **necessary and
+insufficient** for production readiness. Production sign-off requires a separate real external
+production desktop/compute node registration to `https://token.place` and a successful encrypted
+API v1 relay/desktop-bridge E2EE request/response through that registered node. Do not reuse
+staging registration evidence for production. The exact node command is operator/environment-specific;
+capture the command actually used.
+
 ```bash
 kubectl -n tokenplace get deploy,po,svc,ingress
 kubectl -n tokenplace rollout status deploy/tokenplace --timeout=180s
@@ -91,13 +102,25 @@ kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
+curl -fsS https://token.place/relay/diagnostics
 curl -fsS https://token.place/
 ```
 
-Optional note: true relay traffic validation requires a registered external compute node plus an
-E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
-See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" and run
-the same external compute-node validation pattern against production hostnames before sign-off.
+Required production evidence after the production compute/E2EE test:
+
+- immutable production image tag (`vX.Y.Z`, or explicitly approved `main-<shortsha>` during a
+  controlled pre-release promotion) and chart version `0.1.1` plus OCI chart digest when available
+- rendered or live Deployment/Ingress YAML showing one replica, `strategy.type: Recreate`, one
+  Gunicorn worker, TLS, public relay URL, and internal relay URL
+- `/livez`, `/healthz`, and `/relay/diagnostics` output captured after the production compute test
+- relay logs from the same UTC window after the production compute test, preserving the
+  relay-blind rule: ciphertext-only plus safe routing metadata; no plaintext payloads, tokens,
+  private keys, or model output text
+
+The required external production compute-node gate above is the production readiness gate; generic
+HTTP health checks alone must never be reported as relay production readiness. See
+`relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" for the
+shared validation pattern.
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 
@@ -110,7 +133,8 @@ If operators override hostname/routing, use the equivalent production host in th
 ## Notes
 
 - Preserve API v1 relay-blind E2EE guardrails (relay sees ciphertext + routing metadata only).
-- Do not rely on local chart path deployment (`./deploy/charts/tokenplace-relay`) for
-  Sugarkube steady-state operations.
+- Use only the GHCR image plus OCI Helm chart path for Sugarkube production. Do not promote the
+  repository-root `docker-compose.yml`, local Compose variants, raw `k8s/` manifests, or local chart
+  path deployment (`./deploy/charts/tokenplace-relay`) into production operations.
 - Do not require `gpuExternalName` or `TOKENPLACE_RELAY_UPSTREAM_URL` for production relay
   readiness in this relay-only phase.

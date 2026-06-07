@@ -1,7 +1,7 @@
 # Sugarkube release workflow for token.place
 
 This is the canonical release path for deploying token.place on Sugarkube. It is
-GHCR-first: GitHub Actions builds the relay image from the repository-root
+GHCR + OCI Helm chart first: GitHub Actions builds the relay image from the repository-root
 `Dockerfile`, GitHub Actions validates and publishes the Helm chart from
 `charts/tokenplace`, and Sugarkube deploys an immutable image tag with an OCI
 chart version.
@@ -42,7 +42,10 @@ ghcr.io/futuroptimist/tokenplace-relay:sha-<shortsha>
 
 Use `main-<shortsha>` or `vX.Y.Z` for Sugarkube deploys. `main-latest` exists
 only as a chart lint/render convenience and a quick human smoke-test pointer;
-it is not the staging or production promotion tag.
+it is not the staging or production promotion tag. When Sugarkube
+`docs/apps/tokenplace.prod.tag` is empty, production promotion must pass an
+explicit immutable tag. Mutable tags such as `latest`, `main-latest`, `staging`,
+`prod`, and `production` are invalid for promotion.
 
 ## Chart contract
 
@@ -57,7 +60,9 @@ helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version CHART_VE
 ```
 
 Replace `CHART_VERSION` with the version recorded in the successful
-`ci-helm.yml` run summary or in the Sugarkube app config/version file.
+`ci-helm.yml` run summary or in the Sugarkube app config/version file. Current
+token.place chart source and Sugarkube pin expectation are `0.1.1`; chart package version
+`0.1.1`; chart `appVersion` remains `"0.1.0"` for the v0.1.0 runtime.
 
 ## Staging deploy path
 
@@ -91,10 +96,35 @@ before copying commands.
 For semver release validation, replace `main-REPLACE_SHORTSHA` with the release
 tag, for example `v0.1.0`.
 
+## Release readiness gates
+
+Staging `app-status`, `app-verify`, `/livez`, `/healthz`, `/relay/diagnostics`,
+and root-page checks are necessary but insufficient. Before promoting staging, a
+real external desktop/compute node must register to `https://staging.token.place`
+and complete a real encrypted API v1 relay/desktop-bridge E2EE request/response.
+After production promotion, repeat the registration and E2EE request/response
+with a separate real production node against `https://token.place`. The exact
+compute-node command is operator/environment-specific; record the actual command
+and environment used.
+
+Evidence for each environment must include the immutable image tag, chart
+version/digest where available, rendered or live Deployment/Ingress YAML,
+`/livez`, `/healthz`, and `/relay/diagnostics` output after the compute test,
+and relay logs after the compute test. Preserve the current relay caveat in all
+release notes: relay-only in cluster, external compute plane, one replica, one Gunicorn worker,
+in-memory registrations/queues/replies, accepted state loss on pod restart/replacement, and no
+HA/durable queue claim until shared state ships. Cloudflare Tunnel/DNS/TLS/WAF validation is an
+external release gate; if a compute node sees a pre-app 403 with a `cf-ray`, check Cloudflare
+Security Events before changing relay application code.
+
+Plaintext relay-dispatched API v1 paths are intentionally fail-closed. Production
+readiness claims apply only to the encrypted API v1 relay/desktop-bridge E2EE
+flow.
+
 ## Local-development appendix
 
-Local image builds are for developer iteration only. They are not the staging or
-production release path.
+Local image builds, root `docker-compose.yml`, and raw `k8s/` manifests are for developer or
+legacy/local iteration only. They are not the staging or production release path.
 
 ```bash
 docker build -t tokenplace-relay:dev -f Dockerfile .

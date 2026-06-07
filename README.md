@@ -74,14 +74,14 @@ On macOS, use `python3` / `pip3` (or the venv’s `python` / `pip` after activat
   fork-specific defaults and updates repo metadata for your clone.
 - **Run the services locally** — `python relay.py` and `python server.py` keep iteration tight when
   changing Python code.
-- **Run via containers** — `docker compose up --build` matches the relay + server layout exercised
-  by CI and production deployments.
+- **Run via containers** — `docker compose up --build` is for local relay + server iteration;
+  Sugarkube production uses the GHCR relay image plus OCI Helm chart instead.
 - **Format & lint** — `pre-commit run --all-files` (or `make lint`) mirrors the CI bot's
   formatting, linting, and quick tests.
 - **Full test sweep** — `./run_all_tests.sh` (or `make test`) calls pytest, Playwright, npm checks,
   and Bandit just like CI.
-- **Deploy Kubernetes manifests** — `make k8s-deploy` applies everything under `k8s/` to the active
-  cluster context.
+- **Deploy Kubernetes manifests** — `make k8s-deploy` applies legacy/local manifests under `k8s/`
+  to the active cluster context; do not use it as the Sugarkube production path.
 
 Make targets surface the same workflows in shorthand:
 

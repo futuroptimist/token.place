@@ -54,3 +54,76 @@ def test_bundle_values_do_not_pin_redis_storage_backend():
     content = BUNDLE_VALUES_PATH.read_text()
     assert "redis://" not in content
     assert "TOKENPLACE_RATE_LIMIT_STORAGE_URI" not in content
+
+
+def test_sugarkube_chart_version_docs_track_canonical_chart_source():
+    """Runbook chart pins should track the canonical chart package version."""
+    chart = yaml.safe_load(Path("charts/tokenplace/Chart.yaml").read_text())
+    app_version = Path("docs/apps/tokenplace.version").read_text().strip()
+    release_doc = Path("docs/ops/sugarkube-release.md").read_text()
+
+    assert chart["version"] == "0.1.1"
+    assert app_version == chart["version"]
+    assert "docs/apps/tokenplace.version`\nshould pin `0.1.1`" in release_doc
+
+
+def test_sugarkube_runbooks_require_real_external_e2ee_proof():
+    """Generic HTTP checks must not be documented as sufficient for sign-off."""
+    docs = "\n".join(
+        Path(path).read_text()
+        for path in (
+            "docs/k3s-sugarkube-staging.md",
+            "docs/k3s-sugarkube-prod.md",
+            "docs/relay_sugarkube_onboarding.md",
+            "docs/ops/sugarkube-release.md",
+        )
+    )
+
+    required_phrases = [
+        "necessary but insufficient",
+        "real external desktop/compute node registers",
+        "encrypted API v1 relay/desktop-bridge E2EE request/response",
+        "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
+        "immutable image tag, chart version and digest where available",
+        "rendered or live deployment YAML",
+        "relay logs after the compute test",
+    ]
+    for phrase in required_phrases:
+        assert phrase in docs
+
+
+def test_sugarkube_docs_keep_cloudflare_and_stateful_caveats_explicit():
+    """Cloudflare gates and non-HA relay limitations should stay visible."""
+    docs = "\n".join(
+        Path(path).read_text()
+        for path in (
+            "docs/k3s-sugarkube-staging.md",
+            "docs/k3s-sugarkube-prod.md",
+            "docs/relay_sugarkube_onboarding.md",
+            "docs/ops/sugarkube-release.md",
+        )
+    )
+
+    for phrase in (
+        "Helm does **not** create/manage Cloudflare routes, DNS, WAF, or Access policies",
+        "cf-ray",
+        "before it reaches `relay.py`",
+        "single-pod",
+        "one-worker",
+        "in-memory",
+        "state loss on",
+        "HA/durable queues are future work",
+    ):
+        assert phrase in docs
+
+
+def test_sugarkube_release_docs_reject_mutable_prod_tags_and_legacy_paths():
+    """Production docs must require immutable tags and the GHCR + OCI path."""
+    release_doc = Path("docs/ops/sugarkube-release.md").read_text()
+
+    for mutable_tag in ("main-latest", "latest", "staging", "prod", "production"):
+        assert mutable_tag in release_doc
+    assert "docs/apps/tokenplace.prod.tag`\nempty" in release_doc
+    assert "production promotion must supply an explicit immutable tag" in release_doc
+    assert "root `docker-compose.yml`, and raw `k8s/` manifests" in release_doc
+    assert "GHCR relay image, and the OCI Helm chart" in release_doc

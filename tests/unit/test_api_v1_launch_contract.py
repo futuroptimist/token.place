@@ -127,10 +127,11 @@ def test_compute_node_control_plane_routes_are_documented_separately():
         assert f"{method} {path}" not in public_section
         assert f"{method} {path}" in internal_section
 
+    for method, path in sorted(INTERNAL_RELAY_LIFECYCLE_ROUTES):
+        assert f"{method} {path}" not in public_section
+        assert f"{method} {path}" in internal_section
+
     assert "not general user-facing API endpoints" in internal_section
-    assert "POST /api/v1/relay/requests/cancel" in internal_section
-    assert "POST /relay/api/v1/chat/completions" in internal_section
-    assert "POST /relay/api/v1/source" in internal_section
 
 
 def test_api_v1_chat_completions_rejects_stream_true(client):
@@ -172,8 +173,11 @@ def test_landing_page_model_example_documents_openai_permission_objects():
     models_section = html.split("/api/v1/models/{model_id}", 1)[0]
 
     assert '"permission": [' in models_section
+    assert '"permission": ["..."]' not in models_section
     assert '"object": "model_permission"' in models_section
     assert '"allow_sampling": true' in models_section
+    assert '"created": CREATED_UNIX_SECONDS' in models_section
+    assert '"created": 1700000000' not in models_section
 
 
 def test_route_level_generate_response_bridge_is_request_local(monkeypatch):

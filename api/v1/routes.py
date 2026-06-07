@@ -37,6 +37,7 @@ from api.v1.models import (
     generate_response as _generate_response,
     get_model_instance as _get_model_instance,
 )
+import api.v1.compute_provider as compute_provider_module
 from api.v1.compute_provider import (
     DistributedTargetSelection,
     get_api_v1_compute_provider,
@@ -271,6 +272,58 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
     return response
 
 
+def _is_model_error(exc: Exception) -> bool:
+    """Return True for ModelError instances across reloaded module copies."""
+
+    return isinstance(exc, ModelError) or (
+        exc.__class__.__name__ == "ModelError"
+        and hasattr(exc, "message")
+        and hasattr(exc, "error_type")
+        and hasattr(exc, "status_code")
+    )
+
+
+def _model_error_response(exc: Exception, context: str):
+    """Format a model error without depending on module identity stability."""
+
+    message = getattr(exc, "message", str(exc))
+    error_type = getattr(exc, "error_type", "invalid_request_error")
+    status_code = getattr(exc, "status_code", 400)
+    log_warning(f"Model error during {context}: {message}")
+    return format_error_response(
+        message,
+        error_type=error_type,
+        status_code=status_code,
+    )
+
+
+def _complete_chat_with_route_overrides(provider, *, model_id, messages, options):
+    """Call a provider while preserving legacy route-level test monkeypatches."""
+
+    route_generate_response = globals().get("generate_response")
+    if (
+        provider.__class__.__name__ == "LocalApiV1ComputeProvider"
+        and route_generate_response is not None
+        and route_generate_response is not _generate_response
+    ):
+        original_generate_response = compute_provider_module.generate_response
+        compute_provider_module.generate_response = route_generate_response
+        try:
+            return provider.complete_chat(
+                model_id=model_id,
+                messages=messages,
+                options=options,
+            )
+        finally:
+            compute_provider_module.generate_response = original_generate_response
+
+    return provider.complete_chat(
+        model_id=model_id,
+        messages=messages,
+        options=options,
+    )
+
+
 def _extract_message_content_for_usage(message: dict) -> str:
     """Return a string representation of a chat message's content."""
 
@@ -482,7 +535,8 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
+        assistant_message = _complete_chat_with_route_overrides(
+            provider,
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
@@ -563,12 +617,7 @@ def _handle_chat_completion_request(data):
             status_code=400,
         )
     except ModelError as e:
-        log_warning(f"Model error during chat completion: {e.message}")
-        return format_error_response(
-            e.message,
-            error_type=e.error_type,
-            status_code=e.status_code,
-        )
+        return _model_error_response(e, "chat completion")
     except ComputeProviderError as e:
         execution_backend_path = get_api_v1_last_backend_path()
         log_warning(
@@ -583,6 +632,8 @@ def _handle_chat_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _is_model_error(e):
+            return _model_error_response(e, "chat completion")
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
             f"Internal server error: {str(e)}",
@@ -665,7 +716,8 @@ def _handle_text_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
+        assistant_message = _complete_chat_with_route_overrides(
+            provider,
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
@@ -717,12 +769,7 @@ def _handle_text_completion_request(data):
         return response
 
     except ModelError as e:
-        log_warning(f"Model error during response generation: {e.message}")
-        return format_error_response(
-            e.message,
-            error_type=e.error_type,
-            status_code=e.status_code,
-        )
+        return _model_error_response(e, "response generation")
     except ComputeProviderError as e:
         return format_error_response(
             e.public_message,
@@ -731,6 +778,8 @@ def _handle_text_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _is_model_error(e):
+            return _model_error_response(e, "response generation")
         log_error("Unexpected error in create_completion endpoint")
         return format_error_response(f"Internal server error: {str(e)}")
 

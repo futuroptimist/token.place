@@ -348,11 +348,14 @@
         <hr>
 
         <h2>API</h2>
-        <p>The token.place API is designed to be compatible with the OpenAI API format, making it easy to integrate with existing applications that use OpenAI's services.</p>
+        <p>The token.place <strong>API v1 launch contract for 0.1.0/0.1.x is frozen</strong>: API v1 is non-streaming, ciphertext-envelope-first for relay-blind E2EE paths, and is the active production API. API v2 is intentionally outside this launch contract.</p>
+        <p>OpenAI-compatible aliases are also registered at <code>/v1/models</code>, <code>/v1/models/{model_id}</code>, <code>/v1/public-key</code>, <code>/v1/public-key/rotate</code>, <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/images/generations</code>, <code>/v1/health</code>, and <code>/v1/relay/unregister</code>.</p>
+
+        <h3>Public/client API v1 launch contract</h3>
 
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models</span></h3>
-            <p>Lists the available models.</p>
+            <p>Lists available API v1 models in OpenAI-compatible list format. API v1 returns stable OpenAI-style model objects, not the API v2 catalog schema.</p>
             <p><strong>Example Response:</strong></p>
             <pre>{
   "object": "list",
@@ -360,9 +363,24 @@
     {
       "id": "llama-3-8b-instruct",
       "object": "model",
-      "created": 1679351277,
+      "created": CREATED_UNIX_SECONDS,
       "owned_by": "token.place",
-      "permission": [...],
+      "permission": [
+        {
+          "id": "modelperm-llama-3-8b-instruct",
+          "object": "model_permission",
+          "created": CREATED_UNIX_SECONDS,
+          "allow_create_engine": false,
+          "allow_sampling": true,
+          "allow_logprobs": true,
+          "allow_search_indices": false,
+          "allow_view": true,
+          "allow_fine_tuning": false,
+          "organization": "*",
+          "group": null,
+          "is_blocking": false
+        }
+      ],
       "root": "llama-3-8b-instruct",
       "parent": null
     }
@@ -372,23 +390,27 @@
 
         <div class="api-endpoint">
             <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/models/{model_id}</span></h3>
-            <p>Retrieves information about a specific model.</p>
+            <p>Retrieves one API v1 model object by ID using the same OpenAI-compatible shape returned by the model list.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/public-key</span></h3>
+            <p>Retrieves the server public key used by encrypted API v1 request mode.</p>
             <p><strong>Example Response:</strong></p>
             <pre>{
-  "id": "llama-3-8b-instruct",
-  "object": "model",
-  "created": 1679351277,
-  "owned_by": "token.place",
-  "permission": [...],
-  "root": "llama-3-8b-instruct",
-  "parent": null
+  "public_key": "SERVER_PUBLIC_KEY_HERE"
 }</pre>
         </div>
 
         <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/public-key/rotate</span></h3>
+            <p><strong>Operator-gated.</strong> Rotates the server RSA key pair and returns the refreshed public key. Requires an operator token when operator auth is configured.</p>
+        </div>
+
+        <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/chat/completions</span></h3>
-            <p>Creates a completion for the chat message.</p>
-            <p><strong>Request Body:</strong></p>
+            <p>Creates a non-streaming chat completion. API v1 rejects <code>stream: true</code>. Encrypted mode sends ciphertext under <code>messages</code> and includes the client public key so only the client can decrypt the response.</p>
+            <p><strong>Encrypted Request Body:</strong></p>
             <pre>{
   "model": "llama-3-8b-instruct",
   "encrypted": true,
@@ -413,39 +435,94 @@
 
         <div class="api-endpoint">
             <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/completions</span></h3>
-            <p>Creates a completion for a legacy plaintext prompt payload. For ciphertext-envelope-first API v1 usage, prefer <code>/api/v1/chat/completions</code> with encrypted request mode.</p>
-            <p><strong>Note:</strong> This endpoint is retained for compatibility with legacy clients that send a plaintext <code>prompt</code>. Relay-blind E2EE deployments should use <code>/api/v1/chat/completions</code> encrypted mode and relay ciphertext envelopes.</p>
-            <p><strong>Response format:</strong> Same schema family as chat/completions (text completion object).</p>
+            <p>Creates a non-streaming legacy text completion response for OpenAI-compatible clients. API v1 rejects <code>stream: true</code>; relay-blind E2EE deployments should prefer encrypted <code>/api/v1/chat/completions</code>.</p>
         </div>
 
         <div class="api-endpoint">
-            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/public-key</span></h3>
-            <p>Retrieves the server's public key for end-to-end encryption.</p>
-            <p><strong>Example Response:</strong></p>
-            <pre>{
-  "public_key": "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUl..."
-}</pre>
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/images/generations</span></h3>
+            <p>Generates a local placeholder image from a validated prompt and size. The response includes <code>created</code>, <code>data[].b64_json</code>, <code>data[].revised_prompt</code>, <code>size</code>, and optional <code>seed</code>.</p>
         </div>
 
-        <h3>E2EE Usage and Relay Envelope</h3>
-        <p>API v1 relay traffic is mandatory end-to-end encrypted: relay endpoints are ciphertext-only and reject plaintext-like or unexpected top-level fields. Use ciphertext envelope payloads in API-facing examples.</p>
-        <ol>
-            <li>Get the server's public key from <code>/api/v1/public-key</code></li>
-            <li>Generate your own RSA key pair on the client</li>
-            <li>Encrypt payload data with the server's public key</li>
-            <li>For API v1 relay routes, send only ciphertext envelope keys</li>
-            <li>Do not send plaintext top-level keys such as <code>messages</code>, <code>prompt</code>, <code>input</code>, <code>content</code>, <code>response</code>, or <code>text</code></li>
-        </ol>
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/health</span></h3>
+            <p>Returns API health metadata: <code>status</code>, <code>version</code>, <code>service</code>, and a current <code>timestamp</code>.</p>
+        </div>
 
-        <p><strong>Example API v1 Relay Request Envelope:</strong></p>
-        <pre>{
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/community/providers</span></h3>
+            <p>Lists community-operated relay and server providers as <code>{"object":"list","data":[...]}</code>, with optional metadata.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/community/leaderboard</span></h3>
+            <p>Returns the community model feedback leaderboard. An optional positive integer <code>limit</code> query parameter limits results.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/community/contributions</span></h3>
+            <p>Queues a community compute contribution offer and returns <code>{"status":"queued","submission_id":"..."}</code> with HTTP 202 when accepted.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/community/contributions/summary</span></h3>
+            <p>Summarizes queued contribution offers for maintainers.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/server-providers</span></h3>
+            <p>Lists the self-hosted relay provider registry as <code>{"object":"list","data":[...]}</code>, with optional metadata.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/relay/server-nodes</span></h3>
+            <p>Returns configured relay server-node URLs for diagnostics and onboarding: <code>configured_servers</code>, <code>primary</code>, <code>secondary</code>, and <code>total</code>.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/relay/unregister</span></h3>
+            <p><strong>Operator-gated.</strong> Removes a registered compute node by <code>server_public_key</code>. This operator endpoint is distinct from compute-node self-unregister control-plane routes.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-get">GET</span> <span class="api-path">/api/v1/relay/servers/next</span></h3>
+            <p>Selects the next registered API v1 compute node for encrypted relay work and returns its <code>server_public_key</code>.</p>
+        </div>
+
+        <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/relay/requests</span></h3>
+            <p>Queues a ciphertext envelope for a selected compute node. Relay-owned state remains ciphertext-only plus safe routing metadata.</p>
+            <p><strong>Ciphertext Envelope:</strong></p>
+            <pre>{
   "server_public_key": "SERVER_PUBLIC_KEY_HERE",
   "client_public_key": "CLIENT_PUBLIC_KEY_HERE",
+  "request_id": "REQUEST_ID_HERE",
   "ciphertext": "ENCRYPTED_DATA_HERE",
   "cipherkey": "ENCRYPTED_AES_KEY_HERE",
   "iv": "INITIALIZATION_VECTOR_HERE"
 }</pre>
+        </div>
 
+        <div class="api-endpoint">
+            <h3><span class="api-method method-post">POST</span> <span class="api-path">/api/v1/relay/responses/retrieve</span></h3>
+            <p>Retrieves an encrypted response envelope by <code>client_public_key</code> and optional <code>request_id</code>. Returns <code>{"status":"pending"}</code> with HTTP 202 while queued work is still pending.</p>
+        </div>
+
+        <h3>Internal relay control-plane routes</h3>
+        <p>These API v1 routes are accounted for in the launch contract but are not general user-facing API endpoints. They are for registered compute nodes or internal relay lifecycle management and must stay ciphertext-only where payload envelopes are exchanged.</p>
+        <table>
+            <thead><tr><th>Route</th><th>Purpose</th></tr></thead>
+            <tbody>
+                <tr><td><code>POST /api/v1/relay/servers/register</code></td><td>Compute node registration and heartbeat lease setup.</td></tr>
+                <tr><td><code>POST /api/v1/relay/servers/unregister</code></td><td>Compute node self-unregister with relay registration authentication.</td></tr>
+                <tr><td><code>POST /api/v1/relay/servers/poll</code></td><td>Compute node long-poll for the next encrypted workload envelope.</td></tr>
+                <tr><td><code>POST /api/v1/relay/requests/cancel</code></td><td>Client request cancellation with a requester proof token.</td></tr>
+                <tr><td><code>POST /api/v1/relay/responses</code></td><td>Compute node stores an encrypted response envelope for client retrieval.</td></tr>
+            </tbody>
+        </table>
+        <p>Internal fail-closed relay dispatch routes <code>POST /relay/api/v1/chat/completions</code> and <code>POST /relay/api/v1/source</code> intentionally reject plaintext distributed API v1 payloads.</p>
+
+        <h3>E2EE Usage and Relay Envelope</h3>
+        <p>API v1 relay traffic is mandatory end-to-end encrypted: relay endpoints are ciphertext-only and reject plaintext-like or unexpected top-level fields. Do not send plaintext top-level keys such as <code>messages</code>, <code>prompt</code>, <code>input</code>, <code>content</code>, <code>response</code>, or <code>text</code> to relay envelope routes.</p>
         <hr>
 
         <h2>Roadmap</h2>

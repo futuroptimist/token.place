@@ -42,7 +42,7 @@ operator workflow.
 - Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
 - Preferred deploy tag for staging/prod validation: immutable `main-<shortsha>`
 - Canonical release tag after pushing a Git tag (example): `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`
-- `main-latest` is convenience-only and not production sign-off material
+- `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and not staging sign-off or production promotion material
 - Before publishing, run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1`; if chart `0.1.1` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.1` does not exist, proceed with publishing chart package version `0.1.1`.
 
 ## Default hostnames
@@ -95,7 +95,9 @@ Otherwise leave the chart defaults in place; staging should not require a manual
 ## Ingress TLS expectations for staging/prod
 
 Cloudflare Tunnel continues to route public hostnames to Traefik, while Helm values control only
-Kubernetes objects. Helm does not manage Cloudflare routes.
+Kubernetes objects. Helm does not manage Cloudflare routes, DNS, WAF, or Access policies. Treat
+Cloudflare route/TLS/WAF validation as an external release gate because a desktop/compute-node
+registration can be blocked before it reaches `relay.py`.
 
 Staging/prod overlays must set `ingress.tls.enabled: true`; cert-manager annotation/secret names
 alone are not enough to render `spec.tls` in the chart. Operators must verify the rendered Ingress
@@ -106,6 +108,51 @@ Assumption: cert-manager is installed and the configured ClusterIssuer (for exam
 
 - Staging: host `staging.token.place`, TLS secret `tokenplace-staging-tls`
 - Production: host `token.place`, TLS secret `tokenplace-prod-tls`
+
+Copy-pasteable external route checks:
+
+~~~bash
+# Cloudflare Tunnel/DNS must point these public hosts at Traefik; inspect the
+# Cloudflare dashboard or your tunnel config for the exact tunnel name/UUID.
+# These DNS and HTTPS probes verify the route from the public edge to the app.
+dig +short staging.token.place
+dig +short token.place
+for host in staging.token.place token.place; do
+  curl -vI "https://${host}/"
+  curl -fsS "https://${host}/livez"
+  curl -fsS "https://${host}/healthz"
+  curl -fsS "https://${host}/relay/diagnostics"
+done
+
+# Safely reproduce the compute-node registration request shape without using
+# a real desktop token or payload. This pre-app route probe is intentionally
+# non-mutating: it uses a clearly fake token and an empty server_public_key so
+# it cannot register a fake compute node even against tokenless relays.
+HOST=staging.token.place
+DIAG_TOKEN="DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE"
+curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
+  -H 'content-type: application/json' \
+  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
+  --data '{"server_public_key":""}'
+
+# Interpret the route probe only as Cloudflare/DNS/TLS/WAF evidence:
+# - JSON 400 or 401 means the request reached relay.py and was rejected by the app.
+# - A non-JSON 403 with server: cloudflare or a cf-ray header means the request
+#   likely stopped in a pre-app Cloudflare/WAF/Access layer.
+# Operators must not replace this pre-app route probe with a real accepted
+# token or a non-empty public key. Real compute-node registration remains a
+# separate sign-off gate using the actual operator/environment-specific node
+# command.
+
+# If a desktop/compute node reports a pre-app 403, capture cf-ray from the
+# client log/response and filter Cloudflare Security Events by that Ray ID.
+CF_RAY=REPLACE_CF_RAY
+printf 'Check Cloudflare Security Events for Ray ID: %s\n' "$CF_RAY"
+~~~
+
+The route probe is intentionally diagnostic-only: operators must not replace this pre-app route
+probe with a real accepted token or a non-empty public key. Real compute-node registration remains
+a separate sign-off gate using the actual operator/environment-specific node command.
 
 ## Sugarkube deployment command patterns
 
@@ -140,7 +187,28 @@ just helm-oci-upgrade release=tokenplace namespace=tokenplace chart=oci://ghcr.i
 Production pattern uses `PATH/TO/tokenplace.values.prod.yaml` with the same approved
 immutable tag.
 
-## Validation (staging example)
+## Validation gates
+
+Generic Sugarkube status, `app-status`, `app-verify`, `/livez`, `/healthz`,
+`/relay/diagnostics`, and root HTTP checks are necessary but insufficient. Staging promotion and
+production sign-off require a real external relay-compute proof:
+
+- Staging promotion gate: a real external desktop/compute node registers to
+  `https://staging.token.place` and appears in both `/healthz` and `/relay/diagnostics`.
+- Staging promotion gate: a real encrypted API v1 relay/desktop-bridge E2EE request/response
+  succeeds through that registered staging node.
+- Production post-promotion gate: a separate real production desktop/compute-node registration and
+  encrypted API v1 relay/desktop-bridge E2EE request/response succeeds against
+  `https://token.place`.
+- Evidence must include the immutable image tag, chart version and digest where available, rendered
+  or live deployment YAML, health/diagnostics output after the compute test, and relay logs after
+  the compute test.
+
+The exact desktop/compute-node launch command is operator/environment-specific; record the command
+actually used, but do not invent a universal runbook command. Plaintext relay-dispatched API v1
+paths are intentionally fail-closed and are not staging or production readiness evidence.
+
+### Staging generic HTTP checks
 
 ~~~bash
 kubectl -n tokenplace get deploy,po,svc,ingress
@@ -157,10 +225,11 @@ kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://staging.token.place/
 curl -fsS https://staging.token.place/livez
 curl -fsS https://staging.token.place/healthz
+curl -fsS https://staging.token.place/relay/diagnostics
 curl -fsS https://staging.token.place/
 ~~~
 
-Production validation:
+### Production generic HTTP checks
 
 ~~~bash
 CHART_VERSION="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+' PATH/TO/tokenplace.version | head -n1)"
@@ -175,11 +244,11 @@ kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
+curl -fsS https://token.place/relay/diagnostics
 curl -fsS https://token.place/
 ~~~
 
-Optional note: true relay traffic validation requires a registered external compute node and an
-E2EE client-flow probe (for example encrypted `/api/v1/chat/completions`). For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
+For desktop release candidates, use the shared [desktop parity validation checklist](desktop_parity_validation.md) before making staging, production, two-node, or round-robin claims. That checklist includes copy-paste staging diagnostics, queue-depth, Stop/Start, Windows CUDA, macOS Metal, and CPU fallback commands.
 
 ### Desktop compute-node HTTP 403 / pre-app rejection diagnostics
 
@@ -209,21 +278,33 @@ CF_RAY=REPLACE_CF_RAY
 # Check which WAF, bot, firewall, or access rule produced the 403.
 
 # 3. Reproduce the compute-node registration shape without exposing the real desktop token.
-# Use a staging-safe throwaway token value or omit the header when validating routing only.
+# This route-shape probe is intentionally non-mutating: it uses a clearly fake
+# token and an empty server_public_key so it cannot register a fake compute node
+# even if the relay is running in tokenless mode. Operators must not replace this
+# pre-app route probe with a real accepted token or a non-empty public key; real
+# compute-node registration remains a separate sign-off gate using the actual
+# operator/environment-specific node command.
+DIAG_TOKEN="DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE"
 curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
   -H 'content-type: application/json' \
-  -H 'X-Relay-Server-Token: REPLACE_WITH_STAGING_TEST_TOKEN' \
-  --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
+  --data '{"server_public_key":""}'
+
+# An app-level JSON 400 or 401 means the request reached relay.py. A non-JSON
+# 403 with server: cloudflare or a cf-ray header means Cloudflare/WAF/Access
+# likely blocked the request before relay.py.
 
 # 4. Reproduce with Python requests to compare headers/body with desktop behavior.
 python - <<'PY'
 import requests
-url = 'https://staging.token.place/api/v1/relay/servers/register'
+
+base_url = 'https://staging.token.place/api/v1/relay/servers'
 headers = {
     'content-type': 'application/json',
-    'X-Relay-Server-Token': 'REPLACE_WITH_STAGING_TEST_TOKEN',
+    'X-Relay-Server-Token': 'DO_NOT_USE_REAL_TOKEN_ROUTE_PROBE',
 }
-response = requests.post(url, headers=headers, json={'server_public_key': 'diagnostic-public-key-placeholder'}, timeout=15)
+payload = {'server_public_key': ''}
+response = requests.post(f'{base_url}/register', headers=headers, json=payload, timeout=15)
 print('status', response.status_code)
 print('headers', {k: response.headers.get(k) for k in ['server', 'cf-ray', 'cf-cache-status', 'content-type', 'x-request-id']})
 print('body', response.text[:512])

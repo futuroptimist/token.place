@@ -31,7 +31,7 @@ stateful relay phase by rendering `replicaCount: 1` and `strategy.type: Recreate
 - Launch runtime alignment for v0.1.0: Git tag `v0.1.0`, chart `appVersion: "0.1.0"`, release image `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`; updated chart defaults publish as chart package version `0.1.1`
 - Required sign-off tag style: immutable semver release tag `vX.Y.Z` (published from a signed-off main artifact)
 - Canonical release image tag after Git tagging is the matching semver tag (example: `v0.1.0` -> `ghcr.io/futuroptimist/tokenplace-relay:v0.1.0`)
-- `main-latest` is convenience-only and not production sign-off
+- `main-latest`, `latest`, `staging`, `prod`, and `production` are mutable/convenience labels only and not production sign-off
 - Pre-publish gate: run `helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version 0.1.1`; if chart `0.1.1` already exists and contents are stale/mismatched, do not overwrite or re-push it; stop and decide manually. If chart `0.1.1` does not exist, proceed with publishing chart package version `0.1.1`.
 
 ## Deployment commands (run from Sugarkube repo)
@@ -43,7 +43,8 @@ Use the values files and version file that live in Sugarkube for your environmen
 ## Ingress TLS + Cloudflare Tunnel contract
 
 - Cloudflare Tunnel still owns public DNS/Tunnel routing for `token.place` to Traefik.
-- Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes.
+- Helm values only control Kubernetes resources; Helm does **not** create/manage Cloudflare routes, DNS, WAF, or Access policies.
+- Cloudflare route/TLS/WAF validation is an external release gate because desktop/compute-node registration can be blocked before the request reaches `relay.py`.
 - Production values must explicitly set `ingress.tls.enabled: true` or chart output omits `spec.tls`.
 - Assumption: cert-manager is installed and `cert-manager.io/cluster-issuer: letsencrypt-production` exists.
 
@@ -91,13 +92,28 @@ kubectl -n tokenplace get ingress tokenplace -o yaml
 curl -vI https://token.place/
 curl -fsS https://token.place/livez
 curl -fsS https://token.place/healthz
+curl -fsS https://token.place/relay/diagnostics
 curl -fsS https://token.place/
 ```
 
-Optional note: true relay traffic validation requires a registered external compute node plus an
-E2EE client-flow probe; health/root checks alone do not prove register/poll/request/response flow.
-See `relay_sugarkube_onboarding.md` "v0.1.0 staging failure modes and operator runbook" and run
-the same external compute-node validation pattern against production hostnames before sign-off.
+The generic Sugarkube status, `app-status`, `app-verify`, `/livez`, `/healthz`,
+`/relay/diagnostics`, and root HTTP checks are necessary but insufficient for production sign-off.
+After promotion, production must repeat the external relay proof instead of reusing staging
+evidence:
+
+- A separate real production desktop/compute node registers to `https://token.place` and appears in
+  both `/healthz` and `/relay/diagnostics`; the exact compute-node start command is
+  operator/environment-specific, so record the command actually used instead of inventing a
+  universal one.
+- A real encrypted API v1 relay/desktop-bridge E2EE request/response succeeds through that
+  registered production node. Plaintext relay-dispatched API v1 paths are intentionally fail-closed
+  and are not production-readiness evidence.
+- Captured evidence includes the immutable image tag, chart version and digest where available,
+  rendered or live deployment YAML, `/healthz` and `/relay/diagnostics` output after the compute
+  test, and relay logs after the compute test.
+
+See `relay_sugarkube_onboarding.md` and run the same external compute-node validation pattern
+against production hostnames before sign-off.
 
 If operators override hostname/routing, use the equivalent production host in the same checks.
 

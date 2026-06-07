@@ -40,9 +40,13 @@ ghcr.io/futuroptimist/tokenplace-relay:vX.Y.Z
 ghcr.io/futuroptimist/tokenplace-relay:sha-<shortsha>
 ```
 
-Use `main-<shortsha>` or `vX.Y.Z` for Sugarkube deploys. `main-latest` exists
-only as a chart lint/render convenience and a quick human smoke-test pointer;
-it is not the staging or production promotion tag.
+Use `main-<shortsha>` or `vX.Y.Z` for Sugarkube deploys. `main-latest`,
+`latest`, `staging`, `prod`, and `production` are mutable/convenience labels;
+they must be rejected by Sugarkube deploy/promotion checks and are not staging
+or production promotion tags. If Sugarkube keeps `docs/apps/tokenplace.prod.tag`
+empty, production promotion must supply an explicit immutable tag on the command
+line; populating that file is a deliberate release-management decision, not a
+default.
 
 ## Chart contract
 
@@ -57,7 +61,10 @@ helm show chart oci://ghcr.io/futuroptimist/charts/tokenplace --version CHART_VE
 ```
 
 Replace `CHART_VERSION` with the version recorded in the successful
-`ci-helm.yml` run summary or in the Sugarkube app config/version file.
+`ci-helm.yml` run summary or in the Sugarkube app config/version file. The
+current token.place chart source is `0.1.1`; Sugarkube `docs/apps/tokenplace.version`
+should pin `0.1.1` unless an operator explicitly documents why a different
+package is being held back.
 
 ## Staging deploy path
 
@@ -89,12 +96,43 @@ before copying commands.
    ```
 
 For semver release validation, replace `main-REPLACE_SHORTSHA` with the release
-tag, for example `v0.1.0`.
+tag, for example `v0.1.0`. Generic HTTP checks are necessary but insufficient:
+staging may not be promoted from those checks alone. A real external
+desktop/compute node must register to staging, appear in `/healthz` and
+`/relay/diagnostics`, and complete an encrypted API v1
+relay/desktop-bridge E2EE request/response. Capture the immutable image tag,
+chart version and digest where available, rendered or live deployment YAML,
+health/diagnostics output after the compute test, and relay logs after the
+compute test. The exact compute-node launch command is operator/environment
+specific, so record the command actually used rather than inventing one here.
+
+## Production promotion gate
+
+Production uses the same GHCR image and OCI Helm chart path, with release and
+namespace `tokenplace/tokenplace`, host `token.place`, and an explicit immutable
+image tag. After promotion, repeat the real external proof against production:
+
+- A separate production desktop/compute node registers to `https://token.place`
+  and appears in `/healthz` and `/relay/diagnostics`.
+- A real encrypted API v1 relay/desktop-bridge E2EE request/response succeeds
+  through that registered production node.
+- Plaintext relay-dispatched API v1 paths are intentionally fail-closed and are
+  not production readiness evidence.
+- Evidence includes the immutable image tag, chart version and digest where
+  available, rendered or live deployment YAML, health/diagnostics output after
+  the compute test, and relay logs after the compute test.
+
+Cloudflare Tunnel/DNS/WAF routing is external to Helm and remains an external
+release gate because desktop/compute-node registration can be blocked before it
+reaches `relay.py`; validate HTTPS `/`, `/livez`, `/healthz`, and
+`/relay/diagnostics`, and check Cloudflare Security Events by `cf-ray` when a
+desktop/compute node sees a pre-app 403 before changing relay code.
 
 ## Local-development appendix
 
-Local image builds are for developer iteration only. They are not the staging or
-production release path.
+Local image builds, root `docker-compose.yml`, and raw `k8s/` manifests are for
+developer iteration or legacy compatibility only. They are not the staging or
+production Sugarkube release path.
 
 ```bash
 docker build -t tokenplace-relay:dev -f Dockerfile .
@@ -103,4 +141,7 @@ docker run --rm -p 127.0.0.1:5010:5010 \
   tokenplace-relay:dev
 ```
 
-Use GitHub Actions and GHCR for deployable Sugarkube artifacts.
+Use GitHub Actions, the GHCR relay image, and the OCI Helm chart for deployable
+Sugarkube artifacts. The production relay remains intentionally single-pod,
+one-worker, and in-memory for registrations, queues, and replies; state loss on
+pod restart/replacement is accepted for this phase, and HA/durable queues are future work.

@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Callable, Dict, Optional, Protocol
 from urllib.parse import urlparse
 
 import requests
@@ -25,6 +25,9 @@ logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
     "api_v1_last_backend_path",
     default="unknown",
+)
+_generate_response_override: contextvars.ContextVar[Callable[..., Any] | None] = (
+    contextvars.ContextVar("api_v1_generate_response_override", default=None)
 )
 
 
@@ -124,6 +127,24 @@ def _error_from_code(code: str, *, message: str) -> ComputeProviderError:
     )
 
 
+def set_api_v1_generate_response_override(generator: Callable[..., Any]):
+    """Set a request-local response generator override for compatibility tests."""
+
+    return _generate_response_override.set(generator)
+
+
+def reset_api_v1_generate_response_override(token) -> None:
+    """Reset a request-local response generator override token."""
+
+    _generate_response_override.reset(token)
+
+
+def _active_generate_response() -> Callable[..., Any]:
+    """Return the current request-local generator or the module default."""
+
+    return _generate_response_override.get() or generate_response
+
+
 class ApiV1ComputeProvider(Protocol):
     """Contract for API v1-compatible compute providers."""
 
@@ -148,7 +169,7 @@ class LocalApiV1ComputeProvider:
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        updated_messages = generate_response(model_id, messages, **(options or {}))
+        updated_messages = _active_generate_response()(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
         assistant_message = updated_messages[-1]

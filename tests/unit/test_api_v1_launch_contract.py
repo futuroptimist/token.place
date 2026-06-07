@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import relay
+from api.v1 import compute_provider, routes
 
 INDEX_HTML = Path(relay.INDEX_HTML_PATH)
 
@@ -159,5 +160,39 @@ def test_api_v1_model_listing_is_not_api_v2_catalog_dump(client):
         assert model["object"] == "model"
         assert model["owned_by"] == "token.place"
         assert "permission" in model
+        assert isinstance(model["permission"], list)
+        assert model["permission"]
+        assert model["permission"][0]["object"] == "model_permission"
         assert "metadata" not in model
         assert "adapter" not in model
+
+
+def test_landing_page_model_example_documents_openai_permission_objects():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    models_section = html.split("/api/v1/models/{model_id}", 1)[0]
+
+    assert '"permission": [' in models_section
+    assert '"object": "model_permission"' in models_section
+    assert '"allow_sampling": true' in models_section
+
+
+def test_route_level_generate_response_bridge_is_request_local(monkeypatch):
+    original_compute_generator = compute_provider.generate_response
+
+    def fake_generate_response(model_id, messages, **options):
+        assert model_id == "llama-3-8b-instruct"
+        assert options == {"temperature": 0.2}
+        return messages + [{"role": "assistant", "content": "request-local bridge"}]
+
+    monkeypatch.setattr(routes, "generate_response", fake_generate_response)
+
+    result = routes._call_provider_complete_chat(
+        compute_provider.LocalApiV1ComputeProvider(),
+        model_id="llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hello"}],
+        options={"temperature": 0.2},
+    )
+
+    assert result == {"role": "assistant", "content": "request-local bridge"}
+    assert compute_provider.generate_response is original_compute_generator
+    assert compute_provider._active_generate_response() is original_compute_generator

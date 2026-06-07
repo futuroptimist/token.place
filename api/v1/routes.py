@@ -44,6 +44,8 @@ from api.v1.compute_provider import (
     get_api_v1_distributed_target_selection,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
+    reset_api_v1_generate_response_override,
+    set_api_v1_generate_response_override,
     ComputeProviderError,
 )
 from api.v1.validation import (
@@ -87,15 +89,10 @@ SERVICE_NAME = os.getenv('SERVICE_NAME', DEFAULT_SERVICE_NAME)
 def _call_provider_complete_chat(provider, *, model_id, messages, options):
     """Call a provider while honoring legacy route-level generate_response patches."""
 
-    from api.v1 import compute_provider as compute_provider_module
-
-    provider_generate_response = getattr(compute_provider_module, "generate_response", None)
-    should_bridge_legacy_patch = (
-        generate_response is not _generate_response
-        and provider_generate_response is _generate_response
-    )
+    should_bridge_legacy_patch = generate_response is not _generate_response
+    override_token = None
     if should_bridge_legacy_patch:
-        compute_provider_module.generate_response = generate_response
+        override_token = set_api_v1_generate_response_override(generate_response)
     try:
         return provider.complete_chat(
             model_id=model_id,
@@ -103,8 +100,8 @@ def _call_provider_complete_chat(provider, *, model_id, messages, options):
             options=options,
         )
     finally:
-        if should_bridge_legacy_patch:
-            compute_provider_module.generate_response = provider_generate_response
+        if override_token is not None:
+            reset_api_v1_generate_response_override(override_token)
 
 
 def _looks_like_model_error(exc: Exception) -> bool:

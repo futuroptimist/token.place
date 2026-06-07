@@ -123,13 +123,22 @@ for host in staging.token.place token.place; do
 done
 
 # Safely reproduce the compute-node registration request shape without using
-# a real desktop token or payload. A non-JSON 403 with server: cloudflare or a
-# cf-ray header means the request may have been stopped before relay.py.
+# a real desktop token or payload. Keep the token intentionally invalid for
+# route-only checks; if a relay accepts the request anyway (for example a
+# tokenless test relay), immediately unregister the unique diagnostic key.
+# A non-JSON 403 with server: cloudflare or a cf-ray header means the request
+# may have been stopped before relay.py.
 HOST=staging.token.place
+DIAG_KEY="diagnostic-public-key-$(date +%s)-$$"
+DIAG_TOKEN="intentionally-invalid-diagnostic-token"
 curl -i -X POST "https://${HOST}/api/v1/relay/servers/register" \
   -H 'content-type: application/json' \
-  -H 'X-Relay-Server-Token: REPLACE_WITH_STAGING_TEST_TOKEN' \
-  --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
+  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")"
+curl -i -X POST "https://${HOST}/api/v1/relay/servers/unregister" \
+  -H 'content-type: application/json' \
+  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
+  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")" || true
 
 # If a desktop/compute node reports a pre-app 403, capture cf-ray from the
 # client log/response and filter Cloudflare Security Events by that Ray ID.
@@ -261,24 +270,40 @@ CF_RAY=REPLACE_CF_RAY
 # Check which WAF, bot, firewall, or access rule produced the 403.
 
 # 3. Reproduce the compute-node registration shape without exposing the real desktop token.
-# Use a staging-safe throwaway token value or omit the header when validating routing only.
+# Keep the token intentionally invalid for route-only checks. If you must use a
+# relay-accepted staging token, keep DIAG_KEY unique and run the unregister call
+# immediately so the diagnostic node cannot be selected for real E2EE traffic.
+DIAG_KEY="diagnostic-public-key-$(date +%s)-$$"
+DIAG_TOKEN="intentionally-invalid-diagnostic-token"
 curl -i -X POST https://staging.token.place/api/v1/relay/servers/register \
   -H 'content-type: application/json' \
-  -H 'X-Relay-Server-Token: REPLACE_WITH_STAGING_TEST_TOKEN' \
-  --data '{"server_public_key":"diagnostic-public-key-placeholder"}'
+  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
+  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")"
+curl -i -X POST https://staging.token.place/api/v1/relay/servers/unregister \
+  -H 'content-type: application/json' \
+  -H "X-Relay-Server-Token: ${DIAG_TOKEN}" \
+  --data "$(printf '{"server_public_key":"%s"}' "${DIAG_KEY}")" || true
 
 # 4. Reproduce with Python requests to compare headers/body with desktop behavior.
 python - <<'PY'
+import time
 import requests
-url = 'https://staging.token.place/api/v1/relay/servers/register'
+
+base_url = 'https://staging.token.place/api/v1/relay/servers'
 headers = {
     'content-type': 'application/json',
-    'X-Relay-Server-Token': 'REPLACE_WITH_STAGING_TEST_TOKEN',
+    'X-Relay-Server-Token': 'intentionally-invalid-diagnostic-token',
 }
-response = requests.post(url, headers=headers, json={'server_public_key': 'diagnostic-public-key-placeholder'}, timeout=15)
+payload = {'server_public_key': f'diagnostic-public-key-{int(time.time())}'}
+response = requests.post(f'{base_url}/register', headers=headers, json=payload, timeout=15)
 print('status', response.status_code)
 print('headers', {k: response.headers.get(k) for k in ['server', 'cf-ray', 'cf-cache-status', 'content-type', 'x-request-id']})
 print('body', response.text[:512])
+try:
+    cleanup = requests.post(f'{base_url}/unregister', headers=headers, json=payload, timeout=15)
+    print('cleanup_status', cleanup.status_code)
+except requests.RequestException as exc:
+    print('cleanup_error', exc)
 PY
 
 # 5. Compare relay app logs with desktop diagnostics for the same UTC window.

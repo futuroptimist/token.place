@@ -96,9 +96,10 @@ before copying commands.
    ```
 
 For semver release validation, replace `main-REPLACE_SHORTSHA` with the release
-tag, for example `v0.1.0`. Staging may not be promoted from these generic HTTP
-checks alone: a real external desktop/compute node must register to staging,
-appear in `/healthz` and `/relay/diagnostics`, and complete an encrypted API v1
+tag, for example `v0.1.0`. Generic HTTP checks are necessary but insufficient:
+staging may not be promoted from those checks alone. A real external
+desktop/compute node must register to staging, appear in `/healthz` and
+`/relay/diagnostics`, and complete an encrypted API v1
 relay/desktop-bridge E2EE request/response. Capture the immutable image tag,
 chart version and digest where available, rendered or live deployment YAML,
 health/diagnostics output after the compute test, and relay logs after the
@@ -121,10 +122,11 @@ image tag. After promotion, repeat the real external proof against production:
   available, rendered or live deployment YAML, health/diagnostics output after
   the compute test, and relay logs after the compute test.
 
-Cloudflare Tunnel/DNS/WAF routing is external to Helm; validate HTTPS `/`,
-`/livez`, `/healthz`, and `/relay/diagnostics`, and check Cloudflare Security
-Events by `cf-ray` when a desktop/compute node sees a pre-app 403 before changing
-relay code.
+Cloudflare Tunnel/DNS/WAF routing is external to Helm and remains an external
+release gate because desktop/compute-node registration can be blocked before it
+reaches `relay.py`; validate HTTPS `/`, `/livez`, `/healthz`, and
+`/relay/diagnostics`, and check Cloudflare Security Events by `cf-ray` when a
+desktop/compute node sees a pre-app 403 before changing relay code.
 
 ## Local-development appendix
 

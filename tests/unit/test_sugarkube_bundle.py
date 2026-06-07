@@ -6,6 +6,16 @@ import yaml
 
 BUNDLE_ENV_PATH = Path("k8s/sugarkube/token-place.env")
 BUNDLE_VALUES_PATH = Path("k8s/sugarkube/token-place-values.yaml")
+SUGARKUBE_RUNBOOKS = (
+    Path("docs/k3s-sugarkube-staging.md"),
+    Path("docs/k3s-sugarkube-prod.md"),
+    Path("docs/relay_sugarkube_onboarding.md"),
+    Path("docs/ops/sugarkube-release.md"),
+)
+OPERATOR_ENVIRONMENT_RUNBOOKS = (
+    Path("docs/k3s-sugarkube-staging.md"),
+    Path("docs/k3s-sugarkube-prod.md"),
+)
 
 
 def _load_env(path: Path) -> dict[str, str]:
@@ -19,6 +29,20 @@ def _load_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         env[key] = value
     return env
+
+
+def _normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _assert_contains_all(path: Path, phrases: tuple[str, ...]) -> None:
+    content = _normalize_whitespace(path.read_text())
+    missing = [
+        phrase
+        for phrase in phrases
+        if _normalize_whitespace(phrase) not in content
+    ]
+    assert not missing, f"{path} missing required phrases: {missing}"
 
 
 def test_bundle_env_targets_canonical_oci_chart():
@@ -59,62 +83,104 @@ def test_bundle_values_do_not_pin_redis_storage_backend():
 def test_sugarkube_chart_version_docs_track_canonical_chart_source():
     """Runbook chart pins should track the canonical chart package version."""
     chart = yaml.safe_load(Path("charts/tokenplace/Chart.yaml").read_text())
+    chart_version = chart["version"]
     app_version = Path("docs/apps/tokenplace.version").read_text().strip()
     release_doc = Path("docs/ops/sugarkube-release.md").read_text()
 
-    assert chart["version"] == "0.1.1"
-    assert app_version == chart["version"]
-    assert "docs/apps/tokenplace.version`\nshould pin `0.1.1`" in release_doc
+    assert app_version == chart_version
+    assert f"current token.place chart source is `{chart_version}`" in release_doc
+    assert "Sugarkube `docs/apps/tokenplace.version`" in release_doc
+    assert "should pin" in release_doc
 
 
-def test_sugarkube_runbooks_require_real_external_e2ee_proof():
-    """Generic HTTP checks must not be documented as sufficient for sign-off."""
-    docs = "\n".join(
-        Path(path).read_text()
-        for path in (
-            "docs/k3s-sugarkube-staging.md",
-            "docs/k3s-sugarkube-prod.md",
-            "docs/relay_sugarkube_onboarding.md",
-            "docs/ops/sugarkube-release.md",
-        )
-    )
-
-    required_phrases = [
+def test_sugarkube_environment_runbooks_require_external_e2ee_proof():
+    """Each environment runbook must keep real E2EE sign-off gates explicit."""
+    shared_required_phrases = (
         "necessary but insufficient",
-        "real external desktop/compute node registers",
         "encrypted API v1 relay/desktop-bridge E2EE request/response",
         "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
         "immutable image tag, chart version and digest where available",
         "rendered or live deployment YAML",
         "relay logs after the compute test",
-    ]
-    for phrase in required_phrases:
-        assert phrase in docs
-
-
-def test_sugarkube_docs_keep_cloudflare_and_stateful_caveats_explicit():
-    """Cloudflare gates and non-HA relay limitations should stay visible."""
-    docs = "\n".join(
-        Path(path).read_text()
-        for path in (
-            "docs/k3s-sugarkube-staging.md",
-            "docs/k3s-sugarkube-prod.md",
-            "docs/relay_sugarkube_onboarding.md",
-            "docs/ops/sugarkube-release.md",
-        )
     )
 
-    for phrase in (
-        "Helm does **not** create/manage Cloudflare routes, DNS, WAF, or Access policies",
-        "cf-ray",
-        "before it reaches `relay.py`",
-        "single-pod",
-        "one-worker",
-        "in-memory",
-        "state loss on",
-        "HA/durable queues are future work",
-    ):
-        assert phrase in docs
+    for path in OPERATOR_ENVIRONMENT_RUNBOOKS:
+        _assert_contains_all(path, shared_required_phrases)
+
+    _assert_contains_all(
+        Path("docs/k3s-sugarkube-staging.md"),
+        ("real external desktop/compute node registers",),
+    )
+    _assert_contains_all(
+        Path("docs/k3s-sugarkube-prod.md"),
+        ("real production desktop/compute node registers", "instead of reusing staging evidence"),
+    )
+
+
+def test_sugarkube_onboarding_and_release_docs_require_external_e2ee_proof():
+    """Cross-environment docs must preserve staging and production proof details."""
+    release_phrases = (
+        "necessary but insufficient",
+        "real external desktop/compute node must register to staging",
+        "repeat the real external proof against production",
+        "encrypted API v1\nrelay/desktop-bridge E2EE request/response",
+        "Plaintext relay-dispatched API v1 paths are intentionally fail-closed",
+        "immutable image tag,\nchart version and digest where available",
+        "rendered or live deployment YAML",
+        "relay logs after the\ncompute test",
+    )
+    onboarding_phrases = (
+        "necessary but insufficient",
+        "real external relay-compute proof",
+        "real external desktop/compute node registers",
+        "encrypted API v1 relay/desktop-bridge E2EE request/response",
+        "paths are intentionally fail-closed",
+        "immutable image tag, chart version and digest where available",
+        "rendered\n  or live deployment YAML",
+        "relay logs after",
+    )
+
+    _assert_contains_all(Path("docs/ops/sugarkube-release.md"), release_phrases)
+    _assert_contains_all(Path("docs/relay_sugarkube_onboarding.md"), onboarding_phrases)
+
+
+def test_sugarkube_docs_keep_cloudflare_gate_explicit_per_runbook():
+    """Every operator runbook should keep Cloudflare/TLS/WAF caveats visible."""
+    for path in SUGARKUBE_RUNBOOKS:
+        _assert_contains_all(
+            path,
+            (
+                "Cloudflare",
+                "WAF",
+                "external release gate",
+                "before",
+                "reaches `relay.py`",
+            ),
+        )
+
+    _assert_contains_all(
+        Path("docs/relay_sugarkube_onboarding.md"),
+        ("cf-ray", "intentionally invalid", "unregister the unique diagnostic key"),
+    )
+    _assert_contains_all(Path("docs/ops/sugarkube-release.md"), ("cf-ray",))
+
+
+def test_sugarkube_docs_keep_stateful_relay_caveats_explicit_per_runbook():
+    """Every operator runbook should keep non-HA relay limitations visible."""
+    for path in SUGARKUBE_RUNBOOKS:
+        _assert_contains_all(path, ("single-pod", "in-memory", "future work"))
+
+    for path in OPERATOR_ENVIRONMENT_RUNBOOKS:
+        _assert_contains_all(path, ("one pod", "one Gunicorn worker", "one replica", "State loss"))
+
+    _assert_contains_all(
+        Path("docs/ops/sugarkube-release.md"),
+        ("one-worker", "state loss", "HA/durable queues are future work"),
+    )
+    _assert_contains_all(
+        Path("docs/relay_sugarkube_onboarding.md"),
+        ("state loss", "one Gunicorn worker", "Multi-replica"),
+    )
 
 
 def test_sugarkube_release_docs_reject_mutable_prod_tags_and_legacy_paths():

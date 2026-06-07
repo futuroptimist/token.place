@@ -17,8 +17,9 @@ import math
 import ipaddress
 from urllib.parse import urlparse
 
-from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
+import api.v1.compute_provider as compute_provider_module
+from api.v1.encryption import encryption_manager
 from api.v1.moderation import evaluate_messages_for_policy
 from api.v1.community import (
     get_provider_directory as _get_community_provider_directory,
@@ -271,6 +272,30 @@ def format_error_response(message, error_type="invalid_request_error", param=Non
     return response
 
 
+def _format_model_error_response(error, context: str):
+    """Return a model-error response for current or reloaded ModelError classes."""
+
+    message = getattr(error, "message", str(error))
+    error_type = getattr(error, "error_type", "model_error")
+    status_code = getattr(error, "status_code", 500)
+    log_warning(f"Model error during {context}: {message}")
+    return format_error_response(
+        message,
+        error_type=error_type,
+        status_code=status_code,
+    )
+
+
+def _looks_like_model_error(error) -> bool:
+    """Detect ModelError instances from modules reloaded during tests."""
+
+    return (
+        error.__class__.__name__ == "ModelError"
+        and hasattr(error, "status_code")
+        and hasattr(error, "error_type")
+    )
+
+
 def _extract_message_content_for_usage(message: dict) -> str:
     """Return a string representation of a chat message's content."""
 
@@ -321,6 +346,24 @@ def _extract_chat_completion_options(data: dict) -> dict:
         for key, value in data.items()
         if key in passthrough_fields and value is not None
     }
+
+
+def _sync_legacy_route_generation_patch():
+    """Temporarily wire route-level generate_response monkeypatches into providers."""
+
+    if generate_response is _generate_response:
+        return None
+
+    original = compute_provider_module.generate_response
+    compute_provider_module.generate_response = generate_response
+    return original
+
+
+def _restore_legacy_route_generation_patch(original) -> None:
+    """Restore provider generation after a route-level monkeypatch request."""
+
+    if original is not None:
+        compute_provider_module.generate_response = original
 
 
 def _handle_chat_completion_request(data):
@@ -457,6 +500,7 @@ def _handle_chat_completion_request(data):
         )
 
         log_info(f"Generating response using model {model_id}")
+        legacy_generation_patch = _sync_legacy_route_generation_patch()
         provider = (
             get_api_v1_compute_provider_for_mode(
                 mode="distributed",
@@ -482,11 +526,14 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
-            model_id=model_id,
-            messages=messages,
-            options=_extract_chat_completion_options(data),
-        )
+        try:
+            assistant_message = provider.complete_chat(
+                model_id=model_id,
+                messages=messages,
+                options=_extract_chat_completion_options(data),
+            )
+        finally:
+            _restore_legacy_route_generation_patch(legacy_generation_patch)
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 
@@ -563,12 +610,7 @@ def _handle_chat_completion_request(data):
             status_code=400,
         )
     except ModelError as e:
-        log_warning(f"Model error during chat completion: {e.message}")
-        return format_error_response(
-            e.message,
-            error_type=e.error_type,
-            status_code=e.status_code,
-        )
+        return _format_model_error_response(e, "chat completion")
     except ComputeProviderError as e:
         execution_backend_path = get_api_v1_last_backend_path()
         log_warning(
@@ -583,6 +625,8 @@ def _handle_chat_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _looks_like_model_error(e):
+            return _format_model_error_response(e, "chat completion")
         log_error("Unexpected error in create_chat_completion endpoint", exc_info=True)
         return format_error_response(
             f"Internal server error: {str(e)}",
@@ -648,6 +692,7 @@ def _handle_text_completion_request(data):
             )
 
         log_info(f"Generating response using model {model_id}")
+        legacy_generation_patch = _sync_legacy_route_generation_patch()
         provider = get_api_v1_compute_provider()
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
@@ -665,11 +710,14 @@ def _handle_text_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = provider.complete_chat(
-            model_id=model_id,
-            messages=messages,
-            options=_extract_chat_completion_options(data),
-        )
+        try:
+            assistant_message = provider.complete_chat(
+                model_id=model_id,
+                messages=messages,
+                options=_extract_chat_completion_options(data),
+            )
+        finally:
+            _restore_legacy_route_generation_patch(legacy_generation_patch)
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 
@@ -717,12 +765,7 @@ def _handle_text_completion_request(data):
         return response
 
     except ModelError as e:
-        log_warning(f"Model error during response generation: {e.message}")
-        return format_error_response(
-            e.message,
-            error_type=e.error_type,
-            status_code=e.status_code,
-        )
+        return _format_model_error_response(e, "response generation")
     except ComputeProviderError as e:
         return format_error_response(
             e.public_message,
@@ -731,6 +774,8 @@ def _handle_text_completion_request(data):
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors
+        if _looks_like_model_error(e):
+            return _format_model_error_response(e, "response generation")
         log_error("Unexpected error in create_completion endpoint")
         return format_error_response(f"Internal server error: {str(e)}")
 

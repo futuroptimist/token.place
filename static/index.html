@@ -367,9 +367,10 @@
                     class="model-select"
                     aria-label="Model"
                     data-testid="landing-model-select"
-                    :disabled="modelsLoading || availableModels.length === 0"
+                    :disabled="modelsLoading || (!modelsError && availableModels.length === 0)"
                 >
-                    <option v-if="availableModels.length === 0" value="">No API v1 models available</option>
+                    <option v-if="modelsError" :value="selectedModelId">{{ selectedModelId }} (emergency fallback)</option>
+                    <option v-else-if="availableModels.length === 0" value="">No API v1 models available</option>
                     <option v-for="model in availableModels" :key="model.id" :value="model.id">{{ model.id }}</option>
                 </select>
                 <p v-if="modelsLoading" class="model-status">Loading API v1 models…</p>

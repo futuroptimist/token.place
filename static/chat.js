@@ -1,5 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
 
 new Vue({
     el: '#app',
@@ -32,7 +33,19 @@ new Vue({
             if (!Array.isArray(this.availableModels)) {
                 return null;
             }
-            return this.availableModels.find((model) => model && model.id === this.selectedModelId) || null;
+            const catalogueModel = this.availableModels.find((model) => model && model.id === this.selectedModelId) || null;
+            if (catalogueModel) {
+                return catalogueModel;
+            }
+            if (this.modelsError && this.selectedModelId === EMERGENCY_MODEL_FALLBACK_ID) {
+                return {
+                    id: EMERGENCY_MODEL_FALLBACK_ID,
+                    object: 'model',
+                    owned_by: 'emergency-fallback',
+                    root: EMERGENCY_MODEL_FALLBACK_ID
+                };
+            }
+            return null;
         },
         selectedModelSummary() {
             const model = this.selectedModel;
@@ -111,8 +124,8 @@ new Vue({
                 .catch(error => {
                     console.error('Error fetching API v1 models:', error);
                     this.availableModels = [];
-                    this.modelsError = 'Could not load the API v1 model list. Please try again before sending.';
-                    this.selectedModelId = '';
+                    this.modelsError = 'Could not load the API v1 model list. Using the emergency API v1 fallback model.';
+                    this.selectedModelId = EMERGENCY_MODEL_FALLBACK_ID;
                 })
                 .finally(() => {
                     this.modelsLoading = false;

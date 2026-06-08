@@ -372,12 +372,12 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
 
 @pytest.mark.e2e
-def test_landing_chat_model_catalog_failure_disables_send(
+def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
     page: Page,
     base_url: str,
     setup_servers,
 ):
-    """The landing chat must not send with an unadvertised hard-coded fallback model."""
+    """A failed model list shows a non-blocking error and stays on API v1 fallback chat."""
 
     server_public_key_pem = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
@@ -390,6 +390,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 -----END PUBLIC KEY-----"""
     server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
     chat_requests = []
+    v2_requests = []
 
     page.route(
         "**/api/v1/models",
@@ -411,7 +412,29 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         "**/api/v1/chat/completions",
         lambda route: (
             chat_requests.append(route.request.post_data_json),
-            route.fulfill(status=500, body="chat should stay disabled without a catalog model"),
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Fallback model acknowledged.",
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ),
+        ),
+    )
+    page.route(
+        "**/api/v2/**",
+        lambda route: (
+            v2_requests.append(route.request.url),
+            route.fulfill(status=500, body="API v2 should not be called by the landing chat"),
         ),
     )
 
@@ -420,14 +443,18 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     model_select = page.get_by_test_id("landing-model-select")
     model_select.wait_for(state="visible")
-    assert model_select.input_value() == ""
-    assert model_select.is_disabled()
+    assert model_select.input_value() == "llama-3-8b-instruct"
+    assert "llama-3-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
     assert "Could not load the API v1 model list" in page.locator(".model-error").inner_text()
 
     page.locator("textarea").first.fill("hello")
-    send_button = page.locator("button", has_text="Send")
-    assert send_button.is_disabled()
-    assert chat_requests == []
+    wait_for_landing_send_enabled(page).click()
+
+    page.locator(".assistant-message").last.wait_for(state="visible")
+    assert chat_requests, "expected the landing chat to POST the API v1 fallback payload"
+    assert chat_requests[-1]["model"] == "llama-3-8b-instruct"
+    assert chat_requests[-1].get("encrypted") is True
+    assert v2_requests == []
 
 
 @pytest.mark.e2e

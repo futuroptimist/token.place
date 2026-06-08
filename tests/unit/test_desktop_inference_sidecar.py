@@ -23,6 +23,14 @@ inference_sidecar = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(inference_sidecar)
 
+@pytest.fixture(autouse=True)
+def _default_desktop_runtime_arch(monkeypatch):
+    """Keep win32 platform simulations independent from the host CPU architecture."""
+
+    runtime_setup = sys.modules.get('desktop_runtime_setup')
+    if runtime_setup is not None:
+        monkeypatch.setattr(runtime_setup.platform_module, 'machine', lambda: 'AMD64')
+
 
 def test_inference_sidecar_repairs_path_before_pathlib_import(tmp_path):
     polluted_site = tmp_path / 'site-packages'

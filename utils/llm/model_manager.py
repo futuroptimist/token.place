@@ -48,6 +48,12 @@ def _stdlib_roots_for_import_order() -> list[str]:
         value = sysconfig.get_paths().get(key)
         if value:
             roots.append(_subprocess_safe_path_text(value))
+    destshared = sysconfig.get_config_var('DESTSHARED')
+    if destshared:
+        roots.append(_subprocess_safe_path_text(destshared))
+    for prefix in {sys.prefix, getattr(sys, 'base_prefix', sys.prefix), getattr(sys, 'exec_prefix', sys.prefix), getattr(sys, 'base_exec_prefix', sys.prefix)}:
+        roots.append(_subprocess_safe_path_text(os.path.join(prefix, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}')))
+        roots.append(_subprocess_safe_path_text(os.path.join(prefix, 'Lib')))
     deduped: list[str] = []
     seen: set[str] = set()
     for root in roots:
@@ -174,7 +180,7 @@ def _canonical_path_for_compare(module_path: Any) -> Optional[str]:
         return None
     try:
         path_text = _strip_windows_extended_path_prefix(str(module_path))
-        return os.path.normcase(os.path.normpath(os.path.abspath(path_text)))
+        return os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
     except (TypeError, ValueError, OSError):
         try:
             return os.path.normcase(os.path.normpath(_strip_windows_extended_path_prefix(str(module_path))))
@@ -322,13 +328,16 @@ def _llama_cpp_path_prefixed_code(user_code: str, path_source: str) -> str:
     )
 
 
-
 def _llama_cpp_stdlib_guard_code() -> str:
     return (
         "import importlib.util as _token_place_importlib_util, sysconfig as _token_place_sysconfig, "
-        "os as _token_place_os\n"
-        "_token_place_stdlib_roots = [_token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_p))) "
-        "for _p in (_token_place_sysconfig.get_paths().get('stdlib'), _token_place_sysconfig.get_paths().get('platstdlib')) if _p]\n"
+        "os as _token_place_os, sys as _token_place_sys\n"
+        "_token_place_stdlib_candidates = [_token_place_sysconfig.get_paths().get('stdlib'), _token_place_sysconfig.get_paths().get('platstdlib'), _token_place_sysconfig.get_config_var('DESTSHARED')]\n"
+        "for _token_place_prefix in {_token_place_sys.prefix, getattr(_token_place_sys, 'base_prefix', _token_place_sys.prefix), getattr(_token_place_sys, 'exec_prefix', _token_place_sys.prefix), getattr(_token_place_sys, 'base_exec_prefix', _token_place_sys.prefix)}:\n"
+        "    _token_place_stdlib_candidates.append(_token_place_os.path.join(_token_place_prefix, 'lib', f'python{_token_place_sys.version_info.major}.{_token_place_sys.version_info.minor}'))\n"
+        "    _token_place_stdlib_candidates.append(_token_place_os.path.join(_token_place_prefix, 'Lib'))\n"
+        "_token_place_stdlib_roots = [_token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.realpath(_token_place_os.path.abspath(_p)))) "
+        "for _p in _token_place_stdlib_candidates if _p]\n"
         "def _token_place_is_site(_p):\n"
         "    return 'site-packages' in str(_p).replace('\\\\', '/').lower() or 'dist-packages' in str(_p).replace('\\\\', '/').lower()\n"
         "def _token_place_is_stdlib(_p):\n"
@@ -336,7 +345,7 @@ def _llama_cpp_stdlib_guard_code() -> str:
         "        return True\n"
         "    if _token_place_is_site(_p):\n"
         "        return False\n"
-        "    _candidate = _token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_p)))\n"
+        "    _candidate = _token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.realpath(_token_place_os.path.abspath(_p))))\n"
         "    for _root in _token_place_stdlib_roots:\n"
         "        try:\n"
         "            if _token_place_os.path.commonpath([_candidate, _root]) == _root:\n"
@@ -350,7 +359,7 @@ def _llama_cpp_stdlib_guard_code() -> str:
         "    if _token_place_spec is None or not _token_place_is_stdlib(_token_place_origin):\n"
         "        _token_place_bad_origin = _token_place_origin or '<not found>'\n"
         "        raise ImportError(f'stdlib module {_token_place_module} shadowed by {_token_place_bad_origin}')\n"
-        "del _token_place_importlib_util, _token_place_sysconfig, _token_place_os\n"
+        "del _token_place_importlib_util, _token_place_sysconfig, _token_place_os, _token_place_sys, _token_place_stdlib_candidates\n"
         "try:\n"
         "    del _token_place_bad_origin\n"
         "except NameError:\n"

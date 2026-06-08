@@ -39,6 +39,12 @@ def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_desktop_arch(monkeypatch):
+    """Keep win32 platform simulations independent from the host CPU architecture."""
+
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'AMD64')
+
 
 def test_pip_source_build_timeout_env_uses_default_for_malformed_values(monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_DESKTOP_PIP_SOURCE_BUILD_TIMEOUT_SECONDS', '30s')

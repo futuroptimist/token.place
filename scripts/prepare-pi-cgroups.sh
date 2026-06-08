@@ -30,16 +30,26 @@ fi
 
 PARAMS="cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory"
 
-# Remove conflicting or duplicate parameters
-sed -i -e 's/\<cgroup_disable=memory\>//g' \
-       -e 's/\<cgroup_enable=cpuset\>//g' \
-       -e 's/\<cgroup_memory=1\>//g' \
-       -e 's/\<cgroup_enable=memory\>//g' "$CMDLINE_FILE"
-# Collapse multiple spaces and trim trailing whitespace
-sed -i -e 's/  */ /g' -e 's/[[:space:]]*$//' "$CMDLINE_FILE"
+# Remove conflicting or duplicate parameters and append required parameters exactly once.
+# Use Python instead of sed -i so the script works with both GNU sed and BSD/macOS sed.
+python3 - "$CMDLINE_FILE" "$PARAMS" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-# Append the required parameters exactly once
-sed -i "s/\$/ $PARAMS/" "$CMDLINE_FILE"
+cmdline_path = Path(sys.argv[1])
+params = sys.argv[2].split()
+text = cmdline_path.read_text(encoding="utf-8").strip()
+for token in (
+    "cgroup_disable=memory",
+    "cgroup_enable=cpuset",
+    "cgroup_memory=1",
+    "cgroup_enable=memory",
+):
+    text = re.sub(rf"(?<!\S){re.escape(token)}(?!\S)", "", text)
+parts = text.split() + params
+cmdline_path.write_text(" ".join(parts) + "\n", encoding="utf-8")
+PY
 
 # Check if the memory controller is enabled
 if grep -qE '^memory\s+.*\s1$' "$CGROUPS_PATH"; then

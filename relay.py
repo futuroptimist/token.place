@@ -778,7 +778,7 @@ def _log_request(response: Response):
     if getattr(g, "request_id", None):
         response.headers.setdefault("X-Request-Id", g.request_id)
 
-    if endpoint == "metrics":
+    if endpoint in {"metrics", "relay_diagnostics"}:
         response.headers.setdefault("Cache-Control", "no-store")
 
     return response

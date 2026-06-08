@@ -11,10 +11,39 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        relayApiV1NonStreaming: true
+        relayApiV1NonStreaming: true,
+        computeNodeCount: null,
+        computeNodeStatus: 'loading',
+        computeNodeLastUpdated: null,
+        computeNodePollIntervalId: null
+    },
+    computed: {
+        computeNodeCountLabel() {
+            if (this.computeNodeStatus === 'ok' && Number.isInteger(this.computeNodeCount)) {
+                return String(this.computeNodeCount);
+            }
+            if (this.computeNodeStatus === 'error') {
+                return 'Unavailable';
+            }
+            return 'Loading…';
+        },
+
+        computeNodeStatusMeta() {
+            if (this.computeNodeStatus === 'ok' && this.computeNodeLastUpdated instanceof Date) {
+                return `last updated ${this.computeNodeLastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+            }
+            if (this.computeNodeStatus === 'error') {
+                return 'diagnostics unavailable';
+            }
+            return 'checking relay diagnostics';
+        }
     },
     mounted() {
         this.detectTouchInput();
+        this.fetchComputeNodeCount();
+        this.computeNodePollIntervalId = setInterval(() => {
+            this.fetchComputeNodeCount();
+        }, 30000);
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
@@ -23,6 +52,26 @@ new Vue({
         });
     },
     methods: {
+        async fetchComputeNodeCount() {
+            try {
+                const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
+                if (!response.ok) {
+                    throw new Error(`Diagnostics returned ${response.status}`);
+                }
+                const data = await response.json();
+                const count = data && data.total_registered_compute_nodes;
+                if (!Number.isInteger(count) || count < 0) {
+                    throw new Error('Diagnostics response did not include a valid compute-node count');
+                }
+                this.computeNodeCount = count;
+                this.computeNodeStatus = 'ok';
+                this.computeNodeLastUpdated = new Date();
+            } catch (error) {
+                console.warn('Unable to refresh relay compute-node diagnostics:', error);
+                this.computeNodeStatus = 'error';
+            }
+        },
+
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -593,6 +642,10 @@ new Vue({
         }
     },
     beforeDestroy() {
+        if (this.computeNodePollIntervalId) {
+            clearInterval(this.computeNodePollIntervalId);
+            this.computeNodePollIntervalId = null;
+        }
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

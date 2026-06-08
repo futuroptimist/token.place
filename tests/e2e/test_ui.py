@@ -82,6 +82,58 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
 # Add more E2E tests here as the UI evolves
 
 
+def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
+    """Landing page should render diagnostics count and refresh it without reload."""
+
+    diagnostics_counts = iter([2, 5])
+
+    def handle_diagnostics(route):
+        count = next(diagnostics_counts, 5)
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"total_registered_compute_nodes": count}),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    widget = page.locator(".compute-node-status")
+    assert widget.is_visible()
+    assert "live compute nodes" in widget.inner_text().lower()
+    assert "2" in widget.inner_text()
+
+    page.evaluate(
+        """async () => {
+            const vm = document.querySelector('#app').__vue__;
+            await vm.fetchComputeNodeCount();
+        }"""
+    )
+
+    assert "5" in widget.inner_text()
+    assert "last updated" in widget.inner_text().lower()
+
+
+def test_compute_node_count_failure_is_graceful(page: Page, base_url: str, setup_servers):
+    """Diagnostics failures should not break the landing chat controls."""
+
+    def handle_diagnostics(route):
+        route.fulfill(status=503, headers={"Content-Type": "application/json"}, body="{}")
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    widget = page.locator(".compute-node-status")
+    assert widget.is_visible()
+    assert "Unavailable" in widget.inner_text()
+    assert "diagnostics unavailable" in widget.inner_text().lower()
+    assert page.locator("textarea").first.is_visible()
+    assert page.locator("button", has_text="Send").is_visible()
+
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
     """The chat UI should render markdown formatting returned by the assistant."""
 

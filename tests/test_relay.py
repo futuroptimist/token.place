@@ -996,6 +996,86 @@ def test_faucet_unknown_server(client):
     assert data['error'] == {'message': 'Server with the specified public key not found', 'code': 404}
 
 
+
+def test_relay_diagnostics_reports_zero_live_compute_nodes(client):
+    """Empty relay diagnostics should report a zero live compute-node count."""
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert payload["registered_compute_nodes"] == []
+    assert payload["total_registered_compute_nodes"] == 0
+
+
+def test_relay_diagnostics_counts_live_api_v1_compute_nodes(client):
+    """Diagnostics count should include live API v1 compute-node registrations."""
+
+    server_a = _server_key("diagnostics-live-a")
+    server_b = _server_key("diagnostics-live-b")
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 2
+    assert {node["server_public_key"] for node in payload["registered_compute_nodes"]} == {
+        server_a,
+        server_b,
+    }
+
+
+def test_relay_diagnostics_evicts_stale_compute_nodes_before_counting(client):
+    """Diagnostics should run relay TTL eviction before calculating the count."""
+
+    live_server = _server_key("diagnostics-live")
+    stale_server = _server_key("diagnostics-stale")
+    _register_api_v1_server(client, live_server)
+    known_servers[stale_server] = {
+        "public_key": stale_server,
+        "last_ping": datetime.now() - timedelta(seconds=120),
+        "last_ping_duration": 1,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 1
+    assert [node["server_public_key"] for node in payload["registered_compute_nodes"]] == [
+        live_server
+    ]
+    assert stale_server not in known_servers
+
+
+def test_relay_diagnostics_does_not_expose_private_material(client):
+    """Diagnostics must stay limited to safe routing metadata and no private keys."""
+
+    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+    payload_text = json.dumps(payload).lower()
+
+    def walk_keys(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield str(key).lower()
+                yield from walk_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk_keys(child)
+
+    assert response.status_code == 200
+    assert "private" not in payload_text
+    assert "secret" not in payload_text
+    assert not any("token" in key for key in walk_keys(payload))
+
+
 def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monkeypatch):
     """Diagnostics should expose configured URLs and live compute registrations."""
     monkeypatch.delenv("TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH", raising=False)

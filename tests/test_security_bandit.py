@@ -23,7 +23,7 @@ def test_bandit_reports_no_medium_or_high_findings():
         repo_root / ".venv-test",
         repo_root / "build",
         repo_root / "dist",
-        repo_root / "desktop",
+        repo_root / "desktop" / "node_modules",
         repo_root / "desktop-tauri" / "node_modules",
         repo_root / "desktop-tauri" / "src-tauri" / "target",
         repo_root / "env",
@@ -31,6 +31,13 @@ def test_bandit_reports_no_medium_or_high_findings():
         repo_root / "tests",
         repo_root / "venv",
     ]
+    excluded_path_strings = {str(path) for path in excluded_paths}
+    assert str(repo_root / "desktop-tauri" / "scripts") not in excluded_path_strings
+    assert str(repo_root / "desktop-tauri" / "src-tauri" / "python") not in excluded_path_strings
+    assert str(repo_root / ".venv") in excluded_path_strings
+    assert str(repo_root / "desktop" / "node_modules") in excluded_path_strings
+    assert str(repo_root / "desktop-tauri" / "node_modules") in excluded_path_strings
+
     cmd = [
         sys.executable,
         "-m",
@@ -62,6 +69,14 @@ def test_bandit_reports_no_medium_or_high_findings():
             "Failed to parse Bandit JSON output:\n"
             f"Error: {exc}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
+
+    scanned_paths = set(report.get("metrics", {}))
+    desktop_runtime_verifier = (
+        repo_root / "desktop-tauri" / "scripts" / "verify_desktop_runtime.py"
+    )
+    assert str(desktop_runtime_verifier) in scanned_paths
+    assert not any("/.venv/" in path for path in scanned_paths)
+    assert not any("/node_modules/" in path for path in scanned_paths)
 
     offending = [
         issue

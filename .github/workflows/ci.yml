@@ -17,14 +17,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
           cache-dependency-path: |
             requirements.txt
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
           cache: 'npm'
       - name: Prepare Raspberry Pi cgroups
         id: prep
@@ -33,9 +33,11 @@ jobs:
           sudo bash scripts/prepare-pi-cgroups.sh
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           exit 0
-      - name: Stop for reboot
+      - name: Fail if Raspberry Pi cgroup prep requires reboot
         if: steps.prep.outputs.rc == '2'
-        run: echo "Cgroup configuration updated. Reboot runner and re-run job."
+        run: |
+          echo "::error::Cgroup configuration updated and requires reboot; hosted CI cannot reboot and must not skip ./run_all_tests.sh."
+          exit 1
       - name: Validate dependency compatibility
         run: python scripts/validate_dependencies.py
         if: steps.prep.outputs.rc != '2'

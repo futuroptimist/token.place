@@ -46,6 +46,32 @@ Integration tests verify that components work together correctly:
 python -m pytest tests/integration/
 ```
 
+#### Headless CLI compute-node validation
+
+The desktop Tauri compute-node bridge is the preferred operator experience, but
+repository-root `server.py` remains the simple headless equivalent and the
+canonical CLI compute-node entrypoint. To run a local mock compute node against
+a relay during development:
+
+```bash
+USE_MOCK_LLM=1 python server.py --relay_url http://127.0.0.1:5010 --server_port 3001
+```
+
+Operators can confirm registration and the live API v1 compute-node count with:
+
+```bash
+curl http://127.0.0.1:5010/relay/diagnostics
+```
+
+The process-level regression test for this path launches `relay.py` plus one or
+more `server.py` processes, verifies the diagnostics count, and sends an API v1
+encrypted mock chat completion through the relay. It is guarded because it is
+heavier than in-process integration tests:
+
+```bash
+RUN_RELAY_REGISTRATION_TESTS=1 python -m pytest tests/integration -k "server_py or compute_node_cli" -v
+```
+
 ### End-to-End (E2E) Tests
 
 **Pytest marker**: `e2e`

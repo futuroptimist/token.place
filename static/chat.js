@@ -1,5 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 
 new Vue({
     el: '#app',
@@ -11,18 +12,61 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        relayApiV1NonStreaming: true
+        relayApiV1NonStreaming: true,
+        computeNodeCount: null,
+        computeNodeCountStatus: 'loading',
+        computeNodeCountLastUpdated: '',
+        computeNodeCountPoller: null
+    },
+    computed: {
+        computeNodeCountLabel() {
+            if (this.computeNodeCountStatus === 'loading') {
+                return 'Live compute nodes: loading…';
+            }
+            if (this.computeNodeCountStatus === 'error') {
+                return 'Live compute nodes: unavailable';
+            }
+            return `Live compute nodes: ${this.computeNodeCount}`;
+        }
     },
     mounted() {
         this.detectTouchInput();
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
+        this.refreshComputeNodeCount();
+        this.computeNodeCountPoller = setInterval(() => {
+            this.refreshComputeNodeCount();
+        }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
     },
     methods: {
+        async refreshComputeNodeCount() {
+            try {
+                const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
+                if (!response.ok) {
+                    throw new Error('Failed to fetch relay diagnostics');
+                }
+                const data = await response.json();
+                const count = Number(data && data.total_registered_compute_nodes);
+                if (!Number.isFinite(count) || count < 0) {
+                    throw new Error('Relay diagnostics missing compute-node count');
+                }
+                this.computeNodeCount = count;
+                this.computeNodeCountStatus = 'ready';
+                this.computeNodeCountLastUpdated = new Date().toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+            } catch (error) {
+                console.warn('Unable to refresh compute-node count:', error);
+                this.computeNodeCountStatus = 'error';
+                this.computeNodeCountLastUpdated = '';
+            }
+        },
+
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -593,6 +637,10 @@ new Vue({
         }
     },
     beforeDestroy() {
+        if (this.computeNodeCountPoller) {
+            clearInterval(this.computeNodeCountPoller);
+            this.computeNodeCountPoller = null;
+        }
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

@@ -37,6 +37,62 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     assert len(headings) > 0, "Page should contain at least one heading"
     print(f"✓ Found {len(headings)} headings on the page")
 
+
+def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
+    """Landing page should render and refresh the relay diagnostics compute-node count."""
+    counts = iter([3, 5])
+    latest_count = {"value": 5}
+
+    def handle_diagnostics(route):
+        try:
+            latest_count["value"] = next(counts)
+        except StopIteration:
+            pass
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"total_registered_compute_nodes": latest_count["value"]}),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator(".compute-node-status")
+    status.wait_for(state="visible")
+    assert "Live compute nodes: 3" in status.inner_text()
+
+    page.evaluate("document.querySelector('#app').__vue__.refreshComputeNodeCount()")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 5')"
+    )
+    assert "Live compute nodes: 5" in status.inner_text()
+
+
+def test_compute_node_count_failure_is_graceful(page: Page, base_url: str, setup_servers):
+    """Diagnostic widget failures should be non-alarming and leave chat usable."""
+
+    def handle_diagnostics_failure(route):
+        route.fulfill(
+            status=503,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": "down"}),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics_failure)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator(".compute-node-status")
+    status.wait_for(state="visible")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: unavailable')"
+    )
+    assert "Live compute nodes: unavailable" in status.inner_text()
+    assert page.locator("textarea").first.is_visible()
+    assert page.locator("button", has_text="Send").is_visible()
+
+
 def test_send_message(page: Page, base_url: str, setup_servers):
     """Test basic page interaction."""
     # Navigate to the base URL

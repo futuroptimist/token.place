@@ -1037,7 +1037,9 @@ def relay_diagnostics():
         "configured_upstream_servers": configured_servers,
         "legacy_configured_upstream_servers": [] if explicit_upstream_config else configured_servers,
     }
-    return jsonify(diagnostics)
+    response = jsonify(diagnostics)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route('/relay/api/v1/chat/completions', methods=['POST'])

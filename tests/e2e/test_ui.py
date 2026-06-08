@@ -51,7 +51,12 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"total_registered_compute_nodes": latest_count["value"]}),
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": 99,
+                    "total_api_v1_registered_compute_nodes": latest_count["value"],
+                }
+            ),
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics)
@@ -106,7 +111,12 @@ def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, set
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"total_registered_compute_nodes": 5}),
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": 99,
+                    "total_api_v1_registered_compute_nodes": 5,
+                }
+            ),
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics)
@@ -121,7 +131,12 @@ def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, set
     first_route["route"].fulfill(
         status=200,
         headers={"Content-Type": "application/json"},
-        body=json.dumps({"total_registered_compute_nodes": 3}),
+        body=json.dumps(
+            {
+                "total_registered_compute_nodes": 99,
+                "total_api_v1_registered_compute_nodes": 3,
+            }
+        ),
     )
     page.wait_for_timeout(100)
     assert "Live compute nodes: 5" in page.locator(".compute-node-status").inner_text()

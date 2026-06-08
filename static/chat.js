@@ -116,13 +116,13 @@ new Vue({
                 if (
                     !data ||
                     typeof data !== 'object' ||
-                    !Object.prototype.hasOwnProperty.call(data, 'total_registered_compute_nodes')
+                    !Object.prototype.hasOwnProperty.call(data, 'total_api_v1_registered_compute_nodes')
                 ) {
-                    throw new Error('Relay diagnostics missing compute-node count');
+                    throw new Error('Relay diagnostics missing API v1 compute-node count');
                 }
-                const count = data.total_registered_compute_nodes;
+                const count = data.total_api_v1_registered_compute_nodes;
                 if (!Number.isInteger(count) || count < 0) {
-                    throw new Error('Relay diagnostics missing compute-node count');
+                    throw new Error('Relay diagnostics missing API v1 compute-node count');
                 }
                 this.computeNodeCount = count;
                 this.computeNodeCountStatus = 'ready';

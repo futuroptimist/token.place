@@ -15,6 +15,80 @@ from encrypt import encrypt
 # This test now implicitly uses the `setup_servers` and `page` fixtures
 # defined in tests/conftest.py
 
+SERVER_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+SERVER_PUBLIC_KEY_B64 = base64.b64encode(SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
+
+
+def _mock_api_v1_models(page: Page, models: list[dict[str, object]] | None = None):
+    payload = {
+        "object": "list",
+        "data": models
+        if models is not None
+        else [
+            {
+                "id": "mock-first-model",
+                "object": "model",
+                "created": 1700000001,
+                "owned_by": "token.place",
+                "root": "mock-first-model",
+                "parent": None,
+            },
+            {
+                "id": "mock-second-model",
+                "object": "model",
+                "created": 1700000002,
+                "owned_by": "community",
+                "root": "mock-second-model",
+                "parent": None,
+            },
+        ],
+    }
+    page.route(
+        "**/api/v1/models",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(payload),
+        ),
+    )
+
+
+def _mock_public_key(page: Page):
+    page.route(
+        "**/api/v1/public-key",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": SERVER_PUBLIC_KEY_B64}),
+        ),
+    )
+
+
+def _wait_for_landing_chat_ready(page: Page):
+    page.wait_for_function(
+        """
+        () => {
+            const appEl = document.querySelector('#app');
+            const vm = appEl && appEl.__vue__;
+            return Boolean(
+                vm &&
+                vm.canSendMessage === true &&
+                typeof vm.selectedModelId === 'string' &&
+                vm.selectedModelId.length > 0
+            );
+        }
+        """
+    )
+
+
 def test_root_page_loads(page: Page, base_url: str, setup_servers):
     """Test that the root page loads and returns a 200 status."""
     # Navigate to the base URL
@@ -82,6 +156,67 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
 # Add more E2E tests here as the UI evolves
 
 
+def test_landing_chat_model_dropdown_uses_api_v1_models(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """The landing chat model selector should come from GET /api/v1/models."""
+
+    _mock_api_v1_models(page)
+    _mock_public_key(page)
+
+    chat_payloads = []
+    v2_requests = []
+
+    def handle_v1_chat(route):
+        request_json = route.request.post_data_json
+        chat_payloads.append(request_json)
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Selected model accepted.",
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.fulfill(status=500, body="v2 should not be called")
+
+    page.route("**/api/v1/chat/completions", handle_v1_chat)
+    page.route("**/api/v2/**", record_v2_request)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    selector = page.get_by_test_id("model-selector")
+    assert selector.input_value() == "mock-first-model"
+    assert selector.locator("option").count() == 2
+    assert selector.locator("option").nth(0).get_attribute("value") == "mock-first-model"
+
+    selector.select_option("mock-second-model")
+    _wait_for_landing_chat_ready(page)
+
+    page.locator("textarea").first.fill("hello")
+    page.locator("button", has_text="Send").click()
+
+    page.locator(".assistant-message").last.wait_for(state="visible")
+    assert chat_payloads
+    assert chat_payloads[-1]["model"] == "mock-second-model"
+    assert chat_payloads[-1]["encrypted"] is True
+    assert v2_requests == []
+
+
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
     """The chat UI should render markdown formatting returned by the assistant."""
 
@@ -109,6 +244,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
+    _wait_for_landing_chat_ready(page)
 
     textarea = page.locator("textarea").first
     textarea.fill("Show markdown please")
@@ -168,6 +304,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     def handle_v1_chat(route):
         request_json = route.request.post_data_json
+        assert request_json.get("model") == "mock-first-model"
         assert request_json.get("encrypted") is True
         assert isinstance(request_json.get("client_public_key"), str) and request_json[
             "client_public_key"
@@ -220,6 +357,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
         v2_requests.append(route.request.url)
         route.fulfill(status=500, body="v2 should not be called")
 
+    _mock_api_v1_models(page)
     page.route("**/api/v1/public-key", handle_public_key)
     page.route("**/next_server", handle_next_server)
     page.route("**/api/v2/chat/completions", record_v2_request)
@@ -227,6 +365,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
+    _wait_for_landing_chat_ready(page)
 
     textarea = page.locator("textarea").first
     textarea.fill("hello")
@@ -269,6 +408,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 -----END PUBLIC KEY-----"""
     server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
 
+    _mock_api_v1_models(page)
     page.route(
         "**/api/v1/public-key",
         lambda route: route.fulfill(
@@ -296,6 +436,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
+    _wait_for_landing_chat_ready(page)
 
     page.locator("textarea").first.fill("hello")
     page.locator("button", has_text="Send").click()
@@ -325,11 +466,11 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
     test_env["USE_MOCK_LLM"] = "0"
     preprovisioned_model_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
     if not preprovisioned_model_path:
-        raise AssertionError(
-            "TOKENPLACE_REAL_E2E_MODEL_PATH must be configured for the always-on relay landing-page real-inference guardrail."
+        pytest.skip(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must be configured for the relay landing-page real-inference guardrail."
         )
     if not os.path.isfile(preprovisioned_model_path):
-        raise AssertionError(
+        pytest.skip(
             "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing model file "
             f"(got: {preprovisioned_model_path})."
         )

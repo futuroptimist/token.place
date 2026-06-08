@@ -1,5 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+const EMERGENCY_FALLBACK_MODEL_ID = 'llama-3-8b-instruct';
 
 new Vue({
     el: '#app',
@@ -11,10 +12,43 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        relayApiV1NonStreaming: true
+        relayApiV1NonStreaming: true,
+        modelEntries: [],
+        selectedModelId: '',
+        isLoadingModels: false,
+        modelListError: ''
+    },
+    computed: {
+        canSendMessage() {
+            return Boolean(
+                this.clientPrivateKey &&
+                this.clientPublicKey &&
+                this.serverPublicKey &&
+                this.selectedModelId &&
+                !this.isGeneratingResponse
+            );
+        },
+        selectedModel() {
+            return this.modelEntries.find((model) => model && model.id === this.selectedModelId) || null;
+        },
+        selectedModelSummary() {
+            const model = this.selectedModel;
+            if (!model) {
+                return '';
+            }
+            const details = [];
+            if (model.owned_by) {
+                details.push(`owned by ${model.owned_by}`);
+            }
+            if (model.root && model.root !== model.id) {
+                details.push(`root ${model.root}`);
+            }
+            return details.join(' · ');
+        }
     },
     mounted() {
         this.detectTouchInput();
+        this.fetchModels();
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
@@ -23,6 +57,46 @@ new Vue({
         });
     },
     methods: {
+
+        fetchModels() {
+            this.isLoadingModels = true;
+            this.modelListError = '';
+
+            return fetch('/api/v1/models')
+                .then(response => {
+                    if (response.ok) {
+                        return response.json();
+                    }
+                    throw new Error('Failed to fetch API v1 model list');
+                })
+                .then(data => {
+                    const entries = data && Array.isArray(data.data) ? data.data : [];
+                    this.modelEntries = entries.filter((entry) => entry && typeof entry.id === 'string' && entry.id.trim());
+                    this.selectedModelId = this.modelEntries.length > 0 ? this.modelEntries[0].id : '';
+                    if (this.modelEntries.length === 0) {
+                        this.modelListError = 'No API v1 models are available right now.';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching API v1 models:', error);
+                    this.modelEntries = [{
+                        id: EMERGENCY_FALLBACK_MODEL_ID,
+                        object: 'model',
+                        owned_by: 'token.place'
+                    }];
+                    this.selectedModelId = EMERGENCY_FALLBACK_MODEL_ID;
+                    this.modelListError = 'Could not load API v1 models; using the launch fallback model.';
+                })
+                .finally(() => {
+                    this.isLoadingModels = false;
+                });
+        },
+        getModelLabel(model) {
+            if (!model || typeof model !== 'object') {
+                return '';
+            }
+            return model.name || model.id;
+        },
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -387,7 +461,7 @@ new Vue({
 
                 // Create the API request payload
                 const payload = {
-                    model: "llama-3-8b-instruct",
+                    model: this.selectedModelId,
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
                     messages: encryptedData,
@@ -525,7 +599,7 @@ new Vue({
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
-            if (!messageContent || !this.serverPublicKey || this.isGeneratingResponse) {
+            if (!messageContent || !this.canSendMessage) {
                 return;
             }
 

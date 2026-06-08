@@ -11,10 +11,15 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        relayApiV1NonStreaming: true
+        relayApiV1NonStreaming: true,
+        models: [],
+        selectedModelId: '',
+        modelsLoading: false,
+        modelsError: ''
     },
     mounted() {
         this.detectTouchInput();
+        this.fetchModels();
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
@@ -22,7 +27,83 @@ new Vue({
             this.adjustMessageInputHeight();
         });
     },
+    computed: {
+        selectedModel() {
+            if (!this.selectedModelId || !Array.isArray(this.models)) {
+                return null;
+            }
+            return this.models.find((model) => model && model.id === this.selectedModelId) || null;
+        },
+
+        selectedModelSummary() {
+            const model = this.selectedModel;
+            if (!model) {
+                return '';
+            }
+
+            const details = [];
+            if (model.owned_by) {
+                details.push(`by ${model.owned_by}`);
+            }
+            if (model.root && model.root !== model.id) {
+                details.push(`root ${model.root}`);
+            }
+
+            return details.join(' · ');
+        },
+
+        canSendMessage() {
+            return Boolean(
+                this.newMessage.trim() &&
+                this.clientPrivateKey &&
+                this.clientPublicKey &&
+                this.serverPublicKey &&
+                this.selectedModelId &&
+                !this.isGeneratingResponse
+            );
+        }
+    },
     methods: {
+
+        fetchModels() {
+            this.modelsLoading = true;
+            this.modelsError = '';
+
+            return fetch('/api/v1/models')
+                .then(response => {
+                    if (response.ok) {
+                        return response.json();
+                    }
+                    throw new Error('Failed to fetch API v1 models');
+                })
+                .then(data => {
+                    const entries = data && Array.isArray(data.data) ? data.data : [];
+                    this.models = entries.filter((model) => model && typeof model.id === 'string' && model.id.trim());
+                    if (this.models.length > 0) {
+                        this.selectedModelId = this.models[0].id;
+                    } else {
+                        this.selectedModelId = '';
+                        this.modelsError = 'No models are available right now.';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching API v1 models:', error);
+                    this.models = [];
+                    this.selectedModelId = 'llama-3-8b-instruct';
+                    this.modelsError = 'Could not load models; using the API v1 fallback model.';
+                })
+                .finally(() => {
+                    this.modelsLoading = false;
+                });
+        },
+
+        formatModelLabel(model) {
+            if (!model || typeof model !== 'object') {
+                return '';
+            }
+            return model.name || model.id;
+        },
+
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -369,6 +450,11 @@ new Vue({
 
         // Send a message to the server using the new API
         async sendMessageApi() {
+            if (!this.selectedModelId) {
+                console.error('Model selection not available');
+                return null;
+            }
+
             if (!this.serverPublicKey) {
                 console.error('Server public key not available');
                 return null;
@@ -387,7 +473,7 @@ new Vue({
 
                 // Create the API request payload
                 const payload = {
-                    model: "llama-3-8b-instruct",
+                    model: this.selectedModelId,
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
                     messages: encryptedData,
@@ -525,7 +611,7 @@ new Vue({
         // Send a message to the server
         async sendMessage() {
             const messageContent = this.newMessage.trim();
-            if (!messageContent || !this.serverPublicKey || this.isGeneratingResponse) {
+            if (!messageContent || !this.canSendMessage) {
                 return;
             }
 

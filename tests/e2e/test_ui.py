@@ -12,6 +12,20 @@ import time
 
 from encrypt import encrypt
 
+
+def wait_for_landing_chat_send_ready(page: Page) -> None:
+    """Wait until Vue has all API v1 landing-chat prerequisites for Send."""
+
+    page.wait_for_function(
+        """
+        () => {
+            const appEl = document.querySelector('#app');
+            const vm = appEl && appEl.__vue__;
+            return Boolean(vm && vm.canSendMessage === true);
+        }
+        """
+    )
+
 # This test now implicitly uses the `setup_servers` and `page` fixtures
 # defined in tests/conftest.py
 
@@ -112,6 +126,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
 
     textarea = page.locator("textarea").first
     textarea.fill("Show markdown please")
+    wait_for_landing_chat_send_ready(page)
     page.locator("button", has_text="Send").click()
 
     assistant_message = page.locator(".assistant-message").last
@@ -230,6 +245,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
 
     textarea = page.locator("textarea").first
     textarea.fill("hello")
+    wait_for_landing_chat_send_ready(page)
     page.locator("button", has_text="Send").click()
 
     assistant_message = page.locator(".assistant-message").last
@@ -247,6 +263,153 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     )
     assert "Relay chat path restored." in assistant_message.inner_text()
     assert "Sorry, I encountered an issue generating a response." not in page.content()
+    assert v2_requests == []
+
+
+def test_landing_chat_model_dropdown_uses_api_v1_models_and_selected_payload(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """Landing chat populates model choices from API v1 and sends the selected model."""
+
+    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+    model_payload = {
+        "object": "list",
+        "data": [
+            {
+                "id": "first-api-v1-model",
+                "object": "model",
+                "owned_by": "token.place",
+                "root": "first-api-v1-model",
+            },
+            {
+                "id": "second-api-v1-model",
+                "object": "model",
+                "owned_by": "community-node",
+                "root": "second-root",
+            },
+        ],
+    }
+    chat_requests = []
+    v2_requests = []
+
+    page.route(
+        "**/api/v1/public-key",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": server_public_key_b64}),
+        ),
+    )
+    page.route(
+        "**/api/v1/models",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(model_payload),
+        ),
+    )
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.fulfill(status=500, body="API v2 should not be called by landing chat")
+
+    def handle_chat_request(route):
+        chat_requests.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "selected model received",
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    page.route("**/api/v2/**", record_v2_request)
+    page.route("**/api/v1/chat/completions", handle_chat_request)
+
+    page.goto(base_url)
+
+    model_select = page.get_by_test_id("landing-chat-model")
+    model_select.wait_for(state="visible")
+    page.wait_for_function(
+        """
+        () => {
+            const select = document.querySelector('[data-testid="landing-chat-model"]');
+            return Boolean(select && select.options.length === 2 && select.value === 'first-api-v1-model');
+        }
+        """
+    )
+
+    option_values = model_select.locator("option").evaluate_all("options => options.map(option => option.value)")
+    assert option_values == ["first-api-v1-model", "second-api-v1-model"]
+    assert model_select.input_value() == "first-api-v1-model"
+
+    model_select.select_option("second-api-v1-model")
+    page.locator("textarea").first.fill("hello selected model")
+    wait_for_landing_chat_send_ready(page)
+    page.locator("button", has_text="Send").click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "selected model received" in assistant_message.inner_text()
+
+    assert len(chat_requests) == 1
+    assert chat_requests[0]["model"] == "second-api-v1-model"
+    assert chat_requests[0].get("encrypted") is True
+    assert chat_requests[0].get("stream") in (None, False)
+    assert isinstance(chat_requests[0].get("messages"), dict)
+    assert v2_requests == []
+
+
+def test_landing_chat_model_dropdown_handles_models_failure_with_v1_fallback(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """A model-list failure should show a non-blocking error and stay on API v1."""
+
+    v2_requests = []
+
+    page.route(
+        "**/api/v1/models",
+        lambda route: route.fulfill(
+            status=503,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": {"message": "model list unavailable"}}),
+        ),
+    )
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.fulfill(status=500, body="API v2 should not be called by landing chat")
+
+    page.route("**/api/v2/**", record_v2_request)
+
+    page.goto(base_url)
+
+    model_error = page.get_by_test_id("landing-chat-model-error")
+    model_error.wait_for(state="visible")
+    assert "Could not load models" in model_error.inner_text()
+    assert page.get_by_test_id("landing-chat-model").input_value() == "llama-3-8b-instruct"
     assert v2_requests == []
 
 
@@ -298,6 +461,7 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     page.wait_for_load_state("networkidle")
 
     page.locator("textarea").first.fill("hello")
+    wait_for_landing_chat_send_ready(page)
     page.locator("button", has_text="Send").click()
 
     assistant_message = page.locator(".assistant-message").last
@@ -540,6 +704,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 f"Last response body: {relay_server_selection_body!r}"
             )
             textarea.fill(prompt_text)
+            wait_for_landing_chat_send_ready(page)
             page.locator("button", has_text="Send").click()
             user_message_count += 1
             page.locator(".user-message").nth(user_message_count - 1).wait_for(state="visible")

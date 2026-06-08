@@ -70,7 +70,7 @@ find_placeholder_in_patch_message () {
 
     message_start=$((header_end + 1))
     message_match=$(awk -v start="$message_start" -v tokens="$PLACEHOLDER_TOKEN_PATTERN" '
-        BEGIN { split(tolower(tokens), token, "|") }
+        BEGIN { split(tolower(tokens), token, "\\|") }
         NR < start { next }
         /^diff --git / || /^--- / { exit }
         {

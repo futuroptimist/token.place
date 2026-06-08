@@ -25,7 +25,6 @@ def test_bandit_reports_no_medium_or_high_findings():
         repo_root / "dist",
         repo_root / "desktop",
         repo_root / "desktop-tauri" / "node_modules",
-        repo_root / "desktop-tauri" / "scripts",
         repo_root / "desktop-tauri" / "src-tauri" / "target",
         repo_root / "env",
         repo_root / "node_modules",

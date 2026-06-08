@@ -56,7 +56,7 @@ jobs:
           key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
 
       - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
-        run: scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
 
       - name: Preflight run_all_tests.sh cannot skip the real desktop-bridge guardrail
         run: |
@@ -144,7 +144,7 @@ jobs:
           key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
 
       - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
-        run: scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
 
       - name: Preflight run_all_tests.sh cannot skip the real desktop-bridge guardrail
         run: |

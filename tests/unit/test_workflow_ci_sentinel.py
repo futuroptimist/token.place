@@ -221,13 +221,13 @@ def test_macos_run_all_tests_pr_job_uses_python_312_and_node_20() -> None:
 
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:
     for job_name, job in _run_all_tests_jobs().items():
-        assert job.get("continue-on-error") != "true", (
-            f"{job_name} must not use continue-on-error; run_all_tests failures "
-            "must make the visible PR check red."
+        assert "continue-on-error" not in job, (
+            f"{job_name} must not define continue-on-error at job level; "
+            "run_all_tests failures must make the visible PR check red."
         )
         for step in _job_steps(job):
-            assert step.get("continue-on-error") != "true", (
-                f"{job_name} step {step.get('name', '<unnamed>')} must not use "
+            assert "continue-on-error" not in step, (
+                f"{job_name} step {step.get('name', '<unnamed>')} must not define "
                 "continue-on-error."
             )
 

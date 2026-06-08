@@ -609,9 +609,11 @@ def _evict_stale_servers() -> list[str]:
     return evicted
 
 
-def _live_server_diagnostics() -> list[dict[str, Any]]:
+def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     for server_public_key, payload in list(known_servers.items()):
+        if api_v1_only and not bool(payload.get(API_V1_SERVER_MARKER)):
+            continue
         diagnostics.append({
             "server_public_key": server_public_key,
             "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
@@ -1023,9 +1025,10 @@ def api_v1_relay_servers_next():
 
 @app.route('/relay/diagnostics', methods=['GET'])
 def relay_diagnostics():
-    """Live diagnostics for legacy relay registered compute nodes."""
+    """Live diagnostics for legacy and API v1 relay registered compute nodes."""
     _evict_stale_servers()
     live_nodes = _live_server_diagnostics()
+    api_v1_live_nodes = _live_server_diagnostics(api_v1_only=True)
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)
@@ -1034,10 +1037,14 @@ def relay_diagnostics():
         "upstream_health_required": require_upstream_health,
         "registered_compute_nodes": live_nodes,
         "total_registered_compute_nodes": len(live_nodes),
+        "api_v1_registered_compute_nodes": api_v1_live_nodes,
+        "total_api_v1_registered_compute_nodes": len(api_v1_live_nodes),
         "configured_upstream_servers": configured_servers,
         "legacy_configured_upstream_servers": [] if explicit_upstream_config else configured_servers,
     }
-    return jsonify(diagnostics)
+    response = jsonify(diagnostics)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route('/relay/api/v1/chat/completions', methods=['POST'])

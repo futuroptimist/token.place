@@ -1,5 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
 
 new Vue({
@@ -16,7 +17,12 @@ new Vue({
         modelsError: '',
         isGeneratingResponse: false,
         isTouchInput: false,
-        relayApiV1NonStreaming: true
+        relayApiV1NonStreaming: true,
+        computeNodeCount: null,
+        computeNodeCountStatus: 'loading',
+        computeNodeCountLastUpdated: '',
+        computeNodeCountPoller: null,
+        computeNodeCountRequestId: 0
     },
     mounted() {
         this.detectTouchInput();
@@ -24,11 +30,24 @@ new Vue({
         this.getServerPublicKey().then(() => {
             this.generateClientKeys();
         });
+        this.refreshComputeNodeCount();
+        this.computeNodeCountPoller = setInterval(() => {
+            this.refreshComputeNodeCount();
+        }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
     },
     computed: {
+        computeNodeCountLabel() {
+            if (this.computeNodeCountStatus === 'loading') {
+                return 'Live compute nodes: loading…';
+            }
+            if (this.computeNodeCountStatus === 'error') {
+                return 'Live compute nodes: unavailable';
+            }
+            return `Live compute nodes: ${this.computeNodeCount}`;
+        },
         selectedModel() {
             if (!Array.isArray(this.availableModels)) {
                 return null;
@@ -78,6 +97,49 @@ new Vue({
         }
     },
     methods: {
+        async refreshComputeNodeCount() {
+            const requestId = this.computeNodeCountRequestId + 1;
+            this.computeNodeCountRequestId = requestId;
+
+            try {
+                const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
+                if (requestId !== this.computeNodeCountRequestId) {
+                    return;
+                }
+                if (!response.ok) {
+                    throw new Error('Failed to fetch relay diagnostics');
+                }
+                const data = await response.json();
+                if (requestId !== this.computeNodeCountRequestId) {
+                    return;
+                }
+                if (
+                    !data ||
+                    typeof data !== 'object' ||
+                    !Object.prototype.hasOwnProperty.call(data, 'total_api_v1_registered_compute_nodes')
+                ) {
+                    throw new Error('Relay diagnostics missing API v1 compute-node count');
+                }
+                const count = data.total_api_v1_registered_compute_nodes;
+                if (!Number.isInteger(count) || count < 0) {
+                    throw new Error('Relay diagnostics missing API v1 compute-node count');
+                }
+                this.computeNodeCount = count;
+                this.computeNodeCountStatus = 'ready';
+                this.computeNodeCountLastUpdated = new Date().toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+            } catch (error) {
+                if (requestId !== this.computeNodeCountRequestId) {
+                    return;
+                }
+                console.warn('Unable to refresh compute-node count:', error);
+                this.computeNodeCountStatus = 'error';
+                this.computeNodeCountLastUpdated = '';
+            }
+        },
+
         detectTouchInput() {
             try {
                 const hasWindow = typeof window !== 'undefined';
@@ -684,6 +746,10 @@ new Vue({
         }
     },
     beforeDestroy() {
+        if (this.computeNodeCountPoller) {
+            clearInterval(this.computeNodeCountPoller);
+            this.computeNodeCountPoller = null;
+        }
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

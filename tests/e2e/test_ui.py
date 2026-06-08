@@ -37,6 +37,157 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     assert len(headings) > 0, "Page should contain at least one heading"
     print(f"✓ Found {len(headings)} headings on the page")
 
+
+def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup_servers):
+    """Landing page should render and refresh the relay diagnostics compute-node count."""
+    counts = iter([3, 5])
+    latest_count = {"value": 5}
+
+    def handle_diagnostics(route):
+        try:
+            latest_count["value"] = next(counts)
+        except StopIteration:
+            pass
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": 99,
+                    "total_api_v1_registered_compute_nodes": latest_count["value"],
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator(".compute-node-status")
+    status.wait_for(state="visible")
+    page.wait_for_function(
+        """
+        () => {
+            const status = document.querySelector('.compute-node-status');
+            return Boolean(
+                status &&
+                status.textContent.includes('Live compute nodes: 3') &&
+                status.textContent.includes('Updated')
+            );
+        }
+        """
+    )
+    assert "Live compute nodes: 3" in status.inner_text()
+    assert "Updated" in status.inner_text()
+
+    page.evaluate("document.querySelector('#app').__vue__.refreshComputeNodeCount()")
+    page.wait_for_function(
+        """
+        () => {
+            const status = document.querySelector('.compute-node-status');
+            return Boolean(
+                status &&
+                status.textContent.includes('Live compute nodes: 5') &&
+                status.textContent.includes('Updated')
+            );
+        }
+        """
+    )
+    assert "Live compute nodes: 5" in status.inner_text()
+    assert "Updated" in status.inner_text()
+
+
+def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
+    """Older diagnostics responses should not overwrite newer compute-node counts."""
+    first_route = {}
+    first_seen = threading.Event()
+
+    def handle_diagnostics(route):
+        if not first_seen.is_set():
+            first_route["route"] = route
+            first_seen.set()
+            return
+
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "total_registered_compute_nodes": 99,
+                    "total_api_v1_registered_compute_nodes": 5,
+                }
+            ),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+    page.goto(base_url, wait_until="domcontentloaded")
+    assert first_seen.wait(timeout=5), "Initial diagnostics request was not intercepted"
+
+    page.evaluate("document.querySelector('#app').__vue__.refreshComputeNodeCount()")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 5')"
+    )
+
+    first_route["route"].fulfill(
+        status=200,
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(
+            {
+                "total_registered_compute_nodes": 99,
+                "total_api_v1_registered_compute_nodes": 3,
+            }
+        ),
+    )
+    page.wait_for_timeout(100)
+    assert "Live compute nodes: 5" in page.locator(".compute-node-status").inner_text()
+
+
+def test_compute_node_count_rejects_null_diagnostics(page: Page, base_url: str, setup_servers):
+    """Invalid null diagnostics payloads should render the unavailable state."""
+
+    def handle_null_diagnostics(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body="null",
+        )
+
+    page.route("**/relay/diagnostics", handle_null_diagnostics)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator(".compute-node-status")
+    status.wait_for(state="visible")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: unavailable')"
+    )
+    assert "Live compute nodes: unavailable" in status.inner_text()
+
+
+def test_compute_node_count_failure_is_graceful(page: Page, base_url: str, setup_servers):
+    """Diagnostic widget failures should be non-alarming and leave chat usable."""
+
+    def handle_diagnostics_failure(route):
+        route.fulfill(
+            status=503,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": "down"}),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics_failure)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator(".compute-node-status")
+    status.wait_for(state="visible")
+    page.wait_for_function(
+        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: unavailable')"
+    )
+    assert "Live compute nodes: unavailable" in status.inner_text()
+    assert page.locator("textarea").first.is_visible()
+    assert page.locator("button", has_text="Send").is_visible()
+
+
 def test_send_message(page: Page, base_url: str, setup_servers):
     """Test basic page interaction."""
     # Navigate to the base URL

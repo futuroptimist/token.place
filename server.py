@@ -5,7 +5,9 @@ Main server application module that integrates all components.
 """
 import os
 import argparse
+import atexit
 import logging
+import signal
 import sys
 from flask import Flask, request, jsonify
 from typing import Optional
@@ -149,6 +151,10 @@ class ServerApp:
         """Start polling the relay in a background thread."""
         self.runtime.start_relay_polling()
 
+    def stop(self):
+        """Stop relay polling and best-effort unregister this compute node."""
+        self.runtime.stop()
+
     def run(self):
         """Run the server application."""
         log_info(f"Starting server on port {self.server_port}")
@@ -203,6 +209,27 @@ def main():
         relay_port=relay_port,
         relay_url=relay_url
     )
+    stopped = False
+
+    def _stop_server_once():
+        nonlocal stopped
+        if stopped:
+            return
+        stopped = True
+        server.stop()
+
+    def _handle_shutdown(signum, _frame):
+        log_info(f"Received shutdown signal {signum}; unregistering compute node")
+        _stop_server_once()
+        raise SystemExit(0)
+
+    atexit.register(_stop_server_once)
+    for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(shutdown_signal, _handle_shutdown)
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            log_error(f"Failed to install shutdown handler for signal {shutdown_signal}")
+
     server.run()
 
 if __name__ == "__main__":  # pragma: no cover

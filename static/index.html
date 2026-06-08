@@ -125,11 +125,24 @@
             color: #ffffff;
             font-size: 14px;
         }
-        .model-status {
+        .model-status,
+        .server-key-status {
             margin: 6px 0 0;
             color: #cccccc;
             font-size: 13px;
             line-height: 1.4;
+        }
+        .server-key-status strong {
+            color: #00ffff;
+            font-weight: 600;
+        }
+        .new-chat-button {
+            padding: 8px 10px;
+            border-radius: 5px;
+            border: 1px solid rgba(0, 255, 255, 0.5);
+            background-color: transparent;
+            color: #00ffff;
+            cursor: pointer;
         }
         .model-error {
             color: #ffcc66;
@@ -335,12 +348,22 @@
         }
 
         body.light-mode .model-selector-container label,
-        body.light-mode .model-status {
+        body.light-mode .model-status,
+        body.light-mode .server-key-status {
             color: #555555;
         }
 
         body.light-mode .model-error {
             color: #9a5b00;
+        }
+
+        body.light-mode .server-key-status strong,
+        body.light-mode .new-chat-button {
+            color: #007bff;
+        }
+
+        body.light-mode .new-chat-button {
+            border-color: rgba(0, 123, 255, 0.5);
         }
 
         body.light-mode .send-button {
@@ -423,6 +446,17 @@
                 <p v-if="modelsLoading" class="model-status">Loading API v1 models…</p>
                 <p v-else-if="modelsError" class="model-status model-error">{{ modelsError }}</p>
                 <p v-else-if="selectedModelSummary" class="model-status">{{ selectedModelSummary }}</p>
+                <p v-if="selectedServerKeyLabel" class="server-key-status" data-testid="landing-server-key-label"><strong>{{ selectedServerKeyLabel }}</strong></p>
+                <p v-else class="server-key-status">Server: selected on first send</p>
+                <button
+                    v-if="selectedServerUnavailable || selectedServerKeyLabel"
+                    type="button"
+                    class="new-chat-button"
+                    data-testid="landing-new-chat-button"
+                    @click="startNewChatSession"
+                >
+                    New chat / choose another node
+                </button>
             </div>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>

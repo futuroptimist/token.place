@@ -179,10 +179,15 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
         "root_page_loads",
+        "landing_chat",
         "landing_chat_uses_api_v1_only_non_streaming",
         "landing_chat_model_dropdown_uses_api_v1_models",
         "landing_chat_model_catalog_failure_uses_api_v1_fallback",
         "landing_chat_shows_no_servers_available_message",
+        "landing_chat_sticks_to_one_server_across_two_turns",
+        "landing_chat_server_key_label_is_shortened",
+        "sticky",
+        "server_key",
         "compute_node_count",
         "compute_node_count_renders_and_updates",
         "compute_node_count_failure_is_graceful",

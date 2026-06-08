@@ -2804,6 +2804,33 @@ def test_api_v1_next_keeps_server_alive_while_any_in_flight_request_remains(clie
     assert next_response.get_json().get('server_public_key') == DUMMY_SERVER_PUB_KEY
 
 
+
+
+def test_api_v1_servers_next_uses_registration_order_round_robin_for_new_clients(client):
+    server_keys = [
+        base64.b64encode(f"server_public_key_rr_{idx}".encode("utf-8")).decode("ascii")
+        for idx in range(3)
+    ]
+    for server_key in server_keys:
+        response = client.post('/api/v1/relay/servers/register', json={'server_public_key': server_key})
+        assert response.status_code == 200
+
+    selected = [
+        client.get('/api/v1/relay/servers/next').get_json()['server_public_key']
+        for _ in range(7)
+    ]
+
+    assert selected == [
+        server_keys[0],
+        server_keys[1],
+        server_keys[2],
+        server_keys[0],
+        server_keys[1],
+        server_keys[2],
+        server_keys[0],
+    ]
+
+
 def test_api_v1_unregister_removes_known_server_and_next_skips_it(client):
     server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200

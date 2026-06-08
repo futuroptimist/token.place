@@ -252,30 +252,36 @@ def test_logs_and_diagnostics_do_not_echo_plaintext_sentinel(monkeypatch, caplog
     assert _to_text(sink_response.get_json()).find(E2EE_SENTINEL_LOGS) == -1
 
 
-def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client):
+@pytest.mark.parametrize("field", ["messages", "prompt", "content", "response", "text"])
+def test_api_v1_relay_rejects_plaintext_fields_on_request_envelope(relay_client, field):
     relay.known_servers["server-key"] = {
         "public_key": "server-key",
         "last_ping": relay.datetime.now(),
         "last_ping_duration": 10,
     }
 
-    resp = relay_client.post(
-        "/api/v1/relay/requests",
-        json={
-            "server_public_key": "server-key",
-            "client_public_key": "client-key",
-            "ciphertext": "c",
-            "cipherkey": "k",
-            "iv": "i",
-            "messages": [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}],
-        },
+    plaintext_value = (
+        [{"role": "user", "content": E2EE_SENTINEL_RELAY_STATE}]
+        if field == "messages"
+        else E2EE_SENTINEL_RELAY_STATE
     )
+    payload = {
+        "server_public_key": "server-key",
+        "client_public_key": "client-key",
+        "ciphertext": "c",
+        "cipherkey": "k",
+        "iv": "i",
+        field: plaintext_value,
+    }
+
+    resp = relay_client.post("/api/v1/relay/requests", json=payload)
 
     assert resp.status_code == 400
     assert "forbidden" in resp.get_json()["error"]["message"]
 
 
-def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client):
+@pytest.mark.parametrize("field", ["messages", "prompt", "content", "response", "text"])
+def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch, relay_client, field):
     monkeypatch.setenv("TOKENPLACE_RELAY_SERVER_BEARER_TOKEN", "token")
     relay.known_servers["server-key"] = {
         "public_key": "server-key",
@@ -290,7 +296,7 @@ def test_api_v1_relay_rejects_plaintext_fields_on_response_envelope(monkeypatch,
             "ciphertext": "c",
             "cipherkey": "k",
             "iv": "i",
-            "content": E2EE_SENTINEL_RELAY_STATE,
+            field: ([{"role": "assistant", "content": E2EE_SENTINEL_RELAY_STATE}] if field == "messages" else E2EE_SENTINEL_RELAY_STATE),
         },
         headers={"Authorization": "Bearer token"},
     )

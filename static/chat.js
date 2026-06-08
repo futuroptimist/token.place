@@ -1,6 +1,9 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
+const RELAY_RESPONSE_POLL_INTERVAL_MS = 500;
+const RELAY_RESPONSE_TIMEOUT_MS = 30000;
+const RELAY_E2EE_PROTOCOL = 'tokenplace_api_v1_relay_e2ee';
 const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
 
 new Vue({
@@ -8,7 +11,10 @@ new Vue({
     data: {
         newMessage: '',
         chatHistory: [],
-        serverPublicKey: null,
+        selectedServerPublicKeyB64: '',
+        selectedServerPublicKey: null,
+        selectedServerKeyLabel: '',
+        selectedServerUnavailable: false,
         clientPrivateKey: null,
         clientPublicKey: null,
         availableModels: [],
@@ -27,9 +33,7 @@ new Vue({
     mounted() {
         this.detectTouchInput();
         this.fetchModels();
-        this.getServerPublicKey().then(() => {
-            this.generateClientKeys();
-        });
+        this.generateClientKeys();
         this.refreshComputeNodeCount();
         this.computeNodeCountPoller = setInterval(() => {
             this.refreshComputeNodeCount();
@@ -84,14 +88,14 @@ new Vue({
             return Boolean(this.clientPrivateKey && this.clientPublicKey);
         },
         hasServerPublicKey() {
-            return Boolean(this.serverPublicKey);
+            return Boolean(this.selectedServerPublicKey && this.selectedServerPublicKeyB64);
         },
         canSendMessage() {
             return Boolean(
                 this.newMessage.trim() &&
                 this.hasClientKeypair &&
-                this.hasServerPublicKey &&
                 this.selectedModel &&
+                !this.selectedServerUnavailable &&
                 !this.isGeneratingResponse
             );
         }
@@ -221,27 +225,64 @@ new Vue({
             return null;
         },
 
-        getServerPublicKey() {
-            // Fetch the server's public key from the API
-            return fetch('/api/v1/public-key')
-                .then(response => {
-                    if (response.ok) {
-                        return response.json();
-                    }
-                    throw new Error('Failed to fetch server public key');
-                })
-                .then(data => {
-                    const normalizedKey = this.normalizeServerPublicKey(data && data.public_key);
-                    if (normalizedKey) {
-                        this.serverPublicKey = normalizedKey;
-                    } else {
-                        console.error('Unexpected server public key format:', data);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error fetching server public key:', error);
-                });
+        createServerKeyLabel(rawKey) {
+            if (typeof rawKey !== 'string') {
+                return '';
+            }
+
+            const compact = rawKey.replace(/-----[^-]+-----/g, '').replace(/[^A-Za-z0-9]/g, '');
+            if (compact.length <= 16) {
+                return compact ? `Server: ${compact}` : '';
+            }
+            return `Server: ${compact.slice(0, 8)}…${compact.slice(-8)}`;
         },
+
+        async ensureSelectedServer() {
+            if (this.hasServerPublicKey) {
+                return true;
+            }
+
+            if (this.selectedServerUnavailable) {
+                throw new Error('selected_server_unavailable');
+            }
+
+            const response = await fetch('/api/v1/relay/servers/next', { cache: 'no-store' });
+            if (!response.ok) {
+                let errorData = null;
+                try {
+                    errorData = await response.json();
+                } catch (_jsonError) {
+                    errorData = null;
+                }
+                return {
+                    error: {
+                        userMessage: this.getUserFacingApiError(errorData, response.status)
+                    }
+                };
+            }
+
+            const data = await response.json();
+            const selectedServerPublicKeyB64 = data && data.server_public_key;
+            const normalizedKey = this.normalizeServerPublicKey(selectedServerPublicKeyB64);
+            if (!selectedServerPublicKeyB64 || !normalizedKey) {
+                throw new Error('invalid_selected_server_public_key');
+            }
+
+            this.selectedServerPublicKeyB64 = selectedServerPublicKeyB64;
+            this.selectedServerPublicKey = normalizedKey;
+            this.selectedServerKeyLabel = this.createServerKeyLabel(selectedServerPublicKeyB64);
+            this.selectedServerUnavailable = false;
+            return true;
+        },
+
+        startNewChatSession() {
+            this.chatHistory = [];
+            this.selectedServerPublicKeyB64 = '';
+            this.selectedServerPublicKey = null;
+            this.selectedServerKeyLabel = '';
+            this.selectedServerUnavailable = false;
+        },
+
         generateClientKeys() {
             const crypt = new JSEncrypt({ default_key_size: 2048 });
             crypt.getKey();
@@ -515,49 +556,94 @@ new Vue({
             }
         },
 
-        // Send a message to the server using the new API
-        async sendMessageApi() {
-            if (!this.serverPublicKey) {
-                console.error('Server public key not available');
-                return null;
+        createRequestId() {
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+                return crypto.randomUUID();
             }
+            const randomPart = Math.random().toString(36).slice(2);
+            return `landing-${Date.now()}-${randomPart}`;
+        },
 
-            if (!this.selectedModel) {
-                console.error('No API v1 catalogue model selected');
-                return null;
-            }
+        sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        },
 
-            try {
-                // Encrypt the chat history
-                const encryptedData = await this.encrypt(
-                    JSON.stringify(this.chatHistory),
-                    this.serverPublicKey
-                );
-
-                if (!encryptedData) {
-                    throw new Error('Failed to encrypt chat history');
-                }
-
-                // Create the API request payload
-                const payload = {
+        buildApiV1RelayPlaintextEnvelope(requestId, messageContent) {
+            return {
+                protocol: RELAY_E2EE_PROTOCOL,
+                version: 1,
+                request_id: requestId,
+                client_public_key: this.encodeClientPublicKeyForApi(),
+                api_v1_request: {
                     model: this.selectedModelId,
-                    encrypted: true,
-                    client_public_key: this.encodeClientPublicKeyForApi(),
-                    messages: encryptedData,
-                    metadata: {
-                        inference_target: "desktop_bridge_api_v1_e2ee",
-                        relay_path: "api_v1_e2ee"
-                    }
-                };
+                    messages: [
+                        { role: 'user', content: messageContent }
+                    ],
+                    options: {}
+                }
+            };
+        },
 
-                // Send the request to the API
-                const response = await fetch('/api/v1/chat/completions', {
+        buildSelectedServerUnavailableError() {
+            this.selectedServerUnavailable = true;
+            return {
+                error: {
+                    userMessage: 'The selected LLM server is unavailable. Start a new chat to choose another compute node.'
+                }
+            };
+        },
+
+        async postRelayRequest(payload) {
+            const response = await fetch('/api/v1/relay/requests', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (response.ok) {
+                return null;
+            }
+
+            let errorData = null;
+            try {
+                errorData = await response.json();
+            } catch (_jsonError) {
+                errorData = null;
+            }
+
+            if (response.status === 404 || response.status === 410) {
+                return this.buildSelectedServerUnavailableError();
+            }
+
+            return {
+                error: {
+                    userMessage: this.getUserFacingApiError(errorData, response.status)
+                }
+            };
+        },
+
+        async retrieveRelayResponse(requestId) {
+            const startedAt = Date.now();
+            const clientPublicKey = this.encodeClientPublicKeyForApi();
+
+            while (Date.now() - startedAt < RELAY_RESPONSE_TIMEOUT_MS) {
+                const response = await fetch('/api/v1/relay/responses/retrieve', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({
+                        client_public_key: clientPublicKey,
+                        request_id: requestId
+                    })
                 });
+
+                if (response.status === 202) {
+                    await this.sleep(RELAY_RESPONSE_POLL_INTERVAL_MS);
+                    continue;
+                }
 
                 if (!response.ok) {
                     let errorData = null;
@@ -566,34 +652,114 @@ new Vue({
                     } catch (_jsonError) {
                         errorData = null;
                     }
+                    if (response.status === 404 || response.status === 410) {
+                        return this.buildSelectedServerUnavailableError();
+                    }
                     return {
                         error: {
-                            userMessage: this.getUserFacingApiError(errorData)
+                            userMessage: this.getUserFacingApiError(errorData, response.status)
                         }
                     };
                 }
 
-                const responseData = await response.json();
+                return response.json();
+            }
 
-                // Handle encrypted response
-                if (responseData.encrypted && responseData.data) {
-                    const decryptedJson = await this.decrypt(
-                        responseData.data.ciphertext,
-                        responseData.data.cipherkey,
-                        responseData.data.iv
-                    );
+            return {
+                error: {
+                    userMessage: 'The LLM server took too long to respond. Please try again.'
+                }
+            };
+        },
 
-                    if (!decryptedJson) {
-                        throw new Error('Failed to decrypt response');
-                    }
+        validateRelayResponseEnvelope(envelope, requestId) {
+            if (!envelope || typeof envelope !== 'object') {
+                throw new Error('invalid_relay_response_envelope');
+            }
+            if (envelope.protocol !== RELAY_E2EE_PROTOCOL) {
+                throw new Error('invalid_relay_response_protocol');
+            }
+            if (envelope.request_id !== requestId) {
+                throw new Error('relay_response_request_id_mismatch');
+            }
+            if (envelope.client_public_key !== this.encodeClientPublicKeyForApi()) {
+                throw new Error('relay_response_client_public_key_mismatch');
+            }
+            if (!envelope.api_v1_response || typeof envelope.api_v1_response !== 'object') {
+                throw new Error('missing_api_v1_response');
+            }
+            if (Array.isArray(envelope.api_v1_response.choices)) {
+                return envelope.api_v1_response;
+            }
+            if (envelope.api_v1_response.message && typeof envelope.api_v1_response.message === 'object') {
+                return {
+                    choices: [
+                        { message: envelope.api_v1_response.message }
+                    ]
+                };
+            }
+            throw new Error('missing_api_v1_response_choices');
+        },
 
-                    return JSON.parse(decryptedJson);
+        // Send a message to the selected compute node using relay-blind API v1 E2EE envelopes.
+        async sendMessageApi(messageContent) {
+            if (!this.selectedModel) {
+                console.error('No API v1 catalogue model selected');
+                return null;
+            }
+
+            try {
+                const selected = await this.ensureSelectedServer();
+                if (selected && selected.error) {
+                    return selected;
                 }
 
-                // Handle unencrypted response (should not happen with encrypted=true)
-                return responseData;
+                const requestId = this.createRequestId();
+                const clientPublicKey = this.encodeClientPublicKeyForApi();
+                const plaintextEnvelope = this.buildApiV1RelayPlaintextEnvelope(requestId, messageContent);
+                const encryptedData = await this.encrypt(
+                    JSON.stringify(plaintextEnvelope),
+                    this.selectedServerPublicKey
+                );
+
+                if (!encryptedData) {
+                    throw new Error('Failed to encrypt relay request envelope');
+                }
+
+                const relayPayload = {
+                    server_public_key: this.selectedServerPublicKeyB64,
+                    client_public_key: clientPublicKey,
+                    request_id: requestId,
+                    protocol: RELAY_E2EE_PROTOCOL,
+                    version: 1,
+                    ciphertext: encryptedData.ciphertext,
+                    cipherkey: encryptedData.cipherkey,
+                    iv: encryptedData.iv
+                };
+
+                const postError = await this.postRelayRequest(relayPayload);
+                if (postError) {
+                    return postError;
+                }
+
+                const responseEnvelope = await this.retrieveRelayResponse(requestId);
+                if (responseEnvelope && responseEnvelope.error) {
+                    return responseEnvelope;
+                }
+
+                const decryptedJson = await this.decrypt(
+                    responseEnvelope.ciphertext || responseEnvelope.chat_history,
+                    responseEnvelope.cipherkey,
+                    responseEnvelope.iv
+                );
+
+                if (!decryptedJson) {
+                    throw new Error('Failed to decrypt relay response');
+                }
+
+                return this.validateRelayResponseEnvelope(JSON.parse(decryptedJson), requestId);
             } catch (error) {
-                console.error('API request error:', error);
+                console.error('API relay request error:', error);
                 return null;
             }
         },
@@ -644,7 +810,7 @@ new Vue({
             return message.content;
         },
 
-        getUserFacingApiError(errorPayload) {
+        getUserFacingApiError(errorPayload, statusCode) {
             const error = errorPayload && typeof errorPayload === 'object' ? errorPayload.error : null;
             const errorCode = error && typeof error.code === 'string' ? error.code : '';
             const fallbackMessage = ASSISTANT_GENERIC_FALLBACK_MESSAGE;
@@ -655,8 +821,14 @@ new Vue({
                 compute_node_bridge_timeout: 'The LLM server took too long to respond. Please try again.',
                 compute_node_unreachable: 'The LLM server is unavailable right now. Please try again.',
                 compute_node_bridge_error: 'Unable to contact the LLM server right now. Please try again.',
-                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.'
+                compute_node_invalid_payload: 'The LLM server returned an invalid response. Please try again.',
+                expired: 'The selected LLM server is unavailable. Start a new chat to choose another compute node.',
+                cancelled: 'The selected LLM server is unavailable. Start a new chat to choose another compute node.'
             };
+
+            if (statusCode === 404 || statusCode === 410) {
+                return 'The selected LLM server is unavailable. Start a new chat to choose another compute node.';
+            }
 
             return codeToMessage[errorCode] || fallbackMessage;
         },
@@ -691,7 +863,7 @@ new Vue({
 
             try {
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
-                let response = await this.sendMessageApi();
+                let response = await this.sendMessageApi(messageContent);
 
                 // Process the response
                 if (response) {

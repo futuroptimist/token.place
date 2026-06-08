@@ -106,6 +106,14 @@ jobs:
     env:
       TEST_COVERAGE: '1'
       TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+      # Build llama_cpp_python from source with Metal enabled while avoiding
+      # Apple clang's fragile native CPU feature probe on macos-latest arm64.
+      CMAKE_ARGS: >-
+        -DGGML_METAL=on
+        -DGGML_NATIVE=off
+        -DCMAKE_OSX_ARCHITECTURES=arm64
+        -DCMAKE_APPLE_SILICON_PROCESSOR=arm64
+      FORCE_CMAKE: '1'
     steps:
       - uses: actions/checkout@v4
 

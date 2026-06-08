@@ -219,6 +219,24 @@ def test_macos_run_all_tests_pr_job_uses_python_312_and_node_20() -> None:
     assert any(step.get("with", {}).get("node-version") == "20" for step in node_steps)
 
 
+def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None:
+    macos_job = _run_all_tests_jobs()["macos-run-all-tests"]
+    env = macos_job.get("env", {})
+
+    assert env.get("FORCE_CMAKE") == "1"
+    cmake_args = str(env.get("CMAKE_ARGS", ""))
+    assert "-DGGML_METAL=on" in cmake_args, (
+        "macOS Apple Silicon CI must build llama_cpp_python with Metal enabled "
+        "so GPU-capable desktop modes do not silently fall back to CPU."
+    )
+    assert "-DGGML_NATIVE=off" in cmake_args, (
+        "macos-latest arm64 runners must disable fragile native CPU feature "
+        "probing so dependency validation does not fail before run_all_tests.sh."
+    )
+    assert "-DCMAKE_OSX_ARCHITECTURES=arm64" in cmake_args
+    assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in cmake_args
+
+
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:
     for job_name, job in _run_all_tests_jobs().items():
         assert "continue-on-error" not in job, (

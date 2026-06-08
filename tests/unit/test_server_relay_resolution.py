@@ -36,3 +36,23 @@ def test_resolve_relay_port_respects_cli_port_override_for_https():
     relay_port = server._resolve_relay_port(7443, "https://token.place")
     assert relay_port == 7443
     assert server.RelayClient._compose_relay_url("https://token.place", relay_port) == "https://token.place:7443"
+
+
+def test_resolve_relay_url_prefers_cli_when_requested(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELAY_URL", "https://relay.example")
+    server = _load_server_script()
+
+    assert (
+        server._resolve_relay_url("http://127.0.0.1:5010", prefer_cli=True)
+        == "http://127.0.0.1:5010"
+    )
+
+
+def test_resolve_relay_port_prefers_cli_url_port_when_requested(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELAY_PORT", "9999")
+    server = _load_server_script()
+
+    assert (
+        server._resolve_relay_port(None, "http://127.0.0.1:5010", prefer_cli=True)
+        == 5010
+    )

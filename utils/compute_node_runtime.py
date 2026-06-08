@@ -148,8 +148,16 @@ def resolve_relay_url(cli_default: str, *, prefer_cli: bool = False) -> str:
     return env_override or cli_default
 
 
-def resolve_relay_port(cli_default: Optional[int], relay_url: str) -> Optional[int]:
+def resolve_relay_port(
+    cli_default: Optional[int], relay_url: str, *, prefer_cli: bool = False
+) -> Optional[int]:
     """Resolve the relay port from CLI, env, or the relay URL."""
+
+    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
+    if prefer_cli and parsed.port is not None:
+        return parsed.port
+    if prefer_cli and cli_default is not None:
+        return cli_default
 
     env_port = first_env(["TOKENPLACE_RELAY_PORT", "TOKEN_PLACE_RELAY_PORT", "RELAY_PORT"])
 
@@ -160,7 +168,6 @@ def resolve_relay_port(cli_default: Optional[int], relay_url: str) -> Optional[i
             _log_error(f"Invalid relay port override: {env_port}")
             return cli_default
 
-    parsed = urlparse(relay_url if "://" in relay_url else f"http://{relay_url}")
     if parsed.port is not None:
         return parsed.port
 

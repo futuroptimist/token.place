@@ -75,55 +75,95 @@ def _terminate_process(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=5)
 
 
+def _process_output(proc: subprocess.Popen[str]) -> str:
+    log_path = getattr(proc, "_tokenplace_log_path", None)
+    if isinstance(log_path, Path) and log_path.exists():
+        return log_path.read_text(encoding="utf-8", errors="replace")
+    if proc.stdout:
+        return proc.stdout.read()
+    return ""
+
+
 def _assert_process_still_running(proc: subprocess.Popen[str], label: str) -> None:
     if proc.poll() is None:
         return
-    stdout = proc.stdout.read() if proc.stdout else ""
+    stdout = _process_output(proc)
     raise AssertionError(f"{label} exited early with {proc.returncode}:\n{stdout}")
 
 
-def _start_relay(relay_port: int) -> subprocess.Popen[str]:
-    relay_url = f"http://127.0.0.1:{relay_port}"
-    env = os.environ.copy()
-    env.update(
-        {
-            "TOKEN_PLACE_ENV": "testing",
-            "ENVIRONMENT": "testing",
-            "USE_MOCK_LLM": "1",
-            "TOKENPLACE_API_V1_COMPUTE_PROVIDER": "distributed",
-            "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK": "0",
-            "TOKENPLACE_DISTRIBUTED_COMPUTE_URL": relay_url,
-            "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS": "10",
-            "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.1",
-            "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS": "2",
-            "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS": "2",
-            "TOKENPLACE_MAX_POLL_FAILURES": "3",
-            "TOKENPLACE_LOG_LEVEL": "WARNING",
-            "PYTHONUNBUFFERED": "1",
-        }
-    )
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "relay.py",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(relay_port),
-            "--use_mock_llm",
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    _wait_for_json(f"{relay_url}/relay/diagnostics", timeout=10)
-    _assert_process_still_running(proc, "relay.py")
+def _bind_failure(output: str) -> bool:
+    return "address already in use" in output.lower() or "errno 98" in output.lower()
+
+
+def _start_process_with_log(
+    args: list[str], *, env: dict[str, str], log_path: Path
+) -> subprocess.Popen[str]:
+    log_handle = log_path.open("w", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            args,
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        log_handle.close()
+    setattr(proc, "_tokenplace_log_path", log_path)
     return proc
 
 
-def _start_server(relay_url: str, server_port: int) -> subprocess.Popen[str]:
+def _start_relay(tmp_path: Path) -> tuple[subprocess.Popen[str], str]:
+    last_error: Exception | None = None
+    for attempt in range(5):
+        relay_port = _free_port()
+        relay_url = f"http://127.0.0.1:{relay_port}"
+        env = os.environ.copy()
+        env.update(
+            {
+                "TOKEN_PLACE_ENV": "testing",
+                "ENVIRONMENT": "testing",
+                "USE_MOCK_LLM": "1",
+                "TOKENPLACE_API_V1_COMPUTE_PROVIDER": "distributed",
+                "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK": "0",
+                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL": relay_url,
+                "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS": "10",
+                "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.1",
+                "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS": "2",
+                "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS": "2",
+                "TOKENPLACE_MAX_POLL_FAILURES": "3",
+                "TOKENPLACE_LOG_LEVEL": "WARNING",
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
+        proc = _start_process_with_log(
+            [
+                sys.executable,
+                "relay.py",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(relay_port),
+                "--use_mock_llm",
+            ],
+            env=env,
+            log_path=tmp_path / f"relay-{attempt}.log",
+        )
+        try:
+            _wait_for_json(f"{relay_url}/relay/diagnostics", timeout=10)
+            _assert_process_still_running(proc, "relay.py")
+            return proc, relay_url
+        except AssertionError as exc:
+            last_error = exc
+            output = _process_output(proc)
+            _terminate_process(proc)
+            if not _bind_failure(output):
+                raise
+    raise AssertionError(f"relay.py failed to bind after retries: {last_error}")
+
+
+def _server_env() -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
@@ -150,8 +190,13 @@ def _start_server(relay_url: str, server_port: int) -> subprocess.Popen[str]:
         "RELAY_PORT",
     ):
         env.pop(key, None)
+    return env
 
-    return subprocess.Popen(
+
+def _start_server(
+    relay_url: str, server_port: int, log_path: Path
+) -> subprocess.Popen[str]:
+    return _start_process_with_log(
         [
             sys.executable,
             "server.py",
@@ -163,12 +208,32 @@ def _start_server(relay_url: str, server_port: int) -> subprocess.Popen[str]:
             str(server_port),
             "--use_mock_llm",
         ],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        env=_server_env(),
+        log_path=log_path,
     )
+
+
+def _start_server_and_wait_for_count(
+    relay_url: str, expected_count: int, tmp_path: Path, label: str
+) -> tuple[subprocess.Popen[str], dict[str, Any]]:
+    last_error: Exception | None = None
+    for attempt in range(5):
+        proc = _start_server(
+            relay_url,
+            _free_port(),
+            tmp_path / f"server-{label}-{attempt}.log",
+        )
+        try:
+            diagnostics = _wait_for_count(relay_url, expected_count, timeout=10)
+            _assert_process_still_running(proc, label)
+            return proc, diagnostics
+        except AssertionError as exc:
+            last_error = exc
+            output = _process_output(proc)
+            _terminate_process(proc)
+            if not _bind_failure(output):
+                raise
+    raise AssertionError(f"{label} failed to bind after retries: {last_error}")
 
 
 def _encrypt_messages_for_relay(
@@ -206,23 +271,22 @@ def _decrypt_chat_completion(
     os.environ.get("RUN_RELAY_REGISTRATION_TESTS") != "1",
     reason="set RUN_RELAY_REGISTRATION_TESTS=1 to launch relay.py and server.py subprocesses",
 )
-def test_server_py_compute_node_cli_registers_scales_and_handles_api_v1_e2ee_work():
-    relay_port = _free_port()
-    server_port_a = _free_port()
-    server_port_b = _free_port()
-    relay_url = f"http://127.0.0.1:{relay_port}"
+def test_server_py_compute_node_cli_registers_scales_and_handles_api_v1_e2ee_work(
+    tmp_path: Path,
+):
+    relay_url = ""
     relay_proc: subprocess.Popen[str] | None = None
     server_proc_a: subprocess.Popen[str] | None = None
     server_proc_b: subprocess.Popen[str] | None = None
 
     try:
-        relay_proc = _start_relay(relay_port)
+        relay_proc, relay_url = _start_relay(tmp_path)
         initial = _wait_for_count(relay_url, 0, timeout=5)
         assert initial["total_registered_compute_nodes"] == 0
 
-        server_proc_a = _start_server(relay_url, server_port_a)
-        diagnostics_one = _wait_for_count(relay_url, 1, timeout=10)
-        _assert_process_still_running(server_proc_a, "server.py A")
+        server_proc_a, diagnostics_one = _start_server_and_wait_for_count(
+            relay_url, 1, tmp_path, "server.py A"
+        )
         assert diagnostics_one["total_registered_compute_nodes"] == 1
 
         browser_crypto = EncryptionManager()
@@ -251,9 +315,9 @@ def test_server_py_compute_node_cli_registers_scales_and_handles_api_v1_e2ee_wor
         content = completion["choices"][0]["message"]["content"]
         assert "Mock Response" in content
 
-        server_proc_b = _start_server(relay_url, server_port_b)
-        diagnostics_two = _wait_for_count(relay_url, 2, timeout=10)
-        _assert_process_still_running(server_proc_b, "server.py B")
+        server_proc_b, diagnostics_two = _start_server_and_wait_for_count(
+            relay_url, 2, tmp_path, "server.py B"
+        )
         assert diagnostics_two["total_registered_compute_nodes"] == 2
 
     finally:
@@ -262,6 +326,7 @@ def test_server_py_compute_node_cli_registers_scales_and_handles_api_v1_e2ee_wor
                 _terminate_process(proc)
         if relay_proc is not None:
             try:
-                _wait_for_count(relay_url, 0, timeout=8)
+                if sys.exc_info()[0] is None:
+                    _wait_for_count(relay_url, 0, timeout=8)
             finally:
                 _terminate_process(relay_proc)

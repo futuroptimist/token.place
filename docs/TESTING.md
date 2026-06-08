@@ -57,6 +57,10 @@ download, GGUF file, or desktop bridge:
 USE_MOCK_LLM=1 python server.py --relay_url http://127.0.0.1:5010 --server_port 3001
 ```
 
+An explicit `--relay_url` is authoritative for this CLI command, so stale
+relay environment variables from another deployment should not redirect this
+local validation run.
+
 Operators can confirm registration and live counts from the relay diagnostics
 endpoint:
 

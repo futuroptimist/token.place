@@ -55,16 +55,18 @@ def _first_env(keys):
     return first_env(keys)
 
 
-def _resolve_relay_url(cli_default: str) -> str:
+def _resolve_relay_url(cli_default: str, *, prefer_cli: bool = False) -> str:
     """Backward-compatible wrapper for runtime relay URL resolution."""
 
-    return resolve_relay_url(cli_default)
+    return resolve_relay_url(cli_default, prefer_cli=prefer_cli)
 
 
-def _resolve_relay_port(cli_default: Optional[int], relay_url: str) -> Optional[int]:
+def _resolve_relay_port(
+    cli_default: Optional[int], relay_url: str, *, prefer_cli: bool = False
+) -> Optional[int]:
     """Backward-compatible wrapper for runtime relay port resolution."""
 
-    return resolve_relay_port(cli_default, relay_url)
+    return resolve_relay_port(cli_default, relay_url, prefer_cli=prefer_cli)
 
 
 def _format_relay_target(relay_url: str, relay_port: Optional[int]) -> str:
@@ -153,11 +155,10 @@ class ServerApp:
         """Run the server application."""
         log_info(f"Starting server on port {self.server_port}")
 
-        # Start relay polling in a background thread
-        self.start_relay_polling()
-
-        # Run the Flask app and best-effort unregister on graceful shutdown.
+        # Start relay polling and run the Flask app with best-effort unregister
+        # for any failure after run() begins, including polling startup errors.
         try:
+            self.start_relay_polling()
             self.app.run(
                 host=self.server_host,
                 port=self.server_port,
@@ -181,7 +182,7 @@ def parse_args():
     parser.add_argument(
         "--relay_url",
         type=str,
-        default=config.get("relay.server_url", "https://token.place"),
+        default=None,
         help="URL of the relay server",
     )
     parser.add_argument("--use_mock_llm", action="store_true", help="Use mock LLM for testing")
@@ -196,8 +197,14 @@ def main():
         os.environ['USE_MOCK_LLM'] = '1'
         print("Running in mock LLM mode")
 
-    relay_url = _resolve_relay_url(args.relay_url)
-    relay_port = _resolve_relay_port(args.relay_port, relay_url)
+    relay_url_arg = args.relay_url or config.get("relay.server_url", "https://token.place")
+    prefer_cli_relay = args.relay_url is not None
+    relay_url = _resolve_relay_url(relay_url_arg, prefer_cli=prefer_cli_relay)
+    relay_port = _resolve_relay_port(
+        args.relay_port,
+        relay_url,
+        prefer_cli=prefer_cli_relay or args.relay_port is not None,
+    )
 
     # Create and run the server
     server = ServerApp(

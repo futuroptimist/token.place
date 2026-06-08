@@ -631,6 +631,14 @@ def test_compute_node_runtime_relay_port_prefers_explicit_url_port(monkeypatch):
     assert relay_port == 5010
 
 
+def test_compute_node_runtime_relay_port_prefers_explicit_cli_port(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RELAY_PORT", "9999")
+
+    relay_port = resolve_relay_port(5010, "http://127.0.0.1", prefer_cli=True)
+
+    assert relay_port == 5010
+
+
 def test_compute_node_runtime_resolve_relay_port_accepts_explicit_zero_port():
     assert resolve_relay_port(None, "https://token.place:0") == 0
 

@@ -69,9 +69,21 @@ find_placeholder_in_patch_message () {
     header_end=${header_end%%:*}
 
     message_start=$((header_end + 1))
-    message_block=$(tail -n +"${message_start}" "$file" | sed '/^diff --git /{q}' | sed '/^--- /{q}')
-
-    message_match=$(printf '%s\n' "$message_block" | nl -ba | grep -Eini "${PLACEHOLDER_REGEX}" | head -n 1 || true)
+    message_match=$(awk -v start="${message_start}" -v tokens="${PLACEHOLDER_TOKEN_PATTERN}" '
+        BEGIN { split(tolower(tokens), token_list, "|") }
+        NR < start { next }
+        /^diff --git / { exit }
+        {
+            line = tolower($0)
+            for (index_token in token_list) {
+                token = token_list[index_token]
+                if (line ~ "(^|[^[:alnum:]_])" token "([^[:alnum:]_]|$)") {
+                    printf "%d:%s\\n", NR - start + 1, $0
+                    exit
+                }
+            }
+        }
+    ' "$file" || true)
 
     if test -n "$message_match"
     then

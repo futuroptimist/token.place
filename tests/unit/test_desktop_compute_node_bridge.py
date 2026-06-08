@@ -27,6 +27,15 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
 
 
+@pytest.fixture(autouse=True)
+def _simulate_supported_windows_arch(monkeypatch):
+    """Keep win32 runtime-message tests independent of the host CPU architecture."""
+
+    desktop_runtime_setup = sys.modules.get('desktop_runtime_setup')
+    if desktop_runtime_setup is not None:
+        monkeypatch.setattr(desktop_runtime_setup.sys, 'token_place_desktop_arch', 'x86_64', raising=False)
+
+
 class FakeModelManager:
     def __init__(self):
         self.model_path = ''

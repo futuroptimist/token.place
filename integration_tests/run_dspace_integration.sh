@@ -38,7 +38,7 @@ ensure_repo() {
 
   if [[ ! -d "$dest" ]]; then
     log_step "Cloning $name repository..."
-    run_cmd git clone "${extra_args[@]}" "$url" "$dest"
+    run_cmd git clone ${extra_args[@]+"${extra_args[@]}"} "$url" "$dest"
   else
     log_step "$name repository already present. Fetching latest changes..."
     run_cmd git -C "$dest" fetch --tags --prune

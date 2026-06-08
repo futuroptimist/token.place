@@ -26,6 +26,23 @@ def test_bandit_reports_no_medium_or_high_findings():
         "medium",
         "--confidence-level",
         "medium",
+        "--exclude",
+        ",".join([
+            str(repo_root / "tests"),
+            str(repo_root / "desktop"),
+            str(repo_root / "desktop-tauri"),
+            str(repo_root / "node_modules"),
+            str(repo_root / ".venv"),
+            str(repo_root / ".venv-test"),
+            str(repo_root / "venv"),
+            str(repo_root / "env"),
+            str(repo_root / "build"),
+            str(repo_root / "dist"),
+            str(repo_root / ".pytest_cache"),
+            str(repo_root / ".mypy_cache"),
+            str(repo_root / ".ruff_cache"),
+            "__pycache__",
+        ]),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(repo_root))

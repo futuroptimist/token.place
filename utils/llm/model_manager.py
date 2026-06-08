@@ -174,7 +174,7 @@ def _canonical_path_for_compare(module_path: Any) -> Optional[str]:
         return None
     try:
         path_text = _strip_windows_extended_path_prefix(str(module_path))
-        return os.path.normcase(os.path.normpath(os.path.abspath(path_text)))
+        return os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
     except (TypeError, ValueError, OSError):
         try:
             return os.path.normcase(os.path.normpath(_strip_windows_extended_path_prefix(str(module_path))))
@@ -327,7 +327,7 @@ def _llama_cpp_stdlib_guard_code() -> str:
     return (
         "import importlib.util as _token_place_importlib_util, sysconfig as _token_place_sysconfig, "
         "os as _token_place_os\n"
-        "_token_place_stdlib_roots = [_token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_p))) "
+        "_token_place_stdlib_roots = [_token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.realpath(_token_place_os.path.abspath(_p)))) "
         "for _p in (_token_place_sysconfig.get_paths().get('stdlib'), _token_place_sysconfig.get_paths().get('platstdlib')) if _p]\n"
         "def _token_place_is_site(_p):\n"
         "    return 'site-packages' in str(_p).replace('\\\\', '/').lower() or 'dist-packages' in str(_p).replace('\\\\', '/').lower()\n"
@@ -336,7 +336,7 @@ def _llama_cpp_stdlib_guard_code() -> str:
         "        return True\n"
         "    if _token_place_is_site(_p):\n"
         "        return False\n"
-        "    _candidate = _token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.abspath(_p)))\n"
+        "    _candidate = _token_place_os.path.normcase(_token_place_os.path.normpath(_token_place_os.path.realpath(_token_place_os.path.abspath(_p))))\n"
         "    for _root in _token_place_stdlib_roots:\n"
         "        try:\n"
         "            if _token_place_os.path.commonpath([_candidate, _root]) == _root:\n"

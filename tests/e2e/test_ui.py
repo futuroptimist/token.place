@@ -82,6 +82,62 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
 # Add more E2E tests here as the UI evolves
 
 
+
+def test_compute_node_count_widget_renders_and_refreshes(page: Page, base_url: str, setup_servers):
+    """Landing page should render diagnostics count and update it without a reload."""
+    counts = [2, 5]
+
+    def handle_diagnostics(route):
+        count = counts.pop(0) if counts else 5
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json", "Cache-Control": "no-store"},
+            body=json.dumps({"total_registered_compute_nodes": count}),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator('[data-testid="compute-node-status"]')
+    page.wait_for_function(
+        "selector => document.querySelector(selector)?.textContent.includes('Live compute nodes: 2')",
+        arg='[data-testid="compute-node-status"]',
+    )
+    assert "Live compute nodes: 2" in status.inner_text()
+    assert "Updated" in status.inner_text()
+
+    page.evaluate("document.querySelector('#app').__vue__.refreshComputeNodeCount()")
+    page.wait_for_function(
+        "selector => document.querySelector(selector)?.textContent.includes('Live compute nodes: 5')",
+        arg='[data-testid="compute-node-status"]',
+    )
+    assert "Live compute nodes: 5" in status.inner_text()
+
+
+def test_compute_node_count_widget_handles_diagnostics_failure(page: Page, base_url: str, setup_servers):
+    """Diagnostics failures should be non-alarming and should not break chat controls."""
+
+    page.route(
+        "**/relay/diagnostics",
+        lambda route: route.fulfill(status=503, body="diagnostics unavailable"),
+    )
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    status = page.locator('[data-testid="compute-node-status"]')
+    page.wait_for_function(
+        "selector => document.querySelector(selector)?.textContent.includes('Live compute nodes: unavailable')",
+        arg='[data-testid="compute-node-status"]',
+    )
+    assert "Live compute nodes: unavailable" in status.inner_text()
+    assert "Diagnostics temporarily unavailable" in status.inner_text()
+    assert page.locator("textarea").first.is_enabled()
+    assert page.locator("button", has_text="Send").is_enabled()
+
+
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
     """The chat UI should render markdown formatting returned by the assistant."""
 

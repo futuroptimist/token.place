@@ -147,6 +147,9 @@ E2E_RELAY_PORT = 5010
 E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
+    "tests/e2e/test_ui.py::test_root_page_loads",
+    "tests/e2e/test_ui.py::test_compute_node_count_widget_renders_and_refreshes",
+    "tests/e2e/test_ui.py::test_compute_node_count_widget_handles_diagnostics_failure",
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
     "tests/e2e/test_ui.py::test_landing_chat_shows_no_servers_available_message",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
@@ -167,6 +170,9 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
 
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
+        "root_page_loads",
+        "compute_node_count_widget_renders_and_refreshes",
+        "compute_node_count_widget_handles_diagnostics_failure",
         "landing_chat_uses_api_v1_only_non_streaming",
         "landing_chat_shows_no_servers_available_message",
         "landing_chat_real_inference_with_desktop_bridge_api_v1",
@@ -185,8 +191,12 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         return False
 
     for i, arg in enumerate(invocation_args):
-        if arg == "-k" and i + 1 < len(invocation_args) and invocation_args[i + 1] in target_names:
-            return True
+        if arg == "-k" and i + 1 < len(invocation_args):
+            expression = invocation_args[i + 1]
+            if expression in target_names:
+                return True
+            if any(target_name in expression for target_name in target_names):
+                return True
 
     return False
 
@@ -363,9 +373,19 @@ def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], 
     3. Yields the browser and context
     4. Cleans up after tests
     """
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=True)
-    context = browser.new_context(ignore_https_errors=True)
+    playwright = None
+    browser = None
+    context = None
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True)
+    except PlaywrightError as exc:  # pragma: no cover - skip when browser unavailable
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
+        pytest.skip(f"Playwright chromium unavailable: {exc}")
 
     # Add console log handler
     context.on("console", print_console_message)
@@ -373,11 +393,9 @@ def browser_context(setup_servers) -> Generator[Tuple[Browser, BrowserContext], 
     try:
         yield browser, context
     finally:
-        try:
-            context.close()
-        finally:
-            browser.close()
-            playwright.stop()
+        context.close()
+        browser.close()
+        playwright.stop()
 
 @pytest.fixture(scope="function")
 def page(browser_context) -> Generator[Page, None, None]:

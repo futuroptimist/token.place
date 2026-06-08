@@ -79,6 +79,30 @@
             padding: 20px;
             margin-top: 30px;
         }
+        .compute-node-status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+            padding: 12px 16px;
+            border: 1px solid rgba(0, 255, 255, 0.35);
+            border-radius: 8px;
+            background-color: rgba(0, 255, 255, 0.08);
+        }
+        .compute-node-status p {
+            margin: 0;
+            padding: 0;
+        }
+        .compute-node-status__label {
+            font-size: 16px;
+            color: #ffffff;
+        }
+        .compute-node-status__meta {
+            font-size: 13px;
+            color: #aaaaaa;
+        }
         .message-input {
             width: 100%;
             padding: 15px;
@@ -243,6 +267,19 @@
             background-color: #ffffff;
         }
 
+        body.light-mode .compute-node-status {
+            border-color: rgba(0, 123, 255, 0.35);
+            background-color: rgba(0, 123, 255, 0.08);
+        }
+
+        body.light-mode .compute-node-status__label {
+            color: #333333;
+        }
+
+        body.light-mode .compute-node-status__meta {
+            color: #666666;
+        }
+
         body.light-mode .message {
             background-color: #eeeeee;
             color: #333333;
@@ -316,6 +353,10 @@
         <hr>
 
         <h2>Try it out:</h2>
+        <div class="compute-node-status" v-cloak aria-live="polite" data-testid="compute-node-status">
+            <p class="compute-node-status__label">{{ computeNodeStatusText }}</p>
+            <p class="compute-node-status__meta" v-if="computeNodeLastUpdatedLabel">{{ computeNodeLastUpdatedLabel }}</p>
+        </div>
         <div class="chat-container" v-cloak>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>

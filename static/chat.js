@@ -1,5 +1,6 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
+const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 30000;
 
 new Vue({
     el: '#app',
@@ -11,7 +12,11 @@ new Vue({
         clientPublicKey: null,
         isGeneratingResponse: false,
         isTouchInput: false,
-        relayApiV1NonStreaming: true
+        relayApiV1NonStreaming: true,
+        computeNodeCount: null,
+        computeNodeCountStatus: 'loading',
+        computeNodeCountLastUpdatedAt: null,
+        computeNodeCountPollTimer: null
     },
     mounted() {
         this.detectTouchInput();
@@ -21,6 +26,32 @@ new Vue({
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
         });
+        this.startComputeNodeCountPolling();
+    },
+    computed: {
+        computeNodeStatusText() {
+            if (this.computeNodeCountStatus === 'error') {
+                return 'Live compute nodes: unavailable';
+            }
+            if (typeof this.computeNodeCount === 'number') {
+                return `Live compute nodes: ${this.computeNodeCount}`;
+            }
+            return 'Live compute nodes: loading...';
+        },
+
+        computeNodeLastUpdatedLabel() {
+            if (this.computeNodeCountStatus === 'error') {
+                return 'Diagnostics temporarily unavailable';
+            }
+            if (!this.computeNodeCountLastUpdatedAt) {
+                return '';
+            }
+            return `Updated ${this.computeNodeCountLastUpdatedAt.toLocaleTimeString([], {
+                hour: 'numeric',
+                minute: '2-digit',
+                second: '2-digit'
+            })}`;
+        }
     },
     methods: {
         detectTouchInput() {
@@ -71,6 +102,49 @@ new Vue({
             }
 
             return null;
+        },
+
+        startComputeNodeCountPolling() {
+            this.refreshComputeNodeCount();
+            this.stopComputeNodeCountPolling();
+            this.computeNodeCountPollTimer = setInterval(() => {
+                this.refreshComputeNodeCount();
+            }, COMPUTE_NODE_COUNT_POLL_INTERVAL_MS);
+        },
+
+        stopComputeNodeCountPolling() {
+            if (this.computeNodeCountPollTimer) {
+                clearInterval(this.computeNodeCountPollTimer);
+                this.computeNodeCountPollTimer = null;
+            }
+        },
+
+        async refreshComputeNodeCount() {
+            try {
+                const response = await fetch('/relay/diagnostics', {
+                    cache: 'no-store',
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Diagnostics request failed with status ${response.status}`);
+                }
+
+                const diagnostics = await response.json();
+                const count = diagnostics && diagnostics.total_registered_compute_nodes;
+                if (!Number.isFinite(count) || count < 0) {
+                    throw new Error('Diagnostics response did not include a valid compute-node count');
+                }
+
+                this.computeNodeCount = count;
+                this.computeNodeCountStatus = 'ready';
+                this.computeNodeCountLastUpdatedAt = new Date();
+            } catch (error) {
+                console.warn('Unable to refresh compute-node diagnostics:', error);
+                this.computeNodeCountStatus = 'error';
+            }
         },
 
         getServerPublicKey() {
@@ -593,6 +667,7 @@ new Vue({
         }
     },
     beforeDestroy() {
+        this.stopComputeNodeCountPolling();
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

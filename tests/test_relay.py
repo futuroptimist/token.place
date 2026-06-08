@@ -1028,6 +1028,81 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monke
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
 
 
+
+def test_relay_diagnostics_counts_live_registered_api_v1_compute_nodes(client):
+    """Diagnostics count should include live API v1 compute-node registrations."""
+    server_a = _server_key("diagnostics-live-a")
+    server_b = _server_key("diagnostics-live-b")
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 2
+    assert {node["server_public_key"] for node in payload["registered_compute_nodes"]} == {
+        server_a,
+        server_b,
+    }
+
+
+def test_relay_diagnostics_empty_relay_reports_zero_compute_nodes(client):
+    """Diagnostics count should be zero before any compute node registers."""
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 0
+    assert payload["registered_compute_nodes"] == []
+
+
+def test_relay_diagnostics_evicts_stale_compute_nodes_before_counting(client):
+    """Diagnostics count should exclude compute nodes past their heartbeat lease."""
+    stale_server = _server_key("diagnostics-stale")
+    known_servers[stale_server] = {
+        "public_key": stale_server,
+        "last_ping": datetime.now() - timedelta(seconds=5),
+        "last_ping_duration": 1,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 0
+    assert payload["registered_compute_nodes"] == []
+    assert stale_server not in known_servers
+
+
+def test_relay_diagnostics_does_not_expose_private_compute_node_material(client):
+    """Diagnostics should not leak private keys or secrets from relay-owned state."""
+    server_public_key = _server_key("diagnostics-private-material")
+    known_servers[server_public_key] = {
+        "public_key": server_public_key,
+        "private_key": "PRIVATE KEY MATERIAL SHOULD NOT LEAK",
+        "server_private_key": "SERVER PRIVATE KEY SHOULD NOT LEAK",
+        "relay_token": "SECRET RELAY TOKEN SHOULD NOT LEAK",
+        "last_ping": datetime.now(),
+        "last_ping_duration": 60,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+
+    response = client.get("/relay/diagnostics")
+    response_text = response.get_data(as_text=True)
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert payload["total_registered_compute_nodes"] == 1
+    assert "PRIVATE KEY MATERIAL SHOULD NOT LEAK" not in response_text
+    assert "SERVER PRIVATE KEY SHOULD NOT LEAK" not in response_text
+    assert "SECRET RELAY TOKEN SHOULD NOT LEAK" not in response_text
+    assert "private_key" not in response_text
+    assert "relay_token" not in response_text
+
 def test_relay_diagnostics_reports_explicit_upstream_env(client, monkeypatch):
     """Diagnostics should retain configured_upstream_servers for explicit upstream env config."""
     configured_servers = ["https://configured-one.example.com:8000"]

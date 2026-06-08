@@ -602,12 +602,15 @@ def test_runtime_root_prefers_token_place_python_import_root_with_config_py(monk
     assert resolved == runtime_root.resolve()
 
 
-def test_runtime_root_with_invalid_env_var_warns_and_falls_back(monkeypatch, capsys):
-    script_path = Path('/tmp/token-place/python/desktop_runtime_setup.py')
-    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', '/tmp/not-a-runtime-root')
+def test_runtime_root_with_invalid_env_var_warns_and_falls_back(monkeypatch, tmp_path, capsys):
+    script_path = tmp_path / 'isolated-runtime' / 'python' / 'desktop_runtime_setup.py'
+    invalid_env_root = tmp_path / 'not-a-runtime-root'
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(invalid_env_root))
     monkeypatch.setattr(desktop_runtime_setup, '__file__', str(script_path))
+
     resolved = desktop_runtime_setup._resolve_runtime_root()
     captured = capsys.readouterr()
+
     assert 'TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root' in captured.err
     assert resolved == script_path.resolve().parents[3]
 

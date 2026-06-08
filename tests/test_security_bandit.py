@@ -71,10 +71,10 @@ def test_bandit_reports_no_medium_or_high_findings():
         )
 
     scanned_paths = set(report.get("metrics", {}))
-    desktop_runtime_verifier = (
-        repo_root / "desktop-tauri" / "scripts" / "verify_desktop_runtime.py"
-    )
-    assert str(desktop_runtime_verifier) in scanned_paths
+    desktop_script_paths = sorted((repo_root / "desktop-tauri" / "scripts").glob("*.py"))
+    assert desktop_script_paths, "Expected checked-in desktop Python scripts to scan"
+    for desktop_script_path in desktop_script_paths:
+        assert str(desktop_script_path) in scanned_paths
     assert not any("/.venv/" in path for path in scanned_paths)
     assert not any("/node_modules/" in path for path in scanned_paths)
 

@@ -261,6 +261,90 @@ def _queue_api_v1_request(client, *, server_public_key, request_id, client_publi
     assert response.status_code == 200
     return response
 
+
+def test_relay_diagnostics_count_includes_live_api_v1_compute_nodes(client):
+    """Diagnostics should expose the live registered compute-node total operators curl."""
+
+    server_a = _server_key("diag-live-a")
+    server_b = _server_key("diag-live-b")
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert payload["total_registered_compute_nodes"] == 2
+    assert {node["server_public_key"] for node in payload["registered_compute_nodes"]} == {
+        server_a,
+        server_b,
+    }
+
+
+def test_relay_diagnostics_empty_relay_returns_zero(client):
+    """Diagnostics should report zero, not an error, when no compute nodes are live."""
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 0
+    assert payload["registered_compute_nodes"] == []
+
+
+def test_relay_diagnostics_evicts_stale_compute_nodes_before_count(client):
+    """Stale registrations should be evicted before diagnostics calculates the count."""
+
+    live_server = _server_key("diag-live")
+    stale_server = _server_key("diag-stale")
+    _register_api_v1_server(client, live_server)
+    _register_api_v1_server(client, stale_server)
+    known_servers[stale_server]["last_ping"] = datetime.now() - timedelta(seconds=120)
+    known_servers[stale_server]["last_ping_duration"] = 1
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 1
+    assert [node["server_public_key"] for node in payload["registered_compute_nodes"]] == [
+        live_server
+    ]
+    assert stale_server not in known_servers
+
+
+def test_relay_diagnostics_does_not_expose_private_material(client):
+    """Diagnostics must stay safe for operator curl usage and avoid private fields."""
+
+    server_public_key = _server_key("diag-safe")
+    known_servers[server_public_key] = {
+        "public_key": server_public_key,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+        relay_module.API_V1_SERVER_MARKER: True,
+        "private_key": "should-not-leak",
+        "api_key": "secret-token",
+        "cipherkey": "opaque-but-not-needed",
+    }
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+    encoded = json.dumps(payload)
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 1
+    assert "should-not-leak" not in encoded
+    assert "secret-token" not in encoded
+    assert "private_key" not in encoded
+    assert "api_key" not in encoded
+    assert set(payload["registered_compute_nodes"][0]) == {
+        "server_public_key",
+        "age_seconds",
+        "next_ping_in_x_seconds",
+        "queue_depth",
+    }
+
 # --- Test /sink ---
 
 def test_sink_register_new_server(client):

@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import threading
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 import time
 
 from encrypt import encrypt
@@ -36,6 +36,74 @@ def test_root_page_loads(page: Page, base_url: str, setup_servers):
     headings = page.locator("h1, h2, h3").all()
     assert len(headings) > 0, "Page should contain at least one heading"
     print(f"✓ Found {len(headings)} headings on the page")
+
+
+def test_compute_node_count_renders_diagnostics_count(page: Page, base_url: str, setup_servers):
+    """Landing page should render the relay diagnostics compute-node count."""
+
+    page.route(
+        "**/relay/diagnostics",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json", "Cache-Control": "no-store"},
+            body=json.dumps({"total_registered_compute_nodes": 3}),
+        ),
+    )
+
+    page.goto(base_url)
+    widget = page.locator('[data-testid="compute-node-count"]')
+    widget.wait_for(state="visible")
+    expect(widget).to_contain_text(re.compile(r"Live compute nodes:\s*3"))
+    assert "Last updated" in widget.inner_text()
+
+
+def test_compute_node_count_updates_on_refresh_without_page_reload(
+    page: Page, base_url: str, setup_servers
+):
+    """The diagnostics widget should update when its Vue refresh method runs."""
+
+    current_count = {"value": 1}
+
+    def handle_diagnostics(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json", "Cache-Control": "no-store"},
+            body=json.dumps({"total_registered_compute_nodes": current_count["value"]}),
+        )
+
+    page.route("**/relay/diagnostics", handle_diagnostics)
+
+    page.goto(base_url)
+    selector = '[data-testid="compute-node-count"]'
+    expect(page.locator(selector)).to_contain_text(re.compile(r"Live compute nodes:\s*1"))
+
+    current_count["value"] = 5
+    page.evaluate("() => document.querySelector('#app').__vue__.fetchComputeNodeCount()")
+    expect(page.locator(selector)).to_contain_text(re.compile(r"Live compute nodes:\s*5"))
+
+
+def test_compute_node_count_failure_is_graceful(page: Page, base_url: str, setup_servers):
+    """Diagnostics failures should show a non-alarming status and leave chat UI usable."""
+
+    page.route(
+        "**/relay/diagnostics",
+        lambda route: route.fulfill(
+            status=503,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": "diagnostics unavailable"}),
+        ),
+    )
+
+    page.goto(base_url)
+    widget = page.locator('[data-testid="compute-node-count"]')
+    widget.wait_for(state="visible")
+    page.wait_for_function(
+        "selector => document.querySelector(selector)?.textContent.includes('temporarily unavailable')",
+        arg='[data-testid="compute-node-count"]',
+    )
+    assert page.locator("textarea").first.is_enabled()
+    assert page.locator("button", has_text="Send").is_enabled()
+
 
 def test_send_message(page: Page, base_url: str, setup_servers):
     """Test basic page interaction."""

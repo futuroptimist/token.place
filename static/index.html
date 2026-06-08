@@ -79,6 +79,32 @@
             padding: 20px;
             margin-top: 30px;
         }
+        .compute-node-status {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+            padding: 10px 12px;
+            border: 1px solid rgba(0, 255, 255, 0.35);
+            border-radius: 8px;
+            background-color: rgba(0, 255, 255, 0.08);
+            color: #ffffff;
+            font-size: 15px;
+        }
+        .compute-node-status strong {
+            color: #00ffff;
+            font-weight: 500;
+        }
+        .compute-node-status small {
+            color: #bbbbbb;
+            font-size: 12px;
+        }
+        .compute-node-status.error {
+            border-color: rgba(255, 255, 255, 0.18);
+            background-color: rgba(255, 255, 255, 0.06);
+        }
         .message-input {
             width: 100%;
             padding: 15px;
@@ -243,6 +269,20 @@
             background-color: #ffffff;
         }
 
+        body.light-mode .compute-node-status {
+            border-color: rgba(0, 123, 255, 0.35);
+            background-color: rgba(0, 123, 255, 0.08);
+            color: #333333;
+        }
+
+        body.light-mode .compute-node-status strong {
+            color: #007bff;
+        }
+
+        body.light-mode .compute-node-status small {
+            color: #666666;
+        }
+
         body.light-mode .message {
             background-color: #eeeeee;
             color: #333333;
@@ -317,6 +357,20 @@
 
         <h2>Try it out:</h2>
         <div class="chat-container" v-cloak>
+            <div
+                class="compute-node-status"
+                :class="{error: computeNodeCountStatus === 'error'}"
+                data-testid="compute-node-count"
+                aria-live="polite"
+            >
+                <span>
+                    <strong>Live compute nodes:</strong>
+                    <span v-if="computeNodeCountStatus === 'loading'">Loading…</span>
+                    <span v-else-if="computeNodeCountStatus === 'ready'">{{ computeNodeCount }}</span>
+                    <span v-else>temporarily unavailable</span>
+                </span>
+                <small v-if="computeNodeCountLastUpdated">Last updated {{ computeNodeCountLastUpdated }}</small>
+            </div>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>

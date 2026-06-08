@@ -82,6 +82,128 @@ def test_multi_turn_conversation(page: Page, base_url: str, setup_servers):
 # Add more E2E tests here as the UI evolves
 
 
+def test_landing_chat_model_dropdown_uses_api_v1_selection(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """The landing chat model dropdown should be driven by GET /api/v1/models."""
+
+    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+    requested_models = []
+    v2_requests = []
+
+    page.route(
+        "**/api/v1/public-key",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": server_public_key_b64}),
+        ),
+    )
+    page.route(
+        "**/api/v1/models",
+        lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "first-api-v1-model",
+                            "object": "model",
+                            "owned_by": "token.place",
+                            "root": "first-api-v1-model",
+                            "description": "First model from the mocked API v1 list.",
+                        },
+                        {
+                            "id": "second-api-v1-model",
+                            "object": "model",
+                            "name": "Second test model",
+                            "owned_by": "community",
+                            "root": "second-api-v1-model",
+                            "description": "Second model from the mocked API v1 list.",
+                        },
+                    ],
+                }
+            ),
+        ),
+    )
+
+    def handle_chat_request(route):
+        request_json = route.request.post_data_json
+        requested_models.append(request_json.get("model"))
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": f"Used {request_json.get('model')}",
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.fulfill(status=500, body="v2 should not be called")
+
+    page.route("**/api/v1/chat/completions", handle_chat_request)
+    page.route("**/api/v2/**", record_v2_request)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    model_select = page.get_by_test_id("landing-chat-model-select")
+    assert model_select.input_value() == "first-api-v1-model"
+    assert model_select.locator("option").nth(0).get_attribute("value") == "first-api-v1-model"
+    assert model_select.locator("option").nth(1).get_attribute("value") == "second-api-v1-model"
+
+    model_select.select_option("second-api-v1-model")
+    send_button = page.locator("button", has_text="Send")
+    send_button.wait_for(state="visible")
+    page.wait_for_function("button => !button.disabled", arg=send_button.element_handle())
+
+    page.locator("textarea").first.fill("hello selected model")
+    send_button.click()
+
+    assistant_message = page.locator(".assistant-message").last
+    assistant_message.wait_for(state="visible")
+    assert "Used second-api-v1-model" in assistant_message.inner_text()
+    assert requested_models == ["second-api-v1-model"]
+    assert v2_requests == []
+
+
+def test_landing_chat_model_dropdown_falls_back_when_api_v1_models_fail(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """A /api/v1/models failure should show a non-blocking fallback message."""
+
+    page.route("**/api/v1/models", lambda route: route.fulfill(status=503, body="unavailable"))
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    assert page.get_by_text("Unable to load the API v1 model list.").is_visible()
+
+
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
     """The chat UI should render markdown formatting returned by the assistant."""
 

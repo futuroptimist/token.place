@@ -109,6 +109,38 @@
             text-align: left;
             background-color: rgba(255, 255, 255, 0.1);
         }
+        .model-picker {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+        .model-picker label {
+            color: #00ffff;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .model-select {
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 5px;
+            background-color: rgba(255, 255, 255, 0.2);
+            color: #ffffff;
+            font-size: 16px;
+        }
+        .model-select option {
+            color: #111111;
+        }
+        .model-status {
+            margin: 0;
+            font-size: 14px;
+            line-height: 1.4;
+            color: #cccccc;
+        }
+        .model-error {
+            color: #ffcc66;
+        }
         .input-container {
             display: flex;
             gap: 12px;
@@ -258,9 +290,22 @@
             color: #333333;
         }
 
-        body.light-mode .message-input {
+        body.light-mode .message-input,
+        body.light-mode .model-select {
             background-color: #ffffff;
             color: #333333;
+        }
+
+        body.light-mode .model-picker label {
+            color: #007bff;
+        }
+
+        body.light-mode .model-status {
+            color: #555555;
+        }
+
+        body.light-mode .model-error {
+            color: #8a5a00;
         }
 
         body.light-mode .send-button {
@@ -317,6 +362,27 @@
 
         <h2>Try it out:</h2>
         <div class="chat-container" v-cloak>
+            <div class="model-picker">
+                <label for="landing-chat-model">Model</label>
+                <select
+                    id="landing-chat-model"
+                    v-model="selectedModelId"
+                    class="model-select"
+                    aria-label="Model"
+                    data-testid="landing-chat-model-select"
+                    :disabled="isLoadingModels || models.length === 0"
+                >
+                    <option v-if="isLoadingModels" value="">Loading API v1 models…</option>
+                    <option v-else-if="models.length === 0" value="">No API v1 models returned</option>
+                    <option v-for="model in models" :key="model.id" :value="model.id">
+                        {{ formatModelLabel(model) }}
+                    </option>
+                </select>
+                <p v-if="isLoadingModels" class="model-status">Loading API v1 models…</p>
+                <p v-else-if="modelListError" class="model-status model-error">{{ modelListError }}</p>
+                <p v-else-if="selectedModelMetadata()" class="model-status">{{ selectedModelMetadata() }}</p>
+                <p v-else-if="models.length === 0" class="model-status">No models are currently advertised by API v1.</p>
+            </div>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>
@@ -339,6 +405,7 @@
                     @touchstart.prevent="sendMessage"
                     class="send-button"
                     :class="{'touch-optimized': isTouchInput}"
+                    :disabled="!canSendMessage"
                 >
                     Send
                 </button>

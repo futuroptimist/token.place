@@ -589,13 +589,14 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     manager = FakeManager()
     _install_fake_manager_module(manager)
 
-    runtime_setup_module = sys.modules['desktop_runtime_setup']
+    original_ensure_runtime = inference_sidecar.ensure_desktop_llama_runtime
+    runtime_setup_globals = original_ensure_runtime.__globals__
 
     class _WinSysStub:
         platform = 'win32'
         executable = sys.executable
 
-    probe = runtime_setup_module.RuntimeProbe(
+    probe = runtime_setup_globals['RuntimeProbe'](
         backend='cpu',
         detected_device='cpu',
         gpu_offload_supported=False,
@@ -606,25 +607,30 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     )
     repair_calls = {'source': 0, 'retry_gate': 0}
 
-    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
-    monkeypatch.delenv(runtime_setup_module.DISABLE_BOOTSTRAP_ENV, raising=False)
-    monkeypatch.delenv(runtime_setup_module.ENABLE_BOOTSTRAP_ENV, raising=False)
-    monkeypatch.setattr(runtime_setup_module, '_probe_llama_runtime', lambda **_: probe)
-    monkeypatch.setattr(
-        runtime_setup_module,
+    monkeypatch.setitem(runtime_setup_globals, 'sys', _WinSysStub)
+    monkeypatch.delenv(runtime_setup_globals['DISABLE_BOOTSTRAP_ENV'], raising=False)
+    monkeypatch.delenv(runtime_setup_globals['ENABLE_BOOTSTRAP_ENV'], raising=False)
+    monkeypatch.setitem(runtime_setup_globals, '_probe_llama_runtime', lambda **_: probe)
+    monkeypatch.setitem(
+        runtime_setup_globals,
         '_windows_cuda_source_repair',
         lambda _requirements_path: (
             repair_calls.__setitem__('source', repair_calls['source'] + 1) or True,
             'ok',
         ),
     )
-    monkeypatch.setattr(
-        runtime_setup_module,
+    monkeypatch.setitem(
+        runtime_setup_globals,
         '_should_attempt_source_repair',
         lambda: (
             repair_calls.__setitem__('retry_gate', repair_calls['retry_gate'] + 1) or True,
             '',
         ),
+    )
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        lambda mode: original_ensure_runtime(mode),
     )
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')

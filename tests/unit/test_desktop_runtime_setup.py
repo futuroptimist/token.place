@@ -608,7 +608,10 @@ def test_runtime_root_with_invalid_env_var_warns_and_falls_back(monkeypatch, cap
     resolved = desktop_runtime_setup._resolve_runtime_root()
     captured = capsys.readouterr()
     assert 'TOKEN_PLACE_PYTHON_IMPORT_ROOT was set but does not look like a runtime root' in captured.err
-    assert resolved == Path('/').resolve()
+    expected_fallback = desktop_runtime_setup._safe_resolve_path(
+        '/tmp/token-place/python/desktop_runtime_setup.py'
+    ).parents[3]
+    assert resolved == expected_fallback
 
 
 def test_runtime_root_ignores_existing_but_invalid_env_path_and_falls_back_to_marker_ancestor(

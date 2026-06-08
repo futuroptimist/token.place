@@ -609,7 +609,12 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
     monkeypatch.delenv(runtime_setup_module.DISABLE_BOOTSTRAP_ENV, raising=False)
     monkeypatch.delenv(runtime_setup_module.ENABLE_BOOTSTRAP_ENV, raising=False)
-    monkeypatch.setattr(runtime_setup_module, '_probe_llama_runtime', lambda **_: probe)
+    monkeypatch.setattr(runtime_setup_module, '_probe_runtime', lambda _runtime_root: probe)
+    monkeypatch.setattr(
+        inference_sidecar,
+        'ensure_desktop_llama_runtime',
+        runtime_setup_module.ensure_desktop_llama_runtime,
+    )
     monkeypatch.setattr(
         runtime_setup_module,
         '_windows_cuda_source_repair',

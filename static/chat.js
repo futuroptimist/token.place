@@ -786,8 +786,9 @@ new Vue({
                     return encryptedResponse;
                 }
 
+                const responseCiphertext = encryptedResponse.chat_history || encryptedResponse.ciphertext;
                 const decryptedJson = await this.decrypt(
-                    encryptedResponse.ciphertext,
+                    responseCiphertext,
                     encryptedResponse.cipherkey,
                     encryptedResponse.iv
                 );

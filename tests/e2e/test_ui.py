@@ -135,7 +135,7 @@ def route_landing_relay_chat(
             headers={"Content-Type": "application/json"},
             body=json.dumps(
                 {
-                    "ciphertext": json.dumps(
+                    "chat_history": json.dumps(
                         {
                             "protocol": "tokenplace_api_v1_relay_e2ee",
                             "version": 1,
@@ -710,7 +710,7 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
             headers={"Content-Type": "application/json"},
             body=json.dumps(
                 {
-                    "ciphertext": json.dumps(
+                    "chat_history": json.dumps(
                         {
                             "protocol": "tokenplace_api_v1_relay_e2ee",
                             "version": 1,

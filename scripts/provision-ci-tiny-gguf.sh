@@ -25,17 +25,26 @@ mkdir -p "$(dirname "$MODEL_PATH")"
 
 verify_sha256() {
     local file_path=$1
-    if command -v sha256sum >/dev/null 2>&1; then
+    if command -v sha256sum >/dev/null 2>&1 && sha256sum --help 2>&1 | grep -q -- '--check'; then
         printf '%s  %s\n' "$MODEL_SHA256" "$file_path" | sha256sum --check
-    else
-        local actual_sha
+        return
+    fi
+
+    local actual_sha
+    if command -v shasum >/dev/null 2>&1; then
         actual_sha="$(shasum -a 256 "$file_path" | awk '{print $1}')"
-        if [ "$actual_sha" != "$MODEL_SHA256" ]; then
-            echo "Error: SHA256 mismatch for $file_path" >&2
-            echo "Expected: $MODEL_SHA256" >&2
-            echo "Actual:   $actual_sha" >&2
-            exit 1
-        fi
+    elif command -v openssl >/dev/null 2>&1; then
+        actual_sha="$(openssl dgst -sha256 -r "$file_path" | awk '{print $1}')"
+    else
+        echo "Error: no supported SHA256 verifier found (need GNU sha256sum, shasum, or openssl)" >&2
+        exit 1
+    fi
+
+    if [ "$actual_sha" != "$MODEL_SHA256" ]; then
+        echo "Error: SHA256 mismatch for $file_path" >&2
+        echo "Expected: $MODEL_SHA256" >&2
+        echo "Actual:   $actual_sha" >&2
+        exit 1
     fi
 }
 

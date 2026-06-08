@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import stat
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -59,6 +63,48 @@ def _job_steps(job: dict) -> list[dict]:
 
 def _step_runs(job: dict) -> str:
     return "\n".join(str(step.get("run", "")) for step in _job_steps(job))
+
+
+
+def test_tiny_gguf_provisioning_accepts_macos_bsd_sha256sum(
+    tmp_path: Path,
+) -> None:
+    model_bytes = b"tiny gguf sentinel fixture"
+    model_sha = hashlib.sha256(model_bytes).hexdigest()
+    model_path = tmp_path / "stories15M-q4_0.gguf"
+    model_path.write_bytes(model_bytes)
+
+    script_text = Path("scripts/provision-ci-tiny-gguf.sh").read_text(encoding="utf-8")
+    script_text = script_text.replace(
+        'MODEL_SHA256="6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04"',
+        f'MODEL_SHA256="{model_sha}"',
+    )
+    script_path = tmp_path / "provision-ci-tiny-gguf.sh"
+    script_path.write_text(script_text, encoding="utf-8")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_sha256sum = fake_bin / "sha256sum"
+    fake_sha256sum.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'usage: sha256sum [-bctwz] [files ...]' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_sha256sum.chmod(fake_sha256sum.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+
+    completed = subprocess.run(
+        ["bash", str(script_path), str(model_path)],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "Provisioned tiny GGUF model" in completed.stdout
 
 
 def test_required_workflows_trigger_on_pull_requests() -> None:

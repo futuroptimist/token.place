@@ -250,6 +250,122 @@ CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
     assert v2_requests == []
 
 
+def test_landing_chat_model_dropdown_uses_api_v1_models(
+    page: Page,
+    base_url: str,
+    setup_servers,
+):
+    """The landing chat model selector is populated from API v1 and drives chat payloads."""
+
+    server_public_key_pem = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnFBKDAvTZEd+IlS59FKV
+VFp4DT28sL1iHwZ94dJ5x5lf+Kq4Wxcl8COEQ3rp3QseM2MkAdZ1VvWbUmsonFux
+7pVLQDyE+ANQkNd4K840zWV+CghTz34jxK59pb6cifSto7J8Wy7EqhUru7YLhnqZ
+xz/AuHBPrq0RUS7f+ycJtfA6vj9Isp0BYpvgwOP97Ey+nCLiR5C/3IazOZblHQ7R
+CbfZqP+encMwRbH/IvrXrz6/vecuIrq60fFtyZIbs7dASpfuSL6atIABu6CiSlXy
++6EhlEdmAXaCOPlQMYjc4u2ZNrOUTjuh3Yw8hMGezsTfTYZd2rrbGZRlkpfKbIdX
+0QIDAQAB
+-----END PUBLIC KEY-----"""
+    server_public_key_b64 = base64.b64encode(server_public_key_pem.encode("utf-8")).decode("ascii")
+
+    models_payload = {
+        "object": "list",
+        "data": [
+            {
+                "id": "api-v1-first-model",
+                "object": "model",
+                "owned_by": "token.place",
+                "root": "api-v1-first-model",
+            },
+            {
+                "id": "api-v1-second-model",
+                "object": "model",
+                "owned_by": "community",
+                "root": "api-v1-second-model",
+            },
+        ],
+    }
+
+    chat_payloads = []
+    v2_requests = []
+
+    def handle_models(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(models_payload),
+        )
+
+    def handle_public_key(route):
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"public_key": server_public_key_b64}),
+        )
+
+    def handle_chat(route):
+        request_json = route.request.post_data_json
+        chat_payloads.append(request_json)
+        route.fulfill(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Selected model acknowledged.",
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+    def record_v2_request(route):
+        v2_requests.append(route.request.url)
+        route.fulfill(status=500, body="API v2 should not be called by the landing chat")
+
+    page.route("**/api/v1/models", handle_models)
+    page.route("**/api/v1/public-key", handle_public_key)
+    page.route("**/api/v1/chat/completions", handle_chat)
+    page.route("**/api/v2/**", record_v2_request)
+
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    model_select = page.get_by_test_id("landing-model-select")
+    model_select.wait_for(state="visible")
+    assert model_select.input_value() == "api-v1-first-model"
+    assert model_select.locator("option").all_inner_texts() == [
+        "api-v1-first-model",
+        "api-v1-second-model",
+    ]
+
+    model_select.select_option("api-v1-second-model")
+
+    textarea = page.locator("textarea").first
+    textarea.fill("Use the selected model")
+    send_button = page.locator("button", has_text="Send")
+    page.wait_for_function(
+        """
+        () => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const send = buttons.find((button) => button.textContent.includes('Send'));
+            return Boolean(send && !send.disabled);
+        }
+        """
+    )
+    send_button.click()
+
+    page.locator(".assistant-message").last.wait_for(state="visible")
+    assert chat_payloads, "expected the landing chat to POST an API v1 chat payload"
+    assert chat_payloads[-1]["model"] == "api-v1-second-model"
+    assert chat_payloads[-1].get("encrypted") is True
+    assert v2_requests == []
+
+
 @pytest.mark.e2e
 def test_landing_chat_shows_no_servers_available_message(
     page: Page,

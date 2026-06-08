@@ -134,6 +134,28 @@
         .model-error {
             color: #ffcc66;
         }
+        .server-session-status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin: 0 0 15px;
+            color: #cccccc;
+            font-size: 13px;
+        }
+        .server-key-label {
+            color: #00ffff;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        .new-session-button {
+            padding: 8px 12px;
+            border-radius: 5px;
+            border: 1px solid rgba(0, 255, 255, 0.5);
+            background-color: rgba(0, 255, 255, 0.08);
+            color: #ffffff;
+            cursor: pointer;
+        }
         .message-input {
             width: 100%;
             padding: 15px;
@@ -423,6 +445,18 @@
                 <p v-if="modelsLoading" class="model-status">Loading API v1 models…</p>
                 <p v-else-if="modelsError" class="model-status model-error">{{ modelsError }}</p>
                 <p v-else-if="selectedModelSummary" class="model-status">{{ selectedModelSummary }}</p>
+            </div>
+            <div class="server-session-status" data-testid="landing-server-session">
+                <span v-if="selectedServerKeyLabel" class="server-key-label">Server: {{ selectedServerKeyLabel }}</span>
+                <span v-else>Server: selected on first message</span>
+                <button
+                    v-if="selectedServerUnavailable"
+                    @click="startNewChatSession"
+                    class="new-session-button"
+                    type="button"
+                >
+                    New chat session
+                </button>
             </div>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>

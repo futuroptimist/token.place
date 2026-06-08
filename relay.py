@@ -1790,7 +1790,7 @@ def api_v1_relay_requests():
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
-            "server_public_key": server_public_key,
+            "server_fingerprint": _safe_key_fingerprint(server_public_key),
             "request_id": envelope.get("request_id"),
             "queued_at_unix": queued_at,
             "queue_depth": queue_depth,

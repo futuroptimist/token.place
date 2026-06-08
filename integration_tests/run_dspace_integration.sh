@@ -34,7 +34,10 @@ ensure_repo() {
   local url="$2"
   local dest="$3"
   shift 3 || true
-  local extra_args=("$@")
+  local -a extra_args=()
+  if [[ $# -gt 0 ]]; then
+    extra_args=("$@")
+  fi
 
   if [[ ! -d "$dest" ]]; then
     log_step "Cloning $name repository..."

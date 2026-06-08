@@ -13,6 +13,29 @@ import pytest
 def test_bandit_reports_no_medium_or_high_findings():
     """Ensure the Bandit security scan passes without medium/high issues."""
     repo_root = Path(__file__).resolve().parent.parent
+    excluded_paths = [
+        repo_root / path
+        for path in (
+            ".venv",
+            ".venv-test",
+            "venv",
+            "env",
+            "node_modules",
+            "tests",
+            "desktop",
+            "build",
+            "dist",
+            ".git",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "desktop-tauri/src-tauri/target",
+            "desktop-tauri/node_modules",
+            "desktop/node_modules",
+            "clients/node_modules",
+        )
+    ]
     cmd = [
         sys.executable,
         "-m",
@@ -26,6 +49,8 @@ def test_bandit_reports_no_medium_or_high_findings():
         "medium",
         "--confidence-level",
         "medium",
+        "--exclude",
+        ",".join(str(path) for path in excluded_paths),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(repo_root))

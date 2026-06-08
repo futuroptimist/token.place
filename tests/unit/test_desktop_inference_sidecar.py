@@ -24,6 +24,15 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(inference_sidecar)
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_desktop_arch(monkeypatch):
+    """Keep simulated Windows runtime tests independent of the host CPU."""
+    setup_module = sys.modules.get('desktop_runtime_setup')
+    if setup_module is not None:
+        monkeypatch.setattr(setup_module.platform_module, 'machine', lambda: 'x86_64')
+
+
+
 def test_inference_sidecar_repairs_path_before_pathlib_import(tmp_path):
     polluted_site = tmp_path / 'site-packages'
     polluted_site.mkdir()

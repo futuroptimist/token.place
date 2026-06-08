@@ -27,6 +27,15 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_desktop_arch(monkeypatch):
+    """Keep simulated Windows runtime tests independent of the host CPU."""
+    setup_module = sys.modules.get('desktop_runtime_setup')
+    if setup_module is not None:
+        monkeypatch.setattr(setup_module.platform_module, 'machine', lambda: 'x86_64')
+
+
+
 class FakeModelManager:
     def __init__(self):
         self.model_path = ''

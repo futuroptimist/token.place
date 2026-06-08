@@ -44,10 +44,26 @@ def _is_site_packages_path(path_text: Any) -> bool:
 
 def _stdlib_roots_for_import_order() -> list[str]:
     roots: list[str] = []
-    for key in ('stdlib', 'platstdlib'):
-        value = sysconfig.get_paths().get(key)
-        if value:
-            roots.append(_subprocess_safe_path_text(value))
+    path_vars = [None]
+    base_vars = {
+        'base': getattr(sys, 'base_prefix', sys.prefix),
+        'platbase': getattr(sys, 'base_exec_prefix', getattr(sys, 'base_prefix', sys.prefix)),
+    }
+    if base_vars not in path_vars:
+        path_vars.append(base_vars)
+    for vars_override in path_vars:
+        try:
+            paths = sysconfig.get_paths(vars=vars_override) if vars_override else sysconfig.get_paths()
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        for key in ('stdlib', 'platstdlib'):
+            value = paths.get(key)
+            if value:
+                roots.append(_subprocess_safe_path_text(value))
+    for prefix in (getattr(sys, 'base_prefix', None), getattr(sys, 'base_exec_prefix', None), sys.prefix):
+        if prefix:
+            version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            roots.append(_subprocess_safe_path_text(Path(prefix) / 'lib' / version))
     deduped: list[str] = []
     seen: set[str] = set()
     for root in roots:
@@ -174,7 +190,7 @@ def _canonical_path_for_compare(module_path: Any) -> Optional[str]:
         return None
     try:
         path_text = _strip_windows_extended_path_prefix(str(module_path))
-        return os.path.normcase(os.path.normpath(os.path.abspath(path_text)))
+        return os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
     except (TypeError, ValueError, OSError):
         try:
             return os.path.normcase(os.path.normpath(_strip_windows_extended_path_prefix(str(module_path))))

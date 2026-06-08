@@ -27,6 +27,13 @@ class _SysStub:
     argv = [str(MODULE_PATH)]
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_desktop_arch(monkeypatch):
+    """Keep simulated Windows runtime tests independent of the host CPU."""
+    monkeypatch.setattr(desktop_runtime_setup.platform_module, 'machine', lambda: 'x86_64')
+
+
+
 def _probe(*, backend='cpu', gpu=False, device='cpu', error=None):
     return desktop_runtime_setup.RuntimeProbe(
         backend=backend,

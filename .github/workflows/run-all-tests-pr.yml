@@ -1,0 +1,165 @@
+name: run_all_tests.sh PR
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: run-all-tests-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-run-all-tests:
+    name: Linux run_all_tests.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Validate dependency compatibility
+        run: python scripts/validate_dependencies.py
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium and Linux system dependencies
+        run: python -m playwright install --with-deps chromium
+
+      - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        run: bash scripts/ci/provision_tiny_gguf.sh
+
+      - name: Run ./run_all_tests.sh
+        env:
+          TEST_COVERAGE: '1'
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: |
+          set -o pipefail
+          ./run_all_tests.sh 2>&1 | tee run_all_tests.log
+
+      - name: Summarize run_all_tests.sh failure
+        if: failure()
+        run: |
+          {
+            echo '## run_all_tests.sh failed on Linux'
+            echo ''
+            echo 'The visible PR check failed because `./run_all_tests.sh` or a required setup step failed.'
+            echo 'Review the job log and the uploaded `linux-run_all_tests-log` artifact.'
+            if [ -f run_all_tests.log ]; then
+              echo ''
+              echo '### Last 120 log lines'
+              echo '```text'
+              tail -n 120 run_all_tests.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run_all_tests.sh log
+        if: failure() && hashFiles('run_all_tests.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-run_all_tests-log
+          path: run_all_tests.log
+          if-no-files-found: error
+
+  macos-run-all-tests:
+    name: macOS run_all_tests.sh
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Validate dependency compatibility
+        run: python scripts/validate_dependencies.py
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium
+
+      - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
+        run: bash scripts/ci/provision_tiny_gguf.sh
+
+      - name: Run ./run_all_tests.sh
+        env:
+          TEST_COVERAGE: '1'
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: |
+          set -o pipefail
+          ./run_all_tests.sh 2>&1 | tee run_all_tests.log
+
+      - name: Summarize run_all_tests.sh failure
+        if: failure()
+        run: |
+          {
+            echo '## run_all_tests.sh failed on macOS'
+            echo ''
+            echo 'The visible PR check failed because `./run_all_tests.sh` or a required setup step failed.'
+            echo 'Review the job log and the uploaded `macos-run_all_tests-log` artifact.'
+            if [ -f run_all_tests.log ]; then
+              echo ''
+              echo '### Last 120 log lines'
+              echo '```text'
+              tail -n 120 run_all_tests.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run_all_tests.sh log
+        if: failure() && hashFiles('run_all_tests.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-run_all_tests-log
+          path: run_all_tests.log
+          if-no-files-found: error

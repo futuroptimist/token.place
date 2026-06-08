@@ -10,13 +10,47 @@ PR_REQUIRED_WORKFLOWS = {
     "ci-image.yml",
     "desktop-operator-e2e.yml",
     "desktop-release.yml",
+    "run-all-tests-pr.yml",
 }
+RUN_ALL_TESTS_PR_WORKFLOW = "run-all-tests-pr.yml"
 
 
 def _load_workflow(path: Path) -> dict:
     data = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     assert isinstance(data, dict), f"{path} should parse as a YAML mapping"
     return data
+
+
+def _step_runs_run_all_tests(step: dict) -> bool:
+    return any(
+        line.strip().startswith("./run_all_tests.sh")
+        for line in str(step.get("run", "")).splitlines()
+    )
+
+
+def _job_invokes_run_all_tests(job: dict) -> bool:
+    return any(
+        isinstance(step, dict) and _step_runs_run_all_tests(step)
+        for step in job.get("steps", [])
+    )
+
+
+def _run_all_tests_pr_workflow() -> dict:
+    return _load_workflow(WORKFLOW_DIR / RUN_ALL_TESTS_PR_WORKFLOW)
+
+
+def _run_all_tests_jobs(workflow_data: dict) -> dict[str, dict]:
+    jobs = workflow_data.get("jobs", {})
+    assert isinstance(jobs, dict), "run_all_tests PR workflow must define jobs"
+    selected = {
+        job_id: job
+        for job_id, job in jobs.items()
+        if isinstance(job, dict) and _job_invokes_run_all_tests(job)
+    }
+    assert (
+        selected
+    ), "run_all_tests PR workflow must have jobs that invoke ./run_all_tests.sh"
+    return selected
 
 
 def _workflow_on_block(data: dict, workflow_name: str) -> dict:
@@ -107,3 +141,142 @@ def test_run_all_tests_uses_absolute_default_real_e2e_model_path() -> None:
         "The default real desktop-bridge guardrail model path must be absolute so "
         "subprocess runtime warm-load checks can resolve it after changing working directories."
     )
+
+
+def test_pr_run_all_tests_workflow_exists_and_triggers_on_pull_requests() -> None:
+    workflow_path = WORKFLOW_DIR / RUN_ALL_TESTS_PR_WORKFLOW
+
+    assert (
+        workflow_path.exists()
+    ), "A dedicated PR-visible run_all_tests workflow must exist"
+
+    workflow_data = _run_all_tests_pr_workflow()
+    on_block = _workflow_on_block(workflow_data, RUN_ALL_TESTS_PR_WORKFLOW)
+
+    assert "pull_request" in on_block
+    assert "workflow_dispatch" in on_block
+
+
+def test_pr_run_all_tests_workflow_has_visible_linux_and_macos_jobs() -> None:
+    workflow_data = _run_all_tests_pr_workflow()
+    jobs = _run_all_tests_jobs(workflow_data)
+
+    linux_jobs = [
+        job for job in jobs.values() if str(job.get("runs-on", "")).startswith("ubuntu")
+    ]
+    macos_jobs = [
+        job for job in jobs.values() if str(job.get("runs-on", "")).startswith("macos")
+    ]
+
+    assert (
+        linux_jobs
+    ), "The PR workflow must expose a Linux job that runs ./run_all_tests.sh"
+    assert (
+        macos_jobs
+    ), "The PR workflow must expose a macOS job that runs ./run_all_tests.sh"
+    assert any(job.get("name") == "Linux run_all_tests.sh" for job in linux_jobs)
+    assert any(job.get("name") == "macOS run_all_tests.sh" for job in macos_jobs)
+
+
+def _assert_job_uses_python_312_and_node_20(job: dict, label: str) -> None:
+    steps = job.get("steps", [])
+    python_steps = [
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("uses") == "actions/setup-python@v5"
+    ]
+    node_steps = [
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("uses") == "actions/setup-node@v4"
+    ]
+
+    assert any(
+        step.get("with", {}).get("python-version") == "3.12" for step in python_steps
+    ), f"{label} run_all_tests job must use Python 3.12"
+    assert any(
+        step.get("with", {}).get("node-version") == "20" for step in node_steps
+    ), f"{label} run_all_tests job must use Node 20"
+
+
+def test_pr_run_all_tests_linux_job_uses_python_312_and_node_20() -> None:
+    workflow_data = _run_all_tests_pr_workflow()
+    jobs = _run_all_tests_jobs(workflow_data)
+    linux_jobs = [
+        job for job in jobs.values() if str(job.get("runs-on", "")).startswith("ubuntu")
+    ]
+    assert linux_jobs, "The PR workflow must include a Linux run_all_tests job"
+
+    for job in linux_jobs:
+        _assert_job_uses_python_312_and_node_20(job, "Linux")
+
+
+def test_pr_run_all_tests_macos_job_uses_python_312_and_node_20() -> None:
+    workflow_data = _run_all_tests_pr_workflow()
+    jobs = _run_all_tests_jobs(workflow_data)
+    macos_jobs = [
+        job for job in jobs.values() if str(job.get("runs-on", "")).startswith("macos")
+    ]
+    assert macos_jobs, "The PR workflow must include a macOS run_all_tests job"
+
+    for job in macos_jobs:
+        _assert_job_uses_python_312_and_node_20(job, "macOS")
+
+
+def test_pr_run_all_tests_jobs_do_not_hide_or_skip_suite_failures() -> None:
+    workflow_data = _run_all_tests_pr_workflow()
+
+    for job_id, job in _run_all_tests_jobs(workflow_data).items():
+        assert (
+            job.get("continue-on-error") != "true"
+        ), f"{job_id} must fail visibly when ./run_all_tests.sh fails"
+
+        steps = job.get("steps", [])
+        run_all_steps = [
+            step
+            for step in steps
+            if isinstance(step, dict) and _step_runs_run_all_tests(step)
+        ]
+        assert run_all_steps, f"{job_id} must include a ./run_all_tests.sh step"
+
+        for step in run_all_steps:
+            assert (
+                step.get("continue-on-error") != "true"
+            ), f"{job_id} must not mark the ./run_all_tests.sh step continue-on-error"
+            run_script = str(step.get("run", ""))
+            assert (
+                'exit "$status"' in run_script or "exit $status" in run_script
+            ), f"{job_id} must propagate the ./run_all_tests.sh exit status"
+            assert (
+                "GITHUB_STEP_SUMMARY" in run_script
+            ), f"{job_id} must append diagnostic context to the job summary"
+
+        combined_runs = "\n".join(
+            str(step.get("run", "")) for step in steps if isinstance(step, dict)
+        )
+        assert "steps.prep.outputs.rc != '2'" not in combined_runs
+        assert "steps.prep.outputs.rc == '2'" not in combined_runs
+        assert "Stop for reboot" not in combined_runs
+
+
+def test_pr_run_all_tests_tiny_gguf_guardrail_uses_github_workspace_path() -> None:
+    workflow_data = _run_all_tests_pr_workflow()
+    env = workflow_data.get("env", {})
+
+    assert (
+        env.get("TOKENPLACE_REAL_E2E_MODEL_PATH")
+        == "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf"
+    ), (
+        "The PR workflow must provide an absolute tiny GGUF path derived from "
+        "github.workspace so run_all_tests cannot silently skip the real guardrail."
+    )
+
+    for job_id, job in _run_all_tests_jobs(workflow_data).items():
+        combined_runs = "\n".join(
+            str(step.get("run", ""))
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+        )
+        assert (
+            'test -s "$TOKENPLACE_REAL_E2E_MODEL_PATH"' in combined_runs
+        ), f"{job_id} must fail preflight if the tiny GGUF was not provisioned"

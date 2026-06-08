@@ -17,47 +17,42 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
           cache-dependency-path: |
             requirements.txt
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
           cache: 'npm'
       - name: Prepare Raspberry Pi cgroups
-        id: prep
         run: |
           set +e
           sudo bash scripts/prepare-pi-cgroups.sh
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
-          exit 0
-      - name: Stop for reboot
-        if: steps.prep.outputs.rc == '2'
-        run: echo "Cgroup configuration updated. Reboot runner and re-run job."
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::Cgroup configuration updated but a reboot would be required; hosted CI cannot reboot, so this run_all_tests signal must fail instead of skipping the suite."
+            exit 1
+          fi
+          exit "$rc"
       - name: Validate dependency compatibility
         run: python scripts/validate_dependencies.py
-        if: steps.prep.outputs.rc != '2'
       - name: Install Python dependencies
-        if: steps.prep.outputs.rc != '2'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
       - name: Install Playwright browsers and system dependencies
-        if: steps.prep.outputs.rc != '2'
-        run: playwright install --with-deps chromium
+        run: python -m playwright install --with-deps chromium
       - name: Install Node.js dependencies
-        if: steps.prep.outputs.rc != '2'
         run: npm ci
       - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
-        if: steps.prep.outputs.rc != '2'
         uses: actions/cache@v4
         with:
           path: .ci-models/stories15M-q4_0.gguf
           key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
       - name: Provision tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
-        if: steps.prep.outputs.rc != '2'
         run: |
           set -euo pipefail
           mkdir -p .ci-models
@@ -75,21 +70,35 @@ jobs:
           fi
           test -s "$MODEL_PATH"
       - name: Verify tiny real GGUF loads via relay landing-page desktop-bridge API v1 guardrail
-        if: steps.prep.outputs.rc != '2'
         env:
           TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
           RUN_RELAY_REGISTRATION_TESTS: '1'
         run: python -m pytest -q tests/e2e/test_ui.py -k 'landing_chat_real_inference_with_desktop_bridge_api_v1'
       - name: Run tests
-        if: steps.prep.outputs.rc != '2'
-        run: ./run_all_tests.sh
         env:
           TEST_COVERAGE: '1'
           # Keep the relay landing-page desktop-bridge API v1 guardrail always-on in CI.
           # This tiny real model avoids fake inference while keeping CI fast and cache-friendly.
           TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: |
+          set -uo pipefail
+          ./run_all_tests.sh 2>&1 | tee run-all-tests.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "## ./run_all_tests.sh failed"
+              echo
+              echo "The CI check is red because ./run_all_tests.sh exited with status $status."
+              echo
+              echo "### Last 80 log lines"
+              echo '```'
+              tail -n 80 run-all-tests.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          echo "## ./run_all_tests.sh passed" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage reports to Codecov
-        if: steps.prep.outputs.rc != '2'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

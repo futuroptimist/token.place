@@ -51,7 +51,7 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"total_api_v1_registered_compute_nodes": latest_count["value"]}),
+            body=json.dumps({"total_registered_compute_nodes": latest_count["value"]}),
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics)
@@ -60,13 +60,36 @@ def test_compute_node_count_renders_and_updates(page: Page, base_url: str, setup
 
     status = page.locator(".compute-node-status")
     status.wait_for(state="visible")
+    page.wait_for_function(
+        """
+        () => {
+            const status = document.querySelector('.compute-node-status');
+            return Boolean(
+                status &&
+                status.textContent.includes('Live compute nodes: 3') &&
+                status.textContent.includes('Updated')
+            );
+        }
+        """
+    )
     assert "Live compute nodes: 3" in status.inner_text()
+    assert "Updated" in status.inner_text()
 
     page.evaluate("document.querySelector('#app').__vue__.refreshComputeNodeCount()")
     page.wait_for_function(
-        "document.querySelector('.compute-node-status').textContent.includes('Live compute nodes: 5')"
+        """
+        () => {
+            const status = document.querySelector('.compute-node-status');
+            return Boolean(
+                status &&
+                status.textContent.includes('Live compute nodes: 5') &&
+                status.textContent.includes('Updated')
+            );
+        }
+        """
     )
     assert "Live compute nodes: 5" in status.inner_text()
+    assert "Updated" in status.inner_text()
 
 
 def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, setup_servers):
@@ -83,7 +106,7 @@ def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, set
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps({"total_api_v1_registered_compute_nodes": 5}),
+            body=json.dumps({"total_registered_compute_nodes": 5}),
         )
 
     page.route("**/relay/diagnostics", handle_diagnostics)
@@ -98,7 +121,7 @@ def test_compute_node_count_ignores_stale_refresh(page: Page, base_url: str, set
     first_route["route"].fulfill(
         status=200,
         headers={"Content-Type": "application/json"},
-        body=json.dumps({"total_api_v1_registered_compute_nodes": 3}),
+        body=json.dumps({"total_registered_compute_nodes": 3}),
     )
     page.wait_for_timeout(100)
     assert "Live compute nodes: 5" in page.locator(".compute-node-status").inner_text()

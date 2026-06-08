@@ -24,17 +24,6 @@ new Vue({
         computeNodeCountPoller: null,
         computeNodeCountRequestId: 0
     },
-    computed: {
-        computeNodeCountLabel() {
-            if (this.computeNodeCountStatus === 'loading') {
-                return 'Live compute nodes: loading…';
-            }
-            if (this.computeNodeCountStatus === 'error') {
-                return 'Live compute nodes: unavailable';
-            }
-            return `Live compute nodes: ${this.computeNodeCount}`;
-        }
-    },
     mounted() {
         this.detectTouchInput();
         this.fetchModels();
@@ -50,6 +39,15 @@ new Vue({
         });
     },
     computed: {
+        computeNodeCountLabel() {
+            if (this.computeNodeCountStatus === 'loading') {
+                return 'Live compute nodes: loading…';
+            }
+            if (this.computeNodeCountStatus === 'error') {
+                return 'Live compute nodes: unavailable';
+            }
+            return `Live compute nodes: ${this.computeNodeCount}`;
+        },
         selectedModel() {
             if (!Array.isArray(this.availableModels)) {
                 return null;
@@ -118,13 +116,13 @@ new Vue({
                 if (
                     !data ||
                     typeof data !== 'object' ||
-                    !Object.prototype.hasOwnProperty.call(data, 'total_api_v1_registered_compute_nodes')
+                    !Object.prototype.hasOwnProperty.call(data, 'total_registered_compute_nodes')
                 ) {
-                    throw new Error('Relay diagnostics missing API v1 compute-node count');
+                    throw new Error('Relay diagnostics missing compute-node count');
                 }
-                const count = Number(data.total_api_v1_registered_compute_nodes);
-                if (!Number.isFinite(count) || count < 0) {
-                    throw new Error('Relay diagnostics missing API v1 compute-node count');
+                const count = data.total_registered_compute_nodes;
+                if (!Number.isInteger(count) || count < 0) {
+                    throw new Error('Relay diagnostics missing compute-node count');
                 }
                 this.computeNodeCount = count;
                 this.computeNodeCountStatus = 'ready';

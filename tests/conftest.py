@@ -7,6 +7,7 @@ import os
 import sys
 import pytest
 import platform
+import re
 import tempfile
 import shutil
 import subprocess
@@ -147,6 +148,7 @@ E2E_RELAY_PORT = 5010
 E2E_BASE_URL = f"http://localhost:{E2E_RELAY_PORT}"
 BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
+    "tests/e2e/test_ui.py::test_root_page_loads",
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
     "tests/e2e/test_ui.py::test_landing_chat_model_dropdown_uses_api_v1_models",
     "tests/e2e/test_ui.py::test_landing_chat_model_catalog_failure_uses_api_v1_fallback",
@@ -176,10 +178,12 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
 
     invocation_args = tuple(str(arg) for arg in request.config.invocation_params.args)
     target_names = {
+        "root_page_loads",
         "landing_chat_uses_api_v1_only_non_streaming",
         "landing_chat_model_dropdown_uses_api_v1_models",
         "landing_chat_model_catalog_failure_uses_api_v1_fallback",
         "landing_chat_shows_no_servers_available_message",
+        "compute_node_count",
         "compute_node_count_renders_and_updates",
         "compute_node_count_failure_is_graceful",
         "compute_node_count_rejects_null_diagnostics",
@@ -193,14 +197,26 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     if any(arg in FOCUSED_RELAY_E2E_NODEIDS for arg in invocation_args):
         return True
 
-    # Focused fallback is intentionally strict: only treat the exact
-    # `tests/e2e/test_ui.py -k <focused landing-chat test name>`
-    # shape as focused so other relay registration e2e paths stay gated.
+    # Focused fallback is intentionally strict: only treat
+    # `tests/e2e/test_ui.py -k <focused landing-chat expression>`
+    # as focused so other relay registration e2e paths stay gated.
     if target_path not in invocation_args:
         return False
 
     for i, arg in enumerate(invocation_args):
-        if arg == "-k" and i + 1 < len(invocation_args) and invocation_args[i + 1] in target_names:
+        if arg != "-k" or i + 1 >= len(invocation_args):
+            continue
+
+        target_expression = invocation_args[i + 1]
+        if target_expression in target_names:
+            return True
+
+        expression_terms = {
+            term
+            for term in re.split(r"\s+or\s+|\s+and\s+|\s+not\s+|[()]", target_expression)
+            if term
+        }
+        if expression_terms and expression_terms.issubset(target_names):
             return True
 
     return False

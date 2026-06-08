@@ -151,6 +151,8 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_shows_no_servers_available_message",
     "tests/e2e/test_ui.py::test_compute_node_count_renders_and_updates",
     "tests/e2e/test_ui.py::test_compute_node_count_failure_is_graceful",
+    "tests/e2e/test_ui.py::test_compute_node_count_rejects_null_diagnostics",
+    "tests/e2e/test_ui.py::test_compute_node_count_ignores_stale_refresh",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
 }
 REAL_DESKTOP_BRIDGE_E2E_NODEID = "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1"
@@ -176,6 +178,8 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
         "landing_chat_shows_no_servers_available_message",
         "compute_node_count_renders_and_updates",
         "compute_node_count_failure_is_graceful",
+        "compute_node_count_rejects_null_diagnostics",
+        "compute_node_count_ignores_stale_refresh",
         "landing_chat_real_inference_with_desktop_bridge_api_v1",
     }
     target_path = "tests/e2e/test_ui.py"

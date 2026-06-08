@@ -16,7 +16,8 @@ new Vue({
         computeNodeCount: null,
         computeNodeCountStatus: 'loading',
         computeNodeCountLastUpdated: '',
-        computeNodeCountPoller: null
+        computeNodeCountPoller: null,
+        computeNodeCountRequestId: 0
     },
     computed: {
         computeNodeCountLabel() {
@@ -44,15 +45,31 @@ new Vue({
     },
     methods: {
         async refreshComputeNodeCount() {
+            const requestId = this.computeNodeCountRequestId + 1;
+            this.computeNodeCountRequestId = requestId;
+
             try {
                 const response = await fetch('/relay/diagnostics', { cache: 'no-store' });
+                if (requestId !== this.computeNodeCountRequestId) {
+                    return;
+                }
                 if (!response.ok) {
                     throw new Error('Failed to fetch relay diagnostics');
                 }
                 const data = await response.json();
-                const count = Number(data && data.total_registered_compute_nodes);
+                if (requestId !== this.computeNodeCountRequestId) {
+                    return;
+                }
+                if (
+                    !data ||
+                    typeof data !== 'object' ||
+                    !Object.prototype.hasOwnProperty.call(data, 'total_api_v1_registered_compute_nodes')
+                ) {
+                    throw new Error('Relay diagnostics missing API v1 compute-node count');
+                }
+                const count = Number(data.total_api_v1_registered_compute_nodes);
                 if (!Number.isFinite(count) || count < 0) {
-                    throw new Error('Relay diagnostics missing compute-node count');
+                    throw new Error('Relay diagnostics missing API v1 compute-node count');
                 }
                 this.computeNodeCount = count;
                 this.computeNodeCountStatus = 'ready';
@@ -61,6 +78,9 @@ new Vue({
                     minute: '2-digit'
                 });
             } catch (error) {
+                if (requestId !== this.computeNodeCountRequestId) {
+                    return;
+                }
                 console.warn('Unable to refresh compute-node count:', error);
                 this.computeNodeCountStatus = 'error';
                 this.computeNodeCountLastUpdated = '';

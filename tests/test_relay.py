@@ -1024,6 +1024,8 @@ def test_relay_diagnostics_distinguishes_configured_and_live_nodes(client, monke
     assert payload["upstream_health_required"] is False
     assert payload["relay_only"] is False
     assert payload["total_registered_compute_nodes"] == 1
+    assert payload["total_api_v1_registered_compute_nodes"] == 0
+    assert payload["api_v1_registered_compute_nodes"] == []
     assert payload["registered_compute_nodes"][0]["server_public_key"] == DUMMY_SERVER_PUB_KEY
     assert payload["registered_compute_nodes"][0]["queue_depth"] == 1
 
@@ -1042,7 +1044,40 @@ def test_relay_diagnostics_counts_live_api_v1_compute_nodes(client):
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
     assert payload["total_registered_compute_nodes"] == 2
+    assert payload["total_api_v1_registered_compute_nodes"] == 2
     assert {node["server_public_key"] for node in payload["registered_compute_nodes"]} == {server_a, server_b}
+    assert {node["server_public_key"] for node in payload["api_v1_registered_compute_nodes"]} == {server_a, server_b}
+
+
+def test_relay_diagnostics_separates_legacy_from_api_v1_compute_node_count(client):
+    """Diagnostics should expose an API v1-eligible count for landing chat capacity."""
+    api_v1_server_key = _server_key("diagnostics-api-v1-usable")
+    legacy_server_key = _server_key("diagnostics-legacy-only")
+    known_servers[api_v1_server_key] = {
+        "public_key": api_v1_server_key,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+        relay_module.API_V1_SERVER_MARKER: True,
+    }
+    known_servers[legacy_server_key] = {
+        "public_key": legacy_server_key,
+        "last_ping": datetime.now(),
+        "last_ping_duration": 10,
+    }
+
+    response = client.get("/relay/diagnostics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["total_registered_compute_nodes"] == 2
+    assert payload["total_api_v1_registered_compute_nodes"] == 1
+    assert {node["server_public_key"] for node in payload["registered_compute_nodes"]} == {
+        api_v1_server_key,
+        legacy_server_key,
+    }
+    assert [node["server_public_key"] for node in payload["api_v1_registered_compute_nodes"]] == [
+        api_v1_server_key
+    ]
 
 
 def test_relay_diagnostics_evicts_stale_compute_nodes_before_counting(client, monkeypatch):
@@ -1068,7 +1103,9 @@ def test_relay_diagnostics_evicts_stale_compute_nodes_before_counting(client, mo
 
     assert response.status_code == 200
     assert payload["total_registered_compute_nodes"] == 1
+    assert payload["total_api_v1_registered_compute_nodes"] == 1
     assert [node["server_public_key"] for node in payload["registered_compute_nodes"]] == [live_server_key]
+    assert [node["server_public_key"] for node in payload["api_v1_registered_compute_nodes"]] == [live_server_key]
     assert stale_server_key not in known_servers
 
 
@@ -1079,7 +1116,9 @@ def test_relay_diagnostics_empty_relay_returns_zero(client):
 
     assert response.status_code == 200
     assert payload["total_registered_compute_nodes"] == 0
+    assert payload["total_api_v1_registered_compute_nodes"] == 0
     assert payload["registered_compute_nodes"] == []
+    assert payload["api_v1_registered_compute_nodes"] == []
 
 
 def test_relay_diagnostics_does_not_expose_private_material(client):

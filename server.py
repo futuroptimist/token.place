@@ -7,6 +7,7 @@ import os
 import argparse
 import logging
 import sys
+import signal
 from flask import Flask, request, jsonify
 from typing import Optional
 
@@ -203,7 +204,21 @@ def main():
         relay_port=relay_port,
         relay_url=relay_url
     )
-    server.run()
+
+    def _shutdown_handler(signum, _frame):
+        """Best-effort relay unregister for CLI process shutdown."""
+
+        log_info(f"Received shutdown signal {signum}; stopping compute-node runtime")
+        server.runtime.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    try:
+        server.run()
+    finally:
+        server.runtime.stop()
 
 if __name__ == "__main__":  # pragma: no cover
     main()

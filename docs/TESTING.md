@@ -46,6 +46,33 @@ Integration tests verify that components work together correctly:
 python -m pytest tests/integration/
 ```
 
+#### CLI compute-node validation
+
+The desktop Tauri app is the preferred operator experience, but the repository-root
+`server.py` remains the simple headless equivalent and the canonical CLI compute-node
+entrypoint. You can run a local mock compute node against a relay with:
+
+```bash
+USE_MOCK_LLM=1 python server.py --relay_url http://127.0.0.1:5010 --server_port 3001
+```
+
+Operators can confirm live registration counts through relay diagnostics:
+
+```bash
+curl http://127.0.0.1:5010/relay/diagnostics
+```
+
+The process-heavy e2e guardrail that launches `relay.py` and one or more `server.py`
+processes is opt-in for normal development runs:
+
+```bash
+RUN_RELAY_REGISTRATION_TESTS=1 python -m pytest tests/integration -k "server_py or compute_node_cli" -v
+```
+
+This test uses mock LLM mode and API v1 E2EE relay routes only; it does not require a
+GPU, llama.cpp model download, GGUF file, desktop Tauri bridge, API v2, or plaintext
+relay dispatch.
+
 ### End-to-End (E2E) Tests
 
 **Pytest marker**: `e2e`

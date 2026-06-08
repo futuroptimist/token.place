@@ -1,45 +1,107 @@
 import os
-import time
+import socket
 import subprocess
-import requests
 import sys
+import time
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
 
-API_PORT = 5056
-BASE_URL = f"http://localhost:{API_PORT}"
+import requests
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _allocate_loopback_port() -> int:
+    """Reserve and release an ephemeral loopback port for the relay fixture."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _captured_process_output(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        stdout, stderr = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+    return stdout or "", stderr or ""
+
+
+def _format_relay_failure(message: str, proc: subprocess.Popen[str]) -> str:
+    stdout, stderr = _captured_process_output(proc)
+    return (
+        f"{message}\n"
+        f"returncode={proc.returncode}\n"
+        f"STDOUT:\n{stdout[-4000:]}\n"
+        f"STDERR:\n{stderr[-4000:]}"
+    )
 
 
 @contextmanager
-def start_relay_with_mock():
+def start_relay_with_mock() -> Iterator[str]:
+    port = _allocate_loopback_port()
+    base_url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
     env["USE_MOCK_LLM"] = "1"
-    cmd = [sys.executable, "relay.py", "--port", str(API_PORT)]
-    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    cmd = [
+        sys.executable,
+        "relay.py",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--use_mock_llm",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     try:
         for _ in range(10):
+            returncode = proc.poll()
+            if returncode is not None:
+                raise RuntimeError(
+                    _format_relay_failure(
+                        "relay exited before becoming healthy for DSPACE compatibility test",
+                        proc,
+                    )
+                )
             try:
-                response = requests.get(f"{BASE_URL}/v1/health", timeout=1)
+                response = requests.get(f"{base_url}/v1/health", timeout=1)
                 if response.status_code == 200:
                     break
             except Exception:
                 pass
             time.sleep(1)
         else:
-            raise RuntimeError("relay failed to start for DSPACE compatibility test")
-        yield
+            proc.terminate()
+            raise RuntimeError(
+                _format_relay_failure(
+                    "relay failed to start for DSPACE compatibility test", proc
+                )
+            )
+        yield base_url
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
-def _post_dspace_chat(payload: dict[str, object]) -> requests.Response:
+def _post_dspace_chat(base_url: str, payload: dict[str, object]) -> requests.Response:
     """Helper to send a DSPACE-style chat completion request."""
 
     return requests.post(
-        f"{BASE_URL}/api/v1/chat/completions",
+        f"{base_url}/api/v1/chat/completions",
         json=payload,
         headers={"Authorization": "Bearer test", "Content-Type": "application/json"},
         timeout=10,
@@ -63,8 +125,8 @@ def _base_dspace_payload() -> dict[str, object]:
 
 
 def test_dspace_can_request_gpt5_alias():
-    with start_relay_with_mock():
-        response = _post_dspace_chat(_base_dspace_payload())
+    with start_relay_with_mock() as base_url:
+        response = _post_dspace_chat(base_url, _base_dspace_payload())
 
         assert response.status_code == 200, response.text
         data = response.json()
@@ -79,11 +141,11 @@ def test_dspace_can_request_gpt5_alias():
 def test_dspace_receives_usage_metrics():
     """DSPACE relies on usage counters to show token consumption to users."""
 
-    with start_relay_with_mock():
+    with start_relay_with_mock() as base_url:
         payload = _base_dspace_payload()
         payload["metadata"] = {"client": "dspace", "conversation_id": "demo"}
 
-        response = _post_dspace_chat(payload)
+        response = _post_dspace_chat(base_url, payload)
 
         assert response.status_code == 200, response.text
         data = response.json()
@@ -103,11 +165,11 @@ def test_dspace_receives_usage_metrics():
 def test_dspace_metadata_round_trip():
     """Metadata should round-trip so DSPACE can track the active conversation."""
 
-    with start_relay_with_mock():
+    with start_relay_with_mock() as base_url:
         payload = _base_dspace_payload()
         payload["metadata"] = {"client": "dspace", "conversation_id": "conv-42"}
 
-        response = _post_dspace_chat(payload)
+        response = _post_dspace_chat(base_url, payload)
 
         assert response.status_code == 200, response.text
         body = response.json()

@@ -9,6 +9,9 @@ new Vue({
         newMessage: '',
         chatHistory: [],
         serverPublicKey: null,
+        selectedServerPublicKeyB64: null,
+        selectedServerPublicKey: null,
+        selectedServerKeyLabel: '',
         clientPrivateKey: null,
         clientPublicKey: null,
         availableModels: [],
@@ -27,9 +30,7 @@ new Vue({
     mounted() {
         this.detectTouchInput();
         this.fetchModels();
-        this.getServerPublicKey().then(() => {
-            this.generateClientKeys();
-        });
+        this.generateClientKeys();
         this.refreshComputeNodeCount();
         this.computeNodeCountPoller = setInterval(() => {
             this.refreshComputeNodeCount();
@@ -83,14 +84,13 @@ new Vue({
         hasClientKeypair() {
             return Boolean(this.clientPrivateKey && this.clientPublicKey);
         },
-        hasServerPublicKey() {
-            return Boolean(this.serverPublicKey);
+        hasSelectedServerPublicKey() {
+            return Boolean(this.selectedServerPublicKey && this.selectedServerPublicKeyB64);
         },
         canSendMessage() {
             return Boolean(
                 this.newMessage.trim() &&
                 this.hasClientKeypair &&
-                this.hasServerPublicKey &&
                 this.selectedModel &&
                 !this.isGeneratingResponse
             );
@@ -221,27 +221,80 @@ new Vue({
             return null;
         },
 
-        getServerPublicKey() {
-            // Fetch the server's public key from the API
-            return fetch('/api/v1/public-key')
-                .then(response => {
-                    if (response.ok) {
-                        return response.json();
-                    }
-                    throw new Error('Failed to fetch server public key');
-                })
-                .then(data => {
-                    const normalizedKey = this.normalizeServerPublicKey(data && data.public_key);
-                    if (normalizedKey) {
-                        this.serverPublicKey = normalizedKey;
-                    } else {
-                        console.error('Unexpected server public key format:', data);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error fetching server public key:', error);
-                });
+        encodePemToBase64(pem) {
+            if (typeof pem !== 'string' || !pem.trim()) {
+                return null;
+            }
+            return btoa(pem.trim());
         },
+
+        createServerKeyLabel(rawKey) {
+            if (typeof rawKey !== 'string' || !rawKey.trim()) {
+                return '';
+            }
+            const normalized = rawKey.replace(/\s+/g, '');
+            const fingerprint = CryptoJS.SHA256(normalized).toString(CryptoJS.enc.Hex);
+            return `Server: ${fingerprint.slice(0, 8)}…${fingerprint.slice(-8)}`;
+        },
+
+        async ensureSelectedServer() {
+            if (this.selectedServerPublicKey && this.selectedServerPublicKeyB64) {
+                return true;
+            }
+
+            try {
+                const response = await fetch('/api/v1/relay/servers/next', { cache: 'no-store' });
+                if (!response.ok) {
+                    let errorData = null;
+                    try {
+                        errorData = await response.json();
+                    } catch (_jsonError) {
+                        errorData = null;
+                    }
+                    return {
+                        error: {
+                            userMessage: this.getUserFacingApiError(errorData)
+                        }
+                    };
+                }
+
+                const data = await response.json();
+                const rawKey = data && data.server_public_key;
+                const normalizedKey = this.normalizeServerPublicKey(rawKey);
+                if (!normalizedKey) {
+                    throw new Error('Relay returned an invalid compute-node public key');
+                }
+
+                const rawKeyText = String(rawKey).trim();
+                this.selectedServerPublicKey = normalizedKey;
+                this.serverPublicKey = normalizedKey;
+                this.selectedServerPublicKeyB64 = rawKeyText.includes('-----BEGIN')
+                    ? this.encodePemToBase64(normalizedKey)
+                    : rawKeyText.replace(/\s+/g, '');
+                this.selectedServerKeyLabel = this.createServerKeyLabel(this.selectedServerPublicKeyB64);
+                return true;
+            } catch (error) {
+                console.error('Error selecting API v1 compute node:', error);
+                return {
+                    error: {
+                        userMessage: 'Unable to select an LLM server right now. Please start a new chat session and try again.'
+                    }
+                };
+            }
+        },
+
+        createRequestId() {
+            const bytes = new Uint8Array(16);
+            if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+                crypto.getRandomValues(bytes);
+            } else {
+                for (let i = 0; i < bytes.length; i++) {
+                    bytes[i] = Math.floor(Math.random() * 256);
+                }
+            }
+            return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        },
+
         generateClientKeys() {
             const crypt = new JSEncrypt({ default_key_size: 2048 });
             crypt.getKey();
@@ -515,85 +568,169 @@ new Vue({
             }
         },
 
-        // Send a message to the server using the new API
-        async sendMessageApi() {
-            if (!this.serverPublicKey) {
-                console.error('Server public key not available');
+        getUserFacingRelayRetrieveError(status) {
+            if (status === 202) {
                 return null;
             }
+            if (status === 404) {
+                return 'The LLM server response was not found. Please start a new chat session and try again.';
+            }
+            if (status === 410) {
+                return 'The LLM server request expired or was cancelled. Please start a new chat session and try again.';
+            }
+            if (status >= 500) {
+                return 'The relay is unavailable right now. Please try again later.';
+            }
+            return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
+        },
 
+        async retrieveRelayResponse(clientPublicKeyB64, requestId) {
+            const timeoutMs = 30000;
+            const pollIntervalMs = 500;
+            const deadline = Date.now() + timeoutMs;
+
+            while (Date.now() < deadline) {
+                const response = await fetch('/api/v1/relay/responses/retrieve', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        client_public_key: clientPublicKeyB64,
+                        request_id: requestId
+                    })
+                });
+
+                if (response.status === 202) {
+                    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+                    continue;
+                }
+
+                if (!response.ok) {
+                    return {
+                        error: {
+                            userMessage: this.getUserFacingRelayRetrieveError(response.status)
+                        }
+                    };
+                }
+
+                return response.json();
+            }
+
+            return {
+                error: {
+                    userMessage: 'The LLM server took too long to respond. Please start a new chat session and try again.'
+                }
+            };
+        },
+
+        // Send a message through the relay-blind API v1 E2EE request routes.
+        async sendMessageApi(messageContent) {
             if (!this.selectedModel) {
                 console.error('No API v1 catalogue model selected');
                 return null;
             }
 
+            const selectedServer = await this.ensureSelectedServer();
+            if (selectedServer !== true) {
+                return selectedServer;
+            }
+
+            const requestId = this.createRequestId();
+            const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
+            const plaintextEnvelope = {
+                protocol: 'tokenplace_api_v1_relay_e2ee',
+                version: 1,
+                request_id: requestId,
+                client_public_key: clientPublicKeyB64,
+                api_v1_request: {
+                    model: this.selectedModelId,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: messageContent
+                        }
+                    ],
+                    options: {}
+                }
+            };
+
             try {
-                // Encrypt the chat history
                 const encryptedData = await this.encrypt(
-                    JSON.stringify(this.chatHistory),
-                    this.serverPublicKey
+                    JSON.stringify(plaintextEnvelope),
+                    this.selectedServerPublicKey
                 );
 
                 if (!encryptedData) {
-                    throw new Error('Failed to encrypt chat history');
+                    throw new Error('Failed to encrypt relay request envelope');
                 }
 
-                // Create the API request payload
-                const payload = {
-                    model: this.selectedModelId,
-                    encrypted: true,
-                    client_public_key: this.encodeClientPublicKeyForApi(),
-                    messages: encryptedData,
-                    metadata: {
-                        inference_target: "desktop_bridge_api_v1_e2ee",
-                        relay_path: "api_v1_e2ee"
-                    }
+                const relayPayload = {
+                    server_public_key: this.selectedServerPublicKeyB64,
+                    client_public_key: clientPublicKeyB64,
+                    request_id: requestId,
+                    protocol: 'tokenplace_api_v1_relay_e2ee',
+                    version: 1,
+                    ciphertext: encryptedData.ciphertext,
+                    cipherkey: encryptedData.cipherkey,
+                    iv: encryptedData.iv
                 };
 
-                // Send the request to the API
-                const response = await fetch('/api/v1/chat/completions', {
+                const dispatchResponse = await fetch('/api/v1/relay/requests', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(relayPayload)
                 });
 
-                if (!response.ok) {
+                if (!dispatchResponse.ok) {
                     let errorData = null;
                     try {
-                        errorData = await response.json();
+                        errorData = await dispatchResponse.json();
                     } catch (_jsonError) {
                         errorData = null;
                     }
+                    const unavailable = dispatchResponse.status === 404 || dispatchResponse.status === 410;
                     return {
                         error: {
-                            userMessage: this.getUserFacingApiError(errorData)
+                            userMessage: unavailable
+                                ? 'The selected LLM server is unavailable. Please start a new chat session before trying another server.'
+                                : this.getUserFacingApiError(errorData)
                         }
                     };
                 }
 
-                const responseData = await response.json();
-
-                // Handle encrypted response
-                if (responseData.encrypted && responseData.data) {
-                    const decryptedJson = await this.decrypt(
-                        responseData.data.ciphertext,
-                        responseData.data.cipherkey,
-                        responseData.data.iv
-                    );
-
-                    if (!decryptedJson) {
-                        throw new Error('Failed to decrypt response');
-                    }
-
-                    return JSON.parse(decryptedJson);
+                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId);
+                if (encryptedResponse && encryptedResponse.error) {
+                    return encryptedResponse;
                 }
 
-                // Handle unencrypted response (should not happen with encrypted=true)
-                return responseData;
+                const decryptedJson = await this.decrypt(
+                    encryptedResponse.ciphertext,
+                    encryptedResponse.cipherkey,
+                    encryptedResponse.iv
+                );
+
+                if (!decryptedJson) {
+                    throw new Error('Failed to decrypt relay response');
+                }
+
+                const responseEnvelope = JSON.parse(decryptedJson);
+                if (
+                    !responseEnvelope ||
+                    responseEnvelope.protocol !== 'tokenplace_api_v1_relay_e2ee' ||
+                    responseEnvelope.version !== 1 ||
+                    responseEnvelope.request_id !== requestId ||
+                    responseEnvelope.client_public_key !== clientPublicKeyB64 ||
+                    !responseEnvelope.api_v1_response
+                ) {
+                    throw new Error('Invalid relay response envelope');
+                }
+
+                return responseEnvelope.api_v1_response;
             } catch (error) {
-                console.error('API request error:', error);
+                console.error('API v1 relay request error:', error);
                 return null;
             }
         },
@@ -691,7 +828,7 @@ new Vue({
 
             try {
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
-                let response = await this.sendMessageApi();
+                let response = await this.sendMessageApi(messageContent);
 
                 // Process the response
                 if (response) {

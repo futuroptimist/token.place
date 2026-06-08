@@ -102,6 +102,27 @@ def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, m
     assert {response.status_code for response in poll_responses} == {200}
 
 
+def test_api_v1_next_server_round_robins_new_client_selections(client):
+    """The relay returns only the next live API v1 compute node; clients own affinity."""
+
+    server_a = _server_key("sticky-node-a")
+    server_b = _server_key("sticky-node-b")
+    server_c = _server_key("sticky-node-c")
+    _register_api_v1_server(client, server_a)
+    _register_api_v1_server(client, server_b)
+    _register_api_v1_server(client, server_c)
+
+    assert [_next_api_v1_server_key(client) for _ in range(7)] == [
+        server_a,
+        server_b,
+        server_c,
+        server_a,
+        server_b,
+        server_c,
+        server_a,
+    ]
+
+
 def test_two_api_v1_nodes_poll_and_round_robin_without_control_plane_429(client, monkeypatch):
     """Two nodes behind one source can poll while next-server rotation remains intact."""
 

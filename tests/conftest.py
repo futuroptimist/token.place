@@ -150,6 +150,7 @@ BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_root_page_loads",
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
+    "tests/e2e/test_ui.py::test_landing_chat_sticky_server_two_turns_and_key_label",
     "tests/e2e/test_ui.py::test_landing_chat_model_dropdown_uses_api_v1_models",
     "tests/e2e/test_ui.py::test_landing_chat_model_catalog_failure_uses_api_v1_fallback",
     "tests/e2e/test_ui.py::test_landing_chat_shows_no_servers_available_message",
@@ -180,6 +181,9 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     target_names = {
         "root_page_loads",
         "landing_chat_uses_api_v1_only_non_streaming",
+        "landing_chat_sticky_server_two_turns_and_key_label",
+        "sticky",
+        "server_key",
         "landing_chat_model_dropdown_uses_api_v1_models",
         "landing_chat_model_catalog_failure_uses_api_v1_fallback",
         "landing_chat_shows_no_servers_available_message",

@@ -18,8 +18,17 @@ def test_chat_js_defines_touch_detection_hook():
 
 def test_landing_chat_js_avoids_relay_v2_streaming_path():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
-    assert "/api/v1/chat/completions" in chat_js, (
-        "landing chat must call relay API v1 chat completions endpoint"
+    assert "/api/v1/relay/servers/next" in chat_js, (
+        "landing chat must select one API v1 compute node for a browser session"
+    )
+    assert "/api/v1/relay/requests" in chat_js, (
+        "landing chat must dispatch ciphertext-only API v1 relay request envelopes"
+    )
+    assert "/api/v1/relay/responses/retrieve" in chat_js, (
+        "landing chat must retrieve encrypted API v1 relay responses directly"
+    )
+    assert "/api/v1/chat/completions" not in chat_js, (
+        "landing chat must not let server-side chat completions choose a compute node per turn"
     )
     assert "/api/v1/completions" not in chat_js, (
         "landing chat must not call legacy API v1 text completions endpoint"

@@ -125,6 +125,12 @@
             color: #ffffff;
             font-size: 14px;
         }
+        .server-key-label {
+            margin: 0 0 15px;
+            color: #cccccc;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 13px;
+        }
         .model-status {
             margin: 6px 0 0;
             color: #cccccc;
@@ -424,6 +430,7 @@
                 <p v-else-if="modelsError" class="model-status model-error">{{ modelsError }}</p>
                 <p v-else-if="selectedModelSummary" class="model-status">{{ selectedModelSummary }}</p>
             </div>
+            <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label">{{ selectedServerKeyLabel }}</p>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>

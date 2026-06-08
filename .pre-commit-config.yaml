@@ -20,7 +20,7 @@ repos:
     rev: 1.7.5
     hooks:
       - id: bandit
-        args: ["-lll", "-x", "tests"]
+        args: ["-lll", "-x", ".git,.mypy_cache,.pytest_cache,.ruff_cache,.tox,.venv,.venv-test,venv,env,node_modules,desktop/node_modules,desktop-tauri/node_modules,desktop-tauri/src-tauri/target,build,dist,tests"]
         additional_dependencies:
           - pbr
   - repo: local

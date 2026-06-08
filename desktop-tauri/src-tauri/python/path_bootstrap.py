@@ -95,16 +95,19 @@ def _stdlib_roots() -> list[str]:
     destshared = sysconfig.get_config_var("DESTSHARED")
     if destshared and _path_exists(str(destshared)):
         roots.append(_safe_resolve_path_text(str(destshared)))
-    base_prefix = getattr(sys, "base_prefix", sys.prefix)
-    for version in (
-        f"{sys.version_info.major}.{sys.version_info.minor}",
-        f"python{sys.version_info.major}.{sys.version_info.minor}",
-    ):
-        candidate = os.path.join(
-            base_prefix, "Lib" if os.name == "nt" else "lib", version
-        )
-        if _path_exists(candidate):
-            roots.append(_safe_resolve_path_text(candidate))
+    for prefix in {
+        sys.prefix,
+        getattr(sys, "base_prefix", sys.prefix),
+        getattr(sys, "exec_prefix", sys.prefix),
+        getattr(sys, "base_exec_prefix", sys.prefix),
+    }:
+        for relative in (
+            ("lib", f"python{sys.version_info.major}.{sys.version_info.minor}"),
+            ("Lib",),
+        ):
+            candidate = os.path.join(prefix, *relative)
+            if _path_exists(candidate):
+                roots.append(_safe_resolve_path_text(candidate))
     deduped: list[str] = []
     seen: set[str] = set()
     for root in roots:

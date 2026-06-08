@@ -62,7 +62,7 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
     last_error: Exception | None = None
     while time.time() < deadline:
         try:
-            with urlopen(url, timeout=2) as response:  # noqa: S310
+            with urlopen(url, timeout=2) as response:  # nosec B310
                 if response.status == 200:
                     return
         except Exception as exc:  # pragma: no cover

@@ -55,7 +55,7 @@ def wait_for_livez(
             with urlopen(
                 f"http://127.0.0.1:{port}/livez",
                 timeout=request_timeout_seconds,
-            ) as resp:  # noqa: S310
+            ) as resp:  # nosec B310
                 if resp.status == 200:
                     return
         except Exception as exc:  # pragma: no cover - retry loop
@@ -78,7 +78,7 @@ def wait_for_livez(
 
 
 def relay_diagnostics(relay_port: int) -> dict[str, object]:
-    with urlopen(  # noqa: S310
+    with urlopen(  # nosec B310
         f"http://127.0.0.1:{relay_port}/relay/diagnostics",
         timeout=RELAY_LIVEZ_REQUEST_TIMEOUT_SECONDS,
     ) as resp:

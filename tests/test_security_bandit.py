@@ -13,6 +13,31 @@ import pytest
 def test_bandit_reports_no_medium_or_high_findings():
     """Ensure the Bandit security scan passes without medium/high issues."""
     repo_root = Path(__file__).resolve().parent.parent
+    excluded_paths = [
+        repo_root / ".git",
+        repo_root / ".mypy_cache",
+        repo_root / ".pytest_cache",
+        repo_root / ".ruff_cache",
+        repo_root / ".tox",
+        repo_root / ".venv",
+        repo_root / ".venv-test",
+        repo_root / "build",
+        repo_root / "dist",
+        repo_root / "desktop" / "node_modules",
+        repo_root / "desktop-tauri" / "node_modules",
+        repo_root / "desktop-tauri" / "src-tauri" / "target",
+        repo_root / "env",
+        repo_root / "node_modules",
+        repo_root / "tests",
+        repo_root / "venv",
+    ]
+    excluded_path_strings = {str(path) for path in excluded_paths}
+    assert str(repo_root / "desktop-tauri" / "scripts") not in excluded_path_strings
+    assert str(repo_root / "desktop-tauri" / "src-tauri" / "python") not in excluded_path_strings
+    assert str(repo_root / ".venv") in excluded_path_strings
+    assert str(repo_root / "desktop" / "node_modules") in excluded_path_strings
+    assert str(repo_root / "desktop-tauri" / "node_modules") in excluded_path_strings
+
     cmd = [
         sys.executable,
         "-m",
@@ -20,6 +45,8 @@ def test_bandit_reports_no_medium_or_high_findings():
         "-q",
         "-r",
         str(repo_root),
+        "-x",
+        ",".join(str(path) for path in excluded_paths),
         "-f",
         "json",
         "--severity-level",
@@ -42,6 +69,14 @@ def test_bandit_reports_no_medium_or_high_findings():
             "Failed to parse Bandit JSON output:\n"
             f"Error: {exc}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
+
+    scanned_paths = set(report.get("metrics", {}))
+    desktop_script_paths = sorted((repo_root / "desktop-tauri" / "scripts").glob("*.py"))
+    assert desktop_script_paths, "Expected checked-in desktop Python scripts to scan"
+    for desktop_script_path in desktop_script_paths:
+        assert str(desktop_script_path) in scanned_paths
+    assert not any("/.venv/" in path for path in scanned_paths)
+    assert not any("/node_modules/" in path for path in scanned_paths)
 
     offending = [
         issue

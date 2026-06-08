@@ -19,6 +19,8 @@ import requests
 from api.v1.encryption import EncryptionManager
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+RELAY_SERVER_LEASE_SECONDS = "120"
+REGISTRATION_COUNT_TIMEOUT_SECONDS = 8.0
 
 
 def _free_port() -> int:
@@ -58,21 +60,28 @@ def _wait_for_count(
     )
 
 
-def _terminate_process(proc: subprocess.Popen[str]) -> None:
+def _terminate_process(
+    proc: subprocess.Popen[str], *, label: str, fail_on_sigkill: bool = False
+) -> bool:
     if proc.poll() is not None:
-        return
+        return False
     proc.send_signal(signal.SIGINT)
     try:
         proc.wait(timeout=8)
-        return
+        return False
     except subprocess.TimeoutExpired:
         proc.terminate()
     try:
         proc.wait(timeout=5)
-        return
+        return False
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+        output = _process_output(proc)
+        message = f"{label} required SIGKILL during shutdown:\n{output}"
+        if fail_on_sigkill:
+            raise AssertionError(message)
+        return True
 
 
 def _process_output(proc: subprocess.Popen[str]) -> str:
@@ -130,8 +139,8 @@ def _start_relay(tmp_path: Path) -> tuple[subprocess.Popen[str], str]:
                 "TOKENPLACE_DISTRIBUTED_COMPUTE_URL": relay_url,
                 "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS": "10",
                 "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.1",
-                "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS": "2",
-                "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS": "2",
+                "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS": RELAY_SERVER_LEASE_SECONDS,
+                "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS": RELAY_SERVER_LEASE_SECONDS,
                 "TOKENPLACE_MAX_POLL_FAILURES": "3",
                 "TOKENPLACE_LOG_LEVEL": "WARNING",
                 "PYTHONUNBUFFERED": "1",
@@ -157,7 +166,7 @@ def _start_relay(tmp_path: Path) -> tuple[subprocess.Popen[str], str]:
         except AssertionError as exc:
             last_error = exc
             output = _process_output(proc)
-            _terminate_process(proc)
+            _terminate_process(proc, label="relay.py")
             if not _bind_failure(output):
                 raise
     raise AssertionError(f"relay.py failed to bind after retries: {last_error}")
@@ -172,8 +181,8 @@ def _server_env() -> dict[str, str]:
             "USE_MOCK_LLM": "1",
             "TOKENPLACE_MAX_POLL_FAILURES": "3",
             "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS": "0.1",
-            "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS": "2",
-            "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS": "2",
+            "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS": RELAY_SERVER_LEASE_SECONDS,
+            "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS": RELAY_SERVER_LEASE_SECONDS,
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -230,7 +239,7 @@ def _start_server_and_wait_for_count(
         except AssertionError as exc:
             last_error = exc
             output = _process_output(proc)
-            _terminate_process(proc)
+            _terminate_process(proc, label=label, fail_on_sigkill=True)
             if not _bind_failure(output):
                 raise
     raise AssertionError(f"{label} failed to bind after retries: {last_error}")
@@ -310,6 +319,15 @@ def test_server_py_compute_node_cli_registers_scales_and_handles_api_v1_e2ee_wor
             timeout=15,
         )
         assert response.status_code == 200, response.text
+        assert (
+            response.headers["X-Tokenplace-API-V1-Resolved-Provider-Path"]
+            == "distributed"
+        )
+        assert (
+            response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"]
+            == "distributed_relay_e2ee"
+        )
+        assert response.headers["X-Tokenplace-API-V1-Stream-Mode"] == "non-streaming"
         completion = _decrypt_chat_completion(browser_crypto, response.json())
         assert completion["object"] == "chat.completion"
         content = completion["choices"][0]["message"]["content"]
@@ -321,12 +339,29 @@ def test_server_py_compute_node_cli_registers_scales_and_handles_api_v1_e2ee_wor
         assert diagnostics_two["total_registered_compute_nodes"] == 2
 
     finally:
-        for proc in (server_proc_b, server_proc_a):
-            if proc is not None:
-                _terminate_process(proc)
+        original_exception = sys.exc_info()[0]
+        if original_exception is None:
+            shutdown_failures: list[str] = []
+            if server_proc_b is not None:
+                if _terminate_process(server_proc_b, label="server.py B"):
+                    shutdown_failures.append("server.py B required SIGKILL")
+                _wait_for_count(
+                    relay_url, 1, timeout=REGISTRATION_COUNT_TIMEOUT_SECONDS
+                )
+            if server_proc_a is not None:
+                if _terminate_process(server_proc_a, label="server.py A"):
+                    shutdown_failures.append("server.py A required SIGKILL")
+                _wait_for_count(
+                    relay_url, 0, timeout=REGISTRATION_COUNT_TIMEOUT_SECONDS
+                )
+            if shutdown_failures:
+                raise AssertionError("; ".join(shutdown_failures))
+        else:
+            for proc, label in (
+                (server_proc_b, "server.py B"),
+                (server_proc_a, "server.py A"),
+            ):
+                if proc is not None:
+                    _terminate_process(proc, label=label)
         if relay_proc is not None:
-            try:
-                if sys.exc_info()[0] is None:
-                    _wait_for_count(relay_url, 0, timeout=8)
-            finally:
-                _terminate_process(relay_proc)
+            _terminate_process(relay_proc, label="relay.py")

@@ -54,7 +54,9 @@ node against a relay. A local mock run does not require a GPU, llama.cpp model
 download, GGUF file, or desktop bridge:
 
 ```bash
+python relay.py --host 127.0.0.1 --port 5010 --use_mock_llm
 USE_MOCK_LLM=1 python server.py --relay_url http://127.0.0.1:5010 --server_port 3001
+curl http://127.0.0.1:5010/relay/diagnostics
 ```
 
 An explicit `--relay_url` is authoritative for this CLI command, so stale
@@ -62,11 +64,7 @@ relay environment variables from another deployment should not redirect this
 local validation run.
 
 Operators can confirm registration and live counts from the relay diagnostics
-endpoint:
-
-```bash
-curl http://127.0.0.1:5010/relay/diagnostics
-```
+endpoint shown in the example above.
 
 The process-level regression test launches `relay.py` plus one or more `server.py`
 subprocesses, so it is guarded behind `RUN_RELAY_REGISTRATION_TESTS=1`:

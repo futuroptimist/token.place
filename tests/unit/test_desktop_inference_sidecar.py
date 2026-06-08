@@ -589,43 +589,27 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     manager = FakeManager()
     _install_fake_manager_module(manager)
 
-    runtime_setup_module = sys.modules['desktop_runtime_setup']
+    runtime_setup_calls = []
+    reexec_calls = []
 
-    class _WinSysStub:
-        platform = 'win32'
-        executable = sys.executable
+    def _probe_only_runtime_setup(mode):
+        runtime_setup_calls.append(mode)
+        return {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'probe_only',
+            'fallback_reason': 'GPU runtime probe only (missing cuda runtime)',
+            'interpreter': sys.executable,
+            'llama_module_path': 'missing',
+        }
 
-    probe = runtime_setup_module.RuntimeProbe(
-        backend='cpu',
-        detected_device='cpu',
-        gpu_offload_supported=False,
-        error='missing cuda runtime',
-        interpreter=sys.executable,
-        llama_module_path='missing',
-        prefix='',
-    )
-    repair_calls = {'source': 0, 'retry_gate': 0}
-
-    monkeypatch.setattr(runtime_setup_module, 'sys', _WinSysStub)
-    monkeypatch.delenv(runtime_setup_module.DISABLE_BOOTSTRAP_ENV, raising=False)
-    monkeypatch.delenv(runtime_setup_module.ENABLE_BOOTSTRAP_ENV, raising=False)
-    monkeypatch.setattr(runtime_setup_module, '_probe_llama_runtime', lambda **_: probe)
+    monkeypatch.setattr(inference_sidecar, 'ensure_desktop_llama_runtime', _probe_only_runtime_setup)
     monkeypatch.setattr(
-        runtime_setup_module,
-        '_windows_cuda_source_repair',
-        lambda _requirements_path: (
-            repair_calls.__setitem__('source', repair_calls['source'] + 1) or True,
-            'ok',
-        ),
+        inference_sidecar,
+        'maybe_reexec_for_runtime_refresh',
+        lambda runtime_setup: reexec_calls.append(runtime_setup['runtime_action']),
     )
-    monkeypatch.setattr(
-        runtime_setup_module,
-        '_should_attempt_source_repair',
-        lambda: (
-            repair_calls.__setitem__('retry_gate', repair_calls['retry_gate'] + 1) or True,
-            '',
-        ),
-    )
+    monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
@@ -637,7 +621,8 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
     assert events[-1]['type'] == 'done'
     assert 'desktop.runtime_setup' in captured.err
     assert 'action=probe_only' in captured.err
-    assert repair_calls == {'source': 0, 'retry_gate': 0}
+    assert runtime_setup_calls == ['auto']
+    assert reexec_calls == ['probe_only']
 
 
 def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path, capsys, monkeypatch):

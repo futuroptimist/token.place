@@ -150,6 +150,8 @@ BROWSER_MATRIX_TARGETS = ("chromium", "firefox", "webkit")
 FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_root_page_loads",
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
+    "tests/e2e/test_ui.py::test_landing_chat_sticky_server_two_turns_and_key_label",
+    "tests/e2e/test_ui.py::test_landing_chat_terminal_server_failure_requires_explicit_new_chat_retry",
     "tests/e2e/test_ui.py::test_landing_chat_model_dropdown_uses_api_v1_models",
     "tests/e2e/test_ui.py::test_landing_chat_model_catalog_failure_uses_api_v1_fallback",
     "tests/e2e/test_ui.py::test_landing_chat_shows_no_servers_available_message",
@@ -169,10 +171,11 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     Prefer selected nodeids when available and fall back to invocation args so
     the gate keeps working across pytest selection behavior changes.
     """
-    if request.node.nodeid in FOCUSED_RELAY_E2E_NODEIDS:
+    nodeid_base = request.node.nodeid.split("[", 1)[0]
+    if request.node.nodeid in FOCUSED_RELAY_E2E_NODEIDS or nodeid_base in FOCUSED_RELAY_E2E_NODEIDS:
         return True
 
-    selected_nodeids = {item.nodeid for item in request.session.items}
+    selected_nodeids = {item.nodeid.split("[", 1)[0] for item in request.session.items}
     if selected_nodeids and selected_nodeids.issubset(FOCUSED_RELAY_E2E_NODEIDS):
         return True
 
@@ -180,6 +183,10 @@ def _is_focused_relay_landing_chat_request(request: pytest.FixtureRequest) -> bo
     target_names = {
         "root_page_loads",
         "landing_chat_uses_api_v1_only_non_streaming",
+        "landing_chat_sticky_server_two_turns_and_key_label",
+        "landing_chat_terminal_server_failure_requires_explicit_new_chat_retry",
+        "sticky",
+        "server_key",
         "landing_chat_model_dropdown_uses_api_v1_models",
         "landing_chat_model_catalog_failure_uses_api_v1_fallback",
         "landing_chat_shows_no_servers_available_message",

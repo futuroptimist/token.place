@@ -18,8 +18,17 @@ def test_chat_js_defines_touch_detection_hook():
 
 def test_landing_chat_js_avoids_relay_v2_streaming_path():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
-    assert "/api/v1/chat/completions" in chat_js, (
-        "landing chat must call relay API v1 chat completions endpoint"
+    assert "/api/v1/relay/servers/next" in chat_js, (
+        "landing chat must select one API v1 compute node for a browser session"
+    )
+    assert "/api/v1/relay/requests" in chat_js, (
+        "landing chat must dispatch ciphertext-only API v1 relay request envelopes"
+    )
+    assert "/api/v1/relay/responses/retrieve" in chat_js, (
+        "landing chat must retrieve encrypted API v1 relay responses directly"
+    )
+    assert "/api/v1/chat/completions" not in chat_js, (
+        "landing chat must not let server-side chat completions choose a compute node per turn"
     )
     assert "/api/v1/completions" not in chat_js, (
         "landing chat must not call legacy API v1 text completions endpoint"
@@ -58,3 +67,21 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
     assert "The LLM server returned an invalid response. Please try again." in chat_js
     assert "distributed provider timed out contacting relay bridge" not in chat_js
     assert "distributed provider request failed" not in chat_js
+
+
+def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "createApiV1Messages" in chat_js
+    assert "this.chatHistory" in chat_js
+    assert "messages: this.createApiV1Messages(messageContent)" in chat_js
+    assert "response.message && typeof response.message === 'object'" in chat_js
+
+
+def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000" in chat_js
+    assert "cancelRelayRequest" in chat_js
+    assert "/api/v1/relay/requests/cancel" in chat_js
+    assert "cancel_token: cancelToken" in chat_js
+    assert "dispatchResponse.status === 404 || dispatchResponse.status === 410" in chat_js
+    assert "this.clearSelectedServer()" in chat_js

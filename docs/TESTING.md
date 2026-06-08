@@ -46,6 +46,31 @@ Integration tests verify that components work together correctly:
 python -m pytest tests/integration/
 ```
 
+#### Headless CLI compute-node validation
+
+The desktop Tauri app is the preferred operator experience, but repository-root
+`server.py` remains the canonical simple headless equivalent for running a compute
+node against a relay. A local mock run does not require a GPU, llama.cpp model
+download, GGUF file, or desktop bridge:
+
+```bash
+USE_MOCK_LLM=1 python server.py --relay_url http://127.0.0.1:5010 --server_port 3001
+```
+
+Operators can confirm registration and live counts from the relay diagnostics
+endpoint:
+
+```bash
+curl http://127.0.0.1:5010/relay/diagnostics
+```
+
+The process-level regression test launches `relay.py` plus one or more `server.py`
+subprocesses, so it is guarded behind `RUN_RELAY_REGISTRATION_TESTS=1`:
+
+```bash
+RUN_RELAY_REGISTRATION_TESTS=1 python -m pytest tests/integration -k "server_py or compute_node_cli" -v
+```
+
 ### End-to-End (E2E) Tests
 
 **Pytest marker**: `e2e`

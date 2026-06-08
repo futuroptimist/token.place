@@ -156,13 +156,16 @@ class ServerApp:
         # Start relay polling in a background thread
         self.start_relay_polling()
 
-        # Run the Flask app
-        self.app.run(
-            host=self.server_host,
-            port=self.server_port,
-            debug=not config.is_production,
-            use_reloader=False  # Disable reloader to avoid duplicate threads
-        )
+        # Run the Flask app and best-effort unregister on graceful shutdown.
+        try:
+            self.app.run(
+                host=self.server_host,
+                port=self.server_port,
+                debug=not config.is_production,
+                use_reloader=False  # Disable reloader to avoid duplicate threads
+            )
+        finally:
+            self.runtime.stop()
 
 def parse_args():
     """Parse command line arguments."""

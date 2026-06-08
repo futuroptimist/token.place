@@ -1,6 +1,5 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
-const EMERGENCY_MODEL_FALLBACK_ID = 'llama-3-8b-instruct';
 
 new Vue({
     el: '#app',
@@ -52,15 +51,15 @@ new Vue({
         hasClientKeypair() {
             return Boolean(this.clientPrivateKey && this.clientPublicKey);
         },
-        hasServerPublicKeyPath() {
+        hasServerPublicKey() {
             return Boolean(this.serverPublicKey);
         },
         canSendMessage() {
             return Boolean(
                 this.newMessage.trim() &&
                 this.hasClientKeypair &&
-                this.hasServerPublicKeyPath &&
-                this.selectedModelId &&
+                this.hasServerPublicKey &&
+                this.selectedModel &&
                 !this.isGeneratingResponse
             );
         }
@@ -112,8 +111,8 @@ new Vue({
                 .catch(error => {
                     console.error('Error fetching API v1 models:', error);
                     this.availableModels = [];
-                    this.modelsError = 'Could not load the API v1 model list. Using the default launch model.';
-                    this.selectedModelId = EMERGENCY_MODEL_FALLBACK_ID;
+                    this.modelsError = 'Could not load the API v1 model list. Please try again before sending.';
+                    this.selectedModelId = '';
                 })
                 .finally(() => {
                     this.modelsLoading = false;
@@ -448,6 +447,11 @@ new Vue({
                 return null;
             }
 
+            if (!this.selectedModel) {
+                console.error('No API v1 catalogue model selected');
+                return null;
+            }
+
             try {
                 // Encrypt the chat history
                 const encryptedData = await this.encrypt(
@@ -461,7 +465,7 @@ new Vue({
 
                 // Create the API request payload
                 const payload = {
-                    model: this.selectedModelId || EMERGENCY_MODEL_FALLBACK_ID,
+                    model: this.selectedModelId,
                     encrypted: true,
                     client_public_key: this.encodeClientPublicKeyForApi(),
                     messages: encryptedData,

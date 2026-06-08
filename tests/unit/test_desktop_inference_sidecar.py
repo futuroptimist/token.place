@@ -585,6 +585,7 @@ def test_run_probe_only_windows_startup_emits_started_without_bootstrap_install_
 
     class _WinSysStub:
         platform = 'win32'
+        desktop_arch = 'x86_64'
         executable = sys.executable
 
     probe = runtime_setup_module.RuntimeProbe(
@@ -653,6 +654,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(tmp_path,
         },
     )
     monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
@@ -693,6 +695,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(tmp_path, cap
         },
     )
     monkeypatch.setattr(inference_sidecar.sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)
@@ -734,6 +737,7 @@ def test_run_windows_gpu_mode_accepts_bootstrap_enabled_cuda_runtime(tmp_path, c
         },
     )
     monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
 
     args = SimpleNamespace(model=str(model_path), mode='auto', prompt='hello')
     status = inference_sidecar.run(args)

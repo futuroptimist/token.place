@@ -34,11 +34,13 @@ ensure_repo() {
   local url="$2"
   local dest="$3"
   shift 3 || true
-  local extra_args=("$@")
-
   if [[ ! -d "$dest" ]]; then
     log_step "Cloning $name repository..."
-    run_cmd git clone "${extra_args[@]}" "$url" "$dest"
+    if [[ $# -gt 0 ]]; then
+      run_cmd git clone "$@" "$url" "$dest"
+    else
+      run_cmd git clone "$url" "$dest"
+    fi
   else
     log_step "$name repository already present. Fetching latest changes..."
     run_cmd git -C "$dest" fetch --tags --prune

@@ -1,2 +1,2 @@
 [bandit]
-exclude: /tests,/desktop,/node_modules
+exclude: /tests,/desktop,/node_modules,/.git,/.mypy_cache,/.pytest_cache,/.ruff_cache,/.venv,/.venv-test,/venv,/env,/build,/dist,/coverage,/htmlcov

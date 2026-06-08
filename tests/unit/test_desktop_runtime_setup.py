@@ -22,6 +22,7 @@ SPEC.loader.exec_module(desktop_runtime_setup)
 
 class _SysStub:
     platform = 'win32'
+    desktop_arch = 'x86_64'
     executable = sys.executable
     prefix = sys.prefix
     argv = [str(MODULE_PATH)]

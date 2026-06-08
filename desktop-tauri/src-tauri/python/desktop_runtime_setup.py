@@ -729,7 +729,10 @@ def _desktop_platform() -> str:
 
 
 def _desktop_arch() -> str:
-    return platform_module.machine().lower().replace("amd64", "x86_64")
+    injected_arch = os.environ.get("TOKEN_PLACE_DESKTOP_ARCH", "").strip()
+    sys_arch = str(getattr(sys, "desktop_arch", "")).strip()
+    raw_arch = injected_arch or sys_arch or platform_module.machine()
+    return raw_arch.lower().replace("amd64", "x86_64")
 
 
 def _runtime_bootstrap_policy() -> RuntimeBootstrapPolicy:

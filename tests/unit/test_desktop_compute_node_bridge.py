@@ -756,6 +756,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_bootstrap_fails(capsys, m
         },
     )
     monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -801,6 +802,7 @@ def test_run_windows_gpu_mode_emits_error_when_runtime_is_shadowed(capsys, monke
         },
     )
     monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -847,6 +849,7 @@ def test_run_windows_gpu_mode_accepts_bootstrap_enabled_cuda_runtime(capsys, mon
         },
     )
     monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
 
     args = SimpleNamespace(
@@ -879,6 +882,7 @@ def test_run_windows_gpu_mode_allows_probe_only_when_bootstrap_is_disabled(capsy
         },
     )
     monkeypatch.setattr(sys.modules['desktop_runtime_setup'].sys, 'platform', 'win32')
+    monkeypatch.setattr(sys.modules['desktop_runtime_setup'].platform_module, 'machine', lambda: 'AMD64')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
     monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP', '1')
 

@@ -131,6 +131,25 @@
             font-family: 'Courier New', Courier, monospace;
             font-size: 13px;
         }
+        .selected-server-failure {
+            margin: 0 0 15px;
+            padding: 12px;
+            border-radius: 5px;
+            background-color: rgba(255, 204, 102, 0.16);
+            color: #ffcc66;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .retry-chat-button {
+            margin-top: 10px;
+            padding: 10px 14px;
+            border: none;
+            border-radius: 5px;
+            background-color: #ffcc66;
+            color: #111111;
+            cursor: pointer;
+            font-weight: 600;
+        }
         .model-status {
             margin: 6px 0 0;
             color: #cccccc;
@@ -431,6 +450,22 @@
                 <p v-else-if="selectedModelSummary" class="model-status">{{ selectedModelSummary }}</p>
             </div>
             <p v-if="selectedServerKeyLabel" class="server-key-label" data-testid="landing-server-key-label">{{ selectedServerKeyLabel }}</p>
+            <div
+                v-if="selectedServerTerminalFailure"
+                class="selected-server-failure"
+                data-testid="landing-selected-server-failure"
+                role="alert"
+            >
+                <div>{{ selectedServerTerminalFailure }}</div>
+                <button
+                    type="button"
+                    class="retry-chat-button"
+                    data-testid="landing-new-chat-retry"
+                    @click="startNewChatAfterSelectedServerFailure"
+                >
+                    Start a new chat and retry
+                </button>
+            </div>
             <div v-for="message in chatHistory" :class="{'user-message': message.role === 'user', 'assistant-message': message.role === 'assistant'}" class="message">
                 <span v-html="renderMarkdown(getDisplayContent(message))"></span>
             </div>

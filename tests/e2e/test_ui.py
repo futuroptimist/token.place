@@ -49,6 +49,7 @@ def route_landing_relay_chat(
     next_status: int = 200,
     next_server_keys: list[str] | None = None,
     request_statuses: list[int] | None = None,
+    retrieve_statuses: list[int] | None = None,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -119,6 +120,16 @@ def route_landing_relay_chat(
         state["retrieve_requests"].append(payload)
         request_id = payload["request_id"]
         client_public_key = payload["client_public_key"]
+        status = 200
+        if retrieve_statuses:
+            status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
+        if status != 200:
+            route.fulfill(
+                status=status,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"error": {"code": "selected_server_terminal"}}),
+            )
+            return
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
@@ -522,14 +533,33 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
 
 
 @pytest.mark.e2e
-def test_landing_chat_reselects_server_after_terminal_dispatch_error(page: Page, base_url: str, setup_servers):
-    """A 404/410 dispatch clears sticky affinity so the next turn can choose a replacement."""
+@pytest.mark.parametrize(
+    ("terminal_endpoint", "terminal_status"),
+    [
+        ("dispatch", 404),
+        ("dispatch", 410),
+        ("retrieve", 404),
+        ("retrieve", 410),
+    ],
+)
+def test_landing_chat_terminal_server_failure_requires_explicit_new_chat_retry(
+    page: Page,
+    base_url: str,
+    setup_servers,
+    terminal_endpoint: str,
+    terminal_status: int,
+):
+    """A terminal selected-server error locks the chat until the user explicitly starts fresh."""
 
+    route_kwargs = {
+        "request_statuses": [terminal_status, 200] if terminal_endpoint == "dispatch" else None,
+        "retrieve_statuses": [terminal_status, 200] if terminal_endpoint == "retrieve" else None,
+    }
     state = route_landing_relay_chat(
         page,
         assistant_content="Replacement server answered.",
         next_server_keys=[SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
-        request_statuses=[404, 200],
+        **route_kwargs,
     )
 
     page.goto(base_url)
@@ -540,9 +570,29 @@ def test_landing_chat_reselects_server_after_terminal_dispatch_error(page: Page,
     textarea.fill("first attempt")
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").last.wait_for(state="visible")
-    assert "Please try again to select another server." in page.locator(".assistant-message").last.inner_text()
 
-    textarea.fill("second attempt")
+    failure = page.get_by_test_id("landing-selected-server-failure")
+    failure.wait_for(state="visible")
+    assert "Start a new chat to select another server" in failure.inner_text()
+    assert page.locator(".assistant-message").last.inner_text().count("Start a new chat") == 1
+    assert state["next_calls"] == 1
+    assert len(state["relay_requests"]) == 1
+    if terminal_endpoint == "retrieve":
+        assert len(state["retrieve_requests"]) == 1
+
+    textarea.fill("second attempt without explicit retry")
+    page.evaluate("() => document.querySelector('#app').__vue__.sendMessage()")
+    page.wait_for_timeout(250)
+    assert state["next_calls"] == 1
+    assert len(state["relay_requests"]) == 1
+    if terminal_endpoint == "retrieve":
+        assert len(state["retrieve_requests"]) == 1
+
+    page.get_by_test_id("landing-new-chat-retry").click()
+    failure.wait_for(state="hidden")
+    assert page.locator(".message").count() == 0
+
+    textarea.fill("fresh attempt")
     wait_for_landing_send_enabled(page).click()
     page.wait_for_function(
         """
@@ -556,6 +606,8 @@ def test_landing_chat_reselects_server_after_terminal_dispatch_error(page: Page,
         SERVER_PUBLIC_KEY_B64,
         ALT_SERVER_PUBLIC_KEY_B64,
     ]
+    fresh_envelope = json.loads(state["relay_requests"][1]["ciphertext"])
+    assert fresh_envelope["api_v1_request"]["messages"] == [{"role": "user", "content": "fresh attempt"}]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
